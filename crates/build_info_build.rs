@@ -29,9 +29,23 @@ fn main() {
         "cargo:rustc-env=DEV_TOOLS_BUILD_UNIX={}",
         build_unix()
     );
+    println!(
+        "cargo:rustc-env=DEV_TOOLS_GIT_COMMIT={}",
+        env::var("DEV_TOOLS_GIT_COMMIT").unwrap_or_else(|_| "unknown".into())
+    );
+    println!(
+        "cargo:rustc-env=DEV_TOOLS_GIT_DIRTY={}",
+        env::var("DEV_TOOLS_GIT_DIRTY").unwrap_or_else(|_| "unknown".into())
+    );
+    println!("cargo:rerun-if-env-changed=DEV_TOOLS_GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=DEV_TOOLS_GIT_DIRTY");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }
 
 fn build_unix() -> u64 {
+    if let Ok(value) = env::var("SOURCE_DATE_EPOCH") {
+        return value.parse().unwrap_or(0);
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

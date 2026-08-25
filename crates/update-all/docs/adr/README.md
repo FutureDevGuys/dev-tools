@@ -15,6 +15,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0003](0003-structured-failure-evidence.md) | Structured failure evidence | accepted | verified |
 | [0004](0004-attributable-aur-failure-containment.md) | Attributable AUR failure containment | superseded | pending |
 | [0005](0005-verified-repository-retirement.md) | Verified repository-retirement recovery | proposed | pending |
+| [0006](0006-product-scoped-authenticated-releases.md) | Product-scoped authenticated releases | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

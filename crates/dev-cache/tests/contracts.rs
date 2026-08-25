@@ -87,6 +87,8 @@ fn build_info_exposes_checkout_independent_build_metadata() {
     assert!(payload["built_unix"]
         .as_u64()
         .is_some_and(|value| value > 0));
+    assert!(payload["git_commit"].as_str().is_some());
+    assert!(payload["git_dirty"].as_str().is_some());
     assert!(payload.get("manifest_dir").is_none());
     assert!(payload.get("source_fingerprint").is_none());
 }

@@ -467,6 +467,10 @@ struct App {
 }
 
 pub fn main_entry(args: Vec<String>) -> i32 {
+    if args.first().is_some_and(|arg| arg == "--version") {
+        println!("skills-sync {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
     if args.first().is_some_and(|arg| arg == "--build-info") {
         build_info::print_build_info();
         return 0;

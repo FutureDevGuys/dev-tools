@@ -6,7 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 PROJECT = Path(__file__).resolve().parents[1]
 
 
@@ -21,6 +20,12 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         check=False,
     )
+
+
+def test_version_has_canonical_product_identity() -> None:
+    result = run_cli("--version")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "sync-configs 0.1.0"
 
 
 def write_manifest(path: Path, source: Path, target: Path, marker: Path) -> None:

@@ -16,16 +16,52 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ureq::ResponseExt;
 use wait_timeout::ChildExt;
 
-const PRODUCT: &str = "update-all";
 const ENGINE_PROTOCOL: u32 = 1;
-const ROOT_URL: &str =
-    "https://github.com/FutureDevGuys/dev-tools/releases/latest/download/dev-tools-root.json";
-const MANIFEST_URL: &str =
-    "https://github.com/FutureDevGuys/dev-tools/releases/latest/download/update-all-stable.json";
+const RELEASES_URL: &str =
+    "https://api.github.com/repos/FutureDevGuys/dev-tools/releases?per_page=100";
 const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const MAX_JITTER_SECS: u64 = 30 * 60;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Product {
+    UpdateAll,
+    DevCache,
+    SyncConfigs,
+    SkillsSync,
+}
+
+impl Product {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::UpdateAll,
+        Self::DevCache,
+        Self::SyncConfigs,
+        Self::SkillsSync,
+    ];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::UpdateAll => "update-all",
+            Self::DevCache => "dev-cache",
+            Self::SyncConfigs => "sync-configs",
+            Self::SkillsSync => "skills-sync",
+        }
+    }
+
+    fn executable_name(self) -> String {
+        if cfg!(windows) && self != Self::SyncConfigs {
+            format!("{}.exe", self.id())
+        } else {
+            self.id().to_string()
+        }
+    }
+
+    fn health_args(self) -> &'static [&'static str] {
+        &["--version"]
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -93,8 +129,9 @@ struct ReleaseState {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Status {
+    pub product: Product,
     pub installed_version: Option<String>,
-    pub running_version: String,
+    pub engine_version: String,
     pub previous_version: Option<String>,
     pub managed: bool,
     pub last_successful_check_unix: Option<u64>,
@@ -102,6 +139,7 @@ pub(crate) struct Status {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Check {
+    pub product: Product,
     pub installed_version: Option<String>,
     pub latest_version: String,
     pub update_available: bool,
@@ -110,9 +148,12 @@ pub(crate) struct Check {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Activation {
-    pub version: String,
+    pub product: Product,
+    pub version: Option<String>,
     pub changed: bool,
-    pub path: PathBuf,
+    pub managed: bool,
+    pub outcome: String,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,71 +171,110 @@ struct FetchResult {
     etag: Option<String>,
 }
 
-pub(crate) fn status() -> Result<Status> {
-    let paths = Paths::resolve()?;
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+pub(crate) fn status(product: Product) -> Result<Status> {
+    let paths = Paths::resolve(product)?;
     let state = load_state(&paths)?;
     Ok(Status {
+        product,
         installed_version: state.active_version.clone(),
-        running_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
         previous_version: state.previous_version,
         managed: is_managed_install(&paths),
         last_successful_check_unix: state.last_successful_check_unix,
     })
 }
 
-pub(crate) fn check() -> Result<Check> {
-    let paths = Paths::resolve()?;
+pub(crate) fn check(product: Product) -> Result<Check> {
+    let paths = Paths::resolve(product)?;
     let mut state = load_state(&paths)?;
-    let verified = fetch_verified_manifest(&paths, &state)?;
+    let verified = fetch_verified_manifest(product, &paths, &state)?;
     accept_root_metadata(&mut state, &verified);
     accept_manifest_metadata(&mut state, &verified)?;
     state.last_successful_check_unix = Some(now_unix());
     save_state(&paths, &state)?;
-    check_from_verified(&state, &verified)
+    check_from_verified(product, &state, &verified)
 }
 
-pub(crate) fn update() -> Result<Activation> {
-    let paths = Paths::resolve()?;
+pub(crate) fn update(product: Product) -> Result<Activation> {
+    let paths = Paths::resolve(product)?;
+    if paths.public_binary.exists() && !is_managed_install(&paths) {
+        return Ok(externally_managed(product, &paths));
+    }
     let mut state = load_state(&paths)?;
-    let verified = fetch_verified_manifest(&paths, &state)?;
+    let verified = fetch_verified_manifest(product, &paths, &state)?;
     accept_root_metadata(&mut state, &verified);
     accept_manifest_metadata(&mut state, &verified)?;
     let bytes = fetch_artifact(&verified.artifact)?;
     verify_artifact(&bytes, &verified.artifact)?;
-    let activation = activate(&paths, &mut state, &verified, &bytes)?;
+    let activation = activate(product, &paths, &mut state, &verified, &bytes)?;
     state.last_successful_check_unix = Some(now_unix());
     save_state(&paths, &state)?;
     Ok(activation)
 }
 
-pub(crate) fn install() -> Result<Activation> {
-    update()
+pub(crate) fn install(product: Product) -> Result<Activation> {
+    update(product)
 }
 
-pub(crate) fn rollback() -> Result<Activation> {
-    let paths = Paths::resolve()?;
+pub(crate) fn update_if_installed(product: Product) -> Result<Activation> {
+    let paths = Paths::resolve(product)?;
+    if !paths.public_binary.exists() {
+        return Ok(Activation {
+            product,
+            version: None,
+            changed: false,
+            managed: false,
+            outcome: "not_applicable".into(),
+            path: None,
+        });
+    }
+    update(product)
+}
+
+pub(crate) fn rollback(product: Product) -> Result<Activation> {
+    let paths = Paths::resolve(product)?;
     let mut state = load_state(&paths)?;
-    let previous = state
-        .previous_version
-        .clone()
-        .context("no retained update-all version is available for rollback")?;
+    let previous = state.previous_version.clone().with_context(|| {
+        format!(
+            "no retained {} version is available for rollback",
+            product.id()
+        )
+    })?;
     let binary = version_binary(&paths, &previous);
     if !binary.is_file() {
         bail!("retained rollback binary is missing: {}", binary.display());
     }
-    activate_link(&paths, &previous)?;
+    activate_link(product, &paths, &previous)?;
     let old_active = state.active_version.replace(previous.clone());
     state.previous_version = old_active;
     save_state(&paths, &state)?;
     Ok(Activation {
-        version: previous,
+        product,
+        version: Some(previous),
         changed: true,
-        path: binary,
+        managed: true,
+        outcome: "rolled_back".into(),
+        path: Some(binary),
     })
 }
 
 pub(crate) fn maybe_auto_update() -> Result<Option<Activation>> {
-    let paths = Paths::resolve()?;
+    let product = Product::UpdateAll;
+    let paths = Paths::resolve(product)?;
     if !is_managed_install(&paths) {
         return Ok(None);
     }
@@ -202,7 +282,7 @@ pub(crate) fn maybe_auto_update() -> Result<Option<Activation>> {
     if !check_due(&state) {
         return Ok(None);
     }
-    match update() {
+    match update(product) {
         Ok(activation) => Ok(Some(activation)),
         Err(err) if err.downcast_ref::<IntegrityFailure>().is_some() => Err(err),
         Err(err) => {
@@ -212,20 +292,23 @@ pub(crate) fn maybe_auto_update() -> Result<Option<Activation>> {
     }
 }
 
-fn check_from_verified(state: &ReleaseState, verified: &VerifiedManifest) -> Result<Check> {
+fn check_from_verified(
+    product: Product,
+    state: &ReleaseState,
+    verified: &VerifiedManifest,
+) -> Result<Check> {
     let latest = Version::parse(&verified.manifest.version).context("parse release version")?;
-    let installed_raw = state
+    let installed = state
         .active_version
         .as_deref()
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let installed = Version::parse(installed_raw).context("parse installed version")?;
+        .map(Version::parse)
+        .transpose()
+        .context("parse installed version")?;
     Ok(Check {
-        installed_version: state
-            .active_version
-            .clone()
-            .or_else(|| Some(installed_raw.to_string())),
+        product,
+        installed_version: state.active_version.clone(),
         latest_version: verified.manifest.version.clone(),
-        update_available: latest > installed,
+        update_available: installed.is_none_or(|installed| latest > installed),
         target: target_id(),
     })
 }
@@ -243,9 +326,14 @@ fn check_due(state: &ReleaseState) -> bool {
     now_unix().saturating_sub(last) >= CHECK_INTERVAL_SECS + (seed % (MAX_JITTER_SECS + 1))
 }
 
-fn fetch_verified_manifest(paths: &Paths, state: &ReleaseState) -> Result<VerifiedManifest> {
+fn fetch_verified_manifest(
+    product: Product,
+    paths: &Paths,
+    state: &ReleaseState,
+) -> Result<VerifiedManifest> {
+    let (root_url, manifest_url) = resolve_release_urls(product)?;
     let root_bytes = fetch_cached(
-        &root_url(),
+        &root_url,
         &paths.root_cache,
         &paths.root_etag,
         METADATA_LIMIT,
@@ -266,7 +354,7 @@ fn fetch_verified_manifest(paths: &Paths, state: &ReleaseState) -> Result<Verifi
     }
 
     let manifest_bytes = fetch_cached(
-        &manifest_url(),
+        &manifest_url,
         &paths.manifest_cache,
         &paths.manifest_etag,
         METADATA_LIMIT,
@@ -274,7 +362,7 @@ fn fetch_verified_manifest(paths: &Paths, state: &ReleaseState) -> Result<Verifi
     let envelope: SignedEnvelope<ProductManifest> =
         parse_trusted_json(&manifest_bytes, "product manifest")?;
     verify_product_manifest(&envelope, &root.signed)?;
-    validate_manifest(&envelope.signed)?;
+    validate_manifest(product, &envelope.signed)?;
     let artifact = envelope
         .signed
         .artifacts
@@ -355,11 +443,11 @@ fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&array).context("parse Ed25519 public key")
 }
 
-fn validate_manifest(manifest: &ProductManifest) -> Result<()> {
+fn validate_manifest(product: Product, manifest: &ProductManifest) -> Result<()> {
     if manifest.schema != "dev-tools-product-v1" {
         return integrity("unsupported product manifest schema");
     }
-    if manifest.product != PRODUCT {
+    if manifest.product != product.id() {
         return integrity("product manifest names a different product");
     }
     if manifest.engine_protocol != ENGINE_PROTOCOL {
@@ -417,6 +505,7 @@ fn verify_artifact(bytes: &[u8], artifact: &Artifact) -> Result<()> {
 }
 
 fn activate(
+    product: Product,
     paths: &Paths,
     state: &mut ReleaseState,
     verified: &VerifiedManifest,
@@ -425,31 +514,37 @@ fn activate(
     let version = &verified.manifest.version;
     let target = version_binary(paths, version);
     if target.is_file() && sha256_file(&target)? == verified.artifact.sha256 {
-        activate_link(paths, version)?;
+        activate_link(product, paths, version)?;
         state.active_version = Some(version.clone());
         return Ok(Activation {
-            version: version.clone(),
+            product,
+            version: Some(version.clone()),
             changed: false,
-            path: target,
+            managed: true,
+            outcome: "no_op".into(),
+            path: Some(target),
         });
     }
     let parent = target.parent().context("version binary has no parent")?;
     create_private_dir(parent)?;
     atomic_write(&target, bytes, true)?;
-    verify_candidate_health(&target, version)?;
+    verify_candidate_health(product, &target, version)?;
     let previous = state.active_version.clone();
-    activate_link(paths, version)?;
+    activate_link(product, paths, version)?;
     state.previous_version = previous.filter(|value| value != version);
     state.active_version = Some(version.clone());
     prune_versions(paths, state)?;
     Ok(Activation {
-        version: version.clone(),
+        product,
+        version: Some(version.clone()),
         changed: true,
-        path: target,
+        managed: true,
+        outcome: "updated".into(),
+        path: Some(target),
     })
 }
 
-fn activate_link(paths: &Paths, version: &str) -> Result<()> {
+fn activate_link(product: Product, paths: &Paths, version: &str) -> Result<()> {
     let binary = version_binary(paths, version);
     if !binary.is_file() {
         bail!(
@@ -468,29 +563,20 @@ fn activate_link(paths: &Paths, version: &str) -> Result<()> {
             .context("create atomic current-version link")?;
         fs::rename(&current_tmp, &paths.current).context("activate current-version link")?;
 
-        let public_tmp = paths.bin_dir.join(".update-all.tmp");
+        let public_tmp = paths.bin_dir.join(format!(".{}.tmp", product.id()));
         let _ = fs::remove_file(&public_tmp);
-        symlink(paths.current.join(PRODUCT), &public_tmp).context("create public command link")?;
+        symlink(paths.current.join(product.id()), &public_tmp)
+            .context("create public command link")?;
         if paths.public_binary.exists() || fs::symlink_metadata(&paths.public_binary).is_ok() {
-            let backup = paths.product_root.join("pre-managed-update-all");
-            if !backup.exists()
-                && !fs::symlink_metadata(&paths.public_binary)?
-                    .file_type()
-                    .is_symlink()
-            {
-                fs::rename(&paths.public_binary, &backup)
-                    .context("retain pre-managed update-all binary")?;
-            } else {
-                fs::remove_file(&paths.public_binary).context("replace public command link")?;
-            }
+            fs::remove_file(&paths.public_binary).context("replace public command link")?;
         }
         fs::rename(&public_tmp, &paths.public_binary).context("activate public command link")?;
     }
     #[cfg(windows)]
     {
-        let staged = paths.bin_dir.join("update-all.next.exe");
+        let staged = paths.bin_dir.join(format!("{}.next.exe", product.id()));
         fs::copy(&binary, &staged).context("stage update-all replacement")?;
-        let backup = paths.bin_dir.join("update-all.previous.exe");
+        let backup = paths.bin_dir.join(format!("{}.previous.exe", product.id()));
         if paths.public_binary.is_file() {
             let _ = fs::remove_file(&backup);
             fs::rename(&paths.public_binary, &backup)
@@ -501,7 +587,8 @@ fn activate_link(paths: &Paths, version: &str) -> Result<()> {
                 let _ = fs::rename(&backup, &paths.public_binary);
             }
             crate::ua_errln!(
-                "update-all activation deferred: close running update-all processes and retry ({error})"
+                "{} activation deferred: close running processes and retry ({error})",
+                product.id()
             );
             return Err(crate::Deferred.into());
         }
@@ -509,9 +596,9 @@ fn activate_link(paths: &Paths, version: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_candidate_health(binary: &Path, expected_version: &str) -> Result<()> {
+fn verify_candidate_health(product: Product, binary: &Path, expected_version: &str) -> Result<()> {
     let mut child = Command::new(binary)
-        .arg("--version")
+        .args(product.health_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -527,7 +614,7 @@ fn verify_candidate_health(binary: &Path, expected_version: &str) -> Result<()> 
         return integrity("candidate release health check failed");
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = format!("update-all {expected_version}");
+    let expected = format!("{} {expected_version}", product.id());
     if !stdout.lines().any(|line| line.starts_with(&expected)) {
         return integrity("candidate release reported an unexpected version");
     }
@@ -543,7 +630,7 @@ fn prune_versions(paths: &Paths, state: &ReleaseState) -> Result<()> {
     if !paths.versions.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(&paths.versions).context("read retained update-all versions")? {
+    for entry in fs::read_dir(&paths.versions).context("read retained product versions")? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if entry.file_type()?.is_dir() && !keep.iter().any(|value| *value == Some(name.as_str())) {
@@ -625,24 +712,77 @@ fn https_get(url: &str, etag: Option<&str>, limit: u64) -> Result<FetchResult> {
 fn allowed_release_host(host: &str) -> bool {
     matches!(
         host,
-        "github.com" | "objects.githubusercontent.com" | "github-releases.githubusercontent.com"
+        "api.github.com"
+            | "github.com"
+            | "objects.githubusercontent.com"
+            | "github-releases.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
     )
 }
 
-fn root_url() -> String {
-    env::var("UPDATE_ALL_ROOT_URL").unwrap_or_else(|_| ROOT_URL.to_string())
+fn resolve_release_urls(product: Product) -> Result<(String, String)> {
+    match (
+        env::var("DEV_TOOLS_ROOT_URL").ok(),
+        env::var("DEV_TOOLS_MANIFEST_URL").ok(),
+    ) {
+        (Some(root), Some(manifest)) => return Ok((root, manifest)),
+        (None, None) => {}
+        _ => bail!("DEV_TOOLS_ROOT_URL and DEV_TOOLS_MANIFEST_URL must be set together"),
+    }
+
+    let releases_url =
+        env::var("DEV_TOOLS_RELEASES_URL").unwrap_or_else(|_| RELEASES_URL.to_string());
+    let bytes = https_get(&releases_url, None, METADATA_LIMIT)?.bytes;
+    let releases: Vec<GitHubRelease> = parse_json(&bytes, "GitHub releases response")?;
+    select_release_urls(&releases, product)
 }
 
-fn manifest_url() -> String {
-    env::var("UPDATE_ALL_MANIFEST_URL").unwrap_or_else(|_| MANIFEST_URL.to_string())
+fn select_release_urls(releases: &[GitHubRelease], product: Product) -> Result<(String, String)> {
+    let prefix = format!("{}/v", product.id());
+    let selected = releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            let version = release.tag_name.strip_prefix(&prefix)?;
+            Version::parse(version)
+                .ok()
+                .map(|version| (version, release))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, release)| release)
+        .with_context(|| format!("no stable {} release is published", product.id()))?;
+    let asset_url = |name: &str| {
+        selected
+            .assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .map(|asset| asset.browser_download_url.clone())
+            .with_context(|| {
+                format!(
+                    "release {} is missing required asset {name}",
+                    selected.tag_name
+                )
+            })
+    };
+    Ok((
+        asset_url("dev-tools-root.json")?,
+        asset_url(&format!("{}-stable.json", product.id()))?,
+    ))
 }
 
 fn is_managed_install(paths: &Paths) -> bool {
-    let Ok(current) = env::current_exe() else {
-        return false;
-    };
-    current.starts_with(&paths.product_root)
-        || fs::canonicalize(current).is_ok_and(|path| path.starts_with(&paths.product_root))
+    fs::canonicalize(&paths.public_binary).is_ok_and(|path| path.starts_with(&paths.product_root))
+}
+
+fn externally_managed(product: Product, paths: &Paths) -> Activation {
+    Activation {
+        product,
+        version: None,
+        changed: false,
+        managed: false,
+        outcome: "externally_managed".into(),
+        path: Some(paths.public_binary.clone()),
+    }
 }
 
 fn target_id() -> String {
@@ -659,11 +799,7 @@ fn target_id() -> String {
 }
 
 fn version_binary(paths: &Paths, version: &str) -> PathBuf {
-    paths.versions.join(version).join(if cfg!(windows) {
-        "update-all.exe"
-    } else {
-        PRODUCT
-    })
+    paths.versions.join(version).join(&paths.executable_name)
 }
 
 fn load_state(paths: &Paths) -> Result<ReleaseState> {
@@ -773,10 +909,11 @@ struct Paths {
     manifest_etag: PathBuf,
     bin_dir: PathBuf,
     public_binary: PathBuf,
+    executable_name: String,
 }
 
 impl Paths {
-    fn resolve() -> Result<Self> {
+    fn resolve(product: Product) -> Result<Self> {
         let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .map(PathBuf::from)
             .context("home directory is unavailable")?;
@@ -794,8 +931,9 @@ impl Paths {
         } else {
             home.join(".local/bin")
         };
-        let product_root = state_home.join("update-all/self");
+        let product_root = state_home.join("dev-tools/products").join(product.id());
         let cache = product_root.join("cache");
+        let executable_name = product.executable_name();
         Ok(Self {
             versions: product_root.join("versions"),
             current: product_root.join("current"),
@@ -804,13 +942,10 @@ impl Paths {
             root_etag: cache.join("root.etag"),
             manifest_cache: cache.join("manifest.json"),
             manifest_etag: cache.join("manifest.etag"),
-            public_binary: bin_dir.join(if cfg!(windows) {
-                "update-all.exe"
-            } else {
-                PRODUCT
-            }),
+            public_binary: bin_dir.join(&executable_name),
             bin_dir,
             product_root,
+            executable_name,
         })
     }
 }
@@ -835,6 +970,38 @@ mod tests {
         }
     }
 
+    fn github_release(tag: &str, draft: bool, prerelease: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.into(),
+            draft,
+            prerelease,
+            assets: vec![
+                GitHubAsset {
+                    name: "dev-tools-root.json".into(),
+                    browser_download_url: format!("https://github.com/root/{tag}"),
+                },
+                GitHubAsset {
+                    name: "dev-cache-stable.json".into(),
+                    browser_download_url: format!("https://github.com/manifest/{tag}"),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn product_release_resolution_uses_latest_stable_matching_tag() {
+        let releases = vec![
+            github_release("dev-cache/v1.2.0", false, false),
+            github_release("dev-cache/v9.0.0", true, false),
+            github_release("dev-cache/v8.0.0", false, true),
+            github_release("update-all/v7.0.0", false, false),
+            github_release("dev-cache/v1.10.0", false, false),
+        ];
+        let (root, manifest) = select_release_urls(&releases, Product::DevCache).unwrap();
+        assert!(root.ends_with("dev-cache/v1.10.0"));
+        assert!(manifest.ends_with("dev-cache/v1.10.0"));
+    }
+
     #[test]
     fn authorized_manifest_signature_is_accepted() {
         let release = SigningKey::from_bytes(&[7_u8; 32]);
@@ -854,7 +1021,7 @@ mod tests {
         };
         let manifest = ProductManifest {
             schema: "dev-tools-product-v1".into(),
-            product: PRODUCT.into(),
+            product: Product::UpdateAll.id().into(),
             generation: 4,
             version: "1.2.3".into(),
             engine_protocol: ENGINE_PROTOCOL,
@@ -882,7 +1049,7 @@ mod tests {
         };
         let manifest = ProductManifest {
             schema: "dev-tools-product-v1".into(),
-            product: PRODUCT.into(),
+            product: Product::UpdateAll.id().into(),
             generation: 4,
             version: "1.2.3".into(),
             engine_protocol: ENGINE_PROTOCOL,
@@ -900,7 +1067,7 @@ mod tests {
             root_sha256: "root".into(),
             manifest: ProductManifest {
                 schema: "dev-tools-product-v1".into(),
-                product: PRODUCT.into(),
+                product: Product::UpdateAll.id().into(),
                 generation,
                 version: version.into(),
                 engine_protocol: ENGINE_PROTOCOL,
@@ -942,8 +1109,8 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' 'update-all 1.2.3 profile=release'\n",
         )
         .unwrap();
-        verify_candidate_health(&binary, "1.2.3").unwrap();
-        let err = verify_candidate_health(&binary, "1.2.4").unwrap_err();
+        verify_candidate_health(Product::UpdateAll, &binary, "1.2.3").unwrap();
+        let err = verify_candidate_health(Product::UpdateAll, &binary, "1.2.4").unwrap_err();
         assert!(err.downcast_ref::<IntegrityFailure>().is_some());
     }
 }

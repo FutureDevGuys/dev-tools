@@ -103,6 +103,8 @@ enum RunSubcommand {
     /// Install, inspect, update, or roll back authenticated update-all releases.
     #[command(name = "self")]
     SelfCommand(SelfCli),
+    /// Install and update authenticated Dev Tools products.
+    Product(ProductCli),
     /// Read, write, validate, and install update-all config files.
     Config(ConfigCli),
     /// Browse prior run artifacts.
@@ -198,6 +200,7 @@ impl RunCli {
             Some(RunSubcommand::Completion(cli)) => return cli.run(),
             Some(RunSubcommand::Completions(cli)) => return cli.run(self.config),
             Some(RunSubcommand::SelfCommand(cli)) => return cli.run_with_default_path(self.config),
+            Some(RunSubcommand::Product(cli)) => return cli.run(),
             Some(RunSubcommand::Config(cli)) => return cli.run_with_default_path(self.config),
             Some(RunSubcommand::Restore(cli)) => return cli.run(self.config),
             Some(RunSubcommand::Resume(cli)) => return cli.run(self.config),
@@ -215,7 +218,7 @@ impl RunCli {
                 if activation.changed {
                     crate::ua_outln!(
                         "Authenticated update-all {} and activated it for the next invocation.",
-                        activation.version
+                        activation.version.as_deref().unwrap_or("<unknown>")
                     );
                 }
             }
@@ -1202,9 +1205,12 @@ struct SelfOutputCli {
 impl SelfCli {
     fn run_with_default_path(self, _default_path: Option<PathBuf>) -> Result<()> {
         match self.cmd {
-            SelfCmd::Install(cli) => emit_release_result(crate::release::install()?, cli.json),
+            SelfCmd::Install(cli) => emit_release_result(
+                crate::release::install(crate::release::Product::UpdateAll)?,
+                cli.json,
+            ),
             SelfCmd::Status(cli) => {
-                let status = crate::release::status()?;
+                let status = crate::release::status(crate::release::Product::UpdateAll)?;
                 if cli.json {
                     crate::ua_outln!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
@@ -1213,7 +1219,7 @@ impl SelfCli {
                         "Installed version: {}",
                         status.installed_version.as_deref().unwrap_or("<unmanaged>")
                     );
-                    crate::ua_outln!("Running version: {}", status.running_version);
+                    crate::ua_outln!("Engine version: {}", status.engine_version);
                     crate::ua_outln!(
                         "Rollback version: {}",
                         status.previous_version.as_deref().unwrap_or("<none>")
@@ -1221,7 +1227,7 @@ impl SelfCli {
                 }
             }
             SelfCmd::Check(cli) => {
-                let check = crate::release::check()?;
+                let check = crate::release::check(crate::release::Product::UpdateAll)?;
                 if cli.json {
                     crate::ua_outln!("{}", serde_json::to_string_pretty(&check)?);
                 } else if check.update_available {
@@ -1238,8 +1244,14 @@ impl SelfCli {
                     );
                 }
             }
-            SelfCmd::Update(cli) => emit_release_result(crate::release::update()?, cli.json),
-            SelfCmd::Rollback(cli) => emit_release_result(crate::release::rollback()?, cli.json),
+            SelfCmd::Update(cli) => emit_release_result(
+                crate::release::update(crate::release::Product::UpdateAll)?,
+                cli.json,
+            ),
+            SelfCmd::Rollback(cli) => emit_release_result(
+                crate::release::rollback(crate::release::Product::UpdateAll)?,
+                cli.json,
+            ),
         }
         Ok(())
     }
@@ -1253,12 +1265,125 @@ fn emit_release_result(result: crate::release::Activation, json: bool) {
         );
     } else if result.changed {
         crate::ua_outln!(
-            "Activated update-all {} at {}",
-            result.version,
-            result.path.display()
+            "Activated {} {} at {}",
+            product_name(result.product),
+            result.version.as_deref().unwrap_or("<unknown>"),
+            result
+                .path
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
         );
     } else {
-        crate::ua_outln!("update-all {} is already active", result.version);
+        crate::ua_outln!(
+            "{}: {}{}",
+            product_name(result.product),
+            result.outcome,
+            result
+                .version
+                .as_deref()
+                .map_or_else(String::new, |version| format!(" ({version})"))
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProductName {
+    UpdateAll,
+    DevCache,
+    SyncConfigs,
+    SkillsSync,
+}
+
+impl From<ProductName> for crate::release::Product {
+    fn from(value: ProductName) -> Self {
+        match value {
+            ProductName::UpdateAll => Self::UpdateAll,
+            ProductName::DevCache => Self::DevCache,
+            ProductName::SyncConfigs => Self::SyncConfigs,
+            ProductName::SkillsSync => Self::SkillsSync,
+        }
+    }
+}
+
+fn product_name(product: crate::release::Product) -> &'static str {
+    product.id()
+}
+
+#[derive(clap::Args, Debug)]
+#[command(about = "Install and update products through shared authenticated manifests.")]
+struct ProductCli {
+    #[command(subcommand)]
+    cmd: ProductCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ProductCmd {
+    /// Install the latest authenticated stable release.
+    Install(ProductOutputCli),
+    /// Show local product activation state without network access.
+    Status(ProductOutputCli),
+    /// Authenticate the latest stable metadata without installing it.
+    Check(ProductOutputCli),
+    /// Update or install the latest authenticated stable release.
+    Update(ProductOutputCli),
+    /// Update only when the product command is already installed.
+    UpdateIfInstalled(ProductOutputCli),
+    /// Atomically reactivate the retained previous version.
+    Rollback(ProductOutputCli),
+}
+
+#[derive(clap::Args, Debug)]
+struct ProductOutputCli {
+    #[arg(value_enum)]
+    product: ProductName,
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
+}
+
+impl ProductCli {
+    fn run(self) -> Result<()> {
+        match self.cmd {
+            ProductCmd::Install(cli) => {
+                emit_release_result(crate::release::install(cli.product.into())?, cli.json)
+            }
+            ProductCmd::Status(cli) => {
+                let status = crate::release::status(cli.product.into())?;
+                if cli.json {
+                    crate::ua_outln!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    crate::ua_outln!(
+                        "{} managed={} active={}",
+                        product_name(status.product),
+                        status.managed,
+                        status.installed_version.as_deref().unwrap_or("<none>")
+                    );
+                }
+            }
+            ProductCmd::Check(cli) => {
+                let check = crate::release::check(cli.product.into())?;
+                if cli.json {
+                    crate::ua_outln!("{}", serde_json::to_string_pretty(&check)?);
+                } else {
+                    crate::ua_outln!(
+                        "{} latest={} update_available={}",
+                        product_name(check.product),
+                        check.latest_version,
+                        check.update_available
+                    );
+                }
+            }
+            ProductCmd::Update(cli) => {
+                emit_release_result(crate::release::update(cli.product.into())?, cli.json)
+            }
+            ProductCmd::UpdateIfInstalled(cli) => emit_release_result(
+                crate::release::update_if_installed(cli.product.into())?,
+                cli.json,
+            ),
+            ProductCmd::Rollback(cli) => {
+                emit_release_result(crate::release::rollback(cli.product.into())?, cli.json)
+            }
+        }
+        Ok(())
     }
 }
 

@@ -9,6 +9,81 @@ category = "language"
 kind = "managed"
 executor = "npm"
 
+[[tasks]]
+id = "dev-tools-update-all"
+label = "Update All"
+os = ["linux", "macos", "windows"]
+detect_any = ["update-all"]
+depends_on = []
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "update-all"
+args = ["product", "update-if-installed", "update-all", "--json"]
+policy_key = "tool_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks]]
+id = "dev-tools-dev-cache"
+label = "Dev Cache"
+os = ["linux", "macos", "windows"]
+detect_any = ["update-all"]
+depends_on = []
+after = ["dev-tools-update-all"]
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "update-all"
+args = ["product", "update-if-installed", "dev-cache", "--json"]
+policy_key = "tool_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks]]
+id = "dev-tools-sync-configs"
+label = "Sync Configs"
+os = ["linux", "macos", "windows"]
+detect_any = ["update-all"]
+depends_on = []
+after = ["dev-tools-dev-cache"]
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "update-all"
+args = ["product", "update-if-installed", "sync-configs", "--json"]
+policy_key = "tool_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks]]
+id = "dev-tools-skills-sync"
+label = "Skills Sync"
+os = ["linux", "macos", "windows"]
+detect_any = ["update-all"]
+depends_on = []
+after = ["dev-tools-sync-configs"]
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "update-all"
+args = ["product", "update-if-installed", "skills-sync", "--json"]
+policy_key = "tool_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
 
 
 

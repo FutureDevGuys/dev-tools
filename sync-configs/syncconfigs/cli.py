@@ -31,7 +31,7 @@ TOOLS_DIR = SCRIPT_DIR.parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from . import json_overlay, managed_path_policy, toml_overlay
+from . import __version__, json_overlay, managed_path_policy, toml_overlay
 import yaml
 
 
@@ -785,6 +785,11 @@ Examples:
 """
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"sync-configs {__version__}",
     )
     parser.add_argument(
         "--config",
