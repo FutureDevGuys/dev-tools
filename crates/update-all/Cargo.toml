@@ -1,0 +1,129 @@
+[package]
+name = "update-all"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Run supported software updaters through one deterministic plan"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+base64 = "0.22"
+ed25519-dalek = "3"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "0.2"
+sha2 = "0.10"
+toml = "1.0"
+ureq = "3.4"
+wait-timeout = "0.2"
+regex = "1"
+is-terminal = "0.4"
+libc = "0.2"
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+ctrlc = "3"
+unicode-width = "0.2"
+uuid = { version = "1", default-features = false, features = ["serde", "v4"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
+
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm"]
+
+# rust-development-skill:clippy-lints:start
+# Workspace Clippy + rustc lint configuration.
+#
+# Where to put:
+# - Workspace repo: paste these two sections into the top-level Cargo.toml.
+# - If your workspace requires it, add `[lints] workspace = true` to each member crate.
+# - Single-crate repo: translate to crate-root attributes (see bottom of file).
+#
+# Enforcement:
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   Optional strict mode: add --all-features and --locked.
+#
+# Notes:
+# - Clippy does NOT ban `unwrap_or*` variants; use the banned_family test for that.
+# - `unsafe_code` is a rustc lint (not clippy) and can be forbidden repo-wide.
+# - If you need exceptions (e.g., a CLI printing to stdout), use crate-level `#![allow(...)]`.
+
+[lints.rust]
+unsafe_code = "warn"
+
+# Unused/dead code hygiene
+unused_imports = "allow"
+unused_variables = "allow"
+unused_mut = "allow"
+unused_must_use = "allow"
+dead_code = "allow"
+unreachable_pub = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+# Broad non-idiomatic coverage
+all = { level = "allow", priority = -1 }
+cargo = { level = "allow", priority = -1 }
+# Most internal crates lack publish metadata; enable for crates.io packages.
+cargo_common_metadata = "allow"
+# Optional strict profile:
+# pedantic = "warn"
+# nursery = "warn"
+
+# Explicit non-idiomatic bans (restriction-style lints)
+#
+# `unwrap/expect/unreachable` are enforced via verify/banned-family checks with
+# same-line invariant comments, so clippy leaves those to the repository policy.
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "allow"
+dbg_macro = "deny"
+indexing_slicing = "allow"
+panic_in_result_fn = "allow"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# --- Single-crate alternative (paste into lib.rs or main.rs) ---
+# #![forbid(unsafe_code)]
+# #![warn(
+#     unused_imports,
+#     unused_variables,
+#     unused_mut,
+#     unused_must_use,
+#     dead_code,
+#     unreachable_pub,
+#     missing_docs,
+#     clippy::all,
+#     clippy::cargo,
+# )]
+# Optional strict profile:
+# #![warn(clippy::pedantic, clippy::nursery)]
+# #![deny(
+#     clippy::unwrap_used,
+#     clippy::expect_used,
+#     clippy::panic,
+#     clippy::todo,
+#     clippy::unimplemented,
+#     clippy::unreachable,
+#     clippy::dbg_macro,
+#     clippy::indexing_slicing,
+#     clippy::panic_in_result_fn,
+#     clippy::print_stdout,
+#     clippy::print_stderr,
+# )]
+
+# rust-development-skill:clippy-lints:end

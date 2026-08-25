@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sync-configs"
+version = "0.1.0"
+description = "Manifest-driven, config-only filesystem and structured-overlay convergence"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+dependencies = ["PyYAML>=6"]
+
+[project.scripts]
+sync-configs = "syncconfigs.cli:main"
+
+[tool.setuptools]
+packages = ["syncconfigs"]
+
+[tool.setuptools.package-data]
+syncconfigs = ["default_filters.gitignore"]

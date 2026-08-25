@@ -1,0 +1,330 @@
+[ui]
+mode = "dashboard"
+persist_until_exit = true
+show_global_log = true
+max_events_per_frame = 120
+
+[ui.dashboard]
+# cancel_all | detach
+quit_behavior = "cancel_all"
+quit_cancel_grace_ms = 3000
+# auto | 1 | 2
+mouse_row_stride = "auto"
+# failures | all | none
+note_verbosity = "failures"
+
+[engine]
+mode = "async"
+jobs = "auto"
+fail_fast = false
+
+[install]
+# Authenticate and activate the latest stable release during normal runs.
+auto_update = true
+
+[runtime.interactive]
+# auto_fallback | capture | direct_tty
+# Interactive commands suspend the dashboard while running in foreground TTY mode.
+mode = "auto_fallback"
+stall_seconds = 20
+max_line_bytes = 262144
+max_capture_bytes = 16777216
+retry_once = true
+
+[logging]
+# Linux/macOS default: $XDG_STATE_HOME/update-all/runs or ~/.local/state/update-all/runs
+# Windows default: %APPDATA%/update-all/runs
+# Uncomment to override the OS default.
+# run_dir = "/absolute/path/to/update-all/runs"
+max_in_memory_lines = 20000
+filter_progress_noise = false
+timestamps = true
+task_colors = true
+
+[bootstrap]
+# Include the Windows user-scope foundations bootstrap task by default.
+enabled = false
+# Supported entries come from src/updaters/windows_foundations.toml.
+windows_foundations = ["scoop", "powershell", "winget"]
+
+# Task policies:
+# timeout_secs: hard timeout for a single attempt
+# retries: additional attempts after a failure/timeout
+# retry_backoff_secs: exponential backoff base delay between retries (base * 2^n, capped at 60s)
+
+[tasks.npm_install]
+timeout_secs = 180
+retries = 0
+retry_backoff_secs = 0
+
+[tasks.pipx_upgrade]
+timeout_secs = 180
+retries = 0
+retry_backoff_secs = 0
+
+[tasks.system_update]
+timeout_secs = 3600
+retries = 0
+retry_backoff_secs = 0
+
+[tasks.aur_update]
+timeout_secs = 10800
+retries = 0
+retry_backoff_secs = 0
+
+[tasks.system_summary]
+timeout_secs = 300
+retries = 0
+retry_backoff_secs = 0
+
+[tasks.tool_update]
+timeout_secs = 600
+retries = 0
+retry_backoff_secs = 0
+
+[updaters]
+# Run every detected built-in updater for the host OS by default.
+run_all_detected = true
+# Additional built-in or custom updater IDs to include in every run.
+# Alias: "winget" expands to "winget-user" + "winget-machine".
+include = []
+# Built-in or custom updater IDs to always exclude.
+# Alias: "winget" expands to "winget-user" + "winget-machine".
+exclude = []
+# skip | prompt_tty | fail
+# prompt_tty prompts only from an interactive terminal; non-interactive runs
+# require an existing sudo session and fail loudly otherwise.
+privilege_mode = "prompt_tty"
+# Optional external custom-updater catalog files. Relative paths are resolved
+# from this config file. Catalog task IDs and inline task IDs must be unique.
+catalogs = []
+
+# Declarative custom updaters.
+# Each task can be constrained by OS, detection probes, dependencies, and policy key.
+# The task policy key maps to [tasks.<key>] above.
+# To keep this file small, move custom updater definitions into catalogs:
+#
+#   [updaters]
+#   catalogs = ["updaters.local.toml"]
+#
+#   # updaters.local.toml
+#   [tasks.mytool]
+#   label = "MyTool"
+#   command = "mytool"
+#
+# Catalog files also accept [updaters.tasks.<id>] for copy/paste compatibility.
+#
+# Authoring loop for beginners:
+# 1. Copy one example below and adjust the command/args.
+# 2. Run `update-all config validate --strict`.
+# 3. Run `update-all list` to confirm the task is detected.
+#
+# Field notes:
+# - detect_mode: `any_present` checks `detect`; `always` ignores `detect`;
+#   `command_available` checks the primary command and command_candidates.
+# - detect: PATH probes; task is eligible when any listed command exists.
+# - detect_all: task is eligible only when every listed command exists.
+# - detect_all_windows: Windows-only required probes; ignored on Linux/macOS.
+# - skip_if_any: task is skipped when any listed command exists.
+# - skip_if_any_windows: Windows-only skip probes; ignored on Linux/macOS.
+# - depends_on: selected task IDs or categories whose healthy capability is
+#   required. A blocking predecessor outcome cancels this task.
+# - after: selected task IDs or categories that must reach any terminal state
+#   first. Their outcome does not gate this task.
+#   Category references expand to the selected task IDs in that category.
+# - requires_selected_any: selected task IDs/categories required for automatic
+#   inclusion; direct --only/include of this task still runs it.
+# - depends_on_selected: when true, also depends on every other selected task
+#   so this task runs after the selected run set.
+# - depends_on_selected_exclude: task IDs to omit from those generated
+#   selected-task dependencies. Direct `depends_on` entries are still honored
+#   when the referenced task is selected.
+# - requires_elevation: command needs elevated privileges.
+# - needs_sudo_session: command should reuse update-all's managed sudo session.
+# - interactive: command may prompt and should stay dashboard-aware.
+# - shell: run a raw platform shell fragment rather than exec-ing the command directly.
+#   When true, command + args are joined as shell text; quote/escape them yourself.
+# - command_candidates: alternate direct commands for the same updater. Candidates
+#   require shell = false and each candidate can set program, args, probe_args,
+#   and optional mode for status text.
+# - pre_commands: optional direct commands that run before the updater command;
+#   failure stops the task before the primary command runs.
+# - external_manager_skip: skip self-update when the command binary is owned by
+#   an external package manager such as pacman, dpkg, rpm, apk, or brew.
+# - report_parser: optional compatibility parser for manager-shaped output.
+#   Prefer report_patterns or report_commands.state_pattern for custom tools so
+#   new updater coverage stays data-driven instead of adding program-specific
+#   Rust parsers. Supported compatibility values: arch_update_services, scoop,
+#   version_lines, winget, yay. Legacy alias: uv.
+# - report_commands: optional read-only commands. By default they run after the
+#   updater succeeds and append successful output before report_parser extracts
+#   structured rows. Set when = "before" to append a pre-update probe, or pair
+#   when = "before_after" with state_pattern to run the same probe before and
+#   after the updater and emit generic state-diff rows. state_pattern captures
+#   {name} and {version} by default; state_name/state_version may override the
+#   templates. Set allow_exit_codes for read-only probes whose non-zero status
+#   still carries useful report data, such as tools that return 1 when updates
+#   are available.
+# - report_patterns: optional regex row extractors for custom output. Templates
+#   may reference named capture groups like {name}, {before}, {after}, and {note}.
+#   status supports: updated, refreshed, passed/pass, unchanged, skipped,
+#   failed, blocked, info.
+#
+# Example 1: plain PATH-visible updater
+# [updaters.tasks.mytool]
+# label = "MyTool"
+# os = ["linux", "macos", "windows"]
+# detect_mode = "any_present"
+# detect = ["mytool"]
+# detect_all = []
+# detect_all_windows = []
+# skip_if_any = []
+# skip_if_any_windows = []
+# depends_on = []
+# after = []
+# requires_selected_any = []
+# depends_on_selected = false
+# depends_on_selected_exclude = []
+# command = "mytool"
+# args = ["self-update"]
+# mode = "direct"
+# enabled = true
+# requires_elevation = false
+# needs_sudo_session = false
+# interactive = false
+# external_window = false
+# shell = false
+# policy_key = "system_update"
+# category = "custom"
+# plain_header = "MyTool Update"
+# plain_start = "Running MyTool update..."
+# success_details = ["Update completed.", "update: completed via {mode}"]
+# external_manager_skip = false
+#
+# [[updaters.tasks.mytool.pre_commands]]
+# program = "mytool"
+# args = ["refresh-index"]
+#
+# [[updaters.tasks.mytool.report_commands]]
+# program = "mytool"
+# args = ["list", "--installed"]
+#
+# [[updaters.tasks.mytool.report_commands]]
+# program = "mytool"
+# args = ["list", "--installed"]
+# when = "before_after"
+# allow_exit_codes = [1]
+# state_pattern = '^(?P<name>\S+)\s+(?P<version>\S+)$'
+# state_section_key = "mytool_state"
+# state_section_title = "MyTool State Results"
+# state_include_unchanged = true
+#
+# [[updaters.tasks.mytool.report_patterns]]
+# pattern = '^(?P<name>\S+) (?P<before>\S+) -> (?P<after>\S+)$'
+# section_key = "mytool_results"
+# section_title = "MyTool Results"
+# status = "updated"
+# name = "{name}"
+# before = "{before}"
+# after = "{after}"
+# note = "from {before} to {after}"
+#
+# [[updaters.tasks.mytool.report_scoped_deltas]]
+# scope_pattern = '^Modified (?P<scope>\S+) environment$'
+# before_pattern = '^- (?P<name>\S+)==(?P<version>\S+)$'
+# after_pattern = '^\+ (?P<name>\S+)==(?P<version>\S+)$'
+# section_key = "mytool_dependencies"
+# section_title = "MyTool Dependency Results"
+# row_name = "{scope} / {name}"
+# scope_section_key = "mytool_state"
+# scope_section_title = "MyTool State Results"
+# scope_row_name = "{scope}"
+#
+# Example 2: direct updater with a fallback command candidate
+# [updaters.tasks.mytool-local]
+# label = "MyTool Local"
+# os = ["linux", "macos", "windows"]
+# detect_mode = "command_available"
+# command = "mytool"
+# args = ["self-update"]
+# mode = "direct"
+# enabled = true
+# requires_elevation = false
+# needs_sudo_session = false
+# interactive = false
+# external_window = false
+# shell = false
+# policy_key = "system_update"
+# category = "custom"
+#
+# [[updaters.tasks.mytool-local.command_candidates]]
+# program = "npx"
+# args = ["--no-install", "mytool", "self-update"]
+# probe_args = ["--no-install", "mytool", "--help"]
+# mode = "npx"
+#
+# Example 3: Linux package-manager wrapper that needs sudo
+# [updaters.tasks.pkgcache]
+# label = "Pkg Cache Refresh"
+# os = ["linux"]
+# detect = ["pkgcache"]
+# depends_on = ["system"]
+# command = "pkgcache"
+# args = ["refresh"]
+# enabled = true
+# requires_elevation = true
+# needs_sudo_session = true
+# interactive = false
+# external_window = false
+# shell = false
+# policy_key = "system_update"
+# category = "custom"
+#
+# Example 4: shell-driven interactive command
+# [updaters.tasks.notes]
+# label = "Notes Sync"
+# os = ["linux", "macos"]
+# detect = ["bash"]
+# depends_on = []
+# command = "bash"
+# args = ["-lc", "notes-sync --interactive"]
+# enabled = true
+# requires_elevation = false
+# needs_sudo_session = false
+# interactive = true
+# external_window = false
+# shell = false
+# policy_key = "system_update"
+# category = "custom"
+
+[completions]
+# User-managed completion tools are merged additively with the repo catalog.
+# You can add your own entries here and you can disable a repo-managed entry
+# without editing the repo itself. Matching is by (provider, name).
+#
+# Supported providers: path, npm, pipx, uv, go
+#
+# Authoring loop for beginners:
+# 1. Add one [[completions.tools]] entry.
+# 2. Run `update-all config validate --strict`.
+# 3. Run `update-all completions sync --providers path --apply --shell zsh`
+#    (or swap `path` for the provider you configured).
+
+# Example 1: PATH-visible tool such as `privatebin`
+# [[completions.tools]]
+# name = "privatebin"
+# provider = "path"
+# enabled = true
+# managed_required = true  # Optional: report missing/unsupported generators as failures.
+
+# Example 2: provider-owned tool
+# [[completions.tools]]
+# name = "markitdown"
+# provider = "pipx"
+# enabled = true
+
+# Example 3: disable a repo-managed tool on your machine
+# [[completions.tools]]
+# name = "pnpm"
+# provider = "path"
+# enabled = false

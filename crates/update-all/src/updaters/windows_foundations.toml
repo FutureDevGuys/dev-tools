@@ -1,0 +1,39 @@
+[[foundations]]
+id = "scoop"
+probe = "scoop"
+present_note = "already installed"
+
+[foundations.missing_command]
+program = "powershell"
+args = [
+  "-NoProfile",
+  "-Command",
+  "Write-Error 'Scoop is missing. update-all will not execute a mutable remote installer; preinstall a reviewed version-and-digest-pinned artifact and retry.'; exit 1",
+]
+after = "blocked"
+
+[[foundations]]
+id = "powershell"
+probe = "pwsh"
+requires_probe = ["scoop"]
+
+[foundations.missing_command]
+program = "scoop"
+args = ["install", "pwsh"]
+after = "installed"
+
+[foundations.present_command]
+program = "scoop"
+args = ["update", "pwsh"]
+after = "updated"
+
+[[foundations]]
+id = "winget"
+probe = "winget"
+requires_probe = ["scoop"]
+present_note = "handled by normal update tasks"
+
+[foundations.missing_command]
+program = "scoop"
+args = ["install", "winget"]
+after = "installed"

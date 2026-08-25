@@ -1,0 +1,16 @@
+# Development and validation
+
+Rust validation uses formatting, Clippy with warnings denied, workspace tests, and the product integration tests. Python validation uses an isolated environment, pytest, and package installation from the built artifact. Release validation additionally audits source and Git objects, dependencies and licenses, fixtures, metadata, documentation, archives, signatures, links, and platform claims.
+
+No release or platform support claim is made from compilation or unit tests alone when a native runtime acceptance gate is documented.
+
+The local validation surface is:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo deny check
+python -m pytest sync-configs/tests
+python sync-configs/scripts/build_zipapp.py
+```

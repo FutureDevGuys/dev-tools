@@ -1,0 +1,616 @@
+[[tasks]]
+id = "npm"
+label = "NPM"
+os = ["linux", "macos", "windows"]
+detect_any = ["npm"]
+depends_on = []
+enabled_by_default = true
+category = "language"
+kind = "managed"
+executor = "npm"
+
+
+
+
+[[tasks]]
+id = "pipx"
+label = "Pipx"
+os = ["linux", "macos", "windows"]
+detect_any = ["pipx"]
+depends_on = []
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "pipx"
+args = ["upgrade-all"]
+policy_key = "pipx_upgrade"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_commands]]
+program = "pipx"
+args = ["list"]
+when = "before_after"
+state_pattern = '^\s*package\s+(?P<name>\S+)\s+(?P<version>[^,\s]+),\s+installed using Python\s+.*$'
+state_section_key = "pipx_packages"
+state_section_title = "Pipx Package Results"
+state_include_unchanged = true
+
+[[tasks.report_patterns]]
+pattern = '^\s*upgrading\s+shared\s+libraries\.\.\.\s*$'
+section_key = "pipx_packages"
+section_title = "Pipx Package Results"
+status = "refreshed"
+name = "pipx shared libraries"
+before = "-"
+after = "-"
+note = "pipx refreshed shared libraries"
+
+[[tasks.report_patterns]]
+pattern = '^\s*upgrading\s+(?P<name>\S+)(?:\s+from\s+\S+\s+to\s+\S+|\.\.\.)\s*$'
+section_key = "pipx_packages"
+section_title = "Pipx Package Results"
+status = "refreshed"
+name = "{name}"
+note = "pipx refreshed app"
+
+[[tasks]]
+id = "winget-user"
+label = "Winget (User)"
+os = ["windows"]
+detect_any = ["winget"]
+depends_on = []
+include_with = ["winget"]
+enabled_by_default = true
+category = "system"
+order_rank = 3
+report_parser = "winget"
+kind = "command"
+program = "winget"
+args = [
+  "upgrade",
+  "--all",
+  "--scope",
+  "user",
+  "--accept-package-agreements",
+  "--accept-source-agreements",
+  "--silent",
+]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = true
+external_window = false
+shell = false
+
+[[tasks]]
+id = "winget-machine"
+label = "Winget (Machine)"
+os = ["windows"]
+detect_any = ["winget"]
+depends_on = ["winget-user"]
+include_with = ["winget"]
+enabled_by_default = true
+category = "system"
+order_rank = 4
+report_parser = "winget"
+kind = "command"
+program = "winget"
+args = [
+  "upgrade",
+  "--all",
+  "--scope",
+  "machine",
+  "--accept-package-agreements",
+  "--accept-source-agreements",
+  "--silent",
+]
+policy_key = "system_update"
+requires_elevation = true
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks]]
+id = "scoop-self"
+label = "Scoop Self"
+os = ["windows"]
+detect_any = ["scoop"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+order_rank = 1
+kind = "command"
+program = "scoop"
+args = ["update"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = true
+external_window = false
+shell = false
+
+[[tasks]]
+id = "scoop-all"
+label = "Scoop"
+os = ["windows"]
+detect_any = ["scoop"]
+depends_on = ["scoop-self"]
+enabled_by_default = true
+category = "system"
+order_rank = 2
+report_parser = "scoop"
+kind = "command"
+program = "scoop"
+args = ["update", "*"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks]]
+id = "choco"
+label = "Chocolatey"
+os = ["windows"]
+detect_any = ["choco"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+order_rank = 5
+kind = "command"
+program = "choco"
+args = ["upgrade", "all", "-y", "--no-progress"]
+policy_key = "system_update"
+requires_elevation = true
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^\s*-\s+(?P<name>[A-Za-z0-9_.+@-]+)\s+v?(?P<after>[0-9][^\s]*)'
+section_key = "choco_packages"
+section_title = "Chocolatey Package Results"
+status = "updated"
+name = "{name}"
+before = "-"
+after = "{after}"
+
+[[tasks.report_patterns]]
+pattern = '^(?P<name>[A-Za-z0-9_.+@-]+)\s+v?(?P<after>[0-9][^\s]*) is the latest version available'
+section_key = "choco_packages"
+section_title = "Chocolatey Package Results"
+status = "unchanged"
+name = "{name}"
+before = "{after}"
+after = "{after}"
+note = "already latest"
+
+[[tasks]]
+id = "uv"
+label = "UV"
+os = ["linux", "macos", "windows"]
+detect_any = ["uv"]
+skip_if_any_windows = ["winget", "scoop", "choco"]
+depends_on = []
+enabled_by_default = true
+category = "language"
+report_parser = "version_lines"
+kind = "command"
+program = "uv"
+args = ["self", "update"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+external_manager_skip = true
+
+[[tasks]]
+id = "rustup"
+label = "Rustup"
+os = ["linux", "macos", "windows"]
+detect_any = ["rustup"]
+depends_on = []
+include_with = ["rust"]
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "rustup"
+args = ["update"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?P<name>\S+)\s+updated - (?P<after>rustc\s+\S+)(?:\s+\([^)]*\))?\s+\(from (?P<before>rustc\s+\S+)(?:\s+\([^)]*\))?\)\s*$'
+section_key = "rustup_channels"
+section_title = "Rustup Channel Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?P<name>\S+)\s+unchanged - (?P<version>.+?)\s*$'
+section_key = "rustup_channels"
+section_title = "Rustup Channel Results"
+status = "unchanged"
+name = "{name}"
+before = "{version}"
+after = "{version}"
+note = "unchanged"
+
+[[tasks]]
+id = "uv-tools"
+label = "UV Tools"
+os = ["linux", "macos", "windows"]
+detect_any = ["uv"]
+depends_on = []
+after = ["uv"]
+include_with = ["uv"]
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "uv"
+args = ["tool", "upgrade", "--all"]
+policy_key = "tool_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_commands]]
+program = "uv"
+args = ["tool", "list"]
+when = "before_after"
+state_pattern = '^(?P<name>\S+)\s+v(?P<version>\S+)\s*$'
+state_section_key = "uv_tools"
+state_section_title = "UV Tool Results"
+state_include_unchanged = true
+
+[[tasks.report_scoped_deltas]]
+scope_pattern = '^Modified (?P<scope>\S+) environment$'
+before_pattern = '^\s*-\s+(?P<name>[A-Za-z0-9_.-]+)==(?P<version>\S+)\s*$'
+after_pattern = '^\s*\+\s+(?P<name>[A-Za-z0-9_.-]+)==(?P<version>\S+)\s*$'
+section_key = "uv_tool_dependencies"
+section_title = "UV Tool Dependency Results"
+row_name = "{scope} / {name}"
+scope_section_key = "uv_tools"
+scope_section_title = "UV Tool Results"
+scope_row_name = "{scope}"
+
+
+
+
+
+
+
+
+[[tasks]]
+id = "cargo"
+label = "Cargo"
+os = ["linux", "macos", "windows"]
+detect_any = ["cargo-install-update"]
+depends_on = ["rustup"]
+include_with = ["rust"]
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "cargo-install-update"
+args = ["install-update", "-a"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?P<name>\S+)\s+(?P<before>\S+)\s+(?P<after>\S+)\s+Yes\s*$'
+section_key = "cargo_packages"
+section_title = "Cargo Package Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?P<name>\S+)\s+(?P<before>\S+)\s+\S+\s+\((?P<note>[^)]*\bavailable\b[^)]*)\)\s+No\s*$'
+section_key = "cargo_packages"
+section_title = "Cargo Package Results"
+status = "unchanged"
+name = "{name}"
+before = "{before}"
+note = "{note}"
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?P<name>\S+)\s+(?P<before>\S+)\s+(?P<after>\S+)\s+No\s*$'
+section_key = "cargo_packages"
+section_title = "Cargo Package Results"
+status = "unchanged"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks]]
+id = "go"
+label = "Go Tools"
+os = ["linux", "macos", "windows"]
+detect_any = ["gup"]
+detect_all = ["go"]
+depends_on = []
+enabled_by_default = true
+category = "language"
+kind = "command"
+program = "gup"
+args = ["update"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_commands]]
+program = "gup"
+args = ["list"]
+
+[[tasks.report_patterns]]
+pattern = '^\s*\[\d+/\d+\]\s+(?P<name>\S+)\s+\((?P<before>\S+)\s+(?:to|->)\s+(?P<after>\S+)\)\s*$'
+section_key = "go_tools"
+section_title = "Go Tool Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?P<alias>[^\s:]+):\s+(?P<name>\S+)@(?P<version>v?[0-9][^\s"/]*)\s*$'
+section_key = "go_tools"
+section_title = "Go Tool Results"
+status = "unchanged"
+name = "{name}"
+before = "{version}"
+after = "{version}"
+note = "already up-to-date"
+
+[[tasks.report_patterns]]
+pattern = "^gup:ERROR:\\s+\\[\\d+/\\d+\\]\\s+(?P<tool>[^:]+):\\s+can't check\\s+(?P<name>[^:]+):"
+section_key = "go_tools"
+section_title = "Go Tool Results"
+status = "failed"
+name = "{name}"
+before = "-"
+after = "-"
+note = "{tool}: check failed"
+
+[[tasks]]
+id = "yay"
+label = "Yay"
+os = ["linux"]
+detect_any = ["yay"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+report_parser = "yay"
+kind = "command"
+program = "yay"
+args = ["-Syu", "--noconfirm"]
+policy_key = "aur_update"
+requires_elevation = false
+needs_sudo_session = true
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^pacman database lock (?P<path>/\S*db\.lck) is present$'
+section_key = "package_recovery"
+section_title = "Package Recovery Actions"
+status = "blocked"
+name = "{path}"
+before = "-"
+after = "-"
+note = "pacman database lock is present; verify no package manager is running before clearing stale locks"
+
+[[tasks.pre_commands]]
+program = "/bin/sh"
+args = [
+  "-c",
+  'lock_path="${UPDATE_ALL_PACMAN_DB_LOCK:-/var/lib/pacman/db.lck}"; if [ -e "$lock_path" ]; then echo "pacman database lock $lock_path is present" >&2; exit 75; fi',
+]
+
+[[tasks]]
+id = "arch-update-services"
+label = "Svc Restart"
+os = ["linux"]
+detect_any = ["arch-update"]
+depends_on = ["yay"]
+requires_selected_any = ["yay"]
+enabled_by_default = true
+category = "system"
+report_parser = "arch_update_services"
+kind = "command"
+program = "arch-update"
+args = ["-s"]
+policy_key = "system_update"
+requires_elevation = true
+needs_sudo_session = true
+interactive = true
+external_window = false
+shell = false
+
+[[tasks]]
+id = "pacman"
+label = "Pacman"
+os = ["linux"]
+detect_any = ["pacman"]
+skip_if_any = ["yay"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+kind = "command"
+program = "pacman"
+args = ["-Syu", "--noconfirm"]
+policy_key = "system_update"
+requires_elevation = true
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^(?:upgrading|installing) (?P<name>[A-Za-z0-9_.+@-]+) \((?P<before>[^)\s]+) -> (?P<after>[^)\s]+)\)'
+section_key = "pacman_packages"
+section_title = "Pacman Package Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks]]
+id = "apt"
+label = "APT"
+os = ["linux"]
+detect_any = ["apt-get"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+kind = "command"
+program = "apt-get"
+args = ["-y", "dist-upgrade"]
+policy_key = "system_update"
+requires_elevation = true
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^Unpacking (?P<name>[A-Za-z0-9_.:+-]+) \((?P<after>[^)]+)\) over \((?P<before>[^)]+)\)'
+section_key = "apt_packages"
+section_title = "APT Package Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks.report_patterns]]
+pattern = '^(?P<name>[A-Za-z0-9_.:+-]+) is already the newest version \((?P<after>[^)]+)\)'
+section_key = "apt_packages"
+section_title = "APT Package Results"
+status = "unchanged"
+name = "{name}"
+before = "{after}"
+after = "{after}"
+note = "already newest"
+
+[[tasks.pre_commands]]
+program = "apt-get"
+args = ["update"]
+
+[[tasks]]
+id = "dnf"
+label = "DNF"
+os = ["linux"]
+detect_any = ["dnf"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+kind = "command"
+program = "dnf"
+args = ["upgrade", "-y", "--refresh"]
+policy_key = "system_update"
+requires_elevation = true
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^\s*(?:Upgrading|Upgraded|Installing|Installed)\s+(?P<name>[A-Za-z0-9_.+:-]+)\s+(?:[A-Za-z0-9_.+:-]+\s+)?(?P<after>[0-9][^\s]+)'
+section_key = "dnf_packages"
+section_title = "DNF Package Results"
+status = "updated"
+name = "{name}"
+before = "-"
+after = "{after}"
+
+[[tasks]]
+id = "brew-formula"
+label = "Homebrew"
+os = ["macos"]
+detect_any = ["brew"]
+depends_on = []
+enabled_by_default = true
+category = "system"
+kind = "command"
+program = "brew"
+args = ["upgrade"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^(?P<name>[A-Za-z0-9_.+@-]+)\s+(?P<before>[0-9][^\s]*)\s+->\s+(?P<after>[0-9][^\s]*)$'
+section_key = "brew_packages"
+section_title = "Homebrew Package Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks.report_patterns]]
+pattern = '^==> Upgrading (?P<name>[A-Za-z0-9_.+@-]+)\s+(?P<before>[0-9][^\s]*)\s+->\s+(?P<after>[0-9][^\s]*)'
+section_key = "brew_packages"
+section_title = "Homebrew Package Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
+
+[[tasks.pre_commands]]
+program = "brew"
+args = ["update"]
+
+[[tasks]]
+id = "brew-cask"
+label = "Homebrew Cask"
+os = ["macos"]
+detect_any = ["brew"]
+depends_on = ["brew-formula"]
+enabled_by_default = true
+category = "system"
+kind = "command"
+program = "brew"
+args = ["upgrade", "--cask"]
+policy_key = "system_update"
+requires_elevation = false
+needs_sudo_session = false
+interactive = false
+external_window = false
+shell = false
+
+[[tasks.report_patterns]]
+pattern = '^==> Upgrading (?P<name>[A-Za-z0-9_.+@-]+) from (?P<before>[^\s]+) to (?P<after>[^\s]+)'
+section_key = "brew_packages"
+section_title = "Homebrew Package Results"
+status = "updated"
+name = "{name}"
+before = "{before}"
+after = "{after}"
