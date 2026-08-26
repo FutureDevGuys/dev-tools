@@ -97,6 +97,18 @@ def release_environment(commit: str, timestamp: str, output: Path) -> dict[str, 
     return environment
 
 
+def build_sync_configs(env: dict[str, str]) -> None:
+    """Build the zipapp without contaminating the release summary stream."""
+    subprocess.run(
+        [sys.executable, str(ROOT / "sync-configs/scripts/build_zipapp.py")],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -158,12 +170,7 @@ def main() -> int:
         env=env,
         check=True,
     )
-    subprocess.run(
-        [sys.executable, str(ROOT / "sync-configs/scripts/build_zipapp.py")],
-        cwd=ROOT,
-        env=env,
-        check=True,
-    )
+    build_sync_configs(env)
     suffix = ".exe" if target.startswith("windows-") else ""
     artifacts = {
         "update-all": cargo_target / "release" / f"update-all{suffix}",

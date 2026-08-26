@@ -42,6 +42,20 @@ def test_release_builder_remaps_checkout_output_and_home_paths(tmp_path: Path) -
     assert "RUSTFLAGS" not in environment
 
 
+def test_release_builder_captures_zipapp_stdout(monkeypatch) -> None:
+    module = load_release_set_module()
+    observed = {}
+
+    def fake_run(*args, **kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    module.build_sync_configs({"TEST": "1"})
+    assert observed["stdout"] is subprocess.PIPE
+    assert observed["text"] is True
+    assert observed["check"] is True
+
+
 def write_key(path: Path, key: Ed25519PrivateKey) -> None:
     path.write_text(key.private_bytes_raw().hex(), encoding="ascii")
     path.chmod(0o600)
