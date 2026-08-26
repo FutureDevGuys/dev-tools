@@ -73,6 +73,30 @@ def target_id() -> str:
     return f"{os_name}-{arch}"
 
 
+def release_environment(commit: str, timestamp: str, output: Path) -> dict[str, str]:
+    """Return a deterministic build environment without host-local path metadata."""
+    remaps = (
+        (ROOT.resolve(), Path("/dev-tools/source")),
+        (output.resolve(), Path("/dev-tools/output")),
+        (Path.home().resolve(), Path("/dev-tools/home")),
+    )
+    encoded_rustflags = "\x1f".join(
+        f"--remap-path-prefix={source}={destination}"
+        for source, destination in remaps
+    )
+    environment = dict(os.environ)
+    environment.pop("RUSTFLAGS", None)
+    environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    environment.update({
+        "CARGO_ENCODED_RUSTFLAGS": encoded_rustflags,
+        "DEV_TOOLS_GIT_COMMIT": commit,
+        "DEV_TOOLS_GIT_DIRTY": "0",
+        "SOURCE_DATE_EPOCH": timestamp,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    return environment
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -110,15 +134,13 @@ def main() -> int:
         raise SystemExit("trusted root public key must be 32-byte hexadecimal") from exc
     build_root = output / "build"
     cargo_target = build_root / "cargo-target"
-    env = {
-        **os.environ,
-        "CARGO_TARGET_DIR": str(cargo_target),
-        "DEV_TOOLS_GIT_COMMIT": commit,
-        "DEV_TOOLS_GIT_DIRTY": "0",
-        "DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY": trusted_root,
-        "SOURCE_DATE_EPOCH": timestamp,
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    env = release_environment(commit, timestamp, output)
+    env.update(
+        {
+            "CARGO_TARGET_DIR": str(cargo_target),
+            "DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY": trusted_root,
+        }
+    )
     subprocess.run(
         [
             "cargo",

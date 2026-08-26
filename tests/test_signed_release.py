@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -20,6 +21,25 @@ from release_signing import (  # noqa: E402
     read_public_key,
     verify_root_document,
 )
+
+
+def load_release_set_module():
+    path = ROOT / "scripts/build-release-set.py"
+    spec = importlib.util.spec_from_file_location("build_release_set", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_release_builder_remaps_checkout_output_and_home_paths(tmp_path: Path) -> None:
+    module = load_release_set_module()
+    environment = module.release_environment("a" * 40, "1", tmp_path)
+    flags = environment["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+    assert f"--remap-path-prefix={ROOT.resolve()}=/dev-tools/source" in flags
+    assert f"--remap-path-prefix={tmp_path.resolve()}=/dev-tools/output" in flags
+    assert f"--remap-path-prefix={Path.home().resolve()}=/dev-tools/home" in flags
+    assert "RUSTFLAGS" not in environment
 
 
 def write_key(path: Path, key: Ed25519PrivateKey) -> None:

@@ -15,4 +15,4 @@ python -m pytest sync-configs/tests
 python sync-configs/scripts/build_zipapp.py
 ```
 
-Run the authenticated release-set recipe only from the exact clean revision intended for publication. The recipe embeds the full source commit and a clean-tree marker in every Rust artifact; release acceptance compares those fields and the installed digest with the signed artifact before support is claimed.
+Run the authenticated release-set recipe only from the exact clean revision intended for publication. The recipe embeds the full source commit and a clean-tree marker in every Rust artifact, remaps checkout and user paths out of compiler metadata, and produces no private-key material; release acceptance compares the metadata and installed digest with the signed artifact before support is claimed.

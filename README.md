@@ -15,11 +15,22 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 
 ## Installation
 
-Verified release artifacts are the supported installation path. Every product uses its own nested release tag, such as `update-all/v1.2.3`. The Rust products require no Git, GitHub CLI, Python, curl, or wget on the target host. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer. Release publication remains gated while the signing and Linux acceptance workflow is established; until the first verified release exists, build from this private staging checkout with the development commands below.
+Verified release artifacts are the supported installation path. Every product uses its own nested release tag, such as `update-all/v1.2.3`. A one-time Update All seed establishes the embedded trust root; authenticated native HTTPS then resolves and installs current stable products without Git, GitHub CLI, curl, wget, authentication, or a source checkout. The seed is not desired-version state and never needs to be refreshed.
+
+On Linux x86-64, download `update-all-0.1.0-linux-x86_64` from the [`update-all/v0.1.0` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.0), make it executable, and run:
+
+```sh
+./update-all-0.1.0-linux-x86_64 self install
+~/.local/bin/update-all product install dev-cache
+~/.local/bin/update-all product install sync-configs
+~/.local/bin/update-all product install skills-sync
+```
+
+After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer.
 
 | Platform | Status | Notes |
 |---|---|---|
-| Linux | Staging | Source validation is supported; signed binary releases are not published yet. |
+| Linux x86-64 | Supported | Signed artifacts, native updater checks, installation, rollback, and fresh-shell runtime acceptance. |
 | Windows | Acceptance pending | Artifacts may be built, but runtime support is not claimed until native Windows acceptance passes. |
 | WSL | Acceptance pending | Runtime support is not claimed until the WSL acceptance harness passes. |
 | macOS | Unclaimed | Some updater definitions are portable, but product runtime acceptance is not complete. |
