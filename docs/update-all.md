@@ -2,7 +2,7 @@
 
 `update-all` discovers supported update authorities, validates one deterministic plan, and records runtime events in an append-only `events.jsonl` journal before delivering them to the dashboard. Public built-ins cover broadly useful system and language managers. Private or machine-local behavior belongs in external catalogs.
 
-The supported task selectors are `--only` and `--exclude`. Select a task by its exact qualified ID, such as `builtin/npm`, `syscfg/codex-web-gpt`, or `local/workspace-index`, or select a functional category. Task presentation is grouped by function while logs and results retain each child task identity.
+The supported task selectors are `--only` and `--exclude`. Select a task by its exact qualified ID, such as `builtin/npm`, `managed/desktop-refresh`, or `local/workspace-index`, or select a functional category. Task presentation is grouped by function while logs and results retain each child task identity.
 
 Prompt request, answer, and cancellation events are explicit journal records; answer text is never persisted. If the frontend disconnects, the engine records `frontend_detached` and continues with complete plain output. If the authoritative journal cannot be written, the engine cancels pending and running work and exits unsuccessfully.
 
