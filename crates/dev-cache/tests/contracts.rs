@@ -934,6 +934,39 @@ fn activation_refreshes_an_owned_alias_after_binary_upgrade() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn activation_repairs_owned_stable_symlinks_after_managed_release_switch() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let bin = temp.path().join("bin");
+    let product = temp.path().join("product");
+    let versions = product.join("versions");
+    let intercept = temp.path().join("intercepts");
+    fs::create_dir_all(&bin).expect("bin directory");
+    fs::create_dir_all(&versions).expect("versions directory");
+    let first = versions.join("first");
+    let second = versions.join("second");
+    fs::copy(env!("CARGO_BIN_EXE_dev-cache"), &first).expect("first release");
+    fs::copy(env!("CARGO_BIN_EXE_dev-cache"), &second).expect("second release");
+    let mut second_bytes = fs::read(&second).expect("read second release");
+    second_bytes.extend_from_slice(b"managed-release-switch");
+    fs::write(&second, second_bytes).expect("different second release");
+    symlink(&first, product.join("current")).expect("first current link");
+    symlink(product.join("current"), bin.join("dev-cache")).expect("public command link");
+
+    install::activate(&bin, &intercept).expect("initial activation");
+    fs::remove_file(product.join("current")).expect("replace current link");
+    symlink(&second, product.join("current")).expect("second current link");
+
+    let repaired =
+        install::activate(&bin, &intercept).expect("repair receipts after managed release switch");
+    assert!(repaired.changed);
+    let repeated = install::activate(&bin, &intercept).expect("repeat activation");
+    assert!(!repeated.changed);
+}
+
 #[test]
 fn central_rust_tool_receipt_supports_safe_adoption_and_uninstall() {
     fn prepare_install(root: &Path) -> (PathBuf, PathBuf) {

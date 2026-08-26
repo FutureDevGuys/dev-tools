@@ -463,7 +463,10 @@ pub fn activate(bin_dir: &Path, intercept_dir: &Path) -> Result<ActivationResult
         .collect();
     let previously_owned = owned_intercept_targets(intercept_dir)?;
     for candidate in targets.iter().chain(previously_owned.iter()) {
-        if candidate.exists() && !owned_target(candidate)? {
+        if candidate.exists()
+            && !owned_target(candidate)?
+            && !repairable_owned_intercept(&installed, candidate)?
+        {
             bail!(
                 "refusing to overwrite unknown command intercept: {}",
                 candidate.display()
@@ -656,6 +659,23 @@ fn owned_target(target: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn repairable_owned_intercept(installed: &Path, target: &Path) -> Result<bool> {
+    let marker = ownership_path(target);
+    if !marker.is_file() {
+        return Ok(false);
+    }
+    let record: OwnershipRecord = serde_json::from_slice(&fs::read(marker)?)?;
+    if record.schema_version != 1
+        || record.kind != intercept_kind(target)
+        || record.target != target
+    {
+        return Ok(false);
+    }
+    let (installed_digest, installed_size) = hash_file(installed)?;
+    let (target_digest, target_size) = hash_file(target)?;
+    Ok(installed_digest == target_digest && installed_size == target_size)
 }
 
 fn activate_alias(installed: &Path, target: &Path) -> Result<bool> {
