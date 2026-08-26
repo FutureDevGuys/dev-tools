@@ -112,6 +112,8 @@ impl RootHandle {
         let platform_root = canonical.join("v2").join("domains").join(&domain_id);
         for relative in [
             "control/leases",
+            "control/resources",
+            "control/gc-journal",
             "workspaces",
             "cache",
             "artifacts/blake3",

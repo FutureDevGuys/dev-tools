@@ -158,7 +158,7 @@ fn verify_object(path: &Path, record: &ArtifactRecord) -> Result<()> {
     Ok(())
 }
 
-fn validate_digest(digest: &str) -> Result<()> {
+pub(crate) fn validate_digest(digest: &str) -> Result<()> {
     if digest.len() != 64
         || !digest
             .bytes()
@@ -169,12 +169,12 @@ fn validate_digest(digest: &str) -> Result<()> {
     Ok(())
 }
 
-fn object_path(root: &RootHandle, digest: &str) -> Result<PathBuf> {
+pub(crate) fn object_path(root: &RootHandle, digest: &str) -> Result<PathBuf> {
     validate_digest(digest)?;
     Ok(root.artifacts().join(&digest[..2]).join(digest))
 }
 
-fn metadata_path(root: &RootHandle, digest: &str) -> Result<PathBuf> {
+pub(crate) fn metadata_path(root: &RootHandle, digest: &str) -> Result<PathBuf> {
     validate_digest(digest)?;
     Ok(root
         .platform_root

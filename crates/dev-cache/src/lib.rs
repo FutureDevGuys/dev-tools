@@ -11,6 +11,7 @@ pub mod lease;
 pub mod migrate;
 pub mod provenance;
 pub mod repository;
+pub mod resources;
 pub mod root;
 pub mod util;
 

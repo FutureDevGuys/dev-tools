@@ -9,7 +9,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 | Product | Use it for |
 |---|---|
 | [`update-all`](docs/update-all.md) | Run supported package and tool updaters through one dependable plan and dashboard. |
-| [`dev-cache`](docs/dev-cache.md) | Route known disposable build caches to storage you select without moving source or deliverables. |
+| [`dev-cache`](docs/dev-cache.md) | Route and automatically maintain known disposable build caches on storage you select without moving source or deliverables. |
 | [`sync-configs`](docs/sync-configs.md) | Converge explicitly selected files, directories, and structured overlays from a trusted manifest. |
 | [`skills-sync`](docs/skills-sync.md) | Reconcile installed agent skills and their links from an explicit lock and provider selection. |
 

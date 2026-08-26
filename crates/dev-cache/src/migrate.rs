@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::Adapter;
 use crate::lease::RootLease;
 use crate::repository::Repository;
+use crate::resources;
 use crate::root::RootHandle;
 use crate::util::{hash_file, now_unix, write_json_atomic};
 
@@ -181,6 +182,7 @@ pub fn migrate_resource(
             .join(format!("{receipt_name}.json")),
         &serde_json::json!({"schema_version":1,"source":source,"destination":destination,"adapter":format!("{adapter:?}"),"resource":resource,"verified":true,"migrated_unix":now_unix()}),
     )?;
+    resources::register_migrated(root, adapter, resource, &destination)?;
     if remove_source && !source_moved {
         if source.is_dir() {
             remove_tree(&source)?;

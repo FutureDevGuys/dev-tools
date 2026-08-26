@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -20,6 +20,7 @@ use crate::lease::RootLease;
 use crate::migrate;
 use crate::provenance;
 use crate::repository::Repository;
+use crate::resources::{self, NativeTool};
 use crate::root::RootHandle;
 use crate::util::{directory_size, now_unix, write_json_atomic};
 
@@ -157,7 +158,7 @@ enum ConfigCommand {
 struct GcArgs {
     #[arg(long)]
     apply: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     automatic: bool,
     #[arg(long)]
     max_bytes: Option<u64>,
@@ -222,6 +223,7 @@ struct StatusReport {
     abstentions: Vec<String>,
     override_reasons: Vec<String>,
     provenance: Option<serde_json::Value>,
+    maintenance: Option<gc::MaintenanceStatus>,
 }
 
 struct AdapterStatusDetails {
@@ -597,6 +599,7 @@ fn status_report(config: &Config) -> Result<StatusReport> {
             abstentions: vec!["routing disabled".to_owned()],
             override_reasons: vec!["routing disabled".to_owned()],
             provenance: provenance::process_report(),
+            maintenance: None,
         });
     }
     let root = open_root(config)?;
@@ -629,9 +632,9 @@ fn status_report(config: &Config) -> Result<StatusReport> {
         enabled: true,
         configured_root: config.root.clone(),
         root_valid: true,
-        platform: Some(root.platform),
-        domain_id: Some(root.domain_id),
-        physical_root_id: Some(root.marker.root_id),
+        platform: Some(root.platform.clone()),
+        domain_id: Some(root.domain_id.clone()),
+        physical_root_id: Some(root.marker.root_id.clone()),
         worktree: repository.as_ref().map(|repo| repo.worktree.clone()),
         worktree_cache: repository.map(|repo| repo.cache_dir),
         routing_complete: activation.healthy(),
@@ -646,6 +649,7 @@ fn status_report(config: &Config) -> Result<StatusReport> {
         abstentions: details.abstentions,
         override_reasons: details.override_reasons,
         provenance: provenance::process_report(),
+        maintenance: Some(gc::maintenance_status(&root)?),
     })
 }
 
@@ -814,12 +818,31 @@ fn doctor(config: &Config, config_path: Option<&Path>, json: bool) -> Result<i32
     let mut checks = Vec::new();
     let config_ok = config.validate().is_ok();
     checks.push(serde_json::json!({"name":"config","ok":config_ok,"path":config_path}));
+    let mut maintenance_ok = true;
     let (root_check, root_ok) = if config.enabled {
         match open_root(config) {
-            Ok(root) => (
-                serde_json::json!({"name":"root","ok":true,"path":root.root}),
-                true,
-            ),
+            Ok(root) => {
+                let maintenance = gc::maintenance_status(&root)?;
+                maintenance_ok = maintenance.catalog_issues.is_empty()
+                    && maintenance.repository_issues.is_empty()
+                    && maintenance.trash_backlog == 0
+                    && maintenance.last_automatic.as_ref().is_none_or(|last| {
+                        last.get("error").is_none()
+                            && last
+                                .get("complete")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true)
+                    });
+                checks.push(serde_json::json!({
+                    "name":"maintenance",
+                    "ok":maintenance_ok,
+                    "status":maintenance,
+                }));
+                (
+                    serde_json::json!({"name":"root","ok":true,"path":root.root}),
+                    true,
+                )
+            }
             Err(error) => (
                 serde_json::json!({"name":"root","ok":false,"error":format!("{error:#}")}),
                 false,
@@ -860,11 +883,13 @@ fn doctor(config: &Config, config_path: Option<&Path>, json: bool) -> Result<i32
             "status":status,
         }),
     )?;
-    Ok(if config_ok && root_ok && activation_ok && status_ok {
-        0
-    } else {
-        1
-    })
+    Ok(
+        if config_ok && root_ok && activation_ok && status_ok && maintenance_ok {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 fn classify_activation(
@@ -1072,7 +1097,7 @@ fn path_command(
 }
 
 fn adapter_path(root: &RootHandle, adapter: Adapter, repo_path: Option<&Path>) -> Result<PathBuf> {
-    let repository = if matches!(adapter, Adapter::Temp) {
+    let repository = if matches!(adapter, Adapter::Cargo | Adapter::Temp) {
         Some(
             Repository::discover(repo_path.unwrap_or(&env::current_dir()?), root)?
                 .context("resolve workspace scope")?,
@@ -1081,9 +1106,18 @@ fn adapter_path(root: &RootHandle, adapter: Adapter, repo_path: Option<&Path>) -
         None
     };
     Ok(match adapter {
-        Adapter::Cargo => root
-            .shared()
-            .join("cargo/intermediate/{workspace-path-hash}"),
+        Adapter::Cargo => {
+            let workspace = repository.context("Cargo adapter requires workspace context")?;
+            root.shared()
+                .join("cargo/intermediate")
+                .join(
+                    workspace
+                        .cache_dir
+                        .file_name()
+                        .context("workspace cache path has no identity component")?,
+                )
+                .join("{workspace-path-hash}")
+        }
         Adapter::Temp => repository
             .context("temp adapter requires repository context")?
             .cache_dir
@@ -1107,10 +1141,15 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
     let root = open_root(config)?;
     let repository = Repository::discover(&env::current_dir()?, &root)?
         .context("resolve current workspace scope")?;
+    maybe_automatic_gc(&root, config, true);
     let lease = RootLease::shared(&root, &format!("exec:{:?}", args.adapter))?;
-    let mut environment = adapter_environment(&root, &repository, args.adapter)?;
+    let (mut environment, mut resource_ids) =
+        adapter_environment(&root, &repository, args.adapter)?;
     if args.adapter == Adapter::Cargo && config.sccache.enabled {
-        environment.extend(adapter_environment(&root, &repository, Adapter::Sccache)?);
+        let (sccache_environment, sccache_resources) =
+            adapter_environment(&root, &repository, Adapter::Sccache)?;
+        environment.extend(sccache_environment);
+        resource_ids.extend(sccache_resources);
         if let Some(size) = &config.sccache.cache_size {
             environment
                 .entry("SCCACHE_CACHE_SIZE".to_owned())
@@ -1136,8 +1175,9 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
         .status()
         .with_context(|| format!("run {}", Path::new(&resolved_program).display()))?;
     let code = status.code().unwrap_or(1);
+    resources::complete(&root, &resource_ids)?;
     drop(lease);
-    maybe_automatic_gc(&root, config);
+    maybe_automatic_gc(&root, config, false);
     Ok(code)
 }
 
@@ -1145,10 +1185,17 @@ fn adapter_environment(
     root: &RootHandle,
     repository: &Repository,
     adapter: Adapter,
-) -> Result<HashMap<String, String>> {
+) -> Result<(HashMap<String, String>, Vec<String>)> {
     let values = adapter_values(root, repository, adapter);
-    prepare_adapter_environment(root, adapter, &values)?;
-    Ok(values)
+    let resources = prepare_adapter_environment(
+        root,
+        repository,
+        adapter,
+        &values,
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )?;
+    Ok((values, resources))
 }
 
 fn adapter_values(
@@ -1174,15 +1221,26 @@ fn adapter_values(
 
 fn prepare_adapter_environment(
     root: &RootHandle,
+    repository: &Repository,
     adapter: Adapter,
     values: &HashMap<String, String>,
-) -> Result<()> {
+    native: &NativeTool,
+    hazards: &BTreeSet<String>,
+) -> Result<Vec<String>> {
     let routed_paths: Vec<PathBuf> = values
         .iter()
         .filter(|(name, _)| name.as_str() != provenance::ENV_NAME)
         .map(|(_, value)| PathBuf::from(value))
         .filter(|path| path.is_absolute())
         .collect();
+    repository.touch(root)?;
+    let mut native = native.clone();
+    for name in ["SCCACHE_SERVER_PORT", "SCCACHE_SERVER_UDS"] {
+        if let Some(value) = values.get(name) {
+            native.environment.insert(name.to_owned(), value.clone());
+        }
+    }
+    let resource_ids = resources::register_routed(root, adapter, values, &native, hazards)?;
     for path in &routed_paths {
         if path.to_string_lossy().contains("{workspace-path-hash}") {
             if let Some(parent) = path.parent() {
@@ -1192,24 +1250,7 @@ fn prepare_adapter_environment(
             fs::create_dir_all(path)?;
         }
     }
-    if adapter.is_shared() {
-        let shared = root.shared();
-        let mut owned_roots = Vec::new();
-        for path in routed_paths.iter().filter(|path| path.starts_with(&shared)) {
-            if let Ok(relative) = path.strip_prefix(&shared) {
-                if let Some(component) = relative.components().next() {
-                    owned_roots.push(shared.join(component.as_os_str()));
-                }
-            }
-        }
-        owned_roots.sort();
-        owned_roots.dedup();
-        for path in owned_roots {
-            fs::create_dir_all(&path)?;
-            gc::mark_shared_cache(&path, &format!("{adapter:?}"))?;
-        }
-    }
-    Ok(())
+    Ok(resource_ids)
 }
 
 fn gc_command(config: &Config, args: GcArgs, json: bool) -> Result<i32> {
@@ -1221,34 +1262,27 @@ fn gc_command(config: &Config, args: GcArgs, json: bool) -> Result<i32> {
         if !config.maintenance.automatic {
             return Ok(0);
         }
-        let marker = root.control().join("last-automatic-gc.json");
-        if let Ok(value) = fs::read(&marker).and_then(|bytes| {
-            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
-        }) {
-            if value["unix"].as_u64().is_some_and(|last| {
-                now_unix().saturating_sub(last) < config.maintenance.interval_hours * 3_600
-            }) {
-                return Ok(0);
+        let pressure = gc::pressure_needed(&root, &config.gc)?;
+        let Some(report) = run_automatic_gc(&root, config, pressure)? else {
+            if json {
+                print_value(
+                    true,
+                    &serde_json::json!({"complete":true,"deferred":"active routed command"}),
+                )?;
             }
-        }
-        let report = gc::collect(
-            &root,
-            &config.gc,
-            config.artifacts.stale_after_days,
-            &GcOverrides::default(),
-            true,
-        )?;
-        write_json_atomic(&marker, &serde_json::json!({"unix":now_unix()}))?;
+            return Ok(0);
+        };
         if json {
             print_value(true, &report)?;
         }
-        return Ok(0);
+        return Ok(if report.complete { 0 } else { 1 });
     }
     let overrides = GcOverrides {
         max_bytes: args.max_bytes,
         min_free_bytes: args.min_free_bytes,
         target_free_bytes: args.target_free_bytes,
         stale_after_days: args.stale_after_days,
+        max_actions: None,
     };
     let report = gc::collect(
         &root,
@@ -1257,8 +1291,9 @@ fn gc_command(config: &Config, args: GcArgs, json: bool) -> Result<i32> {
         &overrides,
         args.apply,
     )?;
+    let complete = report.complete;
     print_value(json, &report)?;
-    Ok(0)
+    Ok(if args.apply && !complete { 1 } else { 0 })
 }
 
 fn artifact_command(config: &Config, command: ArtifactCommand, json: bool) -> Result<i32> {
@@ -1360,6 +1395,7 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     let root = open_root(&config)?;
     let workspace =
         Repository::discover(&current_dir, &root)?.context("resolve current workspace scope")?;
+    maybe_automatic_gc(&root, &config, true);
     let lease = RootLease::shared(&root, &format!("intercept:{command}"))?;
     let context = AdapterContext {
         worktree_cache: workspace.cache_dir.clone(),
@@ -1374,7 +1410,10 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
         &mut environment,
         &format!("{adapter:?}").to_lowercase(),
     );
-    prepare_adapter_environment(&root, adapter, &environment)?;
+    let native = native_tool(&real, command, &args, adapter);
+    let hazards = adapter_hazards(adapter, &args, &current_dir);
+    let resource_ids =
+        prepare_adapter_environment(&root, &workspace, adapter, &environment, &native, &hazards)?;
     let routed: Vec<(String, String)> = environment.into_iter().collect();
     let code = if compiler_intercept {
         let ccache = cargo_intercept::resolve_real_command("ccache", &current_exe)?;
@@ -1385,8 +1424,9 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     } else {
         cargo_intercept::delegate(&real, &args, &routed, None)?
     };
+    resources::complete(&root, &resource_ids)?;
     drop(lease);
-    maybe_automatic_gc(&root, &config);
+    maybe_automatic_gc(&root, &config, false);
     Ok(code)
 }
 
@@ -1451,7 +1491,11 @@ fn apply_persistent_overrides(
         Adapter::Npm | Adapter::Pnpm => {
             for path in ancestor_config_files(current_dir, ".npmrc")
                 .into_iter()
+                .chain(ancestor_config_files(current_dir, "pnpm-workspace.yaml"))
                 .chain(std::iter::once(crate::config::home_dir().join(".npmrc")))
+                .chain(std::iter::once(
+                    crate::config::home_dir().join(".config/pnpm/rc"),
+                ))
             {
                 let Ok(contents) = fs::read_to_string(path) else {
                     continue;
@@ -1474,6 +1518,8 @@ fn apply_persistent_overrides(
                 env::var_os("PIP_CONFIG_FILE").map(PathBuf::from),
                 Some(crate::config::home_dir().join(".config/pip/pip.conf")),
                 Some(crate::config::home_dir().join(".pip/pip.conf")),
+                env::var_os("VIRTUAL_ENV").map(|path| PathBuf::from(path).join("pip.conf")),
+                env::var_os("APPDATA").map(|path| PathBuf::from(path).join("pip/pip.ini")),
             ];
             if candidates.into_iter().flatten().any(|path| {
                 fs::read_to_string(path)
@@ -1524,10 +1570,13 @@ fn apply_persistent_overrides(
                 }
             }
         }
-        Adapter::Sccache if sccache_remote_or_disabled() => {
+        Adapter::Sccache if sccache_remote_or_disabled() || sccache_config_is_ambiguous() => {
             environment.remove("SCCACHE_DIR");
         }
         Adapter::Bun => {
+            if env::var_os("BUN_INSTALL_GLOBAL_STORE").is_some() {
+                environment.remove("BUN_INSTALL_CACHE_DIR");
+            }
             let configured = ancestor_config_files(current_dir, "bunfig.toml")
                 .into_iter()
                 .chain(std::iter::once(
@@ -1590,6 +1639,22 @@ fn sccache_remote_or_disabled() -> bool {
     ]
     .iter()
     .any(|name| env::var_os(name).is_some())
+}
+
+fn sccache_config_is_ambiguous() -> bool {
+    let path = env::var_os("SCCACHE_CONF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home_dir().join(".config/sccache/config"));
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
+        return true;
+    };
+    value
+        .get("cache")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|cache| cache.keys().any(|key| key != "disk"))
 }
 
 fn ancestor_config_files(start: &Path, name: &str) -> Vec<PathBuf> {
@@ -1758,6 +1823,119 @@ fn nested_command<'a>(command: &'a str, args: &'a [OsString]) -> (&'a str, &'a [
     (manager, &args[1..])
 }
 
+fn native_tool(real: &Path, command: &str, args: &[OsString], adapter: Adapter) -> NativeTool {
+    if adapter == Adapter::Ccache && command != "ccache" {
+        return NativeTool::default();
+    }
+    let mut prefix = Vec::new();
+    if command == "corepack" {
+        if let Some(manager) = args.first().and_then(|value| value.to_str()) {
+            prefix.push(manager.to_owned());
+        }
+    } else if adapter == Adapter::Pip && (command.starts_with("python") || command == "py") {
+        let module = args.iter().position(|value| value == "-m");
+        if let Some(index) =
+            module.filter(|index| args.get(index + 1).is_some_and(|value| value == "pip"))
+        {
+            prefix.extend(
+                args[..=index + 1]
+                    .iter()
+                    .map(|value| value.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    NativeTool {
+        program: Some(real.to_path_buf()),
+        prefix,
+        environment: std::collections::BTreeMap::new(),
+    }
+}
+
+fn adapter_hazards(adapter: Adapter, args: &[OsString], current_dir: &Path) -> BTreeSet<String> {
+    let mut hazards = BTreeSet::new();
+    match adapter {
+        Adapter::Uv => {
+            let cli_mode = args.iter().enumerate().find_map(|(index, value)| {
+                let value = value.to_string_lossy();
+                value
+                    .strip_prefix("--link-mode=")
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        (value == "--link-mode")
+                            .then(|| args.get(index + 1)?.to_str().map(str::to_owned))
+                            .flatten()
+                    })
+            });
+            let mode = cli_mode
+                .or_else(|| env::var("UV_LINK_MODE").ok())
+                .or_else(|| configured_uv_link_mode(current_dir).ok().flatten());
+            if mode
+                .as_deref()
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("symlink"))
+            {
+                hazards.insert("uv-symlink-mode".to_owned());
+            }
+        }
+        Adapter::Bun => {
+            if env::var_os("BUN_INSTALL_GLOBAL_STORE").is_some() {
+                hazards.insert("bun-global-store".to_owned());
+            }
+        }
+        Adapter::Sccache if sccache_remote_or_disabled() => {
+            hazards.insert("sccache-remote-or-foreign-server".to_owned());
+        }
+        Adapter::Pnpm
+            if args.iter().any(|arg| {
+                matches!(
+                    arg.to_str(),
+                    Some("--use-running-store-server" | "--use-store-server")
+                )
+            }) =>
+        {
+            hazards.insert("pnpm-external-store-server".to_owned());
+        }
+        _ => {}
+    }
+    hazards
+}
+
+fn configured_uv_link_mode(current_dir: &Path) -> Result<Option<String>> {
+    let candidates = current_dir
+        .ancestors()
+        .flat_map(|ancestor| {
+            [
+                (ancestor.join("uv.toml"), false),
+                (ancestor.join("pyproject.toml"), true),
+            ]
+        })
+        .chain(std::iter::once((
+            crate::config::home_dir().join(".config/uv/uv.toml"),
+            false,
+        )));
+    for (path, pyproject) in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&path)?)
+            .with_context(|| format!("parse uv configuration {}", path.display()))?;
+        let table = if pyproject {
+            value
+                .get("tool")
+                .and_then(|tool| tool.get("uv"))
+                .and_then(toml::Value::as_table)
+        } else {
+            value.as_table()
+        };
+        if let Some(mode) = table
+            .and_then(|table| table.get("link-mode"))
+            .and_then(toml::Value::as_str)
+        {
+            return Ok(Some(mode.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 fn run_cargo(args: Vec<OsString>) -> Result<i32> {
     let (config, _) = Config::load(None)?;
     let current_exe = env::current_exe()?;
@@ -1796,6 +1974,7 @@ struct CargoRouting {
     status: String,
     lease: Option<RootLease>,
     maintenance_root: Option<RootHandle>,
+    resource_ids: Vec<String>,
 }
 
 fn cargo_routing(
@@ -1808,6 +1987,7 @@ fn cargo_routing(
     let mut status = "routing disabled".to_owned();
     let mut lease = None;
     let mut maintenance_root = None;
+    let mut resource_ids = Vec::new();
     let explicit_layout = env::var_os("CARGO_TARGET_DIR").is_some()
         || env::var_os("CARGO_BUILD_TARGET_DIR").is_some()
         || env::var_os("CARGO_BUILD_BUILD_DIR").is_some()
@@ -1837,9 +2017,11 @@ fn cargo_routing(
                     let root = open_root(config)?;
                     let repository = Repository::discover(&repository_start, &root)?
                         .context("resolve Cargo workspace scope")?;
+                    maybe_automatic_gc(&root, config, true);
                     lease = Some(RootLease::shared(&root, "cargo-sccache")?);
-                    let mut environment =
+                    let (mut environment, registered) =
                         adapter_environment(&root, &repository, Adapter::Sccache)?;
+                    resource_ids.extend(registered);
                     if let Some(size) = &config.sccache.cache_size {
                         environment
                             .entry("SCCACHE_CACHE_SIZE".to_owned())
@@ -1863,6 +2045,7 @@ fn cargo_routing(
             status,
             lease,
             maintenance_root,
+            resource_ids,
         });
     }
     if config.enabled && config.cargo.enabled && !explicit_layout && supports_build_dir {
@@ -1876,6 +2059,7 @@ fn cargo_routing(
                     status,
                     lease,
                     maintenance_root,
+                    resource_ids,
                 });
             }
             Err(error) => {
@@ -1887,6 +2071,7 @@ fn cargo_routing(
                     status,
                     lease,
                     maintenance_root,
+                    resource_ids,
                 });
             }
             Ok(false) => {}
@@ -1899,15 +2084,22 @@ fn cargo_routing(
                     status: format!("routing unavailable: {error:#}"),
                     lease,
                     maintenance_root,
+                    resource_ids,
                 });
             }
             Err(error) => return Err(error),
         };
         if let Some(repository) = Repository::discover(&repository_start, &root)? {
+            maybe_automatic_gc(&root, config, true);
             lease = Some(RootLease::shared(&root, "cargo")?);
-            let mut environment = adapter_environment(&root, &repository, Adapter::Cargo)?;
+            let (mut environment, registered) =
+                adapter_environment(&root, &repository, Adapter::Cargo)?;
+            resource_ids.extend(registered);
             if config.sccache.enabled {
-                environment.extend(adapter_environment(&root, &repository, Adapter::Sccache)?);
+                let (sccache_environment, registered) =
+                    adapter_environment(&root, &repository, Adapter::Sccache)?;
+                environment.extend(sccache_environment);
+                resource_ids.extend(registered);
                 if let Some(size) = &config.sccache.cache_size {
                     environment
                         .entry("SCCACHE_CACHE_SIZE".to_owned())
@@ -1945,6 +2137,7 @@ fn cargo_routing(
         status,
         lease,
         maintenance_root,
+        resource_ids,
     })
 }
 
@@ -1961,9 +2154,12 @@ fn cargo_wrapper_is_explicit() -> bool {
 }
 
 fn finish_cargo_routing(routing: CargoRouting, config: &Config) {
+    if let Some(root) = routing.maintenance_root.as_ref() {
+        let _ = resources::complete(root, &routing.resource_ids);
+    }
     drop(routing.lease);
     if let Some(root) = routing.maintenance_root.as_ref() {
-        maybe_automatic_gc(root, config);
+        maybe_automatic_gc(root, config, false);
     }
 }
 
@@ -1972,30 +2168,93 @@ fn cargo_help_prefix(status: &str) -> String {
     format!("dev-cache: {status}\n\n{help}\n")
 }
 
-fn maybe_automatic_gc(root: &RootHandle, config: &Config) {
+fn maybe_automatic_gc(root: &RootHandle, config: &Config, pressure_only: bool) {
     if !config.maintenance.automatic {
         return;
     }
-    let marker = root.control().join("last-automatic-gc.json");
-    if let Ok(value) = fs::read(&marker).and_then(|bytes| {
-        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
-    }) {
-        if value["unix"].as_u64().is_some_and(|last| {
-            now_unix().saturating_sub(last) < config.maintenance.interval_hours * 3_600
-        }) {
-            return;
-        }
+    let pressure = gc::pressure_needed(root, &config.gc).unwrap_or(false);
+    if pressure_only && !pressure {
+        return;
     }
-    if gc::collect(
+    let marker = root.control().join("last-automatic-gc.json");
+    let previous = fs::read(&marker)
+        .and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
+        })
+        .ok();
+    let due = previous
+        .as_ref()
+        .and_then(|value| value["last_success_unix"].as_u64())
+        .is_none_or(|last| {
+            now_unix().saturating_sub(last) >= config.maintenance.interval_hours * 3_600
+        });
+    let pressure_due = previous
+        .as_ref()
+        .and_then(|value| value["last_attempt_unix"].as_u64())
+        .is_none_or(|last| now_unix().saturating_sub(last) >= 3_600);
+    if (pressure && !pressure_due) || (!pressure && !due) {
+        return;
+    }
+    let _ = run_automatic_gc(root, config, pressure);
+}
+
+fn run_automatic_gc(
+    root: &RootHandle,
+    config: &Config,
+    pressure: bool,
+) -> Result<Option<gc::GcReport>> {
+    let marker = root.control().join("last-automatic-gc.json");
+    let previous = fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let last_success = previous
+        .as_ref()
+        .and_then(|value| value["last_success_unix"].as_u64());
+    let result = gc::collect_if_idle(
         root,
         &config.gc,
         config.artifacts.stale_after_days,
-        &GcOverrides::default(),
+        &GcOverrides {
+            max_actions: Some(if pressure { 32 } else { 8 }),
+            ..GcOverrides::default()
+        },
         true,
-    )
-    .is_ok()
-    {
-        let _ = write_json_atomic(&marker, &serde_json::json!({"unix":now_unix()}));
+    );
+    let now = now_unix();
+    match result {
+        Ok(Some(report)) => {
+            write_json_atomic(
+                &marker,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "last_attempt_unix": now,
+                    "last_success_unix": report.complete.then_some(now).or(last_success),
+                    "complete": report.complete,
+                    "pressure": pressure,
+                    "bytes_reclaimed": report.bytes_reclaimed,
+                    "target_shortfall_bytes": report.target_shortfall_bytes,
+                    "size_limit_shortfall_bytes": report.size_limit_shortfall_bytes,
+                    "failures": report.failures,
+                    "trash_backlog": report.trash_backlog,
+                }),
+            )?;
+            Ok(Some(report))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            write_json_atomic(
+                &marker,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "last_attempt_unix": now,
+                    "last_success_unix": last_success,
+                    "complete": false,
+                    "pressure": pressure,
+                    "error": format!("{error:#}"),
+                }),
+            )?;
+            Err(error)
+        }
     }
 }
 

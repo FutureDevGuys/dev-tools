@@ -43,11 +43,18 @@ impl RootLease {
     }
 
     pub fn exclusive(root: &RootHandle) -> Result<Self> {
+        Self::try_exclusive(root)?.context("cache root is busy with an active routed command")
+    }
+
+    pub fn try_exclusive(root: &RootHandle) -> Result<Option<Self>> {
         let file = lock_file(root)?;
-        file.try_lock_exclusive()
-            .context("cache root is busy with an active routed command")?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error).context("acquire exclusive cache-root lease"),
+        }
         clean_stale_lease_records(root)?;
-        Ok(Self { file, record: None })
+        Ok(Some(Self { file, record: None }))
     }
 }
 

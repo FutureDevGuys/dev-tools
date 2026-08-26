@@ -26,6 +26,12 @@ pub struct IdentityRecord {
     pub last_used_unix: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct IdentityIssue {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 impl Repository {
     pub fn discover(cwd: &Path, root: &RootHandle) -> Result<Option<Self>> {
         let requested = cwd
@@ -56,34 +62,18 @@ impl Repository {
         let identity = blake3::hash(seed.as_bytes()).to_hex().to_string();
         let cache_dir = root.repos().join(&identity[..2]).join(&identity);
         let record_path = cache_dir.join("identity.json");
-        let now = now_unix();
         if record_path.exists() {
-            let mut record: IdentityRecord = serde_json::from_slice(&fs::read(&record_path)?)
+            let record: IdentityRecord = serde_json::from_slice(&fs::read(&record_path)?)
                 .context("parse repository identity")?;
-            if record.identity != identity
-                || record.canonical_worktree != worktree
+            validate_identity_record(root, &cache_dir, &record)?;
+            if record.canonical_worktree != worktree
                 || record.filesystem_identity != filesystem_identity
-                || record.platform != root.platform
             {
                 bail!(
                     "repository cache identity mismatch at {}",
                     cache_dir.display()
                 );
             }
-            record.last_used_unix = now;
-            write_json_atomic(&record_path, &record)?;
-        } else {
-            fs::create_dir_all(&cache_dir)?;
-            let record = IdentityRecord {
-                schema_version: 2,
-                identity: identity.clone(),
-                canonical_worktree: worktree.clone(),
-                filesystem_identity,
-                platform: root.platform.clone(),
-                created_unix: now,
-                last_used_unix: now,
-            };
-            write_json_atomic(&record_path, &record)?;
         }
         Ok(Some(Self {
             worktree,
@@ -91,6 +81,107 @@ impl Repository {
             cache_dir,
         }))
     }
+
+    pub fn touch(&self, root: &RootHandle) -> Result<()> {
+        let record_path = self.cache_dir.join("identity.json");
+        let filesystem_identity = filesystem_identity(&self.worktree)?;
+        let now = now_unix();
+        let mut record = if record_path.is_file() {
+            let record: IdentityRecord = serde_json::from_slice(&fs::read(&record_path)?)
+                .context("parse repository identity")?;
+            validate_identity_record(root, &self.cache_dir, &record)?;
+            if record.canonical_worktree != self.worktree
+                || record.filesystem_identity != filesystem_identity
+            {
+                bail!(
+                    "repository cache identity mismatch at {}",
+                    self.cache_dir.display()
+                );
+            }
+            record
+        } else {
+            fs::create_dir_all(&self.cache_dir)?;
+            IdentityRecord {
+                schema_version: 2,
+                identity: self.identity.clone(),
+                canonical_worktree: self.worktree.clone(),
+                filesystem_identity,
+                platform: root.platform.clone(),
+                created_unix: now,
+                last_used_unix: now,
+            }
+        };
+        record.last_used_unix = now;
+        write_json_atomic(&record_path, &record)
+    }
+}
+
+pub fn validate_identity_record(
+    root: &RootHandle,
+    cache_dir: &Path,
+    record: &IdentityRecord,
+) -> Result<()> {
+    if record.schema_version != 2
+        || record.platform != root.platform
+        || record.identity.len() < 2
+        || record.canonical_worktree.as_os_str().is_empty()
+        || record.filesystem_identity.is_empty()
+    {
+        bail!(
+            "invalid repository cache identity at {}",
+            cache_dir.display()
+        );
+    }
+    let seed = format!(
+        "v2\0{}\0{}\0{}",
+        root.domain_id,
+        record.canonical_worktree.display(),
+        record.filesystem_identity
+    );
+    let expected = blake3::hash(seed.as_bytes()).to_hex().to_string();
+    let expected_dir = root.repos().join(&expected[..2]).join(&expected);
+    if record.identity != expected || cache_dir != expected_dir {
+        bail!(
+            "repository cache identity mismatch at {}",
+            cache_dir.display()
+        );
+    }
+    Ok(())
+}
+
+pub fn scan_identity_issues(root: &RootHandle) -> Result<Vec<IdentityIssue>> {
+    if !root.repos().is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut issues = Vec::new();
+    for prefix in fs::read_dir(root.repos())? {
+        let prefix = prefix?;
+        if !prefix.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(prefix.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let identity_path = entry.path().join("identity.json");
+            let result = fs::read(&identity_path)
+                .context("read repository identity")
+                .and_then(|bytes| {
+                    serde_json::from_slice::<IdentityRecord>(&bytes)
+                        .context("parse repository identity")
+                })
+                .and_then(|record| validate_identity_record(root, &entry.path(), &record));
+            if let Err(error) = result {
+                issues.push(IdentityIssue {
+                    path: entry.path(),
+                    reason: format!("{error:#}"),
+                });
+            }
+        }
+    }
+    issues.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(issues)
 }
 
 fn native_workspace_root(start: &Path) -> PathBuf {

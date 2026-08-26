@@ -39,9 +39,16 @@ impl Adapter {
         let shared = &context.shared_cache;
         match self {
             Self::Cargo => {
+                let workspace = context
+                    .worktree_cache
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("workspace"));
                 values.push((
                     "CARGO_BUILD_BUILD_DIR",
-                    shared.join("cargo/intermediate/{workspace-path-hash}"),
+                    shared
+                        .join("cargo/intermediate")
+                        .join(workspace)
+                        .join("{workspace-path-hash}"),
                 ));
             }
             Self::Sccache => {

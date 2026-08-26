@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +17,7 @@ use dev_cache::lease::RootLease;
 use dev_cache::migrate;
 use dev_cache::provenance;
 use dev_cache::repository::Repository;
+use dev_cache::resources::{self, NativeTool, ResourceKind};
 use dev_cache::root::RootHandle;
 
 #[cfg(unix)]
@@ -419,7 +420,13 @@ fn cargo_routes_only_intermediate_artifacts_with_native_workspace_hashing() {
     let routed = Adapter::Cargo.environment(&context);
     assert_eq!(
         routed.get("CARGO_BUILD_BUILD_DIR").map(String::as_str),
-        Some("/root/shared/cargo/intermediate/{workspace-path-hash}")
+        Some(
+            format!(
+                "/root/shared/cargo/intermediate/{}/{{workspace-path-hash}}",
+                "a".repeat(160)
+            )
+            .as_str()
+        )
     );
     assert!(!routed.contains_key("CARGO_TARGET_DIR"));
     for variable in ["TMPDIR", "TEMP", "TMP"] {
@@ -568,6 +575,44 @@ fn artifact_cas_verifies_put_and_restore() {
 }
 
 #[test]
+fn garbage_collection_removes_artifact_objects_and_metadata_as_one_action() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let source = temp.path().join("artifact.bin");
+    fs::write(&source, b"disposable artifact").expect("artifact source");
+    let record = artifacts::put(&root, &source).expect("put artifact");
+    let object = root
+        .artifacts()
+        .join(&record.digest[..2])
+        .join(&record.digest);
+    let metadata = root
+        .platform_root
+        .join("artifacts/metadata")
+        .join(format!("{}.json", record.digest));
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+
+    let report = gc::collect(
+        &root,
+        &policy,
+        0,
+        &GcOverrides {
+            stale_after_days: Some(0),
+            ..GcOverrides::default()
+        },
+        true,
+    )
+    .expect("collect artifact");
+    assert!(report.complete);
+    assert_eq!(report.actions.len(), 1);
+    assert_eq!(report.actions[0].kind, "artifact");
+    assert!(!object.exists());
+    assert!(!metadata.exists());
+    assert_eq!(report.trash_backlog, 0);
+}
+
+#[test]
 fn migration_is_dry_run_first_and_never_follows_symlinks() {
     let root_dir = tempfile::tempdir().expect("root directory");
     let source_dir = tempfile::tempdir().expect("source directory");
@@ -582,6 +627,13 @@ fn migration_is_dry_run_first_and_never_follows_symlinks() {
         .expect("migration apply");
     assert!(applied.destination.join("cache.bin").is_file());
     assert!(source_dir.path().join("cache.bin").is_file());
+    let records = resources::list(&root).expect("migrated resource catalog");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, ResourceKind::NpmCache);
+    assert_eq!(
+        resources::absolute_path(&root, &records[0]).expect("catalog path"),
+        applied.destination
+    );
 }
 
 #[test]
@@ -2189,6 +2241,9 @@ fn doctor_exits_unhealthy_when_status_report_generation_fails() {
     let repository = Repository::discover(temp.path(), &root)
         .expect("discover repository")
         .expect("repository scope");
+    repository
+        .touch(&root)
+        .expect("materialize repository identity");
     fs::write(repository.cache_dir.join("identity.json"), b"not-json")
         .expect("corrupt disposable identity fixture");
 
@@ -2409,10 +2464,8 @@ fn explicit_cargo_exec_composes_sccache_environment() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
-    assert!(
-        stdout.contains("/cache/cargo/intermediate/{workspace-path-hash}\n"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("/cache/cargo/intermediate/"), "{stdout}");
+    assert!(stdout.contains("/{workspace-path-hash}\n"), "{stdout}");
     assert!(stdout.contains("/cache/sccache\n"), "{stdout}");
 }
 
@@ -2431,9 +2484,28 @@ fn garbage_collection_is_dry_run_first_and_honors_active_leases() {
     let repository = Repository::discover(&repo, &root)
         .expect("discover repository")
         .expect("Git worktree");
+    repository
+        .touch(&root)
+        .expect("materialize repository identity");
     let disposable = repository.cache_dir.join("temp/generic/cache.bin");
     fs::create_dir_all(disposable.parent().expect("cache parent")).expect("cache directory");
     fs::write(disposable, b"cache").expect("cache artifact");
+    let resource_ids = resources::register_routed(
+        &root,
+        Adapter::Temp,
+        &HashMap::from([(
+            "TMPDIR".to_owned(),
+            repository
+                .cache_dir
+                .join("temp/generic")
+                .to_string_lossy()
+                .into_owned(),
+        )]),
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("register generic temp resource");
+    resources::complete(&root, &resource_ids).expect("complete generic temp resource");
     let policy = Config::default().gc;
     let overrides = GcOverrides {
         stale_after_days: Some(0),
@@ -2441,6 +2513,9 @@ fn garbage_collection_is_dry_run_first_and_honors_active_leases() {
     };
 
     let lease = RootLease::shared(&root, "test-build").expect("shared build lease");
+    assert!(gc::collect_if_idle(&root, &policy, 120, &overrides, true)
+        .expect("automatic GC deferral")
+        .is_none());
     let busy = gc::collect(&root, &policy, 120, &overrides, true)
         .expect_err("GC must refuse an active build lease");
     assert!(busy.to_string().contains("busy"));
@@ -2456,4 +2531,503 @@ fn garbage_collection_is_dry_run_first_and_honors_active_leases() {
     let applied = gc::collect(&root, &policy, 120, &overrides, true).expect("GC apply");
     assert!(applied.applied);
     assert!(!repository.cache_dir.exists());
+    assert!(resources::list(&root)
+        .expect("reconciled resource catalog")
+        .is_empty());
+}
+
+#[test]
+fn garbage_collection_never_panics_or_escapes_on_malformed_artifact_metadata() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let metadata = root.platform_root.join("artifacts/metadata");
+    fs::create_dir_all(&metadata).expect("artifact metadata directory");
+    fs::write(
+        metadata.join("malformed.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "digest": "x",
+            "size": 1,
+            "original_name": "untrusted",
+            "created_unix": 0,
+            "last_verified_unix": 0
+        }))
+        .expect("serialize malformed record"),
+    )
+    .expect("write malformed record");
+    let sentinel = root.platform_root.join("must-not-move");
+    fs::write(&sentinel, b"durable").expect("external sentinel");
+    let policy = Config::default().gc;
+    let overrides = GcOverrides {
+        stale_after_days: Some(0),
+        ..GcOverrides::default()
+    };
+
+    let result = std::panic::catch_unwind(|| gc::collect(&root, &policy, 0, &overrides, true));
+
+    assert!(result.is_ok(), "malformed metadata must not panic");
+    assert!(result.expect("non-panicking result").is_ok());
+    assert_eq!(fs::read(sentinel).expect("sentinel remains"), b"durable");
+    assert!(metadata.join("malformed.json").exists());
+}
+
+#[test]
+fn repository_discovery_is_read_only_until_a_routed_command_starts() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("go.mod"),
+        b"module example.invalid/read-only\n",
+    )
+    .expect("workspace manifest");
+
+    let repository = Repository::discover(&workspace, &root)
+        .expect("workspace discovery")
+        .expect("workspace scope");
+    assert!(!repository.cache_dir.exists());
+    repository.touch(&root).expect("start routed command");
+    assert!(repository.cache_dir.join("identity.json").is_file());
+}
+
+#[test]
+fn garbage_collection_abstains_from_forged_repository_ownership() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(workspace.join("go.mod"), b"module example.invalid/forged\n")
+        .expect("workspace manifest");
+    let repository = Repository::discover(&workspace, &root)
+        .expect("workspace discovery")
+        .expect("workspace scope");
+    repository.touch(&root).expect("repository ownership");
+    let identity = repository.cache_dir.join("identity.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&identity).expect("identity bytes"))
+            .expect("identity JSON");
+    record["schema_version"] = serde_json::json!(1);
+    fs::write(&identity, serde_json::to_vec(&record).expect("forged JSON"))
+        .expect("forged identity");
+
+    let report = gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides {
+            stale_after_days: Some(0),
+            ..GcOverrides::default()
+        },
+        true,
+    )
+    .expect("safe collection");
+    assert!(report
+        .abstentions
+        .iter()
+        .any(|item| item.reason.contains("invalid repository ownership")));
+    assert!(repository.cache_dir.exists());
+    assert_eq!(
+        gc::maintenance_status(&root)
+            .expect("maintenance status")
+            .repository_issues
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn resource_catalog_tracks_each_disposable_resource_independently() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let values = HashMap::from([
+        (
+            "GOCACHE".to_owned(),
+            root.shared()
+                .join("go-build")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "GOMODCACHE".to_owned(),
+            root.shared().join("go-mod").to_string_lossy().into_owned(),
+        ),
+        (
+            "GOTMPDIR".to_owned(),
+            root.shared().join("go-tmp").to_string_lossy().into_owned(),
+        ),
+    ]);
+    let ids = resources::register_routed(
+        &root,
+        Adapter::Go,
+        &values,
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("register Go resources");
+    resources::complete(&root, &ids).expect("complete Go resources");
+
+    let records = resources::list(&root).expect("resource catalog");
+    let kinds = records
+        .iter()
+        .map(|record| record.kind)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([
+            ResourceKind::GoBuild,
+            ResourceKind::GoModule,
+            ResourceKind::GoTemp,
+        ])
+    );
+    assert!(records.iter().all(|record| {
+        resources::catalog_path(&root, &record.resource_id).starts_with(root.control())
+            && !resources::catalog_path(&root, &record.resource_id)
+                .starts_with(resources::absolute_path(&root, record).expect("resource path"))
+    }));
+}
+
+#[test]
+fn garbage_collection_abstains_from_tampered_catalog_paths() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let cache = root.shared().join("npm");
+    fs::create_dir_all(&cache).expect("cache directory");
+    fs::write(cache.join("cache.bin"), b"cache").expect("cache data");
+    let values = HashMap::from([(
+        "npm_config_cache".to_owned(),
+        cache.to_string_lossy().into_owned(),
+    )]);
+    let ids = resources::register_routed(
+        &root,
+        Adapter::Npm,
+        &values,
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("register npm cache");
+    let catalog = resources::catalog_path(&root, &ids[0]);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&catalog).expect("catalog bytes")).expect("catalog JSON");
+    record["relative_path"] = serde_json::json!("../../outside");
+    fs::write(
+        &catalog,
+        serde_json::to_vec(&record).expect("tampered JSON"),
+    )
+    .expect("tampered catalog");
+    let sentinel = temp.path().join("outside");
+    fs::write(&sentinel, b"durable").expect("external sentinel");
+
+    let report = gc::collect(
+        &root,
+        &Config::default().gc,
+        0,
+        &GcOverrides {
+            stale_after_days: Some(0),
+            ..GcOverrides::default()
+        },
+        true,
+    )
+    .expect("safe GC");
+    assert!(report.actions.is_empty());
+    assert_eq!(report.abstentions.len(), 1);
+    assert_eq!(fs::read(sentinel).expect("sentinel remains"), b"durable");
+    assert!(cache.exists());
+}
+
+#[test]
+fn garbage_collection_preserves_resources_with_sticky_safety_hazards() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let cache = root.shared().join("uv");
+    let values = HashMap::from([(
+        "UV_CACHE_DIR".to_owned(),
+        cache.to_string_lossy().into_owned(),
+    )]);
+    let ids = resources::register_routed(
+        &root,
+        Adapter::Uv,
+        &values,
+        &NativeTool::default(),
+        &BTreeSet::from(["uv-symlink-mode".to_owned()]),
+    )
+    .expect("register uv cache");
+    resources::complete(&root, &ids).expect("complete uv cache");
+    fs::create_dir_all(&cache).expect("cache directory");
+    fs::write(cache.join("cache.bin"), b"cache").expect("cache data");
+
+    let report = gc::collect(
+        &root,
+        &Config::default().gc,
+        0,
+        &GcOverrides {
+            stale_after_days: Some(0),
+            ..GcOverrides::default()
+        },
+        true,
+    )
+    .expect("safe GC");
+    assert!(report.actions.is_empty());
+    assert!(report
+        .abstentions
+        .iter()
+        .any(|item| item.reason.contains("uv-symlink-mode")));
+    assert!(cache.join("cache.bin").is_file());
+}
+
+#[test]
+fn garbage_collection_recovers_committed_transactional_trash() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let transaction = "recoverable";
+    let trash = root.trash().join(transaction);
+    fs::create_dir_all(&trash).expect("transaction trash");
+    fs::write(trash.join("cache.bin"), b"cache").expect("trash data");
+    let journal = root.control().join("gc-journal/recoverable.json");
+    fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "transaction_id": transaction,
+            "resource_id": null,
+            "original_paths": [],
+            "trash_path": trash,
+            "committed": true,
+            "created_unix": 0
+        }))
+        .expect("journal JSON"),
+    )
+    .expect("journal");
+
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+    let report =
+        gc::collect(&root, &policy, 120, &GcOverrides::default(), true).expect("recover trash");
+    assert!(report.complete);
+    assert_eq!(report.trash_backlog, 0);
+    assert!(!trash.exists());
+    assert!(!journal.exists());
+}
+
+#[test]
+fn garbage_collection_rolls_back_uncommitted_transactional_trash() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let transaction = "interrupted";
+    let original = root.platform_root.join("manual-original/cache.bin");
+    let trash = root.trash().join(transaction);
+    fs::create_dir_all(&trash).expect("transaction trash");
+    fs::write(trash.join("0"), b"cache").expect("partially moved data");
+    let journal = root.control().join("gc-journal/interrupted.json");
+    fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "transaction_id": transaction,
+            "resource_id": null,
+            "original_paths": [original],
+            "trash_path": trash,
+            "committed": false,
+            "created_unix": 0
+        }))
+        .expect("journal JSON"),
+    )
+    .expect("journal");
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+
+    let report =
+        gc::collect(&root, &policy, 120, &GcOverrides::default(), true).expect("recover trash");
+    assert!(report.complete);
+    assert_eq!(fs::read(&original).expect("restored original"), b"cache");
+    assert!(!trash.exists());
+    assert!(!journal.exists());
+}
+
+#[test]
+fn bounded_automatic_collection_reports_remaining_work_until_drained() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let values = HashMap::from([
+        (
+            "MESON_PACKAGE_CACHE_DIR".to_owned(),
+            root.shared()
+                .join("meson/packages")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "ZIG_GLOBAL_CACHE_DIR".to_owned(),
+            root.shared()
+                .join("zig/global")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    for path in values.values() {
+        let path = PathBuf::from(path);
+        fs::create_dir_all(&path).expect("cache directory");
+        fs::write(path.join("cache.bin"), b"cache").expect("cache data");
+    }
+    let mut ids = resources::register_routed(
+        &root,
+        Adapter::Meson,
+        &HashMap::from([(
+            "MESON_PACKAGE_CACHE_DIR".to_owned(),
+            values["MESON_PACKAGE_CACHE_DIR"].clone(),
+        )]),
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("register Meson cache");
+    ids.extend(
+        resources::register_routed(
+            &root,
+            Adapter::Zig,
+            &HashMap::from([(
+                "ZIG_GLOBAL_CACHE_DIR".to_owned(),
+                values["ZIG_GLOBAL_CACHE_DIR"].clone(),
+            )]),
+            &NativeTool::default(),
+            &BTreeSet::new(),
+        )
+        .expect("register Zig cache"),
+    );
+    resources::complete(&root, &ids).expect("complete resources");
+    let overrides = GcOverrides {
+        stale_after_days: Some(0),
+        max_actions: Some(1),
+        ..GcOverrides::default()
+    };
+
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+    let first =
+        gc::collect(&root, &policy, 120, &overrides, true).expect("first bounded collection");
+    assert!(!first.complete);
+    assert_eq!(first.actions.len(), 1);
+    let second =
+        gc::collect(&root, &policy, 120, &overrides, true).expect("second bounded collection");
+    assert!(second.complete);
+    assert_eq!(second.actions.len(), 1);
+    assert!(resources::list(&root).expect("drained catalog").is_empty());
+}
+
+#[test]
+fn collection_reports_an_unattainable_space_target_without_false_failure() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    fs::write(root.control().join("unmanaged-control-state"), b"state")
+        .expect("noncollectible control state");
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+    policy.max_bytes = Some(0);
+
+    let report = gc::collect(&root, &policy, 120, &GcOverrides::default(), true)
+        .expect("completed collection");
+    assert!(report.complete);
+    assert!(report.size_limit_shortfall_bytes > 0);
+    assert!(report.failures.is_empty());
+    assert_eq!(report.trash_backlog, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_cleanup_reuses_the_recorded_tool_and_exact_managed_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let cache = root.shared().join("go-build");
+    fs::create_dir_all(&cache).expect("Go cache");
+    fs::write(cache.join("cache.bin"), b"cache").expect("Go cache data");
+    let log = temp.path().join("native.log");
+    let tool = temp.path().join("go-real");
+    fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$*\" \"$GOCACHE\" \"$DEV_CACHE_NATIVE_TEST\" > '{}'\n",
+            log.display()
+        ),
+    )
+    .expect("fake native tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("executable native tool");
+    let native = NativeTool {
+        program: Some(tool),
+        prefix: Vec::new(),
+        environment: std::collections::BTreeMap::from([(
+            "DEV_CACHE_NATIVE_TEST".to_owned(),
+            "recorded".to_owned(),
+        )]),
+    };
+    let ids = resources::register_routed(
+        &root,
+        Adapter::Go,
+        &HashMap::from([("GOCACHE".to_owned(), cache.to_string_lossy().into_owned())]),
+        &native,
+        &BTreeSet::new(),
+    )
+    .expect("register Go cache");
+    resources::complete(&root, &ids).expect("complete Go cache");
+
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+    let report = gc::collect(
+        &root,
+        &policy,
+        120,
+        &GcOverrides {
+            stale_after_days: Some(0),
+            ..GcOverrides::default()
+        },
+        true,
+    )
+    .expect("native cleanup");
+    assert!(report.complete);
+    let output = fs::read_to_string(log).expect("native cleanup log");
+    assert_eq!(
+        output,
+        format!("clean -cache\n{}\nrecorded\n", cache.display())
+    );
+    assert!(resources::get(&root, &ids[0])
+        .expect("catalog read")
+        .expect("catalog record")
+        .last_maintained_unix
+        .is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fails_when_the_maintenance_catalog_is_invalid() {
+    let (temp, upstream, data, config) = doctor_fixture();
+    let config_value: toml::Value =
+        toml::from_str(&fs::read_to_string(&config).expect("config source")).expect("config TOML");
+    let root_path = PathBuf::from(config_value["root"].as_str().expect("configured root"));
+    let root = RootHandle::open(&root_path).expect("cache root");
+    fs::write(root.control().join("resources/invalid.json"), b"not JSON").expect("invalid catalog");
+    let intercept = data.join("dev-cache/intercepts");
+    let path = std::env::join_paths([&intercept, &upstream]).expect("doctor PATH");
+
+    let output = run_doctor(&temp, &upstream, &data, &config, path);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    let maintenance = report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "maintenance")
+        .expect("maintenance check");
+    assert_eq!(maintenance["ok"], false);
+    assert_eq!(
+        maintenance["status"]["catalog_issues"]
+            .as_array()
+            .expect("catalog issues")
+            .len(),
+        1
+    );
 }
