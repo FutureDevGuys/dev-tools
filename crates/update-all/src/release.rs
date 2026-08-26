@@ -737,7 +737,7 @@ fn https_get(url: &str, etag: Option<&str>, limit: u64) -> Result<FetchResult> {
         .user_agent(format!("update-all/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
-    let mut request = agent.get(url).header("Accept", "application/octet-stream");
+    let mut request = agent.get(url).header("Accept", accept_media_type(url));
     if let Some(etag) = etag {
         request = request.header("If-None-Match", etag);
     }
@@ -773,6 +773,14 @@ fn https_get(url: &str, etag: Option<&str>, limit: u64) -> Result<FetchResult> {
         .read_to_vec()
         .with_context(|| format!("read bounded response from {url}"))?;
     Ok(FetchResult { bytes, etag })
+}
+
+fn accept_media_type(url: &str) -> &'static str {
+    if url.starts_with("https://api.github.com/") {
+        "application/vnd.github+json"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 fn allowed_release_host(host: &str) -> bool {
@@ -1188,6 +1196,18 @@ mod tests {
         };
         verify_artifact(bytes, &artifact).unwrap();
         assert!(verify_artifact(b"release!", &artifact).is_err());
+    }
+
+    #[test]
+    fn github_release_discovery_requests_json_while_assets_request_bytes() {
+        assert_eq!(
+            accept_media_type("https://api.github.com/repos/example/releases"),
+            "application/vnd.github+json"
+        );
+        assert_eq!(
+            accept_media_type("https://github.com/example/releases/download/tag/artifact"),
+            "application/octet-stream"
+        );
     }
 
     #[cfg(unix)]
