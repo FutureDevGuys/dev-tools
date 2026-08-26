@@ -5253,9 +5253,10 @@ fn prompt_events_are_journaled_without_answer_content() {
     let event_tx = DashboardSender::new(raw_event_tx, Some(run_log.clone()));
 
     event_tx
-        .send(DashboardEvent::TaskInputStateChanged {
+        .send(DashboardEvent::PromptRequested {
             id: "builtin/yay".to_string(),
-            enabled: true,
+            generation: 7,
+            prompt: "Proceed with installation? [Y/n]".to_string(),
         })
         .unwrap();
     event_rx.recv().unwrap();
@@ -5263,15 +5264,51 @@ fn prompt_events_are_journaled_without_answer_content() {
         &event_tx,
         &UiControlEvent::SendStdin {
             id: "builtin/yay".to_string(),
+            generation: 7,
             line: "private answer".to_string(),
         },
     ));
+    event_tx.journal_control(
+        "prompt_answered",
+        Some("builtin/yay"),
+        serde_json::json!({"generation": 7, "character_count": 14}),
+    );
+    event_tx
+        .send(DashboardEvent::PromptCancelled {
+            id: "builtin/yay".to_string(),
+            generation: 7,
+            reason: "command completed".to_string(),
+        })
+        .unwrap();
+    event_rx.recv().unwrap();
 
     let events = fs::read_to_string(run_log.run_dir().join("events.jsonl")).unwrap();
     assert!(events.contains("prompt_requested"), "{events}");
     assert!(events.contains("prompt_answered"), "{events}");
+    assert!(events.contains("prompt_cancelled"), "{events}");
+    assert!(events.contains("\"generation\":7"), "{events}");
     assert!(events.contains("character_count"), "{events}");
     assert!(!events.contains("private answer"), "{events}");
+}
+
+#[test]
+fn qualified_interactive_transcript_paths_are_flat_and_encoded() {
+    let temp = TempDir::new().unwrap();
+    let task_id = "builtin/../arch-update-services";
+    let transcript = InteractiveTranscript::new(temp.path(), task_id).unwrap();
+    let expected_stem = format!("interactive-{}", task_file_stem(task_id));
+
+    for (path, suffix) in [
+        (&transcript.transcript_path, ".transcript.log"),
+        (&transcript.status_path, ".status"),
+        (&transcript.wrapper_path, ".sh"),
+    ] {
+        assert_eq!(path.parent(), Some(temp.path()));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(format!("{expected_stem}{suffix}").as_str())
+        );
+    }
 }
 
 #[test]

@@ -15,9 +15,9 @@ use crate::config::{
 use crate::logging::{task_file_stem, RunLogSink};
 use crate::sections::Sections;
 use crate::ui::{
-    report_values_are_version_change, DashboardEvent, DashboardQuitBehavior, LogLevel, LogRecord,
-    LogStream, LogViewTarget, MouseRowStride, TaskState, UiControlEvent, UiModeResolved,
-    RUN_LOG_SCOPE,
+    looks_like_interactive_prompt, report_values_are_version_change, DashboardEvent,
+    DashboardQuitBehavior, LogLevel, LogRecord, LogStream, LogViewTarget, MouseRowStride,
+    TaskState, UiControlEvent, UiModeResolved, RUN_LOG_SCOPE,
 };
 use crate::updaters::{
     builtin_windows_foundations, command_candidate_is_available, command_program_path,
@@ -349,6 +349,7 @@ pub struct SyncContext {
     pub debug_report: bool,
     pub(crate) privilege_session: Arc<PrivilegeSession>,
     pub(crate) runtime_control: Option<Arc<RuntimeControl>>,
+    pub(crate) prompt_runtime: Arc<PromptRuntime>,
 }
 
 #[derive(Clone)]
@@ -473,13 +474,27 @@ fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<(
             }),
         ),
         DashboardEvent::TaskInputStateChanged { id, enabled } => log.write_event(
-            if *enabled {
-                "prompt_requested"
-            } else {
-                "prompt_cancelled"
-            },
+            "task_input_state_changed",
             Some(id),
             serde_json::json!({"enabled": enabled}),
+        ),
+        DashboardEvent::PromptRequested {
+            id,
+            generation,
+            prompt,
+        } => log.write_event(
+            "prompt_requested",
+            Some(id),
+            serde_json::json!({"generation": generation, "prompt": prompt}),
+        ),
+        DashboardEvent::PromptCancelled {
+            id,
+            generation,
+            reason,
+        } => log.write_event(
+            "prompt_cancelled",
+            Some(id),
+            serde_json::json!({"generation": generation, "reason": reason}),
         ),
         DashboardEvent::TaskStateChanged { id, state, detail } => log.write_event(
             "task_state_changed",
@@ -557,11 +572,7 @@ fn journal_ui_control(event_tx: &DashboardSender, control: &UiControlEvent) -> b
             serde_json::json!({}),
         ),
         UiControlEvent::CancelAll => ("run_cancel_requested", None, serde_json::json!({})),
-        UiControlEvent::SendStdin { id, line } => (
-            "prompt_answered",
-            Some(id.as_str()),
-            serde_json::json!({"character_count": line.chars().count()}),
-        ),
+        UiControlEvent::SendStdin { .. } => return event_tx.journal_error().is_none(),
         UiControlEvent::RenameRun { name } => (
             "rename_requested",
             None,
@@ -578,6 +589,31 @@ fn journal_ui_control(event_tx: &DashboardSender, control: &UiControlEvent) -> b
     };
     event_tx.journal_control(kind, task_id, payload);
     event_tx.journal_error().is_none()
+}
+
+fn submit_prompt_answer(
+    event_tx: &DashboardSender,
+    runtime_control: &RuntimeControl,
+    prompt_runtime: &PromptRuntime,
+    task_id: &str,
+    generation: u64,
+    line: String,
+) -> bool {
+    let character_count = line.chars().count();
+    let sent = prompt_runtime.submit(task_id, generation, || {
+        runtime_control.send_stdin_line(task_id, line)
+    });
+    if sent {
+        event_tx.journal_control(
+            "prompt_answered",
+            Some(task_id),
+            serde_json::json!({
+                "generation": generation,
+                "character_count": character_count,
+            }),
+        );
+    }
+    sent
 }
 
 pub struct AsyncContext {
@@ -736,6 +772,71 @@ pub(crate) struct RuntimeControl {
     task_stdin: Mutex<BTreeMap<String, mpsc::Sender<String>>>,
 }
 
+#[derive(Default)]
+pub(crate) struct PromptRuntime {
+    tasks: Mutex<BTreeMap<String, PromptRuntimeTask>>,
+}
+
+#[derive(Default)]
+struct PromptRuntimeTask {
+    generation: u64,
+    active: Option<ActivePromptGeneration>,
+}
+
+#[derive(Clone, Copy)]
+struct ActivePromptGeneration {
+    generation: u64,
+    answered: bool,
+}
+
+impl PromptRuntime {
+    fn request(&self, task_id: &str) -> (u64, Option<u64>) {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = tasks.entry(task_id.to_string()).or_default();
+        let cancelled = state
+            .active
+            .filter(|active| !active.answered)
+            .map(|active| active.generation);
+        state.generation = state.generation.saturating_add(1).max(1);
+        let generation = state.generation;
+        state.active = Some(ActivePromptGeneration {
+            generation,
+            answered: false,
+        });
+        (generation, cancelled)
+    }
+
+    fn submit(&self, task_id: &str, generation: u64, send: impl FnOnce() -> bool) -> bool {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active) = tasks
+            .get_mut(task_id)
+            .and_then(|state| state.active.as_mut())
+        else {
+            return false;
+        };
+        if active.generation != generation || active.answered || !send() {
+            return false;
+        }
+        active.answered = true;
+        true
+    }
+
+    fn cancel(&self, task_id: &str) -> Option<u64> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(task_id)
+            .and_then(|state| state.active.take())
+            .map(|active| active.generation)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RunningProcess {
     pid: u32,
@@ -875,6 +976,20 @@ impl RuntimeControl {
 
 impl SyncContext {
     fn set_task_input_state(&self, task_id: &str, enabled: bool) {
+        if !enabled {
+            if let Some(generation) = self.prompt_runtime.cancel(task_id) {
+                let event = DashboardEvent::PromptCancelled {
+                    id: task_id.to_string(),
+                    generation,
+                    reason: "input channel closed".to_string(),
+                };
+                if let Some(tx) = &self.event_tx {
+                    let _ = tx.send(event);
+                } else if let Some(log) = &self.run_log {
+                    let _ = journal_dashboard_event(log, &event);
+                }
+            }
+        }
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(DashboardEvent::TaskInputStateChanged {
                 id: task_id.to_string(),
@@ -882,11 +997,7 @@ impl SyncContext {
             });
         } else if let Some(log) = &self.run_log {
             let _ = log.write_event(
-                if enabled {
-                    "prompt_requested"
-                } else {
-                    "prompt_cancelled"
-                },
+                "task_input_state_changed",
                 Some(task_id),
                 serde_json::json!({"enabled": enabled}),
             );
@@ -896,10 +1007,12 @@ impl SyncContext {
     fn build_stream_callback(
         &self,
         task_id: &str,
+        detect_prompts: bool,
     ) -> Arc<dyn Fn(StreamKind, String) + Send + Sync> {
         let task_for_logs = task_id.to_string();
         let tx = self.event_tx.clone();
         let run_log = self.run_log.clone();
+        let prompt_runtime = self.prompt_runtime.clone();
         let filter_progress_noise = self.filter_progress_noise;
         Arc::new(move |kind, line| {
             let stream = match kind {
@@ -935,7 +1048,32 @@ impl SyncContext {
                 }
             }
             if let Some(tx) = &tx {
-                let _ = tx.send(DashboardEvent::LogLine(rec));
+                let _ = tx.send(DashboardEvent::LogLine(rec.clone()));
+            }
+            if detect_prompts && looks_like_interactive_prompt(&rec.line) {
+                let (generation, cancelled_generation) = prompt_runtime.request(&task_for_logs);
+                if let Some(cancelled_generation) = cancelled_generation {
+                    let cancelled = DashboardEvent::PromptCancelled {
+                        id: task_for_logs.clone(),
+                        generation: cancelled_generation,
+                        reason: "superseded by a new prompt".to_string(),
+                    };
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(cancelled);
+                    } else if let Some(log) = &run_log {
+                        let _ = journal_dashboard_event(log, &cancelled);
+                    }
+                }
+                let requested = DashboardEvent::PromptRequested {
+                    id: task_for_logs.clone(),
+                    generation,
+                    prompt: rec.line,
+                };
+                if let Some(tx) = &tx {
+                    let _ = tx.send(requested);
+                } else if let Some(log) = &run_log {
+                    let _ = journal_dashboard_event(log, &requested);
+                }
             }
         })
     }
@@ -1118,7 +1256,7 @@ impl SyncContext {
         command: &CommandReportCommand,
         policy: &TaskPolicy,
     ) -> Result<String> {
-        let cb = self.build_stream_callback(task_id);
+        let cb = self.build_stream_callback(task_id, false);
         let args_for_run = command.args.iter().map(String::as_str);
         if let Some(runtime) = &self.runtime_control {
             let runtime_for_cancel = runtime.clone();
@@ -1175,7 +1313,7 @@ impl SyncContext {
         loop {
             let args_for_run = args.clone();
             let task = task_id.to_string();
-            let cb = self.build_stream_callback(task_id);
+            let cb = self.build_stream_callback(task_id, interactive && capture_this_run);
             let capture_enabled_for_run = capture_this_run;
             let suspend_ui_for_command =
                 interactive && self.runtime_control.is_some() && !capture_enabled_for_run;
@@ -1720,6 +1858,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     let event_tx = DashboardSender::new(raw_event_tx, ctx.run_log.clone());
     let (ui_control_tx, ui_control_rx) = mpsc::channel::<UiControlEvent>();
     let runtime_control = Arc::new(RuntimeControl::default());
+    let prompt_runtime = Arc::new(PromptRuntime::default());
     let mut ui_handle = ctx.ui.spawn_ui_thread(
         event_rx,
         ui_control_tx,
@@ -1925,8 +2064,19 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                     );
                     made_progress = true;
                 }
-                UiControlEvent::SendStdin { id, line } => {
-                    let sent = runtime_control.send_stdin_line(&id, line.clone());
+                UiControlEvent::SendStdin {
+                    id,
+                    generation,
+                    line,
+                } => {
+                    let sent = submit_prompt_answer(
+                        &event_tx,
+                        &runtime_control,
+                        &prompt_runtime,
+                        &id,
+                        generation,
+                        line.clone(),
+                    );
                     let detail = if sent {
                         format!("stdin line sent ({} chars)", line.chars().count())
                     } else {
@@ -2034,8 +2184,12 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 crate::ua_outln!("[async] started {}", spec.label);
             }
 
-            let task_ctx =
-                ctx_clone_for_task(&ctx, Some(event_tx.clone()), Some(runtime_control.clone()));
+            let task_ctx = ctx_clone_for_task(
+                &ctx,
+                Some(event_tx.clone()),
+                Some(runtime_control.clone()),
+                prompt_runtime.clone(),
+            );
             let spawned_spec = spec.clone();
             let handle = thread::spawn(move || match execute_task(&task_ctx, &spawned_spec) {
                 Ok(task_result) => task_result,
@@ -2490,7 +2644,7 @@ fn maybe_prepare_sudo_session_before_run(ctx: &AsyncContext, specs: &[TaskSpec])
 
         // Authenticate before dashboard startup to avoid prompt/render contention.
         crate::ua_outln!("Preparing elevated session (sudo authentication required)...");
-        let preflight_ctx = ctx_clone_for_task(ctx, None, None);
+        let preflight_ctx = ctx_clone_for_task(ctx, None, None, Arc::new(PromptRuntime::default()));
         ensure_sudo_preflight_once(&preflight_ctx, spec)?;
         Ok(true)
     }
@@ -3244,7 +3398,7 @@ struct InteractiveTranscript {
 
 impl InteractiveTranscript {
     fn new(run_dir: &Path, task_id: &str) -> Result<Self> {
-        let stem = format!("interactive-{task_id}");
+        let stem = format!("interactive-{}", task_file_stem(task_id));
         Ok(Self {
             transcript_path: run_dir.join(format!("{stem}.transcript.log")),
             status_path: run_dir.join(format!("{stem}.status")),
@@ -13474,6 +13628,7 @@ fn ctx_clone_for_task(
     ctx: &AsyncContext,
     tx: Option<DashboardSender>,
     runtime_control: Option<Arc<RuntimeControl>>,
+    prompt_runtime: Arc<PromptRuntime>,
 ) -> SyncContext {
     SyncContext {
         flags: ctx.flags.clone(),
@@ -13498,6 +13653,7 @@ fn ctx_clone_for_task(
         debug_report: ctx.debug_report,
         privilege_session: ctx.privilege_session.clone(),
         runtime_control,
+        prompt_runtime,
     }
 }
 

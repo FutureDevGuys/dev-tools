@@ -2073,7 +2073,7 @@ fn prompt_overlay_context_lines_only_uses_arch_service_prompts() {
 }
 
 #[test]
-fn latest_prompt_comes_from_recent_global_log() {
+fn prompt_like_logs_do_not_create_requests_without_runtime_events() {
     let mut model = Model::new(200, true, true);
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
@@ -2093,11 +2093,11 @@ fn latest_prompt_comes_from_recent_global_log() {
         line: "==> Packages to exclude:".to_string(),
     });
 
+    assert_eq!(find_latest_prompt(&model), None);
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
     assert_eq!(
-        find_latest_prompt(&model)
-            .as_ref()
-            .map(|(_, line)| line.as_str()),
-        Some("==> Packages to exclude:")
+        find_latest_prompt(&model).unwrap().1,
+        "==> Packages to exclude:"
     );
 }
 
@@ -2112,16 +2112,15 @@ fn prompt_modal_auto_opens_for_waiting_input_task() {
     );
     model.set_task_state("arch-update-services", TaskState::Running, None);
     model.set_task_input_state("arch-update-services", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: 2,
-        task_id: "arch-update-services".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "-> Select the service(s) to restart (e.g. 1 3 5), select 0 to restart them all or press \"enter\" to continue without restarting the service(s):".to_string(),
-    });
+    model.set_prompt_request(
+        "arch-update-services".to_string(),
+        4,
+        "-> Select the service(s) to restart (e.g. 1 3 5), select 0 to restart them all or press \"enter\" to continue without restarting the service(s):".to_string(),
+    );
 
     let edit = model.prompt_edit.as_ref().expect("prompt editor opened");
     assert_eq!(edit.task_id, "arch-update-services");
+    assert_eq!(edit.generation, 4);
     assert!(edit.buffer.is_empty());
 }
 
@@ -2131,16 +2130,7 @@ fn first_enter_answers_visible_prompt_exactly_once() {
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    let prompt_ts = now_unix_ms().saturating_sub(1_000);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: prompt_ts,
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
-    model.prompt_edit = None;
-    model.auto_prompt_key = Some(("yay".to_string(), prompt_ts));
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
 
     let (tx, rx) = std::sync::mpsc::channel::<UiControlEvent>();
     let layout = layout_for(
@@ -2158,11 +2148,85 @@ fn first_enter_answers_visible_prompt_exactly_once() {
         DashboardQuitBehavior::Detach,
     ));
     assert!(model.prompt_edit.is_none());
+    assert!(model.prompt_is_submitted());
     assert!(matches!(
         rx.try_recv(),
-        Ok(UiControlEvent::SendStdin { id, line }) if id == "yay" && line.is_empty()
+        Ok(UiControlEvent::SendStdin { id, generation: 1, line }) if id == "yay" && line.is_empty()
+    ));
+
+    assert!(!handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Enter),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
     ));
     assert!(rx.try_recv().is_err());
+    assert_eq!(latest_prompt_task(&model).as_deref(), Some("yay"));
+
+    model.cancel_prompt_request("yay", 1);
+    assert_eq!(latest_prompt_task(&model), None);
+}
+
+#[test]
+fn sequential_prompt_generations_replace_submitted_state_without_log_heuristics() {
+    let mut model = Model::new(200, true, true);
+    model.register_task(
+        "builtin/demo".to_string(),
+        "Demo".to_string(),
+        Vec::new(),
+        true,
+    );
+    model.set_task_state("builtin/demo", TaskState::Running, None);
+    model.set_task_input_state("builtin/demo", true);
+
+    model.set_prompt_request("builtin/demo".to_string(), 11, "First prompt?".to_string());
+    assert_eq!(find_latest_prompt(&model).unwrap().1, "First prompt?");
+    model.mark_prompt_submitted("builtin/demo", 11);
+    assert!(model.prompt_is_submitted());
+
+    model.push_task_log(LogRecord {
+        ts_unix_ms: 99,
+        task_id: "builtin/demo".to_string(),
+        level: LogLevel::Info,
+        stream: LogStream::Stdout,
+        line: "ordinary output after the answer".to_string(),
+    });
+    assert_eq!(find_latest_prompt(&model).unwrap().1, "First prompt?");
+
+    model.set_prompt_request("builtin/demo".to_string(), 12, "Second prompt?".to_string());
+    assert!(!model.prompt_is_submitted());
+    assert_eq!(find_latest_prompt(&model).unwrap().1, "Second prompt?");
+    assert_eq!(model.prompt_edit.as_ref().unwrap().generation, 12);
+
+    let (tx, rx) = std::sync::mpsc::channel::<UiControlEvent>();
+    let layout = layout_for(
+        Rect::new(0, 0, 120, 40),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    for key in [KeyCode::Char('2'), KeyCode::Char(' '), KeyCode::Char('4')] {
+        assert!(!handle_key_event(
+            &mut model,
+            KeyEvent::from(key),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::Detach,
+        ));
+    }
+    assert!(!handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Enter),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
+    ));
+    assert!(matches!(
+        rx.recv().unwrap(),
+        UiControlEvent::SendStdin { id, generation: 12, line } if id == "builtin/demo" && line == "2 4"
+    ));
+    assert!(model.prompt_is_submitted());
 }
 
 #[test]
@@ -2171,13 +2235,7 @@ fn prompt_overlay_scroll_keys_adjust_scroll_from_bottom() {
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: now_unix_ms().saturating_sub(1_000),
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
 
     let (tx, _rx) = std::sync::mpsc::channel::<UiControlEvent>();
     let layout = layout_for(
@@ -2218,22 +2276,10 @@ fn prompt_overlay_scroll_resets_for_new_prompt() {
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: now_unix_ms().saturating_sub(2_000),
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
     model.prompt_scroll_from_bottom = 7;
 
-    model.push_task_log(LogRecord {
-        ts_unix_ms: now_unix_ms().saturating_sub(1_000),
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Diffs to show?".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 2, "==> Diffs to show?".to_string());
 
     assert_eq!(model.prompt_scroll_from_bottom, 0);
 }
@@ -2244,13 +2290,7 @@ fn mouse_wheel_over_prompt_overlay_scrolls_modal() {
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: now_unix_ms().saturating_sub(1_000),
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
 
     let layout = layout_for(
         Rect::new(0, 0, 120, 40),
@@ -2278,26 +2318,14 @@ fn prompt_modal_stays_closed_after_manual_dismiss_until_new_prompt() {
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: 2,
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
     assert!(model.prompt_edit.is_some());
 
     model.prompt_edit = None;
     model.set_task_input_state("yay", true);
     assert!(model.prompt_edit.is_none());
 
-    model.push_task_log(LogRecord {
-        ts_unix_ms: 3,
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Diffs to show?".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 2, "==> Diffs to show?".to_string());
     assert!(model.prompt_edit.is_some());
 }
 
@@ -2307,31 +2335,20 @@ fn prompt_modal_clears_when_task_stops_accepting_input() {
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: 2,
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
 
+    model.cancel_prompt_request("yay", 1);
     model.set_task_input_state("yay", false);
     assert!(model.prompt_edit.is_none());
 }
 
 #[test]
-fn stale_prompt_is_not_shown_after_task_continues() {
+fn prompt_request_remains_until_explicit_cancellation() {
     let mut model = Model::new(200, true, true);
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: 1,
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
     model.push_task_log(LogRecord {
         ts_unix_ms: 2,
         task_id: "yay".to_string(),
@@ -2340,6 +2357,8 @@ fn stale_prompt_is_not_shown_after_task_continues() {
         line: "==> Retrieving sources...".to_string(),
     });
 
+    assert!(find_latest_prompt(&model).is_some());
+    model.cancel_prompt_request("yay", 1);
     assert_eq!(find_latest_prompt(&model), None);
 }
 
@@ -2350,13 +2369,7 @@ fn prompt_remains_visible_when_other_tasks_log() {
     model.register_task("npm".to_string(), "NPM".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
     model.set_task_input_state("yay", true);
-    model.push_task_log(LogRecord {
-        ts_unix_ms: 1,
-        task_id: "yay".to_string(),
-        level: LogLevel::Info,
-        stream: LogStream::Stdout,
-        line: "==> Packages to exclude:".to_string(),
-    });
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
     model.push_task_log(LogRecord {
         ts_unix_ms: 2,
         task_id: "npm".to_string(),
@@ -2378,6 +2391,7 @@ fn prompt_is_hidden_without_active_input_channel() {
     let mut model = Model::new(200, true, true);
     model.register_task("yay".to_string(), "Yay".to_string(), Vec::new(), true);
     model.set_task_state("yay", TaskState::Running, None);
+    model.set_prompt_request("yay".to_string(), 1, "==> Packages to exclude:".to_string());
     model.push_task_log(LogRecord {
         ts_unix_ms: 1,
         task_id: "yay".to_string(),

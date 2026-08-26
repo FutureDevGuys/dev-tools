@@ -1,6 +1,7 @@
 use crate::ui::{
-    is_report_meta_line, is_report_note_line, DashboardEvent, DashboardQuitBehavior, LogLevel,
-    LogRecord, LogStream, LogViewTarget, MouseRowStride, TaskState, UiControlEvent, RUN_LOG_SCOPE,
+    is_report_meta_line, is_report_note_line, looks_like_interactive_prompt, DashboardEvent,
+    DashboardQuitBehavior, LogLevel, LogRecord, LogStream, LogViewTarget, MouseRowStride,
+    TaskState, UiControlEvent, RUN_LOG_SCOPE,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -95,7 +96,16 @@ struct SearchEditState {
 #[derive(Clone)]
 struct PromptEditState {
     task_id: String,
+    generation: u64,
     buffer: String,
+}
+
+#[derive(Clone)]
+struct PromptRequestState {
+    task_id: String,
+    generation: u64,
+    prompt: String,
+    submitted: bool,
 }
 
 #[derive(Clone)]
@@ -145,8 +155,8 @@ struct Model {
     wrap_logs: bool,
     search_edit: Option<SearchEditState>,
     prompt_edit: Option<PromptEditState>,
+    prompt_request: Option<PromptRequestState>,
     rename_edit: Option<RenameEditState>,
-    auto_prompt_key: Option<(String, u64)>,
     prompt_scroll_from_bottom: usize,
     task_search: SearchSpec,
     task_log_search: SearchSpec,
@@ -201,8 +211,8 @@ impl Model {
             wrap_logs: false,
             search_edit: None,
             prompt_edit: None,
+            prompt_request: None,
             rename_edit: None,
-            auto_prompt_key: None,
             prompt_scroll_from_bottom: 0,
             task_search: SearchSpec::default(),
             task_log_search: SearchSpec::default(),
@@ -289,7 +299,6 @@ impl Model {
             self.max_in_memory_lines,
             rec,
         );
-        self.refresh_prompt_state();
     }
 
     fn register_task(
@@ -350,51 +359,56 @@ impl Model {
             task.state = state;
             task.detail = detail.map(|d| sanitize_log_line(&d));
         }
-        self.refresh_prompt_state();
     }
 
     fn set_task_input_state(&mut self, id: &str, enabled: bool) {
         if let Some(task) = self.tasks.get_mut(id) {
             task.input_enabled = enabled;
         }
-        self.refresh_prompt_state();
     }
 
-    fn refresh_prompt_state(&mut self) {
-        let Some((task_id, prompt_ts)) = latest_prompt_signature(self) else {
-            self.prompt_edit = None;
-            self.auto_prompt_key = None;
-            self.prompt_scroll_from_bottom = 0;
-            return;
-        };
-        let prompt_key = (task_id.clone(), prompt_ts);
-        let prompt_task_active = self
-            .tasks
-            .get(&task_id)
-            .is_some_and(|task| task.accepts_input && task.input_enabled);
+    fn set_prompt_request(&mut self, task_id: String, generation: u64, prompt: String) {
+        self.prompt_request = Some(PromptRequestState {
+            task_id: task_id.clone(),
+            generation,
+            prompt: sanitize_log_line(&prompt),
+            submitted: false,
+        });
+        self.prompt_edit = Some(PromptEditState {
+            task_id,
+            generation,
+            buffer: String::new(),
+        });
+        self.prompt_scroll_from_bottom = 0;
+    }
 
-        if !prompt_task_active {
-            self.prompt_edit = None;
-            self.prompt_scroll_from_bottom = 0;
-            return;
-        }
-
-        let has_matching_editor = self
-            .prompt_edit
+    fn cancel_prompt_request(&mut self, task_id: &str, generation: u64) {
+        let matches = self
+            .prompt_request
             .as_ref()
-            .is_some_and(|edit| edit.task_id == task_id);
-        if self.auto_prompt_key.as_ref() != Some(&prompt_key) {
+            .is_some_and(|request| request.task_id == task_id && request.generation == generation);
+        if matches {
+            self.prompt_request = None;
+            self.prompt_edit = None;
             self.prompt_scroll_from_bottom = 0;
         }
-        if !has_matching_editor && self.auto_prompt_key.as_ref() != Some(&prompt_key) {
-            self.prompt_edit = Some(PromptEditState {
-                task_id: task_id.clone(),
-                buffer: String::new(),
-            });
-            self.auto_prompt_key = Some(prompt_key);
-        } else if has_matching_editor {
-            self.auto_prompt_key = Some(prompt_key);
+    }
+
+    fn mark_prompt_submitted(&mut self, task_id: &str, generation: u64) {
+        if let Some(request) = self
+            .prompt_request
+            .as_mut()
+            .filter(|request| request.task_id == task_id && request.generation == generation)
+        {
+            request.submitted = true;
+            self.prompt_edit = None;
         }
+    }
+
+    fn prompt_is_submitted(&self) -> bool {
+        self.prompt_request
+            .as_ref()
+            .is_some_and(|request| request.submitted)
     }
 
     fn search_spec(&self, pane: ActivePane) -> &SearchSpec {
@@ -586,6 +600,16 @@ pub fn run_dashboard(
                     DashboardEvent::TaskInputStateChanged { id, enabled } => {
                         model.set_task_input_state(&id, enabled);
                     }
+                    DashboardEvent::PromptRequested {
+                        id,
+                        generation,
+                        prompt,
+                    } => model.set_prompt_request(id, generation, prompt),
+                    DashboardEvent::PromptCancelled {
+                        id,
+                        generation,
+                        reason: _,
+                    } => model.cancel_prompt_request(&id, generation),
                     DashboardEvent::TaskStateChanged { id, state, detail } => {
                         model.set_task_state(&id, state, detail);
                     }
@@ -838,9 +862,13 @@ fn handle_key_event(
             )
         }
         KeyCode::Enter => {
-            if let Some(task_id) = latest_prompt_task(model) {
+            let prompt = (!model.prompt_is_submitted())
+                .then(|| latest_prompt_generation(model))
+                .flatten();
+            if let Some((task_id, generation)) = prompt {
                 model.prompt_edit = Some(PromptEditState {
                     task_id,
+                    generation,
                     buffer: String::new(),
                 });
             } else if model.active_pane == ActivePane::Tasks {
@@ -966,21 +994,42 @@ fn handle_prompt_overlay_input(
         .saturating_sub(1) as usize;
     let page_rows = page_rows.max(1);
 
+    if model.prompt_is_submitted() {
+        match key.code {
+            KeyCode::Up => model.prompt_scroll_from_bottom += 1,
+            KeyCode::PageUp => model.prompt_scroll_from_bottom += page_rows,
+            KeyCode::Down => {
+                model.prompt_scroll_from_bottom = model.prompt_scroll_from_bottom.saturating_sub(1)
+            }
+            KeyCode::PageDown => {
+                model.prompt_scroll_from_bottom =
+                    model.prompt_scroll_from_bottom.saturating_sub(page_rows)
+            }
+            KeyCode::Home | KeyCode::Char('g') => model.prompt_scroll_from_bottom = usize::MAX / 4,
+            KeyCode::End | KeyCode::Char('G') => model.prompt_scroll_from_bottom = 0,
+            _ => {}
+        }
+        return true;
+    }
+
     if prompt_visible && model.prompt_edit.is_none() {
         match key.code {
             KeyCode::Enter => {
-                if let Some(task_id) = latest_prompt_task(model) {
+                if let Some((task_id, generation)) = latest_prompt_generation(model) {
                     let _ = control_tx.send(UiControlEvent::SendStdin {
-                        id: task_id,
+                        id: task_id.clone(),
+                        generation,
                         line: String::new(),
                     });
+                    model.mark_prompt_submitted(&task_id, generation);
                 }
                 return true;
             }
             KeyCode::Char(character) if !character.is_control() => {
-                if let Some(task_id) = latest_prompt_task(model) {
+                if let Some((task_id, generation)) = latest_prompt_generation(model) {
                     model.prompt_edit = Some(PromptEditState {
                         task_id,
+                        generation,
                         buffer: character.to_string(),
                     });
                 }
@@ -1042,9 +1091,11 @@ fn handle_prompt_edit_input(
             }
             let line = edit.buffer.clone();
             let _ = control_tx.send(UiControlEvent::SendStdin {
-                id: edit.task_id,
+                id: edit.task_id.clone(),
+                generation: edit.generation,
                 line,
             });
+            model.mark_prompt_submitted(&edit.task_id, edit.generation);
             return false;
         }
         KeyCode::Backspace => {
@@ -1561,6 +1612,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &Layout
             &prompt,
             &context_lines,
             model.prompt_edit.as_ref(),
+            model.prompt_is_submitted(),
             model.prompt_scroll_from_bottom,
         );
     }
@@ -3676,40 +3728,6 @@ fn is_transient_progress_line(line: &str) -> bool {
             || trimmed.contains('G'))
 }
 
-fn looks_like_interactive_prompt(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if prompt_kind(trimmed) == PromptKind::ArchServiceRestart {
-        return true;
-    }
-    if lower.contains("[sudo] password for")
-        || lower.contains("password for ")
-        || lower.contains("excluding packages may cause partial upgrades")
-        || lower.contains("proceed with installation")
-        || lower.contains("[y/n]")
-    {
-        return true;
-    }
-
-    if trimmed == "==>" {
-        return true;
-    }
-
-    if lower.starts_with("==> ") {
-        return lower.contains("packages to exclude")
-            || lower.contains("packages to cleanbuild")
-            || lower.contains("diffs to show")
-            || lower.contains("pkgbuilds to edit")
-            || lower.contains("[n]one [a]ll [ab]ort")
-            || lower.contains('?');
-    }
-
-    false
-}
-
 fn prompt_kind(line: &str) -> PromptKind {
     if is_arch_service_restart_prompt(line) {
         PromptKind::ArchServiceRestart
@@ -3733,38 +3751,21 @@ fn is_arch_service_restart_prompt(line: &str) -> bool {
 }
 
 fn find_latest_prompt(model: &Model) -> Option<(String, String)> {
-    latest_prompt_record(model).map(|rec| (rec.task_id.to_string(), rec.line.to_string()))
-}
-
-fn latest_prompt_signature(model: &Model) -> Option<(String, u64)> {
-    latest_prompt_record(model).map(|rec| (rec.task_id.to_string(), rec.ts_unix_ms))
-}
-
-fn latest_prompt_record(model: &Model) -> Option<&LogRecord> {
-    model.global_logs.iter().rev().find(|rec| {
-        if !looks_like_interactive_prompt(&rec.line) {
-            return false;
-        }
-        // Keep prompt overlay tied to a currently waiting task.
-        model
-            .tasks
-            .get(&rec.task_id)
-            .filter(|task| {
-                task.accepts_input && task.input_enabled && task.state == TaskState::Running
-            })
-            .and_then(|task| task.logs.back())
-            .map(|last| {
-                last.ts_unix_ms == rec.ts_unix_ms
-                        && last.line == rec.line
-                        // Debounce noisy prompt-like lines so popup doesn't flash.
-                        && rec.ts_unix_ms.saturating_add(500) <= now_unix_ms()
-            })
-            .unwrap_or(false)
-    })
+    let request = model.prompt_request.as_ref()?;
+    model.tasks.get(&request.task_id).filter(|task| {
+        task.accepts_input && task.input_enabled && task.state == TaskState::Running
+    })?;
+    Some((request.task_id.clone(), request.prompt.clone()))
 }
 
 fn latest_prompt_task(model: &Model) -> Option<String> {
     find_latest_prompt(model).map(|(task_id, _)| task_id)
+}
+
+fn latest_prompt_generation(model: &Model) -> Option<(String, u64)> {
+    let task_id = latest_prompt_task(model)?;
+    let generation = model.prompt_request.as_ref()?.generation;
+    Some((task_id, generation))
 }
 
 fn prompt_overlay_context_lines(model: &Model, task_id: &str, prompt: &str) -> Vec<String> {
@@ -3989,12 +3990,13 @@ fn draw_prompt_overlay(
     prompt: &str,
     context_lines: &[String],
     edit: Option<&PromptEditState>,
+    submitted: bool,
     scroll_from_bottom: usize,
 ) {
     let area = prompt_overlay_area(root);
     frame.render_widget(Clear, area);
     let inner = inner_rect(area);
-    let lines = prompt_overlay_lines(task_id, prompt, context_lines, edit);
+    let lines = prompt_overlay_lines(task_id, prompt, context_lines, edit, submitted);
     let visible_lines = take_visible_rows(
         &lines,
         scroll_from_bottom,
@@ -4051,6 +4053,7 @@ fn prompt_overlay_lines(
     prompt: &str,
     context_lines: &[String],
     edit: Option<&PromptEditState>,
+    submitted: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![Span::styled(
         format!("Input expected for active command ({task_id})"),
@@ -4075,7 +4078,14 @@ fn prompt_overlay_lines(
             .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(prompt.to_string()));
-    if let Some(edit) = edit {
+    if submitted {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Answer submitted; waiting for command…",
+            Style::default().fg(Color::LightCyan),
+        )]));
+        lines.push(Line::from("Up/Down/PgUp/PgDn/Home/End: scroll"));
+    } else if let Some(edit) = edit {
         let display_buffer = if prompt_expects_secret(prompt) {
             "*".repeat(edit.buffer.chars().count())
         } else {

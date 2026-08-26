@@ -173,6 +173,16 @@ pub enum DashboardEvent {
         id: String,
         enabled: bool,
     },
+    PromptRequested {
+        id: String,
+        generation: u64,
+        prompt: String,
+    },
+    PromptCancelled {
+        id: String,
+        generation: u64,
+        reason: String,
+    },
     TaskStateChanged {
         id: String,
         state: TaskState,
@@ -195,11 +205,21 @@ pub enum DashboardEvent {
 
 #[derive(Clone, Debug)]
 pub enum UiControlEvent {
-    CancelTask { id: String },
+    CancelTask {
+        id: String,
+    },
     CancelAll,
-    SendStdin { id: String, line: String },
-    RenameRun { name: String },
-    OpenLog { target: LogViewTarget },
+    SendStdin {
+        id: String,
+        generation: u64,
+        line: String,
+    },
+    RenameRun {
+        name: String,
+    },
+    OpenLog {
+        target: LogViewTarget,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +267,50 @@ pub(crate) fn is_report_note_line(line: &str) -> bool {
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with(' '))
     })
+}
+
+pub(crate) fn looks_like_interactive_prompt(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if is_arch_service_restart_prompt_text(&lower) {
+        return true;
+    }
+    if lower.contains("[sudo] password for")
+        || lower.contains("password for ")
+        || lower.contains("excluding packages may cause partial upgrades")
+        || lower.contains("proceed with installation")
+        || lower.contains("[y/n]")
+    {
+        return true;
+    }
+
+    if trimmed == "==>" {
+        return true;
+    }
+
+    lower.starts_with("==> ")
+        && (lower.contains("packages to exclude")
+            || lower.contains("packages to cleanbuild")
+            || lower.contains("diffs to show")
+            || lower.contains("pkgbuilds to edit")
+            || lower.contains("[n]one [a]ll [ab]ort")
+            || lower.contains('?'))
+}
+
+fn is_arch_service_restart_prompt_text(lower: &str) -> bool {
+    let mentions_service = lower.contains("service(s)")
+        || lower.contains("services")
+        || lower.contains("service to restart");
+    mentions_service
+        && lower.contains("restart")
+        && (lower.contains("select")
+            || lower.contains("choose")
+            || lower.contains("press \"enter\" to continue")
+            || lower.contains("press enter to continue")
+            || lower.contains("continue without restarting"))
 }
 
 pub(crate) fn report_column_count(line: &str) -> usize {

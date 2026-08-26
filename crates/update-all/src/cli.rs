@@ -371,6 +371,7 @@ impl RunCli {
                         debug_report: self.debug_report,
                         privilege_session: Arc::new(PrivilegeSession::default()),
                         runtime_control: None,
+                        prompt_runtime: Arc::new(crate::tasks::PromptRuntime::default()),
                     })?
                 }
             }

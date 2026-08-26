@@ -129,6 +129,7 @@ fn test_context(privilege_session: Arc<PrivilegeSession>) -> SyncContext {
         debug_report: false,
         privilege_session,
         runtime_control: None,
+        prompt_runtime: Arc::new(PromptRuntime::default()),
     }
 }
 
@@ -1947,6 +1948,142 @@ printf 'arch-update %s\n' "$*"
         wrapper_auth < wrapper_launch,
         "sudo -v should precede protected command in the same wrapper:\n{sudo_log}"
     );
+}
+
+#[test]
+fn qualified_interactive_task_reaches_pty_and_accepts_sequential_answers() {
+    let _lock = env_guard();
+
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let answers_file = temp.path().join("answers");
+    write_executable(
+        &bin_dir.join("arch-update"),
+        r#"#!/bin/sh
+set -eu
+printf 'Proceed with installation? [Y/n] '
+IFS= read -r first
+printf '==> Packages to exclude: '
+IFS= read -r second
+printf 'first=<%s>\nsecond=<%s>\n' "$first" "$second" > "${ANSWERS_FILE:?missing answers file}"
+printf 'interactive command complete\n'
+"#,
+    );
+
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let _path_guard = EnvVarGuard::set("PATH", merged_path);
+    let _answers_guard = EnvVarGuard::set("ANSWERS_FILE", answers_file.as_os_str().to_os_string());
+
+    let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let (raw_tx, event_rx) = mpsc::channel::<DashboardEvent>();
+    let event_tx = DashboardSender::new(raw_tx, Some(run_log.clone()));
+    let runtime_control = Arc::new(RuntimeControl::default());
+    let prompt_runtime = Arc::new(PromptRuntime::default());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.event_tx = Some(event_tx.clone());
+    ctx.run_log = Some(run_log.clone());
+    ctx.runtime_control = Some(runtime_control.clone());
+    ctx.prompt_runtime = prompt_runtime.clone();
+    ctx.interactive_runtime.mode = InteractiveExecutionMode::Capture;
+
+    let task_id = "builtin/arch-update-services";
+    let spec = TaskSpec {
+        id: task_id.to_string(),
+        label: "Arch-Update Services".to_string(),
+        depends_on: Vec::new(),
+        kind: TaskKind::Command(CommandTask {
+            program: "arch-update".to_string(),
+            args: vec!["-s".to_string()],
+            mode: None,
+            command_candidates: Vec::new(),
+            pre_commands: Vec::new(),
+            report_commands: Vec::new(),
+            report_patterns: Vec::new(),
+            report_scoped_deltas: Vec::new(),
+            policy_key: "system_update".to_string(),
+            requires_elevation: false,
+            needs_sudo_session: false,
+            interactive: true,
+            external_window: false,
+            shell: false,
+            windows_bridge: false,
+            report_parser: Some(BuiltinReportParser::ArchUpdateServices),
+            plain_header: None,
+            plain_start: None,
+            success_details: Vec::new(),
+            external_manager_skip: false,
+            result_protocol: None,
+        }),
+        category: "maintenance".to_string(),
+        resource_locks: BTreeSet::new(),
+    };
+    let TaskKind::Command(command) = spec.kind.clone() else {
+        panic!("expected command task");
+    };
+    let task_id_owned = task_id.to_string();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = run_command_task(&ctx, &spec, &command);
+        result_tx.send(result).unwrap();
+    });
+
+    let mut generations = Vec::new();
+    while generations.len() < 2 {
+        match event_rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            DashboardEvent::PromptRequested {
+                id,
+                generation,
+                prompt,
+            } => {
+                assert_eq!(id, task_id_owned);
+                generations.push(generation);
+                let answer = if generation == 1 { "" } else { "2 4" };
+                assert!(submit_prompt_answer(
+                    &event_tx,
+                    &runtime_control,
+                    &prompt_runtime,
+                    &id,
+                    generation,
+                    answer.to_string(),
+                ));
+                assert!(!submit_prompt_answer(
+                    &event_tx,
+                    &runtime_control,
+                    &prompt_runtime,
+                    &id,
+                    generation,
+                    "duplicate".to_string(),
+                ));
+                assert!(!prompt.is_empty());
+            }
+            _ => {}
+        }
+    }
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, TaskStatus::Completed, "{result:#?}");
+    assert_eq!(generations, vec![1, 2]);
+    assert_eq!(
+        fs::read_to_string(&answers_file).unwrap(),
+        "first=<>\nsecond=<2 4>\n"
+    );
+
+    let encoded = task_file_stem(task_id);
+    assert!(run_log
+        .run_dir()
+        .join(format!("interactive-{encoded}.sh"))
+        .is_file());
+    assert!(!run_log.run_dir().join("interactive-builtin").exists());
+    let journal = fs::read_to_string(run_log.run_dir().join("events.jsonl")).unwrap();
+    assert_eq!(journal.matches("\"kind\":\"prompt_requested\"").count(), 2);
+    assert_eq!(journal.matches("\"kind\":\"prompt_answered\"").count(), 2);
+    assert!(journal.contains("\"generation\":1"), "{journal}");
+    assert!(journal.contains("\"generation\":2"), "{journal}");
 }
 
 #[test]
