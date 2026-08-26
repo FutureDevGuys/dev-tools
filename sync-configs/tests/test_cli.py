@@ -145,6 +145,37 @@ def test_external_profile_map_can_select_a_generic_nested_list(tmp_path: Path) -
     assert json.loads(result.stdout)["profiles"] == ["linux", "desktop"]
 
 
+def test_external_profile_map_accepts_versioned_caller_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "source.conf"
+    target = tmp_path / "target.conf"
+    marker = tmp_path / "hook-ran"
+    manifest = tmp_path / "manifest.yaml"
+    profile_map = tmp_path / "profiles.yaml"
+    source.write_text("theme = 'dark'\n", encoding="utf-8")
+    write_manifest(manifest, source, target, marker)
+    profile_map.write_text(
+        "schema_version: 1\nprofiles:\n  workstation:\n    selected: [linux, desktop]\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(
+        "--config",
+        str(manifest),
+        "--profile-map",
+        str(profile_map),
+        "--profile-map-field",
+        "selected",
+        "--host-profile",
+        "workstation",
+        "--validate",
+        "--format",
+        "json",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["profiles"] == ["linux", "desktop"]
+
+
 def test_copy_convergence_is_idempotent(tmp_path: Path) -> None:
     source = tmp_path / "source.conf"
     target = tmp_path / "target.conf"

@@ -542,8 +542,16 @@ def mapped_profiles(
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f"Cannot read profile map {path}: {exc}") from exc
-    if not isinstance(payload, dict) or set(payload) != {"profiles"}:
-        raise ConfigError("Profile map must contain only a top-level 'profiles' object.")
+    if (
+        not isinstance(payload, dict)
+        or not set(payload) <= {"schema_version", "profiles"}
+        or "profiles" not in payload
+    ):
+        raise ConfigError(
+            "Profile map must contain 'profiles' and may contain schema_version."
+        )
+    if "schema_version" in payload and payload["schema_version"] != 1:
+        raise ConfigError("Profile map schema_version must be 1.")
     profiles = payload["profiles"]
     if not isinstance(profiles, dict) or not all(isinstance(key, str) for key in profiles):
         raise ConfigError("Profile map 'profiles' must be an object with string keys.")
