@@ -1654,7 +1654,7 @@ def ensure_parent(path: Path, dry_run: bool, force: bool) -> None:
             if not force:
                 raise NotADirectoryError(
                     "target parent is a symlink that does not resolve to a directory "
-                    f"(use --force to replace): {current}"
+                    f"(use --managed-path-policy takeover to replace): {current}"
                 )
             current.unlink()
             current.mkdir(exist_ok=True)
@@ -1666,7 +1666,7 @@ def ensure_parent(path: Path, dry_run: bool, force: bool) -> None:
             if not force:
                 raise NotADirectoryError(
                     "target parent exists but is not a directory "
-                    f"(use --force to replace): {current}"
+                    f"(use --managed-path-policy takeover to replace): {current}"
                 )
             remove_target(current, dry_run=False)
             current.mkdir(exist_ok=True)

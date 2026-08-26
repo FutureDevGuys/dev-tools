@@ -8320,13 +8320,10 @@ fn build_task_specs(
 ) -> Result<Vec<TaskSpec>> {
     let mut specs: Vec<TaskSpec> = Vec::new();
     let only_requested_raw = flags.only.clone().unwrap_or_default();
-    let exact_custom_ids = enabled_custom_ids_for_host(updater_cfg, host_os);
-    let only_requested = expand_alias_ids_except(&only_requested_raw, &exact_custom_ids);
-    let include_requested = expand_alias_ids_except(&updater_cfg.include, &exact_custom_ids);
-    let exclude_requested = expand_alias_ids_except(
-        &updater_cfg.exclude.union(&flags.exclude).cloned().collect(),
-        &exact_custom_ids,
-    );
+    let only_requested = only_requested_raw;
+    let include_requested = updater_cfg.include.clone();
+    let exclude_requested: BTreeSet<String> =
+        updater_cfg.exclude.union(&flags.exclude).cloned().collect();
     let builtin_tasks = crate::updaters::builtin_catalog()?;
     let builtin_categories = builtin_tasks
         .iter()
@@ -8474,7 +8471,6 @@ fn build_task_specs(
                 id,
                 &known_ids_before_excludes,
                 &known_categories_before_excludes,
-                &exact_custom_ids,
             ) {
                 unknown.push(id.clone());
             }
@@ -8659,19 +8655,8 @@ fn selector_matches_known(
     selector: &str,
     known_ids: &BTreeSet<String>,
     known_categories: &BTreeSet<String>,
-    exact_custom_ids: &BTreeSet<String>,
 ) -> bool {
-    if known_ids.contains(selector) || known_categories.contains(selector) {
-        return true;
-    }
-    if exact_custom_ids.contains(selector) {
-        return false;
-    }
-
-    let expanded = expand_alias_ids(&BTreeSet::from([selector.to_string()]));
-    expanded
-        .iter()
-        .any(|id| known_ids.contains(id) || known_categories.contains(id))
+    known_ids.contains(selector) || known_categories.contains(selector)
 }
 
 fn order_task_specs(specs: Vec<TaskSpec>) -> Result<Vec<TaskSpec>> {
@@ -9238,51 +9223,6 @@ fn report_pattern_status(status: &str) -> TaskReportStatus {
         "info" => TaskReportStatus::Info,
         _ => TaskReportStatus::Info,
     }
-}
-
-fn enabled_custom_ids_for_host(updater_cfg: &UpdaterConfig, host_os: &HostOs) -> BTreeSet<String> {
-    updater_cfg
-        .custom_tasks
-        .values()
-        .filter(|custom| custom.enabled)
-        .filter(|custom| {
-            custom
-                .os
-                .iter()
-                .any(|os_name| host_os.matches_name(os_name.as_str()))
-        })
-        .map(|custom| custom.id.clone())
-        .collect()
-}
-
-fn expand_alias_ids(ids: &BTreeSet<String>) -> BTreeSet<String> {
-    expand_alias_ids_except(ids, &BTreeSet::new())
-}
-
-fn expand_alias_ids_except(
-    ids: &BTreeSet<String>,
-    exact_ids: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let builtin_tasks = crate::updaters::builtin_catalog().unwrap_or_default();
-    let mut out = BTreeSet::new();
-    for id in ids {
-        if exact_ids.contains(id) {
-            out.insert(id.clone());
-            continue;
-        }
-        let mut matched = false;
-        for task in &builtin_tasks {
-            if &task.id == id || task.include_with.iter().any(|selector| selector == id) {
-                out.insert(task.id.clone());
-                matched = true;
-            }
-        }
-        if matched {
-            continue;
-        }
-        out.insert(id.clone());
-    }
-    out
 }
 
 fn is_wsl_host() -> bool {

@@ -61,24 +61,7 @@ fn wait_for_file(path: &Path) {
 }
 
 #[test]
-fn expand_alias_ids_maps_winget_to_scope_tasks() {
-    let mut input = BTreeSet::new();
-    input.insert("winget".to_string());
-    input.insert("rust".to_string());
-    input.insert("builtin/pipx".to_string());
-
-    let expanded = expand_alias_ids(&input);
-    assert!(expanded.contains("builtin/winget-user"));
-    assert!(expanded.contains("builtin/winget-machine"));
-    assert!(expanded.contains("builtin/rustup"));
-    assert!(expanded.contains("builtin/cargo"));
-    assert!(expanded.contains("builtin/pipx"));
-    assert!(!expanded.contains("winget"));
-    assert!(!expanded.contains("rust"));
-}
-
-#[test]
-fn build_task_specs_accepts_rust_only_alias() {
+fn build_task_specs_accepts_exact_rust_task_ids() {
     let _lock = env_guard();
 
     let temp = TempDir::new().unwrap();
@@ -103,7 +86,10 @@ fn build_task_specs_accepts_rust_only_alias() {
     };
     let flags = Sections {
         exclude: BTreeSet::new(),
-        only: Some(BTreeSet::from(["rust".to_string()])),
+        only: Some(BTreeSet::from([
+            "builtin/rustup".to_string(),
+            "builtin/cargo".to_string(),
+        ])),
     };
 
     let specs = build_task_specs(&flags, &HostOs::Linux, &updater_config).expect("build specs");
@@ -175,7 +161,7 @@ fn build_task_specs_allows_config_exclude_to_prune_direct_only_selector_without_
 }
 
 #[test]
-fn build_task_specs_allows_config_exclude_to_prune_only_alias_without_unknown_error() {
+fn build_task_specs_allows_config_exclude_to_prune_exact_only_selector() {
     let _lock = env_guard();
 
     let temp = TempDir::new().unwrap();
@@ -190,7 +176,7 @@ fn build_task_specs_allows_config_exclude_to_prune_only_alias_without_unknown_er
     let updater_config = UpdaterConfig {
         run_all_detected: false,
         include: BTreeSet::new(),
-        exclude: BTreeSet::from(["rust".to_string()]),
+        exclude: BTreeSet::from(["builtin/rustup".to_string(), "builtin/cargo".to_string()]),
         privilege_mode: crate::updaters::PrivilegeMode::PromptTty,
         custom_tasks: BTreeMap::new(),
         bootstrap: BootstrapConfig {
@@ -200,7 +186,10 @@ fn build_task_specs_allows_config_exclude_to_prune_only_alias_without_unknown_er
     };
     let flags = Sections {
         exclude: BTreeSet::new(),
-        only: Some(BTreeSet::from(["rust".to_string()])),
+        only: Some(BTreeSet::from([
+            "builtin/rustup".to_string(),
+            "builtin/cargo".to_string(),
+        ])),
     };
 
     let specs = build_task_specs(&flags, &HostOs::Linux, &updater_config).expect("build specs");
@@ -213,7 +202,7 @@ fn build_task_specs_allows_config_exclude_to_prune_only_alias_without_unknown_er
     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
     assert!(
         ids.is_empty(),
-        "excluded alias selector should prune expanded tasks without becoming unknown: {ids:?}"
+        "excluded exact selectors should prune tasks without becoming unknown: {ids:?}"
     );
 }
 
@@ -2851,7 +2840,7 @@ fn final_task_overview_summarizes_legacy_recovered_package_row_without_fake_upda
     assert!(final_text.contains("recovered=1"), "{final_text}");
     assert!(
         !final_text.contains("updated=1"),
-        "legacy package recovery rows must not be summarized as package updates:\n{final_text}"
+        "restored package recovery rows must not be summarized as package updates:\n{final_text}"
     );
 }
 
@@ -3190,7 +3179,6 @@ fn builtin_catalog_report_patterns_convert_to_command_report_sections() {
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
         resource_locks: Vec::new(),
-        include_with: Vec::new(),
         enabled_by_default: true,
         category: "language".to_string(),
         order_rank: 20,
@@ -4255,7 +4243,7 @@ fn build_task_specs_run_all_detected_false_does_not_materialize_legacy_npm_pipx(
     assert_eq!(
         ids,
         Vec::<&str>::new(),
-        "run_all_detected=false should not schedule legacy defaults: {ids:?}"
+        "run_all_detected=false should not schedule implicit defaults: {ids:?}"
     );
 }
 
@@ -4445,7 +4433,7 @@ fn bootstrap_enabled_includes_windows_foundations_task() {
 }
 
 #[test]
-fn only_winget_expands_to_both_winget_scopes() {
+fn exact_winget_scope_ids_select_both_tasks() {
     let _lock = env_guard();
 
     let updater_config = UpdaterConfig {
@@ -4461,7 +4449,10 @@ fn only_winget_expands_to_both_winget_scopes() {
     };
     let flags = Sections {
         exclude: BTreeSet::new(),
-        only: Some(BTreeSet::from(["winget".to_string()])),
+        only: Some(BTreeSet::from([
+            "builtin/winget-user".to_string(),
+            "builtin/winget-machine".to_string(),
+        ])),
     };
     let temp = TempDir::new().unwrap();
     write_executable(

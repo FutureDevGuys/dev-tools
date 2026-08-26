@@ -325,7 +325,6 @@ pub struct BuiltinTask {
     pub depends_on_selected: bool,
     pub depends_on_selected_exclude: Vec<String>,
     pub resource_locks: Vec<String>,
-    pub include_with: Vec<String>,
     pub enabled_by_default: bool,
     pub category: String,
     pub order_rank: u16,
@@ -363,7 +362,6 @@ struct BuiltinTaskEntry {
     depends_on_selected: Option<bool>,
     depends_on_selected_exclude: Option<Vec<String>>,
     resource_locks: Option<Vec<String>>,
-    include_with: Option<Vec<String>>,
     enabled_by_default: bool,
     category: String,
     order_rank: Option<u16>,
@@ -659,7 +657,6 @@ fn parse_builtin_catalog() -> Result<Vec<BuiltinTask>> {
         qualify_builtin_references(&raw_ids, &mut task.after);
         qualify_builtin_references(&raw_ids, &mut task.requires_selected_any);
         qualify_builtin_references(&raw_ids, &mut task.depends_on_selected_exclude);
-        qualify_builtin_references(&raw_ids, &mut task.include_with);
     }
     validate_builtin_catalog(tasks)
 }
@@ -823,7 +820,6 @@ impl BuiltinTaskEntry {
             depends_on_selected: self.depends_on_selected.unwrap_or(false),
             depends_on_selected_exclude: self.depends_on_selected_exclude.unwrap_or_default(),
             resource_locks: self.resource_locks.unwrap_or_default(),
-            include_with: self.include_with.unwrap_or_default(),
             enabled_by_default: self.enabled_by_default,
             category: self.category,
             order_rank: self.order_rank.unwrap_or(20),
@@ -1381,14 +1377,6 @@ fn validate_builtin_catalog(tasks: Vec<BuiltinTask>) -> Result<Vec<BuiltinTask>>
             if predecessor.trim().is_empty() {
                 anyhow::bail!(
                     "built-in updater catalog task '{}' has an empty ordering predecessor",
-                    task.id
-                );
-            }
-        }
-        for selector in &task.include_with {
-            if selector.trim().is_empty() {
-                anyhow::bail!(
-                    "built-in updater catalog task '{}' has an empty include_with selector",
                     task.id
                 );
             }

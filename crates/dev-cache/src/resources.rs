@@ -135,7 +135,7 @@ pub fn register_routed(
         } else {
             let mut initial_hazards = BTreeSet::new();
             if linked_state_sensitive(kind) && directory_nonempty(&absolute)? {
-                initial_hazards.insert("legacy-linked-state-unknown".to_owned());
+                initial_hazards.insert("existing-linked-state-unknown".to_owned());
             }
             ResourceRecord {
                 schema_version: SCHEMA_VERSION,

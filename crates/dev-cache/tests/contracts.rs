@@ -265,7 +265,6 @@ fn default_intercept_directory_is_product_owned_xdg_data() {
             .to_string_lossy()
             .as_ref()
     );
-    assert!(payload.get("compatibility_aliases").is_none());
 }
 
 #[test]
@@ -617,7 +616,7 @@ fn migration_is_dry_run_first_and_never_follows_symlinks() {
     let root_dir = tempfile::tempdir().expect("root directory");
     let source_dir = tempfile::tempdir().expect("source directory");
     let root = RootHandle::initialize(root_dir.path()).expect("cache root");
-    fs::write(source_dir.path().join("cache.bin"), b"cache").expect("legacy cache");
+    fs::write(source_dir.path().join("cache.bin"), b"cache").expect("existing cache");
 
     let plan = migrate::migrate(&root, None, Adapter::Npm, source_dir.path(), false, false)
         .expect("migration plan");
@@ -641,7 +640,7 @@ fn migration_plan_reports_when_an_active_destination_cannot_be_replaced() {
     let root_dir = tempfile::tempdir().expect("root directory");
     let source_dir = tempfile::tempdir().expect("source directory");
     let root = RootHandle::initialize(root_dir.path()).expect("cache root");
-    fs::write(source_dir.path().join("legacy.bin"), b"legacy").expect("legacy cache");
+    fs::write(source_dir.path().join("existing.bin"), b"existing").expect("existing cache");
     let destination = root.shared().join("npm");
     fs::create_dir_all(&destination).expect("active destination");
     fs::write(destination.join("active.bin"), b"active").expect("active cache");
@@ -747,7 +746,7 @@ fn migration_selects_independent_resources_without_guessing() {
     let root_dir = tempfile::tempdir().expect("root directory");
     let source_dir = tempfile::tempdir().expect("source directory");
     let root = RootHandle::initialize(root_dir.path()).expect("cache root");
-    fs::write(source_dir.path().join("module.zip"), b"module").expect("legacy module");
+    fs::write(source_dir.path().join("module.zip"), b"module").expect("existing module");
 
     let plan = migrate::migrate_resource(
         &root,
@@ -776,10 +775,10 @@ fn migration_selects_independent_resources_without_guessing() {
 fn migration_accepts_only_the_owned_v1_namespace_inside_the_root() {
     let root_dir = tempfile::tempdir().expect("root directory");
     let root = RootHandle::initialize(root_dir.path()).expect("cache root");
-    let legacy = root.root.join("v1").join(&root.platform).join("shared/npm");
-    fs::create_dir_all(&legacy).expect("legacy cache");
-    fs::write(legacy.join("cache.bin"), b"cache").expect("legacy object");
-    assert!(migrate::migrate(&root, None, Adapter::Npm, &legacy, false, false).is_ok());
+    let existing = root.root.join("v1").join(&root.platform).join("shared/npm");
+    fs::create_dir_all(&existing).expect("existing cache");
+    fs::write(existing.join("cache.bin"), b"cache").expect("existing object");
+    assert!(migrate::migrate(&root, None, Adapter::Npm, &existing, false, false).is_ok());
 
     let unrelated = root.root.join("unrelated");
     fs::create_dir(&unrelated).expect("unrelated root child");

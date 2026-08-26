@@ -1484,18 +1484,12 @@ fn completion_install_zsh(rc_root: PathBuf) -> Result<CompletionInstallResult> {
     let managed_completion_dir = managed_completion_dir(&rc_root);
     let overlay_completion_dir = managed_overlay_dir(&rc_root);
     let bootstrap_file = bootstrap_dir.join("20-update-all-managed-fpath.zsh");
-    let compat_file = completion_init_dir.join("15-update-all-managed.zsh");
+    let retired_completion_init_file = completion_init_dir.join("15-update-all-managed.zsh");
     let self_completion_path = managed_completion_dir.join("_update-all");
     fs::create_dir_all(&bootstrap_dir)
         .with_context(|| format!("create bootstrap dir {}", bootstrap_dir.to_string_lossy()))?;
     fs::create_dir_all(&manifest_dir)
         .with_context(|| format!("create manifest dir {}", manifest_dir.to_string_lossy()))?;
-    fs::create_dir_all(&completion_init_dir).with_context(|| {
-        format!(
-            "create completion-init dir {}",
-            completion_init_dir.to_string_lossy()
-        )
-    })?;
     fs::create_dir_all(&managed_completion_dir).with_context(|| {
         format!(
             "create managed completion dir {}",
@@ -1525,12 +1519,6 @@ do
 done
 unset _rc_comp_dir
 "#;
-    let compat_payload = r#"# managed by update-all; compatibility shim
-# Completion directories are now registered during early shell bootstrap, before
-# compinit runs. Keep this file as a harmless marker for older installs.
-return 0
-"#;
-
     let bootstrap_changed =
         write_bytes_if_changed(&bootstrap_file, bootstrap_payload.as_bytes())
             .with_context(|| format!("write {}", bootstrap_file.to_string_lossy()))?;
@@ -1538,8 +1526,7 @@ return 0
         &manifest_path,
         "shell/bootstrap/completions/20-update-all-managed-fpath.zsh",
     )?;
-    let compat_changed = write_bytes_if_changed(&compat_file, compat_payload.as_bytes())
-        .with_context(|| format!("write {}", compat_file.to_string_lossy()))?;
+    let retired_marker_removed = remove_owned_completion_marker(&retired_completion_init_file)?;
     let self_changed = write_bytes_if_changed(
         &self_completion_path,
         generate_update_all_completion("zsh")?.as_bytes(),
@@ -1551,7 +1538,7 @@ return 0
     } else {
         "__UA_COMP_UNCHANGED"
     };
-    let apply_status = if bootstrap_changed || manifest_changed || compat_changed {
+    let apply_status = if bootstrap_changed || manifest_changed || retired_marker_removed {
         "installed"
     } else {
         "unchanged"
@@ -1569,6 +1556,22 @@ return 0
             ),
         ],
     })
+}
+
+fn remove_owned_completion_marker(path: &Path) -> Result<bool> {
+    let body = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    if !body.starts_with("# managed by update-all;") {
+        anyhow::bail!(
+            "refusing to remove unowned completion-init file {}",
+            path.display()
+        );
+    }
+    fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    Ok(true)
 }
 
 fn completion_install_powershell(powershell_root: &Path) -> Result<CompletionInstallResult> {
@@ -1995,11 +1998,26 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn owned_completion_marker_is_removed_without_touching_unowned_files() {
+        let temp = TempDir::new().unwrap();
+        let owned = temp.path().join("owned.zsh");
+        fs::write(&owned, "# managed by update-all; marker\nreturn 0\n").unwrap();
+        assert!(remove_owned_completion_marker(&owned).unwrap());
+        assert!(!owned.exists());
+        assert!(!remove_owned_completion_marker(&owned).unwrap());
+
+        let unowned = temp.path().join("unowned.zsh");
+        fs::write(&unowned, "return 0\n").unwrap();
+        assert!(remove_owned_completion_marker(&unowned).is_err());
+        assert!(unowned.is_file());
+    }
+
+    #[test]
     fn completion_skip_records_classify_provider_init_without_hiding_required_failures() {
         let records = vec![
             completion_record_from_skip("uv", "provider_init", "uv_tool_list_empty"),
             completion_record_from_skip("path", "broken", "generator_probe_timeout"),
-            completion_record_from_skip("npm", "legacy", "unsupported_generator"),
+            completion_record_from_skip("npm", "unsupported", "unsupported_generator"),
             completion_record_from_skip(
                 "path",
                 "required",

@@ -32,7 +32,7 @@ There is deliberately no separate refresh command: routing is reconciled on each
 
 Explicit native cache/output settings and `DEV_CACHE_MODE=off` remain authoritative. Unsupported versions, unparseable persistent configuration, external services, remote backends, symlink-sensitive modes, and linked-state ambiguity affect only the relevant resource; the original command delegates unchanged and the resource is not presented as routed or collectible.
 
-Migration is always explicit and dry-run first. A successful applied migration fingerprints the source and destination, publishes only into a known adapter resource, writes a receipt, and registers the verified destination in the same authoritative catalog. Dev Cache does not implicitly discover or adopt legacy product state.
+Migration is always explicit and dry-run first. A successful applied migration fingerprints the source and destination, publishes only into a known adapter resource, writes a receipt, and registers the verified destination in the same authoritative catalog. Dev Cache does not implicitly discover or adopt existing product state.
 
 ## Activation health
 

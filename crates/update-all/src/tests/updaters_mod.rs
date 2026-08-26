@@ -170,13 +170,6 @@ fn builtin_catalog_carries_declarative_detection_rules() {
         ),
         _ => panic!("go should be a command task"),
     }
-    assert_eq!(find("winget-user").include_with, vec!["winget".to_string()]);
-    assert_eq!(
-        find("winget-machine").include_with,
-        vec!["winget".to_string()]
-    );
-    assert_eq!(find("rustup").include_with, vec!["rust".to_string()]);
-    assert_eq!(find("cargo").include_with, vec!["rust".to_string()]);
     assert_eq!(
         find("arch-update-services").report_parser,
         Some(BuiltinReportParser::ArchUpdateServices)
@@ -354,36 +347,6 @@ kind = "managed"
 }
 
 #[test]
-fn managed_catalog_entries_reject_legacy_program_kinds() {
-    for legacy_kind in ["npm", "pipx", "completions"] {
-        let raw = format!(
-            r#"
-[[tasks]]
-id = "demo"
-label = "Demo"
-os = ["linux"]
-detect_any = ["demo"]
-depends_on = []
-enabled_by_default = true
-category = "language"
-kind = "{legacy_kind}"
-"#
-        );
-        let catalog: BuiltinCatalog = toml::from_str(&raw).expect("valid TOML shape");
-        let err = catalog
-            .tasks
-            .into_iter()
-            .next()
-            .expect("task")
-            .into_builtin_task()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unsupported kind"), "{err}");
-        assert!(err.contains(legacy_kind), "{err}");
-    }
-}
-
-#[test]
 fn non_command_catalog_entries_reject_command_fields() {
     let entry = BuiltinTaskEntry {
         id: "npm".to_string(),
@@ -401,7 +364,6 @@ fn non_command_catalog_entries_reject_command_fields() {
         depends_on_selected: None,
         depends_on_selected_exclude: None,
         resource_locks: None,
-        include_with: None,
         enabled_by_default: true,
         category: "language".to_string(),
         order_rank: None,
@@ -452,7 +414,6 @@ fn catalog_entries_reject_unknown_report_parser() {
             depends_on_selected: None,
             depends_on_selected_exclude: None,
             resource_locks: None,
-            include_with: None,
             enabled_by_default: true,
             category: "maintenance".to_string(),
             order_rank: None,
@@ -537,7 +498,6 @@ fn builtin_catalog_validation_rejects_unknown_os_names() {
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
         resource_locks: Vec::new(),
-        include_with: Vec::new(),
         enabled_by_default: true,
         category: "maintenance".to_string(),
         order_rank: 20,
@@ -572,7 +532,6 @@ fn builtin_catalog_validation_rejects_any_present_without_any_detector() {
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
         resource_locks: Vec::new(),
-        include_with: Vec::new(),
         enabled_by_default: true,
         category: "maintenance".to_string(),
         order_rank: 20,
@@ -607,7 +566,6 @@ fn builtin_catalog_validation_rejects_unknown_relationship_selectors() {
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
         resource_locks: Vec::new(),
-        include_with: Vec::new(),
         enabled_by_default: true,
         category: "maintenance".to_string(),
         order_rank: 20,

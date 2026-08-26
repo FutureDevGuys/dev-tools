@@ -123,7 +123,7 @@ enum CommandKind {
         #[arg(long)]
         intercept_dir: Option<PathBuf>,
     },
-    /// Plan or copy a legacy cache into its routed destination.
+    /// Plan or copy a existing cache into its routed destination.
     Migrate(MigrateArgs),
 }
 

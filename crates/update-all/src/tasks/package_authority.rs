@@ -750,15 +750,15 @@ print(json.dumps({"operation":"reconcile","authority_packages":[]}))
 print(json.dumps({
   "changed": True,
   "desired_packages": [],
-  "excluded_packages": ["legacy-cli"],
+  "excluded_packages": ["former-cli"],
   "packages": [{
     "package_id": "linux-demo-cli",
     "observed_backend": "npm",
-    "observed_package": "legacy-cli",
+    "observed_package": "former-cli",
     "desired_backend": "aur",
     "desired_package": "demo-cli",
     "status": "reconciled",
-    "removed_packages": ["legacy-cli"],
+    "removed_packages": ["former-cli"],
     "note": "direct desired-provider command health probe passed"
   }]
 }))
@@ -769,14 +769,14 @@ print(json.dumps({
             os_name: "linux".to_string(),
             linux_family: "arch".to_string(),
             observed_backend: "npm".to_string(),
-            observed_packages: vec!["legacy-cli".to_string()],
+            observed_packages: vec!["former-cli".to_string()],
             verify_desired: false,
         };
 
         let outcome = reconcile_installed_providers(&source_root, &run_dir, &request).unwrap();
 
         assert!(outcome.changed);
-        assert_eq!(outcome.excluded_packages, vec!["legacy-cli"]);
+        assert_eq!(outcome.excluded_packages, vec!["former-cli"]);
         assert_eq!(
             outcome.packages[0].status,
             PackageAuthorityStatus::Reconciled
