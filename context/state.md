@@ -1,6 +1,4 @@
 # Active work
 
-- Complete runtime acceptance for the shared signed per-product release path, including external-manager, locked-binary, rollback, and repeated-convergence probes.
-- Finish public extraction audits for private identifiers, retired names, dependency licenses, fixtures, build metadata, and release archives.
 - Native Windows and WSL runtime acceptance remains required before those platforms are advertised as supported.
-- Publish the initial signed releases.
+- The current Linux cache root contains identity-mismatched disposable workspace records that keep `dev-cache doctor` maintenance health nonzero. The separately assigned Dev Cache GC work owns reconciliation; preserve fail-closed behavior until it completes.
