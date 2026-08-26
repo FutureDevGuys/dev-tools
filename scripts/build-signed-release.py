@@ -167,7 +167,7 @@ def main() -> int:
     if destination.exists() and any(destination.iterdir()):
         raise SystemExit(f"release output directory is not empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(args.artifact, destination / artifact_name)
+    shutil.copy2(args.artifact, destination / artifact_name)
     write_json(
         destination / "dev-tools-root.json",
         root_envelope(root_document, [root_key, *additional_root_keys]),

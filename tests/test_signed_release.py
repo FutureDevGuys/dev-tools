@@ -26,6 +26,7 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
     write_key(root_file, root)
     write_key(release_file, release)
     artifact.write_bytes(b"fixture artifact")
+    artifact.chmod(0o755)
     trust = tmp_path / "root.pub"
     trust.write_text(root.public_key().public_bytes_raw().hex() + "\n", encoding="ascii")
     outputs = []
@@ -71,6 +72,7 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
     assert signed["product"] == "dev-cache"
     assert signed["generation"] == 2
     assert signed["artifacts"]["linux-x86_64"]["length"] == len(b"fixture artifact")
+    assert (outputs[0] / "dev-cache-1.2.3-linux-x86_64").stat().st_mode & 0o111
 
 
 def test_release_recipe_emits_dual_root_signatures_for_rotation(tmp_path: Path) -> None:
