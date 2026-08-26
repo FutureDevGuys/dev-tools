@@ -11,8 +11,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const NPM_OUTDATED_TIMEOUT_SECS: u64 = 60;
@@ -40,6 +40,484 @@ struct ManifestProtocolIssue {
     dependency: String,
     spec: String,
     protocol: String,
+}
+
+#[derive(Clone, Debug)]
+struct NpmGlobalLayout {
+    prefix: PathBuf,
+    root: PathBuf,
+}
+
+fn npm_global_path(npm_bin: &str, subcommand: &str) -> Result<PathBuf> {
+    let raw = run_capture_allow_exit_codes(
+        npm_bin,
+        [subcommand, "-g"],
+        Some(Duration::from_secs(30)),
+        &[],
+    )?;
+    let path = raw
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("npm {subcommand} -g returned an empty path"))?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "npm {subcommand} -g returned a non-absolute path: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+#[cfg(unix)]
+fn unix_path_authority_issue(owner_uid: u32, current_uid: u32, mode: u32) -> Option<&'static str> {
+    if owner_uid == 0 {
+        return Some("is owned by root");
+    }
+    if owner_uid != current_uid {
+        return Some("is not owned by the current user");
+    }
+    if mode & 0o300 != 0o300 {
+        return Some("is not writable and searchable by its owner");
+    }
+    None
+}
+
+#[cfg(unix)]
+fn current_unix_uid() -> Result<u32> {
+    static CURRENT_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(uid) = CURRENT_UID.get() {
+        return Ok(*uid);
+    }
+    let id_path = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .context("could not find a trusted absolute id executable")?;
+    let uid_output = Command::new(id_path)
+        .arg("-u")
+        .output()
+        .context("could not determine the current Unix user id")?;
+    if !uid_output.status.success() {
+        anyhow::bail!("id -u exited with {}", uid_output.status);
+    }
+    let current_uid = String::from_utf8(uid_output.stdout)
+        .context("id -u returned non-UTF-8 output")?
+        .trim()
+        .parse::<u32>()
+        .context("id -u returned an invalid user id")?;
+    let _ = CURRENT_UID.set(current_uid);
+    Ok(current_uid)
+}
+
+#[cfg(unix)]
+fn platform_path_authority_issue(path: &Path) -> Result<Option<String>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("could not inspect npm mutation path {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Ok(Some(format!("{} is not a directory", path.display())));
+    }
+    let current_uid = current_unix_uid()?;
+    Ok(
+        unix_path_authority_issue(metadata.uid(), current_uid, metadata.permissions().mode())
+            .map(|reason| format!("{} {reason}", path.display())),
+    )
+}
+
+#[cfg(windows)]
+fn platform_path_authority_issue(path: &Path) -> Result<Option<String>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("could not inspect npm mutation path {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Ok(Some(format!("{} is not a directory", path.display())));
+    }
+    if metadata.permissions().readonly() {
+        return Ok(Some(format!("{} is read-only", path.display())));
+    }
+    let trusted_roots = ["USERPROFILE", "LOCALAPPDATA", "APPDATA"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect::<Vec<_>>();
+    if trusted_roots.iter().any(|root| path.starts_with(root)) {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "{} is outside the current user's Windows profile roots",
+            path.display()
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_path_authority_issue(path: &Path) -> Result<Option<String>> {
+    Ok(Some(format!(
+        "ownership checks are unsupported for {} on this platform",
+        path.display()
+    )))
+}
+
+fn npm_mutation_layout(
+    npm_bin: &str,
+    planned_packages: &[(String, Option<PathBuf>)],
+) -> Result<NpmGlobalLayout, String> {
+    let prefix_raw = npm_global_path(npm_bin, "prefix")
+        .map_err(|error| format!("could not resolve npm global prefix: {error}"))?;
+    let root_raw = npm_global_path(npm_bin, "root")
+        .map_err(|error| format!("could not resolve npm global root: {error}"))?;
+    let prefix = fs::canonicalize(&prefix_raw).map_err(|error| {
+        format!(
+            "could not canonicalize npm global prefix {}: {error}",
+            prefix_raw.display()
+        )
+    })?;
+    let root = fs::canonicalize(&root_raw).map_err(|error| {
+        format!(
+            "could not canonicalize npm global root {}: {error}",
+            root_raw.display()
+        )
+    })?;
+    if !root.starts_with(&prefix) {
+        return Err(format!(
+            "npm global root {} is outside global prefix {}",
+            root.display(),
+            prefix.display()
+        ));
+    }
+
+    let mut mutation_paths = vec![prefix.clone(), root.clone()];
+    #[cfg(not(windows))]
+    {
+        let prefix_bin = prefix.join("bin");
+        if prefix_bin.exists() {
+            mutation_paths.push(prefix_bin);
+        }
+    }
+    for (package, reported_location) in planned_packages {
+        let package_path = reported_location
+            .clone()
+            .unwrap_or_else(|| root.join(package));
+        let path = package_path.as_path();
+        let normalized = if path.exists() {
+            fs::canonicalize(path).map_err(|error| {
+                format!(
+                    "could not canonicalize planned npm package location {}: {error}",
+                    path.display()
+                )
+            })?
+        } else {
+            lexical_absolute_path(path).ok_or_else(|| {
+                format!(
+                    "planned npm package location is not a safe absolute path: {}",
+                    path.display()
+                )
+            })?
+        };
+        if !normalized.starts_with(&root) || normalized == root {
+            return Err(format!(
+                "planned npm package location {} is outside global root {}",
+                normalized.display(),
+                root.display()
+            ));
+        }
+        if normalized.exists() {
+            mutation_paths.push(normalized);
+        }
+    }
+    mutation_paths.sort();
+    mutation_paths.dedup();
+    for path in &mutation_paths {
+        if let Some(issue) = platform_path_authority_issue(path)
+            .map_err(|error| format!("npm global authority inspection failed: {error}"))?
+        {
+            return Err(issue);
+        }
+    }
+    Ok(NpmGlobalLayout { prefix, root })
+}
+
+fn npm_authority_blocked_result(
+    reason: String,
+    packages: &BTreeMap<String, NpmOutdatedEntry>,
+    excluded_packages: &BTreeSet<String>,
+    system_managed_packages: &BTreeMap<String, String>,
+    authority_outcome: Option<&package_authority::PackageAuthorityOutcome>,
+) -> TaskResult {
+    let remediation = "Update package-manager-owned Node/npm packages through their owning system manager. Move unowned global npm packages to a user-owned, user-writable npm prefix or a supported per-user Node installation, then rerun update-all; update-all will not infer sudo or rewrite ownership.".to_string();
+    let mut rows = vec![TaskReportRow {
+        name: "global npm tree".to_string(),
+        status: TaskReportStatus::Blocked,
+        before: Some("installed".to_string()),
+        after: None,
+        note: Some(reason.clone()),
+    }];
+    for (package, entry) in packages {
+        if let Some(owner) = system_managed_packages.get(package) {
+            rows.push(TaskReportRow {
+                name: package.clone(),
+                status: TaskReportStatus::Skipped,
+                before: normalize_version(entry.current.as_deref()),
+                after: None,
+                note: Some(format!("excluded because it is owned by {owner}")),
+            });
+            continue;
+        }
+        if excluded_packages.contains(package) {
+            continue;
+        }
+        rows.push(TaskReportRow {
+            name: package.clone(),
+            status: TaskReportStatus::Blocked,
+            before: normalize_version(entry.current.as_deref())
+                .or_else(|| Some(MISSING_NPM_CURRENT_VERSION.to_string())),
+            after: select_target(entry),
+            note: Some("unowned global-root residue; not mutated".to_string()),
+        });
+    }
+    let mut result = TaskResult::completed("NPM");
+    result.details.push(format!(
+        "Blocked npm global updates before mutation: {reason}"
+    ));
+    result.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Error,
+        code: "npm-global-authority-blocked".to_string(),
+        summary: "NPM global update authority could not be established".to_string(),
+        remediation,
+        blocks_dependents: true,
+    });
+    result.report_sections.push(TaskReportSection {
+        key: "npm_authority".to_string(),
+        title: "NPM Global Authority".to_string(),
+        rows,
+    });
+    if let Some(outcome) = authority_outcome {
+        if let Some(section) = package_authority::report_section(outcome) {
+            result.report_sections.push(section);
+        }
+    }
+    result
+}
+
+fn npm_mutation_candidates(
+    packages: &BTreeMap<String, NpmOutdatedEntry>,
+    installed_versions: &BTreeMap<String, String>,
+    excluded_packages: &BTreeSet<String>,
+) -> Vec<(String, Option<PathBuf>)> {
+    packages
+        .iter()
+        .filter(|(package, entry)| {
+            if excluded_packages.contains(*package) {
+                return false;
+            }
+            let Some(target) = select_target(entry) else {
+                return false;
+            };
+            let current = npm_outdated_current_version(package, entry, installed_versions);
+            current.as_deref().is_none_or(|current| {
+                version_update_decision(current, &target) != VersionDecision::NotNewer
+            })
+        })
+        .map(|(package, entry)| {
+            (
+                package.clone(),
+                entry.location.as_deref().map(PathBuf::from),
+            )
+        })
+        .collect()
+}
+
+fn preflight_npm_mutation(
+    ctx: &SyncContext,
+    npm_bin: &str,
+    packages: &BTreeMap<String, NpmOutdatedEntry>,
+    installed_versions: &BTreeMap<String, String>,
+    excluded_packages: &BTreeSet<String>,
+    system_managed_packages: &BTreeMap<String, String>,
+    authority_outcome: Option<&package_authority::PackageAuthorityOutcome>,
+) -> Option<TaskResult> {
+    let candidates = npm_mutation_candidates(packages, installed_versions, excluded_packages);
+    if candidates.is_empty() {
+        return None;
+    }
+    match npm_mutation_layout(npm_bin, &candidates) {
+        Ok(layout) => {
+            ctx.log_line(
+                TASK_NPM,
+                LogLevel::Info,
+                LogStream::Meta,
+                format!(
+                    "verified user-owned npm mutation authority for prefix {} and root {}",
+                    layout.prefix.display(),
+                    layout.root.display()
+                ),
+            );
+            None
+        }
+        Err(reason) => {
+            ctx.log_line(
+                TASK_NPM,
+                LogLevel::Error,
+                LogStream::Meta,
+                format!("blocked npm global updates before mutation: {reason}"),
+            );
+            Some(npm_authority_blocked_result(
+                reason,
+                packages,
+                excluded_packages,
+                system_managed_packages,
+                authority_outcome,
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn successful_command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!output.is_empty()).then_some(output)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_system_manager_owner(path: &Path) -> Option<String> {
+    let path = path.to_string_lossy();
+    successful_command_output("pacman", &["-Qqo", path.as_ref()])
+        .map(|package| format!("pacman package {package}"))
+        .or_else(|| {
+            successful_command_output("dpkg-query", &["-S", path.as_ref()]).and_then(|output| {
+                let package = output.split(':').next()?.trim();
+                (!package.is_empty()).then(|| format!("dpkg package {package}"))
+            })
+        })
+        .or_else(|| {
+            successful_command_output("rpm", &["-qf", path.as_ref()])
+                .map(|package| format!("rpm package {package}"))
+        })
+        .or_else(|| {
+            successful_command_output("apk", &["info", "-W", path.as_ref()]).and_then(|output| {
+                let package = output.split_once(" is owned by ")?.1.trim();
+                (!package.is_empty()).then(|| format!("apk package {package}"))
+            })
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_system_manager_owner(_path: &Path) -> Option<String> {
+    None
+}
+
+fn npm_system_managed_packages(
+    npm_bin: &str,
+    packages: &BTreeMap<String, NpmOutdatedEntry>,
+) -> BTreeMap<String, String> {
+    let Ok(root) = npm_global_path(npm_bin, "root") else {
+        return BTreeMap::new();
+    };
+    packages
+        .iter()
+        .filter_map(|(package, entry)| {
+            let location = entry
+                .location
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join(package));
+            if !location.exists() {
+                return None;
+            }
+            let manifest = location.join("package.json");
+            let probe = if manifest.is_file() {
+                manifest.as_path()
+            } else {
+                location.as_path()
+            };
+            linux_system_manager_owner(probe).map(|owner| (package.clone(), owner))
+        })
+        .collect()
+}
+
+fn npm_install_authority_failure(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "eacces",
+        "eperm",
+        "permission denied",
+        "operation not permitted",
+        "access is denied",
+        "access denied",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+}
+
+fn npm_install_authority_failure_result(
+    plans: &[PlannedUpdate],
+    detail: String,
+    authority_outcome: Option<&package_authority::PackageAuthorityOutcome>,
+) -> TaskResult {
+    let remediation = "Repair the NPM installation by moving global packages to a user-owned, user-writable prefix or supported per-user Node installation. Update system-manager-owned packages through that manager; update-all will not infer sudo or rewrite ownership.".to_string();
+    let rows = plans
+        .iter()
+        .map(|plan| TaskReportRow {
+            name: plan.package.clone(),
+            status: TaskReportStatus::Blocked,
+            before: Some(plan.current.clone()),
+            after: Some(plan.target.clone()),
+            note: Some(
+                "install authority changed or could not be exercised; not retried".to_string(),
+            ),
+        })
+        .collect();
+    let mut result = TaskResult::completed("NPM");
+    result.details.push(format!(
+        "Blocked npm update after one authority failure; individual retries were suppressed: {detail}"
+    ));
+    result.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Error,
+        code: "npm-global-authority-blocked".to_string(),
+        summary: "NPM global update authority failed during installation".to_string(),
+        remediation,
+        blocks_dependents: true,
+    });
+    result.report_sections.push(TaskReportSection {
+        key: "npm_authority".to_string(),
+        title: "NPM Global Authority".to_string(),
+        rows,
+    });
+    if let Some(outcome) = authority_outcome {
+        if let Some(section) = package_authority::report_section(outcome) {
+            result.report_sections.push(section);
+        }
+    }
+    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -319,59 +797,8 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
         "npm"
     };
     let installed_global_versions = npm_list_global_versions(npm_bin);
-    let mut authority_outcome = if installed_global_versions.is_empty() {
-        None
-    } else {
-        match package_authority::reconcile_for_task(
-            ctx,
-            "npm",
-            installed_global_versions.keys().cloned().collect(),
-            false,
-        ) {
-            Ok(outcome) => Some(outcome),
-            Err(error) => {
-                let detail = format!("package-provider reconciliation skipped: {error}");
-                ctx.log_line(TASK_NPM, LogLevel::Warn, LogStream::Meta, detail.clone());
-                advisories.push(TaskAdvisory {
-                    severity: AdvisorySeverity::Warning,
-                    code: "package-authority-unavailable".to_string(),
-                    summary: "Package-provider reconciliation was unavailable".to_string(),
-                    remediation: detail,
-                    blocks_dependents: false,
-                });
-                None
-            }
-        }
-    };
-    let mut excluded_packages = authority_outcome
-        .as_ref()
-        .map(|outcome| {
-            outcome
-                .excluded_packages
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    match prune_stale_npm_temp_dirs(ctx, npm_bin) {
-        Ok(pruned) if !pruned.is_empty() => {
-            let summary = format!(
-                "Pruned {} stale npm temp package director{}: {}.",
-                pruned.len(),
-                if pruned.len() == 1 { "y" } else { "ies" },
-                pruned.join(", ")
-            );
-            ctx.log_line(TASK_NPM, LogLevel::Info, LogStream::Meta, summary.clone());
-            details.push(summary);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            let detail = format!("npm temp-dir cleanup skipped: {e}");
-            ctx.log_line(TASK_NPM, LogLevel::Warn, LogStream::Meta, detail.clone());
-            details.push(detail);
-        }
-    }
-
+    let mut authority_outcome = None;
+    let mut excluded_packages = BTreeSet::new();
     ctx.log_line(
         TASK_NPM,
         LogLevel::Info,
@@ -415,70 +842,88 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
     let parsed_outdated = match parse_npm_outdated_payload(&outdated) {
         Ok(entries) => entries,
         Err(e) => {
-            ctx.log_line(
-                TASK_NPM,
-                LogLevel::Warn,
-                LogStream::Meta,
-                format!("npm outdated parse failed ({e}); falling back to generic npm update -g"),
+            let detail = format!(
+                "npm outdated returned invalid structured output ({e}); refusing the unscoped npm update -g fallback"
             );
-            match run_npm_update_fallback(ctx, npm_bin) {
-                Ok(fallback_output) => {
-                    advisories.extend(collect_npm_advisories(&fallback_output));
-                    let blocked_scripts = parse_blocked_install_scripts(&fallback_output);
-                    if blocked_scripts.is_empty() {
-                        report_rows.push(TaskReportRow {
-                            name: "(fallback)".to_string(),
-                            status: TaskReportStatus::Info,
-                            before: None,
-                            after: None,
-                            note: Some(
-                                "used npm update -g fallback (package-level diff unavailable)"
-                                    .to_string(),
-                            ),
-                        });
-                    } else {
-                        for script in &blocked_scripts {
-                            record_unassociated_blocked_install_script(
-                                &mut lifecycle_rows,
-                                &mut advisories,
-                                script,
-                            );
-                        }
-                    }
-                }
-                Err(fallback_err) => {
-                    let detail = format!("fallback npm update failed: {fallback_err}");
-                    ctx.log_line(TASK_NPM, LogLevel::Error, LogStream::Meta, detail.clone());
-                    let mut result = TaskResult::failed("NPM", detail);
-                    result.report_sections.push(TaskReportSection {
-                        key: "npm_packages".to_string(),
-                        title: "NPM Package Results".to_string(),
-                        rows: vec![TaskReportRow {
-                            name: "(fallback)".to_string(),
-                            status: TaskReportStatus::Info,
-                            before: None,
-                            after: None,
-                            note: Some(
-                                "npm outdated parse failure and fallback update failed".to_string(),
-                            ),
-                        }],
-                    });
-                    if let Some(outcome) = authority_outcome.as_ref() {
-                        if let Some(section) = package_authority::report_section(outcome) {
-                            result.report_sections.push(section);
-                        }
-                    }
-                    result.advisories = dedupe_advisories(advisories);
-                    return Ok(result);
+            ctx.log_line(TASK_NPM, LogLevel::Error, LogStream::Meta, detail.clone());
+            let mut result = TaskResult::failed("NPM", detail.clone());
+            result.report_sections.push(TaskReportSection {
+                key: "npm_packages".to_string(),
+                title: "NPM Package Results".to_string(),
+                rows: vec![TaskReportRow {
+                    name: "npm outdated".to_string(),
+                    status: TaskReportStatus::Failed,
+                    before: None,
+                    after: None,
+                    note: Some(detail),
+                }],
+            });
+            if let Some(outcome) = authority_outcome.as_ref() {
+                if let Some(section) = package_authority::report_section(outcome) {
+                    result.report_sections.push(section);
                 }
             }
-            BTreeMap::new()
+            result.advisories = dedupe_advisories(advisories);
+            return Ok(result);
         }
     };
 
+    let system_managed_packages = npm_system_managed_packages(npm_bin, &parsed_outdated);
+    for (package, owner) in &system_managed_packages {
+        excluded_packages.insert(package.clone());
+        ctx.log_line(
+            TASK_NPM,
+            LogLevel::Info,
+            LogStream::Meta,
+            format!("- {package}: excluded from npm mutation ({owner})"),
+        );
+    }
+    if let Some(blocked) = preflight_npm_mutation(
+        ctx,
+        npm_bin,
+        &parsed_outdated,
+        &installed_global_versions,
+        &excluded_packages,
+        &system_managed_packages,
+        None,
+    ) {
+        return Ok(blocked);
+    }
+
+    let observed_outdated_packages = parsed_outdated
+        .keys()
+        .filter(|package| {
+            installed_global_versions.contains_key(*package)
+                && !excluded_packages.contains(*package)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !observed_outdated_packages.is_empty() {
+        match package_authority::reconcile_for_task(ctx, "npm", observed_outdated_packages, false) {
+            Ok(outcome) => {
+                excluded_packages.extend(outcome.excluded_packages.iter().cloned());
+                authority_outcome = Some(outcome);
+            }
+            Err(error) => {
+                let detail = format!("package-provider reconciliation skipped: {error}");
+                ctx.log_line(TASK_NPM, LogLevel::Warn, LogStream::Meta, detail.clone());
+                advisories.push(TaskAdvisory {
+                    severity: AdvisorySeverity::Warning,
+                    code: "package-authority-unavailable".to_string(),
+                    summary: "Package-provider reconciliation was unavailable".to_string(),
+                    remediation: detail,
+                    blocks_dependents: false,
+                });
+            }
+        }
+    }
+
     let unobserved_outdated_packages = parsed_outdated
         .keys()
-        .filter(|package| !installed_global_versions.contains_key(*package))
+        .filter(|package| {
+            !installed_global_versions.contains_key(*package)
+                && !excluded_packages.contains(*package)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if !unobserved_outdated_packages.is_empty() {
@@ -504,6 +949,33 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                     remediation: detail,
                     blocks_dependents: false,
                 });
+            }
+        }
+    }
+
+    if !npm_mutation_candidates(
+        &parsed_outdated,
+        &installed_global_versions,
+        &excluded_packages,
+    )
+    .is_empty()
+    {
+        match prune_stale_npm_temp_dirs(ctx, npm_bin) {
+            Ok(pruned) if !pruned.is_empty() => {
+                let summary = format!(
+                    "Pruned {} stale npm temp package director{}: {}.",
+                    pruned.len(),
+                    if pruned.len() == 1 { "y" } else { "ies" },
+                    pruned.join(", ")
+                );
+                ctx.log_line(TASK_NPM, LogLevel::Info, LogStream::Meta, summary.clone());
+                details.push(summary);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let detail = format!("npm temp-dir cleanup skipped: {e}");
+                ctx.log_line(TASK_NPM, LogLevel::Warn, LogStream::Meta, detail.clone());
+                details.push(detail);
             }
         }
     }
@@ -534,21 +1006,25 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
             let current_missing = current.is_none();
             let current = current.unwrap_or_else(|| MISSING_NPM_CURRENT_VERSION.to_string());
             if excluded_packages.contains(pkg) {
+                let note = system_managed_packages.get(pkg).map_or_else(
+                    || {
+                        "non-desired provider excluded from npm update and handed to reconciliation"
+                            .to_string()
+                    },
+                    |owner| format!("owned by {owner}; update through that manager"),
+                );
                 ctx.log_line(
                     TASK_NPM,
                     LogLevel::Info,
                     LogStream::Meta,
-                    format!("- {pkg}: skipped (catalog selects another provider on this host)"),
+                    format!("- {pkg}: skipped ({note})"),
                 );
                 report_rows.push(TaskReportRow {
                     name: pkg.clone(),
                     status: TaskReportStatus::Skipped,
                     before: Some(current),
                     after: None,
-                    note: Some(
-                        "non-desired provider excluded from npm update and handed to reconciliation"
-                            .to_string(),
-                    ),
+                    note: Some(note),
                 });
                 continue;
             }
@@ -839,6 +1315,22 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                     }
                 }
                 Err(e) => {
+                    if npm_install_authority_failure(&e.to_string()) {
+                        let detail = format!("npm install authority failure: {e}");
+                        ctx.log_line(
+                            TASK_NPM,
+                            LogLevel::Error,
+                            LogStream::Meta,
+                            format!(
+                                "{detail}; suppressing per-package retries and refusing elevation"
+                            ),
+                        );
+                        return Ok(npm_install_authority_failure_result(
+                            &plans,
+                            detail,
+                            authority_outcome.as_ref(),
+                        ));
+                    }
                     let retry_plan = RecoveryPlan {
                         kind: PackageManagerKind::Npm,
                         causes: vec![RecoveryCause::PartialBatchFailure],
@@ -1175,26 +1667,6 @@ fn dedupe_advisories(advisories: Vec<TaskAdvisory>) -> Vec<TaskAdvisory> {
             .or_insert(advisory);
     }
     seen.into_values().collect()
-}
-
-fn run_npm_update_fallback(ctx: &SyncContext, npm_bin: &str) -> Result<String> {
-    ctx.log_line(
-        TASK_NPM,
-        LogLevel::Info,
-        LogStream::Meta,
-        "running fallback npm update -g",
-    );
-    let fallback_out = ctx.run_command_with_policy(
-        TASK_NPM,
-        npm_bin,
-        vec!["update".to_string(), "-g".to_string()],
-        &ctx.task_policies.npm_install,
-        false,
-    )?;
-    if ctx.emit_plain {
-        crate::ua_out!("{fallback_out}");
-    }
-    Ok(fallback_out)
 }
 
 fn prune_stale_npm_temp_dirs(ctx: &SyncContext, npm_bin: &str) -> Result<Vec<String>> {
@@ -1838,6 +2310,20 @@ fn build_report_counts_line(rows: &[TaskReportRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_npm_authority_rejects_root_and_non_writable_ownership() {
+        assert_eq!(
+            unix_path_authority_issue(0, 1000, 0o755),
+            Some("is owned by root")
+        );
+        assert_eq!(
+            unix_path_authority_issue(1000, 1000, 0o555),
+            Some("is not writable and searchable by its owner")
+        );
+        assert_eq!(unix_path_authority_issue(1000, 1000, 0o755), None);
+    }
 
     #[test]
     fn npm_manifest_protocol_issue_tolerates_noisy_json_output() {

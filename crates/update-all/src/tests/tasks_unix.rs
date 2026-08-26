@@ -338,6 +338,11 @@ if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
   exit 0
 fi
 
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+
 if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
   cat <<'JSON'
 {"dependencies":{"missing-current":{"overridden":false}}}
@@ -349,9 +354,7 @@ if [ "$1" = "outdated" ] && [ "${2:-}" = "-g" ]; then
   if [ -f "${NPM_STUB_INSTALLED:?missing marker}" ]; then
     printf '%s\n' '{}'
   else
-    cat <<'JSON'
-{"missing-current":{"wanted":"1.2.3","latest":"1.2.3","dependent":"global","location":"/tmp/missing-current"}}
-JSON
+    printf '{"missing-current":{"wanted":"1.2.3","latest":"1.2.3","dependent":"global","location":"%s"}}\n' "${NPM_STUB_PACKAGE:?missing package location}"
   fi
   exit 1
 fi
@@ -387,6 +390,11 @@ exit 2
     let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     let _path_guard = EnvVarGuard::set("PATH", merged_path);
     let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
+    let _package_guard = EnvVarGuard::set(
+        "NPM_STUB_PACKAGE",
+        npm_root.join("missing-current").as_os_str().to_os_string(),
+    );
     let _marker_guard = EnvVarGuard::set(
         "NPM_STUB_INSTALLED",
         install_marker.as_os_str().to_os_string(),
@@ -430,6 +438,11 @@ if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
   exit 0
 fi
 
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+
 if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
   cat <<'JSON'
 {"dependencies":{"@qwen-code/qwen-code":{"version":"0.15.11","overridden":false}}}
@@ -464,6 +477,7 @@ exit 2
     let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     let _path_guard = EnvVarGuard::set("PATH", merged_path);
     let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
     let _marker_guard = EnvVarGuard::set(
         "NPM_STUB_INSTALLED",
         install_marker.as_os_str().to_os_string(),
@@ -506,6 +520,11 @@ if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
   exit 0
 fi
 
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+
 if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
   cat <<'JSON'
 {"dependencies":{"location-version":{"overridden":false}}}
@@ -538,6 +557,7 @@ exit 2
     let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     let _path_guard = EnvVarGuard::set("PATH", merged_path);
     let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
     let _package_guard = EnvVarGuard::set(
         "NPM_STUB_PACKAGE_DIR",
         package_dir.as_os_str().to_os_string(),
@@ -581,6 +601,11 @@ if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
   exit 0
 fi
 
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+
 if [ "$1" = "outdated" ] && [ "${2:-}" = "-g" ]; then
   printf '%s\n' '{}'
   exit 0
@@ -607,6 +632,7 @@ exit 2
     let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     let _path_guard = EnvVarGuard::set("PATH", merged_path);
     let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
 
     let ctx = test_context(Arc::new(PrivilegeSession::default()));
     let result = npm::task_npm_sync(&ctx).unwrap();
@@ -651,6 +677,11 @@ if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
   exit 0
 fi
 
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+
 if [ "$1" = "outdated" ] && [ "${2:-}" = "-g" ]; then
   printf '%s\n' '{}'
   exit 0
@@ -672,6 +703,7 @@ exit 2
     let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
     let _path_guard = EnvVarGuard::set("PATH", merged_path);
     let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
 
     let ctx = test_context(Arc::new(PrivilegeSession::default()));
     let result = npm::task_npm_sync(&ctx).unwrap();
@@ -681,6 +713,281 @@ exit 2
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].name, "@qwen-code/qwen-code");
     assert!(rows.iter().all(|row| row.name != "codex"), "{rows:#?}");
+}
+
+#[test]
+fn npm_blocks_non_writable_global_prefix_before_any_mutation() {
+    let _lock = env_guard();
+
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    let npm_prefix = temp.path().join("locked-prefix");
+    let npm_root = npm_prefix.join("lib/node_modules");
+    let system_package = npm_root.join("system-owned-tool");
+    let install_marker = temp.path().join("install-attempted");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&npm_root).unwrap();
+    fs::create_dir_all(&system_package).unwrap();
+    fs::write(
+        system_package.join("package.json"),
+        r#"{"name":"system-owned-tool","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&npm_prefix, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(&npm_root, fs::Permissions::from_mode(0o555)).unwrap();
+
+    write_executable(
+        &bin_dir.join("npm"),
+        r#"#!/bin/sh
+set -eu
+
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+
+if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_ROOT:?missing root}"
+  exit 0
+fi
+
+if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
+  cat <<'JSON'
+{"dependencies":{"system-owned-tool":{"version":"1.0.0"},"unowned-root-residue":{"version":"1.0.0"}}}
+JSON
+  exit 0
+fi
+
+if [ "$1" = "outdated" ] && [ "${2:-}" = "-g" ]; then
+  printf '{"system-owned-tool":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0","location":"%s"},"unowned-root-residue":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0","location":"%s"}}\n' "${NPM_STUB_SYSTEM_PACKAGE:?missing system package path}" "${NPM_STUB_PACKAGE:?missing package path}"
+  exit 1
+fi
+
+if [ "$1" = "view" ]; then
+  printf '%s\n' '{}'
+  exit 0
+fi
+
+if [ "$1" = "install" ] || [ "$1" = "update" ]; then
+  touch "${NPM_STUB_INSTALL_MARKER:?missing install marker}"
+  printf '%s\n' 'mutation must have been blocked' >&2
+  exit 1
+fi
+
+printf '%s\n' "unexpected npm args: $*" >&2
+exit 2
+"#,
+    );
+    write_executable(
+        &bin_dir.join("pacman"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "-Qqo" ] && [ "${2:-}" = "${NPM_STUB_SYSTEM_MANIFEST:?missing system manifest}" ]; then
+  printf '%s\n' 'node-system-tool'
+  exit 0
+fi
+exit 1
+"#,
+    );
+
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let _path_guard = EnvVarGuard::set("PATH", merged_path);
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", npm_prefix.as_os_str().to_os_string());
+    let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _package_guard = EnvVarGuard::set(
+        "NPM_STUB_PACKAGE",
+        npm_root
+            .join("unowned-root-residue")
+            .as_os_str()
+            .to_os_string(),
+    );
+    let _system_package_guard = EnvVarGuard::set(
+        "NPM_STUB_SYSTEM_PACKAGE",
+        system_package.as_os_str().to_os_string(),
+    );
+    let _system_manifest_guard = EnvVarGuard::set(
+        "NPM_STUB_SYSTEM_MANIFEST",
+        system_package
+            .join("package.json")
+            .as_os_str()
+            .to_os_string(),
+    );
+    let _marker_guard = EnvVarGuard::set(
+        "NPM_STUB_INSTALL_MARKER",
+        install_marker.as_os_str().to_os_string(),
+    );
+
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let result = npm::task_npm_sync(&ctx).unwrap();
+
+    assert_eq!(result.status, TaskStatus::Completed, "{result:#?}");
+    assert!(
+        !install_marker.exists(),
+        "npm mutation must not be attempted"
+    );
+    assert_eq!(result.advisories.len(), 1, "{result:#?}");
+    assert_eq!(result.advisories[0].code, "npm-global-authority-blocked");
+    assert!(result.advisories[0].blocks_dependents);
+    let rows = result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "npm_authority")
+        .expect("npm authority report")
+        .rows
+        .as_slice();
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    assert_eq!(rows[0].name, "global npm tree");
+    assert_eq!(rows[0].status, TaskReportStatus::Blocked);
+    assert_eq!(rows[1].name, "system-owned-tool");
+    assert_eq!(rows[1].status, TaskReportStatus::Skipped);
+    assert!(
+        rows[1]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("pacman package node-system-tool")),
+        "{rows:#?}"
+    );
+    assert_eq!(rows[2].name, "unowned-root-residue");
+    assert_eq!(rows[2].status, TaskReportStatus::Blocked);
+    assert!(
+        rows[2]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("not mutated")),
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn npm_invalid_outdated_payload_never_runs_unscoped_update_fallback() {
+    let _lock = env_guard();
+
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    let mutation_marker = temp.path().join("mutation-attempted");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_executable(
+        &bin_dir.join("npm"),
+        r#"#!/bin/sh
+set -eu
+if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' '{"dependencies":{"demo":{"version":"1.0.0"}}}'
+  exit 0
+fi
+if [ "$1" = "outdated" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' 'npm warning followed by invalid {json'
+  exit 1
+fi
+if [ "$1" = "install" ] || [ "$1" = "update" ]; then
+  touch "${NPM_STUB_MUTATION_MARKER:?missing marker}"
+  exit 1
+fi
+printf '%s\n' "unexpected npm args: $*" >&2
+exit 2
+"#,
+    );
+
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let _path_guard = EnvVarGuard::set("PATH", merged_path);
+    let _marker_guard = EnvVarGuard::set(
+        "NPM_STUB_MUTATION_MARKER",
+        mutation_marker.as_os_str().to_os_string(),
+    );
+
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let result = npm::task_npm_sync(&ctx).unwrap();
+
+    assert_eq!(result.status, TaskStatus::Failed, "{result:#?}");
+    assert!(!mutation_marker.exists());
+    assert!(
+        result
+            .details
+            .iter()
+            .any(|detail| detail.contains("refusing the unscoped npm update -g fallback")),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn npm_permission_failure_suppresses_individual_retry_storm() {
+    let _lock = env_guard();
+
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    let npm_root = temp.path().join("lib/node_modules");
+    let install_counter = temp.path().join("install-count");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&npm_root).unwrap();
+    write_executable(
+        &bin_dir.join("npm"),
+        r#"#!/bin/sh
+set -eu
+if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_PREFIX:?missing prefix}"
+  exit 0
+fi
+if [ "$1" = "root" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' "${NPM_STUB_ROOT:?missing root}"
+  exit 0
+fi
+if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' '{"dependencies":{"first":{"version":"1.0.0"},"second":{"version":"1.0.0"}}}'
+  exit 0
+fi
+if [ "$1" = "outdated" ] && [ "${2:-}" = "-g" ]; then
+  printf '%s\n' '{"first":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0"},"second":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0"}}'
+  exit 1
+fi
+if [ "$1" = "view" ]; then
+  printf '%s\n' '{}'
+  exit 0
+fi
+if [ "$1" = "install" ]; then
+  count=0
+  if [ -f "${NPM_STUB_INSTALL_COUNTER:?missing counter}" ]; then
+    count="$(cat "$NPM_STUB_INSTALL_COUNTER")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$NPM_STUB_INSTALL_COUNTER"
+  printf '%s\n' 'npm error code EACCES: permission denied' >&2
+  exit 1
+fi
+printf '%s\n' "unexpected npm args: $*" >&2
+exit 2
+"#,
+    );
+
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    let _path_guard = EnvVarGuard::set("PATH", merged_path);
+    let _prefix_guard = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
+    let _root_guard = EnvVarGuard::set("NPM_STUB_ROOT", npm_root.as_os_str().to_os_string());
+    let _counter_guard = EnvVarGuard::set(
+        "NPM_STUB_INSTALL_COUNTER",
+        install_counter.as_os_str().to_os_string(),
+    );
+
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let result = npm::task_npm_sync(&ctx).unwrap();
+
+    assert_eq!(result.status, TaskStatus::Completed, "{result:#?}");
+    assert_eq!(fs::read_to_string(&install_counter).unwrap().trim(), "1");
+    assert_eq!(result.advisories.len(), 1, "{result:#?}");
+    assert_eq!(result.advisories[0].code, "npm-global-authority-blocked");
+    let rows = &result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "npm_authority")
+        .expect("npm authority report")
+        .rows;
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+    assert!(
+        rows.iter()
+            .all(|row| row.status == TaskReportStatus::Blocked),
+        "{rows:#?}"
+    );
 }
 
 #[test]
