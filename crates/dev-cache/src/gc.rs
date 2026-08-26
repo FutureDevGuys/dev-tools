@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
+use walkdir::WalkDir;
 
 use crate::artifacts::{self, ArtifactRecord};
 use crate::cargo_intercept;
@@ -697,14 +698,7 @@ fn is_empty_identity_duplicate(
     }
     validate_action_path(root, source)?;
     validate_action_destination(root, destination)?;
-    let mut entries = fs::read_dir(source)?;
-    let Some(entry) = entries.next().transpose()? else {
-        return Ok(false);
-    };
-    if entry.file_name() != "identity.json"
-        || !entry.file_type()?.is_file()
-        || entries.next().transpose()?.is_some()
-    {
+    if !contains_only_identity_and_empty_directories(source)? {
         return Ok(false);
     }
     let destination_record: IdentityRecord = match fs::read(destination.join("identity.json"))
@@ -721,6 +715,30 @@ fn is_empty_identity_duplicate(
         source_record,
         &destination_record,
     ))
+}
+
+fn contains_only_identity_and_empty_directories(source: &Path) -> Result<bool> {
+    let identity = source.join("identity.json");
+    let mut found_identity = false;
+    for entry in WalkDir::new(source).follow_links(false) {
+        let entry = entry?;
+        if entry.path() == source {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Ok(false);
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        if metadata.is_file() && entry.path() == identity {
+            found_identity = true;
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(found_identity)
 }
 
 fn reconcile_repository_identity(root: &RootHandle, action: &GcAction) -> Result<()> {

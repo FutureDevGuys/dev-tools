@@ -3016,7 +3016,8 @@ fn garbage_collection_removes_only_empty_unknown_generation_duplicates() {
         .repos()
         .join(&duplicate_identity[..2])
         .join(&duplicate_identity);
-    fs::create_dir_all(&duplicate).expect("duplicate identity directory");
+    fs::create_dir_all(duplicate.join("temp/ccache"))
+        .expect("duplicate identity empty cache directories");
     fs::write(
         duplicate.join("identity.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -3031,6 +3032,34 @@ fn garbage_collection_removes_only_empty_unknown_generation_duplicates() {
         .expect("duplicate identity JSON"),
     )
     .expect("duplicate identity");
+    let payload_identity = blake3::hash(b"unknown generation with payload")
+        .to_hex()
+        .to_string();
+    let payload_duplicate = root
+        .repos()
+        .join(&payload_identity[..2])
+        .join(&payload_identity);
+    fs::create_dir_all(payload_duplicate.join("temp/ccache"))
+        .expect("payload duplicate cache directory");
+    fs::write(
+        payload_duplicate.join("temp/ccache/inode-cache.v2"),
+        b"must remain protected",
+    )
+    .expect("payload duplicate data");
+    fs::write(
+        payload_duplicate.join("identity.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "identity": payload_identity,
+            "canonical_worktree": workspace,
+            "filesystem_identity": filesystem_identity,
+            "platform": root.platform,
+            "created_unix": 1,
+            "last_used_unix": 1
+        }))
+        .expect("payload duplicate identity JSON"),
+    )
+    .expect("payload duplicate identity");
 
     let report = gc::collect(
         &root,
@@ -3045,11 +3074,16 @@ fn garbage_collection_removes_only_empty_unknown_generation_duplicates() {
         .iter()
         .any(|action| action.reason == "duplicate-identity-record"));
     assert!(!duplicate.exists());
+    assert!(payload_duplicate.exists());
+    assert!(report.abstentions.iter().any(|abstention| {
+        abstention.path == payload_duplicate && abstention.reason.contains("not an empty duplicate")
+    }));
     assert!(repository.cache_dir.join("identity.json").is_file());
-    assert!(gc::maintenance_status(&root)
+    let remaining_issues = gc::maintenance_status(&root)
         .expect("maintenance status")
-        .repository_issues
-        .is_empty());
+        .repository_issues;
+    assert_eq!(remaining_issues.len(), 1);
+    assert_eq!(remaining_issues[0].path, payload_duplicate);
 }
 
 #[cfg(unix)]
