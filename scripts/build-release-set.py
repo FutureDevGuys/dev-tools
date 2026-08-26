@@ -75,13 +75,7 @@ def target_id() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-private-key", required=True, type=Path)
-    parser.add_argument(
-        "--additional-root-private-key",
-        action="append",
-        default=[],
-        type=Path,
-    )
+    parser.add_argument("--root-document", required=True, type=Path)
     parser.add_argument("--release-private-key", required=True, type=Path)
     parser.add_argument(
         "--trusted-root-public-key",
@@ -89,7 +83,6 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "crates/update-all/trust/root-public-key.txt",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--root-generation", required=True, type=int)
     parser.add_argument("--manifest-generation", required=True, type=int)
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
@@ -166,23 +159,17 @@ def main() -> int:
             target,
             "--artifact",
             str(artifacts[product]),
-            "--root-private-key",
-            str(args.root_private_key),
+            "--root-document",
+            str(args.root_document),
             "--release-private-key",
             str(args.release_private_key),
             "--trusted-root-public-key",
             str(args.trusted_root_public_key),
-            "--root-generation",
-            str(args.root_generation),
             "--manifest-generation",
             str(args.manifest_generation),
             "--output",
             str(destination),
         ]
-        for additional_root in args.additional_root_private_key:
-            command.extend(
-                ["--additional-root-private-key", str(additional_root)]
-            )
         summaries.append(json.loads(run(*command, env=env)))
     shutil.rmtree(build_root)
     print(
