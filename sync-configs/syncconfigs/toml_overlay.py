@@ -56,6 +56,7 @@ class OverlayResult:
     text: str
     materialized_symlink: bool = False
     ownership_changed: bool = False
+    suppressed: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -356,6 +357,95 @@ def assignment_line_paths(text: str) -> dict[int, tuple[str, ...]]:
     return paths
 
 
+def commented_target_paths(text: str) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    """Return commented assignment paths and commented table prefixes.
+
+    Only syntactically recognizable TOML keys and headers count. Values are
+    deliberately neither parsed nor returned so diagnostics cannot disclose
+    commented configuration values.
+    """
+    assignments: set[tuple[str, ...]] = set()
+    tables: set[tuple[str, ...]] = set()
+    active_table: tuple[str, ...] = ()
+    for line in text.splitlines():
+        active_header = extract_table_header_path(line)
+        if active_header is not None:
+            active_table, _ = active_header
+            continue
+        stripped = line.lstrip()
+        if not stripped.startswith("#"):
+            continue
+        candidate = stripped[1:].lstrip()
+        header = extract_table_header_path(candidate)
+        if header is not None:
+            tables.add(header[0])
+            continue
+        separator = _assignment_separator(candidate)
+        if separator is None:
+            continue
+        raw_key = candidate[:separator].strip()
+        if not raw_key:
+            continue
+        try:
+            assignments.add((*active_table, *parse_toml_key_path(raw_key)))
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return assignments, tables
+
+
+def _source_paths_suppressed_by_target_comments(
+    source_text: str, target_text: str
+) -> tuple[tuple[str, ...], ...]:
+    assignments, tables = commented_target_paths(target_text)
+    source_paths = set(assignment_line_paths(source_text).values())
+    return tuple(
+        sorted(
+            path
+            for path in source_paths
+            if path in assignments or any(path[: len(prefix)] == prefix for prefix in tables)
+        )
+    )
+
+
+def _nested_tables_at_pattern(
+    data: dict[str, Any], pattern: tuple[str, ...]
+) -> Iterable[tuple[tuple[str, ...], dict[str, Any]]]:
+    frontier: list[tuple[tuple[str, ...], Any]] = [((), data)]
+    for component in pattern:
+        next_frontier: list[tuple[tuple[str, ...], Any]] = []
+        for path, value in frontier:
+            if not isinstance(value, dict):
+                continue
+            if component == "*":
+                next_frontier.extend(((*path, str(key)), child) for key, child in value.items())
+            elif component in value:
+                next_frontier.append(((*path, component), value[component]))
+        frontier = next_frontier
+    for path, value in frontier:
+        if isinstance(value, dict):
+            yield path, value
+
+
+def _exclusive_retired_paths(
+    source_data: dict[str, Any],
+    groups: Iterable[tuple[tuple[str, ...], tuple[str, ...]]],
+) -> set[tuple[str, ...]]:
+    retired: set[tuple[str, ...]] = set()
+    for parent_pattern, keys in groups:
+        if len(set(keys)) != len(keys) or len(keys) < 2:
+            raise ValueError("mutually exclusive sibling groups require at least two unique keys")
+        for parent_path, table in _nested_tables_at_pattern(source_data, parent_pattern):
+            present = [key for key in keys if key in table]
+            if len(present) > 1:
+                raise ValueError(
+                    "mutually exclusive source keys are both active at "
+                    f"{render_toml_key_path(parent_path)}: {', '.join(sorted(present))}"
+                )
+            if len(present) == 1:
+                retired.update((*parent_path, key) for key in keys if key != present[0])
+    return retired
+
+
 def remove_empty_table_headers(lines: list[str]) -> list[str]:
     changed = True
     while changed:
@@ -509,12 +599,31 @@ def overlay_toml_text(
     conflict_policy: str = "source",
     preserve_target_layout: bool = False,
     retired_paths: Iterable[tuple[str, ...]] = (),
+    commented_target_policy: str = "respect",
+    exclusive_sibling_groups: Iterable[
+        tuple[tuple[str, ...], tuple[str, ...]]
+    ] = (),
 ) -> OverlayResult:
     if conflict_policy not in {"source", "target"}:
         raise ValueError("conflict_policy must be 'source' or 'target'")
+    if commented_target_policy not in {"respect", "activate", "error"}:
+        raise ValueError("commented_target_policy must be respect, activate, or error")
+
+    suppressed = _source_paths_suppressed_by_target_comments(source_text, target_text)
+    if commented_target_policy == "error" and suppressed:
+        raise ValueError(
+            "commented target paths suppress source keys: "
+            + ", ".join(render_toml_key_path(path) for path in suppressed)
+        )
+    if commented_target_policy == "activate":
+        suppressed = ()
+    if suppressed:
+        source_text = prune_toml_paths(source_text, suppressed).text
+        preserve_target_layout = True
 
     source_data = load_toml_text(source_text, "source")
-    prune_result = prune_toml_paths(target_text, retired_paths)
+    exclusive_retired = _exclusive_retired_paths(source_data, exclusive_sibling_groups)
+    prune_result = prune_toml_paths(target_text, (*retired_paths, *exclusive_retired))
     target_text = prune_result.text
     target_data = load_toml_text(target_text, "target")
 
@@ -524,7 +633,7 @@ def overlay_toml_text(
     if conflict_policy == "target":
         assignments = list(iter_missing_assignments(source_data, target_data))
         if not assignments:
-            return OverlayResult(changed=prune_result.changed, added=0, overwritten=0, removed=prune_result.removed, text=target_text)
+            return OverlayResult(changed=prune_result.changed, added=0, overwritten=0, removed=prune_result.removed, text=target_text, suppressed=suppressed)
 
         if not target_text.strip():
             updated = _ensure_trailing_newline(source_text)
@@ -557,6 +666,7 @@ def overlay_toml_text(
         overwritten=overwritten,
         removed=prune_result.removed,
         text=updated,
+        suppressed=suppressed,
     )
 
 
@@ -614,6 +724,10 @@ def overlay_toml_file(
     reconcile_removed_keys: bool = False,
     managed_overlay_id: str | None = None,
     state_root: Path | None = None,
+    commented_target_policy: str = "respect",
+    exclusive_sibling_groups: Iterable[
+        tuple[tuple[str, ...], tuple[str, ...]]
+    ] = (),
 ) -> OverlayResult:
     source_text = source_path.read_text(encoding="utf-8")
     target_text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
@@ -633,6 +747,8 @@ def overlay_toml_file(
         conflict_policy=conflict_policy,
         preserve_target_layout=preserve_target_layout,
         retired_paths=prior_paths - current_paths,
+        commented_target_policy=commented_target_policy,
+        exclusive_sibling_groups=exclusive_sibling_groups,
     )
     ownership_changed = ownership_path is not None and prior_paths != current_paths
     if materialize_symlink:
@@ -686,6 +802,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reconcile-removed-keys", action="store_true")
     parser.add_argument("--managed-overlay-id")
     parser.add_argument("--state-root", type=Path)
+    parser.add_argument(
+        "--commented-target-policy",
+        choices=("respect", "activate", "error"),
+        default="respect",
+        help="How active source keys interact with recognizable commented target keys.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Report the merge without writing.")
     parser.add_argument("--check", action="store_true", help="Exit non-zero when the target is missing source keys.")
     parser.add_argument(
@@ -718,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
             reconcile_removed_keys=args.reconcile_removed_keys,
             managed_overlay_id=args.managed_overlay_id,
             state_root=args.state_root,
+            commented_target_policy=args.commented_target_policy,
         )
     except (OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}")

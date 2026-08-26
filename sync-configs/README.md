@@ -9,4 +9,6 @@ sync-configs --config ./manifest.yaml --profile desktop
 
 Dry-run performs no writes and runs no hooks. `sync-configs` installs no packages, applications, public tools, or copies of itself. Personal manifests, host policy, generated configurations, hooks, and desired paths belong in the configuration repository that invokes it.
 
+TOML overlays preserve intentional commented target keys by default, report their dotted paths without values, and support explicit `activate` or `error` policies. Generic mutually exclusive sibling groups prevent stale alternatives from surviving beside the selected source key. Root manifests may declare read-only JSON state preconditions so an owning configuration system can require its current layout generation before local overlays run.
+
 See the workspace [sync-configs documentation](../docs/sync-configs.md) for the supported interface and trust boundary.

@@ -94,7 +94,11 @@ Entry modes:
   - `json_overlay`: overlay source JSON into the target, preferring source values on conflicts,
     and materializing a symlink target into a normal file
   - `toml_overlay`: overlay source TOML into the target, preferring source values on conflicts,
-    and materializing a symlink target into a normal file
+    materializing a symlink target into a normal file, and respecting recognizable
+    commented target keys by default (`commented_target_policy`: respect|activate|error)
+
+Root `state_preconditions` may require exact non-secret JSON fields before any
+entry runs. These checks are read-only and direct stale state to caller-authored remediation.
 
 Output is buffered and printed grouped by status at the end:
   - Performed entries (always shown)
@@ -235,6 +239,7 @@ STATUS_LABELS = {
     "script_skipped": "[skip]",
     "info": "[info]",
     "errors": "[error]",
+    "suppressed_comment": "[note]",
 }
 
 STATUS_COLORS = {
@@ -246,6 +251,7 @@ STATUS_COLORS = {
     "script_skipped": "33",  # yellow
     "info": "34",  # blue
     "errors": "31",  # red
+    "suppressed_comment": "33",  # yellow
 }
 
 # Display order and headers for buffered output grouping.
@@ -256,6 +262,7 @@ STATUS_GROUP_ORDER = (
     ("skipped_existing", "Skipped (existing target)"),
     ("missing_source", "Skipped (missing source)"),
     ("errors", "Errors"),
+    ("suppressed_comment", "Suppressed by comments"),
     ("up_to_date", "Up-to-date"),
 )
 
@@ -390,6 +397,10 @@ class Entry:
     reconcile_existing: bool = False
     reconcile_removed_keys: bool = False
     managed_overlay_id: Optional[str] = None
+    commented_target_policy: str = "respect"
+    exclusive_sibling_groups: tuple[
+        tuple[tuple[str, ...], tuple[str, ...]], ...
+    ] = ()
 
 
 @dataclass
@@ -412,6 +423,13 @@ class StatusRecord:
 
 class ConfigError(Exception):
     """Raised when the configuration file contains invalid data."""
+
+
+@dataclass(frozen=True)
+class JsonStatePrecondition:
+    path: Path
+    fields: tuple[tuple[str, object], ...]
+    remediation: str
 
 
 @dataclass(frozen=True)
@@ -521,6 +539,36 @@ def parse_bool_option(value: object, key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"Entry '{key}' must be a boolean if provided.")
     return value
+
+
+def parse_exclusive_sibling_groups(
+    value: object,
+) -> tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError("Entry 'mutually_exclusive_sibling_keys' must be a list.")
+    groups: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for index, raw_group in enumerate(value):
+        if not isinstance(raw_group, dict):
+            raise ConfigError(f"Mutually exclusive sibling group {index} must be an object.")
+        under = raw_group.get("under")
+        keys = raw_group.get("keys")
+        if not isinstance(under, str) or not under.strip():
+            raise ConfigError(f"Mutually exclusive sibling group {index} requires 'under'.")
+        try:
+            parent_pattern = toml_overlay.parse_toml_key_path(under.strip())
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"Mutually exclusive sibling group {index} has invalid 'under'.") from exc
+        parsed_keys = parse_pattern_list(keys, "mutually_exclusive_sibling_keys.keys")
+        if len(parsed_keys) < 2 or len(set(parsed_keys)) != len(parsed_keys):
+            raise ConfigError(
+                f"Mutually exclusive sibling group {index} requires at least two unique keys."
+            )
+        if any("." in key or key == "*" for key in parsed_keys):
+            raise ConfigError(f"Mutually exclusive sibling group {index} keys must be direct siblings.")
+        groups.append((parent_pattern, parsed_keys))
+    return tuple(groups)
 
 
 def ordered_unique_profiles(values: Iterable[str]) -> tuple[str, ...]:
@@ -1177,6 +1225,8 @@ def apply_source_overrides(entries: list[Entry], prefer_overrides: bool) -> list
                 reconcile_existing=entry.reconcile_existing,
                 reconcile_removed_keys=entry.reconcile_removed_keys,
                 managed_overlay_id=entry.managed_overlay_id,
+                commented_target_policy=entry.commented_target_policy,
+                exclusive_sibling_groups=entry.exclusive_sibling_groups,
             )
         )
     return updated
@@ -1420,6 +1470,18 @@ def parse_entries_block(
                 raise ConfigError(
                     "Entry 'managed_overlay_id' is required when reconcile_removed_keys is enabled."
                 )
+        commented_target_policy = entry.get("commented_target_policy", "respect")
+        if commented_target_policy not in {"respect", "activate", "error"}:
+            raise ConfigError(
+                "Entry 'commented_target_policy' must be respect, activate, or error."
+            )
+        exclusive_sibling_groups = parse_exclusive_sibling_groups(
+            entry.get("mutually_exclusive_sibling_keys")
+        )
+        if ("commented_target_policy" in entry or exclusive_sibling_groups) and mode_raw != "toml_overlay":
+            raise ConfigError(
+                "Comment and mutually-exclusive-key policies are supported only for toml_overlay."
+            )
 
         source_path = Path(normalize_user_path(source_raw))
         if not source_path.is_absolute():
@@ -1470,6 +1532,8 @@ def parse_entries_block(
                 reconcile_existing=reconcile_existing,
                 reconcile_removed_keys=reconcile_removed_keys,
                 managed_overlay_id=managed_overlay_id,
+                commented_target_policy=commented_target_policy,
+                exclusive_sibling_groups=exclusive_sibling_groups,
             )
         )
 
@@ -1538,6 +1602,52 @@ def load_config(config_path: Path, default_mode: str | None) -> Iterable[Entry]:
         entries.extend(load_entries_from_dir(config_path, entries_dir_raw, resolved_default_mode))
 
     return entries
+
+
+def load_json_state_preconditions(config_path: Path) -> tuple[JsonStatePrecondition, ...]:
+    payload = load_yaml_mapping(config_path)
+    raw_rows = payload.get("state_preconditions", [])
+    if not isinstance(raw_rows, list):
+        raise ConfigError("Config 'state_preconditions' must be a list.")
+    rows: list[JsonStatePrecondition] = []
+    for index, raw in enumerate(raw_rows):
+        if not isinstance(raw, dict) or raw.get("type") != "json_fields":
+            raise ConfigError(f"State precondition {index} must use type json_fields.")
+        path = raw.get("path")
+        fields = raw.get("fields")
+        remediation = raw.get("remediation")
+        if not isinstance(path, str) or not path:
+            raise ConfigError(f"State precondition {index} requires a path.")
+        if not isinstance(fields, dict) or not fields:
+            raise ConfigError(f"State precondition {index} requires non-empty fields.")
+        if not isinstance(remediation, str) or not remediation:
+            raise ConfigError(f"State precondition {index} requires remediation text.")
+        rows.append(
+            JsonStatePrecondition(
+                path=Path(normalize_user_path(path)),
+                fields=tuple((str(key), value) for key, value in fields.items()),
+                remediation=remediation,
+            )
+        )
+    return tuple(rows)
+
+
+def check_json_state_preconditions(config_path: Path) -> None:
+    for row in load_json_state_preconditions(config_path):
+        try:
+            payload = json.loads(row.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"Required state is absent or invalid at {row.path}. {row.remediation}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ConfigError(f"Required state is invalid at {row.path}. {row.remediation}")
+        mismatches = [key for key, expected in row.fields if payload.get(key) != expected]
+        if mismatches:
+            raise ConfigError(
+                f"Required state at {row.path} does not match fields: {', '.join(mismatches)}. "
+                f"{row.remediation}"
+            )
 
 
 def select_entries_for_profiles(
@@ -2061,6 +2171,12 @@ def process_entry(
             )
         except (TypeError, ValueError) as exc:
             raise OSError(f"failed to overlay TOML {entry.source} -> {entry.target}: {exc}") from exc
+        for path in result.suppressed:
+            buffer.append(StatusRecord(
+                status_key="suppressed_comment",
+                message=f"kept commented TOML path {toml_overlay.render_toml_key_path(path)} inactive",
+                entry=entry,
+            ))
         if result.changed:
             verb = "would overlay" if dry_run else "overlay"
             overlay_notes = [
@@ -2289,6 +2405,7 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
 
     if args.validate:
         try:
+            load_json_state_preconditions(config_path)
             all_entries = list(load_config(config_path, default_mode=args.mode))
             override_path = find_override_path(config_path)
             if override_path:
@@ -2312,6 +2429,12 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
         for profile in collect_profile_names(all_entries):
             print(profile)
         return 0
+
+    try:
+        check_json_state_preconditions(config_path)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     try:
         entries = select_entries_for_profiles(

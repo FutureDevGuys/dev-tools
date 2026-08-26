@@ -30,6 +30,91 @@ def test_version_has_canonical_product_identity() -> None:
     assert result.stdout.strip() == f"sync-configs {metadata['project']['version']}"
 
 
+def test_toml_overlay_reports_commented_paths_without_activating_or_disclosing_values(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.toml"
+    target = tmp_path / "target.toml"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text(
+        '[model_providers.bridge]\nenv_key = "SOURCE_PRIVATE"\nmodel = "new"\n',
+        encoding="utf-8",
+    )
+    target.write_text(
+        '[model_providers.bridge]\n  # env_key = "TARGET_PRIVATE"\nauth = "STALE_PRIVATE"\n',
+        encoding="utf-8",
+    )
+    manifest.write_text(
+        "\n".join(
+            [
+                "entries:",
+                "  - name: codex",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: toml_overlay",
+                "    commented_target_policy: respect",
+                "    mutually_exclusive_sibling_keys:",
+                "      - under: model_providers.*",
+                "        keys: [auth, env_key]",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli("--config", str(manifest), "--no-color")
+
+    assert result.returncode == 0, result.stderr
+    assert "Suppressed by comments" in result.stdout
+    assert "model_providers.bridge.env_key" in result.stdout
+    assert "SOURCE_PRIVATE" not in result.stdout
+    assert "TARGET_PRIVATE" not in result.stdout
+    assert "STALE_PRIVATE" not in result.stdout
+    parsed = tomllib.loads(target.read_text(encoding="utf-8"))["model_providers"]["bridge"]
+    assert "env_key" not in parsed
+    assert parsed["auth"] == "STALE_PRIVATE"
+    assert parsed["model"] == "new"
+
+
+def test_json_state_precondition_blocks_read_only_with_exact_remediation(tmp_path: Path) -> None:
+    source = tmp_path / "source.conf"
+    target = tmp_path / "target.conf"
+    state = tmp_path / "state.json"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text("managed\n", encoding="utf-8")
+    manifest.write_text(
+        "\n".join(
+            [
+                "state_preconditions:",
+                "  - type: json_fields",
+                f"    path: {state}",
+                "    fields:",
+                "      current_version: 1",
+                "      pending: null",
+                "    remediation: Run ./bootstrap.sh --migration-target current",
+                "entries:",
+                "  - name: fixture",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: copy",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    blocked = run_cli("--config", str(manifest), "--dry-run")
+    assert blocked.returncode == 1
+    assert "Run ./bootstrap.sh --migration-target current" in blocked.stderr
+    assert not state.exists()
+    assert not target.exists()
+
+    state.write_text('{"current_version": 1, "pending": null}\n', encoding="utf-8")
+    current = run_cli("--config", str(manifest), "--dry-run")
+    assert current.returncode == 0, current.stderr
+    assert not target.exists()
+
+
 def write_manifest(path: Path, source: Path, target: Path, marker: Path) -> None:
     path.write_text(
         "\n".join(
