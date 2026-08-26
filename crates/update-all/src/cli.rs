@@ -228,7 +228,6 @@ impl RunCli {
             bail!("--dashboard and --plain are mutually exclusive");
         }
 
-        reject_legacy_env()?;
         let mut runtime_cfg = startup_cfg
             .ok_or_else(|| anyhow::anyhow!("runtime config unavailable after startup checks"))?;
         if self.bootstrap {
@@ -296,8 +295,6 @@ impl RunCli {
         let mouse_row_stride = resolve_mouse_row_stride(&runtime_cfg);
 
         let flags = Sections::from_cli_selectors(&self.only, &self.exclude)?;
-        let mut flags = flags;
-        flags.bootstrap = runtime_cfg.updaters.bootstrap.enabled || flags.bootstrap;
 
         let fail_fast = self.fail_fast || runtime_cfg.engine.fail_fast;
         let host_os = HostOs::current();
@@ -520,7 +517,6 @@ struct RunSummaryJson {
     issue_count: usize,
     exit_code: Option<i32>,
     elapsed_ms: Option<u64>,
-    legacy: bool,
     run_json_status: String,
     path: String,
 }
@@ -642,7 +638,6 @@ fn print_run_detail(run: &crate::runs::RunSummary) {
         relative_time_label(run.metadata.updated_unix_ms, now)
     );
     crate::ua_outln!("Path: {}", run.path.display());
-    crate::ua_outln!("Legacy: {}", run.legacy);
     crate::ua_outln!("Run artifact: {}", run.run_json_status.as_str());
     crate::ua_outln!(
         "Exit code: {}",
@@ -675,7 +670,6 @@ fn run_json(run: &crate::runs::RunSummary) -> RunSummaryJson {
         issue_count: run.issue_count,
         exit_code: run.exit_code,
         elapsed_ms: run.elapsed_ms,
-        legacy: run.legacy,
         run_json_status: run.run_json_status.as_str().to_string(),
         path: run.path.display().to_string(),
     }
@@ -849,21 +843,6 @@ fn write_completion_apply_managed_catalog(
         }
     }
     bail!("could not allocate temporary completion managed catalog path after 32 attempts")
-}
-
-fn reject_legacy_env() -> Result<()> {
-    for key in [
-        "UPDATE_ALL_PIPX_PRECHECK",
-        "UPDATE_ALL_PIPX_PRECHECK_TIMEOUT",
-        "UPDATE_ALL_NPM_COMPLETION_TIMEOUT",
-        "UPDATE_ALL_NPM_COMPLETION_BUDGET",
-        "UPDATE_ALL_SYSTEM",
-    ] {
-        if env::var_os(key).is_some() {
-            bail!("Legacy completion/timeout env var is no longer supported: {key}");
-        }
-    }
-    Ok(())
 }
 
 fn parse_engine_mode_env(key: &str) -> Option<EngineMode> {

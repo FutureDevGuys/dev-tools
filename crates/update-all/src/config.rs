@@ -426,13 +426,6 @@ struct FileUpdaterConfig {
 #[serde(deny_unknown_fields)]
 struct FileUpdaterCatalog {
     tasks: Option<BTreeMap<String, FileUpdaterTaskConfig>>,
-    updaters: Option<FileUpdaterCatalogUpdaters>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileUpdaterCatalogUpdaters {
-    tasks: Option<BTreeMap<String, FileUpdaterTaskConfig>>,
 }
 
 struct CollectedUpdaterTaskConfigs {
@@ -1368,11 +1361,6 @@ fn collect_updater_task_configs(
         for (id, raw) in catalog.tasks.unwrap_or_default() {
             insert_updater_task_config(&mut tasks, &mut sources, id, raw, source.clone())?;
         }
-        if let Some(updaters) = catalog.updaters {
-            for (id, raw) in updaters.tasks.unwrap_or_default() {
-                insert_updater_task_config(&mut tasks, &mut sources, id, raw, source.clone())?;
-            }
-        }
     }
 
     for (namespace, catalog_path) in discovered_updater_catalogs(config_path)? {
@@ -1384,12 +1372,6 @@ fn collect_updater_task_configs(
         for (id, raw) in catalog.tasks.unwrap_or_default() {
             validate_discovered_catalog_namespace(&namespace, &id, &catalog_path)?;
             insert_updater_task_config(&mut tasks, &mut sources, id, raw, source.clone())?;
-        }
-        if let Some(updaters) = catalog.updaters {
-            for (id, raw) in updaters.tasks.unwrap_or_default() {
-                validate_discovered_catalog_namespace(&namespace, &id, &catalog_path)?;
-                insert_updater_task_config(&mut tasks, &mut sources, id, raw, source.clone())?;
-            }
         }
     }
 

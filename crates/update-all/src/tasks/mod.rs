@@ -60,7 +60,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
 pub const TASK_NPM: &str = "npm";
-pub const TASK_PIPX: &str = "pipx";
 pub const TASK_COMPLETIONS: &str = "completions";
 const ORDER_ONLY_DEPENDENCY_PREFIX: &str = "\u{1f}after:";
 const TASK_RUN_LOCK_STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
@@ -8093,9 +8092,6 @@ fn build_task_specs(
         &exact_custom_ids,
     );
     let builtin_tasks = crate::updaters::builtin_catalog()?;
-    let known_legacy_disabled_selectors = legacy_disabled_selector_universe(&builtin_tasks);
-    let disabled_legacy_selectors =
-        disabled_legacy_task_selectors(flags, &known_legacy_disabled_selectors);
     let builtin_categories = builtin_tasks
         .iter()
         .map(|task| task.category.clone())
@@ -8106,7 +8102,6 @@ fn build_task_specs(
         .filter(|selector| !builtin_categories.contains(selector.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut include_with_by_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut selected_dependency_excludes_by_id: BTreeMap<String, BTreeSet<String>> =
         BTreeMap::new();
     let mut required_selected_any_by_id: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -8122,7 +8117,6 @@ fn build_task_specs(
         for detected in
             detected_builtin_tasks_with_skip_overrides(target_os, &explicit_builtin_task_ids)?
         {
-            include_with_by_id.insert(detected.id.clone(), detected.include_with.clone());
             record_selected_dependency_rule(
                 &mut selected_dependency_excludes_by_id,
                 &detected.id,
@@ -8158,9 +8152,6 @@ fn build_task_specs(
     }
 
     for include_id in &include_requested {
-        if !flags.custom {
-            continue;
-        }
         if specs.iter().any(|s| &s.id == include_id) {
             continue;
         }
@@ -8187,9 +8178,6 @@ fn build_task_specs(
             only_requested.contains(&custom.id) || only_requested.contains(&custom.category);
         let explicitly_included =
             include_requested.contains(&custom.id) || include_requested.contains(&custom.category);
-        if !flags.custom && !explicitly_requested {
-            continue;
-        }
         if !updater_cfg.run_all_detected && !explicitly_included && !explicitly_requested {
             continue;
         }
@@ -8224,17 +8212,6 @@ fn build_task_specs(
         });
     }
 
-    if updater_cfg.run_all_detected {
-        materialize_legacy_section_builtins(
-            &mut specs,
-            &mut include_with_by_id,
-            &mut selected_dependency_excludes_by_id,
-            &mut required_selected_any_by_id,
-            *host_os,
-            &legacy_section_builtin_selectors(flags),
-        )?;
-    }
-
     let known_ids_before_excludes: BTreeSet<String> = specs
         .iter()
         .map(|s| s.id.as_str())
@@ -8247,14 +8224,7 @@ fn build_task_specs(
         .collect();
 
     specs.retain(|spec| {
-        let selected_by_only = flags.bootstrap && spec.id == "bootstrap-windows-foundations"
-            || spec_selected_by_selectors(spec, &only_requested);
         if exclude_requested.contains(&spec.id) || exclude_requested.contains(&spec.category) {
-            return false;
-        }
-        if !selected_by_only
-            && spec_matches_disabled_selector(spec, &disabled_legacy_selectors, &include_with_by_id)
-        {
             return false;
         }
         true
@@ -8276,10 +8246,7 @@ fn build_task_specs(
             bail!("Unknown section in --only: {}", unknown.join(","));
         }
 
-        specs.retain(|spec| {
-            spec_selected_by_selectors(spec, &only_requested)
-                || (flags.bootstrap && spec.id == "bootstrap-windows-foundations")
-        });
+        specs.retain(|spec| spec_selected_by_selectors(spec, &only_requested));
     }
 
     prune_specs_without_required_selected_any(
@@ -8342,86 +8309,6 @@ fn build_task_specs(
     Ok(specs)
 }
 
-fn legacy_section_builtin_selectors(flags: &Sections) -> BTreeSet<String> {
-    let mut selectors = BTreeSet::new();
-    if flags.npm {
-        selectors.insert(TASK_NPM.to_string());
-    }
-    if flags.pipx {
-        selectors.insert(TASK_PIPX.to_string());
-    }
-    selectors
-}
-
-fn legacy_disabled_selector_universe(builtin_tasks: &[BuiltinTask]) -> BTreeSet<String> {
-    let mut selectors = BTreeSet::from(["custom".to_string(), "system".to_string()]);
-    for task in builtin_tasks {
-        selectors.insert(task.id.clone());
-        selectors.insert(task.category.to_string());
-        selectors.extend(task.include_with.iter().cloned());
-    }
-    selectors
-}
-
-fn disabled_legacy_task_selectors(
-    flags: &Sections,
-    known_selectors: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut selectors = BTreeSet::new();
-    for (enabled, selector) in [
-        (flags.system, "system"),
-        (flags.npm, TASK_NPM),
-        (flags.pipx, TASK_PIPX),
-        (flags.custom, "custom"),
-        (flags.go, "go"),
-        (flags.uv, "uv"),
-        (flags.uvx, "uvx"),
-        (flags.espanso, "espanso"),
-        (flags.rustup, "rustup"),
-        (flags.cargo, "cargo"),
-        (flags.cursor, "cursor"),
-    ] {
-        if !enabled && known_selectors.contains(selector) {
-            selectors.insert(selector.to_string());
-        }
-    }
-    selectors
-}
-
-fn materialize_legacy_section_builtins(
-    specs: &mut Vec<TaskSpec>,
-    include_with_by_id: &mut BTreeMap<String, Vec<String>>,
-    selected_dependency_excludes_by_id: &mut BTreeMap<String, BTreeSet<String>>,
-    required_selected_any_by_id: &mut BTreeMap<String, BTreeSet<String>>,
-    host_os: HostOs,
-    selectors: &BTreeSet<String>,
-) -> Result<()> {
-    if selectors.is_empty() {
-        return Ok(());
-    }
-
-    for detected in detected_builtin_tasks(host_os)? {
-        let selected = builtin_task_selected_by_selectors(&detected, selectors);
-        include_with_by_id.insert(detected.id.clone(), detected.include_with.clone());
-        record_selected_dependency_rule(
-            selected_dependency_excludes_by_id,
-            &detected.id,
-            detected.depends_on_selected,
-            &detected.depends_on_selected_exclude,
-        );
-        record_required_selected_any(
-            required_selected_any_by_id,
-            &detected.id,
-            &detected.requires_selected_any,
-        );
-        if selected && !specs.iter().any(|spec| spec.id == detected.id) {
-            specs.push(builtin_to_task_spec(detected, false));
-        }
-    }
-
-    Ok(())
-}
-
 fn record_selected_dependency_rule(
     selected_dependency_excludes_by_id: &mut BTreeMap<String, BTreeSet<String>>,
     id: &str,
@@ -8449,35 +8336,11 @@ fn record_required_selected_any(
     }
 }
 
-fn builtin_task_selected_by_selectors(task: &BuiltinTask, selectors: &BTreeSet<String>) -> bool {
-    selectors.contains(&task.id)
-        || selectors.contains(&task.category)
-        || task
-            .include_with
-            .iter()
-            .any(|selector| selectors.contains(selector))
-}
-
 fn spec_selected_by_selectors(spec: &TaskSpec, selectors: &BTreeSet<String>) -> bool {
     if selectors.is_empty() {
         return false;
     }
     selectors.contains(&spec.id) || selectors.contains(&spec.category)
-}
-
-fn spec_matches_disabled_selector(
-    spec: &TaskSpec,
-    selectors: &BTreeSet<String>,
-    include_with_by_id: &BTreeMap<String, Vec<String>>,
-) -> bool {
-    spec_selected_by_selectors(spec, selectors)
-        || include_with_by_id
-            .get(&spec.id)
-            .is_some_and(|include_with| {
-                include_with
-                    .iter()
-                    .any(|selector| selectors.contains(selector))
-            })
 }
 
 fn prune_specs_without_required_selected_any(

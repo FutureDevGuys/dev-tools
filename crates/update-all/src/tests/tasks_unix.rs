@@ -82,18 +82,6 @@ fn sudo_keepalive_drop_stops_thread() {
 fn test_context(privilege_session: Arc<PrivilegeSession>) -> SyncContext {
     SyncContext {
         flags: Sections {
-            npm: false,
-            pipx: false,
-            system: false,
-            custom: true,
-            go: false,
-            uv: false,
-            uvx: false,
-            espanso: false,
-            rustup: false,
-            cargo: false,
-            cursor: false,
-            bootstrap: false,
             exclude: BTreeSet::new(),
             only: None,
         },

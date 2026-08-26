@@ -50,7 +50,6 @@ fn scan_reads_new_metadata_and_sorts_by_updated_time() {
 
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].metadata.run_id, "newer-id");
-    assert!(!runs[0].legacy);
 }
 
 #[test]
@@ -103,40 +102,7 @@ fn metadata_write_replaces_existing_metadata() {
 }
 
 #[test]
-fn scan_synthesizes_legacy_run_identity_from_run_json() {
-    let temp = TempDir::new().unwrap();
-    let run_dir = temp.path().join("run-123-456");
-    fs::create_dir_all(&run_dir).unwrap();
-    fs::write(
-        run_dir.join("run.json"),
-        r#"{
-          "started_unix_ms": 100,
-          "artifact_updated_unix_ms": 200,
-          "exit_code": 130,
-          "host_os": "linux",
-          "ui_mode": "dashboard",
-          "engine_mode": "async",
-          "selected_tasks": ["yay", "cargo"],
-          "tasks_elapsed_ms": 90,
-          "tasks": [
-            {"task_id": "cargo", "status": "failed", "completed_with_issues": false}
-          ]
-        }"#,
-    )
-    .unwrap();
-
-    let runs = scan_runs(temp.path()).unwrap();
-
-    assert_eq!(runs.len(), 1);
-    assert!(runs[0].legacy);
-    assert_eq!(runs[0].run_json_status, RunArtifactStatus::Loaded);
-    assert_eq!(runs[0].metadata.run_id, "run-123-456");
-    assert_eq!(runs[0].metadata.status, "canceled");
-    assert_eq!(runs[0].issue_count, 1);
-}
-
-#[test]
-fn scan_skips_malformed_legacy_run_json_without_blocking_history() {
+fn scan_skips_unowned_run_json_without_blocking_history() {
     let temp = TempDir::new().unwrap();
     let bad_run = temp.path().join("run-bad");
     let good_run = temp.path().join("run-good");
@@ -196,7 +162,6 @@ fn scan_keeps_metadata_run_when_run_json_is_malformed() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].metadata.run_id, "metadata-id");
     assert_eq!(runs[0].task_count, 0);
-    assert!(!runs[0].legacy);
     assert_eq!(runs[0].run_json_status, RunArtifactStatus::Malformed);
 }
 

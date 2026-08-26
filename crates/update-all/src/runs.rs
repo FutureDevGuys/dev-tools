@@ -30,7 +30,6 @@ pub(crate) struct RunMetadata {
 pub(crate) struct RunSummary {
     pub(crate) metadata: RunMetadata,
     pub(crate) path: PathBuf,
-    pub(crate) legacy: bool,
     pub(crate) run_json_status: RunArtifactStatus,
     pub(crate) task_count: usize,
     pub(crate) issue_count: usize,
@@ -217,26 +216,11 @@ fn read_run_summary(path: &Path) -> Result<Option<RunSummary>> {
         return Ok(Some(summary_from_parts(
             path,
             metadata,
-            false,
             artifact,
             run_json_status,
         )));
     }
-
-    let (artifact, run_json_status) = read_run_json_status(path);
-    if run_json_status != RunArtifactStatus::Loaded {
-        return Ok(None);
-    }
-    let Some(artifact) = artifact else {
-        return Ok(None);
-    };
-    Ok(Some(summary_from_parts(
-        path,
-        legacy_metadata(path, &artifact),
-        true,
-        Some(artifact),
-        run_json_status,
-    )))
+    Ok(None)
 }
 
 fn read_run_json_status(path: &Path) -> (Option<Value>, RunArtifactStatus) {
@@ -256,7 +240,6 @@ fn read_run_json_status(path: &Path) -> (Option<Value>, RunArtifactStatus) {
 fn summary_from_parts(
     path: &Path,
     metadata: RunMetadata,
-    legacy: bool,
     artifact: Option<Value>,
     run_json_status: RunArtifactStatus,
 ) -> RunSummary {
@@ -282,67 +265,11 @@ fn summary_from_parts(
     RunSummary {
         metadata,
         path: path.to_path_buf(),
-        legacy,
         run_json_status,
         task_count,
         issue_count,
         exit_code,
         elapsed_ms,
-    }
-}
-
-fn legacy_metadata(path: &Path, artifact: &Value) -> RunMetadata {
-    let dir_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("legacy-run")
-        .to_string();
-    let started = artifact
-        .get("started_unix_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let updated = artifact
-        .get("artifact_updated_unix_ms")
-        .and_then(Value::as_u64)
-        .or_else(|| artifact.get("ended_unix_ms").and_then(Value::as_u64))
-        .unwrap_or(started);
-    let exit_code = artifact
-        .get("exit_code")
-        .and_then(Value::as_i64)
-        .and_then(|code| i32::try_from(code).ok())
-        .unwrap_or(1);
-    RunMetadata {
-        schema_version: 1,
-        run_id: dir_name.clone(),
-        display_name: dir_name,
-        created_unix_ms: started,
-        updated_unix_ms: updated,
-        status: status_from_exit_code(exit_code),
-        run_dir: path.display().to_string(),
-        pid: 0,
-        host_os: artifact
-            .get("host_os")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        ui_mode: artifact
-            .get("ui_mode")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        engine_mode: artifact
-            .get("engine_mode")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        selected_tasks: artifact
-            .get("selected_tasks")
-            .and_then(Value::as_array)
-            .map(|tasks| {
-                tasks
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
     }
 }
 

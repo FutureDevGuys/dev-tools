@@ -230,7 +230,7 @@ impl BuiltinManagedExecutor {
         match input.trim().to_ascii_lowercase().as_str() {
             "npm" => Some(Self::Npm),
             "completions" => Some(Self::Completions),
-            "windows_foundations" | "windows-foundations" => Some(Self::WindowsFoundations),
+            "windows_foundations" => Some(Self::WindowsFoundations),
             _ => None,
         }
     }
@@ -258,9 +258,9 @@ pub enum BuiltinDetectionMode {
 impl BuiltinDetectionMode {
     fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
-            "any_present" | "any" => Some(Self::AnyPresent),
+            "any_present" => Some(Self::AnyPresent),
             "always" => Some(Self::Always),
-            "command_available" | "command" => Some(Self::CommandAvailable),
+            "command_available" => Some(Self::CommandAvailable),
             _ => None,
         }
     }
@@ -278,9 +278,9 @@ pub enum BuiltinReportParser {
 impl BuiltinReportParser {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
-            "arch_update_services" | "arch-update-services" => Some(Self::ArchUpdateServices),
+            "arch_update_services" => Some(Self::ArchUpdateServices),
             "scoop" => Some(Self::Scoop),
-            "version_lines" | "version-lines" | "uv" => Some(Self::VersionLines),
+            "version_lines" => Some(Self::VersionLines),
             "winget" => Some(Self::Winget),
             "yay" => Some(Self::Yay),
             _ => None,
@@ -292,7 +292,6 @@ impl BuiltinReportParser {
             "arch_update_services",
             "scoop",
             "version_lines",
-            "uv",
             "winget",
             "yay",
         ]

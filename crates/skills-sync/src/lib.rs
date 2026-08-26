@@ -311,8 +311,6 @@ enum LockRepair {
         path: String,
         imported: Vec<ImportedSkill>,
     },
-    #[serde(rename = "link")]
-    Link { path: String, target: String },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -510,7 +508,6 @@ impl Options {
             ignore_project_lock: env_bool("SKILLS_SYNC_NO_PROJECT_LOCK")?,
             skills_command: shell_words(
                 &env_string("SKILLS_SYNC_SKILLS_CMD")
-                    .or_else(|| env_string("SKILLS_SYNC_NPX_CMD"))
                     .unwrap_or_else(|| "npx skills@latest".to_string()),
             )?,
             json_output: env_bool("SKILLS_SYNC_JSON")?,
@@ -709,7 +706,6 @@ impl App {
     fn new(options: Options) -> Result<Self> {
         let home = home_dir();
         let default_canonical_global_lock = home.join(".agents").join("skills-lock.json");
-        let default_hidden_global_lock = home.join(".agents").join(".skill-lock.json");
         let include_global = options.mode == CommandMode::Lock
             || matches!(options.scope, Scope::Global | Scope::Both);
         let include_project = options.mode != CommandMode::Lock
@@ -721,21 +717,13 @@ impl App {
             );
         let agent_link_policy = effective_agent_link_policy(&options);
 
-        let global_endpoints = build_global_endpoints(
-            &options,
-            &default_canonical_global_lock,
-            &default_hidden_global_lock,
-        );
+        let global_endpoints = build_global_endpoints(&options, &default_canonical_global_lock);
         let global_lock_selection = select_global_lock(
             &global_endpoints,
             &options,
-            &home,
             include_global
                 && options.mode != CommandMode::Lock
                 && options.mode != CommandMode::Doctor,
-            options.mode == CommandMode::Doctor
-                || (options.mode == CommandMode::Lock
-                    && options.lock_action == Some(LockAction::Repair)),
         );
         let project_lock = if include_project && !options.ignore_project_lock {
             read_lock_file(&options.project_lock_file, false)?
@@ -983,25 +971,6 @@ impl App {
             }
         }
 
-        let canonical_realpath = safe_realpath(&canonical.path);
-        for endpoint in &self.global_endpoints {
-            if endpoint.label == "canonical" {
-                continue;
-            }
-            if endpoint.realpath == canonical_realpath {
-                continue;
-            }
-            self.payload.planned_lock_repairs.push(LockRepair::Link {
-                path: path_string(&endpoint.path),
-                target: path_string(&canonical.path),
-            });
-            if !self.options.dry_run {
-                if let Err(err) = replace_with_symlink(&endpoint.path, &canonical.path) {
-                    self.payload.errors.push(err.to_string());
-                    return;
-                }
-            }
-        }
         self.global_lock_selection.lock = merged;
         self.global_lock_selection.selected =
             Some(inspect_endpoint("canonical", "source", &canonical.path));
@@ -2312,17 +2281,6 @@ impl App {
                         }),
                         style.path(path)
                     ),
-                    LockRepair::Link { path, target } => println!(
-                        "{} {} {} -> {}",
-                        style.prefix(),
-                        style.plan(if self.options.dry_run {
-                            "would link"
-                        } else {
-                            "linked"
-                        }),
-                        style.path(path),
-                        style.path(target)
-                    ),
                 }
             }
             for warning in &self.payload.warnings {
@@ -2389,17 +2347,6 @@ impl App {
                             "wrote"
                         }),
                         style.path(path)
-                    ),
-                    LockRepair::Link { path, target } => println!(
-                        "{} {} lock {} -> {}",
-                        style.prefix(),
-                        style.plan(if self.options.dry_run {
-                            "would link"
-                        } else {
-                            "linked"
-                        }),
-                        style.path(path),
-                        style.path(target)
                     ),
                 }
             }
@@ -2787,16 +2734,14 @@ fn env_scope() -> Result<Option<Scope>> {
 
 fn env_agents() -> Vec<String> {
     let mut agents = Vec::new();
-    for name in ["SKILLS_SYNC_AGENT", "SKILLS_SYNC_AGENTS"] {
-        if let Some(value) = env_string(name) {
-            agents.extend(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|agent| !agent.is_empty())
-                    .map(ToString::to_string),
-            );
-        }
+    if let Some(value) = env_string("SKILLS_SYNC_AGENTS") {
+        agents.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|agent| !agent.is_empty())
+                .map(ToString::to_string),
+        );
     }
     normalize_agents(&agents)
 }
@@ -2945,33 +2890,11 @@ fn same_path(left: &Path, right: &Path) -> bool {
     safe_realpath(left).is_some_and(|left_real| safe_realpath(right) == Some(left_real))
 }
 
-fn build_global_endpoints(options: &Options, canonical: &Path, legacy: &Path) -> Vec<Endpoint> {
+fn build_global_endpoints(options: &Options, canonical: &Path) -> Vec<Endpoint> {
     if let Some(override_path) = &options.global_lock_file {
         return vec![inspect_endpoint("override", "selected", override_path)];
     }
-    let mut endpoints = vec![
-        inspect_endpoint("canonical", "source", canonical),
-        inspect_endpoint("legacy", "compat", legacy),
-    ];
-    let repairs_compat = options.mode == CommandMode::Doctor
-        || (options.mode == CommandMode::Lock && options.lock_action == Some(LockAction::Repair));
-    if repairs_compat {
-        if let Some(xdg_lock) = xdg_global_lock_path() {
-            if xdg_lock != canonical && xdg_lock != legacy {
-                endpoints.push(inspect_endpoint("xdg", "compat", &xdg_lock));
-            }
-        }
-    }
-    endpoints
-}
-
-fn xdg_global_lock_path() -> Option<PathBuf> {
-    let state_home = std::env::var_os("XDG_STATE_HOME")?;
-    let state_home = PathBuf::from(state_home);
-    if state_home.as_os_str().is_empty() {
-        return None;
-    }
-    Some(state_home.join("skills/.skill-lock.json"))
+    vec![inspect_endpoint("canonical", "source", canonical)]
 }
 
 fn inspect_endpoint(label: &str, role: &str, path: &Path) -> Endpoint {
@@ -3032,9 +2955,7 @@ fn endpoint_summary(endpoint: &Endpoint) -> EndpointSummary {
 fn select_global_lock(
     endpoints: &[Endpoint],
     options: &Options,
-    home: &Path,
     required: bool,
-    allow_repair: bool,
 ) -> GlobalLockSelection {
     if options.global_lock_file.is_some() {
         let selected = endpoints.first().cloned();
@@ -3074,64 +2995,17 @@ fn select_global_lock(
         };
     }
 
-    let canonical = endpoints
-        .iter()
-        .find(|endpoint| endpoint.label == "canonical");
-    let legacy = endpoints.iter().find(|endpoint| endpoint.label == "legacy");
-    let mut warnings = Vec::new();
+    let selected = endpoints.first().cloned();
     let mut errors = Vec::new();
-    let mut distinct: Vec<&Endpoint> = Vec::new();
-    for endpoint in endpoints.iter().filter(|endpoint| endpoint.readable) {
-        if !distinct
-            .iter()
-            .any(|candidate| candidate.realpath == endpoint.realpath)
-        {
-            distinct.push(endpoint);
-        }
-    }
-    if distinct.len() > 1 && !allow_repair {
+    if required && selected.as_ref().is_none_or(|endpoint| !endpoint.readable) {
         errors.push(format!(
-            "multiple readable global lock endpoints disagree ({}); run skills-sync doctor or remove one",
-            distinct
-                .iter()
+            "global lock file not found or unreadable: {}",
+            selected
+                .as_ref()
                 .map(|endpoint| path_string(&endpoint.path))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    } else if distinct.len() > 1 {
-        warnings.push(format!(
-            "multiple readable global lock endpoints disagree and will be repaired ({})",
-            distinct
-                .iter()
-                .map(|endpoint| path_string(&endpoint.path))
-                .collect::<Vec<_>>()
-                .join(", ")
+                .unwrap_or_default()
         ));
     }
-
-    let selected = if canonical.is_some_and(|endpoint| endpoint.readable) {
-        canonical.cloned()
-    } else if legacy.is_some_and(|endpoint| endpoint.readable) {
-        let selected = legacy.cloned();
-        if let Some(endpoint) = selected {
-            warnings.push(format!(
-                "using {} global lock {}; canonical lock is missing or unreadable",
-                endpoint.label,
-                endpoint.path.display()
-            ));
-            Some(endpoint)
-        } else {
-            None
-        }
-    } else {
-        if required {
-            errors.push(format!(
-                "global lock file not found in {} (expected skills-lock.json or .skill-lock.json)",
-                home.join(".agents").display()
-            ));
-        }
-        canonical.cloned()
-    };
     let lock = selected
         .as_ref()
         .filter(|endpoint| endpoint.readable)
@@ -3141,7 +3015,7 @@ fn select_global_lock(
     GlobalLockSelection {
         selected,
         lock,
-        warnings,
+        warnings: Vec::new(),
         errors,
     }
 }
@@ -3729,16 +3603,6 @@ fn write_json_following_useful_symlink(path: &Path, value: &Value) -> Result<()>
     .with_context(|| format!("write lock {}", path.display()))
 }
 
-fn replace_with_symlink(path: &Path, target: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create lock directory {}", parent.display()))?;
-    }
-    remove_path(path).with_context(|| format!("remove {}", path.display()))?;
-    symlink_path(target, path, false)
-        .with_context(|| format!("symlink {} -> {}", path.display(), target.display()))
-}
-
 fn apply_agent_link_repair(repair: &AgentLinkRepair) -> Result<()> {
     match repair {
         AgentLinkRepair::CreateMissingSymlink { path, target, .. } => {
@@ -4202,8 +4066,8 @@ WHAT CHANGES FILES?
       skills-sync lock repair
       skills-sync adopt
 
-    Change-making commands can write lock files, relink compatibility lock
-    paths, create missing agent skill symlinks, remove broken or redundant
+    Change-making commands can normalize the selected lock, create missing
+    agent skill symlinks, remove broken or redundant
     Codex symlinks, replace noncanonical agent symlinks, back up duplicate
     Codex skill directories, back up and relink duplicate non-Codex agent skill
     directories, and run `skills add` to restore or adopt skills.
@@ -4220,20 +4084,9 @@ GLOBAL VS PROJECT
     project skills included.
 
 LOCK FILES
-    Default global lock discovery only checks these ~/.agents files:
-      ~/.agents/skills-lock.json
-      ~/.agents/.skill-lock.json
-
-    Only one distinct global lock is accepted during normal status/sync. If both
-    files exist and point to different JSON, status/sync stop so you do not
-    accidentally track a mixed state.
-
-    doctor and lock repair can merge non-conflicting entries into
-    ~/.agents/skills-lock.json and relink ~/.agents/.skill-lock.json to it.
-    XDG_STATE_HOME is intentionally ignored for default lock selection. When it
-    is set, doctor and lock repair treat its upstream skills lock path as a
-    compatibility path and relink it to the canonical ~/.agents lock, so bare
-    `skills update -g` sees the same lock file.
+    The default global lock is exactly ~/.agents/skills-lock.json. Use
+    --global-lock-file when an explicit external profile supplies another lock;
+    default discovery does not adopt any alternate path.
 
 AGENT LINK RECONCILIATION
     skills-sync still delegates real install/link semantics to the upstream
@@ -4282,7 +4135,7 @@ COMMANDS
         Show what sync would do without making changes.
 
     doctor
-        The broad repair command. It repairs lock endpoints, restores missing
+        The broad repair command. It normalizes the selected lock, restores missing
         locked skills, relinks installed-but-unlinked skills, and safely adopts
         installed skills when their source can be inferred. If a skill was
         installed by Codex Desktop into a per-agent directory, doctor can adopt
@@ -4290,12 +4143,10 @@ COMMANDS
         metadata and the vendor checkout has a supported GitHub origin.
 
     lock status
-        Show which global lock endpoints exist, which are symlinks, and whether
-        they agree.
+        Show the selected global lock and its readable state.
 
     lock repair
-        Merge non-conflicting compatibility locks into ~/.agents/skills-lock.json
-        and relink compatibility paths to the canonical lock.
+        Normalize the selected global lock without changing its path.
 
     adopt
         Add one explicitly sourced skill to the lock/tracking flow.
@@ -4318,7 +4169,7 @@ COMMON EXAMPLES
     Only inspect the lock-file problem:
       skills-sync lock status -c skills
 
-    Repair only the global lock files and symlinks:
+    Normalize only the selected global lock:
       skills-sync lock repair -c skills
 
     Ask upstream to repair/register Codex only:
@@ -4336,7 +4187,7 @@ COMMON EXAMPLES
       skills-sync adopt -g --source owner/repo/skills/name --skill name -a codex -c skills
     Use this when a skill is installed but no reliable source can be inferred.
 
-    Adopt compatible Codex Desktop-installed skills and transfer duplicates:
+    Adopt supported Codex Desktop-installed skills and transfer duplicates:
       skills-sync doctor -g -c skills
     When the source can be inferred, this runs upstream `skills add` for the
     canonical global install. If you did not pass -a or -A, Desktop-import
@@ -4438,12 +4289,10 @@ ENVIRONMENT
         Default scope when no scope flag is provided.
 
     SKILLS_SYNC_SKILLS_CMD="skills"
-        Default upstream command. SKILLS_SYNC_NPX_CMD is still accepted for
-        compatibility.
+        Default upstream command.
 
     SKILLS_SYNC_AGENTS="codex,claude"
-        Default explicit upstream --agent targets. SKILLS_SYNC_AGENT is
-        accepted for one agent.
+        Default explicit upstream --agent targets.
 
     SKILLS_SYNC_COLOR=auto|always|never
         Default color mode. NO_COLOR disables color unless --color is provided.

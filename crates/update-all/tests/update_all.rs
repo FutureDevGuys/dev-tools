@@ -44,7 +44,7 @@ fn self_status_is_offline_and_machine_readable() {
         .args(["self", "status", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("running_version"))
+        .stdout(predicate::str::contains("engine_version"))
         .stdout(predicate::str::contains("managed"));
 }
 

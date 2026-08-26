@@ -112,8 +112,6 @@ catalogs = []
 #   label = "MyTool"
 #   command = "mytool"
 #
-# Catalog files also accept [updaters.tasks.<id>] for copy/paste compatibility.
-#
 # Authoring loop for beginners:
 # 1. Copy one example below and adjust the command/args.
 # 2. Run `update-all config validate --strict`.
@@ -151,11 +149,11 @@ catalogs = []
 #   failure stops the task before the primary command runs.
 # - external_manager_skip: skip self-update when the command binary is owned by
 #   an external package manager such as pacman, dpkg, rpm, apk, or brew.
-# - report_parser: optional compatibility parser for manager-shaped output.
+# - report_parser: optional built-in parser for manager-shaped output.
 #   Prefer report_patterns or report_commands.state_pattern for custom tools so
 #   new updater coverage stays data-driven instead of adding program-specific
-#   Rust parsers. Supported compatibility values: arch_update_services, scoop,
-#   version_lines, winget, yay. Legacy alias: uv.
+#   Rust parsers. Supported values: arch_update_services, scoop, version_lines,
+#   winget, yay.
 # - report_commands: optional read-only commands. By default they run after the
 #   updater succeeds and append successful output before report_parser extracts
 #   structured rows. Set when = "before" to append a pre-update probe, or pair

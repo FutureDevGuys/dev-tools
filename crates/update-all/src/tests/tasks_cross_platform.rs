@@ -78,90 +78,6 @@ fn expand_alias_ids_maps_winget_to_scope_tasks() {
 }
 
 #[test]
-fn disabled_legacy_selectors_match_ids_categories_and_catalog_aliases() {
-    let flags = Sections {
-        npm: false,
-        pipx: true,
-        system: false,
-        custom: false,
-        go: false,
-        uv: true,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: true,
-        cursor: false,
-        bootstrap: false,
-        exclude: BTreeSet::new(),
-        only: None,
-    };
-    let catalog = crate::updaters::builtin_catalog().expect("builtin catalog");
-    let known_selectors = legacy_disabled_selector_universe(&catalog);
-    let disabled = disabled_legacy_task_selectors(&flags, &known_selectors);
-    assert!(disabled.contains("npm"));
-    assert!(disabled.contains("system"));
-    assert!(disabled.contains("custom"));
-    assert!(disabled.contains("go"));
-    assert!(disabled.contains("rustup"));
-    assert!(!disabled.contains("uvx"));
-    assert!(!disabled.contains("espanso"));
-    assert!(!disabled.contains("cursor"));
-    assert!(!disabled.contains("pipx"));
-    assert!(!disabled.contains("cargo"));
-
-    let skill_spec = TaskSpec {
-        id: "skills".to_string(),
-        label: "Skills".to_string(),
-        depends_on: Vec::new(),
-        kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
-        category: "language".to_string(),
-    };
-    let system_spec = TaskSpec {
-        id: "yay".to_string(),
-        label: "Yay".to_string(),
-        depends_on: Vec::new(),
-        kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
-        category: "system".to_string(),
-    };
-    let cargo_spec = TaskSpec {
-        id: "cargo".to_string(),
-        label: "Cargo".to_string(),
-        depends_on: Vec::new(),
-        kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
-        category: "language".to_string(),
-    };
-    let cursor_named_custom_spec = TaskSpec {
-        id: "cursor".to_string(),
-        label: "Cursor Custom".to_string(),
-        depends_on: Vec::new(),
-        kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
-        category: "desktop".to_string(),
-    };
-    let include_with_by_id = BTreeMap::from([("skills".to_string(), vec!["npm".to_string()])]);
-
-    assert!(spec_matches_disabled_selector(
-        &skill_spec,
-        &disabled,
-        &include_with_by_id
-    ));
-    assert!(spec_matches_disabled_selector(
-        &system_spec,
-        &disabled,
-        &include_with_by_id
-    ));
-    assert!(!spec_matches_disabled_selector(
-        &cargo_spec,
-        &disabled,
-        &include_with_by_id
-    ));
-    assert!(!spec_matches_disabled_selector(
-        &cursor_named_custom_spec,
-        &disabled,
-        &include_with_by_id
-    ));
-}
-
-#[test]
 fn build_task_specs_accepts_rust_only_alias() {
     let _lock = env_guard();
 
@@ -186,18 +102,6 @@ fn build_task_specs_accepts_rust_only_alias() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["rust".to_string()])),
     };
@@ -246,18 +150,6 @@ fn build_task_specs_allows_config_exclude_to_prune_direct_only_selector_without_
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["go".to_string()])),
     };
@@ -301,18 +193,6 @@ fn build_task_specs_allows_config_exclude_to_prune_only_alias_without_unknown_er
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["rust".to_string()])),
     };
@@ -492,18 +372,6 @@ fn custom_uv_task_is_not_suppressed_by_builtin_windows_skip_rule() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: true,
-        go: false,
-        uv: true,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: None,
     };
@@ -4098,18 +3966,6 @@ fn build_task_specs_runs_arch_update_services_last_after_yay() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: true,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["system".to_string()])),
     };
@@ -4151,18 +4007,6 @@ fn build_task_specs_does_not_block_arch_update_services_on_language_tasks() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: true,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: true,
-        cargo: true,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: None,
     };
@@ -4213,18 +4057,6 @@ fn build_task_specs_keeps_explicit_pacman_when_yay_skip_rule_matches() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: true,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["pacman".to_string()])),
     };
@@ -4265,18 +4097,6 @@ fn build_task_specs_skips_arch_update_services_without_required_selected_yay() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: true,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: None,
     };
@@ -4315,18 +4135,6 @@ fn build_task_specs_only_system_does_not_bypass_required_selected_any() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: true,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["system".to_string()])),
     };
@@ -4365,18 +4173,6 @@ fn build_task_specs_run_all_detected_false_does_not_materialize_legacy_npm_pipx(
         },
     };
     let flags = Sections {
-        npm: true,
-        pipx: true,
-        system: true,
-        custom: true,
-        go: true,
-        uv: true,
-        uvx: true,
-        espanso: true,
-        rustup: true,
-        cargo: true,
-        cursor: true,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: None,
     };
@@ -4460,18 +4256,6 @@ fn build_task_specs_expands_selected_category_dependencies() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: true,
-        custom: true,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: None,
     };
@@ -4518,18 +4302,6 @@ fn build_task_specs_keeps_explicit_windows_system_ids_when_only_disables_section
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from([
             "winget-user".to_string(),
@@ -4581,18 +4353,6 @@ fn bootstrap_enabled_includes_windows_foundations_task() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: true,
         exclude: BTreeSet::new(),
         only: None,
     };
@@ -4630,18 +4390,6 @@ fn only_winget_expands_to_both_winget_scopes() {
         },
     };
     let flags = Sections {
-        npm: false,
-        pipx: false,
-        system: false,
-        custom: false,
-        go: false,
-        uv: false,
-        uvx: false,
-        espanso: false,
-        rustup: false,
-        cargo: false,
-        cursor: false,
-        bootstrap: false,
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from(["winget".to_string()])),
     };
