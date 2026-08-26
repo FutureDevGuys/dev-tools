@@ -2065,3 +2065,7 @@ pub fn parse_engine_mode(s: &str) -> Option<EngineMode> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "tests/config.rs"]
+mod tests;

@@ -4,6 +4,8 @@ Reliable, inspectable tools for keeping a developer workstation current, fast, a
 
 Dev Tools is a product workspace, not a package manager and not a workstation configuration repository. Each command is independently installable and independently released.
 
+![Update All dashboard showing six compact functional groups](docs/assets/update-all-dashboard.png)
+
 | Product | Use it for |
 |---|---|
 | [`update-all`](docs/update-all.md) | Run supported package and tool updaters through one dependable plan and dashboard. |
