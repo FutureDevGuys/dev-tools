@@ -103,6 +103,49 @@ fn runtime_config_rejects_unknown_custom_updater_after_reference() {
 }
 
 #[test]
+fn external_catalog_parses_ordering_after_all_selected_tasks() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    let catalog = tmp.path().join("catalog.toml");
+    std::fs::write(
+        &config,
+        "[updaters]\nrun_all_detected = true\ncatalogs = [\"catalog.toml\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog,
+        "[tasks.\"team/finalize\"]\ncommand = \"finalize\"\nafter_selected = true\nafter_selected_exclude = [\"builtin/npm\"]\n",
+    )
+    .unwrap();
+
+    let runtime = load_runtime_config(Some(config)).unwrap();
+    let task = &runtime.updaters.custom_tasks["team/finalize"];
+    assert!(task.after_selected);
+    assert_eq!(task.after_selected_exclude, ["builtin/npm"]);
+}
+
+#[test]
+fn runtime_config_rejects_unknown_after_selected_exclusion() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[updaters.tasks.notes]\ncommand = \"notes-sync\"\nafter_selected = true\nafter_selected_exclude = [\"missing-updater\"]\n",
+    )
+    .unwrap();
+
+    let error = load_runtime_config(Some(config)).unwrap_err().to_string();
+    assert!(
+        error.contains("updaters.tasks.notes.after_selected_exclude"),
+        "{error}"
+    );
+    assert!(
+        error.contains("unknown task id 'missing-updater'"),
+        "{error}"
+    );
+}
+
+#[test]
 fn duplicate_task_ids_fail_without_override() {
     let tmp = TempDir::new().unwrap();
     let config = tmp.path().join("config.toml");

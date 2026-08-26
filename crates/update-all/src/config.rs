@@ -162,6 +162,8 @@ pub struct UpdaterTaskConfig {
     pub requires_selected_any: Vec<String>,
     pub depends_on_selected: bool,
     pub depends_on_selected_exclude: Vec<String>,
+    pub after_selected: bool,
+    pub after_selected_exclude: Vec<String>,
     pub resource_locks: Vec<String>,
     pub authority: Option<String>,
     pub result_protocol: Option<u32>,
@@ -455,6 +457,8 @@ struct FileUpdaterTaskConfig {
     requires_selected_any: Option<Vec<String>>,
     depends_on_selected: Option<bool>,
     depends_on_selected_exclude: Option<Vec<String>>,
+    after_selected: Option<bool>,
+    after_selected_exclude: Option<Vec<String>>,
     resource_locks: Option<Vec<String>>,
     authority: Option<String>,
     result_protocol: Option<u32>,
@@ -1137,6 +1141,11 @@ fn validate_custom_task_lists(id: &str, raw: &FileUpdaterTaskConfig) -> Result<(
             "task id",
         ),
         (
+            "after_selected_exclude",
+            raw.after_selected_exclude.as_deref(),
+            "task id",
+        ),
+        (
             "success_details",
             raw.success_details.as_deref(),
             "detail text",
@@ -1234,6 +1243,8 @@ fn parse_custom_task(id: &str, raw: FileUpdaterTaskConfig) -> Result<UpdaterTask
         requires_selected_any: raw.requires_selected_any.unwrap_or_default(),
         depends_on_selected: raw.depends_on_selected.unwrap_or(false),
         depends_on_selected_exclude: raw.depends_on_selected_exclude.unwrap_or_default(),
+        after_selected: raw.after_selected.unwrap_or(false),
+        after_selected_exclude: raw.after_selected_exclude.unwrap_or_default(),
         resource_locks: raw.resource_locks.unwrap_or_default(),
         authority: raw.authority,
         result_protocol: raw.result_protocol,
@@ -1491,6 +1502,13 @@ fn validate_custom_task_references(
             "depends_on_selected_exclude",
             "task id",
             &task.depends_on_selected_exclude,
+            &known_ids,
+        )?;
+        validate_custom_selector_references(
+            &task.id,
+            "after_selected_exclude",
+            "task id",
+            &task.after_selected_exclude,
             &known_ids,
         )?;
     }

@@ -8497,6 +8497,7 @@ fn build_task_specs(
         .collect::<BTreeSet<_>>();
     let mut selected_dependency_excludes_by_id: BTreeMap<String, BTreeSet<String>> =
         BTreeMap::new();
+    let mut selected_ordering_excludes_by_id: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut required_selected_any_by_id: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     let mut detection_targets = vec![*host_os];
@@ -8556,6 +8557,12 @@ fn build_task_specs(
                     custom.depends_on_selected,
                     &custom.depends_on_selected_exclude,
                 );
+                record_selected_ordering_rule(
+                    &mut selected_ordering_excludes_by_id,
+                    &custom.id,
+                    custom.after_selected,
+                    &custom.after_selected_exclude,
+                );
                 record_required_selected_any(
                     &mut required_selected_any_by_id,
                     &custom.id,
@@ -8583,6 +8590,12 @@ fn build_task_specs(
                 &custom.id,
                 custom.depends_on_selected,
                 &custom.depends_on_selected_exclude,
+            );
+            record_selected_ordering_rule(
+                &mut selected_ordering_excludes_by_id,
+                &custom.id,
+                custom.after_selected,
+                &custom.after_selected_exclude,
             );
             record_required_selected_any(
                 &mut required_selected_any_by_id,
@@ -8686,6 +8699,16 @@ fn build_task_specs(
                     .cloned(),
             );
         }
+        if let Some(excludes) = selected_ordering_excludes_by_id.get(&spec.id) {
+            let ordering_dependencies = selected_ids
+                .iter()
+                .filter(|id| id.as_str() != spec.id)
+                .filter(|id| !excludes.contains(id.as_str()))
+                .filter(|id| !deps.contains(id.as_str()))
+                .map(|id| ordering_dependency(id))
+                .collect::<Vec<_>>();
+            deps.extend(ordering_dependencies);
+        }
         deps.extend(
             expand_selected_dependency_selectors(
                 &ordering_selectors,
@@ -8712,6 +8735,20 @@ fn record_selected_dependency_rule(
         selected_dependency_excludes_by_id.insert(
             id.to_string(),
             depends_on_selected_exclude.iter().cloned().collect(),
+        );
+    }
+}
+
+fn record_selected_ordering_rule(
+    selected_ordering_excludes_by_id: &mut BTreeMap<String, BTreeSet<String>>,
+    id: &str,
+    after_selected: bool,
+    after_selected_exclude: &[String],
+) {
+    if after_selected {
+        selected_ordering_excludes_by_id.insert(
+            id.to_string(),
+            after_selected_exclude.iter().cloned().collect(),
         );
     }
 }

@@ -8,6 +8,13 @@ Prompt request, answer, and cancellation events are explicit journal records key
 
 Every task-scoped `log_line` record carries the task's exact qualified ID. Run-wide records have a null `task_id`, remain in the global pane and `run.log`, and never create a task-log artifact. The selected task pane replays all retained journal-delivered records for that ID, including records received before task registration.
 
+Catalog relationships distinguish capability health from ordering. `depends_on`
+and `depends_on_selected` require healthy predecessors. `after` and
+`after_selected` wait only for terminal outcomes, so a final reconciliation task
+can still run after an earlier failure. The corresponding `*_exclude` fields
+remove exact task IDs only from generated selected-task relationships; explicit
+relationships remain authoritative. Unknown IDs and cycles fail validation.
+
 Outcome values are `updated`, `no_op`, `not_applicable`, `deferred`, `failed`, `blocked`, and `cancelled`. Exit status `0` means clean completion, `1` task failures, `2` deferrals only, `3` an invalid plan or cancelled required prompt, and `4` updater integrity failure.
 
 Authenticated product operations share one interface:

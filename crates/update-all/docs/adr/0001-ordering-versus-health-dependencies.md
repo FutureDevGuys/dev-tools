@@ -44,7 +44,10 @@ status.
 
 Configurations must choose the relationship that matches capability semantics.
 Existing `depends_on` configurations remain health-gated. The additive `after`
-field is available to built-ins, external catalogs, and inline TOML.
+field is available to built-ins, external catalogs, and inline TOML. External
+catalog tasks may use `after_selected = true` to generate ordering-only edges to
+the selected run set; `after_selected_exclude` removes explicitly named task
+IDs from that generated set.
 
 ## Verification
 
@@ -56,6 +59,8 @@ Named regression tests:
 - `failed_dependencies_block_even_when_their_advisory_is_non_blocking`
 - `mixed_ordering_and_health_dependency_cycle_is_rejected`
 - `runtime_config_rejects_unknown_custom_updater_after_reference`
+- `build_task_specs_expands_after_selected_as_ordering_only`
+- `runtime_config_rejects_unknown_after_selected_exclusion`
 
 ## Runtime acceptance
 

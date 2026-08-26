@@ -137,6 +137,10 @@ catalogs = []
 # - depends_on_selected_exclude: task IDs to omit from those generated
 #   selected-task dependencies. Direct `depends_on` entries are still honored
 #   when the referenced task is selected.
+# - after_selected: when true, wait for every other selected task to reach any
+#   terminal state without treating its outcome as a capability gate.
+# - after_selected_exclude: task IDs to omit from those generated ordering
+#   predecessors. Direct `after` entries are still honored when selected.
 # - requires_elevation: command needs elevated privileges.
 # - needs_sudo_session: command should reuse update-all's managed sudo session.
 # - interactive: command may prompt and should stay dashboard-aware.
@@ -183,6 +187,8 @@ catalogs = []
 # requires_selected_any = []
 # depends_on_selected = false
 # depends_on_selected_exclude = []
+# after_selected = false
+# after_selected_exclude = []
 # command = "mytool"
 # args = ["self-update"]
 # mode = "direct"

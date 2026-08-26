@@ -240,6 +240,8 @@ fn custom_task_windows_detection_gates_are_windows_only() {
         requires_selected_any: Vec::new(),
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
+        after_selected: false,
+        after_selected_exclude: Vec::new(),
         resource_locks: Vec::new(),
         authority: None,
         command: "primary".to_string(),
@@ -335,6 +337,8 @@ fn custom_uv_task_is_not_suppressed_by_builtin_windows_skip_rule() {
             requires_selected_any: Vec::new(),
             depends_on_selected: false,
             depends_on_selected_exclude: Vec::new(),
+            after_selected: false,
+            after_selected_exclude: Vec::new(),
             resource_locks: Vec::new(),
             authority: None,
             command: "custom-uv".to_string(),
@@ -4269,6 +4273,8 @@ fn build_task_specs_expands_selected_category_dependencies() {
             requires_selected_any: Vec::new(),
             depends_on_selected: false,
             depends_on_selected_exclude: Vec::new(),
+            after_selected: false,
+            after_selected_exclude: Vec::new(),
             resource_locks: Vec::new(),
             authority: None,
             command: "after-system".to_string(),
@@ -4334,6 +4340,105 @@ fn build_task_specs_expands_selected_category_dependencies() {
         order.iter().position(|id| *id == "builtin/yay").unwrap()
             < order.iter().position(|id| *id == "after-system").unwrap(),
         "category dependency should order custom task after selected system tasks: {order:?}"
+    );
+}
+
+#[test]
+fn build_task_specs_expands_after_selected_as_ordering_only() {
+    let _lock = env_guard();
+
+    let mut custom_tasks = BTreeMap::new();
+    custom_tasks.insert(
+        "finalize".to_string(),
+        UpdaterTaskConfig {
+            id: "finalize".to_string(),
+            label: "Finalize".to_string(),
+            os: vec!["linux".to_string()],
+            detect_mode: UpdaterDetectionMode::AnyPresent,
+            detect_any: vec!["finalize".to_string()],
+            detect_all: Vec::new(),
+            detect_all_windows: Vec::new(),
+            skip_if_any: Vec::new(),
+            skip_if_any_windows: Vec::new(),
+            depends_on: Vec::new(),
+            after: Vec::new(),
+            requires_selected_any: Vec::new(),
+            depends_on_selected: false,
+            depends_on_selected_exclude: Vec::new(),
+            after_selected: true,
+            after_selected_exclude: vec!["builtin/npm".to_string()],
+            resource_locks: Vec::new(),
+            authority: None,
+            command: "finalize".to_string(),
+            args: Vec::new(),
+            mode: None,
+            command_candidates: Vec::new(),
+            pre_commands: Vec::new(),
+            report_commands: Vec::new(),
+            report_patterns: Vec::new(),
+            report_scoped_deltas: Vec::new(),
+            enabled: true,
+            requires_elevation: false,
+            needs_sudo_session: false,
+            interactive: false,
+            external_window: false,
+            shell: false,
+            policy_key: "system_update".to_string(),
+            category: "maintenance".to_string(),
+            report_parser: None,
+            plain_header: None,
+            plain_start: None,
+            success_details: Vec::new(),
+            external_manager_skip: false,
+            result_protocol: None,
+        },
+    );
+    let updater_config = UpdaterConfig {
+        run_all_detected: true,
+        include: BTreeSet::new(),
+        exclude: BTreeSet::new(),
+        privilege_mode: crate::updaters::PrivilegeMode::PromptTty,
+        custom_tasks,
+        bootstrap: BootstrapConfig {
+            enabled: false,
+            windows_foundations: Vec::new(),
+        },
+    };
+    let flags = Sections {
+        exclude: BTreeSet::new(),
+        only: None,
+    };
+
+    let temp = TempDir::new().unwrap();
+    for command in ["yay", "npm", "npx", "finalize"] {
+        write_executable(&temp.path().join(command), "#!/bin/sh\nexit 0\n");
+    }
+    let original_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", temp.path());
+    let specs = build_task_specs(&flags, &HostOs::Linux, &updater_config).expect("build specs");
+    if let Some(path) = original_path {
+        std::env::set_var("PATH", path);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    let finalize = specs
+        .iter()
+        .find(|spec| spec.id == "finalize")
+        .expect("finalize spec");
+    assert_eq!(
+        finalize.depends_on,
+        vec![ordering_dependency("builtin/yay")]
+    );
+
+    let failed = TaskResult::failed("Yay", "system update failed");
+    let pending = BTreeMap::from([("finalize".to_string(), finalize.clone())]);
+    let done = BTreeMap::from([("builtin/yay".to_string(), failed)]);
+    assert_eq!(
+        next_ready_task(&pending, &done, &BTreeSet::new())
+            .map(|(id, _)| id)
+            .as_deref(),
+        Some("finalize")
     );
 }
 
