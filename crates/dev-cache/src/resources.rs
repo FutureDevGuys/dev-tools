@@ -159,6 +159,7 @@ pub fn register_routed(
             }
         };
         record.last_started_unix = now;
+        record.last_completed_unix = None;
         record.hazards.extend(
             hazards
                 .iter()
@@ -281,6 +282,59 @@ pub fn resource_ids_under(root: &RootHandle, parent: &Path) -> Result<Vec<String
         .collect()
 }
 
+pub fn rebase_under(root: &RootHandle, source: &Path, destination: &Path) -> Result<()> {
+    if source == destination {
+        return Ok(());
+    }
+    let (records, issues) = scan(root)?;
+    if let Some(issue) = issues.first() {
+        bail!(
+            "cannot rebase workspace resources while catalog entry {} is invalid: {}",
+            issue.path.display(),
+            issue.reason
+        );
+    }
+    let mut updates = Vec::new();
+    for record in records {
+        let absolute = absolute_path(root, &record)?;
+        if !absolute.starts_with(source) {
+            continue;
+        }
+        let suffix = absolute.strip_prefix(source)?;
+        let rebased_absolute = destination.join(suffix);
+        let relative_path = checked_relative(root, &rebased_absolute)?;
+        let new_id = resource_id(record.kind, &relative_path);
+        let mut updated = record.clone();
+        updated.relative_path = relative_path;
+        updated.resource_id = new_id.clone();
+        let target_path = catalog_path(root, &new_id);
+        if target_path.is_file() && new_id != record.resource_id {
+            let target: ResourceRecord = serde_json::from_slice(&fs::read(&target_path)?)
+                .with_context(|| format!("parse resource record {}", target_path.display()))?;
+            validate_record(root, &target)?;
+            if target.kind != updated.kind
+                || target.adapter != updated.adapter
+                || target.cleanup != updated.cleanup
+            {
+                bail!(
+                    "rebased resource collides with incompatible catalog record {}",
+                    target.resource_id
+                );
+            }
+            updated = merge_rebased_records(target, updated);
+        }
+        updates.push((record.resource_id, updated));
+    }
+    for (old_id, updated) in updates {
+        let new_path = catalog_path(root, &updated.resource_id);
+        write_json_atomic(&new_path, &updated)?;
+        if old_id != updated.resource_id {
+            remove_record(root, &old_id)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn list(root: &RootHandle) -> Result<Vec<ResourceRecord>> {
     let (records, issues) = scan(root)?;
     if let Some(issue) = issues.first() {
@@ -368,6 +422,30 @@ fn catalog_dir(root: &RootHandle) -> PathBuf {
 fn resource_id(kind: ResourceKind, relative: &Path) -> String {
     let payload = format!("v1\0{kind:?}\0{}", relative.to_string_lossy());
     blake3::hash(payload.as_bytes()).to_hex().to_string()
+}
+
+fn merge_rebased_records(mut current: ResourceRecord, legacy: ResourceRecord) -> ResourceRecord {
+    let legacy_is_newer = legacy.last_started_unix > current.last_started_unix;
+    current.created_unix = current.created_unix.min(legacy.created_unix);
+    current.last_started_unix = current.last_started_unix.max(legacy.last_started_unix);
+    current.last_completed_unix =
+        max_optional(current.last_completed_unix, legacy.last_completed_unix);
+    current.last_maintained_unix =
+        max_optional(current.last_maintained_unix, legacy.last_maintained_unix);
+    current.hazards.extend(legacy.hazards);
+    if legacy_is_newer {
+        current.native_program = legacy.native_program;
+        current.native_prefix = legacy.native_prefix;
+        current.native_environment = legacy.native_environment;
+    }
+    current
+}
+
+fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
 }
 
 fn checked_relative(root: &RootHandle, absolute: &Path) -> Result<PathBuf> {

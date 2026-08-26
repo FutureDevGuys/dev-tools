@@ -16,7 +16,7 @@ use crate::config::{Config, EnvironmentOverrides};
 use crate::dispatch::{classify_invocation, is_intercept_name, Dispatch};
 use crate::gc::{self, GcOverrides};
 use crate::install;
-use crate::lease::RootLease;
+use crate::lease::{ActiveLease, RootLease};
 use crate::migrate;
 use crate::provenance;
 use crate::repository::Repository;
@@ -1142,7 +1142,7 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
     let repository = Repository::discover(&env::current_dir()?, &root)?
         .context("resolve current workspace scope")?;
     maybe_automatic_gc(&root, config, true);
-    let lease = RootLease::shared(&root, &format!("exec:{:?}", args.adapter))?;
+    let setup_lease = RootLease::shared(&root, &format!("exec:{:?}", args.adapter))?;
     let (mut environment, mut resource_ids) =
         adapter_environment(&root, &repository, args.adapter)?;
     if args.adapter == Adapter::Cargo && config.sccache.enabled {
@@ -1156,6 +1156,7 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
                 .or_insert_with(|| size.clone());
         }
     }
+    let active_lease = setup_lease.into_active(&resource_ids)?;
     let (program, program_args) = args.program.split_first().context("missing program")?;
     let resolved_program = if args.adapter == Adapter::Cargo
         && Path::new(program)
@@ -1176,7 +1177,7 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
         .with_context(|| format!("run {}", Path::new(&resolved_program).display()))?;
     let code = status.code().unwrap_or(1);
     resources::complete(&root, &resource_ids)?;
-    drop(lease);
+    drop(active_lease);
     maybe_automatic_gc(&root, config, false);
     Ok(code)
 }
@@ -1396,7 +1397,7 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     let workspace =
         Repository::discover(&current_dir, &root)?.context("resolve current workspace scope")?;
     maybe_automatic_gc(&root, &config, true);
-    let lease = RootLease::shared(&root, &format!("intercept:{command}"))?;
+    let setup_lease = RootLease::shared(&root, &format!("intercept:{command}"))?;
     let context = AdapterContext {
         worktree_cache: workspace.cache_dir.clone(),
         shared_cache: root.shared(),
@@ -1414,6 +1415,7 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     let hazards = adapter_hazards(adapter, &args, &current_dir);
     let resource_ids =
         prepare_adapter_environment(&root, &workspace, adapter, &environment, &native, &hazards)?;
+    let active_lease = setup_lease.into_active(&resource_ids)?;
     let routed: Vec<(String, String)> = environment.into_iter().collect();
     let code = if compiler_intercept {
         let ccache = cargo_intercept::resolve_real_command("ccache", &current_exe)?;
@@ -1425,7 +1427,7 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
         cargo_intercept::delegate(&real, &args, &routed, None)?
     };
     resources::complete(&root, &resource_ids)?;
-    drop(lease);
+    drop(active_lease);
     maybe_automatic_gc(&root, &config, false);
     Ok(code)
 }
@@ -1972,7 +1974,7 @@ fn run_rustup(args: Vec<OsString>) -> Result<i32> {
 struct CargoRouting {
     environment: Vec<(String, String)>,
     status: String,
-    lease: Option<RootLease>,
+    lease: Option<ActiveLease>,
     maintenance_root: Option<RootHandle>,
     resource_ids: Vec<String>,
 }
@@ -2018,7 +2020,7 @@ fn cargo_routing(
                     let repository = Repository::discover(&repository_start, &root)?
                         .context("resolve Cargo workspace scope")?;
                     maybe_automatic_gc(&root, config, true);
-                    lease = Some(RootLease::shared(&root, "cargo-sccache")?);
+                    let setup_lease = RootLease::shared(&root, "cargo-sccache")?;
                     let (mut environment, registered) =
                         adapter_environment(&root, &repository, Adapter::Sccache)?;
                     resource_ids.extend(registered);
@@ -2029,6 +2031,7 @@ fn cargo_routing(
                     }
                     environment.insert("RUSTC_WRAPPER".to_owned(), "sccache".to_owned());
                     routed.extend(environment);
+                    lease = Some(setup_lease.into_active(&resource_ids)?);
                     maintenance_root = Some(root);
                     status = "Cargo is older than 1.91; native target layout preserved and sccache routing is active".to_owned();
                 } else if persistent_wrapper.is_err() {
@@ -2091,7 +2094,7 @@ fn cargo_routing(
         };
         if let Some(repository) = Repository::discover(&repository_start, &root)? {
             maybe_automatic_gc(&root, config, true);
-            lease = Some(RootLease::shared(&root, "cargo")?);
+            let setup_lease = RootLease::shared(&root, "cargo")?;
             let (mut environment, registered) =
                 adapter_environment(&root, &repository, Adapter::Cargo)?;
             resource_ids.extend(registered);
@@ -2124,6 +2127,7 @@ fn cargo_routing(
                     .display()
             );
             routed.extend(environment);
+            lease = Some(setup_lease.into_active(&resource_ids)?);
             maintenance_root = Some(root);
         }
     } else if config.enabled && config.cargo.enabled && explicit_layout {

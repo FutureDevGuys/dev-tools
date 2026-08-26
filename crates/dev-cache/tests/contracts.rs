@@ -2569,6 +2569,69 @@ fn garbage_collection_is_dry_run_first_and_honors_active_leases() {
 }
 
 #[test]
+fn garbage_collection_skips_active_resources_without_blocking_unrelated_collection() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let active_path = root.shared().join("meson/packages");
+    let inactive_path = root.shared().join("zig/global");
+    for path in [&active_path, &inactive_path] {
+        fs::create_dir_all(path).expect("cache directory");
+        fs::write(path.join("cache.bin"), b"cache").expect("cache data");
+    }
+    let active_ids = resources::register_routed(
+        &root,
+        Adapter::Meson,
+        &HashMap::from([(
+            "MESON_PACKAGE_CACHE_DIR".to_owned(),
+            active_path.to_string_lossy().into_owned(),
+        )]),
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("active resource");
+    let inactive_ids = resources::register_routed(
+        &root,
+        Adapter::Zig,
+        &HashMap::from([(
+            "ZIG_GLOBAL_CACHE_DIR".to_owned(),
+            inactive_path.to_string_lossy().into_owned(),
+        )]),
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("inactive resource");
+    resources::complete(&root, &active_ids).expect("complete active setup");
+    resources::complete(&root, &inactive_ids).expect("complete inactive setup");
+    let active = RootLease::shared(&root, "long-running")
+        .expect("setup lease")
+        .into_active(&active_ids)
+        .expect("resource-specific active lease");
+    let mut policy = Config::default().gc;
+    policy.min_free_bytes = 0;
+    policy.target_free_bytes = 0;
+    let overrides = GcOverrides {
+        stale_after_days: Some(0),
+        ..GcOverrides::default()
+    };
+
+    let report =
+        gc::collect(&root, &policy, 120, &overrides, true).expect("unrelated collection proceeds");
+    assert!(active_path.exists());
+    assert!(!inactive_path.exists());
+    assert!(report
+        .abstentions
+        .iter()
+        .any(|item| item.resource_id.as_ref() == Some(&active_ids[0])
+            && item.reason.contains("active routed command")));
+    drop(active);
+
+    let drained = gc::collect(&root, &policy, 120, &overrides, true)
+        .expect("active resource becomes collectible");
+    assert!(drained.complete);
+    assert!(!active_path.exists());
+}
+
+#[test]
 fn garbage_collection_never_panics_or_escapes_on_malformed_artifact_metadata() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
@@ -2666,6 +2729,339 @@ fn garbage_collection_abstains_from_forged_repository_ownership() {
             .len(),
         1
     );
+}
+
+#[test]
+fn garbage_collection_rehomes_root_scoped_workspace_identity_without_losing_cache_data() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(workspace.join("go.mod"), b"module example.invalid/rehome\n")
+        .expect("workspace manifest");
+    let repository = Repository::discover(&workspace, &root)
+        .expect("workspace discovery")
+        .expect("workspace scope");
+    let filesystem_identity = filesystem_identity_for_test(&workspace);
+    let legacy_identity = blake3::hash(
+        format!(
+            "v2\0{}\0{}\0{}",
+            root.marker.root_id,
+            workspace.display(),
+            filesystem_identity
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    let legacy = root
+        .repos()
+        .join(&legacy_identity[..2])
+        .join(&legacy_identity);
+    fs::create_dir_all(legacy.join("temp/generic")).expect("legacy cache directory");
+    fs::write(legacy.join("temp/generic/cache.bin"), b"preserved").expect("legacy cache data");
+    fs::write(
+        legacy.join("identity.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "identity": legacy_identity,
+            "canonical_worktree": workspace,
+            "filesystem_identity": filesystem_identity,
+            "platform": root.platform,
+            "created_unix": 1,
+            "last_used_unix": 1
+        }))
+        .expect("legacy identity JSON"),
+    )
+    .expect("legacy identity");
+    let resource_ids = resources::register_routed(
+        &root,
+        Adapter::Temp,
+        &HashMap::from([(
+            "TMPDIR".to_owned(),
+            legacy.join("temp/generic").to_string_lossy().into_owned(),
+        )]),
+        &NativeTool::default(),
+        &BTreeSet::new(),
+    )
+    .expect("legacy resource catalog");
+    resources::complete(&root, &resource_ids).expect("complete legacy resource");
+
+    let plan = gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides::default(),
+        false,
+    )
+    .expect("reconciliation plan");
+    let action = plan
+        .actions
+        .iter()
+        .find(|action| action.reason == "identity-reconciliation")
+        .expect("identity reconciliation action");
+    assert_eq!(action.path, legacy);
+    assert_eq!(
+        action.destination.as_deref(),
+        Some(repository.cache_dir.as_path())
+    );
+    assert!(legacy.exists(), "a plan must remain read-only");
+
+    let applied = gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .expect("apply reconciliation");
+    assert!(applied.complete);
+    assert!(!legacy.exists());
+    assert_eq!(
+        fs::read(repository.cache_dir.join("temp/generic/cache.bin"))
+            .expect("reconciled cache data"),
+        b"preserved"
+    );
+    let identity: serde_json::Value = serde_json::from_slice(
+        &fs::read(repository.cache_dir.join("identity.json")).expect("current identity"),
+    )
+    .expect("current identity JSON");
+    assert_eq!(identity["identity"], repository.identity);
+    let records = resources::list(&root).expect("rebased resource catalog");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        resources::absolute_path(&root, &records[0]).expect("rebased resource path"),
+        repository.cache_dir.join("temp/generic")
+    );
+    assert!(gc::maintenance_status(&root)
+        .expect("maintenance status")
+        .repository_issues
+        .is_empty());
+}
+
+#[test]
+fn garbage_collection_merges_only_identical_workspace_identity_collisions() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("go.mod"),
+        b"module example.invalid/collision\n",
+    )
+    .expect("workspace manifest");
+    let repository = Repository::discover(&workspace, &root)
+        .expect("workspace discovery")
+        .expect("workspace scope");
+    repository
+        .touch(&root)
+        .expect("current repository identity");
+    fs::create_dir_all(repository.cache_dir.join("temp/ccache")).expect("current cache");
+    fs::write(
+        repository.cache_dir.join("temp/ccache/inode-cache.v2"),
+        b"same cache",
+    )
+    .expect("current cache data");
+    let filesystem_identity = filesystem_identity_for_test(&workspace);
+    let legacy_identity = blake3::hash(
+        format!(
+            "v2\0{}\0{}\0{}",
+            root.marker.root_id,
+            workspace.display(),
+            filesystem_identity
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    let legacy = root
+        .repos()
+        .join(&legacy_identity[..2])
+        .join(&legacy_identity);
+    fs::create_dir_all(legacy.join("temp/ccache")).expect("legacy cache");
+    fs::write(legacy.join("temp/ccache/inode-cache.v2"), b"same cache").expect("legacy cache data");
+    fs::write(
+        legacy.join("identity.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "identity": legacy_identity,
+            "canonical_worktree": workspace,
+            "filesystem_identity": filesystem_identity,
+            "platform": root.platform,
+            "created_unix": 1,
+            "last_used_unix": 1
+        }))
+        .expect("legacy identity JSON"),
+    )
+    .expect("legacy identity");
+
+    let applied = gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .expect("merge identical cache");
+    assert!(applied.complete);
+    assert!(!legacy.exists());
+    assert_eq!(
+        fs::read(repository.cache_dir.join("temp/ccache/inode-cache.v2"))
+            .expect("preserved current cache"),
+        b"same cache"
+    );
+}
+
+#[test]
+fn garbage_collection_preserves_differing_workspace_identity_collisions() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("go.mod"),
+        b"module example.invalid/differing\n",
+    )
+    .expect("workspace manifest");
+    let repository = Repository::discover(&workspace, &root)
+        .expect("workspace discovery")
+        .expect("workspace scope");
+    repository
+        .touch(&root)
+        .expect("current repository identity");
+    fs::create_dir_all(repository.cache_dir.join("temp/ccache")).expect("current cache");
+    fs::write(
+        repository.cache_dir.join("temp/ccache/inode-cache.v2"),
+        b"current",
+    )
+    .expect("current cache data");
+    let filesystem_identity = filesystem_identity_for_test(&workspace);
+    let legacy_identity = blake3::hash(
+        format!(
+            "v2\0{}\0{}\0{}",
+            root.marker.root_id,
+            workspace.display(),
+            filesystem_identity
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    let legacy = root
+        .repos()
+        .join(&legacy_identity[..2])
+        .join(&legacy_identity);
+    fs::create_dir_all(legacy.join("temp/ccache")).expect("legacy cache");
+    fs::write(legacy.join("temp/ccache/inode-cache.v2"), b"legacy").expect("legacy cache data");
+    fs::write(
+        legacy.join("identity.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "identity": legacy_identity,
+            "canonical_worktree": workspace,
+            "filesystem_identity": filesystem_identity,
+            "platform": root.platform,
+            "created_unix": 1,
+            "last_used_unix": 1
+        }))
+        .expect("legacy identity JSON"),
+    )
+    .expect("legacy identity");
+
+    let report = gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .expect("safe reconciliation");
+    assert!(report
+        .abstentions
+        .iter()
+        .any(|item| item.reason.contains("collision differs")));
+    assert_eq!(
+        fs::read(legacy.join("temp/ccache/inode-cache.v2")).expect("legacy cache remains"),
+        b"legacy"
+    );
+    assert_eq!(
+        fs::read(repository.cache_dir.join("temp/ccache/inode-cache.v2"))
+            .expect("current cache remains"),
+        b"current"
+    );
+}
+
+#[test]
+fn garbage_collection_removes_only_empty_unknown_generation_duplicates() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("go.mod"),
+        b"module example.invalid/duplicate\n",
+    )
+    .expect("workspace manifest");
+    let repository = Repository::discover(&workspace, &root)
+        .expect("workspace discovery")
+        .expect("workspace scope");
+    repository
+        .touch(&root)
+        .expect("current repository identity");
+    let filesystem_identity = filesystem_identity_for_test(&workspace);
+    let duplicate_identity = blake3::hash(b"unknown prior generation")
+        .to_hex()
+        .to_string();
+    let duplicate = root
+        .repos()
+        .join(&duplicate_identity[..2])
+        .join(&duplicate_identity);
+    fs::create_dir_all(&duplicate).expect("duplicate identity directory");
+    fs::write(
+        duplicate.join("identity.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "identity": duplicate_identity,
+            "canonical_worktree": workspace,
+            "filesystem_identity": filesystem_identity,
+            "platform": root.platform,
+            "created_unix": 1,
+            "last_used_unix": 1
+        }))
+        .expect("duplicate identity JSON"),
+    )
+    .expect("duplicate identity");
+
+    let report = gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .expect("remove empty duplicate");
+    assert!(report
+        .actions
+        .iter()
+        .any(|action| action.reason == "duplicate-identity-record"));
+    assert!(!duplicate.exists());
+    assert!(repository.cache_dir.join("identity.json").is_file());
+    assert!(gc::maintenance_status(&root)
+        .expect("maintenance status")
+        .repository_issues
+        .is_empty());
+}
+
+#[cfg(unix)]
+fn filesystem_identity_for_test(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).expect("workspace metadata");
+    format!("{}:{}", metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn filesystem_identity_for_test(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
 }
 
 #[test]

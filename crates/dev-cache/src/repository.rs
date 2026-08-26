@@ -32,6 +32,18 @@ pub struct IdentityIssue {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityDisposition {
+    Current,
+    RootScoped {
+        legacy_path: PathBuf,
+        destination: PathBuf,
+    },
+    UnknownSelfBound {
+        destination: PathBuf,
+    },
+}
+
 impl Repository {
     pub fn discover(cwd: &Path, root: &RootHandle) -> Result<Option<Self>> {
         let requested = cwd
@@ -149,6 +161,73 @@ pub fn validate_identity_record(
     Ok(())
 }
 
+pub(crate) fn classify_identity_record(
+    root: &RootHandle,
+    cache_dir: &Path,
+    record: &IdentityRecord,
+) -> Result<IdentityDisposition> {
+    validate_identity_shape(root, cache_dir, record)?;
+    let current_identity = identity_for(
+        &root.domain_id,
+        &record.canonical_worktree,
+        &record.filesystem_identity,
+    );
+    let destination = identity_path(root, &current_identity);
+    if record.identity == current_identity {
+        if cache_dir != destination {
+            bail!(
+                "repository cache identity mismatch at {}",
+                cache_dir.display()
+            );
+        }
+        return Ok(IdentityDisposition::Current);
+    }
+    let root_scoped_identity = identity_for(
+        &root.marker.root_id,
+        &record.canonical_worktree,
+        &record.filesystem_identity,
+    );
+    let legacy_path = identity_path(root, &root_scoped_identity);
+    if record.identity == root_scoped_identity
+        && (cache_dir == legacy_path || cache_dir == destination)
+    {
+        return Ok(IdentityDisposition::RootScoped {
+            legacy_path,
+            destination,
+        });
+    }
+    if cache_dir == identity_path(root, &record.identity) {
+        return Ok(IdentityDisposition::UnknownSelfBound { destination });
+    }
+    bail!(
+        "repository cache identity mismatch at {}",
+        cache_dir.display()
+    )
+}
+
+pub(crate) fn current_identity_record(
+    root: &RootHandle,
+    record: &IdentityRecord,
+) -> IdentityRecord {
+    let mut current = record.clone();
+    current.identity = identity_for(
+        &root.domain_id,
+        &record.canonical_worktree,
+        &record.filesystem_identity,
+    );
+    current
+}
+
+pub(crate) fn records_describe_same_workspace(
+    left: &IdentityRecord,
+    right: &IdentityRecord,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.canonical_worktree == right.canonical_worktree
+        && left.filesystem_identity == right.filesystem_identity
+        && left.platform == right.platform
+}
+
 pub fn scan_identity_issues(root: &RootHandle) -> Result<Vec<IdentityIssue>> {
     if !root.repos().is_dir() {
         return Ok(Vec::new());
@@ -171,7 +250,21 @@ pub fn scan_identity_issues(root: &RootHandle) -> Result<Vec<IdentityIssue>> {
                     serde_json::from_slice::<IdentityRecord>(&bytes)
                         .context("parse repository identity")
                 })
-                .and_then(|record| validate_identity_record(root, &entry.path(), &record));
+                .and_then(|record| {
+                    classify_identity_record(root, &entry.path(), &record).and_then(|disposition| {
+                        match disposition {
+                            IdentityDisposition::Current => Ok(()),
+                            IdentityDisposition::RootScoped { .. } => bail!(
+                                "repository cache identity reconciliation is pending at {}",
+                                entry.path().display()
+                            ),
+                            IdentityDisposition::UnknownSelfBound { .. } => bail!(
+                                "repository cache identity has unknown generation at {}",
+                                entry.path().display()
+                            ),
+                        }
+                    })
+                });
             if let Err(error) = result {
                 issues.push(IdentityIssue {
                     path: entry.path(),
@@ -182,6 +275,44 @@ pub fn scan_identity_issues(root: &RootHandle) -> Result<Vec<IdentityIssue>> {
     }
     issues.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(issues)
+}
+
+fn validate_identity_shape(
+    root: &RootHandle,
+    cache_dir: &Path,
+    record: &IdentityRecord,
+) -> Result<()> {
+    if record.schema_version != 2
+        || record.platform != root.platform
+        || record.identity.len() != 64
+        || !record.identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || record.canonical_worktree.as_os_str().is_empty()
+        || record.filesystem_identity.is_empty()
+        || !record.canonical_worktree.is_absolute()
+        || cache_dir.parent().and_then(Path::file_name) != Some(record.identity[..2].as_ref())
+        || cache_dir.file_name() != Some(record.identity.as_ref())
+        || !cache_dir.starts_with(root.repos())
+    {
+        bail!(
+            "invalid repository cache identity at {}",
+            cache_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn identity_for(scope: &str, worktree: &Path, filesystem_identity: &str) -> String {
+    let seed = format!(
+        "v2\0{}\0{}\0{}",
+        scope,
+        worktree.display(),
+        filesystem_identity
+    );
+    blake3::hash(seed.as_bytes()).to_hex().to_string()
+}
+
+fn identity_path(root: &RootHandle, identity: &str) -> PathBuf {
+    root.repos().join(&identity[..2]).join(identity)
 }
 
 fn native_workspace_root(start: &Path) -> PathBuf {

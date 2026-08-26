@@ -11,9 +11,11 @@ use wait_timeout::ChildExt;
 use crate::artifacts::{self, ArtifactRecord};
 use crate::cargo_intercept;
 use crate::config::GcConfig;
-use crate::lease::RootLease;
+use crate::lease::{active_resource_ids, RootLease};
 use crate::repository::{
-    scan_identity_issues, validate_identity_record, IdentityIssue, IdentityRecord,
+    classify_identity_record, current_identity_record, records_describe_same_workspace,
+    scan_identity_issues, validate_identity_record, IdentityDisposition, IdentityIssue,
+    IdentityRecord,
 };
 use crate::resources::{self, CleanupStrategy, ResourceKind, ResourceRecord};
 use crate::root::RootHandle;
@@ -32,6 +34,8 @@ pub struct GcOverrides {
 pub struct GcAction {
     pub kind: String,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub companion_paths: Vec<PathBuf>,
     pub bytes: u64,
@@ -167,16 +171,19 @@ fn collect_with_lease(
     let max_bytes = overrides.max_bytes.or(policy.max_bytes);
     let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
     let now = now_unix();
+    let active_resource_ids = active_resource_ids(root)?;
+    let active_paths = active_resource_paths(root, &active_resource_ids)?;
     let mut abstentions = Vec::new();
     let (repository_actions, repository_abstentions) =
-        repository_actions(root, now, stale_days, policy)?;
+        repository_actions(root, now, stale_days, policy, &active_paths)?;
     let mut actions = repository_actions;
     abstentions.extend(repository_abstentions);
     let (artifact_actions, artifact_abstentions) =
         artifact_actions(root, now, artifact_stale_after_days)?;
     actions.extend(artifact_actions);
     abstentions.extend(artifact_abstentions);
-    let (resource_actions, resource_abstentions) = resource_actions(root, now, stale_days, policy)?;
+    let (resource_actions, resource_abstentions) =
+        resource_actions(root, now, stale_days, policy, &active_resource_ids)?;
     actions.extend(resource_actions);
     abstentions.extend(resource_abstentions);
     remove_nested_actions(&mut actions);
@@ -258,6 +265,7 @@ fn resource_actions(
     now: u64,
     stale_days: u64,
     policy: &GcConfig,
+    active_resource_ids: &std::collections::BTreeSet<String>,
 ) -> Result<(Vec<GcAction>, Vec<GcAbstention>)> {
     let (records, issues) = resources::scan(root)?;
     let mut actions = Vec::new();
@@ -281,6 +289,14 @@ fn resource_actions(
                 continue;
             }
         };
+        if active_resource_ids.contains(&record.resource_id) {
+            abstentions.push(GcAbstention {
+                resource_id: Some(record.resource_id.clone()),
+                path,
+                reason: "resource is held by an active routed command".to_owned(),
+            });
+            continue;
+        }
         if !record.hazards.is_empty() {
             abstentions.push(GcAbstention {
                 resource_id: Some(record.resource_id.clone()),
@@ -323,6 +339,7 @@ fn resource_actions(
         actions.push(GcAction {
             kind: format!("{:?}", record.kind).to_lowercase(),
             path: path.clone(),
+            destination: None,
             companion_paths: Vec::new(),
             bytes: directory_size(&path),
             reason: reason.to_owned(),
@@ -339,6 +356,7 @@ fn repository_actions(
     now: u64,
     stale_days: u64,
     policy: &GcConfig,
+    active_paths: &[PathBuf],
 ) -> Result<(Vec<GcAction>, Vec<GcAbstention>)> {
     let mut actions = Vec::new();
     let mut abstentions = Vec::new();
@@ -360,10 +378,6 @@ fn repository_actions(
                 .map_err(anyhow::Error::from)
                 .and_then(|bytes| {
                     serde_json::from_slice::<IdentityRecord>(&bytes).map_err(Into::into)
-                })
-                .and_then(|record| {
-                    validate_identity_record(root, &entry.path(), &record)?;
-                    Ok(record)
                 }) {
                 Ok(record) => record,
                 Err(error) => {
@@ -375,6 +389,80 @@ fn repository_actions(
                     continue;
                 }
             };
+            match classify_identity_record(root, &entry.path(), &record) {
+                Ok(IdentityDisposition::RootScoped {
+                    legacy_path: _,
+                    destination,
+                }) => {
+                    if path_overlaps_any(&entry.path(), active_paths)
+                        || path_overlaps_any(&destination, active_paths)
+                    {
+                        abstentions.push(GcAbstention {
+                            resource_id: None,
+                            path: entry.path(),
+                            reason: "workspace identity is held by an active routed command"
+                                .to_owned(),
+                        });
+                        continue;
+                    }
+                    if let Err(error) =
+                        verify_identity_reconciliation(root, &entry.path(), &destination, &record)
+                    {
+                        abstentions.push(GcAbstention {
+                            resource_id: None,
+                            path: entry.path(),
+                            reason: format!(
+                                "workspace identity reconciliation abstained: {error:#}"
+                            ),
+                        });
+                        continue;
+                    }
+                    actions.push(GcAction {
+                        kind: "repository-identity".to_owned(),
+                        path: entry.path(),
+                        destination: Some(destination),
+                        companion_paths: Vec::new(),
+                        bytes: 0,
+                        reason: "identity-reconciliation".to_owned(),
+                        strategy: "atomic-rehome".to_owned(),
+                        resource_id: None,
+                        last_used_unix: record.last_used_unix,
+                    });
+                    continue;
+                }
+                Ok(IdentityDisposition::UnknownSelfBound { destination }) => {
+                    if is_empty_identity_duplicate(root, &entry.path(), &destination, &record)? {
+                        actions.push(GcAction {
+                            kind: "repository-identity-duplicate".to_owned(),
+                            path: entry.path(),
+                            destination: None,
+                            companion_paths: Vec::new(),
+                            bytes: directory_size(&entry.path()),
+                            reason: "duplicate-identity-record".to_owned(),
+                            strategy: "owneddirectory".to_owned(),
+                            resource_id: None,
+                            last_used_unix: record.last_used_unix,
+                        });
+                    } else {
+                        abstentions.push(GcAbstention {
+                            resource_id: None,
+                            path: entry.path(),
+                            reason: "workspace identity generation is unknown and is not an empty duplicate"
+                                .to_owned(),
+                        });
+                    }
+                    continue;
+                }
+                Ok(IdentityDisposition::Current) => {}
+                Err(error) => {
+                    abstentions.push(GcAbstention {
+                        resource_id: None,
+                        path: entry.path(),
+                        reason: format!("invalid repository ownership record: {error:#}"),
+                    });
+                    continue;
+                }
+            }
             let age = now.saturating_sub(record.last_used_unix);
             let orphan = !record.canonical_worktree.exists();
             let threshold = if orphan {
@@ -382,10 +470,11 @@ fn repository_actions(
             } else {
                 stale_days.saturating_mul(86_400)
             };
-            if age >= threshold {
+            if age >= threshold && !path_overlaps_any(&entry.path(), active_paths) {
                 actions.push(GcAction {
                     kind: "repository".to_owned(),
                     path: entry.path(),
+                    destination: None,
                     companion_paths: Vec::new(),
                     bytes: directory_size(&entry.path()),
                     reason: if orphan { "orphan" } else { "stale" }.to_owned(),
@@ -397,6 +486,27 @@ fn repository_actions(
         }
     }
     Ok((actions, abstentions))
+}
+
+fn active_resource_paths(
+    root: &RootHandle,
+    active_resource_ids: &std::collections::BTreeSet<String>,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for resource_id in active_resource_ids {
+        let record = resources::get(root, resource_id)?
+            .with_context(|| format!("active lease references missing resource {resource_id}"))?;
+        paths.push(resources::absolute_path(root, &record)?);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn path_overlaps_any(path: &Path, active_paths: &[PathBuf]) -> bool {
+    active_paths
+        .iter()
+        .any(|active| active.starts_with(path) || path.starts_with(active))
 }
 
 fn artifact_actions(
@@ -457,6 +567,7 @@ fn artifact_actions(
         actions.push(GcAction {
             kind: "artifact".to_owned(),
             path: object,
+            destination: None,
             companion_paths: companions,
             bytes: record.size.saturating_add(entry.metadata()?.len()),
             reason: "stale".to_owned(),
@@ -483,6 +594,12 @@ fn remove_nested_actions(actions: &mut Vec<GcAction>) {
 }
 
 fn apply_action(root: &RootHandle, action: &GcAction) -> Result<()> {
+    if action.kind == "repository-identity" {
+        return reconcile_repository_identity(root, action);
+    }
+    if action.kind == "repository-identity-duplicate" {
+        return remove_empty_identity_duplicate(root, action);
+    }
     if !action.path.exists() && action.companion_paths.iter().all(|path| !path.exists()) {
         return Ok(());
     }
@@ -521,6 +638,264 @@ fn apply_action(root: &RootHandle, action: &GcAction) -> Result<()> {
         owned_transaction(root, action)?;
         for resource_id in nested_resources {
             resources::remove_record(root, &resource_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_identity_duplicate(root: &RootHandle, action: &GcAction) -> Result<()> {
+    let record: IdentityRecord = serde_json::from_slice(
+        &fs::read(action.path.join("identity.json"))
+            .with_context(|| format!("read duplicate identity {}", action.path.display()))?,
+    )
+    .context("parse duplicate workspace identity")?;
+    let destination = match classify_identity_record(root, &action.path, &record)? {
+        IdentityDisposition::UnknownSelfBound { destination } => destination,
+        _ => bail!("workspace identity changed after the collection plan was created"),
+    };
+    if !is_empty_identity_duplicate(root, &action.path, &destination, &record)? {
+        bail!("workspace identity is no longer a safe empty duplicate");
+    }
+    owned_transaction(root, action)?;
+    remove_empty_prefix(action.path.parent(), &root.repos())
+}
+
+fn verify_identity_reconciliation(
+    root: &RootHandle,
+    source: &Path,
+    destination: &Path,
+    source_record: &IdentityRecord,
+) -> Result<()> {
+    validate_action_path(root, source)?;
+    validate_action_destination(root, destination)?;
+    if source == destination {
+        return Ok(());
+    }
+    if !destination.exists() {
+        return Ok(());
+    }
+    let destination_record: IdentityRecord =
+        serde_json::from_slice(&fs::read(destination.join("identity.json")).with_context(
+            || format!("read current workspace identity {}", destination.display()),
+        )?)
+        .context("parse current workspace identity")?;
+    validate_identity_record(root, destination, &destination_record)?;
+    if !records_describe_same_workspace(source_record, &destination_record) {
+        bail!("current destination describes a different workspace");
+    }
+    verify_mergeable_tree(root, source, destination, true)
+}
+
+fn is_empty_identity_duplicate(
+    root: &RootHandle,
+    source: &Path,
+    destination: &Path,
+    source_record: &IdentityRecord,
+) -> Result<bool> {
+    if source == destination || !destination.is_dir() {
+        return Ok(false);
+    }
+    validate_action_path(root, source)?;
+    validate_action_destination(root, destination)?;
+    let mut entries = fs::read_dir(source)?;
+    let Some(entry) = entries.next().transpose()? else {
+        return Ok(false);
+    };
+    if entry.file_name() != "identity.json"
+        || !entry.file_type()?.is_file()
+        || entries.next().transpose()?.is_some()
+    {
+        return Ok(false);
+    }
+    let destination_record: IdentityRecord = match fs::read(destination.join("identity.json"))
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+    {
+        Ok(record) => record,
+        Err(_) => return Ok(false),
+    };
+    if validate_identity_record(root, destination, &destination_record).is_err() {
+        return Ok(false);
+    }
+    Ok(records_describe_same_workspace(
+        source_record,
+        &destination_record,
+    ))
+}
+
+fn reconcile_repository_identity(root: &RootHandle, action: &GcAction) -> Result<()> {
+    let destination = action
+        .destination
+        .as_deref()
+        .context("workspace identity action has no destination")?;
+    let source_record: IdentityRecord = serde_json::from_slice(
+        &fs::read(action.path.join("identity.json"))
+            .with_context(|| format!("read workspace identity {}", action.path.display()))?,
+    )
+    .context("parse workspace identity during reconciliation")?;
+    let disposition = classify_identity_record(root, &action.path, &source_record)?;
+    let legacy_path = match disposition {
+        IdentityDisposition::RootScoped {
+            legacy_path,
+            destination: expected,
+        } if expected == destination => legacy_path,
+        _ => bail!("workspace identity changed after the collection plan was created"),
+    };
+    verify_identity_reconciliation(root, &action.path, destination, &source_record)?;
+    if action.path != destination {
+        if destination.exists() {
+            resources::rebase_under(root, &legacy_path, destination)?;
+            merge_tree(root, &action.path, destination, true)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&action.path, destination).with_context(|| {
+                format!(
+                    "atomically rehome workspace cache {} to {}",
+                    action.path.display(),
+                    destination.display()
+                )
+            })?;
+            resources::rebase_under(root, &legacy_path, destination)?;
+        }
+    } else {
+        resources::rebase_under(root, &legacy_path, destination)?;
+    }
+    let mut current = current_identity_record(root, &source_record);
+    if let Ok(bytes) = fs::read(destination.join("identity.json")) {
+        if let Ok(existing) = serde_json::from_slice::<IdentityRecord>(&bytes) {
+            if validate_identity_record(root, destination, &existing).is_ok()
+                && records_describe_same_workspace(&source_record, &existing)
+            {
+                current.created_unix = current.created_unix.min(existing.created_unix);
+                current.last_used_unix = current.last_used_unix.max(existing.last_used_unix);
+            }
+        }
+    }
+    write_json_atomic(&destination.join("identity.json"), &current)?;
+    remove_empty_prefix(action.path.parent(), &root.repos())?;
+    Ok(())
+}
+
+fn verify_mergeable_tree(
+    root: &RootHandle,
+    source: &Path,
+    destination: &Path,
+    workspace_root: bool,
+) -> Result<()> {
+    validate_action_path(root, source)?;
+    validate_action_destination(root, destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if workspace_root && entry.file_name() == "identity.json" {
+            continue;
+        }
+        let source_child = entry.path();
+        let destination_child = destination.join(entry.file_name());
+        let source_type = entry.file_type()?;
+        if source_type.is_symlink() || is_reparse_point(&entry.metadata()?) {
+            bail!(
+                "workspace cache contains a link at {}",
+                source_child.display()
+            );
+        }
+        if !destination_child.exists() {
+            continue;
+        }
+        let destination_metadata = fs::symlink_metadata(&destination_child)?;
+        if destination_metadata.file_type().is_symlink() || is_reparse_point(&destination_metadata)
+        {
+            bail!(
+                "current workspace cache contains a link at {}",
+                destination_child.display()
+            );
+        }
+        if source_type.is_dir() && destination_metadata.is_dir() {
+            verify_mergeable_tree(root, &source_child, &destination_child, false)?;
+        } else if source_type.is_file()
+            && destination_metadata.is_file()
+            && files_equal(&source_child, &destination_child)?
+        {
+            continue;
+        } else {
+            bail!(
+                "workspace cache collision differs at {}",
+                destination_child.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_tree(
+    root: &RootHandle,
+    source: &Path,
+    destination: &Path,
+    workspace_root: bool,
+) -> Result<()> {
+    verify_mergeable_tree(root, source, destination, workspace_root)?;
+    let mut identity = None;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_child = entry.path();
+        if workspace_root && entry.file_name() == "identity.json" {
+            identity = Some(source_child);
+            continue;
+        }
+        let destination_child = destination.join(entry.file_name());
+        if !destination_child.exists() {
+            fs::rename(&source_child, &destination_child)?;
+        } else if entry.file_type()?.is_dir() {
+            merge_tree(root, &source_child, &destination_child, false)?;
+        } else {
+            fs::remove_file(&source_child)?;
+        }
+    }
+    if let Some(identity) = identity {
+        fs::remove_file(identity)?;
+    }
+    fs::remove_dir(source)?;
+    Ok(())
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn validate_action_destination(root: &RootHandle, path: &Path) -> Result<()> {
+    if !path.starts_with(root.repos()) || path == root.repos() {
+        bail!(
+            "workspace identity destination is outside workspace storage: {}",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        validate_action_path(root, parent)?;
+    }
+    Ok(())
+}
+
+fn remove_empty_prefix(prefix: Option<&Path>, boundary: &Path) -> Result<()> {
+    if let Some(prefix) = prefix.filter(|prefix| *prefix != boundary) {
+        if prefix.is_dir() && fs::read_dir(prefix)?.next().is_none() {
+            fs::remove_dir(prefix)?;
         }
     }
     Ok(())
@@ -859,9 +1234,10 @@ fn trash_backlog(root: &RootHandle) -> Result<usize> {
 
 fn action_age_rank(action: &GcAction) -> u8 {
     match action.reason.as_str() {
-        "stale-temp" => 0,
-        "orphan" => 1,
-        "stale" => 2,
-        _ => 3,
+        "identity-reconciliation" | "duplicate-identity-record" => 0,
+        "stale-temp" => 1,
+        "orphan" => 2,
+        "stale" => 3,
+        _ => 4,
     }
 }
