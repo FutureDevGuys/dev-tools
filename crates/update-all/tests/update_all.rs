@@ -102,3 +102,24 @@ policy_key = "tool_update"
         .success()
         .stdout(predicate::str::contains("Local Demo"));
 }
+
+#[test]
+fn invalid_catalog_plan_uses_documented_exit_code_three() {
+    let home = TempDir::new().unwrap();
+    let config = home.path().join("invalid.toml");
+    fs::write(
+        &config,
+        "[updaters.tasks.\"builtin/npm\"]\ncommand = \"custom-npm\"\n",
+    )
+    .unwrap();
+
+    command(&home)
+        .args(["--config"])
+        .arg(config)
+        .arg("--plain")
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "invalid updater configuration or plan",
+        ));
+}

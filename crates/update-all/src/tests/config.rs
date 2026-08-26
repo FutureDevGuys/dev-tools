@@ -138,3 +138,73 @@ fn strict_validation_accepts_minimal_current_config() {
     let report = validate_config(Some(config), true).unwrap();
     assert!(report.warnings.is_empty());
 }
+
+#[test]
+fn catalog_protocols_locks_authority_and_result_contract_are_validated() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    let catalog = tmp.path().join("catalog.toml");
+    std::fs::write(
+        &config,
+        "[updaters]\nrun_all_detected = false\ncatalogs = [\"catalog.toml\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog,
+        concat!(
+            "schema_version = 1\nengine_api = 1\nadapter_api = 1\n",
+            "[tasks.\"team/index\"]\ncommand = \"indexer\"\n",
+            "resource_locks = [\"index-database\"]\nauthority = \"index-owner\"\n",
+            "result_protocol = 1\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = load_runtime_config(Some(config)).unwrap();
+    let task = &runtime.updaters.custom_tasks["team/index"];
+    assert_eq!(task.resource_locks, ["index-database"]);
+    assert_eq!(task.authority.as_deref(), Some("index-owner"));
+    assert_eq!(task.result_protocol, Some(1));
+}
+
+#[test]
+fn unsupported_catalog_engine_api_fails_closed() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    let catalog = tmp.path().join("catalog.toml");
+    std::fs::write(&config, "[updaters]\ncatalogs = [\"catalog.toml\"]\n").unwrap();
+    std::fs::write(
+        &catalog,
+        "schema_version = 1\nengine_api = 2\nadapter_api = 1\n[tasks.\"team/index\"]\ncommand = \"indexer\"\n",
+    )
+    .unwrap();
+
+    let error = load_runtime_config(Some(config)).unwrap_err().to_string();
+    assert!(error.contains("engine_api=2 is unsupported"), "{error}");
+}
+
+#[test]
+fn duplicate_authority_claims_and_builtin_ids_fail_closed() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        concat!(
+            "[updaters.tasks.\"team/first\"]\ncommand = \"first\"\nauthority = \"shared\"\n",
+            "[updaters.tasks.\"team/second\"]\ncommand = \"second\"\nauthority = \"shared\"\n",
+        ),
+    )
+    .unwrap();
+    let error = load_runtime_config(Some(config.clone()))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("authority 'shared'"), "{error}");
+
+    std::fs::write(
+        &config,
+        "[updaters.tasks.\"builtin/npm\"]\ncommand = \"custom-npm\"\n",
+    )
+    .unwrap();
+    let error = load_runtime_config(Some(config)).unwrap_err().to_string();
+    assert!(error.contains("embedded public catalog"), "{error}");
+}

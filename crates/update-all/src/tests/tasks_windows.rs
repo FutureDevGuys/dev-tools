@@ -21,6 +21,7 @@ fn manager_task(program: &str, args: &[&str], requires_elevation: bool) -> Comma
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     }
 }
 
@@ -180,6 +181,7 @@ fn windows_shell_tasks_use_cmd_c() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     let (program, args) = build_command_invocation(HostOs::Windows, &task);
@@ -214,6 +216,7 @@ fn windows_shell_tasks_preserve_metacharacters_and_quote_spaces_only() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     let (program, args) = build_command_invocation(HostOs::Windows, &task);
@@ -237,6 +240,7 @@ fn winget_spec_with_args(id: &str, args: &[&str]) -> TaskSpec {
         depends_on: Vec::new(),
         kind: TaskKind::Command(manager_task("winget", args, false)),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     }
 }
 

@@ -204,8 +204,10 @@ exit 2
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let second = TaskSpec {
         id: "elevated-b".to_string(),
@@ -232,8 +234,10 @@ exit 2
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     ensure_sudo_preflight_once(&ctx, &first).unwrap();
@@ -718,6 +722,7 @@ exit 1
         depends_on: Vec::new(),
         kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
         category: "language".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     let result =
@@ -805,8 +810,10 @@ exit 2
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     let first = ensure_sudo_preflight_once(&ctx, &spec)
@@ -887,8 +894,10 @@ exit 2
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     ensure_sudo_preflight_once(&ctx, &spec).unwrap();
@@ -926,8 +935,10 @@ fn sudo_session_task_respects_skip_mode() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     let cmd = match &spec.kind {
@@ -1343,6 +1354,7 @@ fn interactive_sudo_session_stays_dashboard_managed() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     assert_eq!(
@@ -1425,8 +1437,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: true,
+            result_protocol: None,
         }),
         category: "language".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -1520,8 +1534,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: true,
+            result_protocol: None,
         }),
         category: "custom".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -1564,6 +1580,7 @@ fn interactive_sudo_session_supports_dashboard_input_when_capture_enabled() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     assert!(command_supports_dashboard_input(
@@ -1601,6 +1618,7 @@ fn interactive_external_window_still_wins_when_requested() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     assert_eq!(
@@ -1703,8 +1721,10 @@ printf '1\n' > "{}"
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "custom".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -1755,8 +1775,10 @@ fn sudo_runtime_error_blocks_sudo_session_task_before_launch() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -1790,6 +1812,7 @@ fn sudo_session_tasks_launch_with_noninteractive_sudo_after_preflight() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     let (program, args) = build_command_invocation(HostOs::Linux, &cmd);
@@ -1891,8 +1914,10 @@ printf 'arch-update %s\n' "$*"
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2023,8 +2048,10 @@ exit 9
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     let cmd = match &spec.kind {
@@ -2156,8 +2183,10 @@ exit 2
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2282,8 +2311,10 @@ exit 0
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2409,8 +2440,10 @@ exit 0
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2498,8 +2531,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2600,8 +2635,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2701,8 +2738,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -2849,8 +2888,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3005,8 +3046,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3118,8 +3161,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3225,8 +3270,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3338,8 +3385,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3440,8 +3489,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3679,8 +3730,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");
@@ -3783,8 +3836,10 @@ exit 1
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let TaskKind::Command(cmd) = &spec.kind else {
         panic!("expected command task");

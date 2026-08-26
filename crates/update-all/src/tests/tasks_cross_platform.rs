@@ -65,14 +65,14 @@ fn expand_alias_ids_maps_winget_to_scope_tasks() {
     let mut input = BTreeSet::new();
     input.insert("winget".to_string());
     input.insert("rust".to_string());
-    input.insert("pipx".to_string());
+    input.insert("builtin/pipx".to_string());
 
     let expanded = expand_alias_ids(&input);
-    assert!(expanded.contains("winget-user"));
-    assert!(expanded.contains("winget-machine"));
-    assert!(expanded.contains("rustup"));
-    assert!(expanded.contains("cargo"));
-    assert!(expanded.contains("pipx"));
+    assert!(expanded.contains("builtin/winget-user"));
+    assert!(expanded.contains("builtin/winget-machine"));
+    assert!(expanded.contains("builtin/rustup"));
+    assert!(expanded.contains("builtin/cargo"));
+    assert!(expanded.contains("builtin/pipx"));
     assert!(!expanded.contains("winget"));
     assert!(!expanded.contains("rust"));
 }
@@ -114,16 +114,22 @@ fn build_task_specs_accepts_rust_only_alias() {
     }
 
     let ids: BTreeSet<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
-    assert_eq!(ids, BTreeSet::from(["cargo", "rustup"]));
+    assert_eq!(ids, BTreeSet::from(["builtin/cargo", "builtin/rustup"]));
     let cargo = specs
         .iter()
-        .find(|spec| spec.id == "cargo")
+        .find(|spec| spec.id == "builtin/cargo")
         .expect("cargo spec");
-    assert_eq!(cargo.depends_on, vec!["rustup".to_string()]);
+    assert_eq!(cargo.depends_on, vec!["builtin/rustup".to_string()]);
     let order: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
     assert!(
-        order.iter().position(|id| *id == "rustup").unwrap()
-            < order.iter().position(|id| *id == "cargo").unwrap(),
+        order
+            .iter()
+            .position(|id| *id == "builtin/rustup")
+            .unwrap()
+            < order
+                .iter()
+                .position(|id| *id == "builtin/cargo")
+                .unwrap(),
         "rustup should complete before cargo install-update when both rust tasks are selected: {order:?}"
     );
 }
@@ -141,7 +147,7 @@ fn build_task_specs_allows_config_exclude_to_prune_direct_only_selector_without_
     let updater_config = UpdaterConfig {
         run_all_detected: false,
         include: BTreeSet::new(),
-        exclude: BTreeSet::from(["go".to_string()]),
+        exclude: BTreeSet::from(["builtin/go".to_string()]),
         privilege_mode: crate::updaters::PrivilegeMode::PromptTty,
         custom_tasks: BTreeMap::new(),
         bootstrap: BootstrapConfig {
@@ -151,7 +157,7 @@ fn build_task_specs_allows_config_exclude_to_prune_direct_only_selector_without_
     };
     let flags = Sections {
         exclude: BTreeSet::new(),
-        only: Some(BTreeSet::from(["go".to_string()])),
+        only: Some(BTreeSet::from(["builtin/go".to_string()])),
     };
 
     let specs = build_task_specs(&flags, &HostOs::Linux, &updater_config).expect("build specs");
@@ -245,6 +251,8 @@ fn custom_task_windows_detection_gates_are_windows_only() {
         requires_selected_any: Vec::new(),
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
+        resource_locks: Vec::new(),
+        authority: None,
         command: "primary".to_string(),
         args: Vec::new(),
         mode: None,
@@ -266,6 +274,7 @@ fn custom_task_windows_detection_gates_are_windows_only() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     assert!(
@@ -337,6 +346,8 @@ fn custom_uv_task_is_not_suppressed_by_builtin_windows_skip_rule() {
             requires_selected_any: Vec::new(),
             depends_on_selected: false,
             depends_on_selected_exclude: Vec::new(),
+            resource_locks: Vec::new(),
+            authority: None,
             command: "custom-uv".to_string(),
             args: vec!["refresh".to_string()],
             mode: None,
@@ -358,6 +369,7 @@ fn custom_uv_task_is_not_suppressed_by_builtin_windows_skip_rule() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         },
     );
     let updater_config = UpdaterConfig {
@@ -422,8 +434,10 @@ fn windows_manager_order_gates_machine_winget_after_user_scope() {
                 plain_start: None,
                 success_details: Vec::new(),
                 external_manager_skip: false,
+                result_protocol: None,
             }),
             category: "system".to_string(),
+            resource_locks: BTreeSet::new(),
         },
         TaskSpec {
             id: "scoop-all".to_string(),
@@ -450,8 +464,10 @@ fn windows_manager_order_gates_machine_winget_after_user_scope() {
                 plain_start: None,
                 success_details: Vec::new(),
                 external_manager_skip: false,
+                result_protocol: None,
             }),
             category: "system".to_string(),
+            resource_locks: BTreeSet::new(),
         },
         TaskSpec {
             id: "winget-user".to_string(),
@@ -478,8 +494,10 @@ fn windows_manager_order_gates_machine_winget_after_user_scope() {
                 plain_start: None,
                 success_details: Vec::new(),
                 external_manager_skip: false,
+                result_protocol: None,
             }),
             category: "system".to_string(),
+            resource_locks: BTreeSet::new(),
         },
         TaskSpec {
             id: "winget-machine".to_string(),
@@ -506,8 +524,10 @@ fn windows_manager_order_gates_machine_winget_after_user_scope() {
                 plain_start: None,
                 success_details: Vec::new(),
                 external_manager_skip: false,
+                result_protocol: None,
             }),
             category: "system".to_string(),
+            resource_locks: BTreeSet::new(),
         },
     ];
 
@@ -590,8 +610,10 @@ fn winget_machine_is_not_ready_until_user_scope_finishes() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let winget_machine = TaskSpec {
         id: "winget-machine".to_string(),
@@ -618,28 +640,56 @@ fn winget_machine_is_not_ready_until_user_scope_finishes() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     let mut pending = BTreeMap::new();
     pending.insert(winget_user.id.clone(), winget_user);
     pending.insert(winget_machine.id.clone(), winget_machine.clone());
     let done = BTreeMap::new();
-    let (id, _) = next_ready_task(&pending, &done).expect("user winget should be ready first");
+    let (id, _) = next_ready_task(&pending, &done, &BTreeSet::new())
+        .expect("user winget should be ready first");
     assert_eq!(id, "winget-user");
 
     let mut pending = BTreeMap::new();
     pending.insert(winget_machine.id.clone(), winget_machine.clone());
-    assert!(next_ready_task(&pending, &done).is_none());
+    assert!(next_ready_task(&pending, &done, &BTreeSet::new()).is_none());
 
     let mut done = BTreeMap::new();
     done.insert(
         "winget-user".to_string(),
         TaskResult::completed("Winget (User)"),
     );
-    let (id, _) = next_ready_task(&pending, &done).expect("machine winget should be unblocked");
+    let (id, _) = next_ready_task(&pending, &done, &BTreeSet::new())
+        .expect("machine winget should be unblocked");
     assert_eq!(id, "winget-machine");
+}
+
+#[test]
+fn resource_locks_prevent_parallel_authority_mutation() {
+    let task = TaskSpec {
+        id: "team/index".to_string(),
+        label: "Index".to_string(),
+        depends_on: Vec::new(),
+        kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
+        category: "maintenance".to_string(),
+        resource_locks: BTreeSet::from(["index-database".to_string()]),
+    };
+    let pending = BTreeMap::from([(task.id.clone(), task)]);
+    let done = BTreeMap::new();
+
+    assert!(next_ready_task(
+        &pending,
+        &done,
+        &BTreeSet::from(["index-database".to_string()]),
+    )
+    .is_none());
+    assert!(
+        next_ready_task(&pending, &done, &BTreeSet::from(["unrelated".to_string()]),).is_some()
+    );
 }
 
 #[test]
@@ -650,6 +700,7 @@ fn failed_dependencies_block_even_when_their_advisory_is_non_blocking() {
         depends_on: vec!["yay".to_string()],
         kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let mut pending = BTreeMap::new();
     pending.insert(service_restart.id.clone(), service_restart);
@@ -664,7 +715,7 @@ fn failed_dependencies_block_even_when_their_advisory_is_non_blocking() {
     });
     let done = BTreeMap::from([("yay".to_string(), yay)]);
 
-    assert!(next_ready_task(&pending, &done).is_none());
+    assert!(next_ready_task(&pending, &done, &BTreeSet::new()).is_none());
     assert_eq!(
         blocked_by_failed_dependency(&pending, &done),
         BTreeSet::from(["arch-update-services".to_string()])
@@ -679,6 +730,7 @@ fn ordering_predecessor_failure_does_not_block_successor() {
         depends_on: vec![ordering_dependency("npm")],
         kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
         category: "language".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let pending = BTreeMap::from([("skills".to_string(), successor)]);
     let done = BTreeMap::from([(
@@ -686,7 +738,8 @@ fn ordering_predecessor_failure_does_not_block_successor() {
         TaskResult::failed("NPM", "package health failed"),
     )]);
 
-    let (id, _) = next_ready_task(&pending, &done).expect("ordering edge should be ready");
+    let (id, _) =
+        next_ready_task(&pending, &done, &BTreeSet::new()).expect("ordering edge should be ready");
     assert_eq!(id, "skills");
     assert!(blocked_by_failed_dependency(&pending, &done).is_empty());
 }
@@ -699,6 +752,7 @@ fn health_dependency_failure_reports_precise_blocking_detail() {
         depends_on: vec!["yay".to_string()],
         kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let done = BTreeMap::from([(
         "yay".to_string(),
@@ -719,6 +773,7 @@ fn health_dependency_completed_with_blocking_issues_is_named_accurately() {
         depends_on: vec!["producer".to_string()],
         kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let mut producer = TaskResult::completed("Producer");
     producer.advisories.push(TaskAdvisory {
@@ -745,6 +800,7 @@ fn mixed_ordering_and_health_dependency_cycle_is_rejected() {
             depends_on: vec!["skills".to_string()],
             kind: TaskKind::Managed(ManagedTaskExecutor::Npm),
             category: "language".to_string(),
+            resource_locks: BTreeSet::new(),
         },
         TaskSpec {
             id: "skills".to_string(),
@@ -752,6 +808,7 @@ fn mixed_ordering_and_health_dependency_cycle_is_rejected() {
             depends_on: vec![ordering_dependency("npm")],
             kind: TaskKind::Managed(ManagedTaskExecutor::Completions),
             category: "language".to_string(),
+            resource_locks: BTreeSet::new(),
         },
     ];
 
@@ -3132,6 +3189,7 @@ fn builtin_catalog_report_patterns_convert_to_command_report_sections() {
         requires_selected_any: Vec::new(),
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
+        resource_locks: Vec::new(),
         include_with: Vec::new(),
         enabled_by_default: true,
         category: "language".to_string(),
@@ -3350,14 +3408,14 @@ fn command_state_report_preserves_non_available_parenthetical_versions() {
 fn builtin_command_tasks_limit_report_parsers_to_foundation_managers() {
     let allowed_parser_tasks = BTreeMap::from([
         (
-            "arch-update-services",
+            "builtin/arch-update-services",
             BuiltinReportParser::ArchUpdateServices,
         ),
-        ("scoop-all", BuiltinReportParser::Scoop),
-        ("uv", BuiltinReportParser::VersionLines),
-        ("winget-machine", BuiltinReportParser::Winget),
-        ("winget-user", BuiltinReportParser::Winget),
-        ("yay", BuiltinReportParser::Yay),
+        ("builtin/scoop-all", BuiltinReportParser::Scoop),
+        ("builtin/uv", BuiltinReportParser::VersionLines),
+        ("builtin/winget-machine", BuiltinReportParser::Winget),
+        ("builtin/winget-user", BuiltinReportParser::Winget),
+        ("builtin/yay", BuiltinReportParser::Yay),
     ]);
 
     for task in crate::updaters::builtin_catalog().expect("builtin catalog") {
@@ -3379,7 +3437,7 @@ fn rustup_builtin_uses_catalog_patterns_for_channel_report() {
     let rustup_task = crate::updaters::builtin_catalog()
         .expect("builtin catalog")
         .into_iter()
-        .find(|task| task.id == "rustup")
+        .find(|task| task.id == "builtin/rustup")
         .expect("rustup task");
     let spec = builtin_to_task_spec(rustup_task, false);
     let TaskKind::Command(cmd) = spec.kind else {
@@ -3434,7 +3492,7 @@ fn cargo_builtin_uses_catalog_patterns_for_install_update_report() {
     let cargo_task = crate::updaters::builtin_catalog()
         .expect("builtin catalog")
         .into_iter()
-        .find(|task| task.id == "cargo")
+        .find(|task| task.id == "builtin/cargo")
         .expect("cargo task");
     let spec = builtin_to_task_spec(cargo_task, false);
     let TaskKind::Command(cmd) = spec.kind else {
@@ -3502,9 +3560,10 @@ fn builtin_package_manager_catalog_patterns_extract_versions() {
     let tasks = crate::updaters::builtin_catalog().expect("builtin catalog");
 
     let command_for = |id: &str| {
+        let qualified = format!("builtin/{id}");
         let task = tasks
             .iter()
-            .find(|task| task.id == id)
+            .find(|task| task.id == qualified)
             .unwrap_or_else(|| panic!("missing built-in task {id}"))
             .clone();
         let spec = builtin_to_task_spec(task, false);
@@ -3698,6 +3757,7 @@ fn failed_yay_report_keeps_confirmed_transactions_updated() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
     let sections = build_failed_command_report_sections_for_command(
         &cmd,
@@ -3776,7 +3836,7 @@ fn go_builtin_uses_catalog_patterns_for_update_and_list_report() {
     let go_task = crate::updaters::builtin_catalog()
         .expect("builtin catalog")
         .into_iter()
-        .find(|task| task.id == "go")
+        .find(|task| task.id == "builtin/go")
         .expect("go task");
     let spec = builtin_to_task_spec(go_task, false);
     let TaskKind::Command(cmd) = spec.kind else {
@@ -3835,7 +3895,7 @@ fn builtin_go_report_patterns_capture_gup_check_failures() {
     let go_task = crate::updaters::builtin_catalog()
         .expect("builtin catalog")
         .into_iter()
-        .find(|task| task.id == "go")
+        .find(|task| task.id == "builtin/go")
         .expect("go task");
     let spec = builtin_to_task_spec(go_task, false);
     let TaskKind::Command(cmd) = spec.kind else {
@@ -3984,11 +4044,11 @@ fn build_task_specs_runs_arch_update_services_last_after_yay() {
 
     let arch = specs
         .iter()
-        .find(|spec| spec.id == "arch-update-services")
+        .find(|spec| spec.id == "builtin/arch-update-services")
         .expect("arch-update-services spec");
-    assert_eq!(arch.depends_on, vec!["yay".to_string()]);
+    assert_eq!(arch.depends_on, vec!["builtin/yay".to_string()]);
     let order: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
-    assert_eq!(order, vec!["yay", "arch-update-services"]);
+    assert_eq!(order, vec!["builtin/yay", "builtin/arch-update-services"]);
 }
 
 #[test]
@@ -4030,15 +4090,15 @@ fn build_task_specs_does_not_block_arch_update_services_on_language_tasks() {
 
     let arch = specs
         .iter()
-        .find(|spec| spec.id == "arch-update-services")
+        .find(|spec| spec.id == "builtin/arch-update-services")
         .expect("arch-update-services spec");
     let cargo = specs
         .iter()
-        .find(|spec| spec.id == "cargo")
+        .find(|spec| spec.id == "builtin/cargo")
         .expect("cargo spec");
 
-    assert_eq!(arch.depends_on, vec!["yay".to_string()]);
-    assert_eq!(cargo.depends_on, vec!["rustup".to_string()]);
+    assert_eq!(arch.depends_on, vec!["builtin/yay".to_string()]);
+    assert_eq!(cargo.depends_on, vec!["builtin/rustup".to_string()]);
 }
 
 #[test]
@@ -4058,7 +4118,7 @@ fn build_task_specs_keeps_explicit_pacman_when_yay_skip_rule_matches() {
     };
     let flags = Sections {
         exclude: BTreeSet::new(),
-        only: Some(BTreeSet::from(["pacman".to_string()])),
+        only: Some(BTreeSet::from(["builtin/pacman".to_string()])),
     };
 
     let temp = TempDir::new().unwrap();
@@ -4076,7 +4136,7 @@ fn build_task_specs_keeps_explicit_pacman_when_yay_skip_rule_matches() {
     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
     assert_eq!(
         ids,
-        vec!["pacman"],
+        vec!["builtin/pacman"],
         "explicit pacman selection should override default yay skip rule: {ids:?}"
     );
 }
@@ -4114,7 +4174,7 @@ fn build_task_specs_skips_arch_update_services_without_required_selected_yay() {
 
     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
     assert!(
-        !ids.contains(&"arch-update-services"),
+        !ids.contains(&"builtin/arch-update-services"),
         "arch-update-services should stay out of automatic runs without yay: {ids:?}"
     );
 }
@@ -4152,7 +4212,7 @@ fn build_task_specs_only_system_does_not_bypass_required_selected_any() {
 
     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
     assert!(
-        !ids.contains(&"arch-update-services"),
+        !ids.contains(&"builtin/arch-update-services"),
         "category selection should not direct-select arch-update-services without yay: {ids:?}"
     );
 }
@@ -4221,6 +4281,8 @@ fn build_task_specs_expands_selected_category_dependencies() {
             requires_selected_any: Vec::new(),
             depends_on_selected: false,
             depends_on_selected_exclude: Vec::new(),
+            resource_locks: Vec::new(),
+            authority: None,
             command: "after-system".to_string(),
             args: Vec::new(),
             mode: None,
@@ -4242,6 +4304,7 @@ fn build_task_specs_expands_selected_category_dependencies() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         },
     );
     let updater_config = UpdaterConfig {
@@ -4276,11 +4339,11 @@ fn build_task_specs_expands_selected_category_dependencies() {
         .iter()
         .find(|spec| spec.id == "after-system")
         .expect("after-system spec");
-    assert_eq!(after_system.depends_on, vec!["yay".to_string()]);
+    assert_eq!(after_system.depends_on, vec!["builtin/yay".to_string()]);
 
     let order: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
     assert!(
-        order.iter().position(|id| *id == "yay").unwrap()
+        order.iter().position(|id| *id == "builtin/yay").unwrap()
             < order.iter().position(|id| *id == "after-system").unwrap(),
         "category dependency should order custom task after selected system tasks: {order:?}"
     );
@@ -4304,9 +4367,9 @@ fn build_task_specs_keeps_explicit_windows_system_ids_when_only_disables_section
     let flags = Sections {
         exclude: BTreeSet::new(),
         only: Some(BTreeSet::from([
-            "winget-user".to_string(),
-            "scoop-self".to_string(),
-            "scoop-all".to_string(),
+            "builtin/winget-user".to_string(),
+            "builtin/scoop-self".to_string(),
+            "builtin/scoop-all".to_string(),
         ])),
     };
 
@@ -4334,7 +4397,14 @@ fn build_task_specs_keeps_explicit_windows_system_ids_when_only_disables_section
     }
 
     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
-    assert_eq!(ids, vec!["scoop-self", "scoop-all", "winget-user"]);
+    assert_eq!(
+        ids,
+        vec![
+            "builtin/scoop-self",
+            "builtin/scoop-all",
+            "builtin/winget-user"
+        ]
+    );
 }
 
 #[test]
@@ -4415,7 +4485,7 @@ fn only_winget_expands_to_both_winget_scopes() {
     }
 
     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
-    assert_eq!(ids, vec!["winget-user", "winget-machine"]);
+    assert_eq!(ids, vec!["builtin/winget-user", "builtin/winget-machine"]);
 }
 
 #[test]
@@ -4446,8 +4516,10 @@ fn task_order_groups_dependency_families_before_unrelated_roots() {
                 plain_start: None,
                 success_details: Vec::new(),
                 external_manager_skip: false,
+                result_protocol: None,
             }),
             category: "language".to_string(),
+            resource_locks: BTreeSet::new(),
         },
         TaskSpec {
             id: "skills".to_string(),
@@ -4474,8 +4546,10 @@ fn task_order_groups_dependency_families_before_unrelated_roots() {
                 plain_start: None,
                 success_details: Vec::new(),
                 external_manager_skip: false,
+                result_protocol: None,
             }),
             category: "language".to_string(),
+            resource_locks: BTreeSet::new(),
         },
         TaskSpec {
             id: "npm".to_string(),
@@ -4483,6 +4557,7 @@ fn task_order_groups_dependency_families_before_unrelated_roots() {
             depends_on: vec![],
             kind: TaskKind::Managed(ManagedTaskExecutor::Npm),
             category: "language".to_string(),
+            resource_locks: BTreeSet::new(),
         },
     ];
 
@@ -5020,10 +5095,10 @@ fn namespaced_task_ids_write_flat_owner_only_artifact_names() {
 #[test]
 fn structured_command_result_marks_a_successful_process_as_deferred() {
     let mut result = TaskResult::completed("Example Tool");
-    apply_structured_command_result(
+    assert!(apply_structured_command_result(
         &mut result,
         "deferred: still running\nUPDATE_ALL_RESULT {\"outcome\":\"deferred\",\"detail\":\"quit the background process\",\"current\":\"3.0.2\",\"latest\":\"3.0.3\"}\n",
-    );
+    ));
 
     assert_eq!(result.status, TaskStatus::Completed);
     assert!(result.is_deferred());
@@ -5031,6 +5106,21 @@ fn structured_command_result_marks_a_successful_process_as_deferred() {
     assert!(result
         .details
         .contains(&"version: 3.0.2 -> 3.0.3".to_string()));
+}
+
+#[test]
+fn structured_command_result_rejects_missing_or_malformed_payloads() {
+    let mut missing = TaskResult::completed("Missing");
+    assert!(!apply_structured_command_result(
+        &mut missing,
+        "ordinary output\n"
+    ));
+
+    let mut malformed = TaskResult::completed("Malformed");
+    assert!(!apply_structured_command_result(
+        &mut malformed,
+        "UPDATE_ALL_RESULT {not-json}\n",
+    ));
 }
 
 #[test]
@@ -5112,12 +5202,63 @@ fn dashboard_sender_records_detachment_once_and_stays_in_plain_fallback() {
         .is_err());
 
     let run_text = fs::read_to_string(run_log.run_dir().join("run.log")).unwrap();
+    let events = fs::read_to_string(run_log.run_dir().join("events.jsonl")).unwrap();
     assert_eq!(
         run_text.matches("frontend_detached:").count(),
         1,
         "{run_text}"
     );
     assert!(run_text.contains("switched to plain output"), "{run_text}");
+    assert_eq!(events.matches("frontend_detached").count(), 1, "{events}");
+}
+
+#[test]
+fn prompt_events_are_journaled_without_answer_content() {
+    let temp = TempDir::new().unwrap();
+    let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let (raw_event_tx, event_rx) = mpsc::channel::<DashboardEvent>();
+    let event_tx = DashboardSender::new(raw_event_tx, Some(run_log.clone()));
+
+    event_tx
+        .send(DashboardEvent::TaskInputStateChanged {
+            id: "builtin/yay".to_string(),
+            enabled: true,
+        })
+        .unwrap();
+    event_rx.recv().unwrap();
+    assert!(journal_ui_control(
+        &event_tx,
+        &UiControlEvent::SendStdin {
+            id: "builtin/yay".to_string(),
+            line: "private answer".to_string(),
+        },
+    ));
+
+    let events = fs::read_to_string(run_log.run_dir().join("events.jsonl")).unwrap();
+    assert!(events.contains("prompt_requested"), "{events}");
+    assert!(events.contains("prompt_answered"), "{events}");
+    assert!(events.contains("character_count"), "{events}");
+    assert!(!events.contains("private answer"), "{events}");
+}
+
+#[test]
+fn journal_failure_blocks_dashboard_delivery_without_faking_detachment() {
+    let temp = TempDir::new().unwrap();
+    let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let (raw_event_tx, event_rx) = mpsc::channel::<DashboardEvent>();
+    let event_tx = DashboardSender::new(raw_event_tx, Some(run_log.clone()));
+    run_log.inject_journal_fault_for_test();
+
+    assert!(event_tx
+        .send(DashboardEvent::TaskStateChanged {
+            id: "builtin/demo".to_string(),
+            state: TaskState::Running,
+            detail: None,
+        })
+        .is_err());
+    assert!(event_rx.try_recv().is_err());
+    assert!(!event_tx.is_detached());
+    assert!(event_tx.journal_error().is_some());
 }
 
 #[test]
@@ -5823,6 +5964,7 @@ fn command_recovery_kind_prefers_report_parser_metadata() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
     let spec = TaskSpec {
         id: "custom-package-manager".to_string(),
@@ -5830,6 +5972,7 @@ fn command_recovery_kind_prefers_report_parser_metadata() {
         depends_on: Vec::new(),
         kind: TaskKind::Command(cmd.clone()),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     assert_eq!(
@@ -5861,6 +6004,7 @@ fn command_recovery_kind_falls_back_to_task_and_program_names() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
     let spec = TaskSpec {
         id: "custom-apt".to_string(),
@@ -5868,6 +6012,7 @@ fn command_recovery_kind_falls_back_to_task_and_program_names() {
         depends_on: Vec::new(),
         kind: TaskKind::Command(cmd.clone()),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     assert_eq!(
@@ -6099,8 +6244,10 @@ fn package_manager_timeout_formats_yay_aur_policy_detail() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let cmd = match &spec.kind {
         TaskKind::Command(cmd) => cmd,
@@ -6151,8 +6298,10 @@ fn package_manager_timeout_detail_uses_yay_metadata_without_yay_task_id() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let cmd = match &spec.kind {
         TaskKind::Command(cmd) => cmd,
@@ -6299,6 +6448,7 @@ fn windows_elevated_commands_disable_interactive_capture_mode() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     assert!(!command_interactive_mode(HostOs::Windows, &cmd));
@@ -6328,6 +6478,7 @@ fn windows_non_elevated_commands_keep_interactive_mode() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
 
     assert!(command_interactive_mode(HostOs::Windows, &cmd));
@@ -6454,8 +6605,10 @@ fn build_command_failure_detail_distinguishes_winget_launch_failure() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let cmd = match &spec.kind {
         TaskKind::Command(cmd) => cmd,
@@ -6499,8 +6652,10 @@ fn build_command_failure_detail_surfaces_winget_package_failure_marker() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let cmd = match &spec.kind {
         TaskKind::Command(cmd) => cmd,
@@ -6558,8 +6713,10 @@ fn build_command_failure_detail_uses_winget_command_metadata_without_winget_task
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
     let cmd = match &spec.kind {
         TaskKind::Command(cmd) => cmd,
@@ -6615,8 +6772,10 @@ fn build_elevation_required_detail_calls_out_machine_scope_winget() {
             plain_start: None,
             success_details: Vec::new(),
             external_manager_skip: false,
+            result_protocol: None,
         }),
         category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
     };
 
     let detail = build_elevation_required_detail(&spec);
@@ -6652,6 +6811,7 @@ fn detect_command_output_failure_flags_winget_dependency_error_markers() {
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
     let output = r#"
 No suitable installer found for manifest: Microsoft.WindowsAppRuntime.1.8 version 1.8.5

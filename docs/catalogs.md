@@ -18,14 +18,23 @@ catalogs = ["catalogs/workspace.toml"]
 Then define the task in `catalogs/workspace.toml`:
 
 ```toml
+schema_version = 1
+engine_api = 1
+adapter_api = 1
+
 [tasks."local/workspace-index"]
 label = "Workspace Index"
 command = "workspace-index"
 args = ["refresh"]
 detect_mode = "command_available"
 category = "maintenance"
+resource_locks = ["workspace-index"]
+authority = "workspace-index-owner"
+result_protocol = 1
 requires_elevation = false
 interactive = false
 ```
 
-The catalog contains only a top-level `tasks` table. Managed files discovered below `catalog.d/syscfg/` must use `syscfg/` task IDs, and files below `catalog.d/local/` must use `local/` task IDs. Explicit catalog paths may use another owner namespace, but duplicate fully qualified IDs are always invalid.
+Catalog protocol fields default to version 1 when omitted; explicitly unsupported schema, engine, adapter, or result protocol versions fail before planning. Managed files discovered below `catalog.d/syscfg/` must use `syscfg/` task IDs, and files below `catalog.d/local/` must use `local/` task IDs. Explicit catalog paths may use another owner namespace, but duplicate fully qualified IDs and duplicate non-empty authority claims are always invalid.
+
+`resource_locks` names mutable authorities that must not run concurrently. Locks affect scheduling without changing dashboard grouping. A task that declares `result_protocol = 1` must finish with one line of the form `UPDATE_ALL_RESULT {"outcome":"updated","detail":"...","current":"...","latest":"..."}`. The supported outcomes are `updated`, `no_op`, `not_applicable`, `deferred`, `failed`, `blocked`, and `cancelled`; answer values and secrets must not appear in the payload.

@@ -324,6 +324,7 @@ pub struct BuiltinTask {
     pub requires_selected_any: Vec<String>,
     pub depends_on_selected: bool,
     pub depends_on_selected_exclude: Vec<String>,
+    pub resource_locks: Vec<String>,
     pub include_with: Vec<String>,
     pub enabled_by_default: bool,
     pub category: String,
@@ -361,6 +362,7 @@ struct BuiltinTaskEntry {
     requires_selected_any: Option<Vec<String>>,
     depends_on_selected: Option<bool>,
     depends_on_selected_exclude: Option<Vec<String>>,
+    resource_locks: Option<Vec<String>>,
     include_with: Option<Vec<String>>,
     enabled_by_default: bool,
     category: String,
@@ -647,7 +649,31 @@ fn parse_builtin_catalog() -> Result<Vec<BuiltinTask>> {
     for entry in catalog.tasks {
         tasks.push(entry.into_builtin_task()?);
     }
+    let raw_ids = tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    for task in &mut tasks {
+        task.id = builtin_task_id(&task.id);
+        qualify_builtin_references(&raw_ids, &mut task.depends_on);
+        qualify_builtin_references(&raw_ids, &mut task.after);
+        qualify_builtin_references(&raw_ids, &mut task.requires_selected_any);
+        qualify_builtin_references(&raw_ids, &mut task.depends_on_selected_exclude);
+        qualify_builtin_references(&raw_ids, &mut task.include_with);
+    }
     validate_builtin_catalog(tasks)
+}
+
+fn builtin_task_id(id: &str) -> String {
+    format!("builtin/{id}")
+}
+
+fn qualify_builtin_references(raw_ids: &BTreeSet<String>, references: &mut [String]) {
+    for reference in references {
+        if raw_ids.contains(reference) {
+            *reference = builtin_task_id(reference);
+        }
+    }
 }
 
 fn parse_builtin_windows_foundations() -> Result<Vec<BuiltinWindowsFoundation>> {
@@ -663,6 +689,11 @@ fn parse_builtin_windows_foundations() -> Result<Vec<BuiltinWindowsFoundation>> 
 
 impl BuiltinTaskEntry {
     fn into_builtin_task(self) -> Result<BuiltinTask> {
+        validate_non_empty_catalog_values(
+            &self.id,
+            "resource locks",
+            self.resource_locks.as_deref().unwrap_or_default(),
+        )?;
         let detect_mode = match self.detect_mode.as_deref() {
             Some(raw) => BuiltinDetectionMode::parse(raw).with_context(|| {
                 format!(
@@ -791,6 +822,7 @@ impl BuiltinTaskEntry {
             requires_selected_any: self.requires_selected_any.unwrap_or_default(),
             depends_on_selected: self.depends_on_selected.unwrap_or(false),
             depends_on_selected_exclude: self.depends_on_selected_exclude.unwrap_or_default(),
+            resource_locks: self.resource_locks.unwrap_or_default(),
             include_with: self.include_with.unwrap_or_default(),
             enabled_by_default: self.enabled_by_default,
             category: self.category,

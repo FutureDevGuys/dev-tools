@@ -370,6 +370,11 @@ impl DashboardSender {
         &self,
         event: DashboardEvent,
     ) -> std::result::Result<(), mpsc::SendError<DashboardEvent>> {
+        if let Some(log) = &self.run_log {
+            if journal_dashboard_event(log, &event).is_err() {
+                return Err(mpsc::SendError(event));
+            }
+        }
         if self.detached.load(Ordering::SeqCst) {
             emit_dashboard_event_plain(&event);
             return Err(mpsc::SendError(event));
@@ -389,6 +394,16 @@ impl DashboardSender {
         self.detached.load(Ordering::SeqCst)
     }
 
+    fn journal_error(&self) -> Option<String> {
+        self.run_log.as_ref().and_then(|log| log.journal_failure())
+    }
+
+    fn journal_control(&self, kind: &str, task_id: Option<&str>, payload: serde_json::Value) {
+        if let Some(log) = &self.run_log {
+            let _ = log.write_event(kind, task_id, payload);
+        }
+    }
+
     fn record_detachment_once(&self) {
         if self
             .detached
@@ -401,6 +416,13 @@ impl DashboardSender {
         let line = "frontend_detached: dashboard receiver disconnected; switched to plain output";
         crate::ua_errln!("update-all: dashboard detached; switching to plain output");
         if let Some(log) = &self.run_log {
+            if let Err(err) = log.write_event(
+                "frontend_detached",
+                None,
+                serde_json::json!({"reason": "dashboard receiver disconnected"}),
+            ) {
+                log.emit_write_warning_once(&err);
+            }
             let rec = LogRecord {
                 ts_unix_ms: now_unix_ms(),
                 task_id: "runtime".to_string(),
@@ -415,6 +437,88 @@ impl DashboardSender {
                 log.emit_write_warning_once(&err);
             }
         }
+    }
+}
+
+fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<()> {
+    match event {
+        DashboardEvent::RunIdentity {
+            run_id,
+            display_name,
+        } => log.write_event(
+            "run_identity",
+            None,
+            serde_json::json!({"run_id": run_id, "display_name": display_name}),
+        ),
+        DashboardEvent::RunRenamed { display_name } => log.write_event(
+            "run_renamed",
+            None,
+            serde_json::json!({"display_name": display_name}),
+        ),
+        DashboardEvent::TaskRegistered {
+            id,
+            label,
+            category,
+            depends_on,
+            accepts_input,
+        } => log.write_event(
+            "task_registered",
+            Some(id),
+            serde_json::json!({
+                "label": label,
+                "category": category,
+                "depends_on": depends_on,
+                "accepts_input": accepts_input,
+            }),
+        ),
+        DashboardEvent::TaskInputStateChanged { id, enabled } => log.write_event(
+            if *enabled {
+                "prompt_requested"
+            } else {
+                "prompt_cancelled"
+            },
+            Some(id),
+            serde_json::json!({"enabled": enabled}),
+        ),
+        DashboardEvent::TaskStateChanged { id, state, detail } => log.write_event(
+            "task_state_changed",
+            Some(id),
+            serde_json::json!({"state": task_state_name(*state), "detail": detail}),
+        ),
+        DashboardEvent::LogLine(record) => log.write_event(
+            "log_line",
+            Some(&record.task_id),
+            serde_json::json!({
+                "level": record.level.as_str(),
+                "stream": record.stream.as_str(),
+                "line": record.line,
+            }),
+        ),
+        DashboardEvent::RunComplete { success, .. } => log.write_event(
+            "run_completed",
+            None,
+            serde_json::json!({"success": success}),
+        ),
+        DashboardEvent::UiSuspendRequested { reason, .. } => log.write_event(
+            "frontend_suspended",
+            None,
+            serde_json::json!({"reason": reason}),
+        ),
+        DashboardEvent::UiResumeRequested { .. } => {
+            log.write_event("frontend_resumed", None, serde_json::json!({}))
+        }
+        DashboardEvent::UiDone => log.write_event("frontend_done", None, serde_json::json!({})),
+    }
+}
+
+fn task_state_name(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Pending => "pending",
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Canceled => "cancelled",
+        TaskState::Skipped => "skipped",
     }
 }
 
@@ -442,6 +546,37 @@ fn emit_dashboard_event_plain(event: &DashboardEvent) {
         ),
         _ => {}
     }
+}
+
+fn journal_ui_control(event_tx: &DashboardSender, control: &UiControlEvent) -> bool {
+    let (kind, task_id, payload) = match control {
+        UiControlEvent::CancelTask { id } => (
+            "task_cancel_requested",
+            Some(id.as_str()),
+            serde_json::json!({}),
+        ),
+        UiControlEvent::CancelAll => ("run_cancel_requested", None, serde_json::json!({})),
+        UiControlEvent::SendStdin { id, line } => (
+            "prompt_answered",
+            Some(id.as_str()),
+            serde_json::json!({"character_count": line.chars().count()}),
+        ),
+        UiControlEvent::RenameRun { name } => (
+            "rename_requested",
+            None,
+            serde_json::json!({"character_count": name.chars().count()}),
+        ),
+        UiControlEvent::OpenLog { target } => (
+            "log_view_requested",
+            match target {
+                LogViewTarget::Task { id } => Some(id.as_str()),
+                LogViewTarget::Run => None,
+            },
+            serde_json::json!({"scope": if matches!(target, LogViewTarget::Run) { "run" } else { "task" }}),
+        ),
+    };
+    event_tx.journal_control(kind, task_id, payload);
+    event_tx.journal_error().is_none()
 }
 
 pub struct AsyncContext {
@@ -499,6 +634,7 @@ struct CommandTask {
     plain_start: Option<String>,
     success_details: Vec<String>,
     external_manager_skip: bool,
+    result_protocol: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -588,6 +724,7 @@ struct TaskSpec {
     depends_on: Vec<String>,
     kind: TaskKind,
     category: String,
+    resource_locks: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -742,6 +879,16 @@ impl SyncContext {
                 id: task_id.to_string(),
                 enabled,
             });
+        } else if let Some(log) = &self.run_log {
+            let _ = log.write_event(
+                if enabled {
+                    "prompt_requested"
+                } else {
+                    "prompt_cancelled"
+                },
+                Some(task_id),
+                serde_json::json!({"enabled": enabled}),
+            );
         }
     }
 
@@ -807,6 +954,11 @@ impl SyncContext {
             stream,
             line,
         };
+        if self.event_tx.is_none() {
+            if let Some(log) = &self.run_log {
+                let _ = journal_dashboard_event(log, &DashboardEvent::LogLine(rec.clone()));
+            }
+        }
         if let Some(log) = &self.run_log {
             if let Err(err) = log.write_raw(&rec) {
                 log.emit_write_warning_once(&err);
@@ -827,6 +979,12 @@ impl SyncContext {
                 state,
                 detail,
             });
+        } else if let Some(log) = &self.run_log {
+            let _ = log.write_event(
+                "task_state_changed",
+                Some(task_id),
+                serde_json::json!({"state": task_state_name(state), "detail": detail}),
+            );
         }
     }
 
@@ -1383,7 +1541,8 @@ pub(crate) fn format_retry_delay(delay: Duration) -> String {
 }
 
 pub fn run_sync(ctx: SyncContext) -> Result<()> {
-    let specs = build_task_specs(&ctx.flags, &ctx.host_os, &ctx.updater_config)?;
+    let specs = build_task_specs(&ctx.flags, &ctx.host_os, &ctx.updater_config)
+        .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
     if specs.is_empty() && ctx.host_os == HostOs::Unknown {
         crate::ua_errln!(
             "update-all: no built-in updater set is defined for this host OS; configure custom tasks or run on Linux, macOS, or Windows"
@@ -1394,8 +1553,24 @@ pub fn run_sync(ctx: SyncContext) -> Result<()> {
     let mut summary: Vec<(String, TaskResult)> = Vec::new();
     let task_run_lock = acquire_task_run_lock(ctx.run_log.as_ref())?;
 
+    if let Some(log) = ctx.run_log.as_ref() {
+        for spec in &specs {
+            log.write_event(
+                "task_registered",
+                Some(&spec.id),
+                serde_json::json!({
+                    "label": &spec.label,
+                    "category": &spec.category,
+                    "depends_on": &spec.depends_on,
+                    "accepts_input": matches!(&spec.kind, TaskKind::Command(command) if command.interactive),
+                }),
+            )?;
+        }
+    }
+
     for spec in specs {
         ctx.set_task_state(&spec.id, TaskState::Running, None);
+        ensure_sync_journal_healthy(&ctx)?;
         let result = match execute_task(&ctx, &spec) {
             Ok(result) => result,
             Err(e) => {
@@ -1412,6 +1587,7 @@ pub fn run_sync(ctx: SyncContext) -> Result<()> {
             to_task_state(result.status),
             result.details.first().cloned(),
         );
+        ensure_sync_journal_healthy(&ctx)?;
         summary.push((spec.id, result));
     }
 
@@ -1431,6 +1607,13 @@ pub fn run_sync(ctx: SyncContext) -> Result<()> {
         0
     };
     let tasks_ended_unix_ms = now_unix_ms();
+    if let Some(log) = ctx.run_log.as_ref() {
+        log.write_event(
+            "run_completed",
+            None,
+            serde_json::json!({"success": !failed && !deferred}),
+        )?;
+    }
     write_run_artifact(
         ctx.run_log.as_ref(),
         ctx.host_os.as_str(),
@@ -1448,6 +1631,13 @@ pub fn run_sync(ctx: SyncContext) -> Result<()> {
     }
     if deferred {
         return Err(anyhow::anyhow!(crate::Deferred));
+    }
+    Ok(())
+}
+
+fn ensure_sync_journal_healthy(ctx: &SyncContext) -> Result<()> {
+    if let Some(error) = ctx.run_log.as_ref().and_then(|log| log.journal_failure()) {
+        bail!("authoritative event journal failed: {error}");
     }
     Ok(())
 }
@@ -1496,7 +1686,8 @@ fn run_log_root(run_log: &RunLogSink) -> &Path {
 }
 
 pub fn run_async(ctx: AsyncContext) -> Result<()> {
-    let specs = build_task_specs(&ctx.flags, &ctx.host_os, &ctx.updater_config)?;
+    let specs = build_task_specs(&ctx.flags, &ctx.host_os, &ctx.updater_config)
+        .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
     if specs.is_empty() && ctx.host_os == HostOs::Unknown {
         crate::ua_errln!(
             "update-all: no built-in updater set is defined for this host OS; configure custom tasks or run on Linux, macOS, or Windows"
@@ -1589,7 +1780,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         (None, None)
     };
 
-    type AsyncHandle = (String, thread::JoinHandle<TaskResult>);
+    type AsyncHandle = (String, BTreeSet<String>, thread::JoinHandle<TaskResult>);
     let mut pending: BTreeMap<String, TaskSpec> =
         specs.into_iter().map(|s| (s.id.clone(), s)).collect();
     let mut running: VecDeque<AsyncHandle> = VecDeque::new();
@@ -1599,9 +1790,29 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     let mut cancel_all_since: Option<std::time::Instant> = None;
     let mut forced_cancel_timeout = false;
     let mut active_log_viewer: Option<thread::JoinHandle<()>> = None;
+    let mut journal_abort_reported = false;
 
     while !pending.is_empty() || !running.is_empty() {
         let mut made_progress = false;
+
+        if !journal_abort_reported {
+            if let Some(error) = event_tx.journal_error() {
+                journal_abort_reported = true;
+                cancel_all_requested = true;
+                if cancel_all_since.is_none() {
+                    cancel_all_since = Some(std::time::Instant::now());
+                }
+                cancel_new.store(true, Ordering::SeqCst);
+                let _ = runtime_control.request_cancel_all();
+                for pending_id in pending.keys() {
+                    let _ = runtime_control.request_task_cancel(pending_id);
+                }
+                crate::ua_errln!(
+                    "update-all: authoritative event journal failed; canceling the run: {error}"
+                );
+                made_progress = true;
+            }
+        }
 
         #[cfg(unix)]
         if let Some(rx) = sudo_keepalive_failure_rx.as_ref() {
@@ -1639,6 +1850,10 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         }
 
         while let Ok(ctrl) = ui_control_rx.try_recv() {
+            if !journal_ui_control(&event_tx, &ctrl) {
+                made_progress = true;
+                continue;
+            }
             match ctrl {
                 UiControlEvent::CancelTask { id } => {
                     let mut handled = false;
@@ -1656,7 +1871,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                         made_progress = true;
                     }
 
-                    let running_task = running.iter().any(|(task_id, _)| task_id == &id);
+                    let running_task = running.iter().any(|(task_id, _, _)| task_id == &id);
                     let killed_running = runtime_control.request_task_cancel(&id);
                     if running_task {
                         handled = true;
@@ -1781,7 +1996,11 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         }
 
         while running.len() < max_parallel_jobs {
-            let ready = next_ready_task(&pending, &done);
+            let busy_resources = running
+                .iter()
+                .flat_map(|(_, locks, _)| locks.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let ready = next_ready_task(&pending, &done, &busy_resources);
             let Some((task_id, spec)) = ready else {
                 break;
             };
@@ -1823,7 +2042,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 }
             });
 
-            running.push_back((task_id, handle));
+            running.push_back((task_id, spec.resource_locks, handle));
             made_progress = true;
         }
 
@@ -1879,7 +2098,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                     forced_cancel_timeout = true;
                     let running_ids: Vec<String> = running
                         .iter()
-                        .map(|(task_id, _)| task_id.as_str())
+                        .map(|(task_id, _, _)| task_id.as_str())
                         .map(str::to_string)
                         .collect();
                     for task_id in running_ids {
@@ -1902,7 +2121,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     }
 
     if forced_cancel_timeout {
-        for (task_id, handle) in running.drain(..) {
+        for (task_id, _, handle) in running.drain(..) {
             let result = join_forced_canceled_task(task_id.clone(), handle);
             let state = to_task_state(result.status);
             let detail = result.details.first().cloned();
@@ -1955,14 +2174,15 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     }
 
     let canceled = cancel_all_requested || cancel::is_cancel_requested();
-    let failed = done.values().any(|r| r.status == TaskStatus::Failed);
+    let journal_error = event_tx.journal_error();
+    let failed = done.values().any(|r| r.status == TaskStatus::Failed) || journal_error.is_some();
     let deferred = done.values().any(TaskResult::is_deferred);
     let outcome = resolve_async_outcome(failed, deferred, canceled);
     let exit_code = match outcome {
         AsyncRunOutcome::Success => 0,
         AsyncRunOutcome::Failed => 1,
         AsyncRunOutcome::Deferred => 2,
-        AsyncRunOutcome::Canceled => 130,
+        AsyncRunOutcome::Canceled => 3,
     };
     emit_async_completion_boundary_and_reports(
         &event_tx,
@@ -2072,6 +2292,9 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         tasks_completed_unix_ms,
     );
 
+    if let Some(error) = event_tx.journal_error().or(journal_error) {
+        bail!("authoritative event journal failed: {error}");
+    }
     match outcome {
         AsyncRunOutcome::Success => Ok(()),
         AsyncRunOutcome::Failed => bail!("one or more tasks failed"),
@@ -3879,7 +4102,14 @@ fn run_command_task_inner(
     result.report_sections = report_sections;
     attach_command_output_diagnostics(&mut result, &after_report_output.input);
     attach_command_advisories(&mut result);
-    apply_structured_command_result(&mut result, &out);
+    let structured_result_applied = apply_structured_command_result(&mut result, &out);
+    if cmd.result_protocol.is_some() && !structured_result_applied {
+        result.status = TaskStatus::Failed;
+        result.details.insert(
+            0,
+            "required structured result protocol was absent or invalid".to_string(),
+        );
+    }
     Ok(result)
 }
 
@@ -3904,9 +4134,9 @@ fn parse_structured_command_result(output: &str) -> Option<StructuredCommandResu
     })
 }
 
-fn apply_structured_command_result(result: &mut TaskResult, output: &str) {
+fn apply_structured_command_result(result: &mut TaskResult, output: &str) -> bool {
     let Some(protocol) = parse_structured_command_result(output) else {
-        return;
+        return false;
     };
     let detail = protocol
         .detail
@@ -3940,6 +4170,7 @@ fn apply_structured_command_result(result: &mut TaskResult, output: &str) {
             .details
             .push(format!("version: {current} -> {latest}"));
     }
+    true
 }
 
 fn failed_command_result_with_report_sections(
@@ -4423,6 +4654,7 @@ fn command_task_for_pre_command(cmd: &CommandTask, pre_command: &CommandPreComma
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     }
 }
 
@@ -6716,6 +6948,7 @@ fn run_recovery_command(
         plain_start: None,
         success_details: Vec::new(),
         external_manager_skip: false,
+        result_protocol: None,
     };
     let (invocation_program, invocation_args) = build_command_invocation(ctx.host_os, &cmd);
     let resolved_program = resolve_recovery_program(&invocation_program, helper_bin_dir);
@@ -8016,6 +8249,7 @@ fn builtin_to_task_spec(detected: BuiltinTask, windows_bridge: bool) -> TaskSpec
         )
         .collect();
     let category = detected.category;
+    let resource_locks = detected.resource_locks.into_iter().collect();
     let report_parser = detected.report_parser;
     let kind = match detected.kind {
         BuiltinTaskKind::Managed { executor } => TaskKind::Managed(match executor {
@@ -8065,6 +8299,7 @@ fn builtin_to_task_spec(detected: BuiltinTask, windows_bridge: bool) -> TaskSpec
             plain_start,
             success_details,
             external_manager_skip,
+            result_protocol: None,
         }),
     };
 
@@ -8074,6 +8309,7 @@ fn builtin_to_task_spec(detected: BuiltinTask, windows_bridge: bool) -> TaskSpec
         depends_on,
         kind,
         category,
+        resource_locks,
     }
 }
 
@@ -8209,6 +8445,7 @@ fn build_task_specs(
                 foundations: updater_cfg.bootstrap.windows_foundations.clone(),
             }),
             category: "system".to_string(),
+            resource_locks: BTreeSet::from(["system-packages".to_string()]),
         });
     }
 
@@ -8680,8 +8917,10 @@ fn custom_to_task_spec(custom: &UpdaterTaskConfig, host_os: &HostOs) -> Option<T
             plain_start: custom.plain_start.clone(),
             success_details: custom.success_details.clone(),
             external_manager_skip: custom.external_manager_skip,
+            result_protocol: custom.result_protocol,
         }),
         category: custom.category.clone(),
+        resource_locks: custom.resource_locks.iter().cloned().collect(),
     })
 }
 
@@ -9061,8 +9300,12 @@ fn is_wsl_host() -> bool {
 fn next_ready_task(
     pending: &BTreeMap<String, TaskSpec>,
     done: &BTreeMap<String, TaskResult>,
+    busy_resources: &BTreeSet<String>,
 ) -> Option<(String, TaskSpec)> {
     for (id, spec) in pending {
+        if !spec.resource_locks.is_disjoint(busy_resources) {
+            continue;
+        }
         let mut deps_ready = true;
         for dep in &spec.depends_on {
             let dep_id = dependency_task_id(dep);
@@ -9154,15 +9397,15 @@ fn dependency_blocking_detail(spec: &TaskSpec, done: &BTreeMap<String, TaskResul
 }
 
 fn take_next_finished(
-    running: &mut VecDeque<(String, thread::JoinHandle<TaskResult>)>,
+    running: &mut VecDeque<(String, BTreeSet<String>, thread::JoinHandle<TaskResult>)>,
 ) -> Option<(String, TaskResult)> {
     if running.is_empty() {
         return None;
     }
     let next_idx = running
         .iter()
-        .position(|(_, handle)| handle.is_finished())?;
-    let (joined_label, handle) = running.remove(next_idx)?;
+        .position(|(_, _, handle)| handle.is_finished())?;
+    let (joined_label, _, handle) = running.remove(next_idx)?;
     let joined = handle.join().unwrap_or_else(|_| {
         failed_task_error_result(&joined_label, &joined_label, "task panicked")
     });

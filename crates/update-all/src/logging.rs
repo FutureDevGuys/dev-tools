@@ -1,10 +1,13 @@
 use crate::ui::{is_report_meta_line, LogLevel, LogRecord, LogStream};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -17,6 +20,12 @@ pub struct RunLogSink {
     timestamps: bool,
     run_file: Mutex<File>,
     run_file_path: PathBuf,
+    event_file: Mutex<File>,
+    event_file_path: PathBuf,
+    event_sequence: Mutex<u64>,
+    journal_failure: Mutex<Option<String>>,
+    #[cfg(test)]
+    journal_fault_injected: AtomicBool,
     task_files: Mutex<BTreeMap<String, LogFileHandle>>,
     raw_task_files: Mutex<BTreeMap<String, LogFileHandle>>,
     write_warning_targets: Mutex<BTreeSet<String>>,
@@ -35,6 +44,8 @@ impl RunLogSink {
             .with_context(|| format!("create run log directory {}", run_dir.display()))?;
         let run_file_path = run_dir.join("run.log");
         let run_file = open_append(&run_file_path)?;
+        let event_file_path = run_dir.join("events.jsonl");
+        let event_file = open_append(&event_file_path)?;
         let run_id = Uuid::new_v4().to_string();
         let sink = Self {
             run_dir,
@@ -44,11 +55,22 @@ impl RunLogSink {
             timestamps,
             run_file: Mutex::new(run_file),
             run_file_path,
+            event_file: Mutex::new(event_file),
+            event_file_path,
+            event_sequence: Mutex::new(0),
+            journal_failure: Mutex::new(None),
+            #[cfg(test)]
+            journal_fault_injected: AtomicBool::new(false),
             task_files: Mutex::new(BTreeMap::new()),
             raw_task_files: Mutex::new(BTreeMap::new()),
             write_warning_targets: Mutex::new(BTreeSet::new()),
         };
         sink.write_metadata("running", None, None, None, Vec::new(), started_unix_ms)?;
+        sink.write_event(
+            "run_started",
+            None,
+            serde_json::json!({"run_id": sink.run_id.clone(), "display_name": sink.display_name()}),
+        )?;
         Ok(sink)
     }
 
@@ -152,6 +174,62 @@ impl RunLogSink {
         Ok(())
     }
 
+    pub fn write_event(&self, kind: &str, task_id: Option<&str>, payload: Value) -> Result<()> {
+        let result = self.write_event_inner(kind, task_id, payload);
+        if let Err(error) = &result {
+            if let Ok(mut failure) = self.journal_failure.lock() {
+                if failure.is_none() {
+                    *failure = Some(format!("{error:#}"));
+                }
+            }
+        }
+        result
+    }
+
+    fn write_event_inner(&self, kind: &str, task_id: Option<&str>, payload: Value) -> Result<()> {
+        #[cfg(test)]
+        if self.journal_fault_injected.load(Ordering::SeqCst) {
+            anyhow::bail!("injected authoritative journal failure");
+        }
+        let mut sequence = self
+            .event_sequence
+            .lock()
+            .map_err(|_| anyhow::anyhow!("event journal sequence lock poisoned"))?;
+        *sequence = sequence.saturating_add(1);
+        let record = JournalRecord {
+            schema_version: 1,
+            sequence: *sequence,
+            ts_unix_ms: unix_ms_now()?,
+            kind,
+            task_id,
+            payload,
+        };
+        let mut encoded = serde_json::to_vec(&record)
+            .with_context(|| format!("serialize {}", self.event_file_path.display()))?;
+        encoded.push(b'\n');
+        let mut file = self
+            .event_file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("event journal file lock poisoned"))?;
+        file.write_all(&encoded)
+            .with_context(|| format!("write {}", self.event_file_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", self.event_file_path.display()))?;
+        Ok(())
+    }
+
+    pub fn journal_failure(&self) -> Option<String> {
+        self.journal_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
+
+    #[cfg(test)]
+    pub fn inject_journal_fault_for_test(&self) {
+        self.journal_fault_injected.store(true, Ordering::SeqCst);
+    }
+
     pub fn write_raw(&self, rec: &LogRecord) -> Result<()> {
         let line = if self.timestamps {
             format!(
@@ -225,6 +303,16 @@ impl RunLogSink {
     fn mark_write_warning_target_for_test(&self, target: &str) -> bool {
         self.mark_write_warning_target(target)
     }
+}
+
+#[derive(Serialize)]
+struct JournalRecord<'a> {
+    schema_version: u32,
+    sequence: u64,
+    ts_unix_ms: u64,
+    kind: &'a str,
+    task_id: Option<&'a str>,
+    payload: Value,
 }
 
 pub(crate) fn task_file_stem(task_id: &str) -> String {
@@ -375,6 +463,12 @@ mod tests {
 
         sink.write_record(&rec).unwrap();
         sink.write_raw(&rec).unwrap();
+        sink.write_event(
+            "task_registered",
+            Some("demo"),
+            serde_json::json!({"label": "Demo"}),
+        )
+        .unwrap();
 
         let run_dir = sink.run_dir().to_path_buf();
         drop(sink);
@@ -382,10 +476,32 @@ mod tests {
         let run_log = std::fs::metadata(run_dir.join("run.log")).unwrap();
         let task_log = std::fs::metadata(run_dir.join("task-demo.log")).unwrap();
         let raw_log = std::fs::metadata(run_dir.join("task-demo.raw.log")).unwrap();
+        let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
 
         assert!(run_log.len() > 0);
         assert!(task_log.len() > 0);
         assert!(raw_log.len() > 0);
+        let records = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["kind"], "run_started");
+        assert_eq!(records[1]["kind"], "task_registered");
+        assert_eq!(records[1]["task_id"], "demo");
+        assert_eq!(records[0]["sequence"], 1);
+        assert_eq!(records[1]["sequence"], 2);
+    }
+
+    #[test]
+    fn authoritative_journal_failure_is_sticky() {
+        let root = TempDir::new().unwrap();
+        let sink = RunLogSink::new(root.path(), true).unwrap();
+        sink.inject_journal_fault_for_test();
+
+        assert!(sink
+            .write_event("task_registered", Some("demo"), serde_json::json!({}))
+            .is_err());
+        assert!(sink.journal_failure().is_some());
     }
 
     #[test]

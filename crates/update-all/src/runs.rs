@@ -200,7 +200,7 @@ pub(crate) fn rename_metadata(
 pub(crate) fn status_from_exit_code(exit_code: i32) -> String {
     match exit_code {
         0 => "completed".to_string(),
-        130 => "canceled".to_string(),
+        3 => "canceled".to_string(),
         _ => "failed".to_string(),
     }
 }

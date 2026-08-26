@@ -17,6 +17,21 @@ use anyhow::Result;
 pub use util::process::Cancelled;
 
 #[derive(Debug)]
+pub struct InvalidPlan(pub String);
+
+impl std::fmt::Display for InvalidPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "invalid updater configuration or plan: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidPlan {}
+
+#[derive(Debug)]
 pub struct IntegrityFailure(pub String);
 
 impl std::fmt::Display for IntegrityFailure {

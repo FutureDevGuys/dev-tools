@@ -1,7 +1,11 @@
 fn main() {
     if let Err(err) = update_all::main_entry() {
         if err.downcast_ref::<update_all::Cancelled>().is_some() {
-            std::process::exit(130);
+            std::process::exit(3);
+        }
+        if err.downcast_ref::<update_all::InvalidPlan>().is_some() {
+            update_all::ua_errln!("{err:#}");
+            std::process::exit(3);
         }
         if err.downcast_ref::<update_all::Deferred>().is_some() {
             std::process::exit(2);

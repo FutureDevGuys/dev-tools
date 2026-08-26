@@ -162,6 +162,9 @@ pub struct UpdaterTaskConfig {
     pub requires_selected_any: Vec<String>,
     pub depends_on_selected: bool,
     pub depends_on_selected_exclude: Vec<String>,
+    pub resource_locks: Vec<String>,
+    pub authority: Option<String>,
+    pub result_protocol: Option<u32>,
     pub command: String,
     pub args: Vec<String>,
     pub mode: Option<String>,
@@ -425,6 +428,9 @@ struct FileUpdaterConfig {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileUpdaterCatalog {
+    schema_version: Option<u32>,
+    engine_api: Option<u32>,
+    adapter_api: Option<u32>,
     tasks: Option<BTreeMap<String, FileUpdaterTaskConfig>>,
 }
 
@@ -449,6 +455,9 @@ struct FileUpdaterTaskConfig {
     requires_selected_any: Option<Vec<String>>,
     depends_on_selected: Option<bool>,
     depends_on_selected_exclude: Option<Vec<String>>,
+    resource_locks: Option<Vec<String>>,
+    authority: Option<String>,
+    result_protocol: Option<u32>,
     command: Option<String>,
     args: Option<Vec<String>>,
     mode: Option<String>,
@@ -1070,6 +1079,14 @@ fn validate_custom_task_shape(id: &str, raw: &FileUpdaterTaskConfig) -> Result<(
         raw.policy_key.as_deref(),
         "task policy key",
     )?;
+    validate_optional_non_empty_scalar(
+        &format!("updaters.tasks.{id}.authority"),
+        raw.authority.as_deref(),
+        "authority claim",
+    )?;
+    if raw.result_protocol.is_some_and(|protocol| protocol != 1) {
+        bail!("updaters.tasks.{id}.result_protocol requires supported protocol 1");
+    }
 
     if let Some(os_names) = raw.os.as_deref() {
         if os_names.is_empty() {
@@ -1123,6 +1140,11 @@ fn validate_custom_task_lists(id: &str, raw: &FileUpdaterTaskConfig) -> Result<(
             "success_details",
             raw.success_details.as_deref(),
             "detail text",
+        ),
+        (
+            "resource_locks",
+            raw.resource_locks.as_deref(),
+            "resource lock",
         ),
     ] {
         validate_non_empty_labeled_list(&format!("updaters.tasks.{id}.{field}"), values, label)?;
@@ -1212,6 +1234,9 @@ fn parse_custom_task(id: &str, raw: FileUpdaterTaskConfig) -> Result<UpdaterTask
         requires_selected_any: raw.requires_selected_any.unwrap_or_default(),
         depends_on_selected: raw.depends_on_selected.unwrap_or(false),
         depends_on_selected_exclude: raw.depends_on_selected_exclude.unwrap_or_default(),
+        resource_locks: raw.resource_locks.unwrap_or_default(),
+        authority: raw.authority,
+        result_protocol: raw.result_protocol,
         command,
         args: raw.args.unwrap_or_default(),
         mode: raw.mode,
@@ -1251,6 +1276,25 @@ fn parse_custom_tasks(
         let task = parse_custom_task(&id, raw).map_err(|err| anyhow::anyhow!("{source}: {err}"))?;
         custom_tasks.insert(id, task);
     }
+    let builtin_ids = builtin_catalog()?
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<BTreeSet<_>>();
+    if let Some(id) = custom_tasks.keys().find(|id| builtin_ids.contains(*id)) {
+        bail!("duplicate updater task id '{id}'; already defined in the embedded public catalog");
+    }
+    let mut authorities = BTreeMap::new();
+    for task in custom_tasks.values() {
+        let Some(authority) = task.authority.as_deref() else {
+            continue;
+        };
+        if let Some(existing) = authorities.insert(authority, task.id.as_str()) {
+            bail!(
+                "updater authority '{authority}' is claimed by both '{existing}' and '{}'",
+                task.id
+            );
+        }
+    }
     validate_custom_task_references(&custom_tasks)?;
     Ok(custom_tasks)
 }
@@ -1258,8 +1302,21 @@ fn parse_custom_tasks(
 fn parse_updater_catalog_file(path: &Path) -> Result<FileUpdaterCatalog> {
     let txt = std::fs::read_to_string(path)
         .with_context(|| format!("read updater catalog {}", path.display()))?;
-    toml::from_str::<FileUpdaterCatalog>(&txt)
-        .with_context(|| format!("parse updater catalog {}", path.display()))
+    let catalog = toml::from_str::<FileUpdaterCatalog>(&txt)
+        .with_context(|| format!("parse updater catalog {}", path.display()))?;
+    for (field, actual, supported) in [
+        ("schema_version", catalog.schema_version.unwrap_or(1), 1),
+        ("engine_api", catalog.engine_api.unwrap_or(1), 1),
+        ("adapter_api", catalog.adapter_api.unwrap_or(1), 1),
+    ] {
+        if actual != supported {
+            bail!(
+                "updater catalog {} {field}={actual} is unsupported; expected {supported}",
+                path.display()
+            );
+        }
+    }
+    Ok(catalog)
 }
 
 fn resolve_updater_catalog_path(

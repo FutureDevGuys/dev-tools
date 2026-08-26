@@ -8,9 +8,10 @@ fn builtin_catalog_loads_from_embedded_data_file() {
         .map(|task| task.id.as_str())
         .collect::<Vec<_>>();
 
-    assert!(ids.contains(&"npm"));
-    assert!(ids.contains(&"yay"));
-    assert!(ids.contains(&"winget-user"));
+    assert!(ids.contains(&"builtin/npm"));
+    assert!(ids.contains(&"builtin/yay"));
+    assert!(ids.contains(&"builtin/winget-user"));
+    assert!(ids.iter().all(|id| id.starts_with("builtin/")));
 }
 
 #[test]
@@ -51,7 +52,13 @@ fn windows_foundation_catalog_loads_from_embedded_data_file() {
 #[test]
 fn builtin_catalog_carries_declarative_detection_rules() {
     let tasks = builtin_catalog().expect("builtin catalog");
-    let find = |id: &str| tasks.iter().find(|t| t.id == id).expect("task exists");
+    let find = |id: &str| {
+        let qualified = format!("builtin/{id}");
+        tasks
+            .iter()
+            .find(|t| t.id == qualified)
+            .expect("task exists")
+    };
 
     match &find("npm").kind {
         BuiltinTaskKind::Managed { executor } => {
@@ -112,7 +119,7 @@ fn builtin_catalog_carries_declarative_detection_rules() {
         } => assert!(*external_manager_skip),
         _ => panic!("uv should be a command task"),
     }
-    assert_eq!(find("uv-tools").after, vec!["uv".to_string()]);
+    assert_eq!(find("uv-tools").after, vec!["builtin/uv".to_string()]);
     match &find("uv-tools").kind {
         BuiltinTaskKind::Command {
             program,
@@ -177,7 +184,7 @@ fn builtin_catalog_carries_declarative_detection_rules() {
     assert!(!find("arch-update-services").depends_on_selected);
     assert_eq!(
         find("arch-update-services").requires_selected_any,
-        vec!["yay".to_string()]
+        vec!["builtin/yay".to_string()]
     );
     assert!(find("arch-update-services")
         .depends_on_selected_exclude
@@ -393,6 +400,7 @@ fn non_command_catalog_entries_reject_command_fields() {
         requires_selected_any: None,
         depends_on_selected: None,
         depends_on_selected_exclude: None,
+        resource_locks: None,
         include_with: None,
         enabled_by_default: true,
         category: "language".to_string(),
@@ -443,6 +451,7 @@ fn catalog_entries_reject_unknown_report_parser() {
             requires_selected_any: None,
             depends_on_selected: None,
             depends_on_selected_exclude: None,
+            resource_locks: None,
             include_with: None,
             enabled_by_default: true,
             category: "maintenance".to_string(),
@@ -527,6 +536,7 @@ fn builtin_catalog_validation_rejects_unknown_os_names() {
         requires_selected_any: Vec::new(),
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
+        resource_locks: Vec::new(),
         include_with: Vec::new(),
         enabled_by_default: true,
         category: "maintenance".to_string(),
@@ -561,6 +571,7 @@ fn builtin_catalog_validation_rejects_any_present_without_any_detector() {
         requires_selected_any: Vec::new(),
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
+        resource_locks: Vec::new(),
         include_with: Vec::new(),
         enabled_by_default: true,
         category: "maintenance".to_string(),
@@ -595,6 +606,7 @@ fn builtin_catalog_validation_rejects_unknown_relationship_selectors() {
         requires_selected_any: Vec::new(),
         depends_on_selected: false,
         depends_on_selected_exclude: Vec::new(),
+        resource_locks: Vec::new(),
         include_with: Vec::new(),
         enabled_by_default: true,
         category: "maintenance".to_string(),
@@ -661,7 +673,13 @@ fn builtin_command_candidates_reject_empty_arg_entries() {
 #[test]
 fn windows_manager_gates_machine_winget_after_user_scope() {
     let tasks = builtin_catalog().expect("builtin catalog");
-    let find = |id: &str| tasks.iter().find(|t| t.id == id).expect("task exists");
+    let find = |id: &str| {
+        let qualified = format!("builtin/{id}");
+        tasks
+            .iter()
+            .find(|t| t.id == qualified)
+            .expect("task exists")
+    };
 
     let winget_user = find("winget-user");
     let winget_machine = find("winget-machine");
@@ -671,9 +689,12 @@ fn windows_manager_gates_machine_winget_after_user_scope() {
 
     assert!(winget_user.depends_on.is_empty());
     assert!(scoop_self.order_rank < winget_user.order_rank);
-    assert_eq!(winget_machine.depends_on, vec!["winget-user".to_string()]);
+    assert_eq!(
+        winget_machine.depends_on,
+        vec!["builtin/winget-user".to_string()]
+    );
     assert!(scoop_self.depends_on.is_empty());
-    assert_eq!(scoop_all.depends_on, vec!["scoop-self".to_string()]);
+    assert_eq!(scoop_all.depends_on, vec!["builtin/scoop-self".to_string()]);
     assert!(choco.depends_on.is_empty());
 
     let user_interactive = match &winget_user.kind {
@@ -693,18 +714,18 @@ fn arch_update_services_builtin_uses_dashboard_input_with_sudo_preflight() {
     let tasks = builtin_catalog().expect("builtin catalog");
     let yay = tasks
         .iter()
-        .find(|task| task.id == "yay")
+        .find(|task| task.id == "builtin/yay")
         .expect("yay task exists");
     let task = tasks
         .iter()
-        .find(|task| task.id == "arch-update-services")
+        .find(|task| task.id == "builtin/arch-update-services")
         .expect("arch-update-services task exists");
     let yay_policy_key = match &yay.kind {
         BuiltinTaskKind::Command { policy_key, .. } => policy_key.as_str(),
         _ => "",
     };
     assert_eq!(yay_policy_key, "aur_update");
-    assert_eq!(task.depends_on, vec!["yay".to_string()]);
+    assert_eq!(task.depends_on, vec!["builtin/yay".to_string()]);
     let (interactive, requires_elevation, needs_sudo_session, external_window) = match &task.kind {
         BuiltinTaskKind::Command {
             interactive,

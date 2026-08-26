@@ -209,7 +209,10 @@ impl RunCli {
             None => {}
         }
 
-        let startup_cfg = Some(load_runtime_config(self.config.clone())?);
+        let startup_cfg = Some(
+            load_runtime_config(self.config.clone())
+                .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?,
+        );
         if startup_cfg
             .as_ref()
             .is_some_and(|config| config.install.auto_update)
@@ -522,7 +525,10 @@ struct RunSummaryJson {
 }
 
 fn run_history_root(default_config_path: Option<PathBuf>) -> Result<PathBuf> {
-    Ok(load_runtime_config(default_config_path)?.logging.run_dir)
+    Ok(load_runtime_config(default_config_path)
+        .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?
+        .logging
+        .run_dir)
 }
 
 fn select_run_match(
@@ -1409,7 +1415,8 @@ impl ConfigCli {
                 crate::ua_outln!("Wrote config: {}", path.display());
             }
             ConfigCmd::Validate(cli) => {
-                let report = validate_config(cli.path.or(default_path), cli.strict)?;
+                let report = validate_config(cli.path.or(default_path), cli.strict)
+                    .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
                 match report.path {
                     Some(path) => crate::ua_outln!("Config OK: {}", path.display()),
                     None => {
