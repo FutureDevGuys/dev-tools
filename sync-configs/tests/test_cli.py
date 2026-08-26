@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -25,7 +26,8 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
 def test_version_has_canonical_product_identity() -> None:
     result = run_cli("--version")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "sync-configs 0.1.0"
+    metadata = tomllib.loads((PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert result.stdout.strip() == f"sync-configs {metadata['project']['version']}"
 
 
 def write_manifest(path: Path, source: Path, target: Path, marker: Path) -> None:

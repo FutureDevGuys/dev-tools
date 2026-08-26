@@ -97,7 +97,7 @@ def normalize_payload(payload: Path) -> None:
         os.utime(path, (timestamp, timestamp), follow_symlinks=False)
 
 
-def validate_archive(path: Path) -> None:
+def validate_archive(path: Path, expected_version: str) -> None:
     with zipfile.ZipFile(path) as archive:
         members = set(archive.namelist())
     if members.intersection(RETIRED_TOP_LEVEL_MODULES):
@@ -117,20 +117,24 @@ def validate_archive(path: Path) -> None:
     if native:
         raise RuntimeError(f"the platform-neutral zipapp contains native files: {native}")
 
-    result = subprocess.run(
-        [sys.executable, "-S", str(path), "--help"],
-        cwd=path.parent,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0 or "usage: sync-configs" not in result.stdout:
-        raise RuntimeError(
-            "the zipapp did not run without site packages: "
-            f"exit={result.returncode}, stdout={result.stdout[:200]!r}, "
-            f"stderr={result.stderr.strip()!r}"
+    for arguments, expected in (
+        (("--help",), "usage: sync-configs"),
+        (("--version",), f"sync-configs {expected_version}"),
+    ):
+        result = subprocess.run(
+            [sys.executable, "-S", str(path), *arguments],
+            cwd=path.parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
         )
+        if result.returncode != 0 or expected not in result.stdout:
+            raise RuntimeError(
+                "the zipapp did not satisfy its isolated CLI contract: "
+                f"arguments={arguments!r}, exit={result.returncode}, "
+                f"stdout={result.stdout[:200]!r}, stderr={result.stderr.strip()!r}"
+            )
 
 
 def main() -> int:
@@ -142,6 +146,10 @@ def main() -> int:
         temporary = Path(raw_temp)
         payload = temporary / "payload"
         shutil.copytree(PACKAGE, payload / "syncconfigs")
+        (payload / "syncconfigs/_release_version.py").write_text(
+            f"__version__ = {version!r}\n",
+            encoding="utf-8",
+        )
         install_dependencies(payload)
         retain_dependency_license(payload)
         remove_build_metadata_and_native_code(payload)
@@ -157,7 +165,7 @@ def main() -> int:
             interpreter="/usr/bin/env python3",
             compressed=True,
         )
-        validate_archive(candidate)
+        validate_archive(candidate, version)
         descriptor, raw_staged = tempfile.mkstemp(
             prefix=f".{destination.name}.", dir=DIST
         )
