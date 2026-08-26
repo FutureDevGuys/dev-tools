@@ -750,6 +750,7 @@ def overlay_toml_file(
         commented_target_policy=commented_target_policy,
         exclusive_sibling_groups=exclusive_sibling_groups,
     )
+    current_paths -= set(result.suppressed)
     ownership_changed = ownership_path is not None and prior_paths != current_paths
     if materialize_symlink:
         result = dataclasses.replace(result, changed=True, materialized_symlink=True)

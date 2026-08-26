@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tomllib
 import sys
 from pathlib import Path
@@ -43,6 +44,48 @@ def test_respect_policy_suppresses_descendants_of_commented_table() -> None:
     }
     assert tomllib.loads(result.text) == {}
     assert "# [model_providers.bridge]" in result.text
+
+
+def test_respected_commented_paths_are_not_claimed_by_ownership_receipt(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.toml"
+    target = tmp_path / "target.toml"
+    state_root = tmp_path / "state"
+    source.write_text(
+        '[model_providers.bridge]\nenv_key = "SECRET_NAME"\nmodel = "gpt"\n',
+        encoding="utf-8",
+    )
+    target.write_text(
+        '[model_providers.bridge]\n  # env_key = "OLD_NAME"\nmodel = "old"\n',
+        encoding="utf-8",
+    )
+
+    first = toml_overlay.overlay_toml_file(
+        source,
+        target,
+        reconcile_removed_keys=True,
+        managed_overlay_id="comment-aware",
+        state_root=state_root,
+        commented_target_policy="respect",
+    )
+    second = toml_overlay.overlay_toml_file(
+        source,
+        target,
+        dry_run=True,
+        reconcile_removed_keys=True,
+        managed_overlay_id="comment-aware",
+        state_root=state_root,
+        commented_target_policy="respect",
+    )
+    receipt = json.loads(
+        (state_root / "overlays" / "comment-aware.json").read_text(encoding="utf-8")
+    )
+
+    assert first.ownership_changed
+    assert receipt["managed_paths"] == [["model_providers", "bridge", "model"]]
+    assert not second.changed
+    assert not second.ownership_changed
 
 
 def test_activate_policy_retains_existing_overlay_behavior() -> None:
