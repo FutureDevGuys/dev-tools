@@ -1331,10 +1331,10 @@ def dedupe_and_validate_duplicate_targets(
     return deduped, error_count
 
 
-def resolve_config_path(config_arg: str, script_dir: Path) -> Path:
+def resolve_config_path(config_arg: str, _script_dir: Path) -> Path:
     config_path = Path(normalize_user_path(config_arg))
     if not config_path.is_absolute():
-        return (script_dir / config_path).resolve()
+        return config_path.resolve()
     return config_path
 
 

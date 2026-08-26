@@ -30,6 +30,31 @@ def test_version_has_canonical_product_identity() -> None:
     assert result.stdout.strip() == f"sync-configs {metadata['project']['version']}"
 
 
+def test_relative_config_path_resolves_from_callers_working_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source.conf"
+    target = tmp_path / "target.conf"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text("managed\n", encoding="utf-8")
+    manifest.write_text(
+        f"entries:\n  - source: {source}\n    target: {target}\n    mode: copy\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(PROJECT)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "syncconfigs.cli", "--config", "manifest.yaml", "--dry-run"],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not target.exists()
+
+
 def test_toml_overlay_reports_commented_paths_without_activating_or_disclosing_values(
     tmp_path: Path,
 ) -> None:
