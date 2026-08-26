@@ -218,12 +218,81 @@ pub(crate) fn update(product: Product) -> Result<Activation> {
     let verified = fetch_verified_manifest(product, &paths, &state)?;
     accept_root_metadata(&mut state, &verified);
     accept_manifest_metadata(&mut state, &verified)?;
+    if activation_is_current(&paths, &state, &verified)? {
+        state.last_successful_check_unix = Some(now_unix());
+        save_state(&paths, &state)?;
+        return Ok(Activation {
+            product,
+            version: Some(verified.manifest.version.clone()),
+            changed: false,
+            managed: true,
+            outcome: "no_op".into(),
+            path: Some(version_binary(&paths, &verified.manifest.version)),
+        });
+    }
+    if activate_retained_verified(product, &paths, &mut state, &verified)? {
+        state.last_successful_check_unix = Some(now_unix());
+        save_state(&paths, &state)?;
+        return Ok(Activation {
+            product,
+            version: Some(verified.manifest.version.clone()),
+            changed: true,
+            managed: true,
+            outcome: "updated".into(),
+            path: Some(version_binary(&paths, &verified.manifest.version)),
+        });
+    }
     let bytes = fetch_artifact(&verified.artifact)?;
     verify_artifact(&bytes, &verified.artifact)?;
     let activation = activate(product, &paths, &mut state, &verified, &bytes)?;
     state.last_successful_check_unix = Some(now_unix());
     save_state(&paths, &state)?;
     Ok(activation)
+}
+
+fn activation_is_current(
+    paths: &Paths,
+    state: &ReleaseState,
+    verified: &VerifiedManifest,
+) -> Result<bool> {
+    let version = &verified.manifest.version;
+    if state.active_version.as_ref() != Some(version) || !is_managed_install(paths) {
+        return Ok(false);
+    }
+    let target = version_binary(paths, version);
+    if !target.is_file()
+        || sha256_file(&target)? != verified.artifact.sha256
+        || sha256_file(&paths.public_binary)? != verified.artifact.sha256
+    {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        return Ok(fs::canonicalize(&paths.public_binary)? == fs::canonicalize(target)?);
+    }
+    #[cfg(windows)]
+    {
+        Ok(true)
+    }
+}
+
+fn activate_retained_verified(
+    product: Product,
+    paths: &Paths,
+    state: &mut ReleaseState,
+    verified: &VerifiedManifest,
+) -> Result<bool> {
+    let version = &verified.manifest.version;
+    let target = version_binary(paths, version);
+    if !target.is_file() || sha256_file(&target)? != verified.artifact.sha256 {
+        return Ok(false);
+    }
+    let previous = state.active_version.clone();
+    activate_link(product, paths, version)?;
+    state.previous_version = previous.filter(|value| value != version);
+    state.active_version = Some(version.clone());
+    prune_versions(paths, state)?;
+    Ok(true)
 }
 
 pub(crate) fn install(product: Product) -> Result<Activation> {
@@ -1119,6 +1188,56 @@ mod tests {
         };
         verify_artifact(bytes, &artifact).unwrap();
         assert!(verify_artifact(b"release!", &artifact).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_authenticated_artifact_repairs_activation_without_a_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let product_root = temp.path().join("products/update-all");
+        let bin_dir = temp.path().join("bin");
+        let paths = Paths {
+            versions: product_root.join("versions"),
+            current: product_root.join("current"),
+            state: product_root.join("state.json"),
+            root_cache: product_root.join("cache/root.json"),
+            root_etag: product_root.join("cache/root.etag"),
+            manifest_cache: product_root.join("cache/manifest.json"),
+            manifest_etag: product_root.join("cache/manifest.etag"),
+            public_binary: bin_dir.join("update-all"),
+            bin_dir,
+            product_root,
+            executable_name: "update-all".into(),
+        };
+        let bytes = b"authenticated release";
+        let version = "1.2.3";
+        let target = version_binary(&paths, version);
+        atomic_write(&target, bytes, true).unwrap();
+        let verified = VerifiedManifest {
+            root_generation: 1,
+            root_sha256: "root".into(),
+            manifest: ProductManifest {
+                schema: "dev-tools-product-v1".into(),
+                product: Product::UpdateAll.id().into(),
+                generation: 1,
+                version: version.into(),
+                engine_protocol: ENGINE_PROTOCOL,
+                artifacts: BTreeMap::new(),
+            },
+            artifact: Artifact {
+                url: "https://github.com/example".into(),
+                length: bytes.len() as u64,
+                sha256: sha256_hex(bytes),
+            },
+            manifest_sha256: "manifest".into(),
+        };
+        let mut state = ReleaseState::default();
+
+        assert!(
+            activate_retained_verified(Product::UpdateAll, &paths, &mut state, &verified).unwrap()
+        );
+        assert!(activation_is_current(&paths, &state, &verified).unwrap());
+        assert_eq!(fs::canonicalize(paths.public_binary).unwrap(), target);
     }
 
     #[cfg(unix)]
