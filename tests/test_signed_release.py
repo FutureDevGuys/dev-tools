@@ -56,6 +56,28 @@ def test_release_builder_captures_zipapp_stdout(monkeypatch) -> None:
     assert observed["check"] is True
 
 
+def test_release_builder_keeps_independent_product_versions() -> None:
+    module = load_release_set_module()
+    versions = module.product_versions()
+
+    assert versions["update-all"] == "0.1.5"
+    assert versions["dev-cache"] == "0.1.6"
+    assert versions["skills-sync"] == "0.1.4"
+    assert versions["sync-configs"] == "0.1.4"
+
+
+def test_release_builder_maps_independent_manifest_generations() -> None:
+    module = load_release_set_module()
+
+    assert module.manifest_generations(["6"], ("update-all",)) == {
+        "update-all": 6
+    }
+    assert module.manifest_generations(
+        ["update-all=6", "dev-cache=9"],
+        ("update-all", "dev-cache"),
+    ) == {"update-all": 6, "dev-cache": 9}
+
+
 def write_key(path: Path, key: Ed25519PrivateKey) -> None:
     path.write_text(key.private_bytes_raw().hex(), encoding="ascii")
     path.chmod(0o600)

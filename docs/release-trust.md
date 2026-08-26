@@ -21,12 +21,22 @@ Routine release construction uses one clean-checkout recipe with only the signed
 
 ```sh
 python scripts/build-release-set.py \
+  --product update-all \
   --release-private-key /run/user/$(id -u)/dev-tools-signing/release.key \
-  --manifest-generation 1 \
-  --output /tmp/dev-tools-release
+  --manifest-generation 6 \
+  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/update-all-v0.1.5"
 ```
 
-The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives the product version and exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds all four products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the supplied release key to be authorized and unrevoked, and produces deterministic canonical signed JSON for identical inputs. Private keys never belong in the repository, build logs, command output, or release archives.
+The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the supplied release key to be authorized and unrevoked, and produces deterministic canonical signed JSON for identical inputs. Private keys never belong in the repository, build logs, command output, or release archives.
+
+Repeat `--product` to construct more than one product from the same exact source
+revision, or omit it to construct all four. For multiple products, repeat the
+generation option as `--manifest-generation update-all=6` and
+`--manifest-generation dev-cache=9`; every selected product must be named
+exactly once. Each product therefore keeps its own version and manifest
+generation, and independent nested release lines never need to be artificially
+synchronized. The output path should live on persistent owner-controlled
+storage rather than a memory-backed temporary filesystem.
 
 Each product uses independent nested tags: `update-all/vX.Y.Z`, `dev-cache/vX.Y.Z`, `sync-configs/vX.Y.Z`, and `skills-sync/vX.Y.Z`.
 

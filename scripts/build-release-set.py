@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SIGNER = ROOT / "scripts" / "build-signed-release.py"
 PRODUCTS = ("update-all", "dev-cache", "sync-configs", "skills-sync")
+RUST_PRODUCTS = ("update-all", "dev-cache", "skills-sync")
 
 
 def run(*args: str, env: dict[str, str] | None = None) -> str:
@@ -42,7 +43,7 @@ def exact_source() -> tuple[str, str]:
     return commit, timestamp
 
 
-def product_version() -> str:
+def product_versions() -> dict[str, str]:
     metadata = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1"))
     versions = {
         package["name"]: package["version"]
@@ -55,10 +56,7 @@ def product_version() -> str:
     versions["sync-configs"] = str(sync_metadata["project"]["version"])
     if set(versions) != set(PRODUCTS):
         raise SystemExit(f"release version metadata is incomplete: {sorted(versions)}")
-    unique = set(versions.values())
-    if len(unique) != 1:
-        raise SystemExit(f"product versions must match for a release set: {versions}")
-    return unique.pop()
+    return versions
 
 
 def target_id() -> str:
@@ -71,6 +69,39 @@ def target_id() -> str:
     if os_name is None or arch is None:
         raise SystemExit(f"unsupported release builder platform: {system}-{machine}")
     return f"{os_name}-{arch}"
+
+
+def manifest_generations(
+    values: list[str], products: tuple[str, ...]
+) -> dict[str, int]:
+    if len(values) == 1 and "=" not in values[0]:
+        try:
+            generation = int(values[0])
+        except ValueError as exc:
+            raise SystemExit("manifest generation must be a positive integer") from exc
+        if generation < 1:
+            raise SystemExit("manifest generation must be a positive integer")
+        return {product: generation for product in products}
+
+    generations: dict[str, int] = {}
+    for value in values:
+        product, separator, raw_generation = value.partition("=")
+        if not separator or product not in products or product in generations:
+            raise SystemExit(
+                "manifest generations must name each selected product exactly once"
+            )
+        try:
+            generation = int(raw_generation)
+        except ValueError as exc:
+            raise SystemExit("manifest generation must be a positive integer") from exc
+        if generation < 1:
+            raise SystemExit("manifest generation must be a positive integer")
+        generations[product] = generation
+    if set(generations) != set(products):
+        raise SystemExit(
+            "manifest generations must name each selected product exactly once"
+        )
+    return generations
 
 
 def release_environment(commit: str, timestamp: str, output: Path) -> dict[str, str]:
@@ -123,15 +154,32 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "crates/update-all/trust/root-public-key.txt",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--manifest-generation", required=True, type=int)
+    parser.add_argument(
+        "--manifest-generation",
+        required=True,
+        action="append",
+        help=(
+            "positive generation for all selected products, or repeat "
+            "PRODUCT=GENERATION for independent generations"
+        ),
+    )
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--product",
+        dest="products",
+        action="append",
+        choices=PRODUCTS,
+        help="product to build and sign; repeat to select multiple (default: all)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     commit, timestamp = exact_source()
-    version = product_version()
+    versions = product_versions()
+    products = tuple(dict.fromkeys(args.products or PRODUCTS))
+    generations = manifest_generations(args.manifest_generation, products)
     target = target_id()
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
@@ -153,33 +201,24 @@ def main() -> int:
             "DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY": trusted_root,
         }
     )
-    subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--locked",
-            "--bin",
-            "update-all",
-            "--bin",
-            "dev-cache",
-            "--bin",
-            "skills-sync",
-        ],
-        cwd=ROOT,
-        env=env,
-        check=True,
-    )
-    build_sync_configs(env)
+    rust_products = [product for product in products if product in RUST_PRODUCTS]
+    if rust_products:
+        cargo_command = ["cargo", "build", "--release", "--locked"]
+        for product in rust_products:
+            cargo_command.extend(["--bin", product])
+        subprocess.run(cargo_command, cwd=ROOT, env=env, check=True)
+    if "sync-configs" in products:
+        build_sync_configs(env)
     suffix = ".exe" if target.startswith("windows-") else ""
     artifacts = {
         "update-all": cargo_target / "release" / f"update-all{suffix}",
         "dev-cache": cargo_target / "release" / f"dev-cache{suffix}",
         "skills-sync": cargo_target / "release" / f"skills-sync{suffix}",
-        "sync-configs": ROOT / f"sync-configs/dist/sync-configs-{version}.pyz",
+        "sync-configs": ROOT
+        / f"sync-configs/dist/sync-configs-{versions['sync-configs']}.pyz",
     }
     summaries: list[dict[str, object]] = []
-    for product in PRODUCTS:
+    for product in products:
         destination = output / "releases" / product
         command = [
             sys.executable,
@@ -187,7 +226,7 @@ def main() -> int:
             "--product",
             product,
             "--version",
-            version,
+            versions[product],
             "--target",
             target,
             "--artifact",
@@ -199,19 +238,19 @@ def main() -> int:
             "--trusted-root-public-key",
             str(args.trusted_root_public_key),
             "--manifest-generation",
-            str(args.manifest_generation),
+            str(generations[product]),
             "--output",
             str(destination),
         ]
         summaries.append(json.loads(run(*command, env=env)))
-    shutil.rmtree(build_root)
+    shutil.rmtree(build_root, ignore_errors=True)
     print(
         json.dumps(
             {
                 "commit": commit,
                 "source_date_epoch": int(timestamp),
                 "target": target,
-                "version": version,
+                "versions": {product: versions[product] for product in products},
                 "products": summaries,
             },
             sort_keys=True,
