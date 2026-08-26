@@ -17,6 +17,7 @@ fn main() {
         workspace_root.join("Cargo.lock").display()
     );
     println!("cargo:rerun-if-changed=config.example.toml");
+    println!("cargo:rerun-if-changed=trust/root-public-key.txt");
     emit_release_source_rerun_paths(&manifest_dir);
     emit_git_rerun_paths(&manifest_dir);
 
@@ -26,14 +27,36 @@ fn main() {
     );
     set_env(
         "UPDATE_ALL_GIT_COMMIT",
-        &git_output(&manifest_dir, &["rev-parse", "--short=12", "HEAD"])
+        &env::var("DEV_TOOLS_GIT_COMMIT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| git_output(&manifest_dir, &["rev-parse", "HEAD"]))
             .unwrap_or_else(|| "unknown".into()),
     );
     set_env(
         "UPDATE_ALL_GIT_DIRTY",
-        if git_dirty(&manifest_dir) { "1" } else { "0" },
+        &env::var("DEV_TOOLS_GIT_DIRTY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| if git_dirty(&manifest_dir) { "1" } else { "0" }.into()),
     );
     set_env("UPDATE_ALL_BUILD_UNIX", &build_unix().to_string());
+    set_env(
+        "UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY",
+        &env::var("DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                fs::read_to_string(manifest_dir.join("trust/root-public-key.txt"))
+                    .ok()
+                    .map(|value| value.trim().to_string())
+            })
+            .unwrap_or_else(|| "invalid".into()),
+    );
+    println!("cargo:rerun-if-env-changed=DEV_TOOLS_GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=DEV_TOOLS_GIT_DIRTY");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY");
 }
 
 fn set_env(name: &str, value: &str) {
@@ -161,6 +184,9 @@ fn workspace_root(manifest_dir: &Path) -> Option<PathBuf> {
 }
 
 fn build_unix() -> u64 {
+    if let Ok(value) = env::var("SOURCE_DATE_EPOCH") {
+        return value.parse().unwrap_or(0);
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

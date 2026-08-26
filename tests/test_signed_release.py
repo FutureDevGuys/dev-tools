@@ -71,3 +71,57 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
     assert signed["product"] == "dev-cache"
     assert signed["generation"] == 2
     assert signed["artifacts"]["linux-x86_64"]["length"] == len(b"fixture artifact")
+
+
+def test_release_recipe_emits_dual_root_signatures_for_rotation(tmp_path: Path) -> None:
+    current = Ed25519PrivateKey.from_private_bytes(bytes([11]) * 32)
+    next_key = Ed25519PrivateKey.from_private_bytes(bytes([13]) * 32)
+    release = Ed25519PrivateKey.from_private_bytes(bytes([17]) * 32)
+    current_file = tmp_path / "current.key"
+    next_file = tmp_path / "next.key"
+    release_file = tmp_path / "release.key"
+    artifact = tmp_path / "update-all"
+    trust = tmp_path / "root.pub"
+    write_key(current_file, current)
+    write_key(next_file, next_key)
+    write_key(release_file, release)
+    artifact.write_bytes(b"release artifact")
+    trust.write_text(current.public_key().public_bytes_raw().hex() + "\n", encoding="ascii")
+    output = tmp_path / "release"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--product",
+            "update-all",
+            "--version",
+            "1.2.3",
+            "--target",
+            "linux-x86_64",
+            "--artifact",
+            str(artifact),
+            "--root-private-key",
+            str(current_file),
+            "--additional-root-private-key",
+            str(next_file),
+            "--release-private-key",
+            str(release_file),
+            "--trusted-root-public-key",
+            str(trust),
+            "--root-generation",
+            "2",
+            "--manifest-generation",
+            "2",
+            "--output",
+            str(output),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    envelope = json.loads((output / "dev-tools-root.json").read_text())
+    assert len(envelope["signatures"]) == 2
+    assert all(row["key_id"].startswith("root-") for row in envelope["signatures"])

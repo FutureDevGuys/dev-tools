@@ -65,6 +65,22 @@ def envelope(document: dict[str, object], key_name: str, key: Ed25519PrivateKey)
     }
 
 
+def root_envelope(
+    document: dict[str, object], keys: list[Ed25519PrivateKey]
+) -> dict[str, object]:
+    signed = canonical_json(document)
+    return {
+        "signed": document,
+        "signatures": [
+            {
+                "key_id": key_id("root", key),
+                "signature": base64.b64encode(key.sign(signed)).decode("ascii"),
+            }
+            for key in keys
+        ],
+    }
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_bytes(canonical_json(value) + b"\n")
 
@@ -76,6 +92,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", required=True)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--root-private-key", required=True, type=Path)
+    parser.add_argument(
+        "--additional-root-private-key",
+        action="append",
+        default=[],
+        type=Path,
+        help="Add a next-root signature for a sequential trust-root rotation",
+    )
     parser.add_argument("--release-private-key", required=True, type=Path)
     parser.add_argument(
         "--trusted-root-public-key",
@@ -97,6 +120,7 @@ def main() -> int:
         raise SystemExit("release generations must be positive")
 
     root_key = read_private_key(args.root_private_key)
+    additional_root_keys = [read_private_key(path) for path in args.additional_root_private_key]
     release_key = read_private_key(args.release_private_key)
     trusted_root = args.trusted_root_public_key.read_text(encoding="ascii").strip()
     if public_hex(root_key) != trusted_root:
@@ -144,7 +168,10 @@ def main() -> int:
         raise SystemExit(f"release output directory is not empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.artifact, destination / artifact_name)
-    write_json(destination / "dev-tools-root.json", envelope(root_document, "root", root_key))
+    write_json(
+        destination / "dev-tools-root.json",
+        root_envelope(root_document, [root_key, *additional_root_keys]),
+    )
     write_json(
         destination / f"{args.product}-stable.json",
         envelope(manifest, release_id, release_key),

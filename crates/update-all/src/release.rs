@@ -385,8 +385,8 @@ fn verify_root(envelope: &SignedEnvelope<RootDocument>) -> Result<()> {
     if envelope.signed.schema != "dev-tools-root-v1" {
         return integrity("unsupported root document schema");
     }
-    let key = parse_public_key(include_str!("../trust/root-public-key.txt").trim())?;
-    verify_any_signature(envelope, "root", &key)
+    let key = parse_public_key(env!("UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY"))?;
+    verify_any_signature(envelope, &key)
 }
 
 fn verify_product_manifest(
@@ -412,14 +412,11 @@ fn verify_product_manifest(
 
 fn verify_any_signature<T: Serialize>(
     envelope: &SignedEnvelope<T>,
-    expected_key_id: &str,
     key: &VerifyingKey,
 ) -> Result<()> {
     let signed = serde_jcs::to_vec(&envelope.signed).context("canonicalize signed document")?;
     for signature in &envelope.signatures {
-        if signature.key_id == expected_key_id
-            && verify_signature(key, &signed, &signature.signature).is_ok()
-        {
+        if verify_signature(key, &signed, &signature.signature).is_ok() {
             return Ok(());
         }
     }
@@ -1028,6 +1025,31 @@ mod tests {
             artifacts: BTreeMap::new(),
         };
         verify_product_manifest(&envelope(manifest, "release-1", &release), &root).unwrap();
+    }
+
+    #[test]
+    fn dual_signed_root_document_accepts_each_rotation_key() {
+        let current = SigningKey::from_bytes(&[2_u8; 32]);
+        let next = SigningKey::from_bytes(&[3_u8; 32]);
+        let document = RootDocument {
+            schema: "dev-tools-root-v1".into(),
+            generation: 2,
+            release_keys: Vec::new(),
+        };
+        let bytes = serde_jcs::to_vec(&document).unwrap();
+        let envelope = SignedEnvelope {
+            signed: document,
+            signatures: [&current, &next]
+                .into_iter()
+                .map(|key| DocumentSignature {
+                    key_id: "root-transition".into(),
+                    signature: BASE64.encode(key.sign(&bytes).to_bytes()),
+                })
+                .collect(),
+        };
+
+        verify_any_signature(&envelope, &current.verifying_key()).unwrap();
+        verify_any_signature(&envelope, &next.verifying_key()).unwrap();
     }
 
     #[test]
