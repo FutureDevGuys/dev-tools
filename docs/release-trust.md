@@ -21,13 +21,12 @@ Routine release construction uses one clean-checkout recipe with only the signed
 
 ```sh
 python scripts/build-release-set.py \
-  --root-document /run/user/$(id -u)/dev-tools-signing/dev-tools-root.json \
   --release-private-key /run/user/$(id -u)/dev-tools-signing/release.key \
   --manifest-generation 1 \
   --output /tmp/dev-tools-release
 ```
 
-The recipe refuses a dirty checkout, derives the product version and exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds all four products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the supplied release key to be authorized and unrevoked, and produces deterministic canonical signed JSON for identical inputs. Private keys never belong in the repository, build logs, command output, or release archives.
+The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives the product version and exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds all four products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the supplied release key to be authorized and unrevoked, and produces deterministic canonical signed JSON for identical inputs. Private keys never belong in the repository, build logs, command output, or release archives.
 
 Each product uses independent nested tags: `update-all/vX.Y.Z`, `dev-cache/vX.Y.Z`, `sync-configs/vX.Y.Z`, and `skills-sync/vX.Y.Z`.
 

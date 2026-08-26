@@ -75,7 +75,11 @@ def target_id() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-document", required=True, type=Path)
+    parser.add_argument(
+        "--root-document",
+        type=Path,
+        default=ROOT / "release-trust/dev-tools-root.json",
+    )
     parser.add_argument("--release-private-key", required=True, type=Path)
     parser.add_argument(
         "--trusted-root-public-key",

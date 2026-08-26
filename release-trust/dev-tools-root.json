@@ -1,0 +1,1 @@
+{"signatures":[{"key_id":"root-c5d410990da025ea","signature":"gKWVECMt015yCXngGyhE9C1uxL/QmiGtWo2FfeE5Li8grBV/OBh+0dMiWqLDUkJmSVFk3MVXC1raG2m5U3vNAQ=="}],"signed":{"generation":1,"release_keys":[{"key_id":"release-ca568413f0f27130","public_key":"11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072","revoked":false}],"schema":"dev-tools-root-v1"}}

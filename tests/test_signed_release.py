@@ -11,6 +11,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-signed-release.py"
 ROOT_SCRIPT = ROOT / "scripts" / "build-root-document.py"
+SCRIPTS_ROOT = ROOT / "scripts"
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from release_signing import (  # noqa: E402
+    load_root_document,
+    read_public_key,
+    verify_root_document,
+)
 
 
 def write_key(path: Path, key: Ed25519PrivateKey) -> None:
@@ -20,6 +29,20 @@ def write_key(path: Path, key: Ed25519PrivateKey) -> None:
 
 def write_public_key(path: Path, key: Ed25519PrivateKey) -> None:
     path.write_text(key.public_key().public_bytes_raw().hex() + "\n", encoding="ascii")
+
+
+def test_tracked_root_document_matches_compiled_trust_root() -> None:
+    root_document = load_root_document(ROOT / "release-trust/dev-tools-root.json")
+    trusted_root = read_public_key(
+        ROOT / "crates/update-all/trust/root-public-key.txt"
+    )
+    verify_root_document(root_document, trusted_root)
+    active = [
+        record
+        for record in root_document["signed"]["release_keys"]
+        if not record["revoked"]
+    ]
+    assert len(active) == 1
 
 
 def build_root_document(
