@@ -1,6 +1,6 @@
 use crate::ui::{
     is_report_meta_line, is_report_note_line, DashboardEvent, DashboardQuitBehavior, LogLevel,
-    LogRecord, LogStream, LogViewTarget, MouseRowStride, TaskState, UiControlEvent,
+    LogRecord, LogStream, LogViewTarget, MouseRowStride, TaskState, UiControlEvent, RUN_LOG_SCOPE,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -44,6 +44,11 @@ struct TaskRow {
 struct PendingTaskLogs {
     logs: VecDeque<LogRecord>,
     logs_dropped: u64,
+}
+
+struct TaskRenderPlan {
+    items: Vec<ListItem<'static>>,
+    row_to_task: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,27 +259,29 @@ impl Model {
 
     fn push_task_log(&mut self, mut rec: LogRecord) {
         rec.line = sanitize_log_line(&rec.line);
-        if let Some(task) = self.tasks.get_mut(&rec.task_id) {
-            push_or_coalesce_log(
-                &mut task.logs,
-                &mut task.logs_dropped,
-                self.max_in_memory_lines,
-                rec.clone(),
-            );
-        } else {
-            let pending = self
-                .pending_task_logs
-                .entry(rec.task_id.clone())
-                .or_insert_with(|| PendingTaskLogs {
-                    logs: VecDeque::new(),
-                    logs_dropped: 0,
-                });
-            push_or_coalesce_log(
-                &mut pending.logs,
-                &mut pending.logs_dropped,
-                self.max_in_memory_lines,
-                rec.clone(),
-            );
+        if rec.task_id != RUN_LOG_SCOPE {
+            if let Some(task) = self.tasks.get_mut(&rec.task_id) {
+                push_or_coalesce_log(
+                    &mut task.logs,
+                    &mut task.logs_dropped,
+                    self.max_in_memory_lines,
+                    rec.clone(),
+                );
+            } else {
+                let pending = self
+                    .pending_task_logs
+                    .entry(rec.task_id.clone())
+                    .or_insert_with(|| PendingTaskLogs {
+                        logs: VecDeque::new(),
+                        logs_dropped: 0,
+                    });
+                push_or_coalesce_log(
+                    &mut pending.logs,
+                    &mut pending.logs_dropped,
+                    self.max_in_memory_lines,
+                    rec.clone(),
+                );
+            }
         }
         push_or_coalesce_log(
             &mut self.global_logs,
@@ -460,17 +467,16 @@ impl Model {
             return;
         }
 
-        let max_offset = self.task_order.len().saturating_sub(visible_rows);
-        if self.task_list_offset > max_offset {
-            self.task_list_offset = max_offset;
-        }
+        self.task_list_offset = self
+            .task_list_offset
+            .min(self.task_order.len().saturating_sub(1));
         if self.selected_task < self.task_list_offset {
             self.task_list_offset = self.selected_task;
-        } else if self.selected_task >= self.task_list_offset + visible_rows {
-            self.task_list_offset = self.selected_task + 1 - visible_rows;
         }
-        if self.task_list_offset > max_offset {
-            self.task_list_offset = max_offset;
+        while self.task_list_offset < self.selected_task
+            && !visible_task_indices(self, visible_rows).contains(&self.selected_task)
+        {
+            self.task_list_offset += 1;
         }
     }
 
@@ -1165,13 +1171,7 @@ fn handle_mouse_event(model: &mut Model, mouse: MouseEvent, layout: &LayoutRects
             if rect_contains(layout.tasks, col, row) {
                 model.active_pane = ActivePane::Tasks;
                 model.observe_task_mouse_row(layout.tasks_inner, row);
-                if let Some(idx) = task_index_for_mouse(
-                    layout.tasks_inner,
-                    model.task_list_offset,
-                    model.task_order.len(),
-                    row,
-                    model.task_mouse_row_stride,
-                ) {
+                if let Some(idx) = task_index_for_mouse(model, layout.tasks_inner, row) {
                     model.select_task(idx, visible_rows);
                 }
                 return;
@@ -1216,27 +1216,24 @@ fn handle_mouse_event(model: &mut Model, mouse: MouseEvent, layout: &LayoutRects
     }
 }
 
-fn task_index_for_mouse(
-    tasks_inner: Rect,
-    task_list_offset: usize,
-    total_tasks: usize,
-    mouse_row: u16,
-    row_stride: u16,
-) -> Option<usize> {
+fn task_index_for_mouse(model: &Model, tasks_inner: Rect, mouse_row: u16) -> Option<usize> {
     if tasks_inner.height == 0
         || mouse_row < tasks_inner.y
         || mouse_row >= tasks_inner.y + tasks_inner.height
     {
         return None;
     }
-    let stride = row_stride.max(1) as usize;
+    let stride = model.task_mouse_row_stride.max(1) as usize;
     let rel = (mouse_row - tasks_inner.y) as usize / stride;
-    let idx = task_list_offset + rel;
-    if idx < total_tasks {
-        Some(idx)
-    } else {
-        None
-    }
+    task_render_plan(
+        model,
+        tasks_inner.height as usize,
+        tasks_inner.width as usize,
+    )
+    .row_to_task
+    .get(rel)
+    .copied()
+    .flatten()
 }
 
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
@@ -1507,11 +1504,14 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &Layout
     .block(Block::default().borders(Borders::ALL).title("Dashboard"));
     frame.render_widget(header, layout.header);
 
-    let tasks_widget = List::new(render_task_items(
-        model,
-        layout.tasks_inner.height as usize,
-        layout.tasks_inner.width as usize,
-    ))
+    let tasks_widget = List::new(
+        task_render_plan(
+            model,
+            layout.tasks_inner.height as usize,
+            layout.tasks_inner.width as usize,
+        )
+        .items,
+    )
     .block(pane_block("Tasks", model.active_pane == ActivePane::Tasks));
     frame.render_widget(tasks_widget, layout.tasks);
 
@@ -1811,20 +1811,36 @@ fn render_task_items(
     visible_rows: usize,
     inner_width: usize,
 ) -> Vec<ListItem<'static>> {
+    task_render_plan(model, visible_rows, inner_width).items
+}
+
+fn visible_task_indices(model: &Model, visible_rows: usize) -> Vec<usize> {
+    task_render_plan(model, visible_rows, 1)
+        .row_to_task
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn task_render_plan(model: &Model, visible_rows: usize, inner_width: usize) -> TaskRenderPlan {
     const TASK_LABEL_WIDTH: usize = 14;
     let mut items = Vec::new();
+    let mut row_to_task = Vec::new();
     if model.task_order.is_empty() {
         items.push(ListItem::new(Line::from("Waiting for tasks...")));
-        return items;
+        row_to_task.push(None);
+        return TaskRenderPlan { items, row_to_task };
     }
 
     if visible_rows == 0 {
-        return items;
+        return TaskRenderPlan { items, row_to_task };
     }
 
     let start = model.task_list_offset.min(model.task_order.len());
-    let end = (start + visible_rows).min(model.task_order.len());
-    for idx in start..end {
+    for idx in start..model.task_order.len() {
+        if row_to_task.len() >= visible_rows {
+            break;
+        }
         let task_id = &model.task_order[idx];
         if let Some(row) = model.tasks.get(task_id) {
             let selected = idx == model.selected_task;
@@ -1914,7 +1930,8 @@ fn render_task_items(
                     .and_then(|previous_id| model.tasks.get(previous_id))
                     .is_none_or(|previous| previous.category != row.category);
             let task_line = Line::from(line);
-            if starts_group {
+            let can_render_heading = starts_group && row_to_task.len() + 1 < visible_rows;
+            if can_render_heading {
                 items.push(ListItem::new(vec![
                     Line::from(Span::styled(
                         functional_group_label(&row.category),
@@ -1924,12 +1941,14 @@ fn render_task_items(
                     )),
                     task_line,
                 ]));
+                row_to_task.push(None);
             } else {
                 items.push(ListItem::new(task_line));
             }
+            row_to_task.push(Some(idx));
         }
     }
-    items
+    TaskRenderPlan { items, row_to_task }
 }
 
 fn functional_group_label(category: &str) -> &'static str {

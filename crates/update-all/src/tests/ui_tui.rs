@@ -271,12 +271,118 @@ fn mouse_click_selects_task_row() {
     let click = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: layout.tasks_inner.x + 1,
+        // The first rendered row is the functional group heading. The third
+        // rendered row is therefore task B, not task C.
         row: layout.tasks_inner.y + 2,
         modifiers: KeyModifiers::NONE,
     };
     handle_mouse_event(&mut model, click, &layout);
-    assert_eq!(model.selected_task, 2);
+    assert_eq!(model.selected_task, 1);
     assert_eq!(model.active_pane, ActivePane::Tasks);
+}
+
+#[test]
+fn every_visible_grouped_task_row_selects_the_rendered_task() {
+    let mut model = Model::new(200, true, true);
+    for (id, category) in [
+        ("yay", "system-packages"),
+        ("npm", "developer-tools"),
+        ("cargo", "developer-tools"),
+        ("skills", "agent-tooling"),
+        ("unity", "game-development"),
+    ] {
+        model.register_task_with_category(
+            id.to_string(),
+            id.to_uppercase(),
+            category.to_string(),
+            Vec::new(),
+            false,
+        );
+    }
+    let layout = layout_for(
+        Rect::new(0, 0, 120, 30),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    let plan = task_render_plan(
+        &model,
+        layout.tasks_inner.height as usize,
+        layout.tasks_inner.width as usize,
+    );
+
+    for (rendered_row, expected_task) in plan.row_to_task.iter().enumerate() {
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout.tasks_inner.x + 1,
+            row: layout.tasks_inner.y + rendered_row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        let before = model.selected_task;
+        handle_mouse_event(&mut model, click, &layout);
+        match expected_task {
+            Some(expected_task) => assert_eq!(model.selected_task, *expected_task),
+            None => assert_eq!(model.selected_task, before, "group heading selected a task"),
+        }
+    }
+}
+
+#[test]
+fn grouped_mouse_mapping_tracks_scroll_resize_and_stride_two() {
+    let mut model = Model::new_with_mouse_stride(200, true, true, MouseRowStride::Two);
+    for idx in 0..8 {
+        model.register_task_with_category(
+            format!("task-{idx}"),
+            format!("Task {idx}"),
+            if idx < 4 { "system" } else { "language" }.to_string(),
+            Vec::new(),
+            false,
+        );
+    }
+    model.task_list_offset = 3;
+    let layout = layout_for(
+        Rect::new(0, 0, 80, 21),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    let plan = task_render_plan(
+        &model,
+        layout.tasks_inner.height as usize,
+        layout.tasks_inner.width as usize,
+    );
+    let (logical_row, expected_task) = plan
+        .row_to_task
+        .iter()
+        .enumerate()
+        .find_map(|(row, task)| task.map(|task| (row, task)))
+        .expect("visible task row");
+
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: layout.tasks_inner.x + 1,
+        row: layout.tasks_inner.y + (logical_row as u16 * 2) + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    handle_mouse_event(&mut model, click, &layout);
+    assert_eq!(model.selected_task, expected_task);
+
+    let resized = layout_for(
+        Rect::new(0, 0, 80, 18),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    model.ensure_selected_visible(resized.tasks_inner.height as usize);
+    let resized_plan = task_render_plan(
+        &model,
+        resized.tasks_inner.height as usize,
+        resized.tasks_inner.width as usize,
+    );
+    assert!(resized_plan
+        .row_to_task
+        .iter()
+        .any(|task| *task == Some(model.selected_task)));
 }
 
 #[test]
@@ -295,7 +401,7 @@ fn mouse_click_with_stride_two_maps_odd_rows_correctly() {
     let click = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: layout.tasks_inner.x + 1,
-        row: layout.tasks_inner.y + 3,
+        row: layout.tasks_inner.y + 5,
         modifiers: KeyModifiers::NONE,
     };
     handle_mouse_event(&mut model, click, &layout);
@@ -353,17 +459,13 @@ fn resize_keeps_auto_mouse_stride_at_one() {
 
 #[test]
 fn explicit_mouse_stride_two_remains_opt_in() {
-    let model = Model::new_with_mouse_stride(200, true, true, MouseRowStride::Two);
+    let mut model = Model::new_with_mouse_stride(200, true, true, MouseRowStride::Two);
+    model.register_task("a".into(), "A".into(), Vec::new(), false);
+    model.register_task("b".into(), "B".into(), Vec::new(), false);
     assert_eq!(model.task_mouse_row_stride, 2);
     assert_eq!(
-        task_index_for_mouse(
-            Rect::new(1, 10, 40, 20),
-            0,
-            10,
-            14,
-            model.task_mouse_row_stride
-        ),
-        Some(2)
+        task_index_for_mouse(&model, Rect::new(1, 10, 40, 20), 14),
+        Some(1)
     );
 }
 
@@ -1791,26 +1893,26 @@ fn task_logs_replay_records_received_before_registration() {
 
     model.push_task_log(LogRecord {
         ts_unix_ms: 1,
-        task_id: "npm".to_string(),
+        task_id: "builtin/npm".to_string(),
         level: LogLevel::Warn,
         stream: LogStream::Stderr,
         line: "npm error code ETIMEDOUT".to_string(),
     });
     model.push_task_log(LogRecord {
         ts_unix_ms: 2,
-        task_id: "pipx".to_string(),
+        task_id: "builtin/pipx".to_string(),
         level: LogLevel::Info,
         stream: LogStream::Stdout,
         line: "pipx unrelated".to_string(),
     });
 
     assert_eq!(model.global_logs.len(), 2);
-    assert!(!model.tasks.contains_key("npm"));
+    assert!(!model.tasks.contains_key("builtin/npm"));
 
-    model.register_task("npm".into(), "NPM".into(), Vec::new(), false);
+    model.register_task("builtin/npm".into(), "NPM".into(), Vec::new(), false);
     model.selected_task = 0;
 
-    let task = model.tasks.get("npm").expect("npm task present");
+    let task = model.tasks.get("builtin/npm").expect("npm task present");
     assert_eq!(task.logs.len(), 1);
     assert_eq!(
         task.logs.front().map(|rec| rec.line.as_str()),
@@ -1823,6 +1925,23 @@ fn task_logs_replay_records_received_before_registration() {
         .join("\n");
     assert!(rendered.contains("npm error code ETIMEDOUT"));
     assert!(!rendered.contains("pipx unrelated"));
+}
+
+#[test]
+fn run_scoped_logs_stay_global_and_never_become_orphan_tasks() {
+    let mut model = Model::new(200, true, true);
+    model.register_task("builtin/npm".into(), "NPM".into(), Vec::new(), false);
+    model.push_task_log(LogRecord {
+        ts_unix_ms: 1,
+        task_id: RUN_LOG_SCOPE.to_string(),
+        level: LogLevel::Info,
+        stream: LogStream::Meta,
+        line: "run summary".to_string(),
+    });
+
+    assert_eq!(model.global_logs.len(), 1);
+    assert!(!model.pending_task_logs.contains_key(RUN_LOG_SCOPE));
+    assert!(model.tasks["builtin/npm"].logs.is_empty());
 }
 
 #[test]

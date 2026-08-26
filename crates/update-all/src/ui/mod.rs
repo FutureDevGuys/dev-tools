@@ -130,6 +130,9 @@ pub enum LogStream {
     Meta,
 }
 
+/// Reserved journal scope for records that belong to the run rather than a task.
+pub const RUN_LOG_SCOPE: &str = "run/global";
+
 impl LogStream {
     pub fn as_str(self) -> &'static str {
         match self {

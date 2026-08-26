@@ -1,4 +1,4 @@
-use crate::ui::{is_report_meta_line, LogLevel, LogRecord, LogStream};
+use crate::ui::{is_report_meta_line, LogLevel, LogRecord, LogStream, RUN_LOG_SCOPE};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -148,6 +148,10 @@ impl RunLogSink {
             .with_context(|| format!("flush {}", self.run_file_path.display()))?;
         drop(run_file);
 
+        if rec.task_id == RUN_LOG_SCOPE {
+            return Ok(());
+        }
+
         let mut files = self
             .task_files
             .lock()
@@ -231,6 +235,9 @@ impl RunLogSink {
     }
 
     pub fn write_raw(&self, rec: &LogRecord) -> Result<()> {
+        if rec.task_id == RUN_LOG_SCOPE {
+            return Ok(());
+        }
         let line = if self.timestamps {
             format!(
                 "{} [{}] [{}] [{}] {}\n",

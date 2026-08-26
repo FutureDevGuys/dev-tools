@@ -5084,6 +5084,48 @@ fn namespaced_task_ids_write_flat_owner_only_artifact_names() {
 }
 
 #[test]
+fn managed_builtin_executors_emit_under_registered_canonical_ids() {
+    assert_eq!(TASK_NPM, "builtin/npm");
+    assert_eq!(TASK_COMPLETIONS, "builtin/completions");
+}
+
+#[test]
+fn run_scoped_log_journal_records_have_no_task_identity_or_task_artifact() {
+    let temp = TempDir::new().unwrap();
+    let run_log = RunLogSink::new(temp.path(), false).unwrap();
+    let record = LogRecord {
+        ts_unix_ms: 1,
+        task_id: RUN_LOG_SCOPE.to_string(),
+        level: LogLevel::Info,
+        stream: LogStream::Meta,
+        line: "run summary".to_string(),
+    };
+
+    journal_dashboard_event(&run_log, &DashboardEvent::LogLine(record.clone())).unwrap();
+    run_log.write_raw(&record).unwrap();
+    run_log.write_record(&record).unwrap();
+
+    let journal = fs::read_to_string(run_log.run_dir().join("events.jsonl")).unwrap();
+    let event: serde_json::Value = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .find(|event: &serde_json::Value| event["kind"] == "log_line")
+        .expect("log event");
+    assert!(event["task_id"].is_null(), "{event}");
+    assert!(!run_log
+        .run_dir()
+        .join(format!("task-{}.log", task_file_stem(RUN_LOG_SCOPE)))
+        .exists());
+    assert!(!run_log
+        .run_dir()
+        .join(format!("task-{}.raw.log", task_file_stem(RUN_LOG_SCOPE)))
+        .exists());
+    assert!(fs::read_to_string(run_log.run_dir().join("run.log"))
+        .unwrap()
+        .contains("run summary"));
+}
+
+#[test]
 fn structured_command_result_marks_a_successful_process_as_deferred() {
     let mut result = TaskResult::completed("Example Tool");
     assert!(apply_structured_command_result(

@@ -17,6 +17,7 @@ use crate::sections::Sections;
 use crate::ui::{
     report_values_are_version_change, DashboardEvent, DashboardQuitBehavior, LogLevel, LogRecord,
     LogStream, LogViewTarget, MouseRowStride, TaskState, UiControlEvent, UiModeResolved,
+    RUN_LOG_SCOPE,
 };
 use crate::updaters::{
     builtin_windows_foundations, command_candidate_is_available, command_program_path,
@@ -59,8 +60,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
-pub const TASK_NPM: &str = "npm";
-pub const TASK_COMPLETIONS: &str = "completions";
+pub const TASK_NPM: &str = "builtin/npm";
+pub const TASK_COMPLETIONS: &str = "builtin/completions";
 const ORDER_ONLY_DEPENDENCY_PREFIX: &str = "\u{1f}after:";
 const TASK_RUN_LOCK_STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 const FORCED_CANCEL_TIMEOUT_DETAIL: &str = "forced shutdown after cancel-all grace timeout";
@@ -425,7 +426,7 @@ impl DashboardSender {
             }
             let rec = LogRecord {
                 ts_unix_ms: now_unix_ms(),
-                task_id: "runtime".to_string(),
+                task_id: RUN_LOG_SCOPE.to_string(),
                 level: LogLevel::Warn,
                 stream: LogStream::Meta,
                 line: line.to_string(),
@@ -487,7 +488,7 @@ fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<(
         ),
         DashboardEvent::LogLine(record) => log.write_event(
             "log_line",
-            Some(&record.task_id),
+            (record.task_id != RUN_LOG_SCOPE).then_some(record.task_id.as_str()),
             serde_json::json!({
                 "level": record.level.as_str(),
                 "stream": record.stream.as_str(),
@@ -947,6 +948,11 @@ impl SyncContext {
         line: impl Into<String>,
     ) {
         let line = line.into();
+        let task_id = if task_id == "runtime" {
+            RUN_LOG_SCOPE
+        } else {
+            task_id
+        };
         let rec = LogRecord {
             ts_unix_ms: now_unix_ms(),
             task_id: task_id.to_string(),
@@ -13519,6 +13525,11 @@ fn emit_task_log(
     stream: LogStream,
     line: String,
 ) {
+    let task_id = if task_id == "runtime" {
+        RUN_LOG_SCOPE
+    } else {
+        task_id
+    };
     let rec = LogRecord {
         ts_unix_ms: now_unix_ms(),
         task_id: task_id.to_string(),
