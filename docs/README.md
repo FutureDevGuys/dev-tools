@@ -1,6 +1,7 @@
 # Documentation
 
 - [update-all](update-all.md)
+- [dev-auth](dev-auth.md)
 - [Dev Cache](dev-cache.md)
 - [sync-configs](sync-configs.md)
 - [skills-sync](skills-sync.md)

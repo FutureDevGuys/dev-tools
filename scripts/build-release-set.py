@@ -16,8 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGNER = ROOT / "scripts" / "build-signed-release.py"
-PRODUCTS = ("update-all", "dev-cache", "sync-configs", "skills-sync")
-RUST_PRODUCTS = ("update-all", "dev-cache", "skills-sync")
+PRODUCTS = ("update-all", "dev-auth", "dev-cache", "sync-configs", "skills-sync")
+RUST_PRODUCTS = ("update-all", "dev-auth", "dev-cache", "skills-sync")
 
 
 def run(*args: str, env: dict[str, str] | None = None) -> str:
@@ -212,6 +212,7 @@ def main() -> int:
     suffix = ".exe" if target.startswith("windows-") else ""
     artifacts = {
         "update-all": cargo_target / "release" / f"update-all{suffix}",
+        "dev-auth": cargo_target / "release" / f"dev-auth{suffix}",
         "dev-cache": cargo_target / "release" / f"dev-cache{suffix}",
         "skills-sync": cargo_target / "release" / f"skills-sync{suffix}",
         "sync-configs": ROOT
