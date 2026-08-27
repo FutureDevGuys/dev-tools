@@ -23,7 +23,7 @@ from release_signing import (
 )
 
 
-PRODUCTS = {"update-all", "dev-cache", "sync-configs", "skills-sync"}
+PRODUCTS = {"update-all", "dev-auth", "dev-cache", "sync-configs", "skills-sync"}
 OWNER = "FutureDevGuys"
 REPOSITORY = "dev-tools"
 

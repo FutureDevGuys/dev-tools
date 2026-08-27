@@ -9,6 +9,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 | Product | Use it for |
 |---|---|
 | [`update-all`](docs/update-all.md) | Run supported package and tool updaters through one dependable plan and dashboard. |
+| [`dev-auth`](docs/dev-auth.md) | Supply bounded post-login automation credentials to standard Git, GitHub CLI, child-process, and OpenSSH-agent interfaces. |
 | [`dev-cache`](docs/dev-cache.md) | Route and automatically maintain known disposable build caches on storage you select without moving source or deliverables. |
 | [`sync-configs`](docs/sync-configs.md) | Converge explicitly selected files, directories, and structured overlays from a trusted manifest. |
 | [`skills-sync`](docs/skills-sync.md) | Reconcile installed agent skills and their links from an explicit lock and provider selection. |
@@ -25,6 +26,8 @@ On Linux x86-64, download `update-all-0.1.5-linux-x86_64` from the [`update-all/
 ~/.local/bin/update-all product install sync-configs
 ~/.local/bin/update-all product install skills-sync
 ```
+
+`dev-auth` is distributed through the same signed release format but is provisioned by the workstation configuration authority because enrollment, repository allowlists, and OS-keyring state are machine policy. It is deliberately not an `update-all` product target.
 
 After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer.
 
@@ -50,6 +53,6 @@ See the [documentation index](docs/README.md), [security policy](SECURITY.md), [
 ## Non-goals
 
 - Dev Tools does not choose personal packages, applications, host profiles, desktop policy, or private updater tasks.
-- It does not synchronize credentials, browser state, sessions, tunnels, or complete environment snapshots.
+- It does not synchronize credentials, browser state, sessions, tunnels, or complete environment snapshots; `dev-auth` consumes only an already-enrolled bounded automation authority.
 - It does not install timers, daemons, watchers, scheduled tasks, or a background updater.
 - It does not silently adopt old product names, paths, or configuration.

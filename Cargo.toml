@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/dev-auth",
     "crates/dev-cache",
     "crates/skills-sync",
     "crates/update-all",
