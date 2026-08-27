@@ -503,7 +503,6 @@ pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
         .context("gh command is missing")?;
     let subcommand = arguments.get(1).map(AsRef::as_ref);
     let accepted = match command {
-        "status" => true,
         "pr" => matches!(
             subcommand,
             Some(

@@ -260,7 +260,6 @@ fn gh_surface_is_repository_scoped_and_excludes_administration() {
         vec!["workflow", "list"],
         vec!["release", "download"],
         vec!["repo", "view"],
-        vec!["status"],
     ] {
         assert!(admit_gh_arguments(&accepted).is_ok(), "{accepted:?}");
     }
@@ -273,6 +272,7 @@ fn gh_surface_is_repository_scoped_and_excludes_administration() {
         vec!["secret", "set"],
         vec!["variable", "set"],
         vec!["issue", "create"],
+        vec!["status"],
     ] {
         assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
     }

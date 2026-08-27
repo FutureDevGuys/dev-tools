@@ -12,9 +12,12 @@ fn private_runtime() -> TempDir {
 }
 
 fn credential_helper(operation: &str, input: &str) -> std::process::Output {
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("git-credential-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &helper).unwrap();
     let home = tempfile::tempdir().unwrap();
     let runtime = private_runtime();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_git-credential-dev-auth"))
+    let mut child = Command::new(&helper)
         .arg(operation)
         .env_clear()
         .env("HOME", home.path())
@@ -102,4 +105,30 @@ fn one_released_binary_serves_the_git_helper_symlink() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "quit=true\n");
+}
+
+#[test]
+fn one_released_binary_serves_every_declared_symlink_frontend() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+    for frontend in ["gh-dev-auth", "ssh-keygen-dev-auth"] {
+        let path = directory.path().join(frontend);
+        symlink(env!("CARGO_BIN_EXE_dev-auth"), &path).unwrap();
+        let output = Command::new(&path)
+            .arg("--help")
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{frontend}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .starts_with(&format!("{frontend}: ")),
+            "{frontend}"
+        );
+    }
 }
