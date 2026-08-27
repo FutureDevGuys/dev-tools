@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -178,15 +179,30 @@ fn strip_one_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+fn secret_service_environment(
+    source: impl IntoIterator<Item = (OsString, OsString)>,
+) -> BTreeMap<OsString, OsString> {
+    source
+        .into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_str(),
+                Some("DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR")
+            )
+        })
+        .collect()
+}
+
 fn service_account_token() -> Result<SecretString> {
-    let output = Command::new(SECRET_TOOL)
+    let mut command = Command::new(SECRET_TOOL);
+    command
         .args(["lookup", "service", "dev-auth", "account", "automation"])
         .env_clear()
         .env("PATH", "/usr/bin")
+        .envs(secret_service_environment(env::vars_os()))
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("run OS credential-store lookup")?;
+        .stderr(Stdio::null());
+    let output = command.output().context("run OS credential-store lookup")?;
     if !output.status.success() {
         bail!("the dev-auth service credential is not enrolled or the keyring is locked");
     }
@@ -949,6 +965,28 @@ mod tests {
             ("duplicate".into(), profile(authentication, signing)),
         ]));
         assert!(unique_declared_ssh_profile(&duplicated, &loaded).is_err());
+    }
+
+    #[test]
+    fn credential_store_keeps_only_the_session_bus_context() {
+        let retained = secret_service_environment([
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+            ("DISPLAY".into(), ":0".into()),
+            ("OP_SERVICE_ACCOUNT_TOKEN".into(), "must-not-survive".into()),
+        ]);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(
+            retained.get(&OsString::from("DBUS_SESSION_BUS_ADDRESS")),
+            Some(&OsString::from("unix:path=/run/user/1000/bus"))
+        );
+        assert_eq!(
+            retained.get(&OsString::from("XDG_RUNTIME_DIR")),
+            Some(&OsString::from("/run/user/1000"))
+        );
     }
 
     #[test]
