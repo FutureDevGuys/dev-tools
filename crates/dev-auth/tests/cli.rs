@@ -187,3 +187,74 @@ fn windows_credential_helper_name_preserves_fail_closed_git_output() {
     assert!(!output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "quit=true\n");
 }
+
+#[test]
+fn git_verification_does_not_require_the_secret_runtime_or_ssh_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("ssh-keygen-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &helper).unwrap();
+    let verifier = directory.path().join("ssh-keygen");
+    fs::write(
+        &verifier,
+        "#!/bin/sh\n[ \"$1\" = -Y ] && [ \"$2\" = verify ]\n",
+    )
+    .unwrap();
+    fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(
+        home.path().join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        r#"version = 1
+[credential_store]
+service = "test-dev-auth"
+account = "service-token"
+[programs]
+op = "/usr/bin/false"
+gh = "/usr/bin/false"
+git = "/usr/bin/git"
+ssh_add = "/usr/bin/false"
+ssh_keygen = "{}"
+[github]
+app_id = 42
+private_key_ref = "op://Automation/app/key"
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
+discover_installations = true
+[[ssh_profiles.automation.keys]]
+purpose = "authentication"
+private_key_ref = "op://Automation/auth/private key"
+fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+[[ssh_profiles.automation.keys]]
+purpose = "signing"
+private_key_ref = "op://Automation/sign/private key"
+fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+"#,
+        verifier.display()
+    );
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, config).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let absent_runtime = home.path().join("absent-runtime");
+    let output = Command::new(&helper)
+        .args(["-Y", "verify", "-n", "git"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_RUNTIME_DIR", &absent_runtime)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!absent_runtime.exists());
+}
