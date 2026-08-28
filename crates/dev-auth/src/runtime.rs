@@ -720,7 +720,67 @@ fn explicit_gh_repository(arguments: &[String]) -> Result<Option<String>> {
         }
         index += 1;
     }
+    if let Some(value) = repo_view_positional_repository(arguments)? {
+        if selected.as_ref().is_some_and(|current| current != &value) {
+            bail!("gh command contains conflicting repository selectors");
+        }
+        selected = Some(value);
+    }
     Ok(selected)
+}
+
+fn repo_view_positional_repository(arguments: &[String]) -> Result<Option<String>> {
+    if arguments.first().map(String::as_str) != Some("repo")
+        || arguments.get(1).map(String::as_str) != Some("view")
+    {
+        return Ok(None);
+    }
+
+    let mut positional: Option<String> = None;
+    let mut index = 2;
+    let mut options_ended = false;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if !options_ended && argument == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if !options_ended && matches!(argument.as_str(), "-R" | "--repo") {
+            index += 1;
+            arguments
+                .get(index)
+                .context("gh repository flag has no value")?;
+        } else if !options_ended
+            && matches!(
+                argument.as_str(),
+                "-b" | "--branch" | "-q" | "--jq" | "--json" | "-t" | "--template"
+            )
+        {
+            index += 1;
+            arguments
+                .get(index)
+                .with_context(|| format!("gh repo view flag {argument} has no value"))?;
+        } else if !options_ended
+            && (matches!(argument.as_str(), "-w" | "--web" | "--help")
+                || argument.starts_with("--repo=")
+                || ["--branch=", "--jq=", "--json=", "--template="]
+                    .iter()
+                    .any(|prefix| argument.starts_with(prefix)))
+        {
+            // Flag is complete in this argument.
+        } else if !options_ended && argument.starts_with('-') {
+            bail!("unsupported gh repo view flag: {argument}");
+        } else {
+            crate::parse_github_repository(argument)?;
+            if positional.is_some() {
+                bail!("gh repo view contains more than one positional repository");
+            }
+            positional = Some(argument.clone());
+        }
+        index += 1;
+    }
+    Ok(positional)
 }
 
 fn forwarded_gh_arguments(arguments: &[String]) -> Result<Vec<String>> {
@@ -1425,6 +1485,55 @@ mod tests {
             forwarded_gh_arguments(&arguments).unwrap(),
             vec!["repo", "view", "--json", "nameWithOwner"]
         );
+    }
+
+    #[test]
+    fn repository_view_positional_selects_the_token_scope_and_is_forwarded() {
+        let arguments = vec![
+            "repo".into(),
+            "view".into(),
+            "ExampleOrg/sample-repo".into(),
+            "--json".into(),
+            "nameWithOwner".into(),
+        ];
+        assert_eq!(
+            explicit_gh_repository(&arguments).unwrap(),
+            Some("ExampleOrg/sample-repo".into())
+        );
+        assert_eq!(forwarded_gh_arguments(&arguments).unwrap(), arguments);
+    }
+
+    #[test]
+    fn repository_view_positional_after_value_flag_selects_the_token_scope() {
+        let arguments = vec![
+            "repo".into(),
+            "view".into(),
+            "--json".into(),
+            "nameWithOwner".into(),
+            "ExampleOrg/sample-repo".into(),
+        ];
+        assert_eq!(
+            explicit_gh_repository(&arguments).unwrap(),
+            Some("ExampleOrg/sample-repo".into())
+        );
+        assert_eq!(forwarded_gh_arguments(&arguments).unwrap(), arguments);
+    }
+
+    #[test]
+    fn repository_view_rejects_conflicting_flag_and_late_positional_selectors() {
+        let arguments = vec![
+            "repo".into(),
+            "view".into(),
+            "--repo".into(),
+            "ExampleOrg/first".into(),
+            "--json".into(),
+            "nameWithOwner".into(),
+            "ExampleOrg/second".into(),
+        ];
+        assert!(explicit_gh_repository(&arguments)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting repository selectors"));
     }
 
     #[test]
