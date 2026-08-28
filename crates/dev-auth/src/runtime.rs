@@ -245,7 +245,7 @@ struct AppJwtClaims {
 
 #[derive(Debug, Serialize)]
 struct InstallationTokenRequest<'a> {
-    repository_ids: [u64; 1],
+    repositories: [&'a str; 1],
     permissions: &'a BTreeMap<String, String>,
 }
 
@@ -253,12 +253,21 @@ struct InstallationTokenRequest<'a> {
 struct InstallationTokenResponse {
     token: String,
     expires_at: String,
+    permissions: BTreeMap<String, String>,
+    repository_selection: String,
+}
+
+#[derive(Deserialize)]
+struct RepositoryResponse {
+    id: u64,
+    full_name: String,
 }
 
 fn mint_installation_token(
     config: &Config,
     installation_id: u64,
-    repository_id: u64,
+    owner: &str,
+    repository: &str,
     now: i64,
 ) -> Result<CacheEntry> {
     let private_key = read_automation_secret(&config.github.private_key_ref)?;
@@ -290,7 +299,7 @@ fn mint_installation_token(
         .header("Authorization", format!("Bearer {jwt}"))
         .header("X-GitHub-Api-Version", "2026-03-10")
         .send_json(&InstallationTokenRequest {
-            repository_ids: [repository_id],
+            repositories: [repository],
             permissions: &config.github.permissions,
         })
         .context("request narrowed GitHub App installation token")?;
@@ -315,14 +324,46 @@ fn mint_installation_token(
         || response.token.contains(['\n', '\r', '\0'])
         || expires_at <= now + 300
         || expires_at > now + 3700
+        || response.permissions != config.github.permissions
+        || response.repository_selection != "selected"
     {
         bail!("GitHub returned an invalid installation token contract");
+    }
+    let expected_full_name = format!("{owner}/{repository}");
+    let repository_url = format!("https://api.github.com/repos/{expected_full_name}");
+    let mut repository_response = agent
+        .get(&repository_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {}", response.token))
+        .header("X-GitHub-Api-Version", "2026-03-10")
+        .call()
+        .context("validate narrowed GitHub App repository token")?;
+    if !repository_response.status().is_success() {
+        bail!(
+            "GitHub repository scope validation returned HTTP {}",
+            repository_response.status()
+        );
+    }
+    let repository_bytes = repository_response
+        .body_mut()
+        .with_config()
+        .limit(RESPONSE_LIMIT)
+        .read_to_vec()
+        .context("read bounded GitHub repository response")?;
+    let repository_response: RepositoryResponse = serde_json::from_slice(&repository_bytes)
+        .context("parse GitHub repository scope response")?;
+    if repository_response.id == 0
+        || !repository_response
+            .full_name
+            .eq_ignore_ascii_case(&expected_full_name)
+    {
+        bail!("GitHub repository token scope does not match the requested repository");
     }
     Ok(CacheEntry::new(
         SecretString::new(response.token),
         expires_at,
         installation_id,
-        repository_id,
+        repository.to_owned(),
         config.github.permissions.clone(),
     ))
 }
@@ -333,7 +374,7 @@ struct CacheFile {
     token: String,
     expires_at: i64,
     installation_id: u64,
-    repository_id: u64,
+    repository: String,
     permissions: BTreeMap<String, String>,
 }
 
@@ -343,7 +384,7 @@ impl From<&CacheEntry> for CacheFile {
             token: entry.token().expose().to_owned(),
             expires_at: entry.expires_at(),
             installation_id: entry.installation_id(),
-            repository_id: entry.repository_id(),
+            repository: entry.repository().to_owned(),
             permissions: entry.permissions.clone(),
         }
     }
@@ -355,7 +396,7 @@ impl From<CacheFile> for CacheEntry {
             SecretString::new(value.token),
             value.expires_at,
             value.installation_id,
-            value.repository_id,
+            value.repository,
             value.permissions,
         )
     }
@@ -363,10 +404,10 @@ impl From<CacheFile> for CacheEntry {
 
 fn cache_key(
     installation_id: u64,
-    repository_id: u64,
+    repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let public_scope = serde_json::to_vec(&(installation_id, repository_id, permissions))
+    let public_scope = serde_json::to_vec(&(installation_id, repository, permissions))
         .context("serialize installation-token cache scope")?;
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
@@ -374,7 +415,7 @@ fn cache_key(
 fn locked_cache_entry<F>(
     paths: &RuntimePaths,
     installation_id: u64,
-    repository_id: u64,
+    repository: &str,
     permissions: &BTreeMap<String, String>,
     create: F,
 ) -> Result<CacheEntry>
@@ -382,7 +423,7 @@ where
     F: FnOnce() -> Result<CacheEntry>,
 {
     ensure_runtime(paths)?;
-    let key = cache_key(installation_id, repository_id, permissions)?;
+    let key = cache_key(installation_id, repository, permissions)?;
     let cache_path = paths.cache_dir().join(format!("{key}.json"));
     let lock_path = paths.cache_dir().join(format!("{key}.lock"));
     let lock = private_open(&lock_path)?;
@@ -391,12 +432,12 @@ where
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
     if let Ok(entry) = read_cache(&cache_path) {
-        if entry.is_usable_at(now, installation_id, repository_id, permissions) {
+        if entry.is_usable_at(now, installation_id, repository, permissions) {
             return Ok(entry);
         }
     }
     let entry = create()?;
-    if !entry.is_usable_at(now, installation_id, repository_id, permissions) {
+    if !entry.is_usable_at(now, installation_id, repository, permissions) {
         bail!("new installation token is not usable for the requested scope");
     }
     write_cache(&cache_path, &entry)?;
@@ -429,10 +470,11 @@ fn read_cache(path: &Path) -> Result<CacheEntry> {
 
 fn write_cache(path: &Path, entry: &CacheEntry) -> Result<()> {
     let parent = path.parent().context("cache path has no parent")?;
+    let repository_scope = format!("{:x}", Sha256::digest(entry.repository().as_bytes()));
     let temp = parent.join(format!(
         ".cache-{}-{}.tmp",
         std::process::id(),
-        entry.repository_id()
+        &repository_scope[..16]
     ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
@@ -468,13 +510,14 @@ fn selected_token(
     locked_cache_entry(
         paths,
         selected.installation_id,
-        selected.repository_id,
+        &selected.repository,
         &config.github.permissions,
         || {
             mint_installation_token(
                 config,
                 selected.installation_id,
-                selected.repository_id,
+                &selected.owner,
+                &selected.repository,
                 OffsetDateTime::now_utc().unix_timestamp(),
             )
         },
@@ -496,13 +539,14 @@ pub fn github_token_for_repository(owner: &str, repository: &str) -> Result<Secr
     let entry = locked_cache_entry(
         &paths,
         selected.installation_id,
-        selected.repository_id,
+        &selected.repository,
         &config.github.permissions,
         || {
             mint_installation_token(
                 &config,
                 selected.installation_id,
-                selected.repository_id,
+                &selected.owner,
+                &selected.repository,
                 OffsetDateTime::now_utc().unix_timestamp(),
             )
         },
@@ -593,7 +637,7 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
     ensure_runtime(&paths)?;
     let key = cache_key(
         selected.installation_id,
-        selected.repository_id,
+        &selected.repository,
         &config.github.permissions,
     )?;
     let cache = paths.cache_dir().join(format!("{key}.json"));
@@ -927,6 +971,22 @@ mod tests {
             profiles: BTreeMap::new(),
             ssh_profiles: profiles,
         }
+    }
+
+    #[test]
+    fn installation_token_request_is_narrowed_by_repository_name() {
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let request = InstallationTokenRequest {
+            repositories: ["brand-new-repository"],
+            permissions: &permissions,
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "repositories": ["brand-new-repository"],
+                "permissions": {"contents": "write"}
+            })
+        );
     }
 
     fn profile(authentication: &str, signing: &str) -> SshProfile {

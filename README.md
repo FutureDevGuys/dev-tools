@@ -27,7 +27,7 @@ On Linux x86-64, download `update-all-0.1.5-linux-x86_64` from the [`update-all/
 ~/.local/bin/update-all product install skills-sync
 ```
 
-`dev-auth` is distributed through the same signed release format but is provisioned by the workstation configuration authority because enrollment, repository allowlists, and OS-keyring state are machine policy. It is deliberately not an `update-all` product target.
+`dev-auth` is distributed through the same signed release format but is provisioned by the workstation configuration authority because enrollment, GitHub installation scope, and OS-keyring state are machine policy. It is deliberately not an `update-all` product target.
 
 After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer.
 
