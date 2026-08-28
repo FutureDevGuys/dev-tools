@@ -7,8 +7,9 @@ use zeroize::Zeroizing;
 mod runtime;
 
 pub use runtime::{
-    credential_erase, credential_get, exec_profile, github_token_for_repository, purge_runtime,
-    run_gh, run_ssh_keygen, runtime_status, ssh_load, RuntimeStatus,
+    agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,
+    github_token_for_repository, purge_runtime, run_agent, run_gh, run_ssh_keygen, runtime_status,
+    ssh_load, RuntimeStatus,
 };
 
 const MAX_CREDENTIAL_REQUEST_BYTES: usize = 64 * 1024;
@@ -136,8 +137,47 @@ pub struct GitHubInstallation {
 pub struct GitHubProfile {
     pub app_id: u64,
     pub private_key_ref: String,
+    #[serde(default)]
+    pub discover_installations: bool,
+    #[serde(default)]
     pub installations: Vec<GitHubInstallation>,
     pub permissions: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialStore {
+    #[serde(default = "default_keyring_service")]
+    pub service: String,
+    #[serde(default = "default_keyring_account")]
+    pub account: String,
+}
+
+impl Default for CredentialStore {
+    fn default() -> Self {
+        Self {
+            service: default_keyring_service(),
+            account: default_keyring_account(),
+        }
+    }
+}
+
+fn default_keyring_service() -> String {
+    "dev-auth".into()
+}
+
+fn default_keyring_account() -> String {
+    "service-account-token".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Programs {
+    pub op: String,
+    pub gh: String,
+    pub git: String,
+    pub ssh_add: String,
+    pub ssh_keygen: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -173,6 +213,9 @@ pub struct SshProfile {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    #[serde(default)]
+    pub credential_store: CredentialStore,
+    pub programs: Programs,
     pub github: GitHubProfile,
     #[serde(default)]
     pub profiles: BTreeMap<String, ExecProfile>,
@@ -189,9 +232,20 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
     if config.github.app_id == 0 {
         bail!("GitHub App ID must be positive");
     }
+    validate_public_identifier(&config.credential_store.service, "credential-store service")?;
+    validate_public_identifier(&config.credential_store.account, "credential-store account")?;
+    for (name, program) in [
+        ("1Password CLI", &config.programs.op),
+        ("GitHub CLI", &config.programs.gh),
+        ("Git", &config.programs.git),
+        ("ssh-add", &config.programs.ssh_add),
+        ("ssh-keygen", &config.programs.ssh_keygen),
+    ] {
+        validate_program(program, name)?;
+    }
     validate_op_reference(&config.github.private_key_ref)?;
-    if config.github.installations.is_empty() {
-        bail!("at least one GitHub App installation is required");
+    if config.github.discover_installations != config.github.installations.is_empty() {
+        bail!("GitHub App must use either dynamic installation discovery or static installations");
     }
     if config.github.permissions != approved_github_permissions() {
         bail!("GitHub App permissions do not match the approved exact scope");
@@ -229,9 +283,7 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
             bail!("profile must declare at least one executable");
         }
         for executable in &profile.executables {
-            if !executable.starts_with('/') || executable.contains(['\n', '\r', '\0']) {
-                bail!("profile executable must be an absolute path");
-            }
+            validate_program(executable, "profile executable")?;
         }
         for (variable, reference) in &profile.environment {
             let mut bytes = variable.bytes();
@@ -303,11 +355,42 @@ fn is_profile_character(byte: u8) -> bool {
 }
 
 pub fn validate_op_reference(reference: &str) -> Result<()> {
-    if !reference.starts_with("op://Automation/")
-        || reference.contains(['\n', '\r', '\0'])
-        || reference.split('/').count() < 5
+    if reference.contains(['\n', '\r', '\0']) {
+        bail!("secret reference contains a control character");
+    }
+    let Some(path) = reference.strip_prefix("op://") else {
+        bail!("secret reference must use the op scheme");
+    };
+    let segments: Vec<_> = path.split('/').collect();
+    if !(segments.len() == 3 || segments.len() == 4)
+        || segments.iter().any(|segment| segment.is_empty())
     {
-        bail!("secret reference must address one field in the Automation vault");
+        bail!("secret reference must address one 1Password item field");
+    }
+    Ok(())
+}
+
+fn validate_public_identifier(value: &str, description: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        bail!("{description} contains unsupported characters");
+    }
+    Ok(())
+}
+
+fn validate_program(value: &str, description: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let absolute = std::path::Path::new(value).is_absolute() || windows_absolute;
+    if value.is_empty() || value.contains(['\n', '\r', '\0']) || !absolute {
+        bail!("{description} must be an absolute executable path");
     }
     Ok(())
 }
@@ -354,6 +437,7 @@ pub struct CacheEntry {
     token: SecretString,
     expires_at: i64,
     installation_id: u64,
+    owner: String,
     repository: String,
     pub permissions: BTreeMap<String, String>,
 }
@@ -365,6 +449,7 @@ impl fmt::Debug for CacheEntry {
             .field("token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .field("installation_id", &self.installation_id)
+            .field("owner", &self.owner)
             .field("repository", &self.repository)
             .field("permissions", &self.permissions)
             .finish()
@@ -376,6 +461,7 @@ impl CacheEntry {
         token: SecretString,
         expires_at: i64,
         installation_id: u64,
+        owner: String,
         repository: String,
         permissions: BTreeMap<String, String>,
     ) -> Self {
@@ -383,6 +469,7 @@ impl CacheEntry {
             token,
             expires_at,
             installation_id,
+            owner,
             repository,
             permissions,
         }
@@ -392,6 +479,7 @@ impl CacheEntry {
         token: SecretString,
         expires_at: i64,
         installation_id: u64,
+        owner: String,
         repository: String,
         permissions: BTreeMap<String, String>,
     ) -> Self {
@@ -399,6 +487,7 @@ impl CacheEntry {
             token,
             expires_at,
             installation_id,
+            owner,
             repository,
             permissions,
         }
@@ -408,10 +497,25 @@ impl CacheEntry {
         &self,
         now: i64,
         installation_id: u64,
+        owner: &str,
         repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
         self.installation_id == installation_id
+            && self.owner == owner
+            && self.repository == repository
+            && self.permissions == *permissions
+            && now < self.expires_at - TOKEN_REFRESH_MARGIN_SECONDS
+    }
+
+    pub fn is_usable_for_repository_at(
+        &self,
+        now: i64,
+        owner: &str,
+        repository: &str,
+        permissions: &BTreeMap<String, String>,
+    ) -> bool {
+        self.owner == owner
             && self.repository == repository
             && self.permissions == *permissions
             && now < self.expires_at - TOKEN_REFRESH_MARGIN_SECONDS
@@ -432,6 +536,10 @@ impl CacheEntry {
     pub fn repository(&self) -> &str {
         &self.repository
     }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
 }
 
 pub fn sanitize_environment(
@@ -439,21 +547,27 @@ pub fn sanitize_environment(
     additional_allowed: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     const BASE_ALLOWED: &[&str] = &[
+        "APPDATA",
         "COLORTERM",
+        "COMSPEC",
         "DBUS_SESSION_BUS_ADDRESS",
         "DISPLAY",
         "HOME",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
+        "LOCALAPPDATA",
         "LOGNAME",
         "PATH",
+        "PATHEXT",
         "SHELL",
+        "SYSTEMROOT",
         "TERM",
         "TMP",
         "TMPDIR",
         "TEMP",
         "USER",
+        "USERPROFILE",
         "WAYLAND_DISPLAY",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
@@ -464,7 +578,10 @@ pub fn sanitize_environment(
     input
         .iter()
         .filter(|(key, _)| {
-            BASE_ALLOWED.contains(&key.as_str()) || additional_allowed.contains(key.as_str())
+            BASE_ALLOWED
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+                || additional_allowed.contains(key.as_str())
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
@@ -537,7 +654,7 @@ pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
         "run" => matches!(subcommand, Some("list" | "view" | "watch" | "download")),
         "workflow" => matches!(subcommand, Some("list" | "view")),
         "release" => matches!(subcommand, Some("list" | "view" | "download")),
-        "repo" => matches!(subcommand, Some("view" | "clone")),
+        "repo" => matches!(subcommand, Some("view")),
         _ => false,
     };
     if !accepted {

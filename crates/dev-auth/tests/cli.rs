@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::symlink;
@@ -43,7 +45,7 @@ fn get_failure_stops_git_from_falling_back_to_human_credentials() {
     let output = credential_helper(
         "get",
         &format!(
-            "protocol=https\nhost=github.com\npath=FutureDevGuys/dev-tools.git\npassword={secret}\n\n"
+            "protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\npassword={secret}\n\n"
         ),
     );
     assert!(!output.status.success());
@@ -56,7 +58,18 @@ fn get_failure_stops_git_from_falling_back_to_human_credentials() {
 fn store_discards_git_supplied_secrets_without_output() {
     let output = credential_helper(
         "store",
-        "protocol=https\nhost=github.com\npath=FutureDevGuys/dev-tools.git\nusername=x-access-token\npassword=must-not-appear\n\n",
+        "protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\nusername=x-access-token\npassword=must-not-appear\n\n",
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn store_accepts_git_eof_without_parsing_or_retaining_the_credential() {
+    let output = credential_helper(
+        "store",
+        "protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\nusername=x-access-token\npassword=must-not-appear\n",
     );
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
@@ -71,7 +84,15 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for command in ["exec", "ssh-load", "status", "purge"] {
+    for command in [
+        "enroll",
+        "exec",
+        "agent",
+        "agent-endpoint",
+        "ssh-load",
+        "status",
+        "purge",
+    ] {
         assert!(help.contains(command));
     }
     assert!(!help.to_ascii_lowercase().contains("codex"));
@@ -100,7 +121,7 @@ fn one_released_binary_serves_the_git_helper_symlink() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"protocol=https\nhost=github.com\npath=FutureDevGuys/dev-tools.git\n\n")
+        .write_all(b"protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\n\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
@@ -112,7 +133,12 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     let directory = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let runtime = private_runtime();
-    for frontend in ["gh-dev-auth", "ssh-keygen-dev-auth"] {
+    for frontend in [
+        "gh-dev-auth",
+        "ssh-keygen-dev-auth",
+        "gh-dev-auth.exe",
+        "ssh-keygen-dev-auth.exe",
+    ] {
         let path = directory.path().join(frontend);
         symlink(env!("CARGO_BIN_EXE_dev-auth"), &path).unwrap();
         let output = Command::new(&path)
@@ -131,4 +157,33 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
             "{frontend}"
         );
     }
+}
+
+#[test]
+fn windows_credential_helper_name_preserves_fail_closed_git_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let helper = directory.path().join("git-credential-dev-auth.exe");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &helper).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+    let mut child = Command::new(&helper)
+        .arg("get")
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\n\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "quit=true\n");
 }

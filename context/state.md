@@ -1,4 +1,4 @@
 # Active work
 
-- `dev-auth` requires a release, Syscfg deployment, and Linux post-login acceptance before unattended repository use is enabled.
-- Native Windows and WSL runtime acceptance remains required before those platforms are advertised as supported.
+- Publish and provision the next `dev-auth` release after the cross-platform credential-store, repository-scoped `gh`, and dedicated SSH-agent changes pass audit.
+- Run native macOS, Windows, and WSL acceptance for enrollment, Git, bounded `gh`, SSH authentication/signing, cache expiry, concurrency, revocation, and no-human-fallback before advertising those environments as fully supported.

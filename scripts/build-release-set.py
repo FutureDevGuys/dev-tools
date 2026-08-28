@@ -62,10 +62,15 @@ def product_versions() -> dict[str, str]:
 def target_id() -> str:
     system = platform.system().lower()
     machine = platform.machine().lower()
-    os_name = {"linux": "linux", "windows": "windows"}.get(system)
-    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64"}.get(
-        machine
+    os_name = {"linux": "linux", "darwin": "macos", "windows": "windows"}.get(
+        system
     )
+    arch = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+    }.get(machine)
     if os_name is None or arch is None:
         raise SystemExit(f"unsupported release builder platform: {system}-{machine}")
     return f"{os_name}-{arch}"
