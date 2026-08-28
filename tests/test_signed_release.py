@@ -64,7 +64,7 @@ def test_release_builder_keeps_independent_product_versions() -> None:
     assert versions["dev-auth"] == "0.1.0"
     assert versions["dev-cache"] == "0.1.6"
     assert versions["skills-sync"] == "0.1.4"
-    assert versions["sync-configs"] == "0.1.7"
+    assert versions["sync-configs"] == "0.1.8"
 
 
 def test_release_builder_maps_independent_manifest_generations() -> None:

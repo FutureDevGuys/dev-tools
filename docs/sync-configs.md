@@ -1,6 +1,6 @@
 # sync-configs
 
-`sync-configs` is a config-only convergence engine. It consumes an explicit trusted manifest and supports symlink and copy realization, recursive expansion and filters, permissions, JSON and TOML overlays, ownership receipts, removed-key reconciliation, trusted hooks, profiles, external profile maps, dry-run, validation, and structured value-free output.
+`sync-configs` is a config-only convergence engine. It consumes an explicit trusted manifest and supports symlink and copy realization, recursive expansion and filters, permissions, JSON and TOML overlays, ownership receipts, removed-key reconciliation, trusted hooks, optional native-sudo hook execution, profiles, external profile maps, dry-run, validation, and structured value-free output.
 
 Dry-run writes nothing and executes no hooks. The command never installs packages, applications, Dev Tools products, or itself.
 
@@ -41,3 +41,19 @@ state_preconditions:
 ```
 
 The check is read-only in normal and dry-run modes. Missing, invalid, or mismatched state stops before hooks or writes and reports only the path, mismatched field names, and caller-authored remediation. The owning system—not `sync-configs`—must create or advance the state.
+
+## Privileged hooks
+
+Trusted entries may independently set `pre_script_privilege: sudo` or `post_script_privilege: sudo`; the default is `user`. After profile selection, a normal run requests one native sudo timestamp only when at least one enabled script needs it, then runs each privileged script through `sudo -n --`. Existing cached authorization is reused, dry-run and disabled profiles never authenticate, and an unavailable or rejected sudo session stops before hooks or file convergence. The manifest remains the sole authority for which command is elevated, and sudo remains the sole credential cache and authorization boundary.
+
+```yaml
+entries:
+  - name: native-consumer-hooks
+    source: ./hook-reconciler
+    target: ~/.local/libexec/example/hook-reconciler
+    mode: copy
+    pre_script: python ./hook-reconciler apply --scope system
+    pre_script_privilege: sudo
+    post_script: ~/.local/libexec/example/hook-reconciler apply --scope user
+    post_script_privilege: user
+```
