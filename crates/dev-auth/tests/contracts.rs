@@ -23,7 +23,8 @@ fn profile() -> GitHubProfile {
         installations: vec![GitHubInstallation {
             owner: "FutureDevGuys".into(),
             installation_id: 101,
-            repositories: BTreeMap::from([("dev-tools".into(), 202)]),
+            all_repositories: false,
+            repositories: BTreeSet::from(["dev-tools".into()]),
         }],
         permissions: exact_permissions(),
     }
@@ -51,12 +52,13 @@ fn credential_request_requires_exact_https_github_repository_path() {
 }
 
 #[test]
-fn profile_selects_one_exact_installation_and_numeric_repository() {
+fn profile_selects_one_exact_installation_and_repository_name() {
     let selected = profile()
         .select_repository("FutureDevGuys", "dev-tools")
         .unwrap();
     assert_eq!(selected.installation_id, 101);
-    assert_eq!(selected.repository_id, 202);
+    assert_eq!(selected.owner, "futuredevguys");
+    assert_eq!(selected.repository, "dev-tools");
     assert!(profile()
         .select_repository("FutureDevGuys", "unknown")
         .is_err());
@@ -67,18 +69,40 @@ fn profile_selects_one_exact_installation_and_numeric_repository() {
         profile()
             .select_repository("futuredevguys", "DEV-TOOLS")
             .unwrap()
-            .repository_id,
-        202
+            .repository,
+        "dev-tools"
     );
     let mut duplicate = profile();
     duplicate.installations.push(GitHubInstallation {
         owner: "futuredevguys".into(),
         installation_id: 303,
-        repositories: BTreeMap::from([("dev-tools".into(), 404)]),
+        all_repositories: false,
+        repositories: BTreeSet::from(["dev-tools".into()]),
     });
     assert!(duplicate
         .select_repository("FutureDevGuys", "dev-tools")
         .is_err());
+}
+
+#[test]
+fn all_repository_installation_selects_new_repository_without_static_ids() {
+    let profile = GitHubProfile {
+        app_id: 42,
+        private_key_ref: "op://Automation/contributor-app/private-key".into(),
+        installations: vec![GitHubInstallation {
+            owner: "FutureDevGuys".into(),
+            installation_id: 101,
+            all_repositories: true,
+            repositories: BTreeSet::new(),
+        }],
+        permissions: exact_permissions(),
+    };
+    let selected = profile
+        .select_repository("futuredevguys", "brand-new-repository")
+        .unwrap();
+    assert_eq!(selected.installation_id, 101);
+    assert_eq!(selected.owner, "futuredevguys");
+    assert_eq!(selected.repository, "brand-new-repository");
 }
 
 #[test]
@@ -94,13 +118,13 @@ fn cache_refreshes_before_expiry_and_never_accepts_wrong_scope() {
         SecretString::new("token".into()),
         10_000,
         101,
-        202,
+        "dev-tools".into(),
         BTreeMap::from([("contents".into(), "write".into())]),
     );
-    assert!(entry.is_usable_at(9_699, 101, 202, &entry.permissions));
-    assert!(!entry.is_usable_at(9_700, 101, 202, &entry.permissions));
-    assert!(!entry.is_usable_at(1, 999, 202, &entry.permissions));
-    assert!(!entry.is_usable_at(1, 101, 999, &entry.permissions));
+    assert!(entry.is_usable_at(9_699, 101, "dev-tools", &entry.permissions));
+    assert!(!entry.is_usable_at(9_700, 101, "dev-tools", &entry.permissions));
+    assert!(!entry.is_usable_at(1, 999, "dev-tools", &entry.permissions));
+    assert!(!entry.is_usable_at(1, 101, "syscfg", &entry.permissions));
 }
 
 #[test]
@@ -140,7 +164,7 @@ permissions = { actions = "read", checks = "read", contents = "write", metadata 
 [[github.installations]]
 owner = "FutureDevGuys"
 installation_id = 101
-repositories = { dev-tools = 202 }
+repositories = ["dev-tools"]
 
 [profiles.terraform-plan]
 executables = ["/usr/bin/terraform"]
@@ -200,12 +224,37 @@ permissions = { actions = "read", administration = "write", checks = "read", con
 [[github.installations]]
 owner = "FutureDevGuys"
 installation_id = 101
-repositories = { dev-tools = 202 }
+repositories = ["dev-tools"]
 "#
         .as_slice(),
     ] {
         assert!(parse_config(invalid).is_err());
     }
+}
+
+#[test]
+fn installation_scope_is_exactly_all_or_a_static_allowlist() {
+    let base = |installation: &str| {
+        format!(
+            r#"version = 1
+[github]
+app_id = 42
+private_key_ref = "op://Automation/contributor-app/private-key"
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
+[[github.installations]]
+owner = "FutureDevGuys"
+installation_id = 101
+{installation}
+"#
+        )
+    };
+    assert!(parse_config(base("all_repositories = true").as_bytes()).is_ok());
+    assert!(parse_config(base("repositories = [\"dev-tools\"]").as_bytes()).is_ok());
+    assert!(parse_config(
+        base("all_repositories = true\nrepositories = [\"dev-tools\"]").as_bytes()
+    )
+    .is_err());
+    assert!(parse_config(base("all_repositories = false").as_bytes()).is_err());
 }
 
 #[test]
@@ -244,6 +293,8 @@ fn github_repository_parser_accepts_only_exact_github_repository_identifiers() {
     for invalid in [
         "https://example.com/FutureDevGuys/dev-tools.git",
         "FutureDevGuys/dev-tools/extra",
+        "FutureDevGuys/..",
+        "./dev-tools",
         "github.com/FutureDevGuys/dev-tools",
         "https://github.com/FutureDevGuys/dev-tools?token=secret",
     ] {

@@ -114,9 +114,10 @@ impl CredentialRequest {
 }
 
 fn is_github_component(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    !matches!(value, "" | "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -124,7 +125,10 @@ fn is_github_component(value: &str) -> bool {
 pub struct GitHubInstallation {
     pub owner: String,
     pub installation_id: u64,
-    pub repositories: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub all_repositories: bool,
+    #[serde(default)]
+    pub repositories: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -195,21 +199,25 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
     let mut owners = BTreeSet::new();
     let mut installation_ids = BTreeSet::new();
     for installation in &config.github.installations {
+        let scope_is_valid = if installation.all_repositories {
+            installation.repositories.is_empty()
+        } else {
+            !installation.repositories.is_empty()
+        };
         if !is_github_component(&installation.owner)
             || !owners.insert(installation.owner.to_ascii_lowercase())
             || installation.installation_id == 0
             || !installation_ids.insert(installation.installation_id)
-            || installation.repositories.is_empty()
+            || !scope_is_valid
         {
             bail!("GitHub App installation owner, ID, or repository set is invalid");
         }
         let mut repositories = BTreeSet::new();
-        for (repository, repository_id) in &installation.repositories {
+        for repository in &installation.repositories {
             if !is_github_component(repository)
-                || *repository_id == 0
                 || !repositories.insert(repository.to_ascii_lowercase())
             {
-                bail!("GitHub App repository name or numeric ID is invalid");
+                bail!("GitHub App repository name is invalid");
             }
         }
     }
@@ -304,10 +312,11 @@ pub fn validate_op_reference(reference: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedRepository {
     pub installation_id: u64,
-    pub repository_id: u64,
+    pub owner: String,
+    pub repository: String,
 }
 
 impl GitHubProfile {
@@ -322,15 +331,20 @@ impl GitHubProfile {
         if matches.next().is_some() {
             bail!("repository owner maps to more than one installation");
         }
-        let repository_id = installation
-            .repositories
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(repository))
-            .map(|(_, id)| *id)
-            .context("repository is not approved for automation")?;
+        let repository = if installation.all_repositories {
+            repository.to_ascii_lowercase()
+        } else {
+            installation
+                .repositories
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case(repository))
+                .map(|name| name.to_ascii_lowercase())
+                .context("repository is not approved for automation")?
+        };
         Ok(SelectedRepository {
             installation_id: installation.installation_id,
-            repository_id,
+            owner: installation.owner.to_ascii_lowercase(),
+            repository,
         })
     }
 }
@@ -340,7 +354,7 @@ pub struct CacheEntry {
     token: SecretString,
     expires_at: i64,
     installation_id: u64,
-    repository_id: u64,
+    repository: String,
     pub permissions: BTreeMap<String, String>,
 }
 
@@ -351,7 +365,7 @@ impl fmt::Debug for CacheEntry {
             .field("token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .field("installation_id", &self.installation_id)
-            .field("repository_id", &self.repository_id)
+            .field("repository", &self.repository)
             .field("permissions", &self.permissions)
             .finish()
     }
@@ -362,14 +376,14 @@ impl CacheEntry {
         token: SecretString,
         expires_at: i64,
         installation_id: u64,
-        repository_id: u64,
+        repository: String,
         permissions: BTreeMap<String, String>,
     ) -> Self {
         Self {
             token,
             expires_at,
             installation_id,
-            repository_id,
+            repository,
             permissions,
         }
     }
@@ -378,14 +392,14 @@ impl CacheEntry {
         token: SecretString,
         expires_at: i64,
         installation_id: u64,
-        repository_id: u64,
+        repository: String,
         permissions: BTreeMap<String, String>,
     ) -> Self {
         Self {
             token,
             expires_at,
             installation_id,
-            repository_id,
+            repository,
             permissions,
         }
     }
@@ -394,11 +408,11 @@ impl CacheEntry {
         &self,
         now: i64,
         installation_id: u64,
-        repository_id: u64,
+        repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
         self.installation_id == installation_id
-            && self.repository_id == repository_id
+            && self.repository == repository
             && self.permissions == *permissions
             && now < self.expires_at - TOKEN_REFRESH_MARGIN_SECONDS
     }
@@ -415,8 +429,8 @@ impl CacheEntry {
         self.installation_id
     }
 
-    pub fn repository_id(&self) -> u64 {
-        self.repository_id
+    pub fn repository(&self) -> &str {
+        &self.repository
     }
 }
 
