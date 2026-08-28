@@ -38,6 +38,7 @@ import yaml
 MODES = {"symlink", "copy", "json_overlay", "toml_overlay"}
 DIRECTORY_STRATEGIES = {"as_directory", "children", "recursive"}
 SCRIPT_ON_FAIL_POLICIES = {"abort", "skip", "continue"}
+SCRIPT_PRIVILEGES = {"user", "sudo"}
 PYTHON_HOOK_COMMANDS = {"python", "python3"}
 SHELL_META_CHARS = re.compile(r"[\n;&|<>`$]")
 
@@ -86,6 +87,8 @@ Per-entry hooks:
   - `post_script_on_fail` controls behavior on post-script failure:
       abort — count as error for this entry
       continue (default) — log warning, keep sync status
+  - `pre_script_privilege` and `post_script_privilege` select `user` (default)
+    or `sudo`; enabled sudo scripts authenticate one shared native sudo session
   - `--dry-run` reports scripts without executing them
 
 Entry modes:
@@ -112,8 +115,9 @@ Optional entry `profiles` let you gate sync targets behind one or more named pro
   - use `--list-profiles` to print current profile names from the configured entries
   - use `--host-profile` to activate sync profiles from metadata/convergence
 
-The command owns only config convergence. Package installation, privileged
-system state, and workstation policy belong to callers.
+The command owns only config convergence. A trusted manifest may authorize
+individual hook scripts through native sudo; package installation and
+workstation policy remain caller-owned.
 """
 
 EXAMPLE_ROOT_CONFIG = """\
@@ -182,8 +186,10 @@ entries:
   #   mode: copy
   #   pre_script: python ../scripts/convert_codex_agents.py
   #   pre_script_on_fail: abort      # abort | skip | continue (default: abort)
+  #   pre_script_privilege: user     # user | sudo (default: user)
   #   post_script: echo "agents synced"
   #   post_script_on_fail: continue  # abort | continue (default: continue)
+  #   post_script_privilege: user    # user | sudo (default: user)
 
   # Optional keys and alternative modes:
   # - name: prompts_recursive
@@ -392,8 +398,10 @@ class Entry:
     source_permissions: "PermissionPolicy | None" = None
     pre_script: Optional[str] = None
     pre_script_on_fail: str = "abort"
+    pre_script_privilege: str = "user"
     post_script: Optional[str] = None
     post_script_on_fail: str = "continue"
+    post_script_privilege: str = "user"
     reconcile_existing: bool = False
     reconcile_removed_keys: bool = False
     managed_overlay_id: Optional[str] = None
@@ -1439,6 +1447,17 @@ def parse_entries_block(
                 f"Unsupported pre_script_on_fail '{pre_script_on_fail}'. "
                 f"Allowed values: {sorted(SCRIPT_ON_FAIL_POLICIES)}"
             )
+        pre_script_privilege = entry.get("pre_script_privilege", "user")
+        if (
+            not isinstance(pre_script_privilege, str)
+            or pre_script_privilege not in SCRIPT_PRIVILEGES
+        ):
+            raise ConfigError(
+                "Entry 'pre_script_privilege' must be one of "
+                f"{sorted(SCRIPT_PRIVILEGES)}."
+            )
+        if pre_script is None and pre_script_privilege != "user":
+            raise ConfigError("Entry 'pre_script_privilege' requires pre_script.")
 
         post_script = entry.get("post_script")
         if post_script is not None and not isinstance(post_script, str):
@@ -1449,6 +1468,17 @@ def parse_entries_block(
                 f"Unsupported post_script_on_fail '{post_script_on_fail}'. "
                 f"Allowed values: {sorted(SCRIPT_ON_FAIL_POLICIES)}"
             )
+        post_script_privilege = entry.get("post_script_privilege", "user")
+        if (
+            not isinstance(post_script_privilege, str)
+            or post_script_privilege not in SCRIPT_PRIVILEGES
+        ):
+            raise ConfigError(
+                "Entry 'post_script_privilege' must be one of "
+                f"{sorted(SCRIPT_PRIVILEGES)}."
+            )
+        if post_script is None and post_script_privilege != "user":
+            raise ConfigError("Entry 'post_script_privilege' requires post_script.")
 
         reconcile_removed_keys = parse_bool_option(
             entry.get("reconcile_removed_keys"), "reconcile_removed_keys", False
@@ -1527,8 +1557,10 @@ def parse_entries_block(
                 source_permissions=source_permissions,
                 pre_script=pre_script,
                 pre_script_on_fail=pre_script_on_fail,
+                pre_script_privilege=pre_script_privilege,
                 post_script=post_script,
                 post_script_on_fail=post_script_on_fail,
+                post_script_privilege=post_script_privilege,
                 reconcile_existing=reconcile_existing,
                 reconcile_removed_keys=reconcile_removed_keys,
                 managed_overlay_id=managed_overlay_id,
@@ -1965,6 +1997,9 @@ def run_entry_script(
     script: str,
     config_dir: Path,
     dry_run: bool,
+    *,
+    privilege: str = "user",
+    sudo_path: str | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
     """Run a per-entry hook script from the config directory.
 
@@ -1974,8 +2009,14 @@ def run_entry_script(
     """
     if dry_run:
         return None
+    if privilege not in SCRIPT_PRIVILEGES:
+        raise ConfigError(f"unsupported script privilege: {privilege}")
+    if privilege == "sudo" and sudo_path is None:
+        raise ConfigError("a shared sudo session was not acquired")
     python_argv = current_python_hook_argv(script)
     if python_argv is not None:
+        if privilege == "sudo":
+            python_argv = [sudo_path, "-n", "--", *python_argv]
         try:
             return subprocess.run(
                 python_argv,
@@ -1986,6 +2027,15 @@ def run_entry_script(
             )
         except OSError:
             pass
+    if privilege == "sudo":
+        shell_path = shutil.which("sh") or "/bin/sh"
+        return subprocess.run(
+            [sudo_path, "-n", "--", shell_path, "-c", script],
+            shell=False,
+            cwd=str(config_dir),
+            capture_output=True,
+            text=True,
+        )
     return subprocess.run(
         script,
         shell=True,
@@ -1993,6 +2043,31 @@ def run_entry_script(
         capture_output=True,
         text=True,
     )
+
+
+def acquire_shared_sudo_session() -> str:
+    """Authenticate one native sudo timestamp for all selected privileged scripts."""
+    if os.name == "nt":
+        raise ConfigError("sudo script privilege is unavailable on Windows")
+    sudo_path = shutil.which("sudo")
+    if sudo_path is None:
+        raise ConfigError("sudo script privilege requires sudo on PATH")
+    cached = subprocess.run(
+        [sudo_path, "-n", "-v"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if cached.returncode == 0:
+        return sudo_path
+    authenticated = subprocess.run(
+        [sudo_path, "-v"],
+        check=False,
+    )
+    if authenticated.returncode != 0:
+        raise ConfigError("unable to authenticate one shared sudo session")
+    return sudo_path
 
 
 def format_status_line(
@@ -2457,6 +2532,19 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+    privileged_scripts_selected = any(
+        (entry.pre_script is not None and entry.pre_script_privilege == "sudo")
+        or (entry.post_script is not None and entry.post_script_privilege == "sudo")
+        for entry in [*entries, *override_entries]
+    )
+    sudo_path: str | None = None
+    if privileged_scripts_selected and not args.dry_run:
+        try:
+            sudo_path = acquire_shared_sudo_session()
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     # --- Pre-scripts: run before expansion so generated files are available ---
     config_dir = config_path.parent
     buffer: list[StatusRecord] = []
@@ -2476,7 +2564,13 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
                     entry=entry,
                 ))
             else:
-                result = run_entry_script(entry.pre_script, config_dir, dry_run=False)
+                result = run_entry_script(
+                    entry.pre_script,
+                    config_dir,
+                    dry_run=False,
+                    privilege=entry.pre_script_privilege,
+                    sudo_path=sudo_path,
+                )
                 assert result is not None  # not dry_run so always returns a result
                 script_combined = (result.stdout + result.stderr).strip() or None
                 if result.returncode != 0:
@@ -2583,7 +2677,13 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             ))
         else:
             assert entry.post_script is not None
-            result = run_entry_script(entry.post_script, config_dir, dry_run=False)
+            result = run_entry_script(
+                entry.post_script,
+                config_dir,
+                dry_run=False,
+                privilege=entry.post_script_privilege,
+                sudo_path=sudo_path,
+            )
             assert result is not None
             script_combined = (result.stdout + result.stderr).strip() or None
             if result.returncode != 0:
