@@ -60,15 +60,19 @@ impl CredentialRequest {
             bail!("credential request exceeds the size limit");
         }
         let text = std::str::from_utf8(input).context("credential request is not UTF-8")?;
-        if !text.ends_with("\n\n") {
-            bail!("credential request is not terminated by a blank line");
-        }
+        let attributes_text = if let Some(value) = text.strip_suffix("\n\n") {
+            value
+        } else if let Some(value) = text.strip_suffix('\n') {
+            value
+        } else {
+            bail!("credential request is not terminated by a blank line or end-of-file");
+        };
 
         let mut attributes = BTreeMap::new();
         let mut seen = BTreeSet::new();
-        for line in text.lines() {
+        for line in attributes_text.lines() {
             if line.is_empty() {
-                break;
+                bail!("credential request contains data after its terminator");
             }
             let (key, value) = line
                 .split_once('=')
@@ -76,10 +80,10 @@ impl CredentialRequest {
             if key.is_empty() || value.contains(['\n', '\r', '\0']) {
                 bail!("credential request contains an invalid attribute");
             }
-            if !seen.insert(key.to_owned()) {
-                bail!("credential request contains a duplicate attribute");
-            }
             if matches!(key, "protocol" | "host" | "path") {
+                if !seen.insert(key.to_owned()) {
+                    bail!("credential request contains a duplicate attribute");
+                }
                 attributes.insert(key.to_owned(), value.to_owned());
             }
         }

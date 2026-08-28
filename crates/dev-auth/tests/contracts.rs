@@ -50,6 +50,28 @@ fn credential_request_requires_exact_https_github_repository_path() {
 }
 
 #[test]
+fn credential_request_accepts_git_eof_termination_and_capabilities() {
+    let request = CredentialRequest::parse(
+        b"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\nwwwauth[]=Basic realm=\"GitHub\"\n",
+    )
+    .unwrap();
+    assert_eq!(request.repository().unwrap(), ("ExampleOrg", "sample-repo"));
+
+    assert!(CredentialRequest::parse(
+        b"protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git"
+    )
+    .is_err());
+    assert!(CredentialRequest::parse(
+        b"protocol=https\nhost=github.com\n\npath=ExampleOrg/sample-repo.git\n"
+    )
+    .is_err());
+    assert!(CredentialRequest::parse(
+        b"protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\npath=ExampleOrg/other.git\n"
+    )
+    .is_err());
+}
+
+#[test]
 fn profile_selects_one_exact_installation_and_repository_name() {
     let selected = profile()
         .select_repository("ExampleOrg", "sample-repo")
