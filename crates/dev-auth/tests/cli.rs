@@ -66,6 +66,17 @@ fn store_discards_git_supplied_secrets_without_output() {
 }
 
 #[test]
+fn store_accepts_git_eof_without_parsing_or_retaining_the_credential() {
+    let output = credential_helper(
+        "store",
+        "protocol=https\nhost=github.com\npath=ExampleOrg/sample-repo.git\nusername=x-access-token\npassword=must-not-appear\n",
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn help_is_product_generic_and_lists_the_bounded_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
         .arg("--help")

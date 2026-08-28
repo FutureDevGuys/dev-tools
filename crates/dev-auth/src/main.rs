@@ -127,9 +127,7 @@ fn run_credential_frontend() -> Result<i32> {
     }
     match operation.as_str() {
         "get" => print!("{}", dev_auth::credential_get(&input)?),
-        "store" => {
-            dev_auth::CredentialRequest::parse(&input)?;
-        }
+        "store" => {}
         "erase" => dev_auth::credential_erase(&input)?,
         _ => bail!("unsupported credential-helper operation"),
     }
