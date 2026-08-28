@@ -59,10 +59,12 @@ impl RuntimePaths {
         let project = ProjectDirs::from("", "", "dev-auth")
             .context("the operating system has no user configuration directory")?;
         let base = BaseDirs::new().context("the operating system has no user home directory")?;
-        let runtime_root = base
-            .runtime_dir()
-            .map(|path| path.join("dev-auth"))
-            .unwrap_or_else(|| project.cache_dir().join("runtime"));
+        let login_runtime = secure_login_runtime_dir();
+        let runtime_root = select_runtime_root(
+            base.runtime_dir(),
+            login_runtime.as_deref(),
+            project.cache_dir(),
+        );
         Ok(Self {
             config: project.config_dir().join("config.toml"),
             runtime: runtime_root,
@@ -72,6 +74,37 @@ impl RuntimePaths {
     fn cache_dir(&self) -> PathBuf {
         self.runtime.join("github-installation-tokens")
     }
+}
+
+fn select_runtime_root(
+    environment_runtime: Option<&Path>,
+    login_runtime: Option<&Path>,
+    cache: &Path,
+) -> PathBuf {
+    environment_runtime
+        .or(login_runtime)
+        .map(|path| path.join("dev-auth"))
+        .unwrap_or_else(|| cache.join("runtime"))
+}
+
+#[cfg(target_os = "linux")]
+fn secure_login_runtime_dir() -> Option<PathBuf> {
+    let path = PathBuf::from("/run/user").join(rustix::process::geteuid().as_raw().to_string());
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.permissions().mode() & 0o077 == 0
+    {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secure_login_runtime_dir() -> Option<PathBuf> {
+    None
 }
 
 fn load_config(paths: &RuntimePaths) -> Result<Config> {
@@ -1008,8 +1041,19 @@ fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<Command> {
 
 pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
     let paths = RuntimePaths::discover()?;
-    ensure_runtime(&paths)?;
     let config = load_config(&paths)?;
+    if is_git_verification_operation(arguments)? {
+        return Command::new(&config.programs.ssh_keygen)
+            .args(arguments)
+            .env_clear()
+            .envs(sanitized_current_environment())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run public OpenSSH Git verification");
+    }
+    ensure_runtime(&paths)?;
     #[cfg(unix)]
     validate_ssh_agent_socket(&paths)?;
     let loaded = loaded_ssh_fingerprints(&paths, &config)?;
@@ -1027,6 +1071,21 @@ pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
         .stderr(Stdio::inherit())
         .status()
         .context("run OpenSSH key operation with the dedicated agent")
+}
+
+fn is_git_verification_operation(arguments: &[String]) -> Result<bool> {
+    let operation = exact_option_value(arguments, "-Y")?;
+    match operation {
+        "sign" => Ok(false),
+        "find-principals" => Ok(true),
+        "verify" => {
+            if exact_option_value(arguments, "-n")? != "git" {
+                bail!("automation verification is restricted to the git namespace");
+            }
+            Ok(true)
+        }
+        _ => bail!("unsupported OpenSSH operation for Git signing or verification"),
+    }
 }
 
 fn unique_declared_ssh_profile<'a>(
@@ -1055,11 +1114,7 @@ fn validate_signing_key_argument(
     profile: &SshProfile,
     ssh_keygen_program: &str,
 ) -> Result<()> {
-    let operation = arguments
-        .windows(2)
-        .find(|pair| pair[0] == "-Y")
-        .map(|pair| pair[1].as_str());
-    if operation != Some("sign") {
+    if exact_option_value(arguments, "-Y")? != "sign" {
         return Ok(());
     }
     let public_key = exact_option_value(arguments, "-f")?;
@@ -1101,9 +1156,9 @@ fn exact_option_value<'a>(arguments: &'a [String], option: &str) -> Result<&'a s
         .map(|pair| pair[1].as_str());
     let value = values
         .next()
-        .with_context(|| format!("SSH signing operation requires exactly one {option} value"))?;
+        .with_context(|| format!("OpenSSH operation requires exactly one {option} value"))?;
     if values.next().is_some() || value.starts_with('-') {
-        bail!("SSH signing operation requires exactly one {option} value");
+        bail!("OpenSSH operation requires exactly one {option} value");
     }
     Ok(value)
 }
@@ -1721,5 +1776,50 @@ mod tests {
         let mut wrong_namespace = arguments(&signing_key);
         wrong_namespace[3] = "file".into();
         assert!(validate_signing_key_argument(&wrong_namespace, &profile, "ssh-keygen").is_err());
+    }
+
+    #[test]
+    fn git_verification_operations_are_public_and_bounded() {
+        assert!(is_git_verification_operation(&[
+            "-Y".into(),
+            "find-principals".into(),
+            "-f".into(),
+            "/tmp/allowed-signers".into(),
+        ])
+        .unwrap());
+        assert!(is_git_verification_operation(&[
+            "-Y".into(),
+            "verify".into(),
+            "-n".into(),
+            "git".into(),
+        ])
+        .unwrap());
+        assert!(!is_git_verification_operation(&[
+            "-Y".into(),
+            "sign".into(),
+            "-n".into(),
+            "git".into(),
+        ])
+        .unwrap());
+        assert!(is_git_verification_operation(&[
+            "-Y".into(),
+            "verify".into(),
+            "-n".into(),
+            "file".into(),
+        ])
+        .is_err());
+        assert!(is_git_verification_operation(&["-t".into(), "ed25519".into()]).is_err());
+    }
+
+    #[test]
+    fn login_runtime_precedes_cache_when_the_environment_is_missing() {
+        assert_eq!(
+            select_runtime_root(None, Some(Path::new("/run/user/1000")), Path::new("/cache")),
+            PathBuf::from("/run/user/1000/dev-auth")
+        );
+        assert_eq!(
+            select_runtime_root(None, None, Path::new("/cache")),
+            PathBuf::from("/cache/runtime")
+        );
     }
 }
