@@ -720,6 +720,19 @@ fn explicit_gh_repository(arguments: &[String]) -> Result<Option<String>> {
         }
         index += 1;
     }
+    if arguments.first().map(String::as_str) == Some("repo")
+        && arguments.get(1).map(String::as_str) == Some("view")
+        && arguments
+            .get(2)
+            .is_some_and(|value| !value.starts_with('-'))
+    {
+        let value = arguments[2].clone();
+        crate::parse_github_repository(&value)?;
+        if selected.as_ref().is_some_and(|current| current != &value) {
+            bail!("gh command contains conflicting repository selectors");
+        }
+        selected = Some(value);
+    }
     Ok(selected)
 }
 
@@ -1425,6 +1438,22 @@ mod tests {
             forwarded_gh_arguments(&arguments).unwrap(),
             vec!["repo", "view", "--json", "nameWithOwner"]
         );
+    }
+
+    #[test]
+    fn repository_view_positional_selects_the_token_scope_and_is_forwarded() {
+        let arguments = vec![
+            "repo".into(),
+            "view".into(),
+            "ExampleOrg/sample-repo".into(),
+            "--json".into(),
+            "nameWithOwner".into(),
+        ];
+        assert_eq!(
+            explicit_gh_repository(&arguments).unwrap(),
+            Some("ExampleOrg/sample-repo".into())
+        );
+        assert_eq!(forwarded_gh_arguments(&arguments).unwrap(), arguments);
     }
 
     #[test]
