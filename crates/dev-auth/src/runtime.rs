@@ -1,38 +1,50 @@
+use crate::SshKeyPurpose;
 use crate::{
     parse_config, render_git_credential, sanitize_environment, CacheEntry, Config,
-    CredentialRequest, ExecProfile, SecretString, SshKeyPurpose, SshProfile,
+    CredentialRequest, CredentialStore, ExecProfile, SecretString, SelectedRepository, SshProfile,
 };
 use anyhow::{bail, Context, Result};
+use directories::{BaseDirs, ProjectDirs};
+use ed25519_dalek::pkcs8::DecodePrivateKey;
 use fs2::FileExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use signature::Signer;
+use ssh_agent_lib::agent::{listen, Session};
+#[cfg(windows)]
+use ssh_agent_lib::agent::{Agent, ListeningSocket};
+use ssh_agent_lib::error::AgentError;
+use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
+use ssh_key::private::{Ed25519Keypair, KeypairData};
+use ssh_key::{Algorithm as SshAlgorithm, HashAlg, PrivateKey, PublicKey, Signature};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
-const SECRET_TOOL: &str = "/usr/bin/secret-tool";
-const OP: &str = "/usr/bin/op";
-const SSH_ADD: &str = "/usr/bin/ssh-add";
-const GH: &str = "/usr/bin/gh";
-const GIT: &str = "/usr/bin/git";
-const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeStatus {
     pub config_ready: bool,
     pub service_token_enrolled: bool,
     pub runtime_ready: bool,
+    pub ssh_agent_ready: bool,
     pub cached_installation_tokens: usize,
 }
 
@@ -44,34 +56,22 @@ struct RuntimePaths {
 
 impl RuntimePaths {
     fn discover() -> Result<Self> {
-        let home = absolute_environment_path("HOME")?;
-        let config_root = match env::var_os("XDG_CONFIG_HOME") {
-            Some(value) => absolute_path(value, "XDG_CONFIG_HOME")?,
-            None => home.join(".config"),
-        };
-        let runtime_root = absolute_environment_path("XDG_RUNTIME_DIR")?;
+        let project = ProjectDirs::from("", "", "dev-auth")
+            .context("the operating system has no user configuration directory")?;
+        let base = BaseDirs::new().context("the operating system has no user home directory")?;
+        let runtime_root = base
+            .runtime_dir()
+            .map(|path| path.join("dev-auth"))
+            .unwrap_or_else(|| project.cache_dir().join("runtime"));
         Ok(Self {
-            config: config_root.join("dev-auth/config.toml"),
-            runtime: runtime_root.join("dev-auth"),
+            config: project.config_dir().join("config.toml"),
+            runtime: runtime_root,
         })
     }
 
     fn cache_dir(&self) -> PathBuf {
         self.runtime.join("github-installation-tokens")
     }
-}
-
-fn absolute_environment_path(name: &str) -> Result<PathBuf> {
-    let value = env::var_os(name).with_context(|| format!("{name} is not set"))?;
-    absolute_path(value, name)
-}
-
-fn absolute_path(value: std::ffi::OsString, name: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        bail!("{name} must be an absolute path");
-    }
-    Ok(path)
 }
 
 fn load_config(paths: &RuntimePaths) -> Result<Config> {
@@ -97,9 +97,11 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         bail!("{description} must be a directory");
     }
+    #[cfg(unix)]
     if metadata.uid() != rustix::process::geteuid().as_raw() {
         bail!("{description} is not owned by the current user");
     }
+    #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
         bail!("{description} permissions must not grant group or other access");
     }
@@ -107,9 +109,16 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
 }
 
 fn private_read(path: &Path, description: &str) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {description} at {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("{description} must be a non-symlink regular file");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let file = options
         .open(path)
         .with_context(|| format!("open {description} at {}", path.display()))?;
     validate_open_private_file(&file, description)?;
@@ -120,8 +129,11 @@ fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
     let metadata = file
         .metadata()
         .with_context(|| format!("inspect {description}"))?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
+    if !metadata.file_type().is_file() {
+        bail!("{description} is not a regular file");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.nlink() != 1
         || metadata.permissions().mode() & 0o077 != 0
     {
@@ -133,7 +145,9 @@ fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
 fn ensure_private_directory(path: &Path) -> Result<()> {
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
-        builder.recursive(false).mode(0o700);
+        builder.recursive(false);
+        #[cfg(unix)]
+        builder.mode(0o700);
         builder
             .create(path)
             .with_context(|| format!("create private runtime directory {}", path.display()))?;
@@ -143,9 +157,11 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         bail!("private runtime path is not a directory");
     }
+    #[cfg(unix)]
     if metadata.uid() != rustix::process::geteuid().as_raw() {
         bail!("private runtime directory is not owned by the current user");
     }
+    #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
         bail!("private runtime directory grants group or other access");
     }
@@ -157,77 +173,96 @@ fn ensure_runtime(paths: &RuntimePaths) -> Result<()> {
         .runtime
         .parent()
         .context("private runtime path has no parent")?;
+    if !parent.exists() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder
+            .create(parent)
+            .with_context(|| format!("create runtime root {}", parent.display()))?;
+    }
     let parent_metadata = fs::symlink_metadata(parent)
         .with_context(|| format!("inspect runtime root {}", parent.display()))?;
-    if !parent_metadata.file_type().is_dir()
-        || parent_metadata.uid() != rustix::process::geteuid().as_raw()
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        bail!("runtime root is not a directory");
+    }
+    #[cfg(unix)]
+    if parent_metadata.uid() != rustix::process::geteuid().as_raw()
         || parent_metadata.permissions().mode() & 0o077 != 0
     {
-        bail!("XDG runtime root is not a private current-user directory");
+        bail!("runtime root is not a private current-user directory");
     }
     ensure_private_directory(&paths.runtime)?;
     ensure_private_directory(&paths.cache_dir())?;
+    remove_legacy_token_files(paths)?;
     Ok(())
 }
 
-fn strip_one_line_ending(mut bytes: Vec<u8>) -> Vec<u8> {
-    if bytes.ends_with(b"\r\n") {
-        bytes.truncate(bytes.len() - 2);
-    } else if bytes.ends_with(b"\n") {
-        bytes.truncate(bytes.len() - 1);
+fn remove_legacy_token_files(paths: &RuntimePaths) -> Result<()> {
+    for entry in fs::read_dir(paths.cache_dir()).context("enumerate runtime cache")? {
+        let entry = entry.context("read runtime cache entry")?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let _ = private_read(&path, "legacy installation-token cache")?;
+            fs::remove_file(&path).context("remove legacy file-backed installation-token cache")?;
+        }
     }
-    bytes
+    Ok(())
 }
 
-fn secret_service_environment(
-    source: impl IntoIterator<Item = (OsString, OsString)>,
-) -> BTreeMap<OsString, OsString> {
-    source
-        .into_iter()
-        .filter(|(name, _)| {
-            matches!(
-                name.to_str(),
-                Some("DBUS_SESSION_BUS_ADDRESS" | "XDG_RUNTIME_DIR")
-            )
-        })
-        .collect()
+fn credential_entry(store: &CredentialStore) -> Result<Entry> {
+    Entry::new(&store.service, &store.account).context("open native OS credential-store entry")
 }
 
-fn service_account_token() -> Result<SecretString> {
-    let mut command = Command::new(SECRET_TOOL);
-    command
-        .args(["lookup", "service", "dev-auth", "account", "automation"])
-        .env_clear()
-        .env("PATH", "/usr/bin")
-        .envs(secret_service_environment(env::vars_os()))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    let output = command.output().context("run OS credential-store lookup")?;
-    if !output.status.success() {
-        bail!("the dev-auth service credential is not enrolled or the keyring is locked");
-    }
-    let bytes = strip_one_line_ending(output.stdout);
-    let value = String::from_utf8(bytes).context("credential-store value is not UTF-8")?;
+fn sanitized_current_environment() -> BTreeMap<String, String> {
+    let input: BTreeMap<String, String> = env::vars().collect();
+    sanitize_environment(&input, &BTreeSet::new())
+}
+
+fn service_account_token(store: &CredentialStore) -> Result<SecretString> {
+    let value = credential_entry(store)?
+        .get_password()
+        .context("the dev-auth service credential is not enrolled or the keyring is locked")?;
     if value.is_empty() || value.contains(['\n', '\r', '\0']) {
         bail!("credential-store value is malformed");
     }
     Ok(SecretString::new(value))
 }
 
-fn read_automation_secret(reference: &str) -> Result<SecretString> {
+pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
+    let paths = RuntimePaths::discover()?;
+    let config = load_config(&paths)?;
+    let value = std::str::from_utf8(value).context("service credential is not UTF-8")?;
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(value);
+    if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+        bail!("service credential must be exactly one nonempty line");
+    }
+    credential_entry(&config.credential_store)?
+        .set_password(value)
+        .context("store service credential in the native OS credential store")
+}
+
+fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString> {
     crate::validate_op_reference(reference)?;
-    let service_token = service_account_token()?;
-    let output = Command::new(OP)
+    let service_token = service_account_token(&config.credential_store)?;
+    let output = Command::new(&config.programs.op)
         .args(["read", "--no-newline", reference])
         .env_clear()
-        .env("PATH", "/usr/bin")
+        .envs(sanitized_current_environment())
         .env("OP_SERVICE_ACCOUNT_TOKEN", service_token.expose())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .context("run bounded 1Password item read")?;
     if !output.status.success() {
-        bail!("1Password denied the declared Automation-vault item read");
+        bail!("1Password denied the declared item read");
     }
     let value = String::from_utf8(output.stdout).context("1Password item value is not UTF-8")?;
     if value.is_empty() || value.contains('\0') {
@@ -263,17 +298,25 @@ struct RepositoryResponse {
     full_name: String,
 }
 
-fn mint_installation_token(
-    config: &Config,
-    installation_id: u64,
-    owner: &str,
-    repository: &str,
-    now: i64,
-) -> Result<CacheEntry> {
-    let private_key = read_automation_secret(&config.github.private_key_ref)?;
+#[derive(Deserialize)]
+struct InstallationAccountResponse {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct RepositoryInstallationResponse {
+    id: u64,
+    app_id: u64,
+    account: InstallationAccountResponse,
+    permissions: BTreeMap<String, String>,
+    suspended_at: Option<serde_json::Value>,
+}
+
+fn github_app_jwt(config: &Config, now: i64) -> Result<String> {
+    let private_key = read_declared_secret(config, &config.github.private_key_ref)?;
     let key = EncodingKey::from_rsa_pem(private_key.expose().as_bytes())
         .context("GitHub App private key is not a valid RSA PEM key")?;
-    let jwt = encode(
+    encode(
         &Header::new(Algorithm::RS256),
         &AppJwtClaims {
             iat: now - 60,
@@ -282,16 +325,82 @@ fn mint_installation_token(
         },
         &key,
     )
-    .context("sign GitHub App JWT")?;
+    .context("sign GitHub App JWT")
+}
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+fn github_api_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
         .https_only(true)
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(Some(Duration::from_secs(30)))
         .user_agent(format!("dev-auth/{}", env!("CARGO_PKG_VERSION")))
         .build()
-        .into();
+        .into()
+}
+
+fn discover_repository_installation(
+    config: &Config,
+    owner: &str,
+    repository: &str,
+    now: i64,
+) -> Result<SelectedRepository> {
+    let jwt = github_app_jwt(config, now)?;
+    let url = format!("https://api.github.com/repos/{owner}/{repository}/installation");
+    let mut response = github_api_agent()
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("X-GitHub-Api-Version", "2026-03-10")
+        .call()
+        .context("discover exact repository GitHub App installation")?;
+    if !response.status().is_success() {
+        bail!(
+            "GitHub App repository installation lookup returned HTTP {}",
+            response.status()
+        );
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(RESPONSE_LIMIT)
+        .read_to_vec()
+        .context("read bounded GitHub App installation response")?;
+    validate_repository_installation_response(config, owner, repository, &bytes)
+}
+
+fn validate_repository_installation_response(
+    config: &Config,
+    owner: &str,
+    repository: &str,
+    bytes: &[u8],
+) -> Result<SelectedRepository> {
+    let installation: RepositoryInstallationResponse = serde_json::from_slice(bytes)
+        .context("parse GitHub App repository installation response")?;
+    if installation.id == 0
+        || installation.app_id != config.github.app_id
+        || !installation.account.login.eq_ignore_ascii_case(owner)
+        || installation.permissions != config.github.permissions
+        || installation.suspended_at.is_some()
+    {
+        bail!("GitHub App repository installation does not match the declared authority");
+    }
+    Ok(SelectedRepository {
+        installation_id: installation.id,
+        owner: owner.to_ascii_lowercase(),
+        repository: repository.to_ascii_lowercase(),
+    })
+}
+
+fn mint_installation_token(
+    config: &Config,
+    installation_id: u64,
+    owner: &str,
+    repository: &str,
+    now: i64,
+) -> Result<CacheEntry> {
+    let jwt = github_app_jwt(config, now)?;
+    let agent = github_api_agent();
     let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
     let mut response = agent
         .post(&url)
@@ -363,6 +472,7 @@ fn mint_installation_token(
         SecretString::new(response.token),
         expires_at,
         installation_id,
+        owner.to_ascii_lowercase(),
         repository.to_owned(),
         config.github.permissions.clone(),
     ))
@@ -374,6 +484,7 @@ struct CacheFile {
     token: String,
     expires_at: i64,
     installation_id: u64,
+    owner: String,
     repository: String,
     permissions: BTreeMap<String, String>,
 }
@@ -384,6 +495,7 @@ impl From<&CacheEntry> for CacheFile {
             token: entry.token().expose().to_owned(),
             expires_at: entry.expires_at(),
             installation_id: entry.installation_id(),
+            owner: entry.owner().to_owned(),
             repository: entry.repository().to_owned(),
             permissions: entry.permissions.clone(),
         }
@@ -396,6 +508,7 @@ impl From<CacheFile> for CacheEntry {
             SecretString::new(value.token),
             value.expires_at,
             value.installation_id,
+            value.owner,
             value.repository,
             value.permissions,
         )
@@ -412,9 +525,26 @@ fn cache_key(
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
+fn dynamic_cache_key(
+    owner: &str,
+    repository: &str,
+    permissions: &BTreeMap<String, String>,
+) -> Result<String> {
+    let public_scope = serde_json::to_vec(&(
+        "dynamic",
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase(),
+        permissions,
+    ))
+    .context("serialize dynamic installation-token cache scope")?;
+    Ok(format!("{:x}", Sha256::digest(public_scope)))
+}
+
 fn locked_cache_entry<F>(
     paths: &RuntimePaths,
+    store: &CredentialStore,
     installation_id: u64,
+    owner: &str,
     repository: &str,
     permissions: &BTreeMap<String, String>,
     create: F,
@@ -424,92 +554,119 @@ where
 {
     ensure_runtime(paths)?;
     let key = cache_key(installation_id, repository, permissions)?;
-    let cache_path = paths.cache_dir().join(format!("{key}.json"));
     let lock_path = paths.cache_dir().join(format!("{key}.lock"));
     let lock = private_open(&lock_path)?;
     lock.lock_exclusive()
         .context("lock installation-token cache")?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
-    if let Ok(entry) = read_cache(&cache_path) {
-        if entry.is_usable_at(now, installation_id, repository, permissions) {
+    if let Ok(entry) = read_cache(store, &key) {
+        if entry.is_usable_at(now, installation_id, owner, repository, permissions) {
             return Ok(entry);
         }
     }
     let entry = create()?;
-    if !entry.is_usable_at(now, installation_id, repository, permissions) {
+    if !entry.is_usable_at(now, installation_id, owner, repository, permissions) {
         bail!("new installation token is not usable for the requested scope");
     }
-    write_cache(&cache_path, &entry)?;
+    write_cache(store, &key, &entry)?;
+    Ok(entry)
+}
+
+fn locked_dynamic_cache_entry(
+    paths: &RuntimePaths,
+    config: &Config,
+    owner: &str,
+    repository: &str,
+) -> Result<CacheEntry> {
+    ensure_runtime(paths)?;
+    let owner = owner.to_ascii_lowercase();
+    let repository = repository.to_ascii_lowercase();
+    let key = dynamic_cache_key(&owner, &repository, &config.github.permissions)?;
+    let lock_path = paths.cache_dir().join(format!("{key}.lock"));
+    let lock = private_open(&lock_path)?;
+    lock.lock_exclusive()
+        .context("lock dynamic installation-token cache")?;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
+    if let Ok(entry) = read_cache(&config.credential_store, &key) {
+        if entry.is_usable_for_repository_at(now, &owner, &repository, &config.github.permissions) {
+            return Ok(entry);
+        }
+    }
+
+    let selected = discover_repository_installation(config, &owner, &repository, now)?;
+    let entry = mint_installation_token(
+        config,
+        selected.installation_id,
+        &selected.owner,
+        &selected.repository,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )?;
+    if !entry.is_usable_for_repository_at(now, &owner, &repository, &config.github.permissions) {
+        bail!("new installation token is not usable for the requested repository");
+    }
+    write_cache(&config.credential_store, &key, &entry)?;
     Ok(entry)
 }
 
 fn private_open(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    if path.is_symlink() {
+        bail!("private runtime path must not be a symlink");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .mode(0o600)
+        .mode(0o600);
+    let file = options
         .open(path)
         .with_context(|| format!("open private runtime file {}", path.display()))?;
     validate_open_private_file(&file, "private runtime file")?;
     Ok(file)
 }
 
-fn read_cache(path: &Path) -> Result<CacheEntry> {
-    let file = private_read(path, "installation-token cache")?;
+fn cache_entry(store: &CredentialStore, key: &str) -> Result<Entry> {
+    Entry::new(&format!("{}:github-installation-token", store.service), key)
+        .context("open native installation-token cache entry")
+}
+
+fn read_cache(store: &CredentialStore, key: &str) -> Result<CacheEntry> {
+    let secret = cache_entry(store, key)?
+        .get_password()
+        .context("read native installation-token cache")?;
     let value: CacheFile =
-        serde_json::from_reader(file).context("parse installation-token cache")?;
+        serde_json::from_str(&secret).context("parse installation-token cache")?;
     if value.token.is_empty() || value.token.contains(['\n', '\r', '\0']) {
         bail!("installation-token cache is malformed");
     }
     Ok(value.into())
 }
 
-fn write_cache(path: &Path, entry: &CacheEntry) -> Result<()> {
-    let parent = path.parent().context("cache path has no parent")?;
-    let repository_scope = format!("{:x}", Sha256::digest(entry.repository().as_bytes()));
-    let temp = parent.join(format!(
-        ".cache-{}-{}.tmp",
-        std::process::id(),
-        &repository_scope[..16]
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options
-        .open(&temp)
-        .with_context(|| format!("create private cache temporary file {}", temp.display()))?;
-    let result = (|| -> Result<()> {
-        serde_json::to_writer(&mut file, &CacheFile::from(entry))
-            .context("serialize installation-token cache")?;
-        file.write_all(b"\n")
-            .context("terminate installation-token cache")?;
-        file.sync_all().context("sync installation-token cache")?;
-        fs::rename(&temp, path).context("publish installation-token cache")?;
-        File::open(parent)
-            .context("open installation-token cache directory")?
-            .sync_all()
-            .context("sync installation-token cache directory")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+fn write_cache(store: &CredentialStore, key: &str, entry: &CacheEntry) -> Result<()> {
+    let secret = serde_json::to_string(&CacheFile::from(entry))
+        .context("serialize installation-token cache")?;
+    cache_entry(store, key)?
+        .set_password(&secret)
+        .context("write native installation-token cache")
 }
 
-fn selected_token(
+fn token_entry_for_repository(
     paths: &RuntimePaths,
     config: &Config,
-    request: &CredentialRequest,
+    owner: &str,
+    repository: &str,
 ) -> Result<CacheEntry> {
-    let (owner, repository) = request.repository()?;
+    if config.github.discover_installations {
+        return locked_dynamic_cache_entry(paths, config, owner, repository);
+    }
     let selected = config.github.select_repository(owner, repository)?;
     locked_cache_entry(
         paths,
+        &config.credential_store,
         selected.installation_id,
+        &selected.owner,
         &selected.repository,
         &config.github.permissions,
         || {
@@ -528,29 +685,15 @@ pub fn credential_get(input: &[u8]) -> Result<String> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
     let request = CredentialRequest::parse(input)?;
-    let entry = selected_token(&paths, &config, &request)?;
+    let (owner, repository) = request.repository()?;
+    let entry = token_entry_for_repository(&paths, &config, owner, repository)?;
     render_git_credential(entry.token().expose(), entry.expires_at())
 }
 
 pub fn github_token_for_repository(owner: &str, repository: &str) -> Result<SecretString> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
-    let selected = config.github.select_repository(owner, repository)?;
-    let entry = locked_cache_entry(
-        &paths,
-        selected.installation_id,
-        &selected.repository,
-        &config.github.permissions,
-        || {
-            mint_installation_token(
-                &config,
-                selected.installation_id,
-                &selected.owner,
-                &selected.repository,
-                OffsetDateTime::now_utc().unix_timestamp(),
-            )
-        },
-    )?;
+    let entry = token_entry_for_repository(&paths, &config, owner, repository)?;
     Ok(entry.token().clone())
 }
 
@@ -580,11 +723,32 @@ fn explicit_gh_repository(arguments: &[String]) -> Result<Option<String>> {
     Ok(selected)
 }
 
-fn origin_repository() -> Result<String> {
-    let output = Command::new(GIT)
+fn forwarded_gh_arguments(arguments: &[String]) -> Result<Vec<String>> {
+    let mut forwarded = Vec::with_capacity(arguments.len());
+    let mut index = 0;
+    while index < arguments.len() {
+        if matches!(arguments[index].as_str(), "-R" | "--repo") {
+            if arguments.get(index + 1).is_none() {
+                bail!("gh repository flag has no value");
+            }
+            index += 2;
+            continue;
+        }
+        if arguments[index].starts_with("--repo=") {
+            index += 1;
+            continue;
+        }
+        forwarded.push(arguments[index].clone());
+        index += 1;
+    }
+    Ok(forwarded)
+}
+
+fn origin_repository(program: &str) -> Result<String> {
+    let output = Command::new(program)
         .args(["remote", "get-url", "origin"])
         .env_clear()
-        .env("PATH", "/usr/bin")
+        .envs(sanitized_current_environment())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -596,12 +760,12 @@ fn origin_repository() -> Result<String> {
     Ok(value.trim_end_matches(['\n', '\r']).to_owned())
 }
 
-fn resolve_gh_repository(arguments: &[String]) -> Result<(String, String)> {
+fn resolve_gh_repository(arguments: &[String], git_program: &str) -> Result<(String, String)> {
     let selected = match explicit_gh_repository(arguments)? {
         Some(value) => value,
         None => match env::var("GH_REPO") {
             Ok(value) => value,
-            Err(_) => origin_repository()?,
+            Err(_) => origin_repository(git_program)?,
         },
     };
     crate::parse_github_repository(&selected)
@@ -609,16 +773,20 @@ fn resolve_gh_repository(arguments: &[String]) -> Result<(String, String)> {
 
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     crate::admit_gh_arguments(arguments)?;
-    let (owner, repository) = resolve_gh_repository(arguments)?;
-    let token = github_token_for_repository(&owner, &repository)?;
+    let paths = RuntimePaths::discover()?;
+    let config = load_config(&paths)?;
+    let (owner, repository) = resolve_gh_repository(arguments, &config.programs.git)?;
+    let forwarded = forwarded_gh_arguments(arguments)?;
+    let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
+    let token = entry.token().clone();
     let input: BTreeMap<String, String> = env::vars().collect();
     let mut environment = sanitize_environment(&input, &BTreeSet::new());
     environment.insert("GH_TOKEN".into(), token.expose().into());
     environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
     environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
     environment.insert("GH_REPO".into(), format!("{owner}/{repository}"));
-    Command::new(GH)
-        .args(arguments)
+    Command::new(&config.programs.gh)
+        .args(forwarded)
         .env_clear()
         .envs(environment)
         .stdin(Stdio::inherit())
@@ -633,18 +801,26 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
     let config = load_config(&paths)?;
     let request = CredentialRequest::parse(input)?;
     let (owner, repository) = request.repository()?;
-    let selected = config.github.select_repository(owner, repository)?;
     ensure_runtime(&paths)?;
-    let key = cache_key(
-        selected.installation_id,
-        &selected.repository,
-        &config.github.permissions,
-    )?;
-    let cache = paths.cache_dir().join(format!("{key}.json"));
-    match fs::remove_file(&cache) {
+    let key = if config.github.discover_installations {
+        dynamic_cache_key(owner, repository, &config.github.permissions)?
+    } else {
+        let selected = config.github.select_repository(owner, repository)?;
+        cache_key(
+            selected.installation_id,
+            &selected.repository,
+            &config.github.permissions,
+        )?
+    };
+    match cache_entry(&config.credential_store, &key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(error) => return Err(error).context("remove native installation-token cache"),
+    }
+    let lock = paths.cache_dir().join(format!("{key}.lock"));
+    match fs::remove_file(lock) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("remove installation-token cache"),
+        Err(error) => Err(error).context("remove installation-token cache lock"),
     }
 }
 
@@ -668,7 +844,7 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
     for (variable, reference) in &profile.environment {
         child_environment.insert(
             variable.clone(),
-            read_automation_secret(reference)?.expose().into(),
+            read_declared_secret(&config, reference)?.expose().into(),
         );
     }
     let mut child = Command::new(executable);
@@ -682,10 +858,72 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
     child.status().context("run declared credential profile")
 }
 
+#[cfg(unix)]
 fn ssh_agent_socket(paths: &RuntimePaths) -> PathBuf {
     paths.runtime.join("ssh-agent.sock")
 }
 
+#[cfg(windows)]
+fn ssh_agent_pipe(paths: &RuntimePaths) -> String {
+    let identity = Sha256::digest(paths.config.to_string_lossy().as_bytes());
+    format!(r"\\.\pipe\dev-auth-ssh-agent-{identity:x}")
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct PrivateNamedPipeListener {
+    server: NamedPipeServer,
+    name: std::ffi::OsString,
+}
+
+#[cfg(windows)]
+impl PrivateNamedPipeListener {
+    fn bind(name: impl Into<std::ffi::OsString>) -> io::Result<Self> {
+        let name = name.into();
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&name)?;
+        Ok(Self { server, name })
+    }
+
+    fn next_server(&self) -> io::Result<NamedPipeServer> {
+        ServerOptions::new()
+            .reject_remote_clients(true)
+            .create(&self.name)
+    }
+}
+
+#[cfg(windows)]
+#[ssh_agent_lib::async_trait]
+impl ListeningSocket for PrivateNamedPipeListener {
+    type Stream = NamedPipeServer;
+
+    async fn accept(&mut self) -> io::Result<Self::Stream> {
+        self.server.connect().await?;
+        let next = self.next_server()?;
+        Ok(std::mem::replace(&mut self.server, next))
+    }
+}
+
+#[cfg(unix)]
+fn ssh_agent_endpoint(paths: &RuntimePaths) -> Result<String> {
+    ssh_agent_socket(paths)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("SSH agent socket path is not UTF-8"))
+}
+
+#[cfg(windows)]
+fn ssh_agent_endpoint(paths: &RuntimePaths) -> Result<String> {
+    Ok(ssh_agent_pipe(paths))
+}
+
+pub fn agent_endpoint() -> Result<String> {
+    ssh_agent_endpoint(&RuntimePaths::discover()?)
+}
+
+#[cfg(unix)]
 fn validate_ssh_agent_socket(paths: &RuntimePaths) -> Result<PathBuf> {
     let socket = ssh_agent_socket(paths);
     let metadata = fs::symlink_metadata(&socket).context("inspect dedicated SSH agent socket")?;
@@ -695,13 +933,14 @@ fn validate_ssh_agent_socket(paths: &RuntimePaths) -> Result<PathBuf> {
     Ok(socket)
 }
 
-fn ssh_add_command(paths: &RuntimePaths) -> Result<Command> {
-    let socket = validate_ssh_agent_socket(paths)?;
-    let mut command = Command::new(SSH_ADD);
+fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<Command> {
+    #[cfg(unix)]
+    validate_ssh_agent_socket(paths)?;
+    let mut command = Command::new(&config.programs.ssh_add);
     command
         .env_clear()
-        .env("PATH", "/usr/bin")
-        .env("SSH_AUTH_SOCK", socket)
+        .envs(sanitized_current_environment())
+        .env("SSH_AUTH_SOCK", ssh_agent_endpoint(paths)?)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     Ok(command)
@@ -711,20 +950,15 @@ pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
     let paths = RuntimePaths::discover()?;
     ensure_runtime(&paths)?;
     let config = load_config(&paths)?;
-    let socket = validate_ssh_agent_socket(&paths)?;
-    let loaded = loaded_ssh_fingerprints(&paths)?;
+    #[cfg(unix)]
+    validate_ssh_agent_socket(&paths)?;
+    let loaded = loaded_ssh_fingerprints(&paths, &config)?;
     let profile = unique_declared_ssh_profile(&config, &loaded)?;
-    validate_signing_key_argument(arguments, profile)?;
+    validate_signing_key_argument(arguments, profile, &config.programs.ssh_keygen)?;
     let input: BTreeMap<String, String> = env::vars().collect();
     let mut environment = sanitize_environment(&input, &BTreeSet::new());
-    environment.insert(
-        "SSH_AUTH_SOCK".into(),
-        socket
-            .into_os_string()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("SSH agent socket path is not UTF-8"))?,
-    );
-    Command::new(SSH_KEYGEN)
+    environment.insert("SSH_AUTH_SOCK".into(), ssh_agent_endpoint(&paths)?);
+    Command::new(&config.programs.ssh_keygen)
         .args(arguments)
         .env_clear()
         .envs(environment)
@@ -756,7 +990,11 @@ fn unique_declared_ssh_profile<'a>(
     Ok(profile)
 }
 
-fn validate_signing_key_argument(arguments: &[String], profile: &SshProfile) -> Result<()> {
+fn validate_signing_key_argument(
+    arguments: &[String],
+    profile: &SshProfile,
+    ssh_keygen_program: &str,
+) -> Result<()> {
     let operation = arguments
         .windows(2)
         .find(|pair| pair[0] == "-Y")
@@ -774,10 +1012,10 @@ fn validate_signing_key_argument(arguments: &[String], profile: &SshProfile) -> 
         .iter()
         .find(|key| key.purpose == SshKeyPurpose::Signing)
         .context("declared SSH profile has no signing key")?;
-    let output = Command::new(SSH_KEYGEN)
+    let output = Command::new(ssh_keygen_program)
         .args(["-lf", public_key, "-E", "sha256"])
         .env_clear()
-        .env("PATH", "/usr/bin")
+        .envs(sanitized_current_environment())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -810,8 +1048,8 @@ fn exact_option_value<'a>(arguments: &'a [String], option: &str) -> Result<&'a s
     Ok(value)
 }
 
-fn clear_ssh_agent(paths: &RuntimePaths) -> Result<()> {
-    let status = ssh_add_command(paths)?
+fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
+    let status = ssh_add_command(paths, config)?
         .arg("-D")
         .stdin(Stdio::null())
         .status()
@@ -822,29 +1060,8 @@ fn clear_ssh_agent(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
-fn load_one_ssh_key(paths: &RuntimePaths, key: &SecretString) -> Result<()> {
-    let mut child = ssh_add_command(paths)?
-        .arg("-")
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("start dedicated SSH key load")?;
-    let mut input = child.stdin.take().context("open dedicated SSH key input")?;
-    input
-        .write_all(key.expose().as_bytes())
-        .context("write dedicated SSH key input")?;
-    input
-        .write_all(b"\n")
-        .context("terminate dedicated SSH key input")?;
-    drop(input);
-    let status = child.wait().context("wait for dedicated SSH key load")?;
-    if !status.success() {
-        bail!("dedicated SSH agent rejected a declared key");
-    }
-    Ok(())
-}
-
-fn loaded_ssh_fingerprints(paths: &RuntimePaths) -> Result<BTreeSet<String>> {
-    let output = ssh_add_command(paths)?
+fn loaded_ssh_fingerprints(paths: &RuntimePaths, config: &Config) -> Result<BTreeSet<String>> {
+    let output = ssh_add_command(paths, config)?
         .args(["-l", "-E", "sha256"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -877,75 +1094,254 @@ pub fn ssh_load(profile_name: &str) -> Result<()> {
         .ssh_profiles
         .get(profile_name)
         .context("requested SSH profile is not declared")?;
-    let lock = private_open(&paths.runtime.join("ssh-load.lock"))?;
-    lock.lock_exclusive()
-        .context("lock dedicated SSH agent load")?;
-    clear_ssh_agent(&paths)?;
-    let result = (|| -> Result<()> {
-        for key in &profile.keys {
-            let private_key = read_automation_secret(&key.private_key_ref)?;
-            load_one_ssh_key(&paths, &private_key)?;
-        }
-        let expected: BTreeSet<String> = profile
-            .keys
-            .iter()
-            .map(|key| key.fingerprint.clone())
-            .collect();
-        let loaded = loaded_ssh_fingerprints(&paths)?;
-        if loaded != expected {
-            bail!("dedicated SSH agent fingerprints do not match the declared profile");
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = clear_ssh_agent(&paths);
+    let expected: BTreeSet<String> = profile
+        .keys
+        .iter()
+        .map(|key| key.fingerprint.clone())
+        .collect();
+    let loaded = loaded_ssh_fingerprints(&paths, &config)?;
+    if loaded != expected {
+        bail!("dedicated SSH agent fingerprints do not match the declared profile");
     }
-    result
+    Ok(())
+}
+
+struct AgentIdentity {
+    private_key: PrivateKey,
+    public_key: PublicKey,
+    fingerprint: String,
+}
+
+#[derive(Clone)]
+struct DeclaredAgent {
+    identities: Arc<RwLock<Vec<AgentIdentity>>>,
+}
+
+impl DeclaredAgent {
+    fn new(identities: Vec<AgentIdentity>) -> Self {
+        Self {
+            identities: Arc::new(RwLock::new(identities)),
+        }
+    }
+}
+
+fn agent_failure(message: &'static str) -> AgentError {
+    AgentError::other(io::Error::other(message))
+}
+
+#[ssh_agent_lib::async_trait]
+impl Session for DeclaredAgent {
+    async fn request_identities(&mut self) -> std::result::Result<Vec<Identity>, AgentError> {
+        let identities = self
+            .identities
+            .read()
+            .map_err(|_| agent_failure("SSH identity lock is poisoned"))?;
+        Ok(identities
+            .iter()
+            .map(|identity| Identity {
+                credential: PublicCredential::Key(identity.public_key.key_data().clone()),
+                comment: format!("dev-auth:{}", identity.fingerprint),
+            })
+            .collect())
+    }
+
+    async fn sign(&mut self, request: SignRequest) -> std::result::Result<Signature, AgentError> {
+        if request.flags != 0 {
+            return Err(agent_failure("unsupported SSH signature flags"));
+        }
+        let PublicCredential::Key(requested) = request.credential else {
+            return Err(agent_failure(
+                "SSH certificates are not declared identities",
+            ));
+        };
+        let identities = self
+            .identities
+            .read()
+            .map_err(|_| agent_failure("SSH identity lock is poisoned"))?;
+        let identity = identities
+            .iter()
+            .find(|identity| identity.public_key.key_data() == &requested)
+            .ok_or_else(|| agent_failure("SSH signing identity is not declared"))?;
+        identity
+            .private_key
+            .try_sign(&request.data)
+            .map_err(AgentError::other)
+    }
+
+    async fn remove_all_identities(&mut self) -> std::result::Result<(), AgentError> {
+        self.identities
+            .write()
+            .map_err(|_| agent_failure("SSH identity lock is poisoned"))?
+            .clear();
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Agent<PrivateNamedPipeListener> for DeclaredAgent {
+    fn new_session(&mut self, _socket: &NamedPipeServer) -> impl Session {
+        self.clone()
+    }
+}
+
+fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
+    if let Ok(private_key) = PrivateKey::from_openssh(source.expose().as_bytes()) {
+        return Ok(private_key);
+    }
+    let signing_key = ed25519_dalek::SigningKey::from_pkcs8_pem(source.expose())
+        .map_err(|_| anyhow::anyhow!("declared SSH key is not supported private-key material"))?;
+    PrivateKey::new(
+        KeypairData::Ed25519(Ed25519Keypair::from(signing_key)),
+        "dev-auth automation key",
+    )
+    .context("construct declared Ed25519 SSH key")
+}
+
+fn declared_agent(config: &Config, profile: &SshProfile) -> Result<DeclaredAgent> {
+    let mut identities = Vec::with_capacity(profile.keys.len());
+    for declared in &profile.keys {
+        let source = read_declared_secret(config, &declared.private_key_ref)?;
+        let private_key = parse_declared_ssh_private_key(&source)?;
+        if private_key.is_encrypted() || private_key.algorithm() != SshAlgorithm::Ed25519 {
+            bail!("declared SSH key must be an unencrypted Ed25519 OpenSSH key");
+        }
+        let public_key = private_key.public_key().clone();
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        if fingerprint != declared.fingerprint {
+            bail!("declared SSH key fingerprint does not match its private key");
+        }
+        identities.push(AgentIdentity {
+            private_key,
+            public_key,
+            fingerprint,
+        });
+    }
+    Ok(DeclaredAgent::new(identities))
+}
+
+#[cfg(unix)]
+fn prepare_unix_agent_socket(paths: &RuntimePaths) -> Result<UnixListener> {
+    let socket = ssh_agent_socket(paths);
+    if socket.exists() {
+        let metadata = fs::symlink_metadata(&socket).context("inspect stale SSH agent socket")?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            bail!("existing SSH agent endpoint is not a current-user socket");
+        }
+        fs::remove_file(&socket).context("remove stale SSH agent socket")?;
+    }
+    UnixListener::bind(&socket).context("bind dedicated SSH agent socket")
+}
+
+pub fn run_agent(profile_name: &str) -> Result<()> {
+    let paths = RuntimePaths::discover()?;
+    ensure_runtime(&paths)?;
+    let config = load_config(&paths)?;
+    let profile = config
+        .ssh_profiles
+        .get(profile_name)
+        .context("requested SSH profile is not declared")?;
+    let lock = private_open(&paths.runtime.join("ssh-agent.lock"))?;
+    lock.try_lock_exclusive()
+        .context("another dedicated SSH agent is already active")?;
+    let agent = declared_agent(&config, profile)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .context("create dedicated SSH agent runtime")?;
+
+    #[cfg(unix)]
+    {
+        let listener = {
+            let _runtime_guard = runtime.enter();
+            prepare_unix_agent_socket(&paths)?
+        };
+        let result = runtime.block_on(listen(listener, agent));
+        let _ = fs::remove_file(ssh_agent_socket(&paths));
+        result.context("run dedicated SSH agent")?;
+    }
+    #[cfg(windows)]
+    {
+        let listener = {
+            let _runtime_guard = runtime.enter();
+            PrivateNamedPipeListener::bind(ssh_agent_pipe(&paths))
+                .context("bind dedicated SSH agent named pipe")?
+        };
+        runtime
+            .block_on(listen(listener, agent))
+            .context("run dedicated SSH agent")?;
+    }
+    Ok(())
 }
 
 pub fn runtime_status() -> Result<RuntimeStatus> {
     let paths = RuntimePaths::discover()?;
-    let config_ready = load_config(&paths).is_ok();
-    let service_token_enrolled = service_account_token().is_ok();
+    let config = load_config(&paths);
+    let config_ready = config.is_ok();
+    let service_token_enrolled = config
+        .as_ref()
+        .is_ok_and(|config| service_account_token(&config.credential_store).is_ok());
     let runtime_ready = ensure_runtime(&paths).is_ok();
-    let cached_installation_tokens = fs::read_dir(paths.cache_dir())
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .is_some_and(|value| value == "json")
-                })
-                .count()
+    let ssh_agent_ready = config.as_ref().is_ok_and(|config| {
+        config.ssh_profiles.is_empty()
+            || loaded_ssh_fingerprints(&paths, config)
+                .and_then(|loaded| unique_declared_ssh_profile(config, &loaded).map(|_| ()))
+                .is_ok()
+    });
+    let cached_installation_tokens = config
+        .as_ref()
+        .ok()
+        .and_then(|config| {
+            fs::read_dir(paths.cache_dir()).ok().map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        if !path.extension().is_some_and(|value| value == "lock") {
+                            return None;
+                        }
+                        path.file_stem()?.to_str().map(str::to_owned)
+                    })
+                    .filter(|key| read_cache(&config.credential_store, key).is_ok())
+                    .count()
+            })
         })
         .unwrap_or(0);
     Ok(RuntimeStatus {
         config_ready,
         service_token_enrolled,
         runtime_ready,
+        ssh_agent_ready,
         cached_installation_tokens,
     })
 }
 
 pub fn purge_runtime() -> Result<()> {
     let paths = RuntimePaths::discover()?;
+    let config = load_config(&paths)?;
     let cache_dir = paths.cache_dir();
     if !cache_dir.exists() {
         return Ok(());
     }
     ensure_runtime(&paths)?;
-    if ssh_agent_socket(&paths).exists() {
-        clear_ssh_agent(&paths)?;
+    if loaded_ssh_fingerprints(&paths, &config).is_ok() {
+        clear_ssh_agent(&paths, &config)?;
     }
     for entry in fs::read_dir(&cache_dir).context("enumerate dev-auth runtime cache")? {
         let entry = entry.context("read dev-auth runtime cache entry")?;
         let path = entry.path();
         let extension = path.extension().and_then(|value| value.to_str());
-        if matches!(extension, Some("json") | Some("lock")) {
-            fs::remove_file(&path)
-                .with_context(|| format!("remove dev-auth runtime file {}", path.display()))?;
+        if extension == Some("lock") {
+            let key = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("runtime lock has an invalid cache key")?;
+            match cache_entry(&config.credential_store, key)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(error).context("purge native installation-token cache"),
+            }
+            fs::remove_file(&path).context("remove installation-token cache lock")?;
         } else {
             bail!("unknown file in dev-auth runtime cache");
         }
@@ -957,14 +1353,26 @@ pub fn purge_runtime() -> Result<()> {
 mod tests {
     use super::*;
     use crate::{GitHubProfile, SshKey};
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ssh_key::private::{Ed25519Keypair, KeypairData};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn config_with_profiles(profiles: BTreeMap<String, SshProfile>) -> Config {
         Config {
             version: 1,
+            credential_store: CredentialStore::default(),
+            programs: crate::Programs {
+                op: "/usr/bin/op".into(),
+                gh: "/usr/bin/gh".into(),
+                git: "/usr/bin/git".into(),
+                ssh_add: "/usr/bin/ssh-add".into(),
+                ssh_keygen: "/usr/bin/ssh-keygen".into(),
+            },
             github: GitHubProfile {
                 app_id: 1,
-                private_key_ref: "op://Automation/app/private-key".into(),
+                private_key_ref: "op://Machine Vault/app/private-key".into(),
+                discover_installations: false,
                 installations: Vec::new(),
                 permissions: BTreeMap::new(),
             },
@@ -989,17 +1397,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dynamic_cache_scope_is_case_insensitive_and_owner_specific() {
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let expected = dynamic_cache_key("ExampleOrg", "Sample-Repo", &permissions).unwrap();
+        assert_eq!(
+            expected,
+            dynamic_cache_key("exampleorg", "sample-repo", &permissions).unwrap()
+        );
+        assert_ne!(
+            expected,
+            dynamic_cache_key("AnotherOrg", "sample-repo", &permissions).unwrap()
+        );
+    }
+
+    #[test]
+    fn repository_selector_is_consumed_before_invoking_upstream_gh() {
+        let arguments = vec![
+            "repo".into(),
+            "view".into(),
+            "-R".into(),
+            "ExampleOrg/sample-repo".into(),
+            "--json".into(),
+            "nameWithOwner".into(),
+        ];
+        assert_eq!(
+            forwarded_gh_arguments(&arguments).unwrap(),
+            vec!["repo", "view", "--json", "nameWithOwner"]
+        );
+    }
+
+    #[test]
+    fn dynamic_installation_response_must_match_exact_repository_authority() {
+        let mut config = config_with_profiles(BTreeMap::new());
+        config.github.app_id = 42;
+        config.github.discover_installations = true;
+        config.github.permissions = crate::approved_github_permissions();
+        let response = serde_json::json!({
+            "id": 101,
+            "app_id": 42,
+            "account": {"login": "ExampleOrg"},
+            "permissions": config.github.permissions,
+            "suspended_at": null
+        });
+        let selected = validate_repository_installation_response(
+            &config,
+            "exampleorg",
+            "New-Repository",
+            &serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.installation_id, 101);
+        assert_eq!(selected.owner, "exampleorg");
+        assert_eq!(selected.repository, "new-repository");
+
+        let mut wrong_app = response;
+        wrong_app["app_id"] = serde_json::json!(99);
+        assert!(validate_repository_installation_response(
+            &config,
+            "exampleorg",
+            "New-Repository",
+            &serde_json::to_vec(&wrong_app).unwrap(),
+        )
+        .is_err());
+    }
+
     fn profile(authentication: &str, signing: &str) -> SshProfile {
         SshProfile {
             keys: vec![
                 SshKey {
                     purpose: SshKeyPurpose::Authentication,
-                    private_key_ref: "op://Automation/ssh-auth/private-key".into(),
+                    private_key_ref: "op://Machine Vault/ssh-auth/private-key".into(),
                     fingerprint: authentication.into(),
                 },
                 SshKey {
                     purpose: SshKeyPurpose::Signing,
-                    private_key_ref: "op://Automation/ssh-sign/private-key".into(),
+                    private_key_ref: "op://Machine Vault/ssh-sign/private-key".into(),
                     fingerprint: signing.into(),
                 },
             ],
@@ -1028,27 +1501,63 @@ mod tests {
     }
 
     #[test]
-    fn credential_store_keeps_only_the_session_bus_context() {
-        let retained = secret_service_environment([
-            (
-                "DBUS_SESSION_BUS_ADDRESS".into(),
-                "unix:path=/run/user/1000/bus".into(),
-            ),
-            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
-            ("DISPLAY".into(), ":0".into()),
-            ("OP_SERVICE_ACCOUNT_TOKEN".into(), "must-not-survive".into()),
-        ]);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(
-            retained.get(&OsString::from("DBUS_SESSION_BUS_ADDRESS")),
-            Some(&OsString::from("unix:path=/run/user/1000/bus"))
-        );
-        assert_eq!(
-            retained.get(&OsString::from("XDG_RUNTIME_DIR")),
-            Some(&OsString::from("/run/user/1000"))
-        );
+    fn dedicated_agent_exposes_only_declared_keys_and_supports_purge() {
+        let private_key = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[42; 32])),
+            "test automation key",
+        )
+        .unwrap();
+        let public_key = private_key.public_key().clone();
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let mut agent = DeclaredAgent::new(vec![AgentIdentity {
+            private_key,
+            public_key: public_key.clone(),
+            fingerprint: fingerprint.clone(),
+        }]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let identities = runtime.block_on(agent.request_identities()).unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].comment, format!("dev-auth:{fingerprint}"));
+        let message = b"bounded automation signature";
+        let signature = runtime
+            .block_on(agent.sign(SignRequest {
+                credential: PublicCredential::Key(public_key.key_data().clone()),
+                data: message.to_vec(),
+                flags: 0,
+            }))
+            .unwrap();
+        signature::Verifier::verify(&public_key, message, &signature).unwrap();
+
+        runtime.block_on(agent.remove_all_identities()).unwrap();
+        assert!(runtime
+            .block_on(agent.request_identities())
+            .unwrap()
+            .is_empty());
     }
 
+    #[test]
+    fn declared_ssh_key_accepts_native_ssh_and_pkcs8_ed25519_encodings() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let pkcs8 = signing_key.to_pkcs8_pem(Default::default()).unwrap();
+        let parsed = parse_declared_ssh_private_key(&SecretString::new(pkcs8.to_string())).unwrap();
+        assert_eq!(parsed.algorithm(), SshAlgorithm::Ed25519);
+
+        let native = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[22; 32])),
+            "native test key",
+        )
+        .unwrap()
+        .to_openssh(ssh_key::LineEnding::LF)
+        .unwrap();
+        let parsed =
+            parse_declared_ssh_private_key(&SecretString::new(native.to_string())).unwrap();
+        assert_eq!(parsed.algorithm(), SshAlgorithm::Ed25519);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn git_signing_requires_the_declared_signing_public_key() {
         let directory = tempfile::tempdir().unwrap();
@@ -1056,7 +1565,7 @@ mod tests {
         let signing_key = directory.path().join("signing");
         let authentication_key = directory.path().join("authentication");
         for key in [&signing_key, &authentication_key] {
-            assert!(Command::new(SSH_KEYGEN)
+            assert!(Command::new("ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-N", "", "-f"])
                 .arg(key)
                 .status()
@@ -1064,7 +1573,7 @@ mod tests {
                 .success());
         }
         let fingerprint = |key: &Path| {
-            let output = Command::new(SSH_KEYGEN)
+            let output = Command::new("ssh-keygen")
                 .args(["-lf"])
                 .arg(key.with_extension("pub"))
                 .args(["-E", "sha256"])
@@ -1091,10 +1600,17 @@ mod tests {
                 key.with_extension("pub").display().to_string(),
             ]
         };
-        assert!(validate_signing_key_argument(&arguments(&signing_key), &profile).is_ok());
-        assert!(validate_signing_key_argument(&arguments(&authentication_key), &profile).is_err());
+        assert!(
+            validate_signing_key_argument(&arguments(&signing_key), &profile, "ssh-keygen").is_ok()
+        );
+        assert!(validate_signing_key_argument(
+            &arguments(&authentication_key),
+            &profile,
+            "ssh-keygen"
+        )
+        .is_err());
         let mut wrong_namespace = arguments(&signing_key);
         wrong_namespace[3] = "file".into();
-        assert!(validate_signing_key_argument(&wrong_namespace, &profile).is_err());
+        assert!(validate_signing_key_argument(&wrong_namespace, &profile, "ssh-keygen").is_err());
     }
 }

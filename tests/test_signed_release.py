@@ -61,7 +61,7 @@ def test_release_builder_keeps_independent_product_versions() -> None:
     versions = module.product_versions()
 
     assert versions["update-all"] == "0.1.5"
-    assert versions["dev-auth"] == "0.1.0"
+    assert versions["dev-auth"] == "0.2.0"
     assert versions["dev-cache"] == "0.1.6"
     assert versions["skills-sync"] == "0.1.4"
     assert versions["sync-configs"] == "0.1.8"
@@ -77,6 +77,18 @@ def test_release_builder_maps_independent_manifest_generations() -> None:
         ["update-all=6", "dev-cache=9"],
         ("update-all", "dev-cache"),
     ) == {"update-all": 6, "dev-cache": 9}
+
+
+def test_release_builder_names_linux_macos_and_windows_targets(monkeypatch) -> None:
+    module = load_release_set_module()
+    for system, machine, expected in [
+        ("Linux", "x86_64", "linux-x86_64"),
+        ("Darwin", "arm64", "macos-aarch64"),
+        ("Windows", "AMD64", "windows-x86_64"),
+    ]:
+        monkeypatch.setattr(module.platform, "system", lambda value=system: value)
+        monkeypatch.setattr(module.platform, "machine", lambda value=machine: value)
+        assert module.target_id() == expected
 
 
 def write_key(path: Path, key: Ed25519PrivateKey) -> None:
