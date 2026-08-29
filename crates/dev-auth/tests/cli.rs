@@ -163,6 +163,35 @@ fn unsafe_gh_operations_are_rejected_before_configuration_or_credentials_are_rea
 }
 
 #[test]
+fn invalid_ambient_gh_repository_is_rejected_before_configuration_or_runtime_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let frontend = directory.path().join("gh-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+
+    let output = Command::new(&frontend)
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .env_clear()
+        .env("GH_REPO", "not/an/exact/repository")
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("exact github.com owner/repository"),
+        "{error}"
+    );
+    assert!(!error.contains("configuration"), "{error}");
+    assert!(!runtime.path().join("dev-auth").exists());
+}
+
+#[test]
 fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
     let home = tempfile::tempdir().unwrap();
     let gh = home.path().join("gh");

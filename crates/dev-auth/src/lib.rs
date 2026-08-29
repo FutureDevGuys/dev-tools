@@ -183,6 +183,31 @@ fn default_keyring_account() -> String {
     "service-account-token".into()
 }
 
+fn is_reserved_profile_environment(variable: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "APPDATA",
+        "COLORTERM",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOCALAPPDATA",
+        "PATH",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ];
+    RESERVED
+        .iter()
+        .any(|reserved| variable.eq_ignore_ascii_case(reserved))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Programs {
@@ -324,6 +349,9 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
                 .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
             if !valid_start || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
                 bail!("profile environment variable is not a valid identifier");
+            }
+            if is_reserved_profile_environment(variable) {
+                bail!("profile environment variable conflicts with the private sandbox");
             }
             validate_op_reference(reference)?;
         }

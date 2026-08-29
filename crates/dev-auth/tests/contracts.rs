@@ -322,6 +322,16 @@ fn published_example_is_complete_and_valid() {
 }
 
 #[test]
+fn execution_profiles_cannot_override_private_sandbox_variables() {
+    let example = include_str!("../config.example.toml");
+    for variable in ["PATH", "home", "XDG_CONFIG_HOME", "Temp"] {
+        let invalid = example.replace("TF_TOKEN_app_terraform_io", variable);
+        let error = parse_config(invalid.as_bytes()).unwrap_err().to_string();
+        assert!(error.contains("conflicts with the private sandbox"));
+    }
+}
+
+#[test]
 fn installation_scope_is_exactly_all_or_a_static_allowlist() {
     let base = |selection: &str, installation: &str| {
         format!(

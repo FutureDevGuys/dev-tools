@@ -139,6 +139,42 @@ impl RuntimePaths {
     fn gh_git_hooks_dir(&self) -> PathBuf {
         self.gh_sandbox_dir().join("git-empty-hooks")
     }
+
+    fn exec_sandbox_dir(&self) -> PathBuf {
+        self.runtime.join("exec-sandbox")
+    }
+
+    fn exec_profile_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_sandbox_dir().join(profile_name)
+    }
+
+    fn exec_bin_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("bin")
+    }
+
+    fn exec_config_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("config")
+    }
+
+    fn exec_home_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("home")
+    }
+
+    fn exec_cache_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("cache")
+    }
+
+    fn exec_data_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("data")
+    }
+
+    fn exec_temp_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("tmp")
+    }
+
+    fn exec_runtime_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("runtime")
+    }
 }
 
 fn select_runtime_root(
@@ -1078,16 +1114,26 @@ fn origin_repository(program: &str) -> Result<String> {
     origin_repository_at(program, None, &sanitized_current_environment())
 }
 
+fn preconfigured_gh_repository(
+    selected: Option<(String, String)>,
+) -> Result<Option<(String, String)>> {
+    if selected.is_some() {
+        return Ok(selected);
+    }
+    match env::var("GH_REPO") {
+        Ok(value) => crate::exact_github_repository(&value).map(Some),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => bail!("GH_REPO is not valid Unicode"),
+    }
+}
+
 fn resolve_gh_repository(
     selected: Option<(String, String)>,
     git_program: &str,
 ) -> Result<(String, String)> {
     match selected {
         Some(repository) => Ok(repository),
-        None => match env::var("GH_REPO") {
-            Ok(value) => crate::exact_github_repository(&value),
-            Err(_) => crate::parse_github_repository(&origin_repository(git_program)?),
-        },
+        None => crate::parse_github_repository(&origin_repository(git_program)?),
     }
 }
 
@@ -1342,14 +1388,15 @@ fn isolated_gh_environment(
 
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     let plan = crate::parse_gh_invocation(arguments)?;
+    let selected_repository = preconfigured_gh_repository(plan.repository.clone())?;
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
+    let (owner, repository) = resolve_gh_repository(selected_repository, &config.programs.git)?;
     ensure_gh_sandbox(&paths)?;
     #[cfg(windows)]
     let _frontend_guards = gh_child_frontend_guards(&paths)?;
     let _program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
     validate_gh_version(&config.programs.gh, &paths)?;
-    let (owner, repository) = resolve_gh_repository(plan.repository.clone(), &config.programs.git)?;
     let forwarded = forwarded_gh_arguments(plan, &owner, &repository);
     let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
     let token = entry.token().clone();
@@ -1709,6 +1756,65 @@ fn declared_profile<'a>(config: &'a Config, name: &str) -> Result<&'a ExecProfil
         .context("requested execution profile is not declared")
 }
 
+fn ensure_exec_sandbox(paths: &RuntimePaths, profile_name: &str) -> Result<()> {
+    ensure_runtime(paths)?;
+    ensure_private_directory(&paths.exec_sandbox_dir())?;
+    ensure_private_directory(&paths.exec_profile_dir(profile_name))?;
+    for directory in [
+        paths.exec_bin_dir(profile_name),
+        paths.exec_config_dir(profile_name),
+        paths.exec_home_dir(profile_name),
+        paths.exec_cache_dir(profile_name),
+        paths.exec_data_dir(profile_name),
+        paths.exec_temp_dir(profile_name),
+        paths.exec_runtime_dir(profile_name),
+    ] {
+        ensure_private_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn isolated_exec_environment(
+    input: &BTreeMap<String, String>,
+    paths: &RuntimePaths,
+    profile_name: &str,
+) -> BTreeMap<String, String> {
+    const PASS_THROUGH: &[&str] = &["COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TERM"];
+    let mut environment: BTreeMap<String, String> = input
+        .iter()
+        .filter(|(key, _)| {
+            PASS_THROUGH
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let home = paths.exec_home_dir(profile_name).display().to_string();
+    let config = paths.exec_config_dir(profile_name).display().to_string();
+    let cache = paths.exec_cache_dir(profile_name).display().to_string();
+    let data = paths.exec_data_dir(profile_name).display().to_string();
+    let temporary = paths.exec_temp_dir(profile_name).display().to_string();
+    environment.insert("HOME".into(), home.clone());
+    environment.insert("USERPROFILE".into(), home);
+    environment.insert(
+        "PATH".into(),
+        paths.exec_bin_dir(profile_name).display().to_string(),
+    );
+    environment.insert("XDG_CONFIG_HOME".into(), config.clone());
+    environment.insert("XDG_CACHE_HOME".into(), cache);
+    environment.insert("XDG_DATA_HOME".into(), data.clone());
+    environment.insert(
+        "XDG_RUNTIME_DIR".into(),
+        paths.exec_runtime_dir(profile_name).display().to_string(),
+    );
+    environment.insert("APPDATA".into(), config);
+    environment.insert("LOCALAPPDATA".into(), data);
+    for variable in ["TMP", "TEMP", "TMPDIR"] {
+        environment.insert(variable.into(), temporary.clone());
+    }
+    environment
+}
+
 pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
@@ -1718,8 +1824,9 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
         bail!("command executable is not admitted by the selected profile");
     }
     let _program_guard = program_guard(executable, "declared profile executable")?;
+    ensure_exec_sandbox(&paths, profile_name)?;
     let input: BTreeMap<String, String> = env::vars().collect();
-    let mut child_environment = sanitize_environment(&input, &BTreeSet::new());
+    let mut child_environment = isolated_exec_environment(&input, &paths, profile_name);
     for (variable, reference) in &profile.environment {
         child_environment.insert(
             variable.clone(),
@@ -2557,6 +2664,127 @@ mod tests {
         assert!(!environment.contains_key("COMSPEC"));
         assert!(!environment.values().any(|value| value.contains("attacker")));
         assert!(!environment.values().any(|value| value == "/home/example"));
+    }
+
+    #[test]
+    fn profile_child_environment_replaces_ambient_helpers_and_human_config() {
+        let paths = RuntimePaths {
+            config: PathBuf::from("/private/config.toml"),
+            runtime: PathBuf::from("/private/runtime"),
+        };
+        let input = BTreeMap::from([
+            ("HOME".into(), "/home/example".into()),
+            ("USERPROFILE".into(), "C:\\Users\\example".into()),
+            ("PATH".into(), "/attacker/bin".into()),
+            ("APPDATA".into(), "C:\\Users\\example\\AppData".into()),
+            ("LOCALAPPDATA".into(), "C:\\Users\\example\\Local".into()),
+            ("XDG_CONFIG_HOME".into(), "/home/example/.config".into()),
+            ("XDG_CACHE_HOME".into(), "/home/example/.cache".into()),
+            ("XDG_DATA_HOME".into(), "/home/example/.local/share".into()),
+            ("COMSPEC".into(), "C:\\attacker\\cmd.exe".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/attacker/bus".into(),
+            ),
+            ("DISPLAY".into(), ":99".into()),
+            ("GH_TOKEN".into(), "human-token".into()),
+        ]);
+
+        let environment = isolated_exec_environment(&input, &paths, "profile-a");
+
+        assert_eq!(
+            environment["HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/home")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["USERPROFILE"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/home")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["PATH"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/bin")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["XDG_CONFIG_HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/config")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["XDG_CACHE_HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/cache")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["XDG_DATA_HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/data")
+                .display()
+                .to_string()
+        );
+        for variable in ["COMSPEC", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "GH_TOKEN"] {
+            assert!(!environment.contains_key(variable));
+        }
+        assert!(!environment.values().any(|value| value.contains("attacker")));
+        assert!(!environment.values().any(|value| value == "/home/example"));
+        assert!(!environment
+            .values()
+            .any(|value| value == "C:\\Users\\example"));
+    }
+
+    #[test]
+    fn profile_sandbox_is_private_empty_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime/dev-auth");
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime,
+        };
+
+        ensure_exec_sandbox(&paths, "profile-a").unwrap();
+        ensure_exec_sandbox(&paths, "profile-a").unwrap();
+
+        for directory in [
+            paths.exec_sandbox_dir(),
+            paths.exec_profile_dir("profile-a"),
+            paths.exec_bin_dir("profile-a"),
+            paths.exec_config_dir("profile-a"),
+            paths.exec_home_dir("profile-a"),
+            paths.exec_cache_dir("profile-a"),
+            paths.exec_data_dir("profile-a"),
+            paths.exec_temp_dir("profile-a"),
+            paths.exec_runtime_dir("profile-a"),
+        ] {
+            let metadata = fs::symlink_metadata(&directory).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            #[cfg(unix)]
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+        assert_eq!(
+            fs::read_dir(paths.exec_bin_dir("profile-a"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[cfg(target_os = "linux")]

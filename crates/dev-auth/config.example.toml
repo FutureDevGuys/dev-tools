@@ -26,7 +26,9 @@ discover_installations = true
 permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
 
 # Execution profiles are optional. Each profile admits exact executables and
-# exact 1Password fields; dev-auth has no arbitrary secret-read command.
+# exact 1Password fields; dev-auth has no arbitrary secret-read command. The
+# child gets a private inert HOME and empty PATH, so use a self-contained native
+# executable or make the executable resolve its own helpers by absolute path.
 [profiles.terraform-plan]
 executables = ["/usr/bin/terraform"]
 environment = { TF_TOKEN_app_terraform_io = "op://Automation Example/terraform-plan/token" }
