@@ -192,6 +192,54 @@ fn invalid_ambient_gh_repository_is_rejected_before_configuration_or_runtime_mut
 }
 
 #[test]
+fn invalid_literal_local_origin_is_rejected_before_configuration_or_runtime_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let frontend = directory.path().join("gh-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
+    let repository = directory.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://github.com/ExampleOrg/too/many.git",
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+
+    let output = Command::new(&frontend)
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .current_dir(&repository)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("exactly owner/repository"),
+        "unexpected error: {error}"
+    );
+    assert!(!error.contains("configuration"), "{error}");
+    assert!(!runtime.path().join("dev-auth").exists());
+}
+
+#[test]
 fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
     let home = tempfile::tempdir().unwrap();
     let gh = home.path().join("gh");

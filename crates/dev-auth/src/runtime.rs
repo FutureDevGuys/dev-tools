@@ -932,38 +932,81 @@ fn locked_dynamic_cache_entry(
     )?;
     with_cache_scope_lock(paths, &key, || {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if let Ok(entry) = read_cache(&config.credential_store, &key) {
-            if entry.is_usable_for_repository_at(
+        resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
                 now,
-                config.github.app_id,
-                &owner,
-                &repository,
-                &config.github.permissions,
-            ) {
-                return Ok(entry);
-            }
-        }
-
-        let selected = discover_repository_installation(config, &owner, &repository, now)?;
-        let entry = mint_installation_token(
-            config,
-            selected.installation_id,
-            &selected.owner,
-            &selected.repository,
-            OffsetDateTime::now_utc().unix_timestamp(),
-        )?;
-        if !entry.is_usable_for_repository_at(
-            now,
-            config.github.app_id,
-            &owner,
-            &repository,
-            &config.github.permissions,
-        ) {
-            bail!("new installation token is not usable for the requested repository");
-        }
-        write_cache(&config.credential_store, &key, &entry)?;
-        Ok(entry)
+                app_id: config.github.app_id,
+                owner: &owner,
+                repository: &repository,
+                permissions: &config.github.permissions,
+            },
+            || discover_repository_installation(config, &owner, &repository, now),
+            || read_cache(&config.credential_store, &key),
+            |installation_id| {
+                mint_installation_token(
+                    config,
+                    installation_id,
+                    &owner,
+                    &repository,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )
+            },
+            |entry| write_cache(&config.credential_store, &key, entry),
+        )
     })
+}
+
+struct DynamicRepositoryScope<'a> {
+    now: i64,
+    app_id: u64,
+    owner: &'a str,
+    repository: &'a str,
+    permissions: &'a BTreeMap<String, String>,
+}
+
+fn resolve_dynamic_cache_entry<Discover, Read, Mint, Write>(
+    scope: DynamicRepositoryScope<'_>,
+    discover: Discover,
+    read: Read,
+    mint: Mint,
+    write: Write,
+) -> Result<CacheEntry>
+where
+    Discover: FnOnce() -> Result<SelectedRepository>,
+    Read: FnOnce() -> Result<CacheEntry>,
+    Mint: FnOnce(u64) -> Result<CacheEntry>,
+    Write: FnOnce(&CacheEntry) -> Result<()>,
+{
+    let selected = discover()?;
+    if selected.owner != scope.owner || selected.repository != scope.repository {
+        bail!("live GitHub installation does not match the requested repository");
+    }
+    if let Ok(entry) = read() {
+        if entry.is_usable_for_repository_at(
+            scope.now,
+            scope.app_id,
+            selected.installation_id,
+            scope.owner,
+            scope.repository,
+            scope.permissions,
+        ) {
+            return Ok(entry);
+        }
+    }
+
+    let entry = mint(selected.installation_id)?;
+    if !entry.is_usable_for_repository_at(
+        scope.now,
+        scope.app_id,
+        selected.installation_id,
+        scope.owner,
+        scope.repository,
+        scope.permissions,
+    ) {
+        bail!("new installation token is not usable for the requested repository");
+    }
+    write(&entry)?;
+    Ok(entry)
 }
 
 #[cfg(windows)]
@@ -1110,8 +1153,45 @@ fn origin_repository_at(
     String::from_utf8(value.to_vec()).context("literal local Git origin is not UTF-8")
 }
 
-fn origin_repository(program: &str) -> Result<String> {
-    origin_repository_at(program, None, &sanitized_current_environment())
+fn preconfig_git_program(environment: &BTreeMap<String, String>) -> Result<String> {
+    let path = environment
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case("PATH").then_some(value))
+        .context("PATH is required to resolve the pre-credential Git origin reader")?;
+    #[cfg(windows)]
+    let executable = "git.exe";
+    #[cfg(not(windows))]
+    let executable = "git";
+
+    for directory in env::split_paths(path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let candidate = directory.join(executable);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspect pre-credential Git executable"),
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+        let candidate = candidate
+            .to_str()
+            .context("pre-credential Git executable path is not UTF-8")?;
+        return Ok(candidate.to_owned());
+    }
+    bail!("no absolute Git executable is available on the sanitized caller PATH")
+}
+
+fn origin_repository() -> Result<String> {
+    let environment = sanitized_current_environment();
+    let program = preconfig_git_program(&environment)?;
+    origin_repository_at(&program, None, &environment)
 }
 
 fn preconfigured_gh_repository(
@@ -1127,13 +1207,10 @@ fn preconfigured_gh_repository(
     }
 }
 
-fn resolve_gh_repository(
-    selected: Option<(String, String)>,
-    git_program: &str,
-) -> Result<(String, String)> {
+fn resolve_gh_repository(selected: Option<(String, String)>) -> Result<(String, String)> {
     match selected {
         Some(repository) => Ok(repository),
-        None => crate::parse_github_repository(&origin_repository(git_program)?),
+        None => crate::parse_github_repository(&origin_repository()?),
     }
 }
 
@@ -1389,9 +1466,9 @@ fn isolated_gh_environment(
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     let plan = crate::parse_gh_invocation(arguments)?;
     let selected_repository = preconfigured_gh_repository(plan.repository.clone())?;
+    let (owner, repository) = resolve_gh_repository(selected_repository)?;
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
-    let (owner, repository) = resolve_gh_repository(selected_repository, &config.programs.git)?;
     ensure_gh_sandbox(&paths)?;
     #[cfg(windows)]
     let _frontend_guards = gh_child_frontend_guards(&paths)?;
@@ -1774,10 +1851,30 @@ fn ensure_exec_sandbox(paths: &RuntimePaths, profile_name: &str) -> Result<()> {
     Ok(())
 }
 
+fn create_empty_exec_path(paths: &RuntimePaths, profile_name: &str) -> Result<tempfile::TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(paths.exec_bin_dir(profile_name))
+        .context("create fresh private profile executable path")?;
+    #[cfg(unix)]
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .context("restrict fresh profile executable path")?;
+    validate_private_directory(directory.path(), "fresh profile executable path")?;
+    if fs::read_dir(directory.path())
+        .context("inspect fresh profile executable path")?
+        .next()
+        .is_some()
+    {
+        bail!("fresh profile executable path is not empty");
+    }
+    Ok(directory)
+}
+
 fn isolated_exec_environment(
     input: &BTreeMap<String, String>,
     paths: &RuntimePaths,
     profile_name: &str,
+    executable_path: &Path,
 ) -> BTreeMap<String, String> {
     const PASS_THROUGH: &[&str] = &["COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TERM"];
     let mut environment: BTreeMap<String, String> = input
@@ -1796,10 +1893,7 @@ fn isolated_exec_environment(
     let temporary = paths.exec_temp_dir(profile_name).display().to_string();
     environment.insert("HOME".into(), home.clone());
     environment.insert("USERPROFILE".into(), home);
-    environment.insert(
-        "PATH".into(),
-        paths.exec_bin_dir(profile_name).display().to_string(),
-    );
+    environment.insert("PATH".into(), executable_path.display().to_string());
     environment.insert("XDG_CONFIG_HOME".into(), config.clone());
     environment.insert("XDG_CACHE_HOME".into(), cache);
     environment.insert("XDG_DATA_HOME".into(), data.clone());
@@ -1825,8 +1919,10 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
     }
     let _program_guard = program_guard(executable, "declared profile executable")?;
     ensure_exec_sandbox(&paths, profile_name)?;
+    let executable_path = create_empty_exec_path(&paths, profile_name)?;
     let input: BTreeMap<String, String> = env::vars().collect();
-    let mut child_environment = isolated_exec_environment(&input, &paths, profile_name);
+    let mut child_environment =
+        isolated_exec_environment(&input, &paths, profile_name, executable_path.path());
     for (variable, reference) in &profile.environment {
         child_environment.insert(
             variable.clone(),
@@ -2610,6 +2706,123 @@ mod tests {
         );
     }
 
+    fn test_cache_entry(installation_id: u64) -> CacheEntry {
+        CacheEntry::new_for_test(
+            SecretString::new("test-token".into()),
+            10_000,
+            42,
+            installation_id,
+            "exampleorg".into(),
+            "sample-repo".into(),
+            BTreeMap::from([("contents".into(), "write".into())]),
+        )
+    }
+
+    #[test]
+    fn dynamic_cache_hit_fails_closed_when_live_discovery_fails() {
+        use std::cell::Cell;
+
+        let cache_was_read = Cell::new(false);
+        let result = resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now: 1,
+                app_id: 42,
+                owner: "exampleorg",
+                repository: "sample-repo",
+                permissions: &BTreeMap::from([("contents".into(), "write".into())]),
+            },
+            || bail!("live installation authority is unavailable"),
+            || {
+                cache_was_read.set(true);
+                Ok(test_cache_entry(101))
+            },
+            |_| panic!("mint must not run after failed discovery"),
+            |_| panic!("write must not run after failed discovery"),
+        );
+
+        assert!(result.is_err());
+        assert!(!cache_was_read.get());
+    }
+
+    #[test]
+    fn dynamic_cache_hit_with_stale_installation_id_is_refreshed() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let written = RefCell::new(None);
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let result = resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now: 1,
+                app_id: 42,
+                owner: "exampleorg",
+                repository: "sample-repo",
+                permissions: &permissions,
+            },
+            || {
+                events.borrow_mut().push("discover");
+                Ok(SelectedRepository {
+                    installation_id: 202,
+                    owner: "exampleorg".into(),
+                    repository: "sample-repo".into(),
+                })
+            },
+            || {
+                events.borrow_mut().push("read");
+                Ok(test_cache_entry(101))
+            },
+            |installation_id| {
+                events.borrow_mut().push("mint");
+                Ok(test_cache_entry(installation_id))
+            },
+            |entry| {
+                events.borrow_mut().push("write");
+                *written.borrow_mut() = Some(entry.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.installation_id(), 202);
+        assert_eq!(written.borrow().as_ref().unwrap().installation_id(), 202);
+        assert_eq!(*events.borrow(), ["discover", "read", "mint", "write"]);
+    }
+
+    #[test]
+    fn dynamic_cache_hit_with_current_installation_is_reused_after_discovery() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let result = resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now: 1,
+                app_id: 42,
+                owner: "exampleorg",
+                repository: "sample-repo",
+                permissions: &permissions,
+            },
+            || {
+                events.borrow_mut().push("discover");
+                Ok(SelectedRepository {
+                    installation_id: 202,
+                    owner: "exampleorg".into(),
+                    repository: "sample-repo".into(),
+                })
+            },
+            || {
+                events.borrow_mut().push("read");
+                Ok(test_cache_entry(202))
+            },
+            |_| panic!("mint must not run for a current cache entry"),
+            |_| panic!("write must not run for a current cache entry"),
+        )
+        .unwrap();
+
+        assert_eq!(result.installation_id(), 202);
+        assert_eq!(*events.borrow(), ["discover", "read"]);
+    }
+
     #[test]
     fn gh_child_environment_replaces_ambient_execution_and_ui_surfaces() {
         let paths = RuntimePaths {
@@ -2690,7 +2903,10 @@ mod tests {
             ("GH_TOKEN".into(), "human-token".into()),
         ]);
 
-        let environment = isolated_exec_environment(&input, &paths, "profile-a");
+        let executable_path = paths
+            .exec_bin_dir("profile-a")
+            .join("fresh-execution-directory");
+        let environment = isolated_exec_environment(&input, &paths, "profile-a", &executable_path);
 
         assert_eq!(
             environment["HOME"],
@@ -2708,14 +2924,7 @@ mod tests {
                 .display()
                 .to_string()
         );
-        assert_eq!(
-            environment["PATH"],
-            paths
-                .runtime
-                .join("exec-sandbox/profile-a/bin")
-                .display()
-                .to_string()
-        );
+        assert_eq!(environment["PATH"], executable_path.display().to_string());
         assert_eq!(
             environment["XDG_CONFIG_HOME"],
             paths
@@ -2785,6 +2994,36 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn profile_exec_path_is_fresh_and_ignores_stale_helpers() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime/dev-auth"),
+        };
+
+        ensure_exec_sandbox(&paths, "profile-a").unwrap();
+        fs::write(
+            paths.exec_bin_dir("profile-a").join("stale-helper"),
+            b"must never be executable through the profile PATH",
+        )
+        .unwrap();
+
+        let first = create_empty_exec_path(&paths, "profile-a").unwrap();
+        assert_ne!(first.path(), paths.exec_bin_dir("profile-a"));
+        assert_eq!(fs::read_dir(first.path()).unwrap().count(), 0);
+        assert!(!first.path().join("stale-helper").exists());
+
+        let first_path = first.path().to_path_buf();
+        drop(first);
+        assert!(!first_path.exists());
+
+        let second = create_empty_exec_path(&paths, "profile-a").unwrap();
+        assert_ne!(second.path(), first_path);
+        assert_eq!(fs::read_dir(second.path()).unwrap().count(), 0);
+        assert!(!second.path().join("stale-helper").exists());
     }
 
     #[cfg(target_os = "linux")]

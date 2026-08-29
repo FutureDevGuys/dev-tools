@@ -173,6 +173,22 @@ fn cache_refreshes_before_expiry_and_never_accepts_wrong_scope() {
         &entry.permissions
     ));
     assert!(!entry.is_usable_at(1, 42, 101, "exampleorg", "syscfg", &entry.permissions));
+    assert!(entry.is_usable_for_repository_at(
+        1,
+        42,
+        101,
+        "exampleorg",
+        "sample-repo",
+        &entry.permissions
+    ));
+    assert!(!entry.is_usable_for_repository_at(
+        1,
+        42,
+        999,
+        "exampleorg",
+        "sample-repo",
+        &entry.permissions
+    ));
 }
 
 #[test]

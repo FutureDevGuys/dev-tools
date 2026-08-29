@@ -580,15 +580,12 @@ impl CacheEntry {
         &self,
         now: i64,
         app_id: u64,
+        installation_id: u64,
         owner: &str,
         repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
-        self.app_id == app_id
-            && self.owner == owner
-            && self.repository == repository
-            && self.permissions == *permissions
-            && now < self.expires_at - TOKEN_REFRESH_MARGIN_SECONDS
+        self.is_usable_at(now, app_id, installation_id, owner, repository, permissions)
     }
 
     pub fn token(&self) -> &SecretString {

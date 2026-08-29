@@ -22,6 +22,7 @@ signature = "2"
 ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "net"] }
 toml = "0.9"
 ureq = { version = "3.4", features = ["json"] }
@@ -37,9 +38,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [[bin]]
 name = "dev-auth"
