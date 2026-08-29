@@ -816,23 +816,31 @@ fn repo_view_positional_repository(arguments: &[String]) -> Result<Option<String
     Ok(positional)
 }
 
-fn forwarded_gh_arguments(arguments: &[String]) -> Result<Vec<String>> {
-    let mut forwarded = Vec::with_capacity(arguments.len());
-    let mut index = 0;
+fn forwarded_gh_arguments(
+    arguments: &[String],
+    owner: &str,
+    repository: &str,
+) -> Result<Vec<String>> {
+    if arguments.first().map(String::as_str) != Some("repo")
+        || arguments.get(1).map(String::as_str) != Some("view")
+        || repo_view_positional_repository(arguments)?.is_some()
+    {
+        return Ok(arguments.to_vec());
+    }
+
+    let mut forwarded = Vec::with_capacity(arguments.len() + 1);
+    forwarded.extend_from_slice(&arguments[..2]);
+    forwarded.push(format!("{owner}/{repository}"));
+    let mut index = 2;
     while index < arguments.len() {
         if matches!(arguments[index].as_str(), "-R" | "--repo") {
-            if arguments.get(index + 1).is_none() {
-                bail!("gh repository flag has no value");
-            }
             index += 2;
-            continue;
-        }
-        if arguments[index].starts_with("--repo=") {
+        } else if arguments[index].starts_with("--repo=") {
             index += 1;
-            continue;
+        } else {
+            forwarded.push(arguments[index].clone());
+            index += 1;
         }
-        forwarded.push(arguments[index].clone());
-        index += 1;
     }
     Ok(forwarded)
 }
@@ -869,7 +877,7 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
     let (owner, repository) = resolve_gh_repository(arguments, &config.programs.git)?;
-    let forwarded = forwarded_gh_arguments(arguments)?;
+    let forwarded = forwarded_gh_arguments(arguments, &owner, &repository)?;
     let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
     let token = entry.token().clone();
     let input: BTreeMap<String, String> = env::vars().collect();
@@ -1527,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_selector_is_consumed_before_invoking_upstream_gh() {
+    fn repository_view_flag_is_translated_to_its_native_positional_selector() {
         let arguments = vec![
             "repo".into(),
             "view".into(),
@@ -1537,8 +1545,48 @@ mod tests {
             "nameWithOwner".into(),
         ];
         assert_eq!(
-            forwarded_gh_arguments(&arguments).unwrap(),
-            vec!["repo", "view", "--json", "nameWithOwner"]
+            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            vec![
+                "repo",
+                "view",
+                "ExampleOrg/sample-repo",
+                "--json",
+                "nameWithOwner"
+            ]
+        );
+    }
+
+    #[test]
+    fn repository_view_injects_the_resolved_repository_when_no_selector_is_positional() {
+        let arguments = vec![
+            "repo".into(),
+            "view".into(),
+            "--json".into(),
+            "nameWithOwner".into(),
+        ];
+        assert_eq!(
+            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            vec![
+                "repo",
+                "view",
+                "ExampleOrg/sample-repo",
+                "--json",
+                "nameWithOwner"
+            ]
+        );
+    }
+
+    #[test]
+    fn native_repository_flags_are_preserved_for_commands_that_support_them() {
+        let arguments = vec![
+            "pr".into(),
+            "list".into(),
+            "-R".into(),
+            "ExampleOrg/sample-repo".into(),
+        ];
+        assert_eq!(
+            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            arguments
         );
     }
 
@@ -1555,7 +1603,10 @@ mod tests {
             explicit_gh_repository(&arguments).unwrap(),
             Some("ExampleOrg/sample-repo".into())
         );
-        assert_eq!(forwarded_gh_arguments(&arguments).unwrap(), arguments);
+        assert_eq!(
+            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            arguments
+        );
     }
 
     #[test]
@@ -1571,7 +1622,10 @@ mod tests {
             explicit_gh_repository(&arguments).unwrap(),
             Some("ExampleOrg/sample-repo".into())
         );
-        assert_eq!(forwarded_gh_arguments(&arguments).unwrap(), arguments);
+        assert_eq!(
+            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            arguments
+        );
     }
 
     #[test]
