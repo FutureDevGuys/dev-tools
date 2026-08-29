@@ -102,8 +102,85 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
 }
 
 #[test]
-fn offline_validation_is_value_free_and_does_not_read_secrets() {
+fn unsafe_gh_operations_are_rejected_before_configuration_or_credentials_are_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let frontend = directory.path().join("gh-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
     let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+
+    for arguments in [
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--base",
+            "main",
+            "--title",
+            "Bounded change",
+            "--body",
+            "Reviewed body",
+            "--dry-run",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body-file=/proc/self/environ",
+        ],
+        vec!["pr", "comment", "42", "--body-file=private-link"],
+        vec!["pr", "review", "42", "-aF/proc/self/environ"],
+        vec!["pr", "merge", "42", "--admin", "--squash"],
+        vec!["run", "download", "42", "--dir=/tmp"],
+        vec!["repo", "view", "-RExampleOrg/sample-repo"],
+        vec![
+            "pr",
+            "comment",
+            "https://github.com/OtherOrg/other-repo/pull/42",
+            "--body",
+            "cross-repository",
+        ],
+        vec!["pr", "view", "42", "--unknown"],
+    ] {
+        let output = Command::new(&frontend)
+            .args(&arguments)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(!error.contains("configuration"), "{arguments:?}: {error}");
+        assert!(!error.contains("credential"), "{arguments:?}: {error}");
+    }
+}
+
+#[test]
+fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
+    let home = tempfile::tempdir().unwrap();
+    let gh = home.path().join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\n\
+         [ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 91\n\
+         [ -z \"${GH_TOKEN+x}\" ] || exit 92\n\
+         [ -z \"${GITHUB_TOKEN+x}\" ] || exit 93\n\
+         [ -z \"${GH_REPO+x}\" ] || exit 94\n\
+         [ -z \"${DEV_AUTH_GH_CHILD+x}\" ] || exit 95\n\
+         [ -z \"${DEV_AUTH_GH_GIT+x}\" ] || exit 96\n\
+         case \"$HOME\" in */gh-sandbox/home) ;; *) exit 97 ;; esac\n\
+         case \"$GH_CONFIG_DIR\" in */gh-sandbox/config) ;; *) exit 98 ;; esac\n\
+         printf 'gh version 2.98.0 (2026-08-21)\\nhttps://github.com/cli/cli/releases/tag/v2.98.0\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
     let config_dir = home.path().join(".config/dev-auth");
     fs::create_dir_all(&config_dir).unwrap();
     fs::set_permissions(
@@ -112,21 +189,23 @@ fn offline_validation_is_value_free_and_does_not_read_secrets() {
     )
     .unwrap();
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let config = r#"version = 1
+    let config = format!(
+        r#"version = 1
 [programs]
 op = "/usr/bin/false"
-gh = "/usr/bin/false"
+gh = "{}"
 git = "/usr/bin/false"
 ssh_add = "/usr/bin/false"
 ssh_keygen = "/usr/bin/false"
 [github]
 app_id = 42
 private_key_ref = "op://Example Vault/app/private-key"
+repository_selection = "all"
 discover_installations = true
-permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 [profiles.plan]
 executables = ["/usr/bin/false"]
-environment = { EXAMPLE_TOKEN = "op://Example Vault/plan/token" }
+environment = {{ EXAMPLE_TOKEN = "op://Example Vault/plan/token" }}
 [[ssh_profiles.automation.keys]]
 purpose = "authentication"
 private_key_ref = "op://Example Vault/auth/private-key"
@@ -135,7 +214,9 @@ fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 purpose = "signing"
 private_key_ref = "op://Example Vault/signing/private-key"
 fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-"#;
+"#,
+        gh.display()
+    );
     let config_path = config_dir.join("config.toml");
     fs::write(&config_path, config).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -158,6 +239,25 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         "config_valid=true online=false declared_exec_profiles=1 declared_ssh_profiles=1 declared_secret_references=4\n"
     );
     assert!(output.stderr.is_empty());
+
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf 'gh version 2.99.0 (2026-08-28)\\nhttps://github.com/cli/cli/releases/tag/v2.99.0\\n'\n",
+    )
+    .unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .arg("validate")
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8(rejected.stderr).unwrap();
+    assert!(error.contains("supported 2.98.0 protocol"));
+    assert!(!error.contains("2.99.0"));
 }
 
 #[test]
@@ -256,6 +356,7 @@ ssh_keygen = "/usr/bin/false"
 [github]
 app_id = 42
 private_key_ref = "op://Example Vault/app/private-key"
+repository_selection = "all"
 discover_installations = true
 permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 "#,
@@ -475,6 +576,7 @@ ssh_keygen = "{}"
 [github]
 app_id = 42
 private_key_ref = "op://Automation/app/key"
+repository_selection = "all"
 permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 discover_installations = true
 [[ssh_profiles.automation.keys]]

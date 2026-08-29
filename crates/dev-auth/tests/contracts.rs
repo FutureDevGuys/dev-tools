@@ -1,7 +1,7 @@
 use dev_auth::{
     admit_gh_arguments, parse_config, parse_github_repository, render_git_credential,
     sanitize_environment, CacheEntry, CredentialRequest, GitHubInstallation, GitHubProfile,
-    SecretString,
+    RepositorySelection, SecretString,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +20,7 @@ fn profile() -> GitHubProfile {
     GitHubProfile {
         app_id: 42,
         private_key_ref: "op://Machine Vault/contributor-app/private-key".into(),
+        repository_selection: RepositorySelection::Selected,
         discover_installations: false,
         installations: vec![GitHubInstallation {
             owner: "ExampleOrg".into(),
@@ -109,6 +110,7 @@ fn all_repository_installation_selects_new_repository_without_static_ids() {
     let profile = GitHubProfile {
         app_id: 42,
         private_key_ref: "op://Machine Vault/contributor-app/private-key".into(),
+        repository_selection: RepositorySelection::All,
         discover_installations: false,
         installations: vec![GitHubInstallation {
             owner: "ExampleOrg".into(),
@@ -218,6 +220,7 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [github]
 app_id = 42
 	private_key_ref = "op://Any Vault/contributor-app/private-key"
+repository_selection = "selected"
 permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
 
 [[github.installations]]
@@ -246,6 +249,10 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     assert_eq!(config.credential_store.account, "service-token");
     assert_eq!(config.programs.gh, "/usr/bin/gh");
     assert_eq!(config.github.app_id, 42);
+    assert_eq!(
+        config.github.repository_selection,
+        RepositorySelection::Selected
+    );
     assert_eq!(
         config.profiles["terraform-plan"].executables,
         ["/usr/bin/terraform"]
@@ -307,6 +314,7 @@ repositories = ["sample-repo"]
 fn published_example_is_complete_and_valid() {
     let config = parse_config(include_bytes!("../config.example.toml")).unwrap();
     assert!(config.github.discover_installations);
+    assert_eq!(config.github.repository_selection, RepositorySelection::All);
     assert!(config.github.installations.is_empty());
     assert_eq!(config.profiles.len(), 1);
     assert_eq!(config.ssh_profiles.len(), 1);
@@ -315,7 +323,7 @@ fn published_example_is_complete_and_valid() {
 
 #[test]
 fn installation_scope_is_exactly_all_or_a_static_allowlist() {
-    let base = |installation: &str| {
+    let base = |selection: &str, installation: &str| {
         format!(
             r#"version = 1
 [programs]
@@ -327,6 +335,7 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [github]
 app_id = 42
 private_key_ref = "op://Machine Vault/contributor-app/private-key"
+repository_selection = "{selection}"
 permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 [[github.installations]]
 owner = "ExampleOrg"
@@ -335,13 +344,19 @@ installation_id = 101
 "#
         )
     };
-    assert!(parse_config(base("all_repositories = true").as_bytes()).is_ok());
-    assert!(parse_config(base("repositories = [\"sample-repo\"]").as_bytes()).is_ok());
+    assert!(parse_config(base("all", "all_repositories = true").as_bytes()).is_ok());
+    assert!(parse_config(base("selected", "repositories = [\"sample-repo\"]").as_bytes()).is_ok());
     assert!(parse_config(
-        base("all_repositories = true\nrepositories = [\"sample-repo\"]").as_bytes()
+        base(
+            "all",
+            "all_repositories = true\nrepositories = [\"sample-repo\"]"
+        )
+        .as_bytes()
     )
     .is_err());
-    assert!(parse_config(base("all_repositories = false").as_bytes()).is_err());
+    assert!(parse_config(base("selected", "all_repositories = false").as_bytes()).is_err());
+    assert!(parse_config(base("all", "repositories = [\"sample-repo\"]").as_bytes()).is_err());
+    assert!(parse_config(base("selected", "all_repositories = true").as_bytes()).is_err());
 
     let dynamic = r#"version = 1
 [programs]
@@ -353,6 +368,7 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [github]
 app_id = 42
 private_key_ref = "op://Machine Vault/contributor-app/private-key"
+repository_selection = "all"
 discover_installations = true
 permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
 "#;
@@ -376,6 +392,7 @@ fn credential_bearing_commands_require_exact_absolute_paths() {
 [github]
 app_id = 42
 private_key_ref = "op://Machine Vault/contributor-app/private-key"
+repository_selection = "all"
 discover_installations = true
 permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 {profile}
@@ -478,10 +495,43 @@ fn github_repository_parser_accepts_only_exact_github_repository_identifiers() {
 fn gh_surface_is_repository_scoped_and_excludes_administration() {
     for accepted in [
         vec!["pr", "list"],
-        vec!["pr", "create", "-R", "ExampleOrg/sample-repo"],
-        vec!["run", "view"],
+        vec![
+            "pr",
+            "create",
+            "-R",
+            "ExampleOrg/sample-repo",
+            "--head",
+            "automation/change",
+            "--base",
+            "main",
+            "--title",
+            "Bounded change",
+            "--body",
+            "Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body-file=-",
+        ],
+        vec![
+            "pr",
+            "create",
+            "-H",
+            "automation/change",
+            "-B",
+            "main",
+            "-t",
+            "Bounded change",
+            "-F",
+            "-",
+        ],
+        vec!["run", "view", "42"],
         vec!["workflow", "list"],
-        vec!["release", "download"],
+        vec!["release", "view", "v1.0.0"],
         vec!["repo", "view"],
     ] {
         assert!(admit_gh_arguments(&accepted).is_ok(), "{accepted:?}");
@@ -493,6 +543,8 @@ fn gh_surface_is_repository_scoped_and_excludes_administration() {
         vec!["repo", "clone"],
         vec!["repo", "delete"],
         vec!["workflow", "run"],
+        vec!["run", "download"],
+        vec!["release", "download"],
         vec!["secret", "set"],
         vec!["variable", "set"],
         vec!["issue", "create"],
@@ -500,10 +552,360 @@ fn gh_surface_is_repository_scoped_and_excludes_administration() {
         vec!["repo", "view", "--web"],
         vec!["pr", "view", "-w"],
         vec!["pr", "create", "--editor"],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "-dF/proc/self/environ",
+        ],
+        vec!["pr", "view", "42", "-wc"],
+        vec!["run", "view", "42", "-wv"],
+        vec!["workflow", "view", "build", "-wy"],
+        vec!["repo", "view", "-wbmain"],
+        vec!["repo", "view", "-RExampleOrg/sample-repo"],
+        vec!["repo", "view", "-R=ExampleOrg/sample-repo"],
+        vec!["repo", "view", "-w=true"],
+        vec!["repo", "view", "--"],
+        vec!["pr", "create"],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--title",
+            "Bounded change",
+            "--body",
+            "Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--body",
+            "Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--title",
+            "Bounded change",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--title",
+            "Bounded change",
+            "--body",
+            "Reviewed body",
+            "--body-file",
+            "reviewed.md",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--title=Bounded change",
+            "--body-file=reviewed.md",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--title=Bounded change",
+            "--body-file=/proc/self/environ",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--title=Bounded change",
+            "--body-file=symlink-to-private-file",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--head=automation/other",
+            "--title",
+            "Bounded change",
+            "--body",
+            "Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--title=Bounded change",
+            "-t",
+            "Other title",
+            "--body",
+            "Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--title=",
+            "--body=Reviewed body",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "--dry-run",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "--fill",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "--fill-first",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "--fill-verbose",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "-f",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "--recover",
+            "recovery-token",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "--template",
+            "pull_request.md",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "-e",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body=Reviewed body",
+            "-dw",
+        ],
         vec!["pr", "close", "42", "--delete-branch"],
         vec!["pr", "close", "42", "-d"],
         vec!["pr", "merge", "42", "--delete-branch=false"],
         vec!["pr", "merge", "42", "-d=false"],
+    ] {
+        assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
+fn gh_pull_request_mutations_require_explicit_noninteractive_inputs() {
+    for accepted in [
+        vec!["pr", "comment", "42", "--body", "Reviewed comment"],
+        vec!["pr", "comment", "42", "--body-file=-"],
+        vec!["pr", "edit", "42", "--title", "Revised title"],
+        vec!["pr", "edit", "42", "--body-file", "-"],
+        vec!["pr", "ready", "42"],
+        vec!["pr", "review", "42", "--approve"],
+        vec![
+            "pr",
+            "review",
+            "42",
+            "--comment",
+            "--body",
+            "Reviewed comment",
+        ],
+        vec!["pr", "review", "42", "--request-changes", "--body-file=-"],
+        vec!["pr", "merge", "42", "--squash"],
+        vec!["pr", "merge", "42", "--merge", "--body-file", "-"],
+        vec!["pr", "close", "42"],
+        vec!["pr", "reopen", "42"],
+    ] {
+        assert!(admit_gh_arguments(&accepted).is_ok(), "{accepted:?}");
+    }
+
+    for rejected in [
+        vec!["pr", "comment", "--body", "inferred target"],
+        vec!["pr", "comment", "42"],
+        vec!["pr", "comment", "42", "--body-file", "reviewed.md"],
+        vec!["pr", "comment", "42", "--body-file=/proc/self/environ"],
+        vec!["pr", "comment", "42", "--body-file=symlink-to-private-file"],
+        vec!["pr", "comment", "42", "--edit-last", "--body", "edited"],
+        vec!["pr", "comment", "42", "--delete-last"],
+        vec!["pr", "edit", "--title", "inferred target"],
+        vec!["pr", "edit", "42"],
+        vec!["pr", "edit", "42", "--body-file=reviewed.md"],
+        vec!["pr", "review", "--approve"],
+        vec!["pr", "review", "42"],
+        vec!["pr", "review", "42", "--comment"],
+        vec![
+            "pr",
+            "review",
+            "42",
+            "--approve",
+            "--request-changes",
+            "--body",
+            "conflicting",
+        ],
+        vec!["pr", "review", "42", "--approve", "--body-file=reviewed.md"],
+        vec!["pr", "review", "42", "-aF/proc/self/environ"],
+        vec!["pr", "ready", "--undo"],
+        vec!["pr", "merge", "--squash"],
+        vec!["pr", "merge", "42"],
+        vec!["pr", "merge", "42", "--admin", "--squash"],
+        vec!["pr", "merge", "42", "--merge", "--squash"],
+        vec!["pr", "merge", "42", "--squash", "--body-file=reviewed.md"],
+        vec!["pr", "merge", "42", "-mF/proc/self/environ"],
+        vec!["pr", "merge", "42", "--merge", "-dF/reviewed.md"],
+        vec!["pr", "close", "42", "-dcTEXT"],
+        vec!["pr", "close"],
+        vec!["pr", "reopen"],
+    ] {
+        assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
+fn gh_pull_request_targets_and_flags_are_fail_closed() {
+    for accepted in [
+        vec!["pr", "view", "42"],
+        vec!["pr", "checks", "42", "--required"],
+        vec!["pr", "diff", "42", "--name-only"],
+    ] {
+        assert!(admit_gh_arguments(&accepted).is_ok(), "{accepted:?}");
+    }
+
+    for subcommand in ["view", "checks", "diff"] {
+        for selector in [
+            "https://github.com/OtherOrg/other-repo/pull/42",
+            "feature/branch",
+            "0",
+            "-1",
+        ] {
+            let rejected = vec!["pr", subcommand, selector];
+            assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
+        }
+        let inferred = vec!["pr", subcommand];
+        assert!(admit_gh_arguments(&inferred).is_err(), "{inferred:?}");
+    }
+
+    for subcommand in [
+        "comment", "edit", "ready", "review", "merge", "close", "reopen",
+    ] {
+        let rejected = vec![
+            "pr",
+            subcommand,
+            "https://github.com/OtherOrg/other-repo/pull/42",
+        ];
+        assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
+    }
+
+    for rejected in [
+        vec!["pr", "list", "--unknown"],
+        vec!["pr", "view", "42", "--unknown"],
+        vec!["pr", "checks", "42", "--unknown"],
+        vec!["pr", "diff", "42", "--allow-escape-sequences"],
+        vec!["run", "list", "--unknown"],
+        vec!["run", "view", "1", "--unknown"],
+        vec!["run", "watch", "1", "--unknown"],
+        vec!["workflow", "list", "--unknown"],
+        vec!["workflow", "view", "build.yml", "--unknown"],
+        vec!["release", "list", "--unknown"],
+        vec!["release", "view", "v1.0.0", "--unknown"],
+        vec!["repo", "view", "--unknown"],
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "h",
+            "--base",
+            "b",
+            "--title",
+            "t",
+            "--body",
+            "safe",
+            "-dF/proc/self/environ",
+        ],
+        vec!["pr", "review", "42", "-aF/proc/self/environ"],
+        vec!["pr", "merge", "42", "-mF/proc/self/environ"],
+        vec!["pr", "close", "42", "-dccomment"],
+        vec!["pr", "merge", "42", "--merge", "-dF/proc/self/environ"],
+        vec![
+            "pr", "create", "--head", "h", "--base", "b", "--title", "t", "--body", "b", "-e",
+        ],
+        vec![
+            "pr", "create", "--head", "h", "--base", "b", "--title", "t", "--body", "b", "-dw",
+        ],
+        vec!["pr", "view", "42", "-wc"],
+        vec!["run", "view", "1", "-wv"],
+        vec!["workflow", "view", "1", "-wy"],
+        vec!["repo", "view", "-wbmain"],
+        vec!["repo", "view", "-w=true"],
+        vec!["repo", "view", "-ROtherOrg/other-repo"],
+        vec!["repo", "view", "-R=OtherOrg/other-repo"],
     ] {
         assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
     }

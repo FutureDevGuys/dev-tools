@@ -21,6 +21,7 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [github]
 app_id = 12345
 private_key_ref = "op://Automation Example/contributor-app/private-key"
+repository_selection = "all"
 discover_installations = true
 permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
 

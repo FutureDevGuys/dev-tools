@@ -46,6 +46,11 @@ mod windows_security;
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
+// Reviewed against github/cli tag v2.98.0 at
+// a255baf71d13fe5947a4eb7ad521ffd412d64cee.
+const SUPPORTED_GH_VERSION: &str = "2.98.0";
+const SUPPORTED_GH_VERSION_OUTPUT: &str =
+    "gh version 2.98.0 (2026-08-21)\nhttps://github.com/cli/cli/releases/tag/v2.98.0\n";
 #[cfg(windows)]
 const GH_CHILD_FRONTENDS: [&str; 3] = ["git.exe", "cat.exe", "false.exe"];
 #[cfg(not(windows))]
@@ -529,6 +534,7 @@ struct RepositoryInstallationResponse {
     app_id: u64,
     account: InstallationAccountResponse,
     permissions: BTreeMap<String, String>,
+    repository_selection: crate::RepositorySelection,
     suspended_at: Option<serde_json::Value>,
 }
 
@@ -601,6 +607,7 @@ fn validate_repository_installation_response(
         || installation.app_id != config.github.app_id
         || !installation.account.login.eq_ignore_ascii_case(owner)
         || installation.permissions != config.github.permissions
+        || installation.repository_selection != config.github.repository_selection
         || installation.suspended_at.is_some()
     {
         bail!("GitHub App repository installation does not match the declared authority");
@@ -742,16 +749,24 @@ impl From<CacheFile> for CacheEntry {
 fn cache_key(
     app_id: u64,
     installation_id: u64,
+    repository_selection: crate::RepositorySelection,
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let public_scope = serde_json::to_vec(&(app_id, installation_id, repository, permissions))
-        .context("serialize installation-token cache scope")?;
+    let public_scope = serde_json::to_vec(&(
+        app_id,
+        installation_id,
+        repository_selection,
+        repository,
+        permissions,
+    ))
+    .context("serialize installation-token cache scope")?;
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
 fn dynamic_cache_key(
     app_id: u64,
+    repository_selection: crate::RepositorySelection,
     owner: &str,
     repository: &str,
     permissions: &BTreeMap<String, String>,
@@ -759,6 +774,7 @@ fn dynamic_cache_key(
     let public_scope = serde_json::to_vec(&(
         "dynamic",
         app_id,
+        repository_selection,
         owner.to_ascii_lowercase(),
         repository.to_ascii_lowercase(),
         permissions,
@@ -829,6 +845,7 @@ where
     let key = cache_key(
         config.github.app_id,
         selected.installation_id,
+        config.github.repository_selection,
         &selected.repository,
         &config.github.permissions,
     )?;
@@ -872,6 +889,7 @@ fn locked_dynamic_cache_entry(
     let repository = repository.to_ascii_lowercase();
     let key = dynamic_cache_key(
         config.github.app_id,
+        config.github.repository_selection,
         &owner,
         &repository,
         &config.github.permissions,
@@ -1000,119 +1018,16 @@ pub fn github_token_for_repository(owner: &str, repository: &str) -> Result<Secr
     Ok(entry.token().clone())
 }
 
-fn explicit_gh_repository(arguments: &[String]) -> Result<Option<String>> {
-    let mut selected: Option<String> = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        let value = if matches!(arguments[index].as_str(), "-R" | "--repo") {
-            index += 1;
-            Some(
-                arguments
-                    .get(index)
-                    .context("gh repository flag has no value")?
-                    .clone(),
-            )
-        } else {
-            arguments[index].strip_prefix("--repo=").map(str::to_owned)
-        };
-        if let Some(value) = value {
-            if selected.as_ref().is_some_and(|current| current != &value) {
-                bail!("gh command contains conflicting repository selectors");
-            }
-            selected = Some(value);
-        }
-        index += 1;
-    }
-    if let Some(value) = repo_view_positional_repository(arguments)? {
-        if selected.as_ref().is_some_and(|current| current != &value) {
-            bail!("gh command contains conflicting repository selectors");
-        }
-        selected = Some(value);
-    }
-    Ok(selected)
-}
-
-fn repo_view_positional_repository(arguments: &[String]) -> Result<Option<String>> {
-    if arguments.first().map(String::as_str) != Some("repo")
-        || arguments.get(1).map(String::as_str) != Some("view")
-    {
-        return Ok(None);
-    }
-
-    let mut positional: Option<String> = None;
-    let mut index = 2;
-    let mut options_ended = false;
-    while index < arguments.len() {
-        let argument = &arguments[index];
-        if !options_ended && argument == "--" {
-            options_ended = true;
-            index += 1;
-            continue;
-        }
-        if !options_ended && matches!(argument.as_str(), "-R" | "--repo") {
-            index += 1;
-            arguments
-                .get(index)
-                .context("gh repository flag has no value")?;
-        } else if !options_ended
-            && matches!(
-                argument.as_str(),
-                "-b" | "--branch" | "-q" | "--jq" | "--json" | "-t" | "--template"
-            )
-        {
-            index += 1;
-            arguments
-                .get(index)
-                .with_context(|| format!("gh repo view flag {argument} has no value"))?;
-        } else if !options_ended
-            && (matches!(argument.as_str(), "-w" | "--web" | "--help")
-                || argument.starts_with("--repo=")
-                || ["--branch=", "--jq=", "--json=", "--template="]
-                    .iter()
-                    .any(|prefix| argument.starts_with(prefix)))
-        {
-            // Flag is complete in this argument.
-        } else if !options_ended && argument.starts_with('-') {
-            bail!("unsupported gh repo view flag: {argument}");
-        } else {
-            crate::parse_github_repository(argument)?;
-            if positional.is_some() {
-                bail!("gh repo view contains more than one positional repository");
-            }
-            positional = Some(argument.clone());
-        }
-        index += 1;
-    }
-    Ok(positional)
-}
-
 fn forwarded_gh_arguments(
-    arguments: &[String],
+    mut plan: crate::GhInvocationPlan,
     owner: &str,
     repository: &str,
-) -> Result<Vec<String>> {
-    if arguments.first().map(String::as_str) != Some("repo")
-        || arguments.get(1).map(String::as_str) != Some("view")
-        || repo_view_positional_repository(arguments)?.is_some()
-    {
-        return Ok(arguments.to_vec());
+) -> Vec<String> {
+    if plan.inject_repository_argument {
+        plan.forwarded_arguments
+            .insert(2, format!("{owner}/{repository}"));
     }
-
-    let mut forwarded = Vec::with_capacity(arguments.len() + 1);
-    forwarded.extend_from_slice(&arguments[..2]);
-    forwarded.push(format!("{owner}/{repository}"));
-    let mut index = 2;
-    while index < arguments.len() {
-        if matches!(arguments[index].as_str(), "-R" | "--repo") {
-            index += 2;
-        } else if arguments[index].starts_with("--repo=") {
-            index += 1;
-        } else {
-            forwarded.push(arguments[index].clone());
-            index += 1;
-        }
-    }
-    Ok(forwarded)
+    plan.forwarded_arguments
 }
 
 fn origin_repository(program: &str) -> Result<String> {
@@ -1132,15 +1047,17 @@ fn origin_repository(program: &str) -> Result<String> {
     Ok(value.trim_end_matches(['\n', '\r']).to_owned())
 }
 
-fn resolve_gh_repository(arguments: &[String], git_program: &str) -> Result<(String, String)> {
-    let selected = match explicit_gh_repository(arguments)? {
-        Some(value) => value,
+fn resolve_gh_repository(
+    selected: Option<(String, String)>,
+    git_program: &str,
+) -> Result<(String, String)> {
+    match selected {
+        Some(repository) => Ok(repository),
         None => match env::var("GH_REPO") {
-            Ok(value) => value,
-            Err(_) => origin_repository(git_program)?,
+            Ok(value) => crate::exact_github_repository(&value),
+            Err(_) => crate::parse_github_repository(&origin_repository(git_program)?),
         },
-    };
-    crate::parse_github_repository(&selected)
+    }
 }
 
 fn file_sha256(path: &Path, description: &str) -> Result<[u8; 32]> {
@@ -1319,7 +1236,6 @@ fn isolated_gh_environment(
 ) -> BTreeMap<String, String> {
     const PLATFORM_ALLOWED: &[&str] = &[
         "COLORTERM",
-        "COMSPEC",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
@@ -1394,15 +1310,16 @@ fn isolated_gh_environment(
 }
 
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
-    crate::admit_gh_arguments(arguments)?;
+    let plan = crate::parse_gh_invocation(arguments)?;
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
     ensure_gh_sandbox(&paths)?;
     #[cfg(windows)]
     let _frontend_guards = gh_child_frontend_guards(&paths)?;
-    let (owner, repository) = resolve_gh_repository(arguments, &config.programs.git)?;
-    let forwarded = forwarded_gh_arguments(arguments, &owner, &repository)?;
     let _program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
+    validate_gh_version(&config.programs.gh, &paths)?;
+    let (owner, repository) = resolve_gh_repository(plan.repository.clone(), &config.programs.git)?;
+    let forwarded = forwarded_gh_arguments(plan, &owner, &repository);
     let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
     let token = entry.token().clone();
     let input: BTreeMap<String, String> = env::vars().collect();
@@ -1423,6 +1340,74 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
         .stderr(Stdio::inherit())
         .status()
         .context("run repository-scoped gh command")
+}
+
+fn gh_version_is_supported(stdout: &[u8], stderr: &[u8]) -> bool {
+    if !stderr.is_empty() {
+        return false;
+    }
+    stdout == SUPPORTED_GH_VERSION_OUTPUT.as_bytes()
+        || stdout == SUPPORTED_GH_VERSION_OUTPUT.replace('\n', "\r\n").as_bytes()
+}
+
+fn isolated_gh_probe_environment(paths: &RuntimePaths) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        ("HOME".into(), paths.gh_home_dir().display().to_string()),
+        (
+            "GH_CONFIG_DIR".into(),
+            paths.gh_config_dir().display().to_string(),
+        ),
+        (
+            "XDG_CONFIG_HOME".into(),
+            paths.gh_config_dir().display().to_string(),
+        ),
+        (
+            "XDG_CACHE_HOME".into(),
+            paths.gh_cache_dir().display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME".into(),
+            paths.gh_data_dir().display().to_string(),
+        ),
+        (
+            "APPDATA".into(),
+            paths.gh_config_dir().display().to_string(),
+        ),
+        (
+            "LOCALAPPDATA".into(),
+            paths.gh_data_dir().display().to_string(),
+        ),
+        ("TMP".into(), paths.gh_temp_dir().display().to_string()),
+        ("TEMP".into(), paths.gh_temp_dir().display().to_string()),
+        ("TMPDIR".into(), paths.gh_temp_dir().display().to_string()),
+        ("GH_PROMPT_DISABLED".into(), "1".into()),
+        ("GH_NO_UPDATE_NOTIFIER".into(), "1".into()),
+        ("GH_NO_EXTENSION_UPDATE_NOTIFIER".into(), "1".into()),
+        ("GH_TELEMETRY".into(), "false".into()),
+    ]);
+    for variable in ["COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"] {
+        if let Ok(value) = env::var(variable) {
+            environment.insert(variable.into(), value);
+        }
+    }
+    environment
+}
+
+fn validate_gh_version(program: &str, paths: &RuntimePaths) -> Result<()> {
+    let output = Command::new(program)
+        .arg("--version")
+        .env_clear()
+        .envs(isolated_gh_probe_environment(paths))
+        .stdin(Stdio::null())
+        .output()
+        .context("inspect configured GitHub CLI version")?;
+    if !output.status.success() || !gh_version_is_supported(&output.stdout, &output.stderr) {
+        bail!(
+            "configured GitHub CLI does not match the supported {} protocol",
+            SUPPORTED_GH_VERSION
+        );
+    }
+    Ok(())
 }
 
 fn valid_git_ref_fragment(value: &str) -> bool {
@@ -1663,6 +1648,7 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
     let key = if config.github.discover_installations {
         dynamic_cache_key(
             config.github.app_id,
+            config.github.repository_selection,
             owner,
             repository,
             &config.github.permissions,
@@ -1672,6 +1658,7 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
         cache_key(
             config.github.app_id,
             selected.installation_id,
+            config.github.repository_selection,
             &selected.repository,
             &config.github.permissions,
         )?
@@ -2152,6 +2139,8 @@ fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
 pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
+    let _gh_program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
+    validate_gh_version(&config.programs.gh, &paths)?;
     let references = config.declared_secret_references();
     if online {
         let mut secrets = BTreeMap::new();
@@ -2373,6 +2362,7 @@ mod tests {
             github: GitHubProfile {
                 app_id: 1,
                 private_key_ref: "op://Machine Vault/app/private-key".into(),
+                repository_selection: crate::RepositorySelection::All,
                 discover_installations: false,
                 installations: Vec::new(),
                 permissions: BTreeMap::new(),
@@ -2380,6 +2370,33 @@ mod tests {
             profiles: BTreeMap::new(),
             ssh_profiles: profiles,
         }
+    }
+
+    #[test]
+    fn gh_version_parser_accepts_only_the_reviewed_protocol_release() {
+        assert!(gh_version_is_supported(
+            SUPPORTED_GH_VERSION_OUTPUT.as_bytes(),
+            b""
+        ));
+        assert!(gh_version_is_supported(
+            SUPPORTED_GH_VERSION_OUTPUT.replace('\n', "\r\n").as_bytes(),
+            b""
+        ));
+        for output in [
+            b"gh version 2.98.0 (2026-08-20)\nhttps://github.com/cli/cli/releases/tag/v2.98.0\n"
+                .as_slice(),
+            b"gh version 2.97.0 (2026-08-13)\n".as_slice(),
+            b"gh version 2.99.0 (2026-08-27)\n".as_slice(),
+            b"attacker gh version 2.98.0\n".as_slice(),
+            b"gh version\n".as_slice(),
+            b"\xff\n".as_slice(),
+        ] {
+            assert!(!gh_version_is_supported(output, b""));
+        }
+        assert!(!gh_version_is_supported(
+            SUPPORTED_GH_VERSION_OUTPUT.as_bytes(),
+            b"warning\n"
+        ));
     }
 
     #[test]
@@ -2401,18 +2418,57 @@ mod tests {
     #[test]
     fn dynamic_cache_scope_is_case_insensitive_and_owner_specific() {
         let permissions = BTreeMap::from([("contents".into(), "write".into())]);
-        let expected = dynamic_cache_key(42, "ExampleOrg", "Sample-Repo", &permissions).unwrap();
+        let expected = dynamic_cache_key(
+            42,
+            crate::RepositorySelection::All,
+            "ExampleOrg",
+            "Sample-Repo",
+            &permissions,
+        )
+        .unwrap();
         assert_eq!(
             expected,
-            dynamic_cache_key(42, "exampleorg", "sample-repo", &permissions).unwrap()
+            dynamic_cache_key(
+                42,
+                crate::RepositorySelection::All,
+                "exampleorg",
+                "sample-repo",
+                &permissions,
+            )
+            .unwrap()
         );
         assert_ne!(
             expected,
-            dynamic_cache_key(42, "AnotherOrg", "sample-repo", &permissions).unwrap()
+            dynamic_cache_key(
+                42,
+                crate::RepositorySelection::All,
+                "AnotherOrg",
+                "sample-repo",
+                &permissions,
+            )
+            .unwrap()
         );
         assert_ne!(
             expected,
-            dynamic_cache_key(99, "ExampleOrg", "Sample-Repo", &permissions).unwrap()
+            dynamic_cache_key(
+                99,
+                crate::RepositorySelection::All,
+                "ExampleOrg",
+                "Sample-Repo",
+                &permissions,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            expected,
+            dynamic_cache_key(
+                42,
+                crate::RepositorySelection::Selected,
+                "ExampleOrg",
+                "Sample-Repo",
+                &permissions,
+            )
+            .unwrap()
         );
     }
 
@@ -2430,6 +2486,7 @@ mod tests {
             ("GH_EDITOR".into(), "/attacker/editor".into()),
             ("BROWSER".into(), "/attacker/browser".into()),
             ("PAGER".into(), "/attacker/pager".into()),
+            ("COMSPEC".into(), "/attacker/shell".into()),
         ]);
         let environment = isolated_gh_environment(
             &input,
@@ -2466,6 +2523,7 @@ mod tests {
         assert_eq!(environment["PAGER"], "cat");
         assert_eq!(environment["DEV_AUTH_GH_CHILD"], "1");
         assert_eq!(environment["DEV_AUTH_GH_GIT"], "/trusted/bin/git");
+        assert!(!environment.contains_key("COMSPEC"));
         assert!(!environment.values().any(|value| value.contains("attacker")));
         assert!(!environment.values().any(|value| value == "/home/example"));
     }
@@ -2719,7 +2777,7 @@ mod tests {
 
     #[test]
     fn repository_view_flag_is_translated_to_its_native_positional_selector() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "-R".into(),
@@ -2727,8 +2785,13 @@ mod tests {
             "--json".into(),
             "nameWithOwner".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
+        );
+        assert_eq!(
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
             vec![
                 "repo",
                 "view",
@@ -2741,14 +2804,16 @@ mod tests {
 
     #[test]
     fn repository_view_injects_the_resolved_repository_when_no_selector_is_positional() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "--json".into(),
             "nameWithOwner".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
+        assert_eq!(plan.repository, None);
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
             vec![
                 "repo",
                 "view",
@@ -2760,60 +2825,79 @@ mod tests {
     }
 
     #[test]
-    fn native_repository_flags_are_preserved_for_commands_that_support_them() {
-        let arguments = vec![
+    fn repository_flags_are_bound_once_and_removed_from_child_arguments() {
+        let arguments: Vec<String> = vec![
             "pr".into(),
             "list".into(),
             "-R".into(),
             "ExampleOrg/sample-repo".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
-            arguments
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
+        );
+        assert_eq!(
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
+            vec!["pr", "list"]
         );
     }
 
     #[test]
     fn repository_view_positional_selects_the_token_scope_and_is_forwarded() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "ExampleOrg/sample-repo".into(),
             "--json".into(),
             "nameWithOwner".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            explicit_gh_repository(&arguments).unwrap(),
-            Some("ExampleOrg/sample-repo".into())
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
         );
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
-            arguments
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
+            vec![
+                "repo",
+                "view",
+                "ExampleOrg/sample-repo",
+                "--json",
+                "nameWithOwner"
+            ]
         );
     }
 
     #[test]
     fn repository_view_positional_after_value_flag_selects_the_token_scope() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "--json".into(),
             "nameWithOwner".into(),
             "ExampleOrg/sample-repo".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            explicit_gh_repository(&arguments).unwrap(),
-            Some("ExampleOrg/sample-repo".into())
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
         );
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
-            arguments
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
+            vec![
+                "repo",
+                "view",
+                "ExampleOrg/sample-repo",
+                "--json",
+                "nameWithOwner"
+            ]
         );
     }
 
     #[test]
     fn repository_view_rejects_conflicting_flag_and_late_positional_selectors() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "--repo".into(),
@@ -2822,10 +2906,29 @@ mod tests {
             "nameWithOwner".into(),
             "ExampleOrg/second".into(),
         ];
-        assert!(explicit_gh_repository(&arguments)
+        assert!(crate::parse_gh_invocation(&arguments)
             .unwrap_err()
             .to_string()
-            .contains("conflicting repository selectors"));
+            .contains("more than one repository selector"));
+    }
+
+    #[test]
+    fn option_values_that_look_like_repository_flags_do_not_select_a_token_scope() {
+        let arguments: Vec<String> = vec![
+            "pr".into(),
+            "create".into(),
+            "--head".into(),
+            "automation/change".into(),
+            "--base".into(),
+            "main".into(),
+            "--title".into(),
+            "Bounded change".into(),
+            "--body".into(),
+            "--repo=OtherOrg/other-repo".into(),
+        ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
+        assert_eq!(plan.repository, None);
+        assert_eq!(plan.forwarded_arguments, arguments);
     }
 
     #[test]
@@ -2839,6 +2942,7 @@ mod tests {
             "app_id": 42,
             "account": {"login": "ExampleOrg"},
             "permissions": config.github.permissions,
+            "repository_selection": "all",
             "suspended_at": null
         });
         let selected = validate_repository_installation_response(
@@ -2851,6 +2955,16 @@ mod tests {
         assert_eq!(selected.installation_id, 101);
         assert_eq!(selected.owner, "exampleorg");
         assert_eq!(selected.repository, "new-repository");
+
+        let mut wrong_selection = response.clone();
+        wrong_selection["repository_selection"] = serde_json::json!("selected");
+        assert!(validate_repository_installation_response(
+            &config,
+            "exampleorg",
+            "New-Repository",
+            &serde_json::to_vec(&wrong_selection).unwrap(),
+        )
+        .is_err());
 
         let mut wrong_app = response;
         wrong_app["app_id"] = serde_json::json!(99);
