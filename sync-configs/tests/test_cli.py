@@ -1,13 +1,43 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
+from syncconfigs import cli
+
 PROJECT = Path(__file__).resolve().parents[1]
+
+
+class TtyBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_interactive_hook_progress_is_value_free_and_noninteractive_output_stays_quiet(
+    tmp_path: Path,
+) -> None:
+    entry = cli.Entry(
+        name="agent_plugin_installer",
+        source=tmp_path / "source",
+        target=tmp_path / "target",
+        mode="copy",
+        scope_label="Skills / Agent Plugins",
+    )
+    terminal = TtyBuffer()
+    cli.emit_script_progress(entry, "post_script", stream=terminal)
+    assert terminal.getvalue() == (
+        "[sync-configs] running post_script: "
+        "Skills / Agent Plugins / agent_plugin_installer\n"
+    )
+
+    captured = io.StringIO()
+    cli.emit_script_progress(entry, "post_script", stream=captured)
+    assert captured.getvalue() == ""
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
