@@ -682,6 +682,16 @@ pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
         .map(AsRef::as_ref)
         .context("gh command is missing")?;
     let subcommand = arguments.get(1).map(AsRef::as_ref);
+    if command == "pr"
+        && matches!(subcommand, Some("close" | "merge"))
+        && arguments.iter().skip(2).any(|argument| {
+            matches!(argument.as_ref(), "-d" | "--delete-branch")
+                || argument.as_ref().starts_with("-d=")
+                || argument.as_ref().starts_with("--delete-branch=")
+        })
+    {
+        bail!("gh branch deletion is outside the bounded automation surface");
+    }
     let accepted = match command {
         "pr" => matches!(
             subcommand,

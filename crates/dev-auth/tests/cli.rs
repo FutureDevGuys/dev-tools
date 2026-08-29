@@ -223,17 +223,20 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
 #[test]
 fn internal_gh_children_do_not_forward_the_installation_token_to_git() {
     let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
     let git_frontend = directory.path().join("git");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
     let upstream_git = directory.path().join("upstream-git");
     fs::write(
         &upstream_git,
-        "#!/bin/sh\n[ -z \"${GH_TOKEN+x}\" ] || exit 90\n[ -z \"${GITHUB_TOKEN+x}\" ] || exit 91\n[ \"$GIT_TERMINAL_PROMPT\" = 0 ] || exit 92\nprintf passed > \"$1\"\n",
+        format!(
+            "#!/bin/sh\n[ -z \"${{GH_TOKEN+x}}\" ] || exit 90\n[ -z \"${{GITHUB_TOKEN+x}}\" ] || exit 91\n[ \"$GIT_TERMINAL_PROMPT\" = 0 ] || exit 92\n[ \"$1 $2\" = 'remote -v' ] || exit 93\nprintf passed > '{}'\n",
+            home.path().join("git-child-result").display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&upstream_git, fs::Permissions::from_mode(0o700)).unwrap();
 
-    let home = tempfile::tempdir().unwrap();
     let config_dir = home.path().join(".config/dev-auth");
     fs::create_dir_all(&config_dir).unwrap();
     fs::set_permissions(
@@ -264,7 +267,7 @@ permissions = {{ actions = "read", checks = "read", contents = "write", metadata
 
     let marker = home.path().join("git-child-result");
     let output = Command::new(&git_frontend)
-        .arg(&marker)
+        .args(["remote", "-v"])
         .env_clear()
         .env("HOME", home.path())
         .env("PATH", directory.path())
@@ -283,6 +286,102 @@ permissions = {{ actions = "read", checks = "read", contents = "write", metadata
     assert_eq!(fs::read_to_string(marker).unwrap(), "passed");
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn internal_gh_git_child_rejects_url_scoped_repository_credential_helpers() {
+    let directory = tempfile::tempdir().unwrap();
+    let git_frontend = directory.path().join("git");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
+    let repository = directory.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+
+    let marker = directory.path().join("credential-helper-ran");
+    let helper = directory.path().join("credential-helper");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nif [ \"${{1:-}}\" = get ]; then\n  printf 'username=human\\npassword=human-secret\\n'\nfi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "--local",
+            "credential.https://github.com.helper",
+            &format!("!{}", helper.display()),
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(&git_frontend)
+        .args(["credential", "fill"])
+        .current_dir(&repository)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", directory.path())
+        .env("DEV_AUTH_GH_CHILD", "1")
+        .env("DEV_AUTH_GH_GIT", "/usr/bin/git")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=github.com\npath=ExampleOrg/repository.git\n\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("human-secret"));
+}
+
+#[test]
+fn internal_gh_git_child_rejects_explicit_config_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let git_frontend = directory.path().join("git");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
+    let marker = directory.path().join("upstream-git-ran");
+    let upstream_git = directory.path().join("upstream-git");
+    fs::write(
+        &upstream_git,
+        format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&upstream_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = Command::new(&git_frontend)
+        .args(["-ccredential.helper=!attacker", "status"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", directory.path())
+        .env("DEV_AUTH_GH_CHILD", "1")
+        .env("DEV_AUTH_GH_GIT", &upstream_git)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside the bounded read-only surface")
+    );
 }
 
 #[test]

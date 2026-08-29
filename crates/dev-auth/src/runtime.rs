@@ -122,6 +122,18 @@ impl RuntimePaths {
     fn gh_temp_dir(&self) -> PathBuf {
         self.gh_sandbox_dir().join("tmp")
     }
+
+    fn gh_git_config_file(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("git-empty-config")
+    }
+
+    fn gh_git_attributes_file(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("git-empty-attributes")
+    }
+
+    fn gh_git_hooks_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("git-empty-hooks")
+    }
 }
 
 fn select_runtime_root(
@@ -1208,6 +1220,28 @@ fn install_gh_child_frontend(source: &Path, destination: &Path, digest: &[u8; 32
     Ok(())
 }
 
+fn ensure_empty_private_file(path: &Path, description: &str) -> Result<()> {
+    let file = private_open(path).with_context(|| format!("open {description}"))?;
+    file.set_len(0)
+        .with_context(|| format!("truncate {description}"))?;
+    file.sync_all()
+        .with_context(|| format!("synchronize {description}"))
+}
+
+fn ensure_gh_sandbox_roots(paths: &RuntimePaths) -> Result<()> {
+    ensure_runtime(paths)?;
+    ensure_private_directory(&paths.gh_sandbox_dir())?;
+    ensure_private_directory(&paths.gh_child_bin_dir())?;
+    ensure_private_directory(&paths.gh_config_dir())?;
+    ensure_private_directory(&paths.gh_home_dir())?;
+    ensure_private_directory(&paths.gh_cache_dir())?;
+    ensure_private_directory(&paths.gh_data_dir())?;
+    ensure_private_directory(&paths.gh_temp_dir())?;
+    ensure_private_directory(&paths.gh_git_hooks_dir())?;
+    ensure_empty_private_file(&paths.gh_git_config_file(), "empty Git configuration")?;
+    ensure_empty_private_file(&paths.gh_git_attributes_file(), "empty Git attributes file")
+}
+
 #[cfg(windows)]
 fn gh_child_frontend_guards(paths: &RuntimePaths) -> Result<Vec<ProgramGuard>> {
     GH_CHILD_FRONTENDS
@@ -1222,14 +1256,7 @@ fn gh_child_frontend_guards(paths: &RuntimePaths) -> Result<Vec<ProgramGuard>> {
 
 #[cfg(not(windows))]
 fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
-    ensure_runtime(paths)?;
-    ensure_private_directory(&paths.gh_sandbox_dir())?;
-    ensure_private_directory(&paths.gh_child_bin_dir())?;
-    ensure_private_directory(&paths.gh_config_dir())?;
-    ensure_private_directory(&paths.gh_home_dir())?;
-    ensure_private_directory(&paths.gh_cache_dir())?;
-    ensure_private_directory(&paths.gh_data_dir())?;
-    ensure_private_directory(&paths.gh_temp_dir())?;
+    ensure_gh_sandbox_roots(paths)?;
     let lock = private_open(&paths.runtime.join("gh-sandbox.lock"))?;
     lock.lock_exclusive().context("lock gh sandbox update")?;
     let executable = env::current_exe().context("resolve running dev-auth executable")?;
@@ -1246,14 +1273,7 @@ fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
 
 #[cfg(windows)]
 fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
-    ensure_runtime(paths)?;
-    ensure_private_directory(&paths.gh_sandbox_dir())?;
-    ensure_private_directory(&paths.gh_child_bin_dir())?;
-    ensure_private_directory(&paths.gh_config_dir())?;
-    ensure_private_directory(&paths.gh_home_dir())?;
-    ensure_private_directory(&paths.gh_cache_dir())?;
-    ensure_private_directory(&paths.gh_data_dir())?;
-    ensure_private_directory(&paths.gh_temp_dir())?;
+    ensure_gh_sandbox_roots(paths)?;
     let lock = private_open(&paths.runtime.join("gh-sandbox.lock"))?;
     lock.lock_exclusive().context("lock gh sandbox update")?;
     let executable = env::current_exe().context("resolve running dev-auth executable")?;
@@ -1405,24 +1425,226 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
         .context("run repository-scoped gh command")
 }
 
+fn valid_git_ref_fragment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && value != "@"
+        && !value.starts_with(['-', '.', '/'])
+        && !value.ends_with(['.', '/'])
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && !value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && !component.ends_with(".lock"))
+}
+
+fn valid_full_ref(value: &str) -> bool {
+    ["refs/heads/", "refs/remotes/"].iter().any(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(valid_git_ref_fragment)
+    })
+}
+
+fn valid_remote_name(value: &str) -> bool {
+    valid_git_ref_fragment(value) && !value.contains('/')
+}
+
+fn valid_log_range(value: &str) -> bool {
+    let Some((base, head)) = value.split_once("...") else {
+        return false;
+    };
+    !head.contains("...") && valid_git_ref_fragment(base) && valid_git_ref_fragment(head)
+}
+
+fn valid_commit_object(value: &str) -> bool {
+    value == "HEAD"
+        || matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || valid_full_ref(value)
+}
+
+fn unquote_go_regexp_literal(value: &str) -> Option<String> {
+    const META: &str = r"\.+*?()|[]{}^$";
+    let mut result = String::new();
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let escaped = characters.next()?;
+            if !META.contains(escaped) {
+                return None;
+            }
+            result.push(escaped);
+        } else if META.contains(character) {
+            return None;
+        } else {
+            result.push(character);
+        }
+    }
+    Some(result)
+}
+
+fn valid_branch_config_pattern(value: &str) -> bool {
+    const PREFIX: &str = r"^branch\.";
+    const SUFFIX: &str = r"\.(remote|merge|pushremote|gh-merge-base)$";
+    value
+        .strip_prefix(PREFIX)
+        .and_then(|value| value.strip_suffix(SUFFIX))
+        .and_then(unquote_go_regexp_literal)
+        .is_some_and(|branch| valid_git_ref_fragment(&branch))
+}
+
+fn bounded_gh_git_arguments(arguments: &[String]) -> Result<Vec<String>> {
+    let (signature_disabled, command_arguments) = match arguments {
+        [flag, value, remaining @ ..] if flag == "-c" && value == "log.ShowSignature=false" => {
+            (true, remaining)
+        }
+        _ => (false, arguments),
+    };
+    let arguments: Vec<&str> = command_arguments.iter().map(String::as_str).collect();
+    let admitted = match arguments.as_slice() {
+        ["remote", "-v"] => true,
+        ["remote", "get-url", "--", remote] => valid_remote_name(remote),
+        ["symbolic-ref", "--quiet", "HEAD"] => true,
+        ["show-ref", "--verify", "--", references @ ..] => {
+            !references.is_empty()
+                && references
+                    .iter()
+                    .all(|reference| *reference == "HEAD" || valid_full_ref(reference))
+        }
+        ["config", "--get-regexp", r"^remote\..*\.gh-resolved$"] => true,
+        ["config", "--get-regexp", pattern] => valid_branch_config_pattern(pattern),
+        ["config", "push.default" | "remote.pushDefault"] => true,
+        ["rev-parse", "--symbolic-full-name", revision] => revision
+            .strip_suffix("@{push}")
+            .is_some_and(valid_git_ref_fragment),
+        ["rev-parse", "--verify", reference] => reference
+            .strip_prefix("refs/heads/")
+            .is_some_and(valid_git_ref_fragment),
+        ["rev-parse", "--show-toplevel" | "--git-dir" | "--show-prefix"] => true,
+        ["log", "--pretty=format:%H%x00%s%x00%b%x00", "--cherry", range] => {
+            signature_disabled && valid_log_range(range)
+        }
+        ["show", "-s", "--pretty=format:%H,%s", "HEAD"] => signature_disabled,
+        ["show", "-s", "--pretty=format:%b", object] => {
+            signature_disabled && valid_commit_object(object)
+        }
+        _ => false,
+    };
+    if !admitted {
+        bail!("internal gh Git operation is outside the bounded read-only surface");
+    }
+    Ok(command_arguments.to_vec())
+}
+
 pub fn run_gh_git_child(arguments: &[String]) -> Result<ExitStatus> {
+    let arguments = bounded_gh_git_arguments(arguments)?;
     let program = env::var("DEV_AUTH_GH_GIT")
         .context("internal gh Git frontend has no configured executable")?;
     crate::validate_program(&program, "internal gh Git executable")?;
     let _program_guard = program_guard(&program, "internal gh Git")?;
     let input: BTreeMap<String, String> = env::vars().collect();
     let mut environment = sanitize_environment(&input, &BTreeSet::new());
+    let paths = RuntimePaths::discover()?;
     let parent = Path::new(&program)
         .parent()
         .context("configured Git executable has no parent directory")?;
-    environment.insert("PATH".into(), parent.display().to_string());
+    let path = env::join_paths([paths.gh_child_bin_dir(), parent.to_path_buf()])
+        .context("construct bounded internal Git executable path")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("bounded internal Git executable path is not Unicode"))?;
+    environment.insert("PATH".into(), path);
+    environment.insert("HOME".into(), paths.gh_home_dir().display().to_string());
+    environment.insert(
+        "USERPROFILE".into(),
+        paths.gh_home_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CONFIG_HOME".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".into(),
+        paths.gh_cache_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_DATA_HOME".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    environment.insert(
+        "APPDATA".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "LOCALAPPDATA".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    for variable in ["TMP", "TEMP", "TMPDIR"] {
+        environment.insert(variable.into(), paths.gh_temp_dir().display().to_string());
+    }
     environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    environment.insert("GIT_ASKPASS".into(), "false".into());
+    environment.insert("SSH_ASKPASS".into(), "false".into());
+    environment.insert("GCM_INTERACTIVE".into(), "Never".into());
+    environment.insert("GIT_EDITOR".into(), "false".into());
+    environment.insert("GIT_SEQUENCE_EDITOR".into(), "false".into());
+    environment.insert("GIT_PAGER".into(), "cat".into());
+    environment.insert("GIT_SSH_COMMAND".into(), "false".into());
+    environment.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
+    environment.insert(
+        "GIT_CONFIG_SYSTEM".into(),
+        paths.gh_git_config_file().display().to_string(),
+    );
+    environment.insert(
+        "GIT_CONFIG_GLOBAL".into(),
+        paths.gh_git_config_file().display().to_string(),
+    );
+    environment.insert("GIT_ATTR_NOSYSTEM".into(), "1".into());
+    environment.insert("GIT_NO_LAZY_FETCH".into(), "1".into());
+    environment.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+    let attributes_file = paths.gh_git_attributes_file();
+    let attributes_file = attributes_file
+        .to_str()
+        .context("private Git attributes path is not Unicode")?;
+    let hooks_dir = paths.gh_git_hooks_dir();
+    let hooks_dir = hooks_dir
+        .to_str()
+        .context("private Git hooks path is not Unicode")?;
+    let config_overrides = [
+        ("credential.helper", ""),
+        ("credential.interactive", "false"),
+        ("core.askPass", "false"),
+        ("core.attributesFile", attributes_file),
+        ("core.editor", "false"),
+        ("core.excludesFile", attributes_file),
+        ("core.hooksPath", hooks_dir),
+        ("core.pager", "cat"),
+        ("core.sshCommand", "false"),
+        ("http.cookieFile", ""),
+        ("http.extraHeader", ""),
+        ("http.saveCookies", "false"),
+        ("log.showSignature", "false"),
+        ("sequence.editor", "false"),
+    ];
+    environment.insert(
+        "GIT_CONFIG_COUNT".into(),
+        config_overrides.len().to_string(),
+    );
+    for (index, (key, value)) in config_overrides.iter().enumerate() {
+        environment.insert(format!("GIT_CONFIG_KEY_{index}"), (*key).into());
+        environment.insert(format!("GIT_CONFIG_VALUE_{index}"), (*value).into());
+    }
     environment.remove("GH_TOKEN");
     environment.remove("GITHUB_TOKEN");
     environment.remove("DEV_AUTH_GH_CHILD");
     environment.remove("DEV_AUTH_GH_GIT");
     Command::new(program)
-        .args(arguments)
+        .args(&arguments)
         .env_clear()
         .envs(environment)
         .stdin(Stdio::inherit())
@@ -2246,6 +2468,122 @@ mod tests {
         assert_eq!(environment["DEV_AUTH_GH_GIT"], "/trusted/bin/git");
         assert!(!environment.values().any(|value| value.contains("attacker")));
         assert!(!environment.values().any(|value| value == "/home/example"));
+    }
+
+    #[test]
+    fn gh_git_child_accepts_only_source_derived_read_operations() {
+        let accepted = [
+            vec!["remote", "-v"],
+            vec!["remote", "get-url", "--", "origin"],
+            vec!["symbolic-ref", "--quiet", "HEAD"],
+            vec![
+                "show-ref",
+                "--verify",
+                "--",
+                "HEAD",
+                "refs/heads/feature.v1",
+                "refs/remotes/origin/feature.v1",
+            ],
+            vec!["config", "--get-regexp", r"^remote\..*\.gh-resolved$"],
+            vec![
+                "config",
+                "--get-regexp",
+                r"^branch\.feature\.v1\.(remote|merge|pushremote|gh-merge-base)$",
+            ],
+            vec!["config", "push.default"],
+            vec!["config", "remote.pushDefault"],
+            vec!["rev-parse", "--symbolic-full-name", "feature.v1@{push}"],
+            vec!["rev-parse", "--verify", "refs/heads/feature.v1"],
+            vec!["rev-parse", "--show-toplevel"],
+            vec!["rev-parse", "--git-dir"],
+            vec!["rev-parse", "--show-prefix"],
+            vec!["-c", "log.ShowSignature=false", "log", "%PLACEHOLDER%"],
+            vec![
+                "-c",
+                "log.ShowSignature=false",
+                "show",
+                "-s",
+                "--pretty=format:%H,%s",
+                "HEAD",
+            ],
+            vec![
+                "-c",
+                "log.ShowSignature=false",
+                "show",
+                "-s",
+                "--pretty=format:%b",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+        ];
+
+        for arguments in accepted {
+            let mut arguments: Vec<String> = arguments.into_iter().map(str::to_owned).collect();
+            if arguments.get(2).map(String::as_str) == Some("log") {
+                arguments.splice(
+                    3..4,
+                    [
+                        "--pretty=format:%H%x00%s%x00%b%x00".into(),
+                        "--cherry".into(),
+                        "origin/main...feature.v1".into(),
+                    ],
+                );
+            }
+            let bounded = bounded_gh_git_arguments(&arguments)
+                .unwrap_or_else(|error| panic!("{arguments:?}: {error:#}"));
+            assert!(!bounded.iter().any(|argument| argument == "-c"));
+        }
+    }
+
+    #[test]
+    fn gh_git_child_rejects_network_mutation_and_local_execution_surfaces() {
+        let rejected = [
+            vec!["status", "--porcelain"],
+            vec!["credential", "fill"],
+            vec!["fetch", "origin"],
+            vec!["pull"],
+            vec!["push", "origin", "HEAD"],
+            vec!["checkout", "main"],
+            vec!["branch", "-D", "main"],
+            vec!["config", "credential.helper"],
+            vec!["config", "--get-regexp", ".*"],
+            vec!["remote", "get-url", "origin"],
+            vec!["remote", "set-url", "origin", "ext::attacker"],
+            vec!["-C", "/tmp", "remote", "-v"],
+            vec!["-ccredential.helper=!attacker", "remote", "-v"],
+            vec!["-c", "credential.helper=!attacker", "remote", "-v"],
+            vec!["-c", "log.ShowSignature=false", "fetch", "origin"],
+            vec![
+                "-c",
+                "log.ShowSignature=true",
+                "show",
+                "-s",
+                "--pretty=format:%H,%s",
+                "HEAD",
+            ],
+            vec!["show-ref", "--verify", "--", "--head"],
+            vec!["show-ref", "--verify", "--", "refs/tags/release"],
+            vec![
+                "rev-parse",
+                "--symbolic-full-name",
+                "feature@{push}:attacker",
+            ],
+            vec!["rev-parse", "--verify", "refs/heads/main^{object}"],
+            vec![
+                "-c",
+                "log.ShowSignature=false",
+                "show",
+                "--textconv",
+                "HEAD:file",
+            ],
+        ];
+
+        for arguments in rejected {
+            let arguments: Vec<String> = arguments.into_iter().map(str::to_owned).collect();
+            assert!(
+                bounded_gh_git_arguments(&arguments).is_err(),
+                "{arguments:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

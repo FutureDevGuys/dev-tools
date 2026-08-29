@@ -500,6 +500,10 @@ fn gh_surface_is_repository_scoped_and_excludes_administration() {
         vec!["repo", "view", "--web"],
         vec!["pr", "view", "-w"],
         vec!["pr", "create", "--editor"],
+        vec!["pr", "close", "42", "--delete-branch"],
+        vec!["pr", "close", "42", "-d"],
+        vec!["pr", "merge", "42", "--delete-branch=false"],
+        vec!["pr", "merge", "42", "-d=false"],
     ] {
         assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
     }
