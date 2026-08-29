@@ -440,6 +440,25 @@ class JsonStatePrecondition:
     remediation: str
 
 
+def emit_script_progress(
+    entry: Entry,
+    phase: str,
+    *,
+    stream=None,
+) -> None:
+    """Identify an active hook on interactive terminals without exposing its command."""
+    if phase not in {"pre_script", "post_script"}:
+        raise ConfigError(f"unsupported script phase: {phase}")
+    output = sys.stderr if stream is None else stream
+    if not getattr(output, "isatty", lambda: False)():
+        return
+    print(
+        f"[sync-configs] running {phase}: {entry.scope_label} / {entry.name}",
+        file=output,
+        flush=True,
+    )
+
+
 @dataclass(frozen=True)
 class IgnoreRule:
     pattern: str
@@ -2564,6 +2583,7 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
                     entry=entry,
                 ))
             else:
+                emit_script_progress(entry, "pre_script")
                 result = run_entry_script(
                     entry.pre_script,
                     config_dir,
@@ -2677,6 +2697,7 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             ))
         else:
             assert entry.post_script is not None
+            emit_script_progress(entry, "post_script")
             result = run_entry_script(
                 entry.post_script,
                 config_dir,
