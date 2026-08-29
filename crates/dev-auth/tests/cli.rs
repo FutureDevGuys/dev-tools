@@ -192,7 +192,7 @@ fn invalid_ambient_gh_repository_is_rejected_before_configuration_or_runtime_mut
 }
 
 #[test]
-fn invalid_literal_local_origin_is_rejected_before_configuration_or_runtime_mutation() {
+fn configured_git_resolves_literal_origin_without_caller_path_fallback() {
     let directory = tempfile::tempdir().unwrap();
     let frontend = directory.path().join("gh-dev-auth");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
@@ -216,6 +216,50 @@ fn invalid_literal_local_origin_is_rejected_before_configuration_or_runtime_muta
         .unwrap()
         .success());
     let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(
+        home.path().join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"version = 1
+[programs]
+op = "/usr/bin/false"
+gh = "/usr/bin/false"
+git = "/usr/bin/git"
+ssh_add = "/usr/bin/false"
+ssh_keygen = "/usr/bin/false"
+[github]
+app_id = 42
+private_key_ref = "op://Automation/app/private key"
+repository_selection = "all"
+discover_installations = true
+permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        config_dir.join("config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let attacker_bin = directory.path().join("attacker-bin");
+    fs::create_dir(&attacker_bin).unwrap();
+    let marker = directory.path().join("caller-path-git-ran");
+    let attacker_git = attacker_bin.join("git");
+    fs::write(
+        &attacker_git,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nprintf 'https://github.com/ExampleOrg/too/many.git\\0'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&attacker_git, fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = private_runtime();
 
     let output = Command::new(&frontend)
@@ -223,7 +267,7 @@ fn invalid_literal_local_origin_is_rejected_before_configuration_or_runtime_muta
         .current_dir(&repository)
         .env_clear()
         .env("HOME", home.path())
-        .env("PATH", "/usr/bin")
+        .env("PATH", format!("{}:/usr/bin", attacker_bin.display()))
         .env("XDG_RUNTIME_DIR", runtime.path())
         .output()
         .unwrap();
@@ -236,6 +280,8 @@ fn invalid_literal_local_origin_is_rejected_before_configuration_or_runtime_muta
         "unexpected error: {error}"
     );
     assert!(!error.contains("configuration"), "{error}");
+    assert!(!error.contains("credential"), "{error}");
+    assert!(!marker.exists());
     assert!(!runtime.path().join("dev-auth").exists());
 }
 

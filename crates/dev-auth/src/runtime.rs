@@ -1153,45 +1153,8 @@ fn origin_repository_at(
     String::from_utf8(value.to_vec()).context("literal local Git origin is not UTF-8")
 }
 
-fn preconfig_git_program(environment: &BTreeMap<String, String>) -> Result<String> {
-    let path = environment
-        .iter()
-        .find_map(|(key, value)| key.eq_ignore_ascii_case("PATH").then_some(value))
-        .context("PATH is required to resolve the pre-credential Git origin reader")?;
-    #[cfg(windows)]
-    let executable = "git.exe";
-    #[cfg(not(windows))]
-    let executable = "git";
-
-    for directory in env::split_paths(path) {
-        if !directory.is_absolute() {
-            continue;
-        }
-        let candidate = directory.join(executable);
-        let metadata = match fs::symlink_metadata(&candidate) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("inspect pre-credential Git executable"),
-        };
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o111 == 0 {
-            continue;
-        }
-        let candidate = candidate
-            .to_str()
-            .context("pre-credential Git executable path is not UTF-8")?;
-        return Ok(candidate.to_owned());
-    }
-    bail!("no absolute Git executable is available on the sanitized caller PATH")
-}
-
-fn origin_repository() -> Result<String> {
-    let environment = sanitized_current_environment();
-    let program = preconfig_git_program(&environment)?;
-    origin_repository_at(&program, None, &environment)
+fn origin_repository(program: &str) -> Result<String> {
+    origin_repository_at(program, None, &sanitized_current_environment())
 }
 
 fn preconfigured_gh_repository(
@@ -1207,10 +1170,13 @@ fn preconfigured_gh_repository(
     }
 }
 
-fn resolve_gh_repository(selected: Option<(String, String)>) -> Result<(String, String)> {
+fn resolve_gh_repository(
+    selected: Option<(String, String)>,
+    git_program: &str,
+) -> Result<(String, String)> {
     match selected {
         Some(repository) => Ok(repository),
-        None => crate::parse_github_repository(&origin_repository()?),
+        None => crate::parse_github_repository(&origin_repository(git_program)?),
     }
 }
 
@@ -1466,9 +1432,9 @@ fn isolated_gh_environment(
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     let plan = crate::parse_gh_invocation(arguments)?;
     let selected_repository = preconfigured_gh_repository(plan.repository.clone())?;
-    let (owner, repository) = resolve_gh_repository(selected_repository)?;
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
+    let (owner, repository) = resolve_gh_repository(selected_repository, &config.programs.git)?;
     ensure_gh_sandbox(&paths)?;
     #[cfg(windows)]
     let _frontend_guards = gh_child_frontend_guards(&paths)?;

@@ -375,7 +375,7 @@ fn open_local_regular_file(
     desired_access: u32,
     share_mode: u32,
 ) -> io::Result<ProgramGuard> {
-    let ancestor_handles = validate_local_input_path_on_fixed_drive(path, false)?;
+    let ancestor_handles = validate_local_input_path_on_fixed_drive(path, true)?;
     let wide = nul_terminated(path.as_os_str())?;
     // SAFETY: wide is NUL-terminated and all other arguments follow CreateFileW's
     // contract. Opening the final component as a reparse point makes the subsequent
@@ -683,7 +683,7 @@ fn validate_local_regular_handle(handle: HANDLE) -> io::Result<()> {
     if standard.Directory {
         return Err(permission_denied("program path must be a regular file"));
     }
-    validate_final_handle_path_with_policy(handle, false)
+    validate_final_handle_path_with_policy(handle, true)
 }
 
 fn validate_private_security(handle: HANDLE, kind: ObjectKind) -> io::Result<()> {
@@ -1014,12 +1014,16 @@ fn validate_persistent_acls(drive: u8) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    if flags & FILE_PERSISTENT_ACLS == 0 {
+    if !volume_supports_persistent_acls(flags) {
         return Err(permission_denied(
             "private path volume does not preserve access-control lists",
         ));
     }
     Ok(())
+}
+
+fn volume_supports_persistent_acls(flags: u32) -> bool {
+    flags & FILE_PERSISTENT_ACLS != 0
 }
 
 fn validate_final_handle_path(handle: HANDLE) -> io::Result<()> {
@@ -1209,6 +1213,12 @@ mod tests {
             local_disk_drive(Path::new(r"\\?\C:\Users\example\dev-auth"), true),
             Some(b'C')
         );
+    }
+
+    #[test]
+    fn credential_program_volume_policy_requires_persistent_acls() {
+        assert!(!volume_supports_persistent_acls(0));
+        assert!(volume_supports_persistent_acls(FILE_PERSISTENT_ACLS));
     }
 
     #[test]
