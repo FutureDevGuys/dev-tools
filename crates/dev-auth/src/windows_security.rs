@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io;
 use std::io::{Seek, SeekFrom};
 use std::mem::{offset_of, size_of};
+use std::ops::{Deref, DerefMut};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -90,6 +91,25 @@ impl Drop for OwnedWinHandle {
         unsafe {
             CloseHandle(self.0);
         }
+    }
+}
+
+pub(super) struct ProgramGuard {
+    file: File,
+    _ancestor_handles: Vec<OwnedWinHandle>,
+}
+
+impl Deref for ProgramGuard {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl DerefMut for ProgramGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
     }
 }
 
@@ -295,7 +315,7 @@ impl PrivateSecurityAttributes {
 }
 
 pub(super) fn validate_private_directory(path: &Path) -> io::Result<()> {
-    validate_local_input_path(path)?;
+    let _ancestor_handles = validate_local_input_path(path)?;
     let wide = nul_terminated(path.as_os_str())?;
     // SAFETY: wide is NUL-terminated, all pointers are valid for the call, and no raw
     // handle escapes before it is placed under OwnedWinHandle ownership.
@@ -315,7 +335,7 @@ pub(super) fn validate_private_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn open_private_file(path: &Path) -> io::Result<File> {
-    validate_local_input_path(path)?;
+    let _ancestor_handles = validate_local_input_path(path)?;
     let wide = nul_terminated(path.as_os_str())?;
     // SAFETY: wide is NUL-terminated and all other arguments follow CreateFileW's
     // contract. FILE_FLAG_OPEN_REPARSE_POINT keeps the final component untraversed.
@@ -342,16 +362,20 @@ pub(super) fn validate_local_program(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn lock_local_program(path: &Path) -> io::Result<File> {
+pub(super) fn lock_local_program(path: &Path) -> io::Result<ProgramGuard> {
     open_local_regular_file(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ)
 }
 
-pub(super) fn lock_local_program_for_copy(path: &Path) -> io::Result<File> {
+pub(super) fn lock_local_program_for_copy(path: &Path) -> io::Result<ProgramGuard> {
     open_local_regular_file(path, FILE_GENERIC_READ, FILE_SHARE_READ)
 }
 
-fn open_local_regular_file(path: &Path, desired_access: u32, share_mode: u32) -> io::Result<File> {
-    validate_local_input_path_on_fixed_drive(path, false)?;
+fn open_local_regular_file(
+    path: &Path,
+    desired_access: u32,
+    share_mode: u32,
+) -> io::Result<ProgramGuard> {
+    let ancestor_handles = validate_local_input_path_on_fixed_drive(path, false)?;
     let wide = nul_terminated(path.as_os_str())?;
     // SAFETY: wide is NUL-terminated and all other arguments follow CreateFileW's
     // contract. Opening the final component as a reparse point makes the subsequent
@@ -374,11 +398,14 @@ fn open_local_regular_file(path: &Path, desired_access: u32, share_mode: u32) ->
     // ownership and closes the handle on every success or validation-error path.
     let file = unsafe { File::from_raw_handle(handle) };
     validate_local_regular_handle(file.as_raw_handle())?;
-    Ok(file)
+    Ok(ProgramGuard {
+        file,
+        _ancestor_handles: ancestor_handles,
+    })
 }
 
 pub(super) fn open_or_create_private_file(path: &Path) -> io::Result<File> {
-    validate_local_input_path(path)?;
+    let _ancestor_handles = validate_local_input_path(path)?;
     let wide = nul_terminated(path.as_os_str())?;
     let mut security = PrivateSecurityAttributes::new(ObjectKind::File)?;
     let attributes = security.attributes();
@@ -412,6 +439,7 @@ pub(super) fn copy_open_file_to_private_replacement(
     let parent = destination
         .parent()
         .ok_or_else(|| invalid_input("private replacement has no parent directory"))?;
+    let _ancestor_handles = validate_local_input_path(destination)?;
     validate_private_directory(parent)?;
     source.seek(SeekFrom::Start(0))?;
     let source_length = source.metadata()?.len();
@@ -445,12 +473,12 @@ pub(super) fn atomically_replace_private_file(
             "private replacement and destination must share a directory",
         ));
     }
+    let _ancestor_handles = validate_local_input_path(destination)?;
     let parent = replacement
         .parent()
         .ok_or_else(|| invalid_input("private replacement has no parent directory"))?;
     validate_private_directory(parent)?;
     drop(open_private_file(replacement)?);
-    validate_local_input_path(destination)?;
     let replacement_wide = nul_terminated(replacement.as_os_str())?;
     let destination_wide = nul_terminated(destination.as_os_str())?;
     // SAFETY: both paths are NUL-terminated. The replacement is a validated private file
@@ -471,7 +499,7 @@ pub(super) fn atomically_replace_private_file(
 }
 
 pub(super) fn ensure_private_directory(path: &Path) -> io::Result<()> {
-    validate_local_input_path(path)?;
+    let _ancestor_handles = validate_local_input_path(path)?;
     let wide = nul_terminated(path.as_os_str())?;
     let mut security = PrivateSecurityAttributes::new(ObjectKind::Directory)?;
     let attributes = security.attributes();
@@ -490,7 +518,7 @@ pub(super) fn ensure_private_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn ensure_private_directory_all(path: &Path) -> io::Result<()> {
-    validate_local_input_path(path)?;
+    let _ancestor_handles = validate_local_input_path(path)?;
     let mut missing = Vec::<PathBuf>::new();
     let mut current = path;
     loop {
@@ -544,7 +572,7 @@ fn file_from_validated_handle(handle: HANDLE) -> io::Result<File> {
 }
 
 fn create_new_private_file(path: &Path) -> io::Result<File> {
-    validate_local_input_path(path)?;
+    let _ancestor_handles = validate_local_input_path(path)?;
     let wide = nul_terminated(path.as_os_str())?;
     let mut security = PrivateSecurityAttributes::new(ObjectKind::File)?;
     let attributes = security.attributes();
@@ -788,19 +816,97 @@ fn validate_private_security(handle: HANDLE, kind: ObjectKind) -> io::Result<()>
     }
 }
 
-fn validate_local_input_path(path: &Path) -> io::Result<()> {
+fn validate_local_input_path(path: &Path) -> io::Result<Vec<OwnedWinHandle>> {
     validate_local_input_path_on_fixed_drive(path, true)
 }
 
 fn validate_local_input_path_on_fixed_drive(
     path: &Path,
     require_persistent_acls: bool,
-) -> io::Result<()> {
+) -> io::Result<Vec<OwnedWinHandle>> {
     let drive = local_disk_drive(path, false)
         .ok_or_else(|| invalid_input("private path must be an absolute local drive path"))?;
     validate_fixed_drive(drive)?;
     if require_persistent_acls {
         validate_persistent_acls(drive)?;
+    }
+    open_existing_ancestor_handles(path)
+}
+
+fn open_existing_ancestor_handles(path: &Path) -> io::Result<Vec<OwnedWinHandle>> {
+    let mut ancestors = Vec::new();
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        ancestors.push(ancestor);
+        current = ancestor.parent();
+    }
+    ancestors.reverse();
+
+    let mut handles = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors {
+        let wide = nul_terminated(ancestor.as_os_str())?;
+        // SAFETY: wide is NUL-terminated and all other arguments follow CreateFileW's
+        // contract. OPEN_REPARSE_POINT makes the cumulative ancestor the untraversed
+        // final component, and the returned raw handle is immediately given one owner.
+        let raw_handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        let handle = match owned_handle(raw_handle) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        };
+        validate_ancestor_handle(handle.0)?;
+        handles.push(handle);
+    }
+    Ok(handles)
+}
+
+fn validate_ancestor_handle(handle: HANDLE) -> io::Result<()> {
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: handle is live and attributes is writable storage of the exact requested
+    // FILE_ATTRIBUTE_TAG_INFO size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE) != 0 {
+        return Err(permission_denied(
+            "path ancestor must not be a reparse point or device",
+        ));
+    }
+
+    let mut standard = FILE_STANDARD_INFO::default();
+    // SAFETY: handle is live and standard is writable storage of the exact requested
+    // FILE_STANDARD_INFO size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if !standard.Directory {
+        return Err(permission_denied("path ancestor must be a directory"));
     }
     Ok(())
 }
@@ -993,6 +1099,25 @@ fn permission_denied(message: &'static str) -> io::Error {
 mod tests {
     use super::*;
 
+    fn create_test_directory_symlink(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error()
+                        == Some(
+                            windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32,
+                        ) =>
+            {
+                eprintln!(
+                    "skipping directory-symlink test because Windows denied creation: {error}"
+                );
+                false
+            }
+            Err(error) => panic!("create test directory symlink: {error}"),
+        }
+    }
+
     fn accepted_policy(kind: ObjectKind) -> AclPolicyObservation {
         AclPolicyObservation {
             owner_is_current_user: true,
@@ -1134,6 +1259,36 @@ mod tests {
 
         drop(guard);
         fs::remove_file(&program).unwrap();
+    }
+
+    #[test]
+    fn program_path_rejects_directory_symlink_ancestor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("program-target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("tool.exe"), b"executable").unwrap();
+        let link = temporary.path().join("program-link");
+        if !create_test_directory_symlink(&target, &link) {
+            return;
+        }
+
+        let error = validate_local_program(&link.join("tool.exe")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn private_path_rejects_directory_symlink_ancestor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("private-target");
+        ensure_private_directory(&target).unwrap();
+        drop(open_or_create_private_file(&target.join("secret")).unwrap());
+        let link = temporary.path().join("private-link");
+        if !create_test_directory_symlink(&target, &link) {
+            return;
+        }
+
+        let error = open_private_file(&link.join("secret")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

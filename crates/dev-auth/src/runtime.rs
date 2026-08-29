@@ -198,7 +198,7 @@ fn validate_configured_windows_programs(config: &Config) -> Result<()> {
 }
 
 #[cfg(windows)]
-type ProgramGuard = File;
+type ProgramGuard = windows_security::ProgramGuard;
 #[cfg(not(windows))]
 struct ProgramGuard;
 
@@ -783,6 +783,26 @@ where
         .lock_exclusive()
         .context("lock installation-token cache lifecycle for purge")?;
     operation()
+}
+
+fn with_cache_scope_erase_lock<T, F>(paths: &RuntimePaths, key: &str, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_runtime(paths)?;
+    let lifecycle = cache_lifecycle_lock(paths)?;
+    lifecycle
+        .lock_exclusive()
+        .context("lock installation-token cache lifecycle for erase")?;
+    let scope_path = paths.cache_dir().join(format!("{key}.lock"));
+    let scope = private_open(&scope_path)?;
+    scope
+        .lock_exclusive()
+        .context("lock installation-token cache scope for erase")?;
+    let value = operation()?;
+    drop(scope);
+    fs::remove_file(&scope_path).context("remove erased installation-token scope receipt")?;
+    Ok(value)
 }
 
 fn locked_cache_entry<F>(
@@ -1434,7 +1454,7 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
             &config.github.permissions,
         )?
     };
-    with_cache_scope_lock(&paths, &key, || {
+    with_cache_scope_erase_lock(&paths, &key, || {
         match cache_entry(&config.credential_store, &key)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error).context("remove native installation-token cache"),
@@ -2073,27 +2093,32 @@ pub fn purge_runtime() -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
     with_cache_purge_lock(&paths, || {
-        if loaded_ssh_fingerprints(&paths, &config).is_ok() {
-            clear_ssh_agent(&paths, &config)?;
-        }
+        let mut scopes = Vec::<(String, PathBuf)>::new();
         for entry in fs::read_dir(paths.cache_dir()).context("enumerate dev-auth runtime cache")? {
             let entry = entry.context("read dev-auth runtime cache entry")?;
             let path = entry.path();
-            let extension = path.extension().and_then(|value| value.to_str());
-            if extension == Some("lock") {
-                let key = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .context("runtime lock has an invalid cache key")?;
-                match cache_entry(&config.credential_store, key)?.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => {}
-                    Err(error) => {
-                        return Err(error).context("purge native installation-token cache")
-                    }
-                }
-            } else {
+            if path.extension().and_then(|value| value.to_str()) != Some("lock") {
                 bail!("unknown file in dev-auth runtime cache");
             }
+            let key = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("runtime lock has an invalid cache key")?
+                .to_owned();
+            let _ = private_read(&path, "installation-token scope receipt")?;
+            scopes.push((key, path));
+        }
+        scopes.sort_by(|left, right| left.0.cmp(&right.0));
+
+        if loaded_ssh_fingerprints(&paths, &config).is_ok() {
+            clear_ssh_agent(&paths, &config)?;
+        }
+        for (key, path) in scopes {
+            match cache_entry(&config.credential_store, &key)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(error).context("purge native installation-token cache"),
+            }
+            fs::remove_file(&path).context("remove purged installation-token scope receipt")?;
         }
         Ok(())
     })
@@ -2308,17 +2333,30 @@ mod tests {
         });
         entered_rx.recv().unwrap();
 
-        let competing = private_open(&paths.cache_dir().join("scope.lock")).unwrap();
-        assert!(competing.try_lock_exclusive().is_err());
+        let erase_paths = RuntimePaths {
+            config: paths.config.clone(),
+            runtime: paths.runtime.clone(),
+        };
+        let erase_marker = marker.clone();
+        let (erased_tx, erased_rx) = mpsc::channel();
+        let erase = thread::spawn(move || {
+            with_cache_scope_erase_lock(&erase_paths, "scope", || {
+                fs::remove_file(&erase_marker).unwrap();
+                erased_tx.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert!(matches!(
+            erased_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         release_tx.send(()).unwrap();
         refresh.join().unwrap();
-
-        with_cache_scope_lock(&paths, "scope", || {
-            fs::remove_file(&marker).unwrap();
-            Ok(())
-        })
-        .unwrap();
+        erased_rx.recv().unwrap();
+        erase.join().unwrap();
         assert!(!marker.exists());
+        assert!(!paths.cache_dir().join("scope.lock").exists());
     }
 
     #[test]
