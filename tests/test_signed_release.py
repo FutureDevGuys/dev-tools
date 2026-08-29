@@ -5,6 +5,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -60,11 +61,17 @@ def test_release_builder_keeps_independent_product_versions() -> None:
     module = load_release_set_module()
     versions = module.product_versions()
 
-    assert versions["update-all"] == "0.1.5"
-    assert versions["dev-auth"] == "0.2.0"
-    assert versions["dev-cache"] == "0.1.6"
-    assert versions["skills-sync"] == "0.1.4"
-    assert versions["sync-configs"] == "0.1.8"
+    expected = {
+        product: tomllib.loads(
+            (ROOT / "crates" / product / "Cargo.toml").read_text(encoding="utf-8")
+        )["package"]["version"]
+        for product in ("update-all", "dev-auth", "dev-cache", "skills-sync")
+    }
+    expected["sync-configs"] = tomllib.loads(
+        (ROOT / "sync-configs" / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+
+    assert versions == expected
 
 
 def test_release_builder_maps_independent_manifest_generations() -> None:

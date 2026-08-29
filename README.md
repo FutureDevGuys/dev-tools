@@ -41,10 +41,11 @@ After that, `update-all` checks its authenticated stable manifest automatically 
 ## Development
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-python -m pytest sync-configs/tests
+cargo deny check
+python -m pytest tests sync-configs/tests
 python sync-configs/scripts/build_zipapp.py
 ```
 

@@ -8,8 +8,9 @@ mod runtime;
 
 pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,
-    github_token_for_repository, purge_runtime, run_agent, run_gh, run_ssh_keygen, runtime_status,
-    ssh_load, RuntimeStatus,
+    github_token_for_repository, purge_runtime, run_agent, run_gh, run_gh_git_child,
+    run_ssh_keygen, runtime_status, ssh_load, ssh_public, validate_configuration, RuntimeStatus,
+    ValidationReport,
 };
 
 const MAX_CREDENTIAL_REQUEST_BYTES: usize = 64 * 1024;
@@ -136,11 +137,19 @@ pub struct GitHubInstallation {
     pub repositories: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositorySelection {
+    All,
+    Selected,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubProfile {
     pub app_id: u64,
     pub private_key_ref: String,
+    pub repository_selection: RepositorySelection,
     #[serde(default)]
     pub discover_installations: bool,
     #[serde(default)]
@@ -172,6 +181,31 @@ fn default_keyring_service() -> String {
 
 fn default_keyring_account() -> String {
     "service-account-token".into()
+}
+
+fn is_reserved_profile_environment(variable: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "APPDATA",
+        "COLORTERM",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOCALAPPDATA",
+        "PATH",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ];
+    RESERVED
+        .iter()
+        .any(|reserved| variable.eq_ignore_ascii_case(reserved))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -227,6 +261,24 @@ pub struct Config {
     pub ssh_profiles: BTreeMap<String, SshProfile>,
 }
 
+impl Config {
+    pub fn declared_secret_references(&self) -> BTreeSet<String> {
+        std::iter::once(&self.github.private_key_ref)
+            .chain(
+                self.profiles
+                    .values()
+                    .flat_map(|profile| profile.environment.values()),
+            )
+            .chain(
+                self.ssh_profiles
+                    .values()
+                    .flat_map(|profile| profile.keys.iter().map(|key| &key.private_key_ref)),
+            )
+            .cloned()
+            .collect()
+    }
+}
+
 pub fn parse_config(input: &[u8]) -> Result<Config> {
     let text = std::str::from_utf8(input).context("configuration is not UTF-8")?;
     let config: Config = toml::from_str(text).context("configuration is not valid TOML")?;
@@ -261,7 +313,8 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
             installation.repositories.is_empty()
         } else {
             !installation.repositories.is_empty()
-        };
+        } && installation.all_repositories
+            == matches!(config.github.repository_selection, RepositorySelection::All);
         if !is_github_component(&installation.owner)
             || !owners.insert(installation.owner.to_ascii_lowercase())
             || installation.installation_id == 0
@@ -296,6 +349,9 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
                 .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
             if !valid_start || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
                 bail!("profile environment variable is not a valid identifier");
+            }
+            if is_reserved_profile_environment(variable) {
+                bail!("profile environment variable conflicts with the private sandbox");
             }
             validate_op_reference(reference)?;
         }
@@ -386,7 +442,7 @@ fn validate_public_identifier(value: &str, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_program(value: &str, description: &str) -> Result<()> {
+pub(crate) fn validate_program(value: &str, description: &str) -> Result<()> {
     let bytes = value.as_bytes();
     let windows_absolute = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -440,6 +496,7 @@ impl GitHubProfile {
 pub struct CacheEntry {
     token: SecretString,
     expires_at: i64,
+    app_id: u64,
     installation_id: u64,
     owner: String,
     repository: String,
@@ -452,6 +509,7 @@ impl fmt::Debug for CacheEntry {
             .debug_struct("CacheEntry")
             .field("token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
+            .field("app_id", &self.app_id)
             .field("installation_id", &self.installation_id)
             .field("owner", &self.owner)
             .field("repository", &self.repository)
@@ -464,6 +522,7 @@ impl CacheEntry {
     pub fn new(
         token: SecretString,
         expires_at: i64,
+        app_id: u64,
         installation_id: u64,
         owner: String,
         repository: String,
@@ -472,6 +531,7 @@ impl CacheEntry {
         Self {
             token,
             expires_at,
+            app_id,
             installation_id,
             owner,
             repository,
@@ -482,6 +542,7 @@ impl CacheEntry {
     pub fn new_for_test(
         token: SecretString,
         expires_at: i64,
+        app_id: u64,
         installation_id: u64,
         owner: String,
         repository: String,
@@ -490,6 +551,7 @@ impl CacheEntry {
         Self {
             token,
             expires_at,
+            app_id,
             installation_id,
             owner,
             repository,
@@ -500,12 +562,14 @@ impl CacheEntry {
     pub fn is_usable_at(
         &self,
         now: i64,
+        app_id: u64,
         installation_id: u64,
         owner: &str,
         repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
-        self.installation_id == installation_id
+        self.app_id == app_id
+            && self.installation_id == installation_id
             && self.owner == owner
             && self.repository == repository
             && self.permissions == *permissions
@@ -515,14 +579,13 @@ impl CacheEntry {
     pub fn is_usable_for_repository_at(
         &self,
         now: i64,
+        app_id: u64,
+        installation_id: u64,
         owner: &str,
         repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
-        self.owner == owner
-            && self.repository == repository
-            && self.permissions == *permissions
-            && now < self.expires_at - TOKEN_REFRESH_MARGIN_SECONDS
+        self.is_usable_at(now, app_id, installation_id, owner, repository, permissions)
     }
 
     pub fn token(&self) -> &SecretString {
@@ -535,6 +598,10 @@ impl CacheEntry {
 
     pub fn installation_id(&self) -> u64 {
         self.installation_id
+    }
+
+    pub fn app_id(&self) -> u64 {
+        self.app_id
     }
 
     pub fn repository(&self) -> &str {
@@ -631,38 +698,491 @@ pub fn parse_github_repository(value: &str) -> Result<(String, String)> {
     Ok((owner.to_owned(), repository.to_owned()))
 }
 
-pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhInvocationPlan {
+    pub(crate) repository: Option<(String, String)>,
+    pub(crate) forwarded_arguments: Vec<String>,
+    pub(crate) inject_repository_argument: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhOptionKind {
+    Flag,
+    Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GhOptionSpec {
+    long: &'static str,
+    short: Option<&'static str>,
+    kind: GhOptionKind,
+}
+
+#[derive(Debug)]
+struct ParsedGhTail {
+    repository: Option<(String, String)>,
+    forwarded: Vec<String>,
+    positionals: Vec<String>,
+    options: BTreeMap<String, Vec<Option<String>>>,
+}
+
+const fn gh_flag(long: &'static str, short: Option<&'static str>) -> GhOptionSpec {
+    GhOptionSpec {
+        long,
+        short,
+        kind: GhOptionKind::Flag,
+    }
+}
+
+const fn gh_value(long: &'static str, short: Option<&'static str>) -> GhOptionSpec {
+    GhOptionSpec {
+        long,
+        short,
+        kind: GhOptionKind::Value,
+    }
+}
+
+fn gh_specs(command: &str, subcommand: &str) -> Result<Vec<GhOptionSpec>> {
+    let specs = match (command, subcommand) {
+        ("pr", "list") => &[
+            gh_value("--app", None),
+            gh_value("--assignee", Some("-a")),
+            gh_value("--author", Some("-A")),
+            gh_value("--base", Some("-B")),
+            gh_flag("--draft", Some("-d")),
+            gh_value("--head", Some("-H")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--label", Some("-l")),
+            gh_value("--limit", Some("-L")),
+            gh_value("--search", Some("-S")),
+            gh_value("--state", Some("-s")),
+            gh_value("--template", Some("-t")),
+        ][..],
+        ("pr", "view") => &[
+            gh_flag("--comments", Some("-c")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--template", Some("-t")),
+        ],
+        ("pr", "checks") => &[
+            gh_flag("--fail-fast", None),
+            gh_value("--interval", Some("-i")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_flag("--required", None),
+            gh_value("--template", Some("-t")),
+            gh_flag("--watch", None),
+        ],
+        ("pr", "diff") => &[
+            gh_value("--color", None),
+            gh_value("--exclude", Some("-e")),
+            gh_flag("--name-only", None),
+            gh_flag("--patch", None),
+        ],
+        ("pr", "create") => &[
+            gh_value("--assignee", Some("-a")),
+            gh_value("--base", Some("-B")),
+            gh_value("--body", Some("-b")),
+            gh_value("--body-file", Some("-F")),
+            gh_flag("--draft", Some("-d")),
+            gh_value("--head", Some("-H")),
+            gh_value("--label", Some("-l")),
+            gh_value("--milestone", Some("-m")),
+            gh_flag("--no-maintainer-edit", None),
+            gh_value("--project", Some("-p")),
+            gh_value("--reviewer", Some("-r")),
+            gh_value("--title", Some("-t")),
+        ],
+        ("pr", "comment") => &[
+            gh_value("--body", Some("-b")),
+            gh_value("--body-file", Some("-F")),
+        ],
+        ("pr", "edit") => &[
+            gh_value("--add-assignee", None),
+            gh_value("--add-label", None),
+            gh_value("--add-project", None),
+            gh_value("--add-reviewer", None),
+            gh_value("--base", Some("-B")),
+            gh_value("--body", Some("-b")),
+            gh_value("--body-file", Some("-F")),
+            gh_value("--milestone", Some("-m")),
+            gh_value("--remove-assignee", None),
+            gh_value("--remove-label", None),
+            gh_flag("--remove-milestone", None),
+            gh_value("--remove-project", None),
+            gh_value("--remove-reviewer", None),
+            gh_value("--title", Some("-t")),
+        ],
+        ("pr", "ready") => &[],
+        ("pr", "review") => &[
+            gh_flag("--approve", Some("-a")),
+            gh_value("--body", Some("-b")),
+            gh_value("--body-file", Some("-F")),
+            gh_flag("--comment", Some("-c")),
+            gh_flag("--request-changes", Some("-r")),
+        ],
+        ("pr", "merge") => &[
+            gh_value("--author-email", Some("-A")),
+            gh_value("--body", Some("-b")),
+            gh_value("--body-file", Some("-F")),
+            gh_value("--match-head-commit", None),
+            gh_flag("--merge", Some("-m")),
+            gh_flag("--rebase", Some("-r")),
+            gh_flag("--squash", Some("-s")),
+            gh_value("--subject", Some("-t")),
+        ],
+        ("pr", "close") | ("pr", "reopen") => &[gh_value("--comment", Some("-c"))],
+        ("run", "list") => &[
+            gh_flag("--all", Some("-a")),
+            gh_value("--branch", Some("-b")),
+            gh_value("--commit", Some("-c")),
+            gh_value("--created", None),
+            gh_value("--event", Some("-e")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--limit", Some("-L")),
+            gh_value("--status", Some("-s")),
+            gh_value("--template", Some("-t")),
+            gh_value("--user", Some("-u")),
+            gh_value("--workflow", Some("-w")),
+        ],
+        ("run", "view") => &[
+            gh_value("--attempt", Some("-a")),
+            gh_flag("--exit-status", None),
+            gh_value("--job", Some("-j")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_flag("--log", None),
+            gh_flag("--log-failed", None),
+            gh_value("--template", Some("-t")),
+            gh_flag("--verbose", Some("-v")),
+        ],
+        ("run", "watch") => &[
+            gh_flag("--compact", None),
+            gh_flag("--exit-status", None),
+            gh_value("--interval", Some("-i")),
+        ],
+        ("workflow", "list") => &[
+            gh_flag("--all", Some("-a")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--limit", Some("-L")),
+            gh_value("--template", Some("-t")),
+        ],
+        ("workflow", "view") => &[gh_value("--ref", Some("-r")), gh_flag("--yaml", Some("-y"))],
+        ("release", "list") => &[
+            gh_flag("--exclude-drafts", None),
+            gh_flag("--exclude-pre-releases", None),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--limit", Some("-L")),
+            gh_value("--order", Some("-O")),
+            gh_value("--template", Some("-t")),
+        ],
+        ("release", "view") => &[
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--template", Some("-t")),
+        ],
+        ("repo", "view") => &[
+            gh_value("--branch", Some("-b")),
+            gh_value("--jq", Some("-q")),
+            gh_value("--json", None),
+            gh_value("--template", Some("-t")),
+        ],
+        _ => bail!("gh command is outside the repository-scoped automation surface"),
+    };
+    Ok(specs.to_vec())
+}
+
+fn exact_github_repository(value: &str) -> Result<(String, String)> {
+    if value.contains(['\n', '\r', '\0', ':', '@', '?', '#']) {
+        bail!("gh repository selector must be an exact github.com owner/repository");
+    }
+    let mut parts = value.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repository = parts.next().unwrap_or_default();
+    if !is_github_component(owner) || !is_github_component(repository) || parts.next().is_some() {
+        bail!("gh repository selector must be an exact github.com owner/repository");
+    }
+    Ok((owner.to_owned(), repository.to_owned()))
+}
+
+fn set_gh_repository(selected: &mut Option<(String, String)>, value: &str) -> Result<()> {
+    if selected.is_some() {
+        bail!("gh command contains more than one repository selector");
+    }
+    *selected = Some(exact_github_repository(value)?);
+    Ok(())
+}
+
+fn find_gh_option<'a, 'b>(
+    specs: &'a [GhOptionSpec],
+    argument: &'b str,
+) -> Option<(&'a GhOptionSpec, Option<&'b str>)> {
+    if let Some((name, value)) = argument.split_once('=') {
+        return specs
+            .iter()
+            .find(|spec| spec.long == name && spec.kind == GhOptionKind::Value)
+            .map(|spec| (spec, Some(value)));
+    }
+    specs
+        .iter()
+        .find(|spec| spec.long == argument || spec.short == Some(argument))
+        .map(|spec| (spec, None))
+}
+
+fn parse_gh_tail(
+    command: &str,
+    subcommand: &str,
+    tail: &[&str],
+    specs: &[GhOptionSpec],
+) -> Result<ParsedGhTail> {
+    let mut parsed = ParsedGhTail {
+        repository: None,
+        forwarded: vec![command.to_owned(), subcommand.to_owned()],
+        positionals: Vec::new(),
+        options: BTreeMap::new(),
+    };
+    let mut index = 0_usize;
+    while index < tail.len() {
+        let argument = tail[index];
+        if argument == "--"
+            || argument.starts_with('-') && !argument.starts_with("--") && argument.len() > 2
+        {
+            bail!("gh compact, attached, bundled, and option-terminator forms are not admitted");
+        }
+
+        let repository_value = if matches!(argument, "-R" | "--repo") {
+            index += 1;
+            Some(
+                tail.get(index)
+                    .copied()
+                    .context("gh repository selector has no value")?,
+            )
+        } else {
+            argument.strip_prefix("--repo=")
+        };
+        if let Some(value) = repository_value {
+            set_gh_repository(&mut parsed.repository, value)?;
+            index += 1;
+            continue;
+        }
+
+        if argument.starts_with('-') {
+            let (spec, attached) = find_gh_option(specs, argument)
+                .context("gh option is outside the reviewed command grammar")?;
+            match spec.kind {
+                GhOptionKind::Flag => {
+                    if attached.is_some() {
+                        bail!("gh boolean option assignment is not admitted");
+                    }
+                    parsed
+                        .options
+                        .entry(spec.long.into())
+                        .or_default()
+                        .push(None);
+                    parsed.forwarded.push(argument.into());
+                }
+                GhOptionKind::Value => {
+                    let value = if let Some(value) = attached {
+                        value
+                    } else {
+                        index += 1;
+                        tail.get(index)
+                            .copied()
+                            .context("gh option value is missing")?
+                    };
+                    parsed
+                        .options
+                        .entry(spec.long.into())
+                        .or_default()
+                        .push(Some(value.into()));
+                    parsed.forwarded.push(argument.into());
+                    if attached.is_none() {
+                        parsed.forwarded.push(value.into());
+                    }
+                }
+            }
+            index += 1;
+            continue;
+        }
+
+        parsed.positionals.push(argument.into());
+        if (command, subcommand) != ("repo", "view") {
+            parsed.forwarded.push(argument.into());
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+fn gh_occurrences(parsed: &ParsedGhTail, name: &str) -> usize {
+    parsed.options.get(name).map_or(0, Vec::len)
+}
+
+fn gh_values<'a>(parsed: &'a ParsedGhTail, name: &str) -> Vec<&'a str> {
+    parsed
+        .options
+        .get(name)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_deref())
+        .collect()
+}
+
+fn valid_positive_number(value: &str) -> bool {
+    value.parse::<u64>().is_ok_and(|number| number > 0)
+}
+
+fn require_no_positionals(parsed: &ParsedGhTail) -> Result<()> {
+    if !parsed.positionals.is_empty() {
+        bail!("gh command does not accept positional inference");
+    }
+    Ok(())
+}
+
+fn require_numbered_target(parsed: &ParsedGhTail) -> Result<()> {
+    if parsed.positionals.len() != 1 || !valid_positive_number(&parsed.positionals[0]) {
+        bail!("gh command requires exactly one positive numeric target");
+    }
+    Ok(())
+}
+
+fn gh_body_source_count(parsed: &ParsedGhTail) -> Result<usize> {
+    let files = gh_values(parsed, "--body-file");
+    if files.iter().any(|value| *value != "-") {
+        bail!("gh body-file input is restricted to standard input");
+    }
+    Ok(gh_occurrences(parsed, "--body") + files.len())
+}
+
+fn validate_gh_shape(command: &str, subcommand: &str, parsed: &mut ParsedGhTail) -> Result<bool> {
+    match (command, subcommand) {
+        ("pr", "list") | ("run", "list") | ("workflow", "list") | ("release", "list") => {
+            require_no_positionals(parsed)?
+        }
+        ("pr", "view" | "checks" | "diff") => require_numbered_target(parsed)?,
+        ("pr", "create") => {
+            require_no_positionals(parsed)?;
+            for (option, description) in [
+                ("--head", "already-pushed head"),
+                ("--base", "base"),
+                ("--title", "title"),
+            ] {
+                let values = gh_values(parsed, option);
+                if values.len() != 1 || values[0].is_empty() {
+                    bail!("gh pull-request creation requires exactly one explicit {description}");
+                }
+            }
+            if gh_body_source_count(parsed)? != 1 {
+                bail!("gh pull-request creation requires exactly one explicit body source");
+            }
+            if gh_values(parsed, "--body")
+                .first()
+                .is_some_and(|value| value.is_empty())
+            {
+                bail!("gh pull-request creation requires a nonempty body");
+            }
+        }
+        ("pr", "comment") => {
+            require_numbered_target(parsed)?;
+            if gh_body_source_count(parsed)? != 1 {
+                bail!("gh pull-request comment requires exactly one explicit body source");
+            }
+        }
+        ("pr", "edit") => {
+            require_numbered_target(parsed)?;
+            if parsed.options.is_empty() {
+                bail!("gh pull-request edit requires an explicit mutation");
+            }
+            if gh_body_source_count(parsed)? > 1 {
+                bail!("gh pull-request edit accepts at most one explicit body source");
+            }
+        }
+        ("pr", "ready") => require_numbered_target(parsed)?,
+        ("pr", "review") => {
+            require_numbered_target(parsed)?;
+            let actions = ["--approve", "--comment", "--request-changes"];
+            if actions
+                .iter()
+                .map(|option| gh_occurrences(parsed, option))
+                .sum::<usize>()
+                != 1
+            {
+                bail!("gh pull-request review requires exactly one explicit review action");
+            }
+            let body_sources = gh_body_source_count(parsed)?;
+            let needs_body = gh_occurrences(parsed, "--comment") == 1
+                || gh_occurrences(parsed, "--request-changes") == 1;
+            if body_sources > 1 || needs_body && body_sources != 1 {
+                bail!("gh pull-request review has an invalid explicit body source");
+            }
+        }
+        ("pr", "merge") => {
+            require_numbered_target(parsed)?;
+            if ["--merge", "--rebase", "--squash"]
+                .iter()
+                .map(|option| gh_occurrences(parsed, option))
+                .sum::<usize>()
+                != 1
+            {
+                bail!("gh pull-request merge requires exactly one explicit strategy");
+            }
+            if gh_body_source_count(parsed)? > 1 {
+                bail!("gh pull-request merge accepts at most one explicit body source");
+            }
+        }
+        ("pr", "close" | "reopen") => {
+            require_numbered_target(parsed)?;
+            if gh_occurrences(parsed, "--comment") > 1 {
+                bail!("gh pull-request mutation accepts at most one explicit comment");
+            }
+        }
+        ("run", "view" | "watch") => require_numbered_target(parsed)?,
+        ("workflow", "view") | ("release", "view") => {
+            if parsed.positionals.len() != 1 || parsed.positionals[0].is_empty() {
+                bail!("gh command requires exactly one explicit target");
+            }
+        }
+        ("repo", "view") => {
+            if parsed.positionals.len() > 1 {
+                bail!("gh repository view accepts at most one repository target");
+            }
+            if let Some(value) = parsed.positionals.first() {
+                set_gh_repository(&mut parsed.repository, value)?;
+            }
+            return Ok(true);
+        }
+        _ => bail!("gh command is outside the repository-scoped automation surface"),
+    }
+    Ok(false)
+}
+
+pub(crate) fn parse_gh_invocation<S: AsRef<str>>(arguments: &[S]) -> Result<GhInvocationPlan> {
     let command = arguments
         .first()
         .map(AsRef::as_ref)
         .context("gh command is missing")?;
-    let subcommand = arguments.get(1).map(AsRef::as_ref);
-    let accepted = match command {
-        "pr" => matches!(
-            subcommand,
-            Some(
-                "list"
-                    | "view"
-                    | "create"
-                    | "checks"
-                    | "diff"
-                    | "comment"
-                    | "edit"
-                    | "ready"
-                    | "review"
-                    | "merge"
-                    | "close"
-                    | "reopen"
-            )
-        ),
-        "run" => matches!(subcommand, Some("list" | "view" | "watch" | "download")),
-        "workflow" => matches!(subcommand, Some("list" | "view")),
-        "release" => matches!(subcommand, Some("list" | "view" | "download")),
-        "repo" => matches!(subcommand, Some("view")),
-        _ => false,
-    };
-    if !accepted {
-        bail!("gh command is outside the repository-scoped automation surface");
+    let subcommand = arguments
+        .get(1)
+        .map(AsRef::as_ref)
+        .context("gh subcommand is missing")?;
+    if command.starts_with('-') || subcommand.starts_with('-') {
+        bail!("gh global options and implicit command selection are not admitted");
     }
-    Ok(())
+    let specs = gh_specs(command, subcommand)?;
+    let tail: Vec<&str> = arguments.iter().skip(2).map(AsRef::as_ref).collect();
+    let mut parsed = parse_gh_tail(command, subcommand, &tail, &specs)?;
+    let inject_repository_argument = validate_gh_shape(command, subcommand, &mut parsed)?;
+    Ok(GhInvocationPlan {
+        repository: parsed.repository,
+        forwarded_arguments: parsed.forwarded,
+        inject_repository_argument,
+    })
+}
+
+pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
+    parse_gh_invocation(arguments).map(|_| ())
 }

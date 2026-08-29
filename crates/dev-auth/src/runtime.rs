@@ -21,8 +21,12 @@ use ssh_key::private::{Ed25519Keypair, KeypairData};
 use ssh_key::{Algorithm as SshAlgorithm, HashAlg, PrivateKey, PublicKey, Signature};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -32,12 +36,25 @@ use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+#[cfg(windows)]
+#[path = "windows_security.rs"]
+mod windows_security;
+
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
+// Reviewed against github/cli tag v2.98.0 at
+// a255baf71d13fe5947a4eb7ad521ffd412d64cee.
+const SUPPORTED_GH_VERSION: &str = "2.98.0";
+const SUPPORTED_GH_VERSION_OUTPUT: &str =
+    "gh version 2.98.0 (2026-08-21)\nhttps://github.com/cli/cli/releases/tag/v2.98.0\n";
+#[cfg(windows)]
+const GH_CHILD_FRONTENDS: [&str; 3] = ["git.exe", "cat.exe", "false.exe"];
+#[cfg(not(windows))]
+const GH_CHILD_FRONTENDS: [&str; 3] = ["git", "cat", "false"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeStatus {
@@ -46,6 +63,14 @@ pub struct RuntimeStatus {
     pub runtime_ready: bool,
     pub ssh_agent_ready: bool,
     pub cached_installation_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub online: bool,
+    pub declared_exec_profiles: usize,
+    pub declared_ssh_profiles: usize,
+    pub declared_secret_references: usize,
 }
 
 #[derive(Debug)]
@@ -73,6 +98,82 @@ impl RuntimePaths {
 
     fn cache_dir(&self) -> PathBuf {
         self.runtime.join("github-installation-tokens")
+    }
+
+    fn gh_sandbox_dir(&self) -> PathBuf {
+        self.runtime.join("gh-sandbox")
+    }
+
+    fn gh_child_bin_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("bin")
+    }
+
+    fn gh_config_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("config")
+    }
+
+    fn gh_home_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("home")
+    }
+
+    fn gh_cache_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("cache")
+    }
+
+    fn gh_data_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("data")
+    }
+
+    fn gh_temp_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("tmp")
+    }
+
+    fn gh_git_config_file(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("git-empty-config")
+    }
+
+    fn gh_git_attributes_file(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("git-empty-attributes")
+    }
+
+    fn gh_git_hooks_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("git-empty-hooks")
+    }
+
+    fn exec_sandbox_dir(&self) -> PathBuf {
+        self.runtime.join("exec-sandbox")
+    }
+
+    fn exec_profile_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_sandbox_dir().join(profile_name)
+    }
+
+    fn exec_bin_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("bin")
+    }
+
+    fn exec_config_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("config")
+    }
+
+    fn exec_home_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("home")
+    }
+
+    fn exec_cache_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("cache")
+    }
+
+    fn exec_data_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("data")
+    }
+
+    fn exec_temp_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("tmp")
+    }
+
+    fn exec_runtime_dir(&self, profile_name: &str) -> PathBuf {
+        self.exec_profile_dir(profile_name).join("runtime")
     }
 }
 
@@ -121,9 +222,57 @@ fn load_config(paths: &RuntimePaths) -> Result<Config> {
     if bytes.len() as u64 > CONFIG_LIMIT {
         bail!("configuration exceeds the size limit");
     }
-    parse_config(&bytes)
+    let config = parse_config(&bytes)?;
+    #[cfg(windows)]
+    validate_configured_windows_programs(&config)?;
+    Ok(config)
 }
 
+#[cfg(windows)]
+fn validate_configured_windows_programs(config: &Config) -> Result<()> {
+    for (description, program) in [
+        ("1Password CLI", &config.programs.op),
+        ("GitHub CLI", &config.programs.gh),
+        ("Git", &config.programs.git),
+        ("ssh-add", &config.programs.ssh_add),
+        ("ssh-keygen", &config.programs.ssh_keygen),
+    ] {
+        windows_security::validate_local_program(Path::new(program))
+            .with_context(|| format!("validate configured {description} program at {program}"))?;
+    }
+    for (profile_name, profile) in &config.profiles {
+        for executable in &profile.executables {
+            windows_security::validate_local_program(Path::new(executable)).with_context(|| {
+                format!("validate executable for profile {profile_name} at {executable}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+type ProgramGuard = windows_security::ProgramGuard;
+#[cfg(not(windows))]
+struct ProgramGuard;
+
+#[cfg(windows)]
+fn program_guard(program: &str, description: &str) -> Result<ProgramGuard> {
+    windows_security::lock_local_program(Path::new(program))
+        .with_context(|| format!("lock configured {description} program at {program}"))
+}
+
+#[cfg(not(windows))]
+fn program_guard(_program: &str, _description: &str) -> Result<ProgramGuard> {
+    Ok(ProgramGuard)
+}
+
+#[cfg(windows)]
+fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
+    windows_security::validate_private_directory(path)
+        .with_context(|| format!("inspect {description} at {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
@@ -141,6 +290,13 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn private_read(path: &Path, description: &str) -> Result<File> {
+    windows_security::open_private_file(path)
+        .with_context(|| format!("open and validate {description} at {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn private_read(path: &Path, description: &str) -> Result<File> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
@@ -158,6 +314,7 @@ fn private_read(path: &Path, description: &str) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(not(windows))]
 fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
     let metadata = file
         .metadata()
@@ -175,6 +332,13 @@ fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    windows_security::ensure_private_directory(path)
+        .with_context(|| format!("create or validate private directory {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn ensure_private_directory(path: &Path) -> Result<()> {
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
@@ -206,25 +370,31 @@ fn ensure_runtime(paths: &RuntimePaths) -> Result<()> {
         .runtime
         .parent()
         .context("private runtime path has no parent")?;
-    if !parent.exists() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        builder.mode(0o700);
-        builder
-            .create(parent)
-            .with_context(|| format!("create runtime root {}", parent.display()))?;
-    }
-    let parent_metadata = fs::symlink_metadata(parent)
-        .with_context(|| format!("inspect runtime root {}", parent.display()))?;
-    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
-        bail!("runtime root is not a directory");
-    }
-    #[cfg(unix)]
-    if parent_metadata.uid() != rustix::process::geteuid().as_raw()
-        || parent_metadata.permissions().mode() & 0o077 != 0
+    #[cfg(windows)]
+    windows_security::ensure_private_directory_all(parent)
+        .with_context(|| format!("create or validate runtime root {}", parent.display()))?;
+    #[cfg(not(windows))]
     {
-        bail!("runtime root is not a private current-user directory");
+        if !parent.exists() {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder
+                .create(parent)
+                .with_context(|| format!("create runtime root {}", parent.display()))?;
+        }
+        let parent_metadata = fs::symlink_metadata(parent)
+            .with_context(|| format!("inspect runtime root {}", parent.display()))?;
+        if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+            bail!("runtime root is not a directory");
+        }
+        #[cfg(unix)]
+        if parent_metadata.uid() != rustix::process::geteuid().as_raw()
+            || parent_metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!("runtime root is not a private current-user directory");
+        }
     }
     ensure_private_directory(&paths.runtime)?;
     ensure_private_directory(&paths.cache_dir())?;
@@ -247,7 +417,64 @@ fn remove_legacy_token_files(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn validate_secret_service_session_at(
+    environment: &BTreeMap<String, String>,
+    run_user_root: &Path,
+    uid: u32,
+) -> Result<()> {
+    let runtime = run_user_root.join(uid.to_string());
+    let runtime_metadata = fs::symlink_metadata(&runtime).with_context(|| {
+        format!(
+            "inspect current-user runtime directory {}",
+            runtime.display()
+        )
+    })?;
+    if !runtime_metadata.file_type().is_dir()
+        || runtime_metadata.file_type().is_symlink()
+        || runtime_metadata.uid() != uid
+        || runtime_metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("Secret Service runtime must be a private current-user directory");
+    }
+    let bus = runtime.join("bus");
+    let bus_metadata = fs::symlink_metadata(&bus)
+        .with_context(|| format!("inspect current-user session bus {}", bus.display()))?;
+    if !bus_metadata.file_type().is_socket()
+        || bus_metadata.file_type().is_symlink()
+        || bus_metadata.uid() != uid
+    {
+        bail!("Secret Service session bus must be a current-user Unix socket");
+    }
+    if environment
+        .get("XDG_RUNTIME_DIR")
+        .is_some_and(|value| Path::new(value) != runtime)
+    {
+        bail!("XDG_RUNTIME_DIR does not identify the current-user login runtime");
+    }
+    let expected_address = format!("unix:path={}", bus.display());
+    if environment
+        .get("DBUS_SESSION_BUS_ADDRESS")
+        .is_some_and(|value| value != &expected_address)
+    {
+        bail!("DBUS_SESSION_BUS_ADDRESS does not identify the current-user session bus");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_secret_service_session() -> Result<()> {
+    let environment: BTreeMap<String, String> = env::vars().collect();
+    validate_secret_service_session_at(
+        &environment,
+        Path::new("/run/user"),
+        rustix::process::geteuid().as_raw(),
+    )
+}
+
 fn credential_entry(store: &CredentialStore) -> Result<Entry> {
+    #[cfg(target_os = "linux")]
+    validate_secret_service_session()?;
     Entry::new(&store.service, &store.account).context("open native OS credential-store entry")
 }
 
@@ -284,6 +511,7 @@ pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
 
 fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString> {
     crate::validate_op_reference(reference)?;
+    let _program_guard = program_guard(&config.programs.op, "1Password CLI")?;
     let service_token = service_account_token(&config.credential_store)?;
     let output = Command::new(&config.programs.op)
         .args(["read", "--no-newline", reference])
@@ -342,6 +570,7 @@ struct RepositoryInstallationResponse {
     app_id: u64,
     account: InstallationAccountResponse,
     permissions: BTreeMap<String, String>,
+    repository_selection: crate::RepositorySelection,
     suspended_at: Option<serde_json::Value>,
 }
 
@@ -414,6 +643,7 @@ fn validate_repository_installation_response(
         || installation.app_id != config.github.app_id
         || !installation.account.login.eq_ignore_ascii_case(owner)
         || installation.permissions != config.github.permissions
+        || installation.repository_selection != config.github.repository_selection
         || installation.suspended_at.is_some()
     {
         bail!("GitHub App repository installation does not match the declared authority");
@@ -504,6 +734,7 @@ fn mint_installation_token(
     Ok(CacheEntry::new(
         SecretString::new(response.token),
         expires_at,
+        config.github.app_id,
         installation_id,
         owner.to_ascii_lowercase(),
         repository.to_owned(),
@@ -516,6 +747,7 @@ fn mint_installation_token(
 struct CacheFile {
     token: String,
     expires_at: i64,
+    app_id: u64,
     installation_id: u64,
     owner: String,
     repository: String,
@@ -527,6 +759,7 @@ impl From<&CacheEntry> for CacheFile {
         Self {
             token: entry.token().expose().to_owned(),
             expires_at: entry.expires_at(),
+            app_id: entry.app_id(),
             installation_id: entry.installation_id(),
             owner: entry.owner().to_owned(),
             repository: entry.repository().to_owned(),
@@ -540,6 +773,7 @@ impl From<CacheFile> for CacheEntry {
         CacheEntry::new(
             SecretString::new(value.token),
             value.expires_at,
+            value.app_id,
             value.installation_id,
             value.owner,
             value.repository,
@@ -549,22 +783,34 @@ impl From<CacheFile> for CacheEntry {
 }
 
 fn cache_key(
+    app_id: u64,
     installation_id: u64,
+    repository_selection: crate::RepositorySelection,
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let public_scope = serde_json::to_vec(&(installation_id, repository, permissions))
-        .context("serialize installation-token cache scope")?;
+    let public_scope = serde_json::to_vec(&(
+        app_id,
+        installation_id,
+        repository_selection,
+        repository,
+        permissions,
+    ))
+    .context("serialize installation-token cache scope")?;
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
 fn dynamic_cache_key(
+    app_id: u64,
+    repository_selection: crate::RepositorySelection,
     owner: &str,
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> Result<String> {
     let public_scope = serde_json::to_vec(&(
         "dynamic",
+        app_id,
+        repository_selection,
         owner.to_ascii_lowercase(),
         repository.to_ascii_lowercase(),
         permissions,
@@ -573,37 +819,100 @@ fn dynamic_cache_key(
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
+fn cache_lifecycle_lock(paths: &RuntimePaths) -> Result<File> {
+    private_open(&paths.runtime.join("cache-lifecycle.lock"))
+}
+
+fn with_cache_scope_lock<T, F>(paths: &RuntimePaths, key: &str, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_runtime(paths)?;
+    let lifecycle = cache_lifecycle_lock(paths)?;
+    FileExt::lock_shared(&lifecycle).context("lock installation-token cache lifecycle")?;
+    let scope = private_open(&paths.cache_dir().join(format!("{key}.lock")))?;
+    scope
+        .lock_exclusive()
+        .context("lock installation-token cache scope")?;
+    operation()
+}
+
+fn with_cache_purge_lock<T, F>(paths: &RuntimePaths, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_runtime(paths)?;
+    let lifecycle = cache_lifecycle_lock(paths)?;
+    lifecycle
+        .lock_exclusive()
+        .context("lock installation-token cache lifecycle for purge")?;
+    operation()
+}
+
+fn with_cache_scope_erase_lock<T, F>(paths: &RuntimePaths, key: &str, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_runtime(paths)?;
+    let lifecycle = cache_lifecycle_lock(paths)?;
+    lifecycle
+        .lock_exclusive()
+        .context("lock installation-token cache lifecycle for erase")?;
+    let scope_path = paths.cache_dir().join(format!("{key}.lock"));
+    let scope = private_open(&scope_path)?;
+    scope
+        .lock_exclusive()
+        .context("lock installation-token cache scope for erase")?;
+    let value = operation()?;
+    drop(scope);
+    fs::remove_file(&scope_path).context("remove erased installation-token scope receipt")?;
+    Ok(value)
+}
+
 fn locked_cache_entry<F>(
     paths: &RuntimePaths,
-    store: &CredentialStore,
-    installation_id: u64,
-    owner: &str,
-    repository: &str,
-    permissions: &BTreeMap<String, String>,
+    config: &Config,
+    selected: &SelectedRepository,
     create: F,
 ) -> Result<CacheEntry>
 where
     F: FnOnce() -> Result<CacheEntry>,
 {
-    ensure_runtime(paths)?;
-    let key = cache_key(installation_id, repository, permissions)?;
-    let lock_path = paths.cache_dir().join(format!("{key}.lock"));
-    let lock = private_open(&lock_path)?;
-    lock.lock_exclusive()
-        .context("lock installation-token cache")?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-
-    if let Ok(entry) = read_cache(store, &key) {
-        if entry.is_usable_at(now, installation_id, owner, repository, permissions) {
-            return Ok(entry);
+    let key = cache_key(
+        config.github.app_id,
+        selected.installation_id,
+        config.github.repository_selection,
+        &selected.repository,
+        &config.github.permissions,
+    )?;
+    with_cache_scope_lock(paths, &key, || {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if let Ok(entry) = read_cache(&config.credential_store, &key) {
+            if entry.is_usable_at(
+                now,
+                config.github.app_id,
+                selected.installation_id,
+                &selected.owner,
+                &selected.repository,
+                &config.github.permissions,
+            ) {
+                return Ok(entry);
+            }
         }
-    }
-    let entry = create()?;
-    if !entry.is_usable_at(now, installation_id, owner, repository, permissions) {
-        bail!("new installation token is not usable for the requested scope");
-    }
-    write_cache(store, &key, &entry)?;
-    Ok(entry)
+        let entry = create()?;
+        if !entry.is_usable_at(
+            now,
+            config.github.app_id,
+            selected.installation_id,
+            &selected.owner,
+            &selected.repository,
+            &config.github.permissions,
+        ) {
+            bail!("new installation token is not usable for the requested scope");
+        }
+        write_cache(&config.credential_store, &key, &entry)?;
+        Ok(entry)
+    })
 }
 
 fn locked_dynamic_cache_entry(
@@ -612,37 +921,101 @@ fn locked_dynamic_cache_entry(
     owner: &str,
     repository: &str,
 ) -> Result<CacheEntry> {
-    ensure_runtime(paths)?;
     let owner = owner.to_ascii_lowercase();
     let repository = repository.to_ascii_lowercase();
-    let key = dynamic_cache_key(&owner, &repository, &config.github.permissions)?;
-    let lock_path = paths.cache_dir().join(format!("{key}.lock"));
-    let lock = private_open(&lock_path)?;
-    lock.lock_exclusive()
-        .context("lock dynamic installation-token cache")?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let key = dynamic_cache_key(
+        config.github.app_id,
+        config.github.repository_selection,
+        &owner,
+        &repository,
+        &config.github.permissions,
+    )?;
+    with_cache_scope_lock(paths, &key, || {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now,
+                app_id: config.github.app_id,
+                owner: &owner,
+                repository: &repository,
+                permissions: &config.github.permissions,
+            },
+            || discover_repository_installation(config, &owner, &repository, now),
+            || read_cache(&config.credential_store, &key),
+            |installation_id| {
+                mint_installation_token(
+                    config,
+                    installation_id,
+                    &owner,
+                    &repository,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )
+            },
+            |entry| write_cache(&config.credential_store, &key, entry),
+        )
+    })
+}
 
-    if let Ok(entry) = read_cache(&config.credential_store, &key) {
-        if entry.is_usable_for_repository_at(now, &owner, &repository, &config.github.permissions) {
+struct DynamicRepositoryScope<'a> {
+    now: i64,
+    app_id: u64,
+    owner: &'a str,
+    repository: &'a str,
+    permissions: &'a BTreeMap<String, String>,
+}
+
+fn resolve_dynamic_cache_entry<Discover, Read, Mint, Write>(
+    scope: DynamicRepositoryScope<'_>,
+    discover: Discover,
+    read: Read,
+    mint: Mint,
+    write: Write,
+) -> Result<CacheEntry>
+where
+    Discover: FnOnce() -> Result<SelectedRepository>,
+    Read: FnOnce() -> Result<CacheEntry>,
+    Mint: FnOnce(u64) -> Result<CacheEntry>,
+    Write: FnOnce(&CacheEntry) -> Result<()>,
+{
+    let selected = discover()?;
+    if selected.owner != scope.owner || selected.repository != scope.repository {
+        bail!("live GitHub installation does not match the requested repository");
+    }
+    if let Ok(entry) = read() {
+        if entry.is_usable_for_repository_at(
+            scope.now,
+            scope.app_id,
+            selected.installation_id,
+            scope.owner,
+            scope.repository,
+            scope.permissions,
+        ) {
             return Ok(entry);
         }
     }
 
-    let selected = discover_repository_installation(config, &owner, &repository, now)?;
-    let entry = mint_installation_token(
-        config,
+    let entry = mint(selected.installation_id)?;
+    if !entry.is_usable_for_repository_at(
+        scope.now,
+        scope.app_id,
         selected.installation_id,
-        &selected.owner,
-        &selected.repository,
-        OffsetDateTime::now_utc().unix_timestamp(),
-    )?;
-    if !entry.is_usable_for_repository_at(now, &owner, &repository, &config.github.permissions) {
+        scope.owner,
+        scope.repository,
+        scope.permissions,
+    ) {
         bail!("new installation token is not usable for the requested repository");
     }
-    write_cache(&config.credential_store, &key, &entry)?;
+    write(&entry)?;
     Ok(entry)
 }
 
+#[cfg(windows)]
+fn private_open(path: &Path) -> Result<File> {
+    windows_security::open_or_create_private_file(path)
+        .with_context(|| format!("open private runtime file {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn private_open(path: &Path) -> Result<File> {
     if path.is_symlink() {
         bail!("private runtime path must not be a symlink");
@@ -661,6 +1034,8 @@ fn private_open(path: &Path) -> Result<File> {
 }
 
 fn cache_entry(store: &CredentialStore, key: &str) -> Result<Entry> {
+    #[cfg(target_os = "linux")]
+    validate_secret_service_session()?;
     Entry::new(&format!("{}:github-installation-token", store.service), key)
         .context("open native installation-token cache entry")
 }
@@ -695,23 +1070,15 @@ fn token_entry_for_repository(
         return locked_dynamic_cache_entry(paths, config, owner, repository);
     }
     let selected = config.github.select_repository(owner, repository)?;
-    locked_cache_entry(
-        paths,
-        &config.credential_store,
-        selected.installation_id,
-        &selected.owner,
-        &selected.repository,
-        &config.github.permissions,
-        || {
-            mint_installation_token(
-                config,
-                selected.installation_id,
-                &selected.owner,
-                &selected.repository,
-                OffsetDateTime::now_utc().unix_timestamp(),
-            )
-        },
-    )
+    locked_cache_entry(paths, config, &selected, || {
+        mint_installation_token(
+            config,
+            selected.installation_id,
+            &selected.owner,
+            &selected.repository,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+    })
 }
 
 pub fn credential_get(input: &[u8]) -> Result<String> {
@@ -730,162 +1097,361 @@ pub fn github_token_for_repository(owner: &str, repository: &str) -> Result<Secr
     Ok(entry.token().clone())
 }
 
-fn explicit_gh_repository(arguments: &[String]) -> Result<Option<String>> {
-    let mut selected: Option<String> = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        let value = if matches!(arguments[index].as_str(), "-R" | "--repo") {
-            index += 1;
-            Some(
-                arguments
-                    .get(index)
-                    .context("gh repository flag has no value")?
-                    .clone(),
-            )
-        } else {
-            arguments[index].strip_prefix("--repo=").map(str::to_owned)
-        };
-        if let Some(value) = value {
-            if selected.as_ref().is_some_and(|current| current != &value) {
-                bail!("gh command contains conflicting repository selectors");
-            }
-            selected = Some(value);
-        }
-        index += 1;
-    }
-    if let Some(value) = repo_view_positional_repository(arguments)? {
-        if selected.as_ref().is_some_and(|current| current != &value) {
-            bail!("gh command contains conflicting repository selectors");
-        }
-        selected = Some(value);
-    }
-    Ok(selected)
-}
-
-fn repo_view_positional_repository(arguments: &[String]) -> Result<Option<String>> {
-    if arguments.first().map(String::as_str) != Some("repo")
-        || arguments.get(1).map(String::as_str) != Some("view")
-    {
-        return Ok(None);
-    }
-
-    let mut positional: Option<String> = None;
-    let mut index = 2;
-    let mut options_ended = false;
-    while index < arguments.len() {
-        let argument = &arguments[index];
-        if !options_ended && argument == "--" {
-            options_ended = true;
-            index += 1;
-            continue;
-        }
-        if !options_ended && matches!(argument.as_str(), "-R" | "--repo") {
-            index += 1;
-            arguments
-                .get(index)
-                .context("gh repository flag has no value")?;
-        } else if !options_ended
-            && matches!(
-                argument.as_str(),
-                "-b" | "--branch" | "-q" | "--jq" | "--json" | "-t" | "--template"
-            )
-        {
-            index += 1;
-            arguments
-                .get(index)
-                .with_context(|| format!("gh repo view flag {argument} has no value"))?;
-        } else if !options_ended
-            && (matches!(argument.as_str(), "-w" | "--web" | "--help")
-                || argument.starts_with("--repo=")
-                || ["--branch=", "--jq=", "--json=", "--template="]
-                    .iter()
-                    .any(|prefix| argument.starts_with(prefix)))
-        {
-            // Flag is complete in this argument.
-        } else if !options_ended && argument.starts_with('-') {
-            bail!("unsupported gh repo view flag: {argument}");
-        } else {
-            crate::parse_github_repository(argument)?;
-            if positional.is_some() {
-                bail!("gh repo view contains more than one positional repository");
-            }
-            positional = Some(argument.clone());
-        }
-        index += 1;
-    }
-    Ok(positional)
-}
-
 fn forwarded_gh_arguments(
-    arguments: &[String],
+    mut plan: crate::GhInvocationPlan,
     owner: &str,
     repository: &str,
-) -> Result<Vec<String>> {
-    if arguments.first().map(String::as_str) != Some("repo")
-        || arguments.get(1).map(String::as_str) != Some("view")
-        || repo_view_positional_repository(arguments)?.is_some()
-    {
-        return Ok(arguments.to_vec());
+) -> Vec<String> {
+    if plan.inject_repository_argument {
+        plan.forwarded_arguments
+            .insert(2, format!("{owner}/{repository}"));
     }
+    plan.forwarded_arguments
+}
 
-    let mut forwarded = Vec::with_capacity(arguments.len() + 1);
-    forwarded.extend_from_slice(&arguments[..2]);
-    forwarded.push(format!("{owner}/{repository}"));
-    let mut index = 2;
-    while index < arguments.len() {
-        if matches!(arguments[index].as_str(), "-R" | "--repo") {
-            index += 2;
-        } else if arguments[index].starts_with("--repo=") {
-            index += 1;
-        } else {
-            forwarded.push(arguments[index].clone());
-            index += 1;
-        }
+fn origin_repository_at(
+    program: &str,
+    working_directory: Option<&Path>,
+    environment: &BTreeMap<String, String>,
+) -> Result<String> {
+    let _program_guard = program_guard(program, "Git")?;
+    let mut command = Command::new(program);
+    command
+        .args([
+            "config",
+            "--local",
+            "--no-includes",
+            "--null",
+            "--get-all",
+            "remote.origin.url",
+        ])
+        .env_clear()
+        .envs(environment)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
     }
-    Ok(forwarded)
+    let output = command.output().context("read current Git origin")?;
+    if !output.status.success() {
+        bail!("no explicit repository and no literal local Git origin");
+    }
+    if output.stdout.len() as u64 > RESPONSE_LIMIT {
+        bail!("literal local Git origin exceeds the size limit");
+    }
+    let mut values = output.stdout.split(|byte| *byte == 0);
+    let value = values.next().unwrap_or_default();
+    if value.is_empty()
+        || values
+            .next()
+            .is_none_or(|terminator| !terminator.is_empty())
+        || values.next().is_some()
+    {
+        bail!("literal local Git origin is missing or ambiguous");
+    }
+    String::from_utf8(value.to_vec()).context("literal local Git origin is not UTF-8")
 }
 
 fn origin_repository(program: &str) -> Result<String> {
-    let output = Command::new(program)
-        .args(["remote", "get-url", "origin"])
-        .env_clear()
-        .envs(sanitized_current_environment())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("read current Git origin")?;
-    if !output.status.success() {
-        bail!("no explicit repository and no readable Git origin");
-    }
-    let value = String::from_utf8(output.stdout).context("Git origin is not UTF-8")?;
-    Ok(value.trim_end_matches(['\n', '\r']).to_owned())
+    origin_repository_at(program, None, &sanitized_current_environment())
 }
 
-fn resolve_gh_repository(arguments: &[String], git_program: &str) -> Result<(String, String)> {
-    let selected = match explicit_gh_repository(arguments)? {
-        Some(value) => value,
-        None => match env::var("GH_REPO") {
-            Ok(value) => value,
-            Err(_) => origin_repository(git_program)?,
-        },
-    };
-    crate::parse_github_repository(&selected)
+fn preconfigured_gh_repository(
+    selected: Option<(String, String)>,
+) -> Result<Option<(String, String)>> {
+    if selected.is_some() {
+        return Ok(selected);
+    }
+    match env::var("GH_REPO") {
+        Ok(value) => crate::exact_github_repository(&value).map(Some),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => bail!("GH_REPO is not valid Unicode"),
+    }
+}
+
+fn resolve_gh_repository(
+    selected: Option<(String, String)>,
+    git_program: &str,
+) -> Result<(String, String)> {
+    match selected {
+        Some(repository) => Ok(repository),
+        None => crate::parse_github_repository(&origin_repository(git_program)?),
+    }
+}
+
+fn file_sha256(path: &Path, description: &str) -> Result<[u8; 32]> {
+    let mut file = File::open(path).with_context(|| format!("open {description}"))?;
+    file_sha256_file(&mut file, description)
+}
+
+fn file_sha256_file(file: &mut File, description: &str) -> Result<[u8; 32]> {
+    #[cfg(windows)]
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {description}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {description}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    #[cfg(windows)]
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {description}"))?;
+    Ok(digest.finalize().into())
+}
+
+#[cfg(not(windows))]
+fn install_gh_child_frontend(source: &Path, destination: &Path, digest: &[u8; 32]) -> Result<()> {
+    #[cfg(windows)]
+    if destination.exists()
+        && private_read(destination, "gh child frontend").is_ok()
+        && file_sha256(destination, "gh child frontend")? == *digest
+    {
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    if destination.exists() {
+        let _ = private_read(destination, "gh child frontend")?;
+        if file_sha256(destination, "gh child frontend")? == *digest {
+            return Ok(());
+        }
+    }
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("gh child frontend name is invalid")?;
+    let temporary = destination.with_file_name(format!(".{name}.tmp"));
+    #[cfg(not(windows))]
+    if temporary.exists() {
+        let _ = private_read(&temporary, "temporary gh child frontend")?;
+        fs::remove_file(&temporary).context("remove stale temporary gh child frontend")?;
+    }
+    #[cfg(windows)]
+    windows_security::copy_to_private_replacement(source, &temporary)
+        .context("copy gh child frontend into a private Windows file")?;
+    #[cfg(not(windows))]
+    fs::copy(source, &temporary).context("copy gh child frontend")?;
+    #[cfg(unix)]
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
+        .context("make gh child frontend executable")?;
+    let _ = private_read(&temporary, "temporary gh child frontend")?;
+    if file_sha256(&temporary, "temporary gh child frontend")? != *digest {
+        bail!("copied gh child frontend does not match the running executable");
+    }
+    #[cfg(windows)]
+    windows_security::atomically_replace_private_file(&temporary, destination)
+        .context("atomically activate private gh child frontend")?;
+    #[cfg(not(windows))]
+    {
+        if destination.exists() {
+            fs::remove_file(destination).context("remove superseded gh child frontend")?;
+        }
+        fs::rename(&temporary, destination).context("activate gh child frontend")?;
+    }
+    Ok(())
+}
+
+fn ensure_empty_private_file(path: &Path, description: &str) -> Result<()> {
+    let file = private_open(path).with_context(|| format!("open {description}"))?;
+    file.set_len(0)
+        .with_context(|| format!("truncate {description}"))?;
+    file.sync_all()
+        .with_context(|| format!("synchronize {description}"))
+}
+
+fn ensure_gh_sandbox_roots(paths: &RuntimePaths) -> Result<()> {
+    ensure_runtime(paths)?;
+    ensure_private_directory(&paths.gh_sandbox_dir())?;
+    ensure_private_directory(&paths.gh_child_bin_dir())?;
+    ensure_private_directory(&paths.gh_config_dir())?;
+    ensure_private_directory(&paths.gh_home_dir())?;
+    ensure_private_directory(&paths.gh_cache_dir())?;
+    ensure_private_directory(&paths.gh_data_dir())?;
+    ensure_private_directory(&paths.gh_temp_dir())?;
+    ensure_private_directory(&paths.gh_git_hooks_dir())?;
+    ensure_empty_private_file(&paths.gh_git_config_file(), "empty Git configuration")?;
+    ensure_empty_private_file(&paths.gh_git_attributes_file(), "empty Git attributes file")
+}
+
+#[cfg(windows)]
+fn gh_child_frontend_guards(paths: &RuntimePaths) -> Result<Vec<ProgramGuard>> {
+    GH_CHILD_FRONTENDS
+        .iter()
+        .map(|frontend| {
+            let path = paths.gh_child_bin_dir().join(frontend);
+            windows_security::lock_local_program(&path)
+                .with_context(|| format!("lock private gh child frontend at {}", path.display()))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
+    ensure_gh_sandbox_roots(paths)?;
+    let lock = private_open(&paths.runtime.join("gh-sandbox.lock"))?;
+    lock.lock_exclusive().context("lock gh sandbox update")?;
+    let executable = env::current_exe().context("resolve running dev-auth executable")?;
+    let digest = file_sha256(&executable, "running dev-auth executable")?;
+    for frontend in GH_CHILD_FRONTENDS {
+        install_gh_child_frontend(
+            &executable,
+            &paths.gh_child_bin_dir().join(frontend),
+            &digest,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
+    ensure_gh_sandbox_roots(paths)?;
+    let lock = private_open(&paths.runtime.join("gh-sandbox.lock"))?;
+    lock.lock_exclusive().context("lock gh sandbox update")?;
+    let executable = env::current_exe().context("resolve running dev-auth executable")?;
+    let mut executable_file = windows_security::lock_local_program_for_copy(&executable)
+        .context("lock running dev-auth executable")?;
+    let digest = file_sha256_file(&mut executable_file, "running dev-auth executable")?;
+    for frontend in GH_CHILD_FRONTENDS {
+        let destination = paths.gh_child_bin_dir().join(frontend);
+        if destination.exists()
+            && private_read(&destination, "gh child frontend").is_ok()
+            && file_sha256(&destination, "gh child frontend")? == digest
+        {
+            continue;
+        }
+        let name = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("gh child frontend name is invalid")?;
+        let temporary = destination.with_file_name(format!(".{name}.tmp"));
+        if temporary.exists() {
+            let _ = private_read(&temporary, "temporary gh child frontend")?;
+            fs::remove_file(&temporary).context("remove stale temporary gh child frontend")?;
+        }
+        windows_security::copy_open_file_to_private_replacement(&mut executable_file, &temporary)
+            .context("copy gh child frontend into a private Windows file")?;
+        let _ = private_read(&temporary, "temporary gh child frontend")?;
+        if file_sha256(&temporary, "temporary gh child frontend")? != digest {
+            bail!("copied gh child frontend does not match the running executable");
+        }
+        windows_security::atomically_replace_private_file(&temporary, &destination)
+            .context("atomically activate private gh child frontend")?;
+    }
+    Ok(())
+}
+
+fn isolated_gh_environment(
+    input: &BTreeMap<String, String>,
+    paths: &RuntimePaths,
+    token: &SecretString,
+    owner: &str,
+    repository: &str,
+    git_program: &str,
+) -> BTreeMap<String, String> {
+    const PLATFORM_ALLOWED: &[&str] = &[
+        "COLORTERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TERM",
+    ];
+    let mut environment: BTreeMap<String, String> = input
+        .iter()
+        .filter(|(key, _)| {
+            PLATFORM_ALLOWED
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    environment.insert(
+        "PATH".into(),
+        paths.gh_child_bin_dir().display().to_string(),
+    );
+    environment.insert(
+        "GH_CONFIG_DIR".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert("HOME".into(), paths.gh_home_dir().display().to_string());
+    environment.insert(
+        "USERPROFILE".into(),
+        paths.gh_home_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CONFIG_HOME".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".into(),
+        paths.gh_cache_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_DATA_HOME".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    environment.insert(
+        "APPDATA".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "LOCALAPPDATA".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    for variable in ["TMP", "TEMP", "TMPDIR"] {
+        environment.insert(variable.into(), paths.gh_temp_dir().display().to_string());
+    }
+    environment.insert("GH_TOKEN".into(), token.expose().into());
+    environment.insert("GH_HOST".into(), "github.com".into());
+    environment.insert("GH_REPO".into(), format!("{owner}/{repository}"));
+    environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
+    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    environment.insert("GH_EDITOR".into(), "false".into());
+    environment.insert("GIT_EDITOR".into(), "false".into());
+    environment.insert("VISUAL".into(), "false".into());
+    environment.insert("EDITOR".into(), "false".into());
+    environment.insert("GH_BROWSER".into(), "false".into());
+    environment.insert("BROWSER".into(), "false".into());
+    environment.insert("GH_PAGER".into(), "cat".into());
+    environment.insert("PAGER".into(), "cat".into());
+    environment.insert("GH_NO_UPDATE_NOTIFIER".into(), "1".into());
+    environment.insert("GH_NO_EXTENSION_UPDATE_NOTIFIER".into(), "1".into());
+    environment.insert("GH_TELEMETRY".into(), "false".into());
+    environment.insert("DEV_AUTH_GH_CHILD".into(), "1".into());
+    environment.insert("DEV_AUTH_GH_GIT".into(), git_program.into());
+    environment
 }
 
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
-    crate::admit_gh_arguments(arguments)?;
+    let plan = crate::parse_gh_invocation(arguments)?;
+    let selected_repository = preconfigured_gh_repository(plan.repository.clone())?;
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
-    let (owner, repository) = resolve_gh_repository(arguments, &config.programs.git)?;
-    let forwarded = forwarded_gh_arguments(arguments, &owner, &repository)?;
+    let (owner, repository) = resolve_gh_repository(selected_repository, &config.programs.git)?;
+    ensure_gh_sandbox(&paths)?;
+    #[cfg(windows)]
+    let _frontend_guards = gh_child_frontend_guards(&paths)?;
+    let _program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
+    validate_gh_version(&config.programs.gh, &paths)?;
+    let forwarded = forwarded_gh_arguments(plan, &owner, &repository);
     let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
     let token = entry.token().clone();
     let input: BTreeMap<String, String> = env::vars().collect();
-    let mut environment = sanitize_environment(&input, &BTreeSet::new());
-    environment.insert("GH_TOKEN".into(), token.expose().into());
-    environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
-    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-    environment.insert("GH_REPO".into(), format!("{owner}/{repository}"));
+    let environment = isolated_gh_environment(
+        &input,
+        &paths,
+        &token,
+        &owner,
+        &repository,
+        &config.programs.git,
+    );
     Command::new(&config.programs.gh)
         .args(forwarded)
         .env_clear()
@@ -897,6 +1463,303 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
         .context("run repository-scoped gh command")
 }
 
+fn gh_version_is_supported(stdout: &[u8], stderr: &[u8]) -> bool {
+    if !stderr.is_empty() {
+        return false;
+    }
+    stdout == SUPPORTED_GH_VERSION_OUTPUT.as_bytes()
+        || stdout == SUPPORTED_GH_VERSION_OUTPUT.replace('\n', "\r\n").as_bytes()
+}
+
+fn isolated_gh_probe_environment(paths: &RuntimePaths) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        ("HOME".into(), paths.gh_home_dir().display().to_string()),
+        (
+            "GH_CONFIG_DIR".into(),
+            paths.gh_config_dir().display().to_string(),
+        ),
+        (
+            "XDG_CONFIG_HOME".into(),
+            paths.gh_config_dir().display().to_string(),
+        ),
+        (
+            "XDG_CACHE_HOME".into(),
+            paths.gh_cache_dir().display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME".into(),
+            paths.gh_data_dir().display().to_string(),
+        ),
+        (
+            "APPDATA".into(),
+            paths.gh_config_dir().display().to_string(),
+        ),
+        (
+            "LOCALAPPDATA".into(),
+            paths.gh_data_dir().display().to_string(),
+        ),
+        ("TMP".into(), paths.gh_temp_dir().display().to_string()),
+        ("TEMP".into(), paths.gh_temp_dir().display().to_string()),
+        ("TMPDIR".into(), paths.gh_temp_dir().display().to_string()),
+        ("GH_PROMPT_DISABLED".into(), "1".into()),
+        ("GH_NO_UPDATE_NOTIFIER".into(), "1".into()),
+        ("GH_NO_EXTENSION_UPDATE_NOTIFIER".into(), "1".into()),
+        ("GH_TELEMETRY".into(), "false".into()),
+    ]);
+    for variable in ["COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"] {
+        if let Ok(value) = env::var(variable) {
+            environment.insert(variable.into(), value);
+        }
+    }
+    environment
+}
+
+fn validate_gh_version(program: &str, paths: &RuntimePaths) -> Result<()> {
+    let output = Command::new(program)
+        .arg("--version")
+        .env_clear()
+        .envs(isolated_gh_probe_environment(paths))
+        .stdin(Stdio::null())
+        .output()
+        .context("inspect configured GitHub CLI version")?;
+    if !output.status.success() || !gh_version_is_supported(&output.stdout, &output.stderr) {
+        bail!(
+            "configured GitHub CLI does not match the supported {} protocol",
+            SUPPORTED_GH_VERSION
+        );
+    }
+    Ok(())
+}
+
+fn valid_git_ref_fragment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && value != "@"
+        && !value.starts_with(['-', '.', '/'])
+        && !value.ends_with(['.', '/'])
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && !value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && !component.ends_with(".lock"))
+}
+
+fn valid_full_ref(value: &str) -> bool {
+    ["refs/heads/", "refs/remotes/"].iter().any(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(valid_git_ref_fragment)
+    })
+}
+
+fn valid_remote_name(value: &str) -> bool {
+    valid_git_ref_fragment(value) && !value.contains('/')
+}
+
+fn valid_log_range(value: &str) -> bool {
+    let Some((base, head)) = value.split_once("...") else {
+        return false;
+    };
+    !head.contains("...") && valid_git_ref_fragment(base) && valid_git_ref_fragment(head)
+}
+
+fn valid_commit_object(value: &str) -> bool {
+    value == "HEAD"
+        || matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || valid_full_ref(value)
+}
+
+fn unquote_go_regexp_literal(value: &str) -> Option<String> {
+    const META: &str = r"\.+*?()|[]{}^$";
+    let mut result = String::new();
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let escaped = characters.next()?;
+            if !META.contains(escaped) {
+                return None;
+            }
+            result.push(escaped);
+        } else if META.contains(character) {
+            return None;
+        } else {
+            result.push(character);
+        }
+    }
+    Some(result)
+}
+
+fn valid_branch_config_pattern(value: &str) -> bool {
+    const PREFIX: &str = r"^branch\.";
+    const SUFFIX: &str = r"\.(remote|merge|pushremote|gh-merge-base)$";
+    value
+        .strip_prefix(PREFIX)
+        .and_then(|value| value.strip_suffix(SUFFIX))
+        .and_then(unquote_go_regexp_literal)
+        .is_some_and(|branch| valid_git_ref_fragment(&branch))
+}
+
+fn bounded_gh_git_arguments(arguments: &[String]) -> Result<Vec<String>> {
+    let (signature_disabled, command_arguments) = match arguments {
+        [flag, value, remaining @ ..] if flag == "-c" && value == "log.ShowSignature=false" => {
+            (true, remaining)
+        }
+        _ => (false, arguments),
+    };
+    let arguments: Vec<&str> = command_arguments.iter().map(String::as_str).collect();
+    let admitted = match arguments.as_slice() {
+        ["remote", "-v"] => true,
+        ["remote", "get-url", "--", remote] => valid_remote_name(remote),
+        ["symbolic-ref", "--quiet", "HEAD"] => true,
+        ["show-ref", "--verify", "--", references @ ..] => {
+            !references.is_empty()
+                && references
+                    .iter()
+                    .all(|reference| *reference == "HEAD" || valid_full_ref(reference))
+        }
+        ["config", "--get-regexp", r"^remote\..*\.gh-resolved$"] => true,
+        ["config", "--get-regexp", pattern] => valid_branch_config_pattern(pattern),
+        ["config", "push.default" | "remote.pushDefault"] => true,
+        ["rev-parse", "--symbolic-full-name", revision] => revision
+            .strip_suffix("@{push}")
+            .is_some_and(valid_git_ref_fragment),
+        ["rev-parse", "--verify", reference] => reference
+            .strip_prefix("refs/heads/")
+            .is_some_and(valid_git_ref_fragment),
+        ["rev-parse", "--show-toplevel" | "--git-dir" | "--show-prefix"] => true,
+        ["log", "--pretty=format:%H%x00%s%x00%b%x00", "--cherry", range] => {
+            signature_disabled && valid_log_range(range)
+        }
+        ["show", "-s", "--pretty=format:%H,%s", "HEAD"] => signature_disabled,
+        ["show", "-s", "--pretty=format:%b", object] => {
+            signature_disabled && valid_commit_object(object)
+        }
+        _ => false,
+    };
+    if !admitted {
+        bail!("internal gh Git operation is outside the bounded read-only surface");
+    }
+    Ok(command_arguments.to_vec())
+}
+
+pub fn run_gh_git_child(arguments: &[String]) -> Result<ExitStatus> {
+    let arguments = bounded_gh_git_arguments(arguments)?;
+    let program = env::var("DEV_AUTH_GH_GIT")
+        .context("internal gh Git frontend has no configured executable")?;
+    crate::validate_program(&program, "internal gh Git executable")?;
+    let _program_guard = program_guard(&program, "internal gh Git")?;
+    let input: BTreeMap<String, String> = env::vars().collect();
+    let mut environment = sanitize_environment(&input, &BTreeSet::new());
+    let paths = RuntimePaths::discover()?;
+    let parent = Path::new(&program)
+        .parent()
+        .context("configured Git executable has no parent directory")?;
+    let path = env::join_paths([paths.gh_child_bin_dir(), parent.to_path_buf()])
+        .context("construct bounded internal Git executable path")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("bounded internal Git executable path is not Unicode"))?;
+    environment.insert("PATH".into(), path);
+    environment.insert("HOME".into(), paths.gh_home_dir().display().to_string());
+    environment.insert(
+        "USERPROFILE".into(),
+        paths.gh_home_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CONFIG_HOME".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".into(),
+        paths.gh_cache_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_DATA_HOME".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    environment.insert(
+        "APPDATA".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "LOCALAPPDATA".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    for variable in ["TMP", "TEMP", "TMPDIR"] {
+        environment.insert(variable.into(), paths.gh_temp_dir().display().to_string());
+    }
+    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    environment.insert("GIT_ASKPASS".into(), "false".into());
+    environment.insert("SSH_ASKPASS".into(), "false".into());
+    environment.insert("GCM_INTERACTIVE".into(), "Never".into());
+    environment.insert("GIT_EDITOR".into(), "false".into());
+    environment.insert("GIT_SEQUENCE_EDITOR".into(), "false".into());
+    environment.insert("GIT_PAGER".into(), "cat".into());
+    environment.insert("GIT_SSH_COMMAND".into(), "false".into());
+    environment.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
+    environment.insert(
+        "GIT_CONFIG_SYSTEM".into(),
+        paths.gh_git_config_file().display().to_string(),
+    );
+    environment.insert(
+        "GIT_CONFIG_GLOBAL".into(),
+        paths.gh_git_config_file().display().to_string(),
+    );
+    environment.insert("GIT_ATTR_NOSYSTEM".into(), "1".into());
+    environment.insert("GIT_NO_LAZY_FETCH".into(), "1".into());
+    environment.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+    let attributes_file = paths.gh_git_attributes_file();
+    let attributes_file = attributes_file
+        .to_str()
+        .context("private Git attributes path is not Unicode")?;
+    let hooks_dir = paths.gh_git_hooks_dir();
+    let hooks_dir = hooks_dir
+        .to_str()
+        .context("private Git hooks path is not Unicode")?;
+    let config_overrides = [
+        ("credential.helper", ""),
+        ("credential.interactive", "false"),
+        ("core.askPass", "false"),
+        ("core.attributesFile", attributes_file),
+        ("core.editor", "false"),
+        ("core.excludesFile", attributes_file),
+        ("core.hooksPath", hooks_dir),
+        ("core.pager", "cat"),
+        ("core.sshCommand", "false"),
+        ("http.cookieFile", ""),
+        ("http.extraHeader", ""),
+        ("http.saveCookies", "false"),
+        ("log.showSignature", "false"),
+        ("sequence.editor", "false"),
+    ];
+    environment.insert(
+        "GIT_CONFIG_COUNT".into(),
+        config_overrides.len().to_string(),
+    );
+    for (index, (key, value)) in config_overrides.iter().enumerate() {
+        environment.insert(format!("GIT_CONFIG_KEY_{index}"), (*key).into());
+        environment.insert(format!("GIT_CONFIG_VALUE_{index}"), (*value).into());
+    }
+    environment.remove("GH_TOKEN");
+    environment.remove("GITHUB_TOKEN");
+    environment.remove("DEV_AUTH_GH_CHILD");
+    environment.remove("DEV_AUTH_GH_GIT");
+    Command::new(program)
+        .args(&arguments)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("run configured Git without the GitHub installation token")
+}
+
 pub fn credential_erase(input: &[u8]) -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
@@ -904,25 +1767,29 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
     let (owner, repository) = request.repository()?;
     ensure_runtime(&paths)?;
     let key = if config.github.discover_installations {
-        dynamic_cache_key(owner, repository, &config.github.permissions)?
+        dynamic_cache_key(
+            config.github.app_id,
+            config.github.repository_selection,
+            owner,
+            repository,
+            &config.github.permissions,
+        )?
     } else {
         let selected = config.github.select_repository(owner, repository)?;
         cache_key(
+            config.github.app_id,
             selected.installation_id,
+            config.github.repository_selection,
             &selected.repository,
             &config.github.permissions,
         )?
     };
-    match cache_entry(&config.credential_store, &key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(error) => return Err(error).context("remove native installation-token cache"),
-    }
-    let lock = paths.cache_dir().join(format!("{key}.lock"));
-    match fs::remove_file(lock) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("remove installation-token cache lock"),
-    }
+    with_cache_scope_erase_lock(&paths, &key, || {
+        match cache_entry(&config.credential_store, &key)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("remove native installation-token cache"),
+        }
+    })
 }
 
 fn declared_profile<'a>(config: &'a Config, name: &str) -> Result<&'a ExecProfile> {
@@ -930,6 +1797,82 @@ fn declared_profile<'a>(config: &'a Config, name: &str) -> Result<&'a ExecProfil
         .profiles
         .get(name)
         .context("requested execution profile is not declared")
+}
+
+fn ensure_exec_sandbox(paths: &RuntimePaths, profile_name: &str) -> Result<()> {
+    ensure_runtime(paths)?;
+    ensure_private_directory(&paths.exec_sandbox_dir())?;
+    ensure_private_directory(&paths.exec_profile_dir(profile_name))?;
+    for directory in [
+        paths.exec_bin_dir(profile_name),
+        paths.exec_config_dir(profile_name),
+        paths.exec_home_dir(profile_name),
+        paths.exec_cache_dir(profile_name),
+        paths.exec_data_dir(profile_name),
+        paths.exec_temp_dir(profile_name),
+        paths.exec_runtime_dir(profile_name),
+    ] {
+        ensure_private_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn create_empty_exec_path(paths: &RuntimePaths, profile_name: &str) -> Result<tempfile::TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(paths.exec_bin_dir(profile_name))
+        .context("create fresh private profile executable path")?;
+    #[cfg(unix)]
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .context("restrict fresh profile executable path")?;
+    validate_private_directory(directory.path(), "fresh profile executable path")?;
+    if fs::read_dir(directory.path())
+        .context("inspect fresh profile executable path")?
+        .next()
+        .is_some()
+    {
+        bail!("fresh profile executable path is not empty");
+    }
+    Ok(directory)
+}
+
+fn isolated_exec_environment(
+    input: &BTreeMap<String, String>,
+    paths: &RuntimePaths,
+    profile_name: &str,
+    executable_path: &Path,
+) -> BTreeMap<String, String> {
+    const PASS_THROUGH: &[&str] = &["COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TERM"];
+    let mut environment: BTreeMap<String, String> = input
+        .iter()
+        .filter(|(key, _)| {
+            PASS_THROUGH
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let home = paths.exec_home_dir(profile_name).display().to_string();
+    let config = paths.exec_config_dir(profile_name).display().to_string();
+    let cache = paths.exec_cache_dir(profile_name).display().to_string();
+    let data = paths.exec_data_dir(profile_name).display().to_string();
+    let temporary = paths.exec_temp_dir(profile_name).display().to_string();
+    environment.insert("HOME".into(), home.clone());
+    environment.insert("USERPROFILE".into(), home);
+    environment.insert("PATH".into(), executable_path.display().to_string());
+    environment.insert("XDG_CONFIG_HOME".into(), config.clone());
+    environment.insert("XDG_CACHE_HOME".into(), cache);
+    environment.insert("XDG_DATA_HOME".into(), data.clone());
+    environment.insert(
+        "XDG_RUNTIME_DIR".into(),
+        paths.exec_runtime_dir(profile_name).display().to_string(),
+    );
+    environment.insert("APPDATA".into(), config);
+    environment.insert("LOCALAPPDATA".into(), data);
+    for variable in ["TMP", "TEMP", "TMPDIR"] {
+        environment.insert(variable.into(), temporary.clone());
+    }
+    environment
 }
 
 pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus> {
@@ -940,8 +1883,12 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
     if !profile.executables.contains(executable) {
         bail!("command executable is not admitted by the selected profile");
     }
+    let _program_guard = program_guard(executable, "declared profile executable")?;
+    ensure_exec_sandbox(&paths, profile_name)?;
+    let executable_path = create_empty_exec_path(&paths, profile_name)?;
     let input: BTreeMap<String, String> = env::vars().collect();
-    let mut child_environment = sanitize_environment(&input, &BTreeSet::new());
+    let mut child_environment =
+        isolated_exec_environment(&input, &paths, profile_name, executable_path.path());
     for (variable, reference) in &profile.environment {
         child_environment.insert(
             variable.clone(),
@@ -981,17 +1928,12 @@ struct PrivateNamedPipeListener {
 impl PrivateNamedPipeListener {
     fn bind(name: impl Into<std::ffi::OsString>) -> io::Result<Self> {
         let name = name.into();
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .reject_remote_clients(true)
-            .create(&name)?;
+        let server = windows_security::create_private_named_pipe(name.as_os_str(), true)?;
         Ok(Self { server, name })
     }
 
     fn next_server(&self) -> io::Result<NamedPipeServer> {
-        ServerOptions::new()
-            .reject_remote_clients(true)
-            .create(&self.name)
+        windows_security::create_private_named_pipe(self.name.as_os_str(), false)
     }
 }
 
@@ -1034,9 +1976,10 @@ fn validate_ssh_agent_socket(paths: &RuntimePaths) -> Result<PathBuf> {
     Ok(socket)
 }
 
-fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<Command> {
+fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<(Command, ProgramGuard)> {
     #[cfg(unix)]
     validate_ssh_agent_socket(paths)?;
+    let guard = program_guard(&config.programs.ssh_add, "ssh-add")?;
     let mut command = Command::new(&config.programs.ssh_add);
     command
         .env_clear()
@@ -1044,12 +1987,13 @@ fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<Command> {
         .env("SSH_AUTH_SOCK", ssh_agent_endpoint(paths)?)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Ok(command)
+    Ok((command, guard))
 }
 
 pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
+    let _program_guard = program_guard(&config.programs.ssh_keygen, "ssh-keygen")?;
     if is_git_verification_operation(arguments)? {
         return Command::new(&config.programs.ssh_keygen)
             .args(arguments)
@@ -1172,7 +2116,8 @@ fn exact_option_value<'a>(arguments: &'a [String], option: &str) -> Result<&'a s
 }
 
 fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
-    let status = ssh_add_command(paths, config)?
+    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let status = command
         .arg("-D")
         .stdin(Stdio::null())
         .status()
@@ -1184,7 +2129,8 @@ fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
 }
 
 fn loaded_ssh_fingerprints(paths: &RuntimePaths, config: &Config) -> Result<BTreeSet<String>> {
-    let output = ssh_add_command(paths, config)?
+    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let output = command
         .args(["-l", "-E", "sha256"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1209,6 +2155,48 @@ fn loaded_ssh_fingerprints(paths: &RuntimePaths, config: &Config) -> Result<BTre
     Ok(fingerprints)
 }
 
+fn parse_agent_public_keys(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut keys = BTreeMap::new();
+    for line in text.lines() {
+        let public_key = PublicKey::from_openssh(line)
+            .context("SSH agent returned an invalid public-key row")?;
+        if public_key.algorithm() != SshAlgorithm::Ed25519 {
+            bail!("SSH agent returned a non-Ed25519 public key");
+        }
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        if keys.contains_key(&fingerprint) {
+            bail!("SSH agent returned a duplicate public key");
+        }
+        let canonical = PublicKey::new(
+            public_key.key_data().clone(),
+            format!("dev-auth:{fingerprint}"),
+        )
+        .to_openssh()
+        .context("encode declared SSH public key")?;
+        keys.insert(fingerprint, canonical);
+    }
+    Ok(keys)
+}
+
+fn loaded_ssh_public_keys(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<BTreeMap<String, String>> {
+    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let output = command
+        .arg("-L")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .output()
+        .context("list dedicated SSH agent public keys")?;
+    if !output.status.success() {
+        bail!("dedicated SSH agent rejected public-key listing");
+    }
+    let text =
+        String::from_utf8(output.stdout).context("SSH agent public-key list is not UTF-8")?;
+    parse_agent_public_keys(&text)
+}
+
 pub fn ssh_load(profile_name: &str) -> Result<()> {
     let paths = RuntimePaths::discover()?;
     ensure_runtime(&paths)?;
@@ -1227,6 +2215,34 @@ pub fn ssh_load(profile_name: &str) -> Result<()> {
         bail!("dedicated SSH agent fingerprints do not match the declared profile");
     }
     Ok(())
+}
+
+pub fn ssh_public(profile_name: &str, purpose: SshKeyPurpose) -> Result<String> {
+    let paths = RuntimePaths::discover()?;
+    ensure_runtime(&paths)?;
+    let config = load_config(&paths)?;
+    let profile = config
+        .ssh_profiles
+        .get(profile_name)
+        .context("requested SSH profile is not declared")?;
+    let expected: BTreeSet<String> = profile
+        .keys
+        .iter()
+        .map(|key| key.fingerprint.clone())
+        .collect();
+    let loaded = loaded_ssh_public_keys(&paths, &config)?;
+    if loaded.keys().cloned().collect::<BTreeSet<_>>() != expected {
+        bail!("dedicated SSH agent public keys do not match the declared profile");
+    }
+    let declared = profile
+        .keys
+        .iter()
+        .find(|key| key.purpose == purpose)
+        .context("declared SSH profile does not contain the requested key purpose")?;
+    loaded
+        .get(&declared.fingerprint)
+        .cloned()
+        .context("requested declared SSH public key is not loaded")
 }
 
 struct AgentIdentity {
@@ -1318,6 +2334,50 @@ fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
         "dev-auth automation key",
     )
     .context("construct declared Ed25519 SSH key")
+}
+
+pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
+    let paths = RuntimePaths::discover()?;
+    let config = load_config(&paths)?;
+    let _gh_program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
+    validate_gh_version(&config.programs.gh, &paths)?;
+    let references = config.declared_secret_references();
+    if online {
+        let mut secrets = BTreeMap::new();
+        for reference in &references {
+            secrets.insert(reference, read_declared_secret(&config, reference)?);
+        }
+        let app_key = secrets
+            .get(&config.github.private_key_ref)
+            .context("declared GitHub App private key was not checked")?;
+        EncodingKey::from_rsa_pem(app_key.expose().as_bytes())
+            .context("GitHub App private key is not a valid RSA PEM key")?;
+        for profile in config.ssh_profiles.values() {
+            for key in &profile.keys {
+                let source = secrets
+                    .get(&key.private_key_ref)
+                    .context("declared SSH private key was not checked")?;
+                let private_key = parse_declared_ssh_private_key(source)?;
+                if private_key.is_encrypted() || private_key.algorithm() != SshAlgorithm::Ed25519 {
+                    bail!("declared SSH key must be an unencrypted Ed25519 OpenSSH key");
+                }
+                if private_key
+                    .public_key()
+                    .fingerprint(HashAlg::Sha256)
+                    .to_string()
+                    != key.fingerprint
+                {
+                    bail!("declared SSH key fingerprint does not match its private key");
+                }
+            }
+        }
+    }
+    Ok(ValidationReport {
+        online,
+        declared_exec_profiles: config.profiles.len(),
+        declared_ssh_profiles: config.ssh_profiles.len(),
+        declared_secret_references: references.len(),
+    })
 }
 
 fn declared_agent(config: &Config, profile: &SshProfile) -> Result<DeclaredAgent> {
@@ -1443,33 +2503,36 @@ pub fn runtime_status() -> Result<RuntimeStatus> {
 pub fn purge_runtime() -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
-    let cache_dir = paths.cache_dir();
-    if !cache_dir.exists() {
-        return Ok(());
-    }
-    ensure_runtime(&paths)?;
-    if loaded_ssh_fingerprints(&paths, &config).is_ok() {
-        clear_ssh_agent(&paths, &config)?;
-    }
-    for entry in fs::read_dir(&cache_dir).context("enumerate dev-auth runtime cache")? {
-        let entry = entry.context("read dev-auth runtime cache entry")?;
-        let path = entry.path();
-        let extension = path.extension().and_then(|value| value.to_str());
-        if extension == Some("lock") {
+    with_cache_purge_lock(&paths, || {
+        let mut scopes = Vec::<(String, PathBuf)>::new();
+        for entry in fs::read_dir(paths.cache_dir()).context("enumerate dev-auth runtime cache")? {
+            let entry = entry.context("read dev-auth runtime cache entry")?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("lock") {
+                bail!("unknown file in dev-auth runtime cache");
+            }
             let key = path
                 .file_stem()
                 .and_then(|value| value.to_str())
-                .context("runtime lock has an invalid cache key")?;
-            match cache_entry(&config.credential_store, key)?.delete_credential() {
+                .context("runtime lock has an invalid cache key")?
+                .to_owned();
+            let _ = private_read(&path, "installation-token scope receipt")?;
+            scopes.push((key, path));
+        }
+        scopes.sort_by(|left, right| left.0.cmp(&right.0));
+
+        if loaded_ssh_fingerprints(&paths, &config).is_ok() {
+            clear_ssh_agent(&paths, &config)?;
+        }
+        for (key, path) in scopes {
+            match cache_entry(&config.credential_store, &key)?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => {}
                 Err(error) => return Err(error).context("purge native installation-token cache"),
             }
-            fs::remove_file(&path).context("remove installation-token cache lock")?;
-        } else {
-            bail!("unknown file in dev-auth runtime cache");
+            fs::remove_file(&path).context("remove purged installation-token scope receipt")?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1480,6 +2543,10 @@ mod tests {
     use ssh_key::private::{Ed25519Keypair, KeypairData};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     fn config_with_profiles(profiles: BTreeMap<String, SshProfile>) -> Config {
         Config {
@@ -1495,6 +2562,7 @@ mod tests {
             github: GitHubProfile {
                 app_id: 1,
                 private_key_ref: "op://Machine Vault/app/private-key".into(),
+                repository_selection: crate::RepositorySelection::All,
                 discover_installations: false,
                 installations: Vec::new(),
                 permissions: BTreeMap::new(),
@@ -1502,6 +2570,33 @@ mod tests {
             profiles: BTreeMap::new(),
             ssh_profiles: profiles,
         }
+    }
+
+    #[test]
+    fn gh_version_parser_accepts_only_the_reviewed_protocol_release() {
+        assert!(gh_version_is_supported(
+            SUPPORTED_GH_VERSION_OUTPUT.as_bytes(),
+            b""
+        ));
+        assert!(gh_version_is_supported(
+            SUPPORTED_GH_VERSION_OUTPUT.replace('\n', "\r\n").as_bytes(),
+            b""
+        ));
+        for output in [
+            b"gh version 2.98.0 (2026-08-20)\nhttps://github.com/cli/cli/releases/tag/v2.98.0\n"
+                .as_slice(),
+            b"gh version 2.97.0 (2026-08-13)\n".as_slice(),
+            b"gh version 2.99.0 (2026-08-27)\n".as_slice(),
+            b"attacker gh version 2.98.0\n".as_slice(),
+            b"gh version\n".as_slice(),
+            b"\xff\n".as_slice(),
+        ] {
+            assert!(!gh_version_is_supported(output, b""));
+        }
+        assert!(!gh_version_is_supported(
+            SUPPORTED_GH_VERSION_OUTPUT.as_bytes(),
+            b"warning\n"
+        ));
     }
 
     #[test]
@@ -1523,20 +2618,720 @@ mod tests {
     #[test]
     fn dynamic_cache_scope_is_case_insensitive_and_owner_specific() {
         let permissions = BTreeMap::from([("contents".into(), "write".into())]);
-        let expected = dynamic_cache_key("ExampleOrg", "Sample-Repo", &permissions).unwrap();
+        let expected = dynamic_cache_key(
+            42,
+            crate::RepositorySelection::All,
+            "ExampleOrg",
+            "Sample-Repo",
+            &permissions,
+        )
+        .unwrap();
         assert_eq!(
             expected,
-            dynamic_cache_key("exampleorg", "sample-repo", &permissions).unwrap()
+            dynamic_cache_key(
+                42,
+                crate::RepositorySelection::All,
+                "exampleorg",
+                "sample-repo",
+                &permissions,
+            )
+            .unwrap()
         );
         assert_ne!(
             expected,
-            dynamic_cache_key("AnotherOrg", "sample-repo", &permissions).unwrap()
+            dynamic_cache_key(
+                42,
+                crate::RepositorySelection::All,
+                "AnotherOrg",
+                "sample-repo",
+                &permissions,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            expected,
+            dynamic_cache_key(
+                99,
+                crate::RepositorySelection::All,
+                "ExampleOrg",
+                "Sample-Repo",
+                &permissions,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            expected,
+            dynamic_cache_key(
+                42,
+                crate::RepositorySelection::Selected,
+                "ExampleOrg",
+                "Sample-Repo",
+                &permissions,
+            )
+            .unwrap()
+        );
+    }
+
+    fn test_cache_entry(installation_id: u64) -> CacheEntry {
+        CacheEntry::new_for_test(
+            SecretString::new("test-token".into()),
+            10_000,
+            42,
+            installation_id,
+            "exampleorg".into(),
+            "sample-repo".into(),
+            BTreeMap::from([("contents".into(), "write".into())]),
+        )
+    }
+
+    #[test]
+    fn dynamic_cache_hit_fails_closed_when_live_discovery_fails() {
+        use std::cell::Cell;
+
+        let cache_was_read = Cell::new(false);
+        let result = resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now: 1,
+                app_id: 42,
+                owner: "exampleorg",
+                repository: "sample-repo",
+                permissions: &BTreeMap::from([("contents".into(), "write".into())]),
+            },
+            || bail!("live installation authority is unavailable"),
+            || {
+                cache_was_read.set(true);
+                Ok(test_cache_entry(101))
+            },
+            |_| panic!("mint must not run after failed discovery"),
+            |_| panic!("write must not run after failed discovery"),
+        );
+
+        assert!(result.is_err());
+        assert!(!cache_was_read.get());
+    }
+
+    #[test]
+    fn dynamic_cache_hit_with_stale_installation_id_is_refreshed() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let written = RefCell::new(None);
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let result = resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now: 1,
+                app_id: 42,
+                owner: "exampleorg",
+                repository: "sample-repo",
+                permissions: &permissions,
+            },
+            || {
+                events.borrow_mut().push("discover");
+                Ok(SelectedRepository {
+                    installation_id: 202,
+                    owner: "exampleorg".into(),
+                    repository: "sample-repo".into(),
+                })
+            },
+            || {
+                events.borrow_mut().push("read");
+                Ok(test_cache_entry(101))
+            },
+            |installation_id| {
+                events.borrow_mut().push("mint");
+                Ok(test_cache_entry(installation_id))
+            },
+            |entry| {
+                events.borrow_mut().push("write");
+                *written.borrow_mut() = Some(entry.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.installation_id(), 202);
+        assert_eq!(written.borrow().as_ref().unwrap().installation_id(), 202);
+        assert_eq!(*events.borrow(), ["discover", "read", "mint", "write"]);
+    }
+
+    #[test]
+    fn dynamic_cache_hit_with_current_installation_is_reused_after_discovery() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let result = resolve_dynamic_cache_entry(
+            DynamicRepositoryScope {
+                now: 1,
+                app_id: 42,
+                owner: "exampleorg",
+                repository: "sample-repo",
+                permissions: &permissions,
+            },
+            || {
+                events.borrow_mut().push("discover");
+                Ok(SelectedRepository {
+                    installation_id: 202,
+                    owner: "exampleorg".into(),
+                    repository: "sample-repo".into(),
+                })
+            },
+            || {
+                events.borrow_mut().push("read");
+                Ok(test_cache_entry(202))
+            },
+            |_| panic!("mint must not run for a current cache entry"),
+            |_| panic!("write must not run for a current cache entry"),
+        )
+        .unwrap();
+
+        assert_eq!(result.installation_id(), 202);
+        assert_eq!(*events.borrow(), ["discover", "read"]);
+    }
+
+    #[test]
+    fn gh_child_environment_replaces_ambient_execution_and_ui_surfaces() {
+        let paths = RuntimePaths {
+            config: PathBuf::from("/private/config.toml"),
+            runtime: PathBuf::from("/private/runtime"),
+        };
+        let input = BTreeMap::from([
+            ("HOME".into(), "/home/example".into()),
+            ("PATH".into(), "/attacker/bin".into()),
+            ("GH_TOKEN".into(), "human-token".into()),
+            ("GITHUB_TOKEN".into(), "human-token".into()),
+            ("GH_EDITOR".into(), "/attacker/editor".into()),
+            ("BROWSER".into(), "/attacker/browser".into()),
+            ("PAGER".into(), "/attacker/pager".into()),
+            ("COMSPEC".into(), "/attacker/shell".into()),
+        ]);
+        let environment = isolated_gh_environment(
+            &input,
+            &paths,
+            &SecretString::new("installation-token".into()),
+            "example",
+            "repository",
+            "/trusted/bin/git",
+        );
+        assert_eq!(
+            environment["HOME"],
+            paths.gh_home_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["XDG_CONFIG_HOME"],
+            paths.gh_config_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["XDG_CACHE_HOME"],
+            paths.gh_cache_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["XDG_DATA_HOME"],
+            paths.gh_data_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["PATH"],
+            paths.gh_child_bin_dir().display().to_string()
+        );
+        assert_eq!(environment["GH_TOKEN"], "installation-token");
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+        assert_eq!(environment["GH_EDITOR"], "false");
+        assert_eq!(environment["BROWSER"], "false");
+        assert_eq!(environment["PAGER"], "cat");
+        assert_eq!(environment["DEV_AUTH_GH_CHILD"], "1");
+        assert_eq!(environment["DEV_AUTH_GH_GIT"], "/trusted/bin/git");
+        assert!(!environment.contains_key("COMSPEC"));
+        assert!(!environment.values().any(|value| value.contains("attacker")));
+        assert!(!environment.values().any(|value| value == "/home/example"));
+    }
+
+    #[test]
+    fn profile_child_environment_replaces_ambient_helpers_and_human_config() {
+        let paths = RuntimePaths {
+            config: PathBuf::from("/private/config.toml"),
+            runtime: PathBuf::from("/private/runtime"),
+        };
+        let input = BTreeMap::from([
+            ("HOME".into(), "/home/example".into()),
+            ("USERPROFILE".into(), "C:\\Users\\example".into()),
+            ("PATH".into(), "/attacker/bin".into()),
+            ("APPDATA".into(), "C:\\Users\\example\\AppData".into()),
+            ("LOCALAPPDATA".into(), "C:\\Users\\example\\Local".into()),
+            ("XDG_CONFIG_HOME".into(), "/home/example/.config".into()),
+            ("XDG_CACHE_HOME".into(), "/home/example/.cache".into()),
+            ("XDG_DATA_HOME".into(), "/home/example/.local/share".into()),
+            ("COMSPEC".into(), "C:\\attacker\\cmd.exe".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/attacker/bus".into(),
+            ),
+            ("DISPLAY".into(), ":99".into()),
+            ("GH_TOKEN".into(), "human-token".into()),
+        ]);
+
+        let executable_path = paths
+            .exec_bin_dir("profile-a")
+            .join("fresh-execution-directory");
+        let environment = isolated_exec_environment(&input, &paths, "profile-a", &executable_path);
+
+        assert_eq!(
+            environment["HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/home")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["USERPROFILE"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/home")
+                .display()
+                .to_string()
+        );
+        assert_eq!(environment["PATH"], executable_path.display().to_string());
+        assert_eq!(
+            environment["XDG_CONFIG_HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/config")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["XDG_CACHE_HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/cache")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            environment["XDG_DATA_HOME"],
+            paths
+                .runtime
+                .join("exec-sandbox/profile-a/data")
+                .display()
+                .to_string()
+        );
+        for variable in ["COMSPEC", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "GH_TOKEN"] {
+            assert!(!environment.contains_key(variable));
+        }
+        assert!(!environment.values().any(|value| value.contains("attacker")));
+        assert!(!environment.values().any(|value| value == "/home/example"));
+        assert!(!environment
+            .values()
+            .any(|value| value == "C:\\Users\\example"));
+    }
+
+    #[test]
+    fn profile_sandbox_is_private_empty_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime/dev-auth");
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime,
+        };
+
+        ensure_exec_sandbox(&paths, "profile-a").unwrap();
+        ensure_exec_sandbox(&paths, "profile-a").unwrap();
+
+        for directory in [
+            paths.exec_sandbox_dir(),
+            paths.exec_profile_dir("profile-a"),
+            paths.exec_bin_dir("profile-a"),
+            paths.exec_config_dir("profile-a"),
+            paths.exec_home_dir("profile-a"),
+            paths.exec_cache_dir("profile-a"),
+            paths.exec_data_dir("profile-a"),
+            paths.exec_temp_dir("profile-a"),
+            paths.exec_runtime_dir("profile-a"),
+        ] {
+            let metadata = fs::symlink_metadata(&directory).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            #[cfg(unix)]
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+        assert_eq!(
+            fs::read_dir(paths.exec_bin_dir("profile-a"))
+                .unwrap()
+                .count(),
+            0
         );
     }
 
     #[test]
+    fn profile_exec_path_is_fresh_and_ignores_stale_helpers() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime/dev-auth"),
+        };
+
+        ensure_exec_sandbox(&paths, "profile-a").unwrap();
+        fs::write(
+            paths.exec_bin_dir("profile-a").join("stale-helper"),
+            b"must never be executable through the profile PATH",
+        )
+        .unwrap();
+
+        let first = create_empty_exec_path(&paths, "profile-a").unwrap();
+        assert_ne!(first.path(), paths.exec_bin_dir("profile-a"));
+        assert_eq!(fs::read_dir(first.path()).unwrap().count(), 0);
+        assert!(!first.path().join("stale-helper").exists());
+
+        let first_path = first.path().to_path_buf();
+        drop(first);
+        assert!(!first_path.exists());
+
+        let second = create_empty_exec_path(&paths, "profile-a").unwrap();
+        assert_ne!(second.path(), first_path);
+        assert_eq!(fs::read_dir(second.path()).unwrap().count(), 0);
+        assert!(!second.path().join("stale-helper").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn origin_authority_ignores_local_and_global_url_rewrites() {
+        let repository = tempfile::tempdir().unwrap();
+        let environment = BTreeMap::from([("HOME".into(), "/nonexistent".into())]);
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ExampleOrg/sample-repo.git",
+            ],
+            vec![
+                "config",
+                "--local",
+                "--add",
+                "url.https://github.com/OtherOrg/.insteadOf",
+                "https://github.com/ExampleOrg/",
+            ],
+        ] {
+            let status = Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(repository.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let rewritten = Command::new("/usr/bin/git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(rewritten.stdout).unwrap().trim(),
+            "https://github.com/OtherOrg/sample-repo.git"
+        );
+        assert_eq!(
+            origin_repository_at("/usr/bin/git", Some(repository.path()), &environment).unwrap(),
+            "https://github.com/ExampleOrg/sample-repo.git"
+        );
+
+        let global_repository = tempfile::tempdir().unwrap();
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ExampleOrg/sample-repo.git",
+            ],
+        ] {
+            let status = Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(global_repository.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let global_home = tempfile::tempdir().unwrap();
+        fs::write(
+            global_home.path().join(".gitconfig"),
+            "[url \"https://github.com/OtherOrg/\"]\n\tinsteadOf = https://github.com/ExampleOrg/\n",
+        )
+        .unwrap();
+        let global_environment =
+            BTreeMap::from([("HOME".into(), global_home.path().display().to_string())]);
+        let globally_rewritten = Command::new("/usr/bin/git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(global_repository.path())
+            .env_clear()
+            .envs(&global_environment)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(globally_rewritten.stdout).unwrap().trim(),
+            "https://github.com/OtherOrg/sample-repo.git"
+        );
+        assert_eq!(
+            origin_repository_at(
+                "/usr/bin/git",
+                Some(global_repository.path()),
+                &global_environment,
+            )
+            .unwrap(),
+            "https://github.com/ExampleOrg/sample-repo.git"
+        );
+    }
+
+    #[test]
+    fn gh_git_child_accepts_only_source_derived_read_operations() {
+        let accepted = [
+            vec!["remote", "-v"],
+            vec!["remote", "get-url", "--", "origin"],
+            vec!["symbolic-ref", "--quiet", "HEAD"],
+            vec![
+                "show-ref",
+                "--verify",
+                "--",
+                "HEAD",
+                "refs/heads/feature.v1",
+                "refs/remotes/origin/feature.v1",
+            ],
+            vec!["config", "--get-regexp", r"^remote\..*\.gh-resolved$"],
+            vec![
+                "config",
+                "--get-regexp",
+                r"^branch\.feature\.v1\.(remote|merge|pushremote|gh-merge-base)$",
+            ],
+            vec!["config", "push.default"],
+            vec!["config", "remote.pushDefault"],
+            vec!["rev-parse", "--symbolic-full-name", "feature.v1@{push}"],
+            vec!["rev-parse", "--verify", "refs/heads/feature.v1"],
+            vec!["rev-parse", "--show-toplevel"],
+            vec!["rev-parse", "--git-dir"],
+            vec!["rev-parse", "--show-prefix"],
+            vec!["-c", "log.ShowSignature=false", "log", "%PLACEHOLDER%"],
+            vec![
+                "-c",
+                "log.ShowSignature=false",
+                "show",
+                "-s",
+                "--pretty=format:%H,%s",
+                "HEAD",
+            ],
+            vec![
+                "-c",
+                "log.ShowSignature=false",
+                "show",
+                "-s",
+                "--pretty=format:%b",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+        ];
+
+        for arguments in accepted {
+            let mut arguments: Vec<String> = arguments.into_iter().map(str::to_owned).collect();
+            if arguments.get(2).map(String::as_str) == Some("log") {
+                arguments.splice(
+                    3..4,
+                    [
+                        "--pretty=format:%H%x00%s%x00%b%x00".into(),
+                        "--cherry".into(),
+                        "origin/main...feature.v1".into(),
+                    ],
+                );
+            }
+            let bounded = bounded_gh_git_arguments(&arguments)
+                .unwrap_or_else(|error| panic!("{arguments:?}: {error:#}"));
+            assert!(!bounded.iter().any(|argument| argument == "-c"));
+        }
+    }
+
+    #[test]
+    fn gh_git_child_rejects_network_mutation_and_local_execution_surfaces() {
+        let rejected = [
+            vec!["status", "--porcelain"],
+            vec!["credential", "fill"],
+            vec!["fetch", "origin"],
+            vec!["pull"],
+            vec!["push", "origin", "HEAD"],
+            vec!["checkout", "main"],
+            vec!["branch", "-D", "main"],
+            vec!["config", "credential.helper"],
+            vec!["config", "--get-regexp", ".*"],
+            vec!["remote", "get-url", "origin"],
+            vec!["remote", "set-url", "origin", "ext::attacker"],
+            vec!["-C", "/tmp", "remote", "-v"],
+            vec!["-ccredential.helper=!attacker", "remote", "-v"],
+            vec!["-c", "credential.helper=!attacker", "remote", "-v"],
+            vec!["-c", "log.ShowSignature=false", "fetch", "origin"],
+            vec![
+                "-c",
+                "log.ShowSignature=true",
+                "show",
+                "-s",
+                "--pretty=format:%H,%s",
+                "HEAD",
+            ],
+            vec!["show-ref", "--verify", "--", "--head"],
+            vec!["show-ref", "--verify", "--", "refs/tags/release"],
+            vec![
+                "rev-parse",
+                "--symbolic-full-name",
+                "feature@{push}:attacker",
+            ],
+            vec!["rev-parse", "--verify", "refs/heads/main^{object}"],
+            vec![
+                "-c",
+                "log.ShowSignature=false",
+                "show",
+                "--textconv",
+                "HEAD:file",
+            ],
+        ];
+
+        for arguments in rejected {
+            let arguments: Vec<String> = arguments.into_iter().map(str::to_owned).collect();
+            assert!(
+                bounded_gh_git_arguments(&arguments).is_err(),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_store_accepts_only_the_current_user_session_bus() {
+        let run_user_root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let runtime = run_user_root.path().join(uid.to_string());
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let bus = runtime.join("bus");
+        let _listener = StdUnixListener::bind(&bus).unwrap();
+        let expected_address = format!("unix:path={}", bus.display());
+
+        validate_secret_service_session_at(
+            &BTreeMap::from([
+                ("XDG_RUNTIME_DIR".into(), runtime.display().to_string()),
+                ("DBUS_SESSION_BUS_ADDRESS".into(), expected_address.clone()),
+            ]),
+            run_user_root.path(),
+            uid,
+        )
+        .unwrap();
+        validate_secret_service_session_at(&BTreeMap::new(), run_user_root.path(), uid).unwrap();
+
+        for environment in [
+            BTreeMap::from([(
+                "XDG_RUNTIME_DIR".into(),
+                run_user_root.path().display().to_string(),
+            )]),
+            BTreeMap::from([(
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/tmp/attacker-bus".into(),
+            )]),
+        ] {
+            assert!(
+                validate_secret_service_session_at(&environment, run_user_root.path(), uid,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_store_rejects_a_non_socket_session_bus() {
+        let run_user_root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let runtime = run_user_root.path().join(uid.to_string());
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(runtime.join("bus"), b"not a socket").unwrap();
+
+        let error = validate_secret_service_session_at(&BTreeMap::new(), run_user_root.path(), uid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("current-user Unix socket"));
+    }
+
+    #[test]
+    fn cache_erase_waits_for_refresh_and_cannot_be_undone_by_it() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime"),
+        };
+        ensure_runtime(&paths).unwrap();
+        let marker = root.path().join("cache-value");
+        let refresh_paths = RuntimePaths {
+            config: paths.config.clone(),
+            runtime: paths.runtime.clone(),
+        };
+        let refresh_marker = marker.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresh = thread::spawn(move || {
+            with_cache_scope_lock(&refresh_paths, "scope", || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fs::write(refresh_marker, b"refreshed").unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        let erase_paths = RuntimePaths {
+            config: paths.config.clone(),
+            runtime: paths.runtime.clone(),
+        };
+        let erase_marker = marker.clone();
+        let (erased_tx, erased_rx) = mpsc::channel();
+        let erase = thread::spawn(move || {
+            with_cache_scope_erase_lock(&erase_paths, "scope", || {
+                fs::remove_file(&erase_marker).unwrap();
+                erased_tx.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert!(matches!(
+            erased_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap();
+        erased_rx.recv().unwrap();
+        erase.join().unwrap();
+        assert!(!marker.exists());
+        assert!(!paths.cache_dir().join("scope.lock").exists());
+    }
+
+    #[test]
+    fn purge_excludes_in_flight_refreshes_until_their_writes_finish() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime"),
+        };
+        ensure_runtime(&paths).unwrap();
+        let lifecycle = cache_lifecycle_lock(&paths).unwrap();
+        lifecycle.lock_shared().unwrap();
+
+        let competing = cache_lifecycle_lock(&paths).unwrap();
+        assert!(competing.try_lock_exclusive().is_err());
+        FileExt::unlock(&lifecycle).unwrap();
+
+        with_cache_purge_lock(&paths, || Ok(())).unwrap();
+    }
+
+    #[test]
     fn repository_view_flag_is_translated_to_its_native_positional_selector() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "-R".into(),
@@ -1544,8 +3339,13 @@ mod tests {
             "--json".into(),
             "nameWithOwner".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
+        );
+        assert_eq!(
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
             vec![
                 "repo",
                 "view",
@@ -1558,14 +3358,16 @@ mod tests {
 
     #[test]
     fn repository_view_injects_the_resolved_repository_when_no_selector_is_positional() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "--json".into(),
             "nameWithOwner".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
+        assert_eq!(plan.repository, None);
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
             vec![
                 "repo",
                 "view",
@@ -1577,60 +3379,79 @@ mod tests {
     }
 
     #[test]
-    fn native_repository_flags_are_preserved_for_commands_that_support_them() {
-        let arguments = vec![
+    fn repository_flags_are_bound_once_and_removed_from_child_arguments() {
+        let arguments: Vec<String> = vec![
             "pr".into(),
             "list".into(),
             "-R".into(),
             "ExampleOrg/sample-repo".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
-            arguments
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
+        );
+        assert_eq!(
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
+            vec!["pr", "list"]
         );
     }
 
     #[test]
     fn repository_view_positional_selects_the_token_scope_and_is_forwarded() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "ExampleOrg/sample-repo".into(),
             "--json".into(),
             "nameWithOwner".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            explicit_gh_repository(&arguments).unwrap(),
-            Some("ExampleOrg/sample-repo".into())
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
         );
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
-            arguments
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
+            vec![
+                "repo",
+                "view",
+                "ExampleOrg/sample-repo",
+                "--json",
+                "nameWithOwner"
+            ]
         );
     }
 
     #[test]
     fn repository_view_positional_after_value_flag_selects_the_token_scope() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "--json".into(),
             "nameWithOwner".into(),
             "ExampleOrg/sample-repo".into(),
         ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
         assert_eq!(
-            explicit_gh_repository(&arguments).unwrap(),
-            Some("ExampleOrg/sample-repo".into())
+            plan.repository,
+            Some(("ExampleOrg".into(), "sample-repo".into()))
         );
         assert_eq!(
-            forwarded_gh_arguments(&arguments, "ExampleOrg", "sample-repo").unwrap(),
-            arguments
+            forwarded_gh_arguments(plan, "ExampleOrg", "sample-repo"),
+            vec![
+                "repo",
+                "view",
+                "ExampleOrg/sample-repo",
+                "--json",
+                "nameWithOwner"
+            ]
         );
     }
 
     #[test]
     fn repository_view_rejects_conflicting_flag_and_late_positional_selectors() {
-        let arguments = vec![
+        let arguments: Vec<String> = vec![
             "repo".into(),
             "view".into(),
             "--repo".into(),
@@ -1639,10 +3460,29 @@ mod tests {
             "nameWithOwner".into(),
             "ExampleOrg/second".into(),
         ];
-        assert!(explicit_gh_repository(&arguments)
+        assert!(crate::parse_gh_invocation(&arguments)
             .unwrap_err()
             .to_string()
-            .contains("conflicting repository selectors"));
+            .contains("more than one repository selector"));
+    }
+
+    #[test]
+    fn option_values_that_look_like_repository_flags_do_not_select_a_token_scope() {
+        let arguments: Vec<String> = vec![
+            "pr".into(),
+            "create".into(),
+            "--head".into(),
+            "automation/change".into(),
+            "--base".into(),
+            "main".into(),
+            "--title".into(),
+            "Bounded change".into(),
+            "--body".into(),
+            "--repo=OtherOrg/other-repo".into(),
+        ];
+        let plan = crate::parse_gh_invocation(&arguments).unwrap();
+        assert_eq!(plan.repository, None);
+        assert_eq!(plan.forwarded_arguments, arguments);
     }
 
     #[test]
@@ -1656,6 +3496,7 @@ mod tests {
             "app_id": 42,
             "account": {"login": "ExampleOrg"},
             "permissions": config.github.permissions,
+            "repository_selection": "all",
             "suspended_at": null
         });
         let selected = validate_repository_installation_response(
@@ -1668,6 +3509,16 @@ mod tests {
         assert_eq!(selected.installation_id, 101);
         assert_eq!(selected.owner, "exampleorg");
         assert_eq!(selected.repository, "new-repository");
+
+        let mut wrong_selection = response.clone();
+        wrong_selection["repository_selection"] = serde_json::json!("selected");
+        assert!(validate_repository_installation_response(
+            &config,
+            "exampleorg",
+            "New-Repository",
+            &serde_json::to_vec(&wrong_selection).unwrap(),
+        )
+        .is_err());
 
         let mut wrong_app = response;
         wrong_app["app_id"] = serde_json::json!(99);
@@ -1754,6 +3605,36 @@ mod tests {
             .block_on(agent.request_identities())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn agent_public_key_rows_are_revalidated_and_canonicalized() {
+        let private_key = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[43; 32])),
+            "untrusted agent comment",
+        )
+        .unwrap();
+        let public_key = private_key.public_key();
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let rows =
+            parse_agent_public_keys(&format!("{}\n", public_key.to_openssh().unwrap())).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[&fingerprint],
+            PublicKey::new(
+                public_key.key_data().clone(),
+                format!("dev-auth:{fingerprint}")
+            )
+            .to_openssh()
+            .unwrap()
+        );
+        let duplicate = format!(
+            "{}\n{}\n",
+            public_key.to_openssh().unwrap(),
+            public_key.to_openssh().unwrap()
+        );
+        assert!(parse_agent_public_keys(&duplicate).is_err());
+        assert!(parse_agent_public_keys("not-a-public-key\n").is_err());
     }
 
     #[test]

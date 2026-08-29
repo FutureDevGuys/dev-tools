@@ -5,7 +5,7 @@ use zeroize::Zeroize;
 const REQUEST_LIMIT: u64 = 64 * 1024;
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth enroll\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth status\n  dev-auth purge"
+    "Usage:\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status\n  dev-auth purge"
 }
 
 fn run() -> Result<i32> {
@@ -54,6 +54,22 @@ fn run() -> Result<i32> {
                     1
                 },
             )
+        }
+        "validate" => {
+            let online = match arguments.next().as_deref() {
+                None => false,
+                Some("--online") if arguments.next().is_none() => true,
+                _ => bail!("validate accepts only the optional --online flag"),
+            };
+            let report = dev_auth::validate_configuration(online)?;
+            println!(
+                "config_valid=true online={} declared_exec_profiles={} declared_ssh_profiles={} declared_secret_references={}",
+                report.online,
+                report.declared_exec_profiles,
+                report.declared_ssh_profiles,
+                report.declared_secret_references
+            );
+            Ok(0)
         }
         "purge" => {
             if arguments.next().is_some() {
@@ -105,6 +121,27 @@ fn run() -> Result<i32> {
             dev_auth::ssh_load(&profile)?;
             Ok(0)
         }
+        "ssh-public" => {
+            if arguments.next().as_deref() != Some("--profile") {
+                bail!("ssh-public requires --profile NAME --purpose authentication|signing");
+            }
+            let profile = arguments
+                .next()
+                .context("ssh-public profile name is missing")?;
+            if arguments.next().as_deref() != Some("--purpose") {
+                bail!("ssh-public requires --purpose authentication|signing");
+            }
+            let purpose = match arguments.next().as_deref() {
+                Some("authentication") => dev_auth::SshKeyPurpose::Authentication,
+                Some("signing") => dev_auth::SshKeyPurpose::Signing,
+                _ => bail!("ssh-public purpose must be authentication or signing"),
+            };
+            if arguments.next().is_some() {
+                bail!("ssh-public accepts no additional arguments");
+            }
+            println!("{}", dev_auth::ssh_public(&profile, purpose)?);
+            Ok(0)
+        }
         "--help" | "-h" | "help" => {
             println!("{}", usage());
             Ok(0)
@@ -146,6 +183,21 @@ fn run_ssh_keygen_frontend() -> Result<i32> {
     Ok(status.code().unwrap_or(128))
 }
 
+fn run_gh_git_child_frontend() -> Result<i32> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let status = dev_auth::run_gh_git_child(&arguments)?;
+    Ok(status.code().unwrap_or(128))
+}
+
+fn run_gh_pager_frontend() -> Result<i32> {
+    if std::env::args().nth(1).is_some() {
+        bail!("the internal gh pager accepts no file arguments");
+    }
+    io::copy(&mut io::stdin().lock(), &mut io::stdout().lock())
+        .context("forward bounded gh output")?;
+    Ok(0)
+}
+
 fn main() {
     let program = std::env::args_os()
         .next()
@@ -160,10 +212,14 @@ fn main() {
     let frontend = normalized_program
         .strip_suffix(".exe")
         .unwrap_or(&normalized_program);
-    let result = match frontend {
-        "git-credential-dev-auth" => run_credential_frontend(),
-        "gh-dev-auth" => run_gh_frontend(),
-        "ssh-keygen-dev-auth" => run_ssh_keygen_frontend(),
+    let gh_child = std::env::var("DEV_AUTH_GH_CHILD").as_deref() == Ok("1");
+    let result = match (frontend, gh_child) {
+        ("git", true) => run_gh_git_child_frontend(),
+        ("cat", true) => run_gh_pager_frontend(),
+        ("false", true) => Ok(1),
+        ("git-credential-dev-auth", _) => run_credential_frontend(),
+        ("gh-dev-auth", _) => run_gh_frontend(),
+        ("ssh-keygen-dev-auth", _) => run_ssh_keygen_frontend(),
         _ => run(),
     };
     match result {

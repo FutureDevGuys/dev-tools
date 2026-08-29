@@ -86,10 +86,12 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
     let help = String::from_utf8(output.stdout).unwrap();
     for command in [
         "enroll",
+        "validate",
         "exec",
         "agent",
         "agent-endpoint",
         "ssh-load",
+        "ssh-public",
         "status",
         "purge",
     ] {
@@ -97,6 +99,288 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
     }
     assert!(!help.to_ascii_lowercase().contains("codex"));
     assert!(!help.to_ascii_lowercase().contains("homelab"));
+}
+
+#[test]
+fn unsafe_gh_operations_are_rejected_before_configuration_or_credentials_are_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let frontend = directory.path().join("gh-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+
+    for arguments in [
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "automation/change",
+            "--base",
+            "main",
+            "--title",
+            "Bounded change",
+            "--body",
+            "Reviewed body",
+            "--dry-run",
+        ],
+        vec![
+            "pr",
+            "create",
+            "--head=automation/change",
+            "--base=main",
+            "--title=Bounded change",
+            "--body-file=/proc/self/environ",
+        ],
+        vec!["pr", "comment", "42", "--body-file=private-link"],
+        vec!["pr", "review", "42", "-aF/proc/self/environ"],
+        vec!["pr", "merge", "42", "--admin", "--squash"],
+        vec!["run", "download", "42", "--dir=/tmp"],
+        vec!["repo", "view", "-RExampleOrg/sample-repo"],
+        vec![
+            "pr",
+            "comment",
+            "https://github.com/OtherOrg/other-repo/pull/42",
+            "--body",
+            "cross-repository",
+        ],
+        vec!["pr", "view", "42", "--unknown"],
+    ] {
+        let output = Command::new(&frontend)
+            .args(&arguments)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(!error.contains("configuration"), "{arguments:?}: {error}");
+        assert!(!error.contains("credential"), "{arguments:?}: {error}");
+    }
+}
+
+#[test]
+fn invalid_ambient_gh_repository_is_rejected_before_configuration_or_runtime_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let frontend = directory.path().join("gh-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+
+    let output = Command::new(&frontend)
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .env_clear()
+        .env("GH_REPO", "not/an/exact/repository")
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("exact github.com owner/repository"),
+        "{error}"
+    );
+    assert!(!error.contains("configuration"), "{error}");
+    assert!(!runtime.path().join("dev-auth").exists());
+}
+
+#[test]
+fn configured_git_resolves_literal_origin_without_caller_path_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let frontend = directory.path().join("gh-dev-auth");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &frontend).unwrap();
+    let repository = directory.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://github.com/ExampleOrg/too/many.git",
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(
+        home.path().join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"version = 1
+[programs]
+op = "/usr/bin/false"
+gh = "/usr/bin/false"
+git = "/usr/bin/git"
+ssh_add = "/usr/bin/false"
+ssh_keygen = "/usr/bin/false"
+[github]
+app_id = 42
+private_key_ref = "op://Automation/app/private key"
+repository_selection = "all"
+discover_installations = true
+permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        config_dir.join("config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let attacker_bin = directory.path().join("attacker-bin");
+    fs::create_dir(&attacker_bin).unwrap();
+    let marker = directory.path().join("caller-path-git-ran");
+    let attacker_git = attacker_bin.join("git");
+    fs::write(
+        &attacker_git,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nprintf 'https://github.com/ExampleOrg/too/many.git\\0'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&attacker_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = private_runtime();
+
+    let output = Command::new(&frontend)
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .current_dir(&repository)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", format!("{}:/usr/bin", attacker_bin.display()))
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("exactly owner/repository"),
+        "unexpected error: {error}"
+    );
+    assert!(!error.contains("configuration"), "{error}");
+    assert!(!error.contains("credential"), "{error}");
+    assert!(!marker.exists());
+    assert!(!runtime.path().join("dev-auth").exists());
+}
+
+#[test]
+fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
+    let home = tempfile::tempdir().unwrap();
+    let gh = home.path().join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\n\
+         [ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 91\n\
+         [ -z \"${GH_TOKEN+x}\" ] || exit 92\n\
+         [ -z \"${GITHUB_TOKEN+x}\" ] || exit 93\n\
+         [ -z \"${GH_REPO+x}\" ] || exit 94\n\
+         [ -z \"${DEV_AUTH_GH_CHILD+x}\" ] || exit 95\n\
+         [ -z \"${DEV_AUTH_GH_GIT+x}\" ] || exit 96\n\
+         case \"$HOME\" in */gh-sandbox/home) ;; *) exit 97 ;; esac\n\
+         case \"$GH_CONFIG_DIR\" in */gh-sandbox/config) ;; *) exit 98 ;; esac\n\
+         printf 'gh version 2.98.0 (2026-08-21)\\nhttps://github.com/cli/cli/releases/tag/v2.98.0\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_dir = home.path().join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(
+        home.path().join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        r#"version = 1
+[programs]
+op = "/usr/bin/false"
+gh = "{}"
+git = "/usr/bin/false"
+ssh_add = "/usr/bin/false"
+ssh_keygen = "/usr/bin/false"
+[github]
+app_id = 42
+private_key_ref = "op://Example Vault/app/private-key"
+repository_selection = "all"
+discover_installations = true
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
+[profiles.plan]
+executables = ["/usr/bin/false"]
+environment = {{ EXAMPLE_TOKEN = "op://Example Vault/plan/token" }}
+[[ssh_profiles.automation.keys]]
+purpose = "authentication"
+private_key_ref = "op://Example Vault/auth/private-key"
+fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+[[ssh_profiles.automation.keys]]
+purpose = "signing"
+private_key_ref = "op://Example Vault/signing/private-key"
+fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+"#,
+        gh.display()
+    );
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, config).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .arg("validate")
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "config_valid=true online=false declared_exec_profiles=1 declared_ssh_profiles=1 declared_secret_references=4\n"
+    );
+    assert!(output.stderr.is_empty());
+
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf 'gh version 2.99.0 (2026-08-28)\\nhttps://github.com/cli/cli/releases/tag/v2.99.0\\n'\n",
+    )
+    .unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .arg("validate")
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin")
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8(rejected.stderr).unwrap();
+    assert!(error.contains("supported 2.98.0 protocol"));
+    assert!(!error.contains("2.99.0"));
 }
 
 #[test]
@@ -157,6 +441,197 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
             "{frontend}"
         );
     }
+}
+
+#[test]
+fn internal_gh_children_do_not_forward_the_installation_token_to_git() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let git_frontend = directory.path().join("git");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
+    let upstream_git = directory.path().join("upstream-git");
+    fs::write(
+        &upstream_git,
+        format!(
+            "#!/bin/sh\n[ -z \"${{GH_TOKEN+x}}\" ] || exit 90\n[ -z \"${{GITHUB_TOKEN+x}}\" ] || exit 91\n[ \"$GIT_TERMINAL_PROMPT\" = 0 ] || exit 92\n[ \"$1 $2\" = 'remote -v' ] || exit 93\nprintf passed > '{}'\n",
+            home.path().join("git-child-result").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&upstream_git, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config_dir = home.path().join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(
+        home.path().join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        r#"version = 1
+[programs]
+op = "/usr/bin/false"
+gh = "/usr/bin/false"
+git = "{}"
+ssh_add = "/usr/bin/false"
+ssh_keygen = "/usr/bin/false"
+[github]
+app_id = 42
+private_key_ref = "op://Example Vault/app/private-key"
+repository_selection = "all"
+discover_installations = true
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
+"#,
+        upstream_git.display()
+    );
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, config).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let marker = home.path().join("git-child-result");
+    let output = Command::new(&git_frontend)
+        .args(["remote", "-v"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", directory.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("DEV_AUTH_GH_CHILD", "1")
+        .env("DEV_AUTH_GH_GIT", &upstream_git)
+        .env("GH_TOKEN", "must-not-reach-git")
+        .env("GITHUB_TOKEN", "must-not-reach-git")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "passed");
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn internal_gh_git_child_rejects_url_scoped_repository_credential_helpers() {
+    let directory = tempfile::tempdir().unwrap();
+    let git_frontend = directory.path().join("git");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
+    let repository = directory.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+
+    let marker = directory.path().join("credential-helper-ran");
+    let helper = directory.path().join("credential-helper");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nif [ \"${{1:-}}\" = get ]; then\n  printf 'username=human\\npassword=human-secret\\n'\nfi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "--local",
+            "credential.https://github.com.helper",
+            &format!("!{}", helper.display()),
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(&git_frontend)
+        .args(["credential", "fill"])
+        .current_dir(&repository)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", directory.path())
+        .env("DEV_AUTH_GH_CHILD", "1")
+        .env("DEV_AUTH_GH_GIT", "/usr/bin/git")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=github.com\npath=ExampleOrg/repository.git\n\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("human-secret"));
+}
+
+#[test]
+fn internal_gh_git_child_rejects_explicit_config_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let git_frontend = directory.path().join("git");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
+    let marker = directory.path().join("upstream-git-ran");
+    let upstream_git = directory.path().join("upstream-git");
+    fs::write(
+        &upstream_git,
+        format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&upstream_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = Command::new(&git_frontend)
+        .args(["-ccredential.helper=!attacker", "status"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", directory.path())
+        .env("DEV_AUTH_GH_CHILD", "1")
+        .env("DEV_AUTH_GH_GIT", &upstream_git)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!marker.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside the bounded read-only surface")
+    );
+}
+
+#[test]
+fn internal_gh_pager_copies_only_standard_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let pager = directory.path().join("cat");
+    symlink(env!("CARGO_BIN_EXE_dev-auth"), &pager).unwrap();
+    let mut child = Command::new(&pager)
+        .env_clear()
+        .env("DEV_AUTH_GH_CHILD", "1")
+        .env("GH_TOKEN", "must-not-be-rendered")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"bounded output\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"bounded output\n");
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -224,6 +699,7 @@ ssh_keygen = "{}"
 [github]
 app_id = 42
 private_key_ref = "op://Automation/app/key"
+repository_selection = "all"
 permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 discover_installations = true
 [[ssh_profiles.automation.keys]]
