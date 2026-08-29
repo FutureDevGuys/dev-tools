@@ -1030,21 +1030,52 @@ fn forwarded_gh_arguments(
     plan.forwarded_arguments
 }
 
-fn origin_repository(program: &str) -> Result<String> {
+fn origin_repository_at(
+    program: &str,
+    working_directory: Option<&Path>,
+    environment: &BTreeMap<String, String>,
+) -> Result<String> {
     let _program_guard = program_guard(program, "Git")?;
-    let output = Command::new(program)
-        .args(["remote", "get-url", "origin"])
+    let mut command = Command::new(program);
+    command
+        .args([
+            "config",
+            "--local",
+            "--no-includes",
+            "--null",
+            "--get-all",
+            "remote.origin.url",
+        ])
         .env_clear()
-        .envs(sanitized_current_environment())
+        .envs(environment)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("read current Git origin")?;
-    if !output.status.success() {
-        bail!("no explicit repository and no readable Git origin");
+        .stderr(Stdio::null());
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
     }
-    let value = String::from_utf8(output.stdout).context("Git origin is not UTF-8")?;
-    Ok(value.trim_end_matches(['\n', '\r']).to_owned())
+    let output = command.output().context("read current Git origin")?;
+    if !output.status.success() {
+        bail!("no explicit repository and no literal local Git origin");
+    }
+    if output.stdout.len() as u64 > RESPONSE_LIMIT {
+        bail!("literal local Git origin exceeds the size limit");
+    }
+    let mut values = output.stdout.split(|byte| *byte == 0);
+    let value = values.next().unwrap_or_default();
+    if value.is_empty()
+        || values
+            .next()
+            .is_none_or(|terminator| !terminator.is_empty())
+        || values.next().is_some()
+    {
+        bail!("literal local Git origin is missing or ambiguous");
+    }
+    String::from_utf8(value.to_vec()).context("literal local Git origin is not UTF-8")
+}
+
+fn origin_repository(program: &str) -> Result<String> {
+    origin_repository_at(program, None, &sanitized_current_environment())
 }
 
 fn resolve_gh_repository(
@@ -2526,6 +2557,96 @@ mod tests {
         assert!(!environment.contains_key("COMSPEC"));
         assert!(!environment.values().any(|value| value.contains("attacker")));
         assert!(!environment.values().any(|value| value == "/home/example"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn origin_authority_ignores_local_and_global_url_rewrites() {
+        let repository = tempfile::tempdir().unwrap();
+        let environment = BTreeMap::from([("HOME".into(), "/nonexistent".into())]);
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ExampleOrg/sample-repo.git",
+            ],
+            vec![
+                "config",
+                "--local",
+                "--add",
+                "url.https://github.com/OtherOrg/.insteadOf",
+                "https://github.com/ExampleOrg/",
+            ],
+        ] {
+            let status = Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(repository.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let rewritten = Command::new("/usr/bin/git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(rewritten.stdout).unwrap().trim(),
+            "https://github.com/OtherOrg/sample-repo.git"
+        );
+        assert_eq!(
+            origin_repository_at("/usr/bin/git", Some(repository.path()), &environment).unwrap(),
+            "https://github.com/ExampleOrg/sample-repo.git"
+        );
+
+        let global_repository = tempfile::tempdir().unwrap();
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ExampleOrg/sample-repo.git",
+            ],
+        ] {
+            let status = Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(global_repository.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let global_home = tempfile::tempdir().unwrap();
+        fs::write(
+            global_home.path().join(".gitconfig"),
+            "[url \"https://github.com/OtherOrg/\"]\n\tinsteadOf = https://github.com/ExampleOrg/\n",
+        )
+        .unwrap();
+        let global_environment =
+            BTreeMap::from([("HOME".into(), global_home.path().display().to_string())]);
+        let globally_rewritten = Command::new("/usr/bin/git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(global_repository.path())
+            .env_clear()
+            .envs(&global_environment)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(globally_rewritten.stdout).unwrap().trim(),
+            "https://github.com/OtherOrg/sample-repo.git"
+        );
+        assert_eq!(
+            origin_repository_at(
+                "/usr/bin/git",
+                Some(global_repository.path()),
+                &global_environment,
+            )
+            .unwrap(),
+            "https://github.com/ExampleOrg/sample-repo.git"
+        );
     }
 
     #[test]
