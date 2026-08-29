@@ -21,8 +21,12 @@ use ssh_key::private::{Ed25519Keypair, KeypairData};
 use ssh_key::{Algorithm as SshAlgorithm, HashAlg, PrivateKey, PublicKey, Signature};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -32,12 +36,20 @@ use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+#[cfg(windows)]
+#[path = "windows_security.rs"]
+mod windows_security;
+
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
+#[cfg(windows)]
+const GH_CHILD_FRONTENDS: [&str; 3] = ["git.exe", "cat.exe", "false.exe"];
+#[cfg(not(windows))]
+const GH_CHILD_FRONTENDS: [&str; 3] = ["git", "cat", "false"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeStatus {
@@ -46,6 +58,14 @@ pub struct RuntimeStatus {
     pub runtime_ready: bool,
     pub ssh_agent_ready: bool,
     pub cached_installation_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub online: bool,
+    pub declared_exec_profiles: usize,
+    pub declared_ssh_profiles: usize,
+    pub declared_secret_references: usize,
 }
 
 #[derive(Debug)]
@@ -73,6 +93,34 @@ impl RuntimePaths {
 
     fn cache_dir(&self) -> PathBuf {
         self.runtime.join("github-installation-tokens")
+    }
+
+    fn gh_sandbox_dir(&self) -> PathBuf {
+        self.runtime.join("gh-sandbox")
+    }
+
+    fn gh_child_bin_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("bin")
+    }
+
+    fn gh_config_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("config")
+    }
+
+    fn gh_home_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("home")
+    }
+
+    fn gh_cache_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("cache")
+    }
+
+    fn gh_data_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("data")
+    }
+
+    fn gh_temp_dir(&self) -> PathBuf {
+        self.gh_sandbox_dir().join("tmp")
     }
 }
 
@@ -121,9 +169,57 @@ fn load_config(paths: &RuntimePaths) -> Result<Config> {
     if bytes.len() as u64 > CONFIG_LIMIT {
         bail!("configuration exceeds the size limit");
     }
-    parse_config(&bytes)
+    let config = parse_config(&bytes)?;
+    #[cfg(windows)]
+    validate_configured_windows_programs(&config)?;
+    Ok(config)
 }
 
+#[cfg(windows)]
+fn validate_configured_windows_programs(config: &Config) -> Result<()> {
+    for (description, program) in [
+        ("1Password CLI", &config.programs.op),
+        ("GitHub CLI", &config.programs.gh),
+        ("Git", &config.programs.git),
+        ("ssh-add", &config.programs.ssh_add),
+        ("ssh-keygen", &config.programs.ssh_keygen),
+    ] {
+        windows_security::validate_local_program(Path::new(program))
+            .with_context(|| format!("validate configured {description} program at {program}"))?;
+    }
+    for (profile_name, profile) in &config.profiles {
+        for executable in &profile.executables {
+            windows_security::validate_local_program(Path::new(executable)).with_context(|| {
+                format!("validate executable for profile {profile_name} at {executable}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+type ProgramGuard = File;
+#[cfg(not(windows))]
+struct ProgramGuard;
+
+#[cfg(windows)]
+fn program_guard(program: &str, description: &str) -> Result<ProgramGuard> {
+    windows_security::lock_local_program(Path::new(program))
+        .with_context(|| format!("lock configured {description} program at {program}"))
+}
+
+#[cfg(not(windows))]
+fn program_guard(_program: &str, _description: &str) -> Result<ProgramGuard> {
+    Ok(ProgramGuard)
+}
+
+#[cfg(windows)]
+fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
+    windows_security::validate_private_directory(path)
+        .with_context(|| format!("inspect {description} at {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
@@ -141,6 +237,13 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn private_read(path: &Path, description: &str) -> Result<File> {
+    windows_security::open_private_file(path)
+        .with_context(|| format!("open and validate {description} at {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn private_read(path: &Path, description: &str) -> Result<File> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
@@ -158,6 +261,7 @@ fn private_read(path: &Path, description: &str) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(not(windows))]
 fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
     let metadata = file
         .metadata()
@@ -175,6 +279,13 @@ fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    windows_security::ensure_private_directory(path)
+        .with_context(|| format!("create or validate private directory {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn ensure_private_directory(path: &Path) -> Result<()> {
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
@@ -206,25 +317,31 @@ fn ensure_runtime(paths: &RuntimePaths) -> Result<()> {
         .runtime
         .parent()
         .context("private runtime path has no parent")?;
-    if !parent.exists() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        builder.mode(0o700);
-        builder
-            .create(parent)
-            .with_context(|| format!("create runtime root {}", parent.display()))?;
-    }
-    let parent_metadata = fs::symlink_metadata(parent)
-        .with_context(|| format!("inspect runtime root {}", parent.display()))?;
-    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
-        bail!("runtime root is not a directory");
-    }
-    #[cfg(unix)]
-    if parent_metadata.uid() != rustix::process::geteuid().as_raw()
-        || parent_metadata.permissions().mode() & 0o077 != 0
+    #[cfg(windows)]
+    windows_security::ensure_private_directory_all(parent)
+        .with_context(|| format!("create or validate runtime root {}", parent.display()))?;
+    #[cfg(not(windows))]
     {
-        bail!("runtime root is not a private current-user directory");
+        if !parent.exists() {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder
+                .create(parent)
+                .with_context(|| format!("create runtime root {}", parent.display()))?;
+        }
+        let parent_metadata = fs::symlink_metadata(parent)
+            .with_context(|| format!("inspect runtime root {}", parent.display()))?;
+        if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+            bail!("runtime root is not a directory");
+        }
+        #[cfg(unix)]
+        if parent_metadata.uid() != rustix::process::geteuid().as_raw()
+            || parent_metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!("runtime root is not a private current-user directory");
+        }
     }
     ensure_private_directory(&paths.runtime)?;
     ensure_private_directory(&paths.cache_dir())?;
@@ -247,7 +364,64 @@ fn remove_legacy_token_files(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn validate_secret_service_session_at(
+    environment: &BTreeMap<String, String>,
+    run_user_root: &Path,
+    uid: u32,
+) -> Result<()> {
+    let runtime = run_user_root.join(uid.to_string());
+    let runtime_metadata = fs::symlink_metadata(&runtime).with_context(|| {
+        format!(
+            "inspect current-user runtime directory {}",
+            runtime.display()
+        )
+    })?;
+    if !runtime_metadata.file_type().is_dir()
+        || runtime_metadata.file_type().is_symlink()
+        || runtime_metadata.uid() != uid
+        || runtime_metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("Secret Service runtime must be a private current-user directory");
+    }
+    let bus = runtime.join("bus");
+    let bus_metadata = fs::symlink_metadata(&bus)
+        .with_context(|| format!("inspect current-user session bus {}", bus.display()))?;
+    if !bus_metadata.file_type().is_socket()
+        || bus_metadata.file_type().is_symlink()
+        || bus_metadata.uid() != uid
+    {
+        bail!("Secret Service session bus must be a current-user Unix socket");
+    }
+    if environment
+        .get("XDG_RUNTIME_DIR")
+        .is_some_and(|value| Path::new(value) != runtime)
+    {
+        bail!("XDG_RUNTIME_DIR does not identify the current-user login runtime");
+    }
+    let expected_address = format!("unix:path={}", bus.display());
+    if environment
+        .get("DBUS_SESSION_BUS_ADDRESS")
+        .is_some_and(|value| value != &expected_address)
+    {
+        bail!("DBUS_SESSION_BUS_ADDRESS does not identify the current-user session bus");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_secret_service_session() -> Result<()> {
+    let environment: BTreeMap<String, String> = env::vars().collect();
+    validate_secret_service_session_at(
+        &environment,
+        Path::new("/run/user"),
+        rustix::process::geteuid().as_raw(),
+    )
+}
+
 fn credential_entry(store: &CredentialStore) -> Result<Entry> {
+    #[cfg(target_os = "linux")]
+    validate_secret_service_session()?;
     Entry::new(&store.service, &store.account).context("open native OS credential-store entry")
 }
 
@@ -284,6 +458,7 @@ pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
 
 fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString> {
     crate::validate_op_reference(reference)?;
+    let _program_guard = program_guard(&config.programs.op, "1Password CLI")?;
     let service_token = service_account_token(&config.credential_store)?;
     let output = Command::new(&config.programs.op)
         .args(["read", "--no-newline", reference])
@@ -504,6 +679,7 @@ fn mint_installation_token(
     Ok(CacheEntry::new(
         SecretString::new(response.token),
         expires_at,
+        config.github.app_id,
         installation_id,
         owner.to_ascii_lowercase(),
         repository.to_owned(),
@@ -516,6 +692,7 @@ fn mint_installation_token(
 struct CacheFile {
     token: String,
     expires_at: i64,
+    app_id: u64,
     installation_id: u64,
     owner: String,
     repository: String,
@@ -527,6 +704,7 @@ impl From<&CacheEntry> for CacheFile {
         Self {
             token: entry.token().expose().to_owned(),
             expires_at: entry.expires_at(),
+            app_id: entry.app_id(),
             installation_id: entry.installation_id(),
             owner: entry.owner().to_owned(),
             repository: entry.repository().to_owned(),
@@ -540,6 +718,7 @@ impl From<CacheFile> for CacheEntry {
         CacheEntry::new(
             SecretString::new(value.token),
             value.expires_at,
+            value.app_id,
             value.installation_id,
             value.owner,
             value.repository,
@@ -549,22 +728,25 @@ impl From<CacheFile> for CacheEntry {
 }
 
 fn cache_key(
+    app_id: u64,
     installation_id: u64,
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let public_scope = serde_json::to_vec(&(installation_id, repository, permissions))
+    let public_scope = serde_json::to_vec(&(app_id, installation_id, repository, permissions))
         .context("serialize installation-token cache scope")?;
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
 fn dynamic_cache_key(
+    app_id: u64,
     owner: &str,
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> Result<String> {
     let public_scope = serde_json::to_vec(&(
         "dynamic",
+        app_id,
         owner.to_ascii_lowercase(),
         repository.to_ascii_lowercase(),
         permissions,
@@ -573,37 +755,79 @@ fn dynamic_cache_key(
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
+fn cache_lifecycle_lock(paths: &RuntimePaths) -> Result<File> {
+    private_open(&paths.runtime.join("cache-lifecycle.lock"))
+}
+
+fn with_cache_scope_lock<T, F>(paths: &RuntimePaths, key: &str, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_runtime(paths)?;
+    let lifecycle = cache_lifecycle_lock(paths)?;
+    FileExt::lock_shared(&lifecycle).context("lock installation-token cache lifecycle")?;
+    let scope = private_open(&paths.cache_dir().join(format!("{key}.lock")))?;
+    scope
+        .lock_exclusive()
+        .context("lock installation-token cache scope")?;
+    operation()
+}
+
+fn with_cache_purge_lock<T, F>(paths: &RuntimePaths, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    ensure_runtime(paths)?;
+    let lifecycle = cache_lifecycle_lock(paths)?;
+    lifecycle
+        .lock_exclusive()
+        .context("lock installation-token cache lifecycle for purge")?;
+    operation()
+}
+
 fn locked_cache_entry<F>(
     paths: &RuntimePaths,
-    store: &CredentialStore,
-    installation_id: u64,
-    owner: &str,
-    repository: &str,
-    permissions: &BTreeMap<String, String>,
+    config: &Config,
+    selected: &SelectedRepository,
     create: F,
 ) -> Result<CacheEntry>
 where
     F: FnOnce() -> Result<CacheEntry>,
 {
-    ensure_runtime(paths)?;
-    let key = cache_key(installation_id, repository, permissions)?;
-    let lock_path = paths.cache_dir().join(format!("{key}.lock"));
-    let lock = private_open(&lock_path)?;
-    lock.lock_exclusive()
-        .context("lock installation-token cache")?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-
-    if let Ok(entry) = read_cache(store, &key) {
-        if entry.is_usable_at(now, installation_id, owner, repository, permissions) {
-            return Ok(entry);
+    let key = cache_key(
+        config.github.app_id,
+        selected.installation_id,
+        &selected.repository,
+        &config.github.permissions,
+    )?;
+    with_cache_scope_lock(paths, &key, || {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if let Ok(entry) = read_cache(&config.credential_store, &key) {
+            if entry.is_usable_at(
+                now,
+                config.github.app_id,
+                selected.installation_id,
+                &selected.owner,
+                &selected.repository,
+                &config.github.permissions,
+            ) {
+                return Ok(entry);
+            }
         }
-    }
-    let entry = create()?;
-    if !entry.is_usable_at(now, installation_id, owner, repository, permissions) {
-        bail!("new installation token is not usable for the requested scope");
-    }
-    write_cache(store, &key, &entry)?;
-    Ok(entry)
+        let entry = create()?;
+        if !entry.is_usable_at(
+            now,
+            config.github.app_id,
+            selected.installation_id,
+            &selected.owner,
+            &selected.repository,
+            &config.github.permissions,
+        ) {
+            bail!("new installation token is not usable for the requested scope");
+        }
+        write_cache(&config.credential_store, &key, &entry)?;
+        Ok(entry)
+    })
 }
 
 fn locked_dynamic_cache_entry(
@@ -612,37 +836,57 @@ fn locked_dynamic_cache_entry(
     owner: &str,
     repository: &str,
 ) -> Result<CacheEntry> {
-    ensure_runtime(paths)?;
     let owner = owner.to_ascii_lowercase();
     let repository = repository.to_ascii_lowercase();
-    let key = dynamic_cache_key(&owner, &repository, &config.github.permissions)?;
-    let lock_path = paths.cache_dir().join(format!("{key}.lock"));
-    let lock = private_open(&lock_path)?;
-    lock.lock_exclusive()
-        .context("lock dynamic installation-token cache")?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-
-    if let Ok(entry) = read_cache(&config.credential_store, &key) {
-        if entry.is_usable_for_repository_at(now, &owner, &repository, &config.github.permissions) {
-            return Ok(entry);
-        }
-    }
-
-    let selected = discover_repository_installation(config, &owner, &repository, now)?;
-    let entry = mint_installation_token(
-        config,
-        selected.installation_id,
-        &selected.owner,
-        &selected.repository,
-        OffsetDateTime::now_utc().unix_timestamp(),
+    let key = dynamic_cache_key(
+        config.github.app_id,
+        &owner,
+        &repository,
+        &config.github.permissions,
     )?;
-    if !entry.is_usable_for_repository_at(now, &owner, &repository, &config.github.permissions) {
-        bail!("new installation token is not usable for the requested repository");
-    }
-    write_cache(&config.credential_store, &key, &entry)?;
-    Ok(entry)
+    with_cache_scope_lock(paths, &key, || {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if let Ok(entry) = read_cache(&config.credential_store, &key) {
+            if entry.is_usable_for_repository_at(
+                now,
+                config.github.app_id,
+                &owner,
+                &repository,
+                &config.github.permissions,
+            ) {
+                return Ok(entry);
+            }
+        }
+
+        let selected = discover_repository_installation(config, &owner, &repository, now)?;
+        let entry = mint_installation_token(
+            config,
+            selected.installation_id,
+            &selected.owner,
+            &selected.repository,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
+        if !entry.is_usable_for_repository_at(
+            now,
+            config.github.app_id,
+            &owner,
+            &repository,
+            &config.github.permissions,
+        ) {
+            bail!("new installation token is not usable for the requested repository");
+        }
+        write_cache(&config.credential_store, &key, &entry)?;
+        Ok(entry)
+    })
 }
 
+#[cfg(windows)]
+fn private_open(path: &Path) -> Result<File> {
+    windows_security::open_or_create_private_file(path)
+        .with_context(|| format!("open private runtime file {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn private_open(path: &Path) -> Result<File> {
     if path.is_symlink() {
         bail!("private runtime path must not be a symlink");
@@ -661,6 +905,8 @@ fn private_open(path: &Path) -> Result<File> {
 }
 
 fn cache_entry(store: &CredentialStore, key: &str) -> Result<Entry> {
+    #[cfg(target_os = "linux")]
+    validate_secret_service_session()?;
     Entry::new(&format!("{}:github-installation-token", store.service), key)
         .context("open native installation-token cache entry")
 }
@@ -695,23 +941,15 @@ fn token_entry_for_repository(
         return locked_dynamic_cache_entry(paths, config, owner, repository);
     }
     let selected = config.github.select_repository(owner, repository)?;
-    locked_cache_entry(
-        paths,
-        &config.credential_store,
-        selected.installation_id,
-        &selected.owner,
-        &selected.repository,
-        &config.github.permissions,
-        || {
-            mint_installation_token(
-                config,
-                selected.installation_id,
-                &selected.owner,
-                &selected.repository,
-                OffsetDateTime::now_utc().unix_timestamp(),
-            )
-        },
-    )
+    locked_cache_entry(paths, config, &selected, || {
+        mint_installation_token(
+            config,
+            selected.installation_id,
+            &selected.owner,
+            &selected.repository,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+    })
 }
 
 pub fn credential_get(input: &[u8]) -> Result<String> {
@@ -846,6 +1084,7 @@ fn forwarded_gh_arguments(
 }
 
 fn origin_repository(program: &str) -> Result<String> {
+    let _program_guard = program_guard(program, "Git")?;
     let output = Command::new(program)
         .args(["remote", "get-url", "origin"])
         .env_clear()
@@ -872,20 +1111,269 @@ fn resolve_gh_repository(arguments: &[String], git_program: &str) -> Result<(Str
     crate::parse_github_repository(&selected)
 }
 
+fn file_sha256(path: &Path, description: &str) -> Result<[u8; 32]> {
+    let mut file = File::open(path).with_context(|| format!("open {description}"))?;
+    file_sha256_file(&mut file, description)
+}
+
+fn file_sha256_file(file: &mut File, description: &str) -> Result<[u8; 32]> {
+    #[cfg(windows)]
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {description}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {description}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    #[cfg(windows)]
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {description}"))?;
+    Ok(digest.finalize().into())
+}
+
+#[cfg(not(windows))]
+fn install_gh_child_frontend(source: &Path, destination: &Path, digest: &[u8; 32]) -> Result<()> {
+    #[cfg(windows)]
+    if destination.exists()
+        && private_read(destination, "gh child frontend").is_ok()
+        && file_sha256(destination, "gh child frontend")? == *digest
+    {
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    if destination.exists() {
+        let _ = private_read(destination, "gh child frontend")?;
+        if file_sha256(destination, "gh child frontend")? == *digest {
+            return Ok(());
+        }
+    }
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("gh child frontend name is invalid")?;
+    let temporary = destination.with_file_name(format!(".{name}.tmp"));
+    #[cfg(not(windows))]
+    if temporary.exists() {
+        let _ = private_read(&temporary, "temporary gh child frontend")?;
+        fs::remove_file(&temporary).context("remove stale temporary gh child frontend")?;
+    }
+    #[cfg(windows)]
+    windows_security::copy_to_private_replacement(source, &temporary)
+        .context("copy gh child frontend into a private Windows file")?;
+    #[cfg(not(windows))]
+    fs::copy(source, &temporary).context("copy gh child frontend")?;
+    #[cfg(unix)]
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
+        .context("make gh child frontend executable")?;
+    let _ = private_read(&temporary, "temporary gh child frontend")?;
+    if file_sha256(&temporary, "temporary gh child frontend")? != *digest {
+        bail!("copied gh child frontend does not match the running executable");
+    }
+    #[cfg(windows)]
+    windows_security::atomically_replace_private_file(&temporary, destination)
+        .context("atomically activate private gh child frontend")?;
+    #[cfg(not(windows))]
+    {
+        if destination.exists() {
+            fs::remove_file(destination).context("remove superseded gh child frontend")?;
+        }
+        fs::rename(&temporary, destination).context("activate gh child frontend")?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn gh_child_frontend_guards(paths: &RuntimePaths) -> Result<Vec<ProgramGuard>> {
+    GH_CHILD_FRONTENDS
+        .iter()
+        .map(|frontend| {
+            let path = paths.gh_child_bin_dir().join(frontend);
+            windows_security::lock_local_program(&path)
+                .with_context(|| format!("lock private gh child frontend at {}", path.display()))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
+    ensure_runtime(paths)?;
+    ensure_private_directory(&paths.gh_sandbox_dir())?;
+    ensure_private_directory(&paths.gh_child_bin_dir())?;
+    ensure_private_directory(&paths.gh_config_dir())?;
+    ensure_private_directory(&paths.gh_home_dir())?;
+    ensure_private_directory(&paths.gh_cache_dir())?;
+    ensure_private_directory(&paths.gh_data_dir())?;
+    ensure_private_directory(&paths.gh_temp_dir())?;
+    let lock = private_open(&paths.runtime.join("gh-sandbox.lock"))?;
+    lock.lock_exclusive().context("lock gh sandbox update")?;
+    let executable = env::current_exe().context("resolve running dev-auth executable")?;
+    let digest = file_sha256(&executable, "running dev-auth executable")?;
+    for frontend in GH_CHILD_FRONTENDS {
+        install_gh_child_frontend(
+            &executable,
+            &paths.gh_child_bin_dir().join(frontend),
+            &digest,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_gh_sandbox(paths: &RuntimePaths) -> Result<()> {
+    ensure_runtime(paths)?;
+    ensure_private_directory(&paths.gh_sandbox_dir())?;
+    ensure_private_directory(&paths.gh_child_bin_dir())?;
+    ensure_private_directory(&paths.gh_config_dir())?;
+    ensure_private_directory(&paths.gh_home_dir())?;
+    ensure_private_directory(&paths.gh_cache_dir())?;
+    ensure_private_directory(&paths.gh_data_dir())?;
+    ensure_private_directory(&paths.gh_temp_dir())?;
+    let lock = private_open(&paths.runtime.join("gh-sandbox.lock"))?;
+    lock.lock_exclusive().context("lock gh sandbox update")?;
+    let executable = env::current_exe().context("resolve running dev-auth executable")?;
+    let mut executable_file = windows_security::lock_local_program_for_copy(&executable)
+        .context("lock running dev-auth executable")?;
+    let digest = file_sha256_file(&mut executable_file, "running dev-auth executable")?;
+    for frontend in GH_CHILD_FRONTENDS {
+        let destination = paths.gh_child_bin_dir().join(frontend);
+        if destination.exists()
+            && private_read(&destination, "gh child frontend").is_ok()
+            && file_sha256(&destination, "gh child frontend")? == digest
+        {
+            continue;
+        }
+        let name = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("gh child frontend name is invalid")?;
+        let temporary = destination.with_file_name(format!(".{name}.tmp"));
+        if temporary.exists() {
+            let _ = private_read(&temporary, "temporary gh child frontend")?;
+            fs::remove_file(&temporary).context("remove stale temporary gh child frontend")?;
+        }
+        windows_security::copy_open_file_to_private_replacement(&mut executable_file, &temporary)
+            .context("copy gh child frontend into a private Windows file")?;
+        let _ = private_read(&temporary, "temporary gh child frontend")?;
+        if file_sha256(&temporary, "temporary gh child frontend")? != digest {
+            bail!("copied gh child frontend does not match the running executable");
+        }
+        windows_security::atomically_replace_private_file(&temporary, &destination)
+            .context("atomically activate private gh child frontend")?;
+    }
+    Ok(())
+}
+
+fn isolated_gh_environment(
+    input: &BTreeMap<String, String>,
+    paths: &RuntimePaths,
+    token: &SecretString,
+    owner: &str,
+    repository: &str,
+    git_program: &str,
+) -> BTreeMap<String, String> {
+    const PLATFORM_ALLOWED: &[&str] = &[
+        "COLORTERM",
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TERM",
+    ];
+    let mut environment: BTreeMap<String, String> = input
+        .iter()
+        .filter(|(key, _)| {
+            PLATFORM_ALLOWED
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    environment.insert(
+        "PATH".into(),
+        paths.gh_child_bin_dir().display().to_string(),
+    );
+    environment.insert(
+        "GH_CONFIG_DIR".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert("HOME".into(), paths.gh_home_dir().display().to_string());
+    environment.insert(
+        "USERPROFILE".into(),
+        paths.gh_home_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CONFIG_HOME".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".into(),
+        paths.gh_cache_dir().display().to_string(),
+    );
+    environment.insert(
+        "XDG_DATA_HOME".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    environment.insert(
+        "APPDATA".into(),
+        paths.gh_config_dir().display().to_string(),
+    );
+    environment.insert(
+        "LOCALAPPDATA".into(),
+        paths.gh_data_dir().display().to_string(),
+    );
+    for variable in ["TMP", "TEMP", "TMPDIR"] {
+        environment.insert(variable.into(), paths.gh_temp_dir().display().to_string());
+    }
+    environment.insert("GH_TOKEN".into(), token.expose().into());
+    environment.insert("GH_HOST".into(), "github.com".into());
+    environment.insert("GH_REPO".into(), format!("{owner}/{repository}"));
+    environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
+    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    environment.insert("GH_EDITOR".into(), "false".into());
+    environment.insert("GIT_EDITOR".into(), "false".into());
+    environment.insert("VISUAL".into(), "false".into());
+    environment.insert("EDITOR".into(), "false".into());
+    environment.insert("GH_BROWSER".into(), "false".into());
+    environment.insert("BROWSER".into(), "false".into());
+    environment.insert("GH_PAGER".into(), "cat".into());
+    environment.insert("PAGER".into(), "cat".into());
+    environment.insert("GH_NO_UPDATE_NOTIFIER".into(), "1".into());
+    environment.insert("GH_NO_EXTENSION_UPDATE_NOTIFIER".into(), "1".into());
+    environment.insert("GH_TELEMETRY".into(), "false".into());
+    environment.insert("DEV_AUTH_GH_CHILD".into(), "1".into());
+    environment.insert("DEV_AUTH_GH_GIT".into(), git_program.into());
+    environment
+}
+
 pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     crate::admit_gh_arguments(arguments)?;
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
+    ensure_gh_sandbox(&paths)?;
+    #[cfg(windows)]
+    let _frontend_guards = gh_child_frontend_guards(&paths)?;
     let (owner, repository) = resolve_gh_repository(arguments, &config.programs.git)?;
     let forwarded = forwarded_gh_arguments(arguments, &owner, &repository)?;
+    let _program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
     let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
     let token = entry.token().clone();
     let input: BTreeMap<String, String> = env::vars().collect();
-    let mut environment = sanitize_environment(&input, &BTreeSet::new());
-    environment.insert("GH_TOKEN".into(), token.expose().into());
-    environment.insert("GH_PROMPT_DISABLED".into(), "1".into());
-    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-    environment.insert("GH_REPO".into(), format!("{owner}/{repository}"));
+    let environment = isolated_gh_environment(
+        &input,
+        &paths,
+        &token,
+        &owner,
+        &repository,
+        &config.programs.git,
+    );
     Command::new(&config.programs.gh)
         .args(forwarded)
         .env_clear()
@@ -897,6 +1385,33 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
         .context("run repository-scoped gh command")
 }
 
+pub fn run_gh_git_child(arguments: &[String]) -> Result<ExitStatus> {
+    let program = env::var("DEV_AUTH_GH_GIT")
+        .context("internal gh Git frontend has no configured executable")?;
+    crate::validate_program(&program, "internal gh Git executable")?;
+    let _program_guard = program_guard(&program, "internal gh Git")?;
+    let input: BTreeMap<String, String> = env::vars().collect();
+    let mut environment = sanitize_environment(&input, &BTreeSet::new());
+    let parent = Path::new(&program)
+        .parent()
+        .context("configured Git executable has no parent directory")?;
+    environment.insert("PATH".into(), parent.display().to_string());
+    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    environment.remove("GH_TOKEN");
+    environment.remove("GITHUB_TOKEN");
+    environment.remove("DEV_AUTH_GH_CHILD");
+    environment.remove("DEV_AUTH_GH_GIT");
+    Command::new(program)
+        .args(arguments)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("run configured Git without the GitHub installation token")
+}
+
 pub fn credential_erase(input: &[u8]) -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
@@ -904,25 +1419,27 @@ pub fn credential_erase(input: &[u8]) -> Result<()> {
     let (owner, repository) = request.repository()?;
     ensure_runtime(&paths)?;
     let key = if config.github.discover_installations {
-        dynamic_cache_key(owner, repository, &config.github.permissions)?
+        dynamic_cache_key(
+            config.github.app_id,
+            owner,
+            repository,
+            &config.github.permissions,
+        )?
     } else {
         let selected = config.github.select_repository(owner, repository)?;
         cache_key(
+            config.github.app_id,
             selected.installation_id,
             &selected.repository,
             &config.github.permissions,
         )?
     };
-    match cache_entry(&config.credential_store, &key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(error) => return Err(error).context("remove native installation-token cache"),
-    }
-    let lock = paths.cache_dir().join(format!("{key}.lock"));
-    match fs::remove_file(lock) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("remove installation-token cache lock"),
-    }
+    with_cache_scope_lock(&paths, &key, || {
+        match cache_entry(&config.credential_store, &key)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("remove native installation-token cache"),
+        }
+    })
 }
 
 fn declared_profile<'a>(config: &'a Config, name: &str) -> Result<&'a ExecProfile> {
@@ -940,6 +1457,7 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
     if !profile.executables.contains(executable) {
         bail!("command executable is not admitted by the selected profile");
     }
+    let _program_guard = program_guard(executable, "declared profile executable")?;
     let input: BTreeMap<String, String> = env::vars().collect();
     let mut child_environment = sanitize_environment(&input, &BTreeSet::new());
     for (variable, reference) in &profile.environment {
@@ -981,17 +1499,12 @@ struct PrivateNamedPipeListener {
 impl PrivateNamedPipeListener {
     fn bind(name: impl Into<std::ffi::OsString>) -> io::Result<Self> {
         let name = name.into();
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .reject_remote_clients(true)
-            .create(&name)?;
+        let server = windows_security::create_private_named_pipe(name.as_os_str(), true)?;
         Ok(Self { server, name })
     }
 
     fn next_server(&self) -> io::Result<NamedPipeServer> {
-        ServerOptions::new()
-            .reject_remote_clients(true)
-            .create(&self.name)
+        windows_security::create_private_named_pipe(self.name.as_os_str(), false)
     }
 }
 
@@ -1034,9 +1547,10 @@ fn validate_ssh_agent_socket(paths: &RuntimePaths) -> Result<PathBuf> {
     Ok(socket)
 }
 
-fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<Command> {
+fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<(Command, ProgramGuard)> {
     #[cfg(unix)]
     validate_ssh_agent_socket(paths)?;
+    let guard = program_guard(&config.programs.ssh_add, "ssh-add")?;
     let mut command = Command::new(&config.programs.ssh_add);
     command
         .env_clear()
@@ -1044,12 +1558,13 @@ fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<Command> {
         .env("SSH_AUTH_SOCK", ssh_agent_endpoint(paths)?)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Ok(command)
+    Ok((command, guard))
 }
 
 pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
+    let _program_guard = program_guard(&config.programs.ssh_keygen, "ssh-keygen")?;
     if is_git_verification_operation(arguments)? {
         return Command::new(&config.programs.ssh_keygen)
             .args(arguments)
@@ -1172,7 +1687,8 @@ fn exact_option_value<'a>(arguments: &'a [String], option: &str) -> Result<&'a s
 }
 
 fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
-    let status = ssh_add_command(paths, config)?
+    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let status = command
         .arg("-D")
         .stdin(Stdio::null())
         .status()
@@ -1184,7 +1700,8 @@ fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
 }
 
 fn loaded_ssh_fingerprints(paths: &RuntimePaths, config: &Config) -> Result<BTreeSet<String>> {
-    let output = ssh_add_command(paths, config)?
+    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let output = command
         .args(["-l", "-E", "sha256"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1209,6 +1726,48 @@ fn loaded_ssh_fingerprints(paths: &RuntimePaths, config: &Config) -> Result<BTre
     Ok(fingerprints)
 }
 
+fn parse_agent_public_keys(text: &str) -> Result<BTreeMap<String, String>> {
+    let mut keys = BTreeMap::new();
+    for line in text.lines() {
+        let public_key = PublicKey::from_openssh(line)
+            .context("SSH agent returned an invalid public-key row")?;
+        if public_key.algorithm() != SshAlgorithm::Ed25519 {
+            bail!("SSH agent returned a non-Ed25519 public key");
+        }
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        if keys.contains_key(&fingerprint) {
+            bail!("SSH agent returned a duplicate public key");
+        }
+        let canonical = PublicKey::new(
+            public_key.key_data().clone(),
+            format!("dev-auth:{fingerprint}"),
+        )
+        .to_openssh()
+        .context("encode declared SSH public key")?;
+        keys.insert(fingerprint, canonical);
+    }
+    Ok(keys)
+}
+
+fn loaded_ssh_public_keys(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<BTreeMap<String, String>> {
+    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let output = command
+        .arg("-L")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .output()
+        .context("list dedicated SSH agent public keys")?;
+    if !output.status.success() {
+        bail!("dedicated SSH agent rejected public-key listing");
+    }
+    let text =
+        String::from_utf8(output.stdout).context("SSH agent public-key list is not UTF-8")?;
+    parse_agent_public_keys(&text)
+}
+
 pub fn ssh_load(profile_name: &str) -> Result<()> {
     let paths = RuntimePaths::discover()?;
     ensure_runtime(&paths)?;
@@ -1227,6 +1786,34 @@ pub fn ssh_load(profile_name: &str) -> Result<()> {
         bail!("dedicated SSH agent fingerprints do not match the declared profile");
     }
     Ok(())
+}
+
+pub fn ssh_public(profile_name: &str, purpose: SshKeyPurpose) -> Result<String> {
+    let paths = RuntimePaths::discover()?;
+    ensure_runtime(&paths)?;
+    let config = load_config(&paths)?;
+    let profile = config
+        .ssh_profiles
+        .get(profile_name)
+        .context("requested SSH profile is not declared")?;
+    let expected: BTreeSet<String> = profile
+        .keys
+        .iter()
+        .map(|key| key.fingerprint.clone())
+        .collect();
+    let loaded = loaded_ssh_public_keys(&paths, &config)?;
+    if loaded.keys().cloned().collect::<BTreeSet<_>>() != expected {
+        bail!("dedicated SSH agent public keys do not match the declared profile");
+    }
+    let declared = profile
+        .keys
+        .iter()
+        .find(|key| key.purpose == purpose)
+        .context("declared SSH profile does not contain the requested key purpose")?;
+    loaded
+        .get(&declared.fingerprint)
+        .cloned()
+        .context("requested declared SSH public key is not loaded")
 }
 
 struct AgentIdentity {
@@ -1318,6 +1905,48 @@ fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
         "dev-auth automation key",
     )
     .context("construct declared Ed25519 SSH key")
+}
+
+pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
+    let paths = RuntimePaths::discover()?;
+    let config = load_config(&paths)?;
+    let references = config.declared_secret_references();
+    if online {
+        let mut secrets = BTreeMap::new();
+        for reference in &references {
+            secrets.insert(reference, read_declared_secret(&config, reference)?);
+        }
+        let app_key = secrets
+            .get(&config.github.private_key_ref)
+            .context("declared GitHub App private key was not checked")?;
+        EncodingKey::from_rsa_pem(app_key.expose().as_bytes())
+            .context("GitHub App private key is not a valid RSA PEM key")?;
+        for profile in config.ssh_profiles.values() {
+            for key in &profile.keys {
+                let source = secrets
+                    .get(&key.private_key_ref)
+                    .context("declared SSH private key was not checked")?;
+                let private_key = parse_declared_ssh_private_key(source)?;
+                if private_key.is_encrypted() || private_key.algorithm() != SshAlgorithm::Ed25519 {
+                    bail!("declared SSH key must be an unencrypted Ed25519 OpenSSH key");
+                }
+                if private_key
+                    .public_key()
+                    .fingerprint(HashAlg::Sha256)
+                    .to_string()
+                    != key.fingerprint
+                {
+                    bail!("declared SSH key fingerprint does not match its private key");
+                }
+            }
+        }
+    }
+    Ok(ValidationReport {
+        online,
+        declared_exec_profiles: config.profiles.len(),
+        declared_ssh_profiles: config.ssh_profiles.len(),
+        declared_secret_references: references.len(),
+    })
 }
 
 fn declared_agent(config: &Config, profile: &SshProfile) -> Result<DeclaredAgent> {
@@ -1443,33 +2072,31 @@ pub fn runtime_status() -> Result<RuntimeStatus> {
 pub fn purge_runtime() -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
-    let cache_dir = paths.cache_dir();
-    if !cache_dir.exists() {
-        return Ok(());
-    }
-    ensure_runtime(&paths)?;
-    if loaded_ssh_fingerprints(&paths, &config).is_ok() {
-        clear_ssh_agent(&paths, &config)?;
-    }
-    for entry in fs::read_dir(&cache_dir).context("enumerate dev-auth runtime cache")? {
-        let entry = entry.context("read dev-auth runtime cache entry")?;
-        let path = entry.path();
-        let extension = path.extension().and_then(|value| value.to_str());
-        if extension == Some("lock") {
-            let key = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .context("runtime lock has an invalid cache key")?;
-            match cache_entry(&config.credential_store, key)?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(error) => return Err(error).context("purge native installation-token cache"),
-            }
-            fs::remove_file(&path).context("remove installation-token cache lock")?;
-        } else {
-            bail!("unknown file in dev-auth runtime cache");
+    with_cache_purge_lock(&paths, || {
+        if loaded_ssh_fingerprints(&paths, &config).is_ok() {
+            clear_ssh_agent(&paths, &config)?;
         }
-    }
-    Ok(())
+        for entry in fs::read_dir(paths.cache_dir()).context("enumerate dev-auth runtime cache")? {
+            let entry = entry.context("read dev-auth runtime cache entry")?;
+            let path = entry.path();
+            let extension = path.extension().and_then(|value| value.to_str());
+            if extension == Some("lock") {
+                let key = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .context("runtime lock has an invalid cache key")?;
+                match cache_entry(&config.credential_store, key)?.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(error) => {
+                        return Err(error).context("purge native installation-token cache")
+                    }
+                }
+            } else {
+                bail!("unknown file in dev-auth runtime cache");
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1480,6 +2107,10 @@ mod tests {
     use ssh_key::private::{Ed25519Keypair, KeypairData};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     fn config_with_profiles(profiles: BTreeMap<String, SshProfile>) -> Config {
         Config {
@@ -1523,15 +2154,191 @@ mod tests {
     #[test]
     fn dynamic_cache_scope_is_case_insensitive_and_owner_specific() {
         let permissions = BTreeMap::from([("contents".into(), "write".into())]);
-        let expected = dynamic_cache_key("ExampleOrg", "Sample-Repo", &permissions).unwrap();
+        let expected = dynamic_cache_key(42, "ExampleOrg", "Sample-Repo", &permissions).unwrap();
         assert_eq!(
             expected,
-            dynamic_cache_key("exampleorg", "sample-repo", &permissions).unwrap()
+            dynamic_cache_key(42, "exampleorg", "sample-repo", &permissions).unwrap()
         );
         assert_ne!(
             expected,
-            dynamic_cache_key("AnotherOrg", "sample-repo", &permissions).unwrap()
+            dynamic_cache_key(42, "AnotherOrg", "sample-repo", &permissions).unwrap()
         );
+        assert_ne!(
+            expected,
+            dynamic_cache_key(99, "ExampleOrg", "Sample-Repo", &permissions).unwrap()
+        );
+    }
+
+    #[test]
+    fn gh_child_environment_replaces_ambient_execution_and_ui_surfaces() {
+        let paths = RuntimePaths {
+            config: PathBuf::from("/private/config.toml"),
+            runtime: PathBuf::from("/private/runtime"),
+        };
+        let input = BTreeMap::from([
+            ("HOME".into(), "/home/example".into()),
+            ("PATH".into(), "/attacker/bin".into()),
+            ("GH_TOKEN".into(), "human-token".into()),
+            ("GITHUB_TOKEN".into(), "human-token".into()),
+            ("GH_EDITOR".into(), "/attacker/editor".into()),
+            ("BROWSER".into(), "/attacker/browser".into()),
+            ("PAGER".into(), "/attacker/pager".into()),
+        ]);
+        let environment = isolated_gh_environment(
+            &input,
+            &paths,
+            &SecretString::new("installation-token".into()),
+            "example",
+            "repository",
+            "/trusted/bin/git",
+        );
+        assert_eq!(
+            environment["HOME"],
+            paths.gh_home_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["XDG_CONFIG_HOME"],
+            paths.gh_config_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["XDG_CACHE_HOME"],
+            paths.gh_cache_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["XDG_DATA_HOME"],
+            paths.gh_data_dir().display().to_string()
+        );
+        assert_eq!(
+            environment["PATH"],
+            paths.gh_child_bin_dir().display().to_string()
+        );
+        assert_eq!(environment["GH_TOKEN"], "installation-token");
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+        assert_eq!(environment["GH_EDITOR"], "false");
+        assert_eq!(environment["BROWSER"], "false");
+        assert_eq!(environment["PAGER"], "cat");
+        assert_eq!(environment["DEV_AUTH_GH_CHILD"], "1");
+        assert_eq!(environment["DEV_AUTH_GH_GIT"], "/trusted/bin/git");
+        assert!(!environment.values().any(|value| value.contains("attacker")));
+        assert!(!environment.values().any(|value| value == "/home/example"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_store_accepts_only_the_current_user_session_bus() {
+        let run_user_root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let runtime = run_user_root.path().join(uid.to_string());
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let bus = runtime.join("bus");
+        let _listener = StdUnixListener::bind(&bus).unwrap();
+        let expected_address = format!("unix:path={}", bus.display());
+
+        validate_secret_service_session_at(
+            &BTreeMap::from([
+                ("XDG_RUNTIME_DIR".into(), runtime.display().to_string()),
+                ("DBUS_SESSION_BUS_ADDRESS".into(), expected_address.clone()),
+            ]),
+            run_user_root.path(),
+            uid,
+        )
+        .unwrap();
+        validate_secret_service_session_at(&BTreeMap::new(), run_user_root.path(), uid).unwrap();
+
+        for environment in [
+            BTreeMap::from([(
+                "XDG_RUNTIME_DIR".into(),
+                run_user_root.path().display().to_string(),
+            )]),
+            BTreeMap::from([(
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/tmp/attacker-bus".into(),
+            )]),
+        ] {
+            assert!(
+                validate_secret_service_session_at(&environment, run_user_root.path(), uid,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_store_rejects_a_non_socket_session_bus() {
+        let run_user_root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let runtime = run_user_root.path().join(uid.to_string());
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(runtime.join("bus"), b"not a socket").unwrap();
+
+        let error = validate_secret_service_session_at(&BTreeMap::new(), run_user_root.path(), uid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("current-user Unix socket"));
+    }
+
+    #[test]
+    fn cache_erase_waits_for_refresh_and_cannot_be_undone_by_it() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime"),
+        };
+        ensure_runtime(&paths).unwrap();
+        let marker = root.path().join("cache-value");
+        let refresh_paths = RuntimePaths {
+            config: paths.config.clone(),
+            runtime: paths.runtime.clone(),
+        };
+        let refresh_marker = marker.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresh = thread::spawn(move || {
+            with_cache_scope_lock(&refresh_paths, "scope", || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fs::write(refresh_marker, b"refreshed").unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        let competing = private_open(&paths.cache_dir().join("scope.lock")).unwrap();
+        assert!(competing.try_lock_exclusive().is_err());
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap();
+
+        with_cache_scope_lock(&paths, "scope", || {
+            fs::remove_file(&marker).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn purge_excludes_in_flight_refreshes_until_their_writes_finish() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime"),
+        };
+        ensure_runtime(&paths).unwrap();
+        let lifecycle = cache_lifecycle_lock(&paths).unwrap();
+        lifecycle.lock_shared().unwrap();
+
+        let competing = cache_lifecycle_lock(&paths).unwrap();
+        assert!(competing.try_lock_exclusive().is_err());
+        FileExt::unlock(&lifecycle).unwrap();
+
+        with_cache_purge_lock(&paths, || Ok(())).unwrap();
     }
 
     #[test]
@@ -1754,6 +2561,36 @@ mod tests {
             .block_on(agent.request_identities())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn agent_public_key_rows_are_revalidated_and_canonicalized() {
+        let private_key = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[43; 32])),
+            "untrusted agent comment",
+        )
+        .unwrap();
+        let public_key = private_key.public_key();
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let rows =
+            parse_agent_public_keys(&format!("{}\n", public_key.to_openssh().unwrap())).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[&fingerprint],
+            PublicKey::new(
+                public_key.key_data().clone(),
+                format!("dev-auth:{fingerprint}")
+            )
+            .to_openssh()
+            .unwrap()
+        );
+        let duplicate = format!(
+            "{}\n{}\n",
+            public_key.to_openssh().unwrap(),
+            public_key.to_openssh().unwrap()
+        );
+        assert!(parse_agent_public_keys(&duplicate).is_err());
+        assert!(parse_agent_public_keys("not-a-public-key\n").is_err());
     }
 
     #[test]

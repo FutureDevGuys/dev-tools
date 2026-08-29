@@ -1,0 +1,43 @@
+# Copy this file to the native per-user dev-auth configuration directory and
+# replace every example value. Keep the resulting file private to its owner.
+version = 1
+
+[credential_store]
+service = "dev-auth"
+account = "service-account-token"
+
+# All credential-bearing executables must use exact native absolute paths.
+# These examples are appropriate for a typical Linux or WSL installation.
+# Native Windows uses drive-qualified paths such as C:\Program Files\...\op.exe.
+[programs]
+op = "/usr/bin/op"
+gh = "/usr/bin/gh"
+git = "/usr/bin/git"
+ssh_add = "/usr/bin/ssh-add"
+ssh_keygen = "/usr/bin/ssh-keygen"
+
+# Dynamic discovery asks GitHub which installation owns the requested
+# repository. The App installation remains the repository authority.
+[github]
+app_id = 12345
+private_key_ref = "op://Automation Example/contributor-app/private-key"
+discover_installations = true
+permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
+
+# Execution profiles are optional. Each profile admits exact executables and
+# exact 1Password fields; dev-auth has no arbitrary secret-read command.
+[profiles.terraform-plan]
+executables = ["/usr/bin/terraform"]
+environment = { TF_TOKEN_app_terraform_io = "op://Automation Example/terraform-plan/token" }
+
+# SSH profiles contain exactly one authentication key and one signing key.
+# Fingerprints are public SHA-256 fingerprints, never private key material.
+[[ssh_profiles.automation.keys]]
+purpose = "authentication"
+private_key_ref = "op://Automation Example/host-authentication/private-key"
+fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[[ssh_profiles.automation.keys]]
+purpose = "signing"
+private_key_ref = "op://Automation Example/commit-signing/private-key"
+fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"

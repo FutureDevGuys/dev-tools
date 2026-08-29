@@ -138,16 +138,39 @@ fn cache_refreshes_before_expiry_and_never_accepts_wrong_scope() {
     let entry = CacheEntry::new_for_test(
         SecretString::new("token".into()),
         10_000,
+        42,
         101,
         "exampleorg".into(),
         "sample-repo".into(),
         BTreeMap::from([("contents".into(), "write".into())]),
     );
-    assert!(entry.is_usable_at(9_699, 101, "exampleorg", "sample-repo", &entry.permissions));
-    assert!(!entry.is_usable_at(9_700, 101, "exampleorg", "sample-repo", &entry.permissions));
-    assert!(!entry.is_usable_at(1, 999, "exampleorg", "sample-repo", &entry.permissions));
-    assert!(!entry.is_usable_at(1, 101, "another-owner", "sample-repo", &entry.permissions));
-    assert!(!entry.is_usable_at(1, 101, "exampleorg", "syscfg", &entry.permissions));
+    assert!(entry.is_usable_at(
+        9_699,
+        42,
+        101,
+        "exampleorg",
+        "sample-repo",
+        &entry.permissions
+    ));
+    assert!(!entry.is_usable_at(
+        9_700,
+        42,
+        101,
+        "exampleorg",
+        "sample-repo",
+        &entry.permissions
+    ));
+    assert!(!entry.is_usable_at(1, 99, 101, "exampleorg", "sample-repo", &entry.permissions));
+    assert!(!entry.is_usable_at(1, 42, 999, "exampleorg", "sample-repo", &entry.permissions));
+    assert!(!entry.is_usable_at(
+        1,
+        42,
+        101,
+        "another-owner",
+        "sample-repo",
+        &entry.permissions
+    ));
+    assert!(!entry.is_usable_at(1, 42, 101, "exampleorg", "syscfg", &entry.permissions));
 }
 
 #[test]
@@ -228,6 +251,15 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         ["/usr/bin/terraform"]
     );
     assert_eq!(config.ssh_profiles["automation"].keys.len(), 2);
+    assert_eq!(
+        config.declared_secret_references(),
+        BTreeSet::from([
+            "op://Any Vault/contributor-app/private-key".to_owned(),
+            "op://Machine Credentials/workstation-signing/private-key".to_owned(),
+            "op://Machine Credentials/workstation-ssh/private-key".to_owned(),
+            "op://Team Vault/hcp-plan/token".to_owned(),
+        ])
+    );
 
     for invalid in [
         br#"version = 1
@@ -269,6 +301,16 @@ repositories = ["sample-repo"]
     ] {
         assert!(parse_config(invalid).is_err());
     }
+}
+
+#[test]
+fn published_example_is_complete_and_valid() {
+    let config = parse_config(include_bytes!("../config.example.toml")).unwrap();
+    assert!(config.github.discover_installations);
+    assert!(config.github.installations.is_empty());
+    assert_eq!(config.profiles.len(), 1);
+    assert_eq!(config.ssh_profiles.len(), 1);
+    assert_eq!(config.declared_secret_references().len(), 4);
 }
 
 #[test]
@@ -455,6 +497,9 @@ fn gh_surface_is_repository_scoped_and_excludes_administration() {
         vec!["variable", "set"],
         vec!["issue", "create"],
         vec!["status"],
+        vec!["repo", "view", "--web"],
+        vec!["pr", "view", "-w"],
+        vec!["pr", "create", "--editor"],
     ] {
         assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
     }

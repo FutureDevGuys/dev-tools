@@ -8,8 +8,9 @@ mod runtime;
 
 pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,
-    github_token_for_repository, purge_runtime, run_agent, run_gh, run_ssh_keygen, runtime_status,
-    ssh_load, RuntimeStatus,
+    github_token_for_repository, purge_runtime, run_agent, run_gh, run_gh_git_child,
+    run_ssh_keygen, runtime_status, ssh_load, ssh_public, validate_configuration, RuntimeStatus,
+    ValidationReport,
 };
 
 const MAX_CREDENTIAL_REQUEST_BYTES: usize = 64 * 1024;
@@ -227,6 +228,24 @@ pub struct Config {
     pub ssh_profiles: BTreeMap<String, SshProfile>,
 }
 
+impl Config {
+    pub fn declared_secret_references(&self) -> BTreeSet<String> {
+        std::iter::once(&self.github.private_key_ref)
+            .chain(
+                self.profiles
+                    .values()
+                    .flat_map(|profile| profile.environment.values()),
+            )
+            .chain(
+                self.ssh_profiles
+                    .values()
+                    .flat_map(|profile| profile.keys.iter().map(|key| &key.private_key_ref)),
+            )
+            .cloned()
+            .collect()
+    }
+}
+
 pub fn parse_config(input: &[u8]) -> Result<Config> {
     let text = std::str::from_utf8(input).context("configuration is not UTF-8")?;
     let config: Config = toml::from_str(text).context("configuration is not valid TOML")?;
@@ -386,7 +405,7 @@ fn validate_public_identifier(value: &str, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_program(value: &str, description: &str) -> Result<()> {
+pub(crate) fn validate_program(value: &str, description: &str) -> Result<()> {
     let bytes = value.as_bytes();
     let windows_absolute = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -440,6 +459,7 @@ impl GitHubProfile {
 pub struct CacheEntry {
     token: SecretString,
     expires_at: i64,
+    app_id: u64,
     installation_id: u64,
     owner: String,
     repository: String,
@@ -452,6 +472,7 @@ impl fmt::Debug for CacheEntry {
             .debug_struct("CacheEntry")
             .field("token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
+            .field("app_id", &self.app_id)
             .field("installation_id", &self.installation_id)
             .field("owner", &self.owner)
             .field("repository", &self.repository)
@@ -464,6 +485,7 @@ impl CacheEntry {
     pub fn new(
         token: SecretString,
         expires_at: i64,
+        app_id: u64,
         installation_id: u64,
         owner: String,
         repository: String,
@@ -472,6 +494,7 @@ impl CacheEntry {
         Self {
             token,
             expires_at,
+            app_id,
             installation_id,
             owner,
             repository,
@@ -482,6 +505,7 @@ impl CacheEntry {
     pub fn new_for_test(
         token: SecretString,
         expires_at: i64,
+        app_id: u64,
         installation_id: u64,
         owner: String,
         repository: String,
@@ -490,6 +514,7 @@ impl CacheEntry {
         Self {
             token,
             expires_at,
+            app_id,
             installation_id,
             owner,
             repository,
@@ -500,12 +525,14 @@ impl CacheEntry {
     pub fn is_usable_at(
         &self,
         now: i64,
+        app_id: u64,
         installation_id: u64,
         owner: &str,
         repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
-        self.installation_id == installation_id
+        self.app_id == app_id
+            && self.installation_id == installation_id
             && self.owner == owner
             && self.repository == repository
             && self.permissions == *permissions
@@ -515,11 +542,13 @@ impl CacheEntry {
     pub fn is_usable_for_repository_at(
         &self,
         now: i64,
+        app_id: u64,
         owner: &str,
         repository: &str,
         permissions: &BTreeMap<String, String>,
     ) -> bool {
-        self.owner == owner
+        self.app_id == app_id
+            && self.owner == owner
             && self.repository == repository
             && self.permissions == *permissions
             && now < self.expires_at - TOKEN_REFRESH_MARGIN_SECONDS
@@ -535,6 +564,10 @@ impl CacheEntry {
 
     pub fn installation_id(&self) -> u64 {
         self.installation_id
+    }
+
+    pub fn app_id(&self) -> u64 {
+        self.app_id
     }
 
     pub fn repository(&self) -> &str {
@@ -632,6 +665,18 @@ pub fn parse_github_repository(value: &str) -> Result<(String, String)> {
 }
 
 pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
+    for argument in arguments {
+        let argument = argument.as_ref();
+        if matches!(
+            argument,
+            "-w" | "--web" | "--editor" | "--browser" | "--help"
+        ) || argument.starts_with("--web=")
+            || argument.starts_with("--editor=")
+            || argument.starts_with("--browser=")
+        {
+            bail!("gh external editor and browser operations are not admitted");
+        }
+    }
     let command = arguments
         .first()
         .map(AsRef::as_ref)

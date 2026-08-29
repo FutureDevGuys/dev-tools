@@ -8,10 +8,10 @@ The local validation surface is:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny check
-python -m pytest sync-configs/tests
+python -m pytest tests sync-configs/tests
 python sync-configs/scripts/build_zipapp.py
 ```
 
