@@ -3073,6 +3073,30 @@ fn stable_repository_authority_binding(
 }
 
 #[cfg(target_os = "linux")]
+fn stabilize_commit_index(program: &str, program_guard: &ProgramGuard, cwd: &Path) -> Result<()> {
+    let mut command = guarded_command(program, program_guard)?;
+    let output = command
+        .arg("write-tree")
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_probe_environment(&BTreeMap::new()))
+        .stdin(Stdio::null())
+        .output()
+        .context("stabilize managed Git commit index")?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("managed Git commit index cannot be stabilized safely");
+    }
+    let tree = std::str::from_utf8(&output.stdout)
+        .context("managed Git commit tree identifier is not UTF-8")?
+        .strip_suffix('\n')
+        .context("managed Git commit tree identifier has no terminator")?;
+    if !matches!(tree.len(), 40 | 64) || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("managed Git commit tree identifier is malformed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn stable_clone_authority_binding(
     destination: &Path,
     request: GitAuthorityRequest<'_>,
@@ -4090,6 +4114,10 @@ where
         .git
         .as_ref()
         .context("Git workspace policy is not declared")?;
+    #[cfg(target_os = "linux")]
+    if capability == crate::GitCapability::Signing && command_name == "commit" {
+        stabilize_commit_index(&config.programs.git, &program_guard, cwd)?;
+    }
     #[cfg(target_os = "linux")]
     let authority = match capability {
         crate::GitCapability::NoAuthority => Some(stable_repository_authority_binding(
@@ -5621,6 +5649,36 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             "ambiguous-short-name".into(),
         ])
         .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_index_is_stabilized_before_private_signing_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::create_dir_all(repository.join("nested/deep")).unwrap();
+        fs::write(repository.join("nested/deep/file"), b"payload\n").unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["add", "--", "nested/deep/file"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let index = repository.join(".git/index");
+        let before = fs::read(&index).unwrap();
+
+        stabilize_commit_index("/usr/bin/git", &test_git_guard(), &repository).unwrap();
+        let stabilized = fs::read(&index).unwrap();
+        assert_ne!(before, stabilized);
+        stabilize_commit_index("/usr/bin/git", &test_git_guard(), &repository).unwrap();
+        assert_eq!(fs::read(index).unwrap(), stabilized);
     }
 
     #[cfg(target_os = "linux")]
