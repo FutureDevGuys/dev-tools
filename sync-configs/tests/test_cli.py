@@ -28,16 +28,58 @@ def test_interactive_hook_progress_is_value_free_and_noninteractive_output_stays
         mode="copy",
         scope_label="Skills / Agent Plugins",
     )
+    widths = cli.PrintWidths(
+        scope=len("Skills / Agent Plugins"),
+        name=len("agent_plugin_installer"),
+    )
     terminal = TtyBuffer()
-    cli.emit_script_progress(entry, "post_script", stream=terminal)
+    cli.emit_script_progress(
+        entry,
+        "post_script",
+        use_color=True,
+        widths=widths,
+        stream=terminal,
+    )
     assert terminal.getvalue() == (
-        "[sync-configs] running post_script: "
-        "Skills / Agent Plugins / agent_plugin_installer\n"
+        "\x1b[34m[info] \x1b[0m "
+        "Skills / Agent Plugins agent_plugin_installer running post_script\n"
     )
 
     captured = io.StringIO()
-    cli.emit_script_progress(entry, "post_script", stream=captured)
+    cli.emit_script_progress(
+        entry,
+        "post_script",
+        use_color=True,
+        widths=widths,
+        stream=captured,
+    )
     assert captured.getvalue() == ""
+
+
+def test_interactive_hook_progress_respects_no_color_and_aligned_widths(
+    tmp_path: Path,
+) -> None:
+    entry = cli.Entry(
+        name="short",
+        source=tmp_path / "source",
+        target=tmp_path / "target",
+        mode="copy",
+        scope_label="CLI / Hooks",
+    )
+    terminal = TtyBuffer()
+
+    cli.emit_script_progress(
+        entry,
+        "pre_script",
+        use_color=False,
+        widths=cli.PrintWidths(scope=14, name=8),
+        stream=terminal,
+    )
+
+    assert terminal.getvalue() == (
+        "[info]  CLI / Hooks    short    running pre_script\n"
+    )
+    assert "\x1b[" not in terminal.getvalue()
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:

@@ -446,19 +446,24 @@ def emit_script_progress(
     entry: Entry,
     phase: str,
     *,
+    use_color: bool,
+    widths: PrintWidths,
     stream=None,
 ) -> None:
-    """Identify an active hook on interactive terminals without exposing its command."""
+    """Identify an active hook using the normal aligned status columns."""
     if phase not in {"pre_script", "post_script"}:
         raise ConfigError(f"unsupported script phase: {phase}")
     output = sys.stderr if stream is None else stream
     if not getattr(output, "isatty", lambda: False)():
         return
-    print(
-        f"[sync-configs] running {phase}: {entry.scope_label} / {entry.name}",
-        file=output,
-        flush=True,
+    line = format_status_line(
+        "info",
+        f"running {phase}",
+        use_color,
+        entry=entry,
+        widths=widths,
     )
+    print(line, file=output, flush=True)
 
 
 @dataclass(frozen=True)
@@ -2585,6 +2590,16 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
     # Collect entries with post-scripts for later execution.
     post_script_entries: list[Entry] = []
     entries_to_expand: list[Entry] = []
+    progress_widths = PrintWidths(
+        scope=max(
+            (len(entry.scope_label) for entry in [*entries, *override_entries]),
+            default=0,
+        ),
+        name=max(
+            (len(entry.name) for entry in [*entries, *override_entries]),
+            default=0,
+        ),
+    )
 
     for entry in entries:
         if entry.pre_script:
@@ -2595,7 +2610,12 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
                     entry=entry,
                 ))
             else:
-                emit_script_progress(entry, "pre_script")
+                emit_script_progress(
+                    entry,
+                    "pre_script",
+                    use_color=use_color,
+                    widths=progress_widths,
+                )
                 result = run_entry_script(
                     entry.pre_script,
                     config_dir,
@@ -2709,7 +2729,12 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             ))
         else:
             assert entry.post_script is not None
-            emit_script_progress(entry, "post_script")
+            emit_script_progress(
+                entry,
+                "post_script",
+                use_color=use_color,
+                widths=widths,
+            )
             result = run_entry_script(
                 entry.post_script,
                 config_dir,
