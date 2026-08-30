@@ -13,6 +13,15 @@ fn private_runtime() -> TempDir {
     directory
 }
 
+fn private_program_root() -> TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix("dev-auth-cli-programs-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
 fn credential_helper(operation: &str, input: &str) -> std::process::Output {
     let directory = tempfile::tempdir().unwrap();
     let helper = directory.path().join("git-credential-dev-auth");
@@ -92,6 +101,7 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
         "agent-endpoint",
         "ssh-load",
         "ssh-public",
+        "workspace-status",
         "status",
         "purge",
     ] {
@@ -287,7 +297,7 @@ permissions = { actions = "read", checks = "read", contents = "write", metadata 
 
 #[test]
 fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
-    let home = tempfile::tempdir().unwrap();
+    let home = private_program_root();
     let gh = home.path().join("gh");
     fs::write(
         &gh,
@@ -418,8 +428,10 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     let home = tempfile::tempdir().unwrap();
     let runtime = private_runtime();
     for frontend in [
+        "git-dev-auth",
         "gh-dev-auth",
         "ssh-keygen-dev-auth",
+        "git-dev-auth.exe",
         "gh-dev-auth.exe",
         "ssh-keygen-dev-auth.exe",
     ] {
@@ -445,7 +457,7 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
 
 #[test]
 fn internal_gh_children_do_not_forward_the_installation_token_to_git() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_program_root();
     let home = tempfile::tempdir().unwrap();
     let git_frontend = directory.path().join("git");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
@@ -665,7 +677,7 @@ fn windows_credential_helper_name_preserves_fail_closed_git_output() {
 
 #[test]
 fn git_verification_does_not_require_the_secret_runtime_or_ssh_agent() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_program_root();
     let helper = directory.path().join("ssh-keygen-dev-auth");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &helper).unwrap();
     let verifier = directory.path().join("ssh-keygen");

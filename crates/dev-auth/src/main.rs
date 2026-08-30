@@ -5,7 +5,7 @@ use zeroize::Zeroize;
 const REQUEST_LIMIT: u64 = 64 * 1024;
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status\n  dev-auth purge"
+    "Usage:\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status\n  dev-auth purge"
 }
 
 fn run() -> Result<i32> {
@@ -70,6 +70,21 @@ fn run() -> Result<i32> {
                 report.declared_secret_references
             );
             Ok(0)
+        }
+        "workspace-status" => {
+            if arguments.next().is_some() {
+                bail!("workspace-status accepts no arguments");
+            }
+            match dev_auth::workspace_status()? {
+                dev_auth::WorkspaceContext::Managed => {
+                    println!("managed");
+                    Ok(0)
+                }
+                dev_auth::WorkspaceContext::Unmanaged => {
+                    println!("unmanaged");
+                    Ok(3)
+                }
+            }
         }
         "purge" => {
             if arguments.next().is_some() {
@@ -177,6 +192,12 @@ fn run_gh_frontend() -> Result<i32> {
     Ok(status.code().unwrap_or(128))
 }
 
+fn run_git_frontend() -> Result<i32> {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let status = dev_auth::run_git(&arguments)?;
+    Ok(status.code().unwrap_or(128))
+}
+
 fn run_ssh_keygen_frontend() -> Result<i32> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let status = dev_auth::run_ssh_keygen(&arguments)?;
@@ -213,13 +234,17 @@ fn main() {
         .strip_suffix(".exe")
         .unwrap_or(&normalized_program);
     let gh_child = std::env::var("DEV_AUTH_GH_CHILD").as_deref() == Ok("1");
-    let result = match (frontend, gh_child) {
-        ("git", true) => run_gh_git_child_frontend(),
-        ("cat", true) => run_gh_pager_frontend(),
-        ("false", true) => Ok(1),
-        ("git-credential-dev-auth", _) => run_credential_frontend(),
-        ("gh-dev-auth", _) => run_gh_frontend(),
-        ("ssh-keygen-dev-auth", _) => run_ssh_keygen_frontend(),
+    let git_child = std::env::var("DEV_AUTH_GIT_CHILD").as_deref() == Ok("1");
+    let result = match (frontend, gh_child, git_child) {
+        ("git", true, _) => run_gh_git_child_frontend(),
+        ("cat", true, _) => run_gh_pager_frontend(),
+        ("false", true, _) => Ok(1),
+        ("cat", _, true) => run_gh_pager_frontend(),
+        ("false", _, true) => Ok(1),
+        ("git-dev-auth", _, _) => run_git_frontend(),
+        ("git-credential-dev-auth", _, _) => run_credential_frontend(),
+        ("gh-dev-auth", _, _) => run_gh_frontend(),
+        ("ssh-keygen-dev-auth", _, _) => run_ssh_keygen_frontend(),
         _ => run(),
     };
     match result {

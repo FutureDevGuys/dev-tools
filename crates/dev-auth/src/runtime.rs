@@ -21,14 +21,20 @@ use ssh_key::private::{Ed25519Keypair, KeypairData};
 use ssh_key::{Algorithm as SshAlgorithm, HashAlg, PrivateKey, PublicKey, Signature};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::{OsStr, OsString};
 #[cfg(not(windows))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
+use std::ops::{Deref, DerefMut};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, RwLock};
@@ -43,6 +49,15 @@ use tokio::net::UnixListener;
 #[cfg(windows)]
 #[path = "windows_security.rs"]
 mod windows_security;
+
+#[path = "git_runtime.rs"]
+mod git_runtime;
+
+use git_runtime::{
+    frontend_runtime_and_config, validate_bound_git_credential_authority,
+    validate_bound_git_signing_authority, validate_git_version,
+};
+pub use git_runtime::{run_git, workspace_status};
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
@@ -73,6 +88,12 @@ pub struct ValidationReport {
     pub declared_secret_references: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceContext {
+    Managed,
+    Unmanaged,
+}
+
 #[derive(Debug)]
 struct RuntimePaths {
     config: PathBuf,
@@ -81,6 +102,7 @@ struct RuntimePaths {
 
 impl RuntimePaths {
     fn discover() -> Result<Self> {
+        let config = discover_config_path()?;
         let project = ProjectDirs::from("", "", "dev-auth")
             .context("the operating system has no user configuration directory")?;
         let base = BaseDirs::new().context("the operating system has no user home directory")?;
@@ -91,7 +113,7 @@ impl RuntimePaths {
             project.cache_dir(),
         );
         Ok(Self {
-            config: project.config_dir().join("config.toml"),
+            config,
             runtime: runtime_root,
         })
     }
@@ -177,6 +199,12 @@ impl RuntimePaths {
     }
 }
 
+fn discover_config_path() -> Result<PathBuf> {
+    let project = ProjectDirs::from("", "", "dev-auth")
+        .context("the operating system has no user configuration directory")?;
+    Ok(project.config_dir().join("config.toml"))
+}
+
 fn select_runtime_root(
     environment_runtime: Option<&Path>,
     login_runtime: Option<&Path>,
@@ -209,12 +237,19 @@ fn secure_login_runtime_dir() -> Option<PathBuf> {
 }
 
 fn load_config(paths: &RuntimePaths) -> Result<Config> {
-    let parent = paths
-        .config
+    load_config_at(&paths.config)
+}
+
+fn load_config_at(path: &Path) -> Result<Config> {
+    load_config_snapshot_at(path).map(|(config, _)| config)
+}
+
+fn load_config_snapshot_at(path: &Path) -> Result<(Config, String)> {
+    let parent = path
         .parent()
         .context("dev-auth configuration has no parent directory")?;
     validate_private_directory(parent, "dev-auth configuration directory")?;
-    let file = private_read(&paths.config, "dev-auth configuration")?;
+    let file = private_read(path, "dev-auth configuration")?;
     let mut bytes = Vec::new();
     file.take(CONFIG_LIMIT + 1)
         .read_to_end(&mut bytes)
@@ -225,7 +260,9 @@ fn load_config(paths: &RuntimePaths) -> Result<Config> {
     let config = parse_config(&bytes)?;
     #[cfg(windows)]
     validate_configured_windows_programs(&config)?;
-    Ok(config)
+    let digest = Sha256::digest(&bytes);
+    let digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok((config, digest))
 }
 
 #[cfg(windows)]
@@ -252,8 +289,35 @@ fn validate_configured_windows_programs(config: &Config) -> Result<()> {
 
 #[cfg(windows)]
 type ProgramGuard = windows_security::ProgramGuard;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+struct ProgramGuard {
+    executable: OwnedFd,
+    execution_path: PathBuf,
+    _ancestor_directories: Vec<OwnedFd>,
+    _proc_fd_directory: OwnedFd,
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 struct ProgramGuard;
+
+struct GuardedCommand<'a> {
+    command: Command,
+    _guard: &'a ProgramGuard,
+}
+
+impl Deref for GuardedCommand<'_> {
+    type Target = Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for GuardedCommand<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
 
 #[cfg(windows)]
 fn program_guard(program: &str, description: &str) -> Result<ProgramGuard> {
@@ -261,9 +325,229 @@ fn program_guard(program: &str, description: &str) -> Result<ProgramGuard> {
         .with_context(|| format!("lock configured {description} program at {program}"))
 }
 
-#[cfg(not(windows))]
-fn program_guard(_program: &str, _description: &str) -> Result<ProgramGuard> {
-    Ok(ProgramGuard)
+#[cfg(target_os = "linux")]
+fn program_guard(program: &str, description: &str) -> Result<ProgramGuard> {
+    crate::validate_program(program, description)?;
+    lock_linux_program(Path::new(program), description)
+        .with_context(|| format!("lock configured {description} program at {program}"))
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn program_guard(program: &str, description: &str) -> Result<ProgramGuard> {
+    crate::validate_program(program, description)?;
+    bail!("configured program identity locking is not supported on this operating system")
+}
+
+#[cfg(windows)]
+fn guarded_command<'a>(program: &str, guard: &'a ProgramGuard) -> Result<GuardedCommand<'a>> {
+    Ok(GuardedCommand {
+        command: Command::new(program),
+        _guard: guard,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn guarded_command<'a>(program: &str, guard: &'a ProgramGuard) -> Result<GuardedCommand<'a>> {
+    let descriptor = guard.executable.as_raw_fd();
+    let mut command = Command::new(&guard.execution_path);
+    command.arg0(program);
+    // SAFETY: GuardedCommand borrows ProgramGuard, so the descriptor remains open
+    // through spawn and child completion. After fork the child owns the same file
+    // table entry. Clearing only FD_CLOEXEC with fcntl is async-signal-safe and lets
+    // an interpreter reopen /proc/self/fd/N without a pathname lookup of the source.
+    unsafe {
+        command.pre_exec(move || {
+            // SAFETY: the ProgramGuard borrow described above keeps this exact raw
+            // descriptor valid until Command has completed its pre-exec callback.
+            let descriptor = BorrowedFd::borrow_raw(descriptor);
+            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
+                .map_err(io::Error::from)
+        });
+    }
+    Ok(GuardedCommand {
+        command,
+        _guard: guard,
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn guarded_command<'a>(_program: &str, _guard: &'a ProgramGuard) -> Result<GuardedCommand<'a>> {
+    bail!("configured program identity execution is not supported on this operating system")
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxProgramIdentity {
+    effective_user: u32,
+    effective_groups: BTreeSet<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProgramIdentity {
+    fn current() -> Result<Self> {
+        let mut effective_groups: BTreeSet<u32> = nix::unistd::getgroups()
+            .context("read effective user's supplementary groups")?
+            .into_iter()
+            .map(|group| group.as_raw())
+            .collect();
+        effective_groups.insert(nix::unistd::getegid().as_raw());
+        Ok(Self {
+            effective_user: rustix::process::geteuid().as_raw(),
+            effective_groups,
+        })
+    }
+
+    fn can_execute(&self, owner: u32, group: u32, mode: u32) -> bool {
+        if self.effective_user == 0 {
+            return mode & 0o111 != 0;
+        }
+        if owner == self.effective_user {
+            mode & 0o100 != 0
+        } else if self.effective_groups.contains(&group) {
+            mode & 0o010 != 0
+        } else {
+            mode & 0o001 != 0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_program_component(
+    metadata: &rustix::fs::Stat,
+    expected_type: rustix::fs::FileType,
+    identity: &LinuxProgramIdentity,
+    description: &str,
+) -> Result<()> {
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != expected_type {
+        bail!("{description} has an unsafe filesystem object type");
+    }
+    if metadata.st_uid != 0 && metadata.st_uid != identity.effective_user {
+        bail!("{description} is not owned by root or the effective user");
+    }
+    if metadata.st_mode & 0o022 != 0 {
+        bail!("{description} is writable by group or other users");
+    }
+    if !identity.can_execute(metadata.st_uid, metadata.st_gid, metadata.st_mode) {
+        bail!("{description} is not executable by the effective user");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_program_filesystem_is_local(filesystem_type: u64) -> bool {
+    // Fail closed for known network, host-shared, and userspace-projected filesystems.
+    // Native Linux/WSL filesystems and container overlay filesystems remain admissible.
+    !matches!(
+        filesystem_type,
+        0x0000_6969 // NFS
+            | 0xff53_4d42 // CIFS
+            | 0x0000_517b // SMB
+            | 0x0102_1997 // 9P / WSL host mounts
+            | 0x7375_7245 // CODA
+            | 0x5346_414f // AFS
+            | 0x00c3_6400 // Ceph
+            | 0x0000_564c // NCP
+            | 0x6573_5546 // FUSE
+            | 0x786f_4256 // VirtualBox shared folders
+            | 0xbacb_acbc // VMware shared folders
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn lock_linux_program(path: &Path, description: &str) -> Result<ProgramGuard> {
+    let identity = LinuxProgramIdentity::current()?;
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
+        bail!("{description} must use an absolute native Linux path");
+    }
+    let names: Vec<OsString> = components
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name.to_os_string()),
+            _ => bail!("{description} path contains a non-canonical component"),
+        })
+        .collect::<Result<_>>()?;
+    let (file_name, directory_names) = names
+        .split_last()
+        .context("configured program path has no executable name")?;
+
+    let directory_flags = rustix::fs::OFlags::PATH
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    let root = rustix::fs::open("/", directory_flags, rustix::fs::Mode::empty())
+        .context("open configured program filesystem root without following links")?;
+    validate_linux_program_component(
+        &rustix::fs::fstat(&root).context("inspect configured program filesystem root")?,
+        rustix::fs::FileType::Directory,
+        &identity,
+        "configured program filesystem root",
+    )?;
+    let mut ancestor_directories = vec![root];
+    for name in directory_names {
+        let directory = rustix::fs::openat(
+            ancestor_directories
+                .last()
+                .context("configured program ancestor chain is empty")?,
+            name,
+            directory_flags,
+            rustix::fs::Mode::empty(),
+        )
+        .with_context(|| format!("open {description} ancestor without following links"))?;
+        validate_linux_program_component(
+            &rustix::fs::fstat(&directory)
+                .with_context(|| format!("inspect {description} ancestor"))?,
+            rustix::fs::FileType::Directory,
+            &identity,
+            "configured program ancestor",
+        )?;
+        ancestor_directories.push(directory);
+    }
+
+    let executable = rustix::fs::openat(
+        ancestor_directories
+            .last()
+            .context("configured program ancestor chain is empty")?,
+        file_name,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("open configured {description} executable without following links"))?;
+    let executable_metadata = rustix::fs::fstat(&executable)
+        .with_context(|| format!("inspect configured {description}"))?;
+    validate_linux_program_component(
+        &executable_metadata,
+        rustix::fs::FileType::RegularFile,
+        &identity,
+        "configured program executable",
+    )?;
+    let filesystem = rustix::fs::fstatfs(&executable)
+        .with_context(|| format!("inspect configured {description} filesystem"))?;
+    if !linux_program_filesystem_is_local(filesystem.f_type as u64) {
+        bail!("configured {description} executable is not on a trusted local filesystem");
+    }
+
+    let proc_fd_directory =
+        rustix::fs::open("/proc/self/fd", directory_flags, rustix::fs::Mode::empty())
+            .context("open Linux process file-descriptor directory")?;
+    let proc_filesystem = rustix::fs::fstatfs(&proc_fd_directory)
+        .context("inspect Linux process file-descriptor filesystem")?;
+    if proc_filesystem.f_type as u64 != 0x0000_9fa0 {
+        bail!("Linux process file-descriptor directory is not provided by procfs");
+    }
+    let execution_path = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+    let execution_metadata = fs::metadata(&execution_path)
+        .context("inspect held configured-program execution identity")?;
+    if execution_metadata.dev() != executable_metadata.st_dev
+        || execution_metadata.ino() != executable_metadata.st_ino
+    {
+        bail!("held configured-program execution identity does not match its descriptor");
+    }
+
+    Ok(ProgramGuard {
+        executable,
+        execution_path,
+        _ancestor_directories: ancestor_directories,
+        _proc_fd_directory: proc_fd_directory,
+    })
 }
 
 #[cfg(windows)]
@@ -511,9 +795,9 @@ pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
 
 fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString> {
     crate::validate_op_reference(reference)?;
-    let _program_guard = program_guard(&config.programs.op, "1Password CLI")?;
+    let program_guard = program_guard(&config.programs.op, "1Password CLI")?;
     let service_token = service_account_token(&config.credential_store)?;
-    let output = Command::new(&config.programs.op)
+    let output = guarded_command(&config.programs.op, &program_guard)?
         .args(["read", "--no-newline", reference])
         .env_clear()
         .envs(sanitized_current_environment())
@@ -1082,11 +1366,23 @@ fn token_entry_for_repository(
 }
 
 pub fn credential_get(input: &[u8]) -> Result<String> {
-    let paths = RuntimePaths::discover()?;
-    let config = load_config(&paths)?;
+    let (paths, config) = frontend_runtime_and_config()?;
+    credential_get_with_sources(
+        input,
+        |owner, repository| validate_bound_git_credential_authority(&config, owner, repository),
+        |owner, repository| token_entry_for_repository(&paths, &config, owner, repository),
+    )
+}
+
+fn credential_get_with_sources<A, T>(input: &[u8], authorize: A, token_source: T) -> Result<String>
+where
+    A: FnOnce(&str, &str) -> Result<()>,
+    T: FnOnce(&str, &str) -> Result<CacheEntry>,
+{
     let request = CredentialRequest::parse(input)?;
     let (owner, repository) = request.repository()?;
-    let entry = token_entry_for_repository(&paths, &config, owner, repository)?;
+    authorize(owner, repository)?;
+    let entry = token_source(owner, repository)?;
     render_git_credential(entry.token().expose(), entry.expires_at())
 }
 
@@ -1114,8 +1410,8 @@ fn origin_repository_at(
     working_directory: Option<&Path>,
     environment: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let _program_guard = program_guard(program, "Git")?;
-    let mut command = Command::new(program);
+    let program_guard = program_guard(program, "Git")?;
+    let mut command = guarded_command(program, &program_guard)?;
     command
         .args([
             "config",
@@ -1438,8 +1734,8 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
     ensure_gh_sandbox(&paths)?;
     #[cfg(windows)]
     let _frontend_guards = gh_child_frontend_guards(&paths)?;
-    let _program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
-    validate_gh_version(&config.programs.gh, &paths)?;
+    let program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
+    validate_gh_version(&config.programs.gh, &paths, &program_guard)?;
     let forwarded = forwarded_gh_arguments(plan, &owner, &repository);
     let entry = token_entry_for_repository(&paths, &config, &owner, &repository)?;
     let token = entry.token().clone();
@@ -1452,7 +1748,7 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
         &repository,
         &config.programs.git,
     );
-    Command::new(&config.programs.gh)
+    guarded_command(&config.programs.gh, &program_guard)?
         .args(forwarded)
         .env_clear()
         .envs(environment)
@@ -1514,8 +1810,12 @@ fn isolated_gh_probe_environment(paths: &RuntimePaths) -> BTreeMap<String, Strin
     environment
 }
 
-fn validate_gh_version(program: &str, paths: &RuntimePaths) -> Result<()> {
-    let output = Command::new(program)
+fn validate_gh_version(
+    program: &str,
+    paths: &RuntimePaths,
+    program_guard: &ProgramGuard,
+) -> Result<()> {
+    let output = guarded_command(program, program_guard)?
         .arg("--version")
         .env_clear()
         .envs(isolated_gh_probe_environment(paths))
@@ -1653,7 +1953,7 @@ pub fn run_gh_git_child(arguments: &[String]) -> Result<ExitStatus> {
     let program = env::var("DEV_AUTH_GH_GIT")
         .context("internal gh Git frontend has no configured executable")?;
     crate::validate_program(&program, "internal gh Git executable")?;
-    let _program_guard = program_guard(&program, "internal gh Git")?;
+    let program_guard = program_guard(&program, "internal gh Git")?;
     let input: BTreeMap<String, String> = env::vars().collect();
     let mut environment = sanitize_environment(&input, &BTreeSet::new());
     let paths = RuntimePaths::discover()?;
@@ -1749,7 +2049,7 @@ pub fn run_gh_git_child(arguments: &[String]) -> Result<ExitStatus> {
     environment.remove("GITHUB_TOKEN");
     environment.remove("DEV_AUTH_GH_CHILD");
     environment.remove("DEV_AUTH_GH_GIT");
-    Command::new(program)
+    guarded_command(&program, &program_guard)?
         .args(&arguments)
         .env_clear()
         .envs(environment)
@@ -1761,10 +2061,10 @@ pub fn run_gh_git_child(arguments: &[String]) -> Result<ExitStatus> {
 }
 
 pub fn credential_erase(input: &[u8]) -> Result<()> {
-    let paths = RuntimePaths::discover()?;
-    let config = load_config(&paths)?;
+    let (paths, config) = frontend_runtime_and_config()?;
     let request = CredentialRequest::parse(input)?;
     let (owner, repository) = request.repository()?;
+    validate_bound_git_credential_authority(&config, owner, repository)?;
     ensure_runtime(&paths)?;
     let key = if config.github.discover_installations {
         dynamic_cache_key(
@@ -1883,7 +2183,7 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
     if !profile.executables.contains(executable) {
         bail!("command executable is not admitted by the selected profile");
     }
-    let _program_guard = program_guard(executable, "declared profile executable")?;
+    let program_guard = program_guard(executable, "declared profile executable")?;
     ensure_exec_sandbox(&paths, profile_name)?;
     let executable_path = create_empty_exec_path(&paths, profile_name)?;
     let input: BTreeMap<String, String> = env::vars().collect();
@@ -1895,7 +2195,7 @@ pub fn exec_profile(profile_name: &str, command: &[String]) -> Result<ExitStatus
             read_declared_secret(&config, reference)?.expose().into(),
         );
     }
-    let mut child = Command::new(executable);
+    let mut child = guarded_command(executable, &program_guard)?;
     child
         .args(&command[1..])
         .env_clear()
@@ -1976,26 +2276,28 @@ fn validate_ssh_agent_socket(paths: &RuntimePaths) -> Result<PathBuf> {
     Ok(socket)
 }
 
-fn ssh_add_command(paths: &RuntimePaths, config: &Config) -> Result<(Command, ProgramGuard)> {
+fn ssh_add_command<'a>(
+    paths: &RuntimePaths,
+    config: &Config,
+    program_guard: &'a ProgramGuard,
+) -> Result<GuardedCommand<'a>> {
     #[cfg(unix)]
     validate_ssh_agent_socket(paths)?;
-    let guard = program_guard(&config.programs.ssh_add, "ssh-add")?;
-    let mut command = Command::new(&config.programs.ssh_add);
+    let mut command = guarded_command(&config.programs.ssh_add, program_guard)?;
     command
         .env_clear()
         .envs(sanitized_current_environment())
         .env("SSH_AUTH_SOCK", ssh_agent_endpoint(paths)?)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Ok((command, guard))
+    Ok(command)
 }
 
 pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
-    let paths = RuntimePaths::discover()?;
-    let config = load_config(&paths)?;
-    let _program_guard = program_guard(&config.programs.ssh_keygen, "ssh-keygen")?;
+    let (paths, config) = frontend_runtime_and_config()?;
+    let program_guard = program_guard(&config.programs.ssh_keygen, "ssh-keygen")?;
     if is_git_verification_operation(arguments)? {
-        return Command::new(&config.programs.ssh_keygen)
+        return guarded_command(&config.programs.ssh_keygen, &program_guard)?
             .args(arguments)
             .env_clear()
             .envs(sanitized_current_environment())
@@ -2005,24 +2307,59 @@ pub fn run_ssh_keygen(arguments: &[String]) -> Result<ExitStatus> {
             .status()
             .context("run public OpenSSH Git verification");
     }
-    ensure_runtime(&paths)?;
-    #[cfg(unix)]
-    validate_ssh_agent_socket(&paths)?;
-    let loaded = loaded_ssh_fingerprints(&paths, &config)?;
-    let profile = unique_declared_ssh_profile(&config, &loaded)?;
-    validate_signing_key_argument(arguments, profile, &config.programs.ssh_keygen)?;
-    let input: BTreeMap<String, String> = env::vars().collect();
-    let mut environment = sanitize_environment(&input, &BTreeSet::new());
-    environment.insert("SSH_AUTH_SOCK".into(), ssh_agent_endpoint(&paths)?);
-    Command::new(&config.programs.ssh_keygen)
-        .args(arguments)
-        .env_clear()
-        .envs(environment)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run OpenSSH key operation with the dedicated agent")
+    with_validated_git_signing_authority(
+        || validate_bound_git_signing_authority(&config),
+        || {
+            ensure_runtime(&paths)?;
+            #[cfg(unix)]
+            validate_ssh_agent_socket(&paths)?;
+            let loaded = loaded_ssh_fingerprints(&paths, &config)?;
+            let profile_name = &config
+                .git
+                .as_ref()
+                .context("Git workspace policy is not declared")?
+                .ssh_profile;
+            let profile = config
+                .ssh_profiles
+                .get(profile_name)
+                .context("Git SSH signing profile is not declared")?;
+            let expected: BTreeSet<String> = profile
+                .keys
+                .iter()
+                .map(|key| key.fingerprint.clone())
+                .collect();
+            if loaded != expected {
+                bail!("dedicated SSH agent keys do not match the Git signing profile");
+            }
+            validate_signing_key_argument(
+                arguments,
+                profile,
+                &config.programs.ssh_keygen,
+                &program_guard,
+            )?;
+            let input: BTreeMap<String, String> = env::vars().collect();
+            let mut environment = sanitize_environment(&input, &BTreeSet::new());
+            environment.insert("SSH_AUTH_SOCK".into(), ssh_agent_endpoint(&paths)?);
+            guarded_command(&config.programs.ssh_keygen, &program_guard)?
+                .args(arguments)
+                .env_clear()
+                .envs(environment)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .context("run OpenSSH key operation with the dedicated agent")
+        },
+    )
+}
+
+fn with_validated_git_signing_authority<A, S, T>(authorize: A, use_signing_agent: S) -> Result<T>
+where
+    A: FnOnce() -> Result<()>,
+    S: FnOnce() -> Result<T>,
+{
+    authorize()?;
+    use_signing_agent()
 }
 
 fn is_git_verification_operation(arguments: &[String]) -> Result<bool> {
@@ -2065,6 +2402,7 @@ fn validate_signing_key_argument(
     arguments: &[String],
     profile: &SshProfile,
     ssh_keygen_program: &str,
+    program_guard: &ProgramGuard,
 ) -> Result<()> {
     if exact_option_value(arguments, "-Y")? != "sign" {
         return Ok(());
@@ -2079,7 +2417,7 @@ fn validate_signing_key_argument(
         .iter()
         .find(|key| key.purpose == SshKeyPurpose::Signing)
         .context("declared SSH profile has no signing key")?;
-    let output = Command::new(ssh_keygen_program)
+    let output = guarded_command(ssh_keygen_program, program_guard)?
         .args(["-lf", public_key, "-E", "sha256"])
         .env_clear()
         .envs(sanitized_current_environment())
@@ -2116,7 +2454,8 @@ fn exact_option_value<'a>(arguments: &'a [String], option: &str) -> Result<&'a s
 }
 
 fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
-    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let program_guard = program_guard(&config.programs.ssh_add, "ssh-add")?;
+    let mut command = ssh_add_command(paths, config, &program_guard)?;
     let status = command
         .arg("-D")
         .stdin(Stdio::null())
@@ -2129,7 +2468,8 @@ fn clear_ssh_agent(paths: &RuntimePaths, config: &Config) -> Result<()> {
 }
 
 fn loaded_ssh_fingerprints(paths: &RuntimePaths, config: &Config) -> Result<BTreeSet<String>> {
-    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let program_guard = program_guard(&config.programs.ssh_add, "ssh-add")?;
+    let mut command = ssh_add_command(paths, config, &program_guard)?;
     let output = command
         .args(["-l", "-E", "sha256"])
         .stdin(Stdio::null())
@@ -2182,7 +2522,8 @@ fn loaded_ssh_public_keys(
     paths: &RuntimePaths,
     config: &Config,
 ) -> Result<BTreeMap<String, String>> {
-    let (mut command, _program_guard) = ssh_add_command(paths, config)?;
+    let program_guard = program_guard(&config.programs.ssh_add, "ssh-add")?;
+    let mut command = ssh_add_command(paths, config, &program_guard)?;
     let output = command
         .arg("-L")
         .stdin(Stdio::null())
@@ -2339,8 +2680,12 @@ fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
 pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
-    let _gh_program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
-    validate_gh_version(&config.programs.gh, &paths)?;
+    let gh_program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
+    validate_gh_version(&config.programs.gh, &paths, &gh_program_guard)?;
+    if config.git.is_some() {
+        let git_program_guard = program_guard(&config.programs.git, "Git")?;
+        validate_git_version(&config.programs.git, &git_program_guard)?;
+    }
     let references = config.declared_secret_references();
     if online {
         let mut secrets = BTreeMap::new();
@@ -2559,6 +2904,7 @@ mod tests {
                 ssh_add: "/usr/bin/ssh-add".into(),
                 ssh_keygen: "/usr/bin/ssh-keygen".into(),
             },
+            git: None,
             github: GitHubProfile {
                 app_id: 1,
                 private_key_ref: "op://Machine Vault/app/private-key".into(),
@@ -2569,6 +2915,147 @@ mod tests {
             },
             profiles: BTreeMap::new(),
             ssh_profiles: profiles,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_program_test_directory() -> tempfile::TempDir {
+        let home = BaseDirs::new().unwrap();
+        tempfile::Builder::new()
+            .prefix("dev-auth-program-guard-")
+            .tempdir_in(home.home_dir())
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_linux_test_program(path: &Path, output: &str, mode: u32) {
+        fs::write(path, format!("#!/bin/sh\nprintf {output}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn credential_authority_failure_precedes_every_token_source() {
+        let token_source_called = std::cell::Cell::new(false);
+        let result = credential_get_with_sources(
+            b"protocol=https\nhost=github.com\npath=ExampleOrg/repository.git\n\n",
+            |_owner, _repository| bail!("bound repository authority mismatch"),
+            |_owner, _repository| -> Result<CacheEntry> {
+                token_source_called.set(true);
+                bail!("token source must not run")
+            },
+        );
+        assert!(result.is_err());
+        assert!(!token_source_called.get());
+    }
+
+    #[test]
+    fn signing_authority_failure_precedes_every_agent_access() {
+        let agent_accessed = std::cell::Cell::new(false);
+        let result = with_validated_git_signing_authority(
+            || bail!("bound repository authority mismatch"),
+            || -> Result<()> {
+                agent_accessed.set(true);
+                bail!("signing agent must not be accessed")
+            },
+        );
+        assert!(result.is_err());
+        assert!(!agent_accessed.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_program_guard_executes_the_held_identity_after_path_replacement() {
+        let temporary = linux_program_test_directory();
+        let program = temporary.path().join("tool");
+        write_linux_test_program(&program, "original", 0o755);
+
+        let guard = program_guard(program.to_str().unwrap(), "test program").unwrap();
+        let mut command = guarded_command(program.to_str().unwrap(), &guard).unwrap();
+        let held_path = temporary.path().join("held-tool");
+        fs::rename(&program, &held_path).unwrap();
+        write_linux_test_program(&program, "replacement", 0o755);
+
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_program_guard_rejects_final_and_ancestor_symlinks() {
+        let temporary = linux_program_test_directory();
+        let real_directory = temporary.path().join("real");
+        fs::create_dir(&real_directory).unwrap();
+        fs::set_permissions(&real_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let program = real_directory.join("tool");
+        write_linux_test_program(&program, "trusted", 0o755);
+        assert!(program_guard(real_directory.to_str().unwrap(), "test program",).is_err());
+
+        let final_link = temporary.path().join("tool-link");
+        std::os::unix::fs::symlink(&program, &final_link).unwrap();
+        assert!(program_guard(final_link.to_str().unwrap(), "test program").is_err());
+
+        let ancestor_link = temporary.path().join("directory-link");
+        std::os::unix::fs::symlink(&real_directory, &ancestor_link).unwrap();
+        assert!(
+            program_guard(ancestor_link.join("tool").to_str().unwrap(), "test program",).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_program_guard_rejects_writable_or_non_executable_components() {
+        let temporary = linux_program_test_directory();
+        let directory = temporary.path().join("bin");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let program = directory.join("tool");
+
+        write_linux_test_program(&program, "unsafe", 0o775);
+        assert!(program_guard(program.to_str().unwrap(), "test program").is_err());
+
+        write_linux_test_program(&program, "not-executable", 0o600);
+        assert!(program_guard(program.to_str().unwrap(), "test program").is_err());
+
+        write_linux_test_program(&program, "unsafe-ancestor", 0o700);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(program_guard(program.to_str().unwrap(), "test program").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_program_identity_applies_effective_owner_and_group_execute_bits() {
+        let user = LinuxProgramIdentity {
+            effective_user: 1000,
+            effective_groups: BTreeSet::from([2000]),
+        };
+        assert!(user.can_execute(1000, 3000, 0o100));
+        assert!(user.can_execute(0, 2000, 0o010));
+        assert!(user.can_execute(0, 3000, 0o001));
+        assert!(!user.can_execute(0, 3000, 0o010));
+
+        let root = LinuxProgramIdentity {
+            effective_user: 0,
+            effective_groups: BTreeSet::new(),
+        };
+        assert!(root.can_execute(0, 0, 0o001));
+        assert!(!root.can_execute(0, 0, 0o600));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_program_filesystem_policy_rejects_remote_and_host_shared_types() {
+        for filesystem_type in [
+            0x0000_6969,
+            0xff53_4d42,
+            0x0102_1997,
+            0x6573_5546,
+            0x786f_4256,
+        ] {
+            assert!(!linux_program_filesystem_is_local(filesystem_type));
+        }
+        for filesystem_type in [0x0000_ef53, 0x9123_683e, 0x794c_7630, 0x0102_1994] {
+            assert!(linux_program_filesystem_is_local(filesystem_type));
         }
     }
 
@@ -3656,7 +4143,7 @@ mod tests {
         assert_eq!(parsed.algorithm(), SshAlgorithm::Ed25519);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn git_signing_requires_the_declared_signing_public_key() {
         let directory = tempfile::tempdir().unwrap();
@@ -3699,18 +4186,37 @@ mod tests {
                 key.with_extension("pub").display().to_string(),
             ]
         };
-        assert!(
-            validate_signing_key_argument(&arguments(&signing_key), &profile, "ssh-keygen").is_ok()
-        );
+        let ssh_keygen_program = "/usr/bin/ssh-keygen";
+        let program_guard = program_guard(ssh_keygen_program, "ssh-keygen").unwrap();
+        assert!(validate_signing_key_argument(
+            &arguments(&signing_key),
+            &profile,
+            ssh_keygen_program,
+            &program_guard,
+        )
+        .is_ok());
         assert!(validate_signing_key_argument(
             &arguments(&authentication_key),
             &profile,
-            "ssh-keygen"
+            ssh_keygen_program,
+            &program_guard,
         )
         .is_err());
         let mut wrong_namespace = arguments(&signing_key);
         wrong_namespace[3] = "file".into();
-        assert!(validate_signing_key_argument(&wrong_namespace, &profile, "ssh-keygen").is_err());
+        assert!(validate_signing_key_argument(
+            &wrong_namespace,
+            &profile,
+            ssh_keygen_program,
+            &program_guard,
+        )
+        .is_err());
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn unsupported_unix_program_identity_execution_fails_closed() {
+        assert!(program_guard("/usr/bin/true", "test program").is_err());
     }
 
     #[test]

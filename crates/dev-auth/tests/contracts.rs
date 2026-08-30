@@ -1,7 +1,7 @@
 use dev_auth::{
-    admit_gh_arguments, parse_config, parse_github_repository, render_git_credential,
-    sanitize_environment, CacheEntry, CredentialRequest, GitHubInstallation, GitHubProfile,
-    RepositorySelection, SecretString,
+    admit_gh_arguments, admit_git_arguments, parse_config, parse_github_repository,
+    render_git_credential, sanitize_environment, CacheEntry, CredentialRequest, GitHubInstallation,
+    GitHubProfile, RepositorySelection, SecretString,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -233,6 +233,12 @@ git = "/usr/bin/git"
 ssh_add = "/usr/bin/ssh-add"
 ssh_keygen = "/usr/bin/ssh-keygen"
 
+[git]
+workspace_roots = ["~/repos", "/srv/automation"]
+author_name = "Example Automation"
+author_email = "automation@example.invalid"
+ssh_profile = "automation"
+
 [github]
 app_id = 42
 	private_key_ref = "op://Any Vault/contributor-app/private-key"
@@ -274,6 +280,11 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         ["/usr/bin/terraform"]
     );
     assert_eq!(config.ssh_profiles["automation"].keys.len(), 2);
+    let git = config.git.as_ref().unwrap();
+    assert_eq!(git.workspace_roots, ["~/repos", "/srv/automation"]);
+    assert_eq!(git.author_name, "Example Automation");
+    assert_eq!(git.author_email, "automation@example.invalid");
+    assert_eq!(git.ssh_profile, "automation");
     assert_eq!(
         config.declared_secret_references(),
         BTreeSet::from([
@@ -334,7 +345,26 @@ fn published_example_is_complete_and_valid() {
     assert!(config.github.installations.is_empty());
     assert_eq!(config.profiles.len(), 1);
     assert_eq!(config.ssh_profiles.len(), 1);
+    assert!(config.git.is_some());
     assert_eq!(config.declared_secret_references().len(), 4);
+}
+
+#[test]
+fn home_relative_workspace_roots_cannot_become_windows_or_alternate_paths() {
+    let example = include_str!("../config.example.toml");
+    for invalid_root in [
+        "~/C:/Windows",
+        "~/C:\\Windows",
+        "~/../repos",
+        "~/repos/./nested",
+        "~/repos//nested",
+    ] {
+        let invalid = example.replace("~/repos", invalid_root);
+        assert!(
+            parse_config(invalid.as_bytes()).is_err(),
+            "accepted {invalid_root}"
+        );
+    }
 }
 
 #[test]
@@ -934,5 +964,230 @@ fn gh_pull_request_targets_and_flags_are_fail_closed() {
         vec!["repo", "view", "-R=OtherOrg/other-repo"],
     ] {
         assert!(admit_gh_arguments(&rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
+fn managed_git_surface_is_exact_and_rejects_process_and_authority_escapes() {
+    for admitted in [
+        vec!["status", "--short"],
+        vec!["add", "--", "src/lib.rs"],
+        vec!["restore", "--", "src/lib.rs"],
+        vec!["branch", "--list"],
+        vec!["switch", "feature"],
+        vec!["checkout", "feature"],
+        vec!["log", "--oneline", "HEAD"],
+        vec!["show", "--stat", "HEAD"],
+        vec!["commit", "--no-status", "--message", "bounded change"],
+        vec!["commit", "--no-status", "--file", "-"],
+        vec!["tag", "--message", "release", "v1.2.3"],
+        vec![
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+        vec!["push", "origin", "HEAD:refs/heads/feature"],
+        vec![
+            "clone",
+            "--no-checkout",
+            "https://github.com/ExampleOrg/repository.git",
+            "repository",
+        ],
+        vec![
+            "clone",
+            "--no-checkout",
+            "git@github.com:ExampleOrg/repository.git",
+            "nested/repository",
+        ],
+    ] {
+        admit_git_arguments(&admitted).unwrap_or_else(|error| {
+            panic!("expected admitted Git arguments {admitted:?}: {error:#}")
+        });
+    }
+
+    for rejected in [
+        vec!["-c", "credential.helper=!human", "status"],
+        vec!["-ccore.hooksPath=/tmp/hooks", "status"],
+        vec!["--config-env=credential.helper=HELPER", "status"],
+        vec!["-C", "/tmp/repository", "status"],
+        vec!["--git-dir=/tmp/repository/.git", "status"],
+        vec!["--work-tree", "/tmp/repository", "status"],
+        vec!["--exec-path=/tmp/bin", "status"],
+        vec!["init", "repository"],
+        vec!["human-alias"],
+        vec!["config", "credential.helper", "!human"],
+        vec!["credential", "fill"],
+        vec!["submodule", "foreach", "git", "push"],
+        vec!["worktree", "add", "../other"],
+        vec!["filter-branch", "--tree-filter", "human-command"],
+        vec!["difftool", "--extcmd", "human-command"],
+        vec!["commit", "--no-gpg-sign", "--message", "unsigned"],
+        vec!["commit", "--author", "Human <human@example.com>", "-m", "x"],
+        vec!["commit", "--file", "/proc/self/environ"],
+        vec!["commit", "--message", "missing no-status"],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--message",
+            "two",
+        ],
+        vec!["commit", "--no-status", "--message", "one", "--file", "-"],
+        vec!["commit", "--no-status", "--file=-"],
+        vec!["commit", "--no-status", "--message", "one", "--status"],
+        vec!["commit", "--no-status", "--no-status", "--message", "one"],
+        vec!["commit", "--no-status", "--message", "one", "--all"],
+        vec!["commit", "--no-status", "--message", "one", "--amend"],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--reuse-message",
+            "HEAD",
+        ],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--reedit-message",
+            "HEAD",
+        ],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--fixup",
+            "HEAD",
+        ],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--squash",
+            "HEAD",
+        ],
+        vec!["commit", "--no-status", "--message", "one", "--edit"],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--cleanup",
+            "strip",
+        ],
+        vec!["commit", "--no-status", "--message", "one", "--scissors"],
+        vec!["commit", "--no-status", "--message", "one", "--no-verify"],
+        vec![
+            "commit",
+            "--no-status",
+            "--message",
+            "one",
+            "--",
+            "src/lib.rs",
+        ],
+        vec!["commit", "--no-status", "--message", "one", "src/lib.rs"],
+        vec!["tag", "--no-sign", "v1.2.3"],
+        vec!["tag", "--no-sign", "--message", "one", "v1.2.3"],
+        vec!["tag", "--local-user", "human", "v1.2.3"],
+        vec!["tag", "--message", "one", "--message", "two", "v1.2.3"],
+        vec!["tag", "--message", "one", "--file", "-", "v1.2.3"],
+        vec!["tag", "--file=-", "v1.2.3"],
+        vec!["log", "--ext-diff", "HEAD"],
+        vec!["log", "--output=/tmp/leak", "HEAD"],
+        vec!["log", "--unknown", "HEAD"],
+        vec!["show", "--textconv", "HEAD"],
+        vec!["show", "--output", "/tmp/leak", "HEAD"],
+        vec!["show", "--unknown", "HEAD"],
+        vec!["status", "--pathspec-from-file=/proc/self/environ"],
+        vec!["status", "--unknown"],
+        vec!["add", "--pathspec-from-file=/proc/self/environ"],
+        vec!["add", "src/lib.rs"],
+        vec!["restore", "--pathspec-from-file", "/proc/self/environ"],
+        vec!["restore", "src/lib.rs"],
+        vec!["branch", "--edit-description", "main"],
+        vec!["branch", "--unknown"],
+        vec!["switch", "--guess", "feature"],
+        vec!["switch", "--unknown", "feature"],
+        vec!["checkout", "--conflict=merge", "feature"],
+        vec!["checkout", "--unknown", "feature"],
+        vec!["fetch", "--upload-pack", "human-command", "origin"],
+        vec!["push", "--receive-pack=human-command", "origin"],
+        vec!["fetch"],
+        vec!["fetch", "origin"],
+        vec!["fetch", "origin", "main"],
+        vec![
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+        vec!["fetch", "origin", ":refs/remotes/origin/main"],
+        vec!["fetch", "origin", "refs/heads/main:refs/heads/main"],
+        vec!["fetch", "origin", "refs/tags/v1:refs/remotes/origin/v1"],
+        vec!["pull", "--ff-only", "origin", "main"],
+        vec!["pull", "--ff-only"],
+        vec!["push"],
+        vec!["push", "origin"],
+        vec!["push", "origin", "main"],
+        vec!["push", "origin", "+HEAD:refs/heads/feature"],
+        vec!["push", "origin", ":refs/heads/main"],
+        vec!["push", "origin", "refs/tags/v1:refs/heads/v1"],
+        vec!["push", "origin", "refs/heads/main:refs/tags/main"],
+        vec!["push", "origin", "HEAD:refs/tags/v1"],
+        vec![
+            "push",
+            "--set-upstream",
+            "origin",
+            "HEAD:refs/heads/feature",
+        ],
+        vec!["push", "-u", "origin", "HEAD:refs/heads/feature"],
+        vec!["push", "origin", "HEAD:refs/heads/../feature"],
+        vec![
+            "clone",
+            "--config",
+            "credential.helper=!human",
+            "https://github.com/a/b",
+        ],
+        vec!["clone", "--template=/tmp/hooks", "https://github.com/a/b"],
+        vec!["clone", "--recurse-submodules", "https://github.com/a/b"],
+        vec![
+            "clone",
+            "https://github.com/ExampleOrg/repository",
+            "repository",
+        ],
+        vec![
+            "clone",
+            "--no-checkout",
+            "https://github.com/ExampleOrg/repository",
+            "../repository",
+        ],
+        vec![
+            "clone",
+            "--no-checkout",
+            "https://github.com/ExampleOrg/repository",
+            "/tmp/repository",
+        ],
+        vec![
+            "clone",
+            "--no-checkout",
+            "https://github.com/ExampleOrg/repository",
+            ".",
+        ],
+        vec!["clone", "file:///tmp/repository"],
+        vec!["clone", "ssh://example.com/repository"],
+        vec!["clone", "http://github.com/ExampleOrg/repository"],
+        vec!["clone", "ext::human-command"],
+        vec!["clone", "ExampleOrg/repository", "repository"],
+        vec!["clone", "https://github.com/ExampleOrg/repository"],
+        vec!["push", "https://github.com/OtherOrg/other", "HEAD"],
+    ] {
+        assert!(
+            admit_git_arguments(&rejected).is_err(),
+            "unsafe Git arguments were admitted: {rejected:?}"
+        );
     }
 }

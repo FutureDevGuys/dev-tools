@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "dev-auth"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "directories",
@@ -946,6 +946,7 @@ dependencies = [
  "fs2",
  "jsonwebtoken",
  "keyring",
+ "nix 0.31.3",
  "rustix",
  "serde",
  "serde_json",
