@@ -2013,9 +2013,6 @@ fn git_ref_authority_selectors(arguments: &[String]) -> Result<Vec<String>> {
                 };
                 selectors.push(selector.to_owned());
             }
-            if operation == "fetch" {
-                selectors.push("FETCH_HEAD".to_owned());
-            }
         }
         _ => {}
     }
@@ -2060,7 +2057,6 @@ fn git_mutable_ref_selectors(arguments: &[String]) -> Result<Vec<String>> {
                     .filter_map(|value| value.split_once(':').map(|(_, destination)| destination))
                     .map(ToOwned::to_owned),
             );
-            selectors.push("FETCH_HEAD".to_owned());
         }
         _ => {}
     }
@@ -2100,7 +2096,7 @@ impl GitChildAuthorityBinding {
 fn operation_mutates_repository_authority(operation: &str) -> bool {
     matches!(
         operation,
-        "add" | "restore" | "branch" | "switch" | "checkout" | "commit" | "tag" | "fetch"
+        "add" | "restore" | "checkout" | "commit" | "tag" | "fetch"
     )
 }
 
@@ -2701,14 +2697,74 @@ fn verify_reference_authority_transition(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ResolvedRepositoryPaths {
+    top_level: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    held_selectors: Vec<HeldRepositoryPath>,
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_commondir_selector(git_dir: &Path, value: &str) -> Result<PathBuf> {
+    let selector = Path::new(value);
+    let normalized = if selector.is_absolute() {
+        selector.to_path_buf()
+    } else {
+        let mut path = git_dir.to_path_buf();
+        for component in selector.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !path.pop() {
+                        bail!("linked-worktree common directory selector escapes the filesystem");
+                    }
+                }
+                std::path::Component::Normal(component) => path.push(component),
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    bail!("linked-worktree common directory selector is malformed")
+                }
+            }
+        }
+        path
+    };
+    canonical_candidate_path(&normalized, git_dir)
+        .context("resolve linked-worktree common directory selector")
+}
+
+#[cfg(target_os = "linux")]
 fn resolved_repository_paths(
     program: &str,
     program_guard: &ProgramGuard,
     cwd: &Path,
-) -> Result<(PathBuf, PathBuf, PathBuf)> {
+) -> Result<ResolvedRepositoryPaths> {
     let environment = BTreeMap::new();
     let git_dir = run_git_path_probe(program, program_guard, cwd, &environment, "--git-dir")?
         .context("managed Git directory cannot be resolved safely")?;
+    let mut held_selectors = vec![HeldRepositoryPath::open(&git_dir, true)?];
+    let commondir_path = git_dir.join("commondir");
+    let expected_common_dir = match fs::symlink_metadata(&commondir_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let held = HeldRepositoryPath::open(&commondir_path, false)?;
+            let bytes = held.read_bounded(RESPONSE_LIMIT)?;
+            let text = std::str::from_utf8(&bytes)
+                .context("linked-worktree common directory selector is not UTF-8")?;
+            let value = text
+                .strip_suffix('\n')
+                .context("linked-worktree common directory selector has no terminator")?;
+            if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+                bail!("linked-worktree common directory selector is malformed");
+            }
+            let selected = resolve_commondir_selector(&git_dir, value)?;
+            held_selectors.push(held);
+            selected
+        }
+        Ok(_) => bail!("linked-worktree common directory selector has an unsafe file type"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => git_dir.clone(),
+        Err(error) => {
+            return Err(error).context("inspect linked-worktree common directory selector")
+        }
+    };
     let common_dir = run_git_path_probe(
         program,
         program_guard,
@@ -2717,10 +2773,21 @@ fn resolved_repository_paths(
         "--git-common-dir",
     )?
     .context("managed Git common directory cannot be resolved safely")?;
+    if common_dir != expected_common_dir {
+        bail!("linked-worktree common directory does not match its held selector");
+    }
     let top_level =
         run_git_path_probe(program, program_guard, cwd, &environment, "--show-toplevel")?
             .context("managed Git worktree cannot be resolved safely")?;
-    Ok((top_level, git_dir, common_dir))
+    for held in &held_selectors {
+        held.verify_path_identity()?;
+    }
+    Ok(ResolvedRepositoryPaths {
+        top_level,
+        git_dir,
+        common_dir,
+        held_selectors,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2730,7 +2797,13 @@ fn repository_authority_binding(
     cwd: &Path,
     request: GitAuthorityRequest<'_>,
 ) -> Result<GitChildAuthorityBinding> {
-    let (top_level, git_dir, common_dir) = resolved_repository_paths(program, program_guard, cwd)?;
+    let resolved = resolved_repository_paths(program, program_guard, cwd)?;
+    let ResolvedRepositoryPaths {
+        top_level,
+        git_dir,
+        common_dir,
+        held_selectors,
+    } = resolved;
     let actual_repository =
         literal_origin_repository_at_os(program, program_guard, cwd, &BTreeMap::new())?;
     if actual_repository != (request.owner.to_owned(), request.repository.to_owned()) {
@@ -2741,7 +2814,7 @@ fn repository_authority_binding(
     let worktree_config =
         git_configuration_scope_snapshot(program, program_guard, cwd, "--worktree")?;
 
-    let mut held_paths = Vec::new();
+    let mut held_paths = held_selectors;
     for directory in [&top_level, &git_dir, &common_dir] {
         if held_paths
             .iter()
@@ -2853,13 +2926,10 @@ fn repository_authority_binding(
                 reference => common_dir.join(reference),
             }
         }));
-        if matches!(
-            request.operation,
-            "add" | "restore" | "branch" | "switch" | "checkout" | "commit"
-        ) {
+        if matches!(request.operation, "add" | "restore" | "checkout" | "commit") {
             mutable_after_child.insert(git_dir.join("index"));
         }
-        if matches!(request.operation, "restore" | "switch" | "checkout") {
+        if matches!(request.operation, "restore" | "checkout") {
             mutable_after_child.extend(attributes.working.iter().map(|(path, _)| path.clone()));
         }
     }
@@ -3768,6 +3838,14 @@ fn normalized_managed_git_arguments(
                 bail!("managed Git network command does not target literal origin");
             }
             *remote = repository_url;
+            if normalized.first().is_some_and(|value| value == "fetch") {
+                normalized.splice(
+                    1..1,
+                    ["--atomic", "--no-tags", "--no-write-fetch-head"]
+                        .into_iter()
+                        .map(str::to_owned),
+                );
+            }
         }
         Some("clone") => {
             let mut index = 1_usize;
@@ -5068,6 +5146,92 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn ref_bearing_no_authority_commands_fail_before_runtime_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let managed = home.join("managed");
+        let repository = managed.join("repository");
+        let config_path = home.join(".config/dev-auth/config.toml");
+        fs::create_dir_all(&repository).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
+        write_workspace_config(&config_path, &managed);
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "--message=initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["branch", "feature"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let directories = NativeUserDirs {
+            home,
+            config: config_path,
+            runtime: runtime.clone(),
+        };
+
+        for arguments in [
+            vec!["restore", "--source", "refs/heads/feature", "--", "file"],
+            vec!["branch", "created", "refs/heads/feature"],
+            vec!["switch", "feature"],
+            vec!["checkout", "feature"],
+            vec!["log", "feature"],
+            vec!["show", "refs/heads/feature"],
+        ] {
+            let arguments: Vec<OsString> = arguments.into_iter().map(OsString::from).collect();
+            let error =
+                run_git_at(&directories, &repository, &BTreeMap::new(), &arguments).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("bounded")
+                    || format!("{error:#}").contains("managed automation surface")
+                    || format!("{error:#}").contains("full object identifier"),
+                "unexpected rejection: {error:#}"
+            );
+            assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+        }
+        assert!(!repository.join(".git/refs/heads/created").exists());
+        let head = Command::new("/usr/bin/git")
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        assert_eq!(head.stdout, b"refs/heads/main\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn no_authority_commands_reject_symlinked_common_objects_authority() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -5339,7 +5503,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 "refs/heads/main:refs/remotes/origin/main".into(),
             ])
             .unwrap(),
-            vec!["FETCH_HEAD", "refs/remotes/origin/main"]
+            vec!["refs/remotes/origin/main"]
         );
         assert!(git_ref_authority_selectors(&[
             "tag".into(),
@@ -5509,14 +5673,6 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         let head = String::from_utf8(head.stdout).unwrap();
         fs::create_dir_all(repository.join(".git/refs/remotes/origin")).unwrap();
         fs::write(repository.join(".git/refs/remotes/origin/main"), &head).unwrap();
-        fs::write(
-            repository.join(".git/FETCH_HEAD"),
-            format!(
-                "{}\t\tbranch 'main' of https://github.com/ExampleOrg/repository\n",
-                head.trim()
-            ),
-        )
-        .unwrap();
         verify_reference_authority_transition(&fetch, true, false).unwrap();
 
         let push_arguments = vec![
@@ -6199,6 +6355,123 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             true,
         )
         .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linked_worktree_commondir_is_held_private_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (repository, worktree) = linked_worktree(root.path());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--worktree",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success());
+        let guard = test_git_guard();
+        let git_dir = resolved_repository_paths("/usr/bin/git", &guard, &worktree)
+            .unwrap()
+            .git_dir;
+        let commondir = git_dir.join("commondir");
+        assert!(commondir.is_file());
+        let original_commondir = fs::read(&commondir).unwrap();
+        let alternate = root.path().join("alternate");
+        fs::create_dir(&alternate).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&alternate)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/OtherOrg/substituted.git",
+            ])
+            .current_dir(&alternate)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(
+            &commondir,
+            format!("{}\n", alternate.join(".git").display()),
+        )
+        .unwrap();
+        fs::set_permissions(&commondir, fs::Permissions::from_mode(0o664)).unwrap();
+        let config_digest = "00".repeat(32);
+
+        for (capability, operation, selectors, mutable) in [
+            ("none", "status", Vec::new(), Vec::new()),
+            (
+                "credential",
+                "fetch",
+                vec!["refs/remotes/origin/main".to_owned()],
+                vec!["refs/remotes/origin/main".to_owned()],
+            ),
+            (
+                "signing",
+                "commit",
+                vec!["HEAD".to_owned()],
+                vec!["HEAD".to_owned()],
+            ),
+        ] {
+            let error = repository_authority_binding(
+                "/usr/bin/git",
+                &guard,
+                &worktree,
+                GitAuthorityRequest {
+                    config_digest: &config_digest,
+                    capability,
+                    operation,
+                    owner: "ExampleOrg",
+                    repository: "repository",
+                    ref_selectors: &selectors,
+                    mutable_ref_selectors: &mutable,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("current-user owned"),
+                "unexpected linked-worktree rejection for {operation}: {error:#}"
+            );
+        }
+
+        fs::write(&commondir, original_commondir).unwrap();
+        fs::set_permissions(&commondir, fs::Permissions::from_mode(0o600)).unwrap();
+        repository_authority_binding(
+            "/usr/bin/git",
+            &guard,
+            &worktree,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: "none",
+                operation: "status",
+                owner: "ExampleOrg",
+                repository: "repository",
+                ref_selectors: &[],
+                mutable_ref_selectors: &[],
+            },
+        )
+        .unwrap();
+        fs::remove_file(&commondir).unwrap();
+        std::os::unix::fs::symlink(alternate.join(".git"), &commondir).unwrap();
+        assert!(resolved_repository_paths("/usr/bin/git", &guard, &worktree).is_err());
     }
 
     #[cfg(unix)]
@@ -7237,7 +7510,11 @@ exit 0
     fn managed_network_arguments_are_normalized_to_one_exact_https_repository() {
         let expected = OsString::from("https://github.com/ExampleOrg/repository.git");
         for input in [
-            vec!["fetch", "origin", "refs/heads/main:refs/heads/main"],
+            vec![
+                "fetch",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
             vec!["push", "origin", "HEAD:refs/heads/change"],
             vec![
                 "clone",
@@ -7246,6 +7523,7 @@ exit 0
                 "repository",
             ],
         ] {
+            let command = input[0];
             let normalized = normalized_managed_git_arguments(
                 &input.into_iter().map(str::to_owned).collect::<Vec<_>>(),
                 "ExampleOrg",
@@ -7257,7 +7535,135 @@ exit 0
             assert!(!normalized
                 .iter()
                 .any(|argument| argument.to_string_lossy().starts_with("git@")));
+            if command == "fetch" {
+                for required in ["--atomic", "--no-tags", "--no-write-fetch-head"] {
+                    assert!(
+                        normalized.contains(&OsString::from(required)),
+                        "managed fetch omitted {required}"
+                    );
+                }
+            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_fetch_is_atomic_tagless_and_does_not_write_fetch_head() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let seed = root.path().join("seed");
+        let client = root.path().join("client");
+        fs::create_dir(&seed).unwrap();
+        fs::create_dir(&client).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "--message=initial",
+            ])
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["tag", "auto-followed"])
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["push", "--quiet", "origin", "main", "--tags"])
+            .current_dir(&seed)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&client)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .current_dir(&client)
+            .status()
+            .unwrap()
+            .success());
+
+        let fetch_head = client.join(".git/FETCH_HEAD");
+        let sentinel = b"unchanged-fetch-head\n";
+        fs::write(&fetch_head, sentinel).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "fetch",
+                "--atomic",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--quiet",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ])
+            .current_dir(&client)
+            .status()
+            .unwrap()
+            .success());
+        assert!(!client.join(".git/refs/tags/auto-followed").exists());
+        assert_eq!(fs::read(&fetch_head).unwrap(), sentinel);
+        let before = Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "refs/remotes/origin/main"])
+            .current_dir(&client)
+            .output()
+            .unwrap();
+        assert!(before.status.success());
+
+        let failed = Command::new("/usr/bin/git")
+            .args([
+                "fetch",
+                "--atomic",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--quiet",
+                "origin",
+                "refs/heads/missing:refs/remotes/origin/main",
+            ])
+            .current_dir(&client)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!failed.success());
+        let after = Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "refs/remotes/origin/main"])
+            .current_dir(&client)
+            .output()
+            .unwrap();
+        assert!(after.status.success());
+        assert_eq!(after.stdout, before.stdout);
+        assert_eq!(fs::read(fetch_head).unwrap(), sentinel);
     }
 
     #[cfg(unix)]

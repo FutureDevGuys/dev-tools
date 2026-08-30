@@ -924,13 +924,7 @@ fn validate_git_restore(arguments: &[&str]) -> Result<()> {
         }
         match argument {
             "--" => pathspec = true,
-            "--staged" | "--worktree" | "--ours" | "--theirs" => {}
-            "--source" => {
-                let value = consume_git_value(arguments, &mut index, argument)?;
-                if !valid_git_ref_operand(value) {
-                    bail!("Git restore source is malformed");
-                }
-            }
+            "--worktree" | "--ours" | "--theirs" => {}
             _ => bail!("Git restore requires bounded options and explicit -- pathspecs"),
         }
         index += 1;
@@ -941,35 +935,8 @@ fn validate_git_restore(arguments: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn validate_git_branch(arguments: &[&str]) -> Result<()> {
-    match arguments {
-        [] | ["--list"] | ["--show-current"] => Ok(()),
-        [name] | [name, _] if valid_git_ref_operand(name) => {
-            if arguments.iter().all(|value| valid_git_ref_operand(value)) {
-                Ok(())
-            } else {
-                bail!("Git branch name or start point is malformed")
-            }
-        }
-        _ => bail!("Git branch operation is outside the bounded automation grammar"),
-    }
-}
-
-fn validate_git_switch(arguments: &[&str]) -> Result<()> {
-    let admitted = matches!(arguments, [branch] if valid_git_ref_operand(branch));
-    if !admitted {
-        bail!("Git switch operation is outside the bounded automation grammar");
-    }
-    Ok(())
-}
-
 fn validate_git_checkout(arguments: &[&str]) -> Result<()> {
-    let admitted = match arguments {
-        [reference] => valid_git_ref_operand(reference),
-        ["--", paths @ ..] => !paths.is_empty(),
-        [reference, "--", paths @ ..] => valid_git_ref_operand(reference) && !paths.is_empty(),
-        _ => false,
-    };
+    let admitted = matches!(arguments, ["--", paths @ ..] if !paths.is_empty());
     if !admitted {
         bail!("Git checkout operation is outside the bounded automation grammar");
     }
@@ -978,17 +945,11 @@ fn validate_git_checkout(arguments: &[&str]) -> Result<()> {
 
 fn validate_git_history(command: &str, arguments: &[&str]) -> Result<()> {
     let mut index = 0_usize;
-    let mut pathspec = false;
+    let mut objects = 0_usize;
     while index < arguments.len() {
         let argument = arguments[index];
-        if pathspec {
-            index += 1;
-            continue;
-        }
         match argument {
-            "--" => pathspec = true,
-            "--oneline" | "--graph" | "--decorate" | "--no-decorate" | "--all" | "--branches"
-            | "--tags" | "--stat" | "--name-only" | "--name-status" | "--no-patch"
+            "--oneline" | "--graph" | "--stat" | "--name-only" | "--name-status" | "--no-patch"
             | "--reverse" | "--first-parent" | "--merges" | "--no-merges" | "--no-renames" => {}
             "-n" | "--max-count" => {
                 let value = consume_git_value(arguments, &mut index, argument)?;
@@ -996,22 +957,20 @@ fn validate_git_history(command: &str, arguments: &[&str]) -> Result<()> {
                     bail!("Git history count is malformed");
                 }
             }
-            "--format" | "--pretty" => {
-                if consume_git_value(arguments, &mut index, argument)?.is_empty() {
-                    bail!("Git history format is empty");
-                }
-            }
             _ if argument
                 .strip_prefix("--max-count=")
                 .is_some_and(|value| value.parse::<u64>().is_ok_and(|count| count > 0)) => {}
-            _ if argument
-                .strip_prefix("--format=")
-                .or_else(|| argument.strip_prefix("--pretty="))
-                .is_some_and(|value| !value.is_empty()) => {}
-            _ if !argument.starts_with('-') && valid_git_ref_operand(argument) => {}
+            _ if matches!(argument.len(), 40 | 64)
+                && argument.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                objects += 1;
+            }
             _ => bail!("Git {command} option is outside the bounded automation grammar"),
         }
         index += 1;
+    }
+    if objects != 1 {
+        bail!("Git {command} requires exactly one full object identifier");
     }
     Ok(())
 }
@@ -1166,14 +1125,7 @@ fn validate_origin_network_command(command: &str, arguments: &[&str]) -> Result<
             let admitted = match command {
                 "fetch" => matches!(
                     *argument,
-                    "--prune"
-                        | "--no-prune"
-                        | "--no-tags"
-                        | "-q"
-                        | "--quiet"
-                        | "-v"
-                        | "--verbose"
-                        | "--dry-run"
+                    "-q" | "--quiet" | "-v" | "--verbose" | "--dry-run"
                 ),
                 "push" => matches!(
                     *argument,
@@ -1197,8 +1149,8 @@ fn validate_origin_network_command(command: &str, arguments: &[&str]) -> Result<
     if positionals.first() != Some(&"origin") {
         bail!("Git network operations require the literal origin remote");
     }
-    if positionals.len() < 2 {
-        bail!("Git network operations require at least one explicit typed refspec");
+    if positionals.len() != 2 {
+        bail!("Git network operations require exactly one explicit typed refspec");
     }
     let invalid_ref = positionals.iter().skip(1).any(|value| {
         if command == "push" {
@@ -1320,8 +1272,6 @@ fn parse_git_capability<S: AsRef<str>>(arguments: &[S]) -> Result<GitCapability>
         "status"
             | "add"
             | "restore"
-            | "branch"
-            | "switch"
             | "checkout"
             | "log"
             | "show"
@@ -1339,8 +1289,6 @@ fn parse_git_capability<S: AsRef<str>>(arguments: &[S]) -> Result<GitCapability>
         "status" => validate_git_status(tail).map(|()| GitCapability::NoAuthority),
         "add" => validate_git_add(tail).map(|()| GitCapability::NoAuthority),
         "restore" => validate_git_restore(tail).map(|()| GitCapability::NoAuthority),
-        "branch" => validate_git_branch(tail).map(|()| GitCapability::NoAuthority),
-        "switch" => validate_git_switch(tail).map(|()| GitCapability::NoAuthority),
         "checkout" => validate_git_checkout(tail).map(|()| GitCapability::NoAuthority),
         "log" | "show" => validate_git_history(command, tail).map(|()| GitCapability::NoAuthority),
         "commit" => validate_git_commit(tail).map(|()| GitCapability::Signing),
@@ -1867,11 +1815,13 @@ mod git_capability_tests {
             &["status", "--short"][..],
             &["add", "--", "src/lib.rs"],
             &["restore", "--", "src/lib.rs"],
-            &["branch", "--list"],
-            &["switch", "main"],
-            &["checkout", "main"],
-            &["log", "--oneline", "HEAD"],
-            &["show", "--stat", "HEAD"],
+            &["checkout", "--", "src/lib.rs"],
+            &[
+                "log",
+                "--oneline",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            &["show", "--stat", "0123456789abcdef0123456789abcdef01234567"],
         ] {
             assert_eq!(
                 git_capability(&arguments(values)).unwrap(),
@@ -1924,6 +1874,24 @@ mod git_capability_tests {
                 "repository",
             ],
             &["fetch", "origin", "main"],
+            &[
+                "restore",
+                "--source",
+                "refs/heads/feature",
+                "--",
+                "src/lib.rs",
+            ],
+            &["branch", "new", "refs/heads/feature"],
+            &["switch", "feature"],
+            &["checkout", "feature"],
+            &["log", "feature"],
+            &["show", "refs/heads/feature"],
+            &[
+                "fetch",
+                "origin",
+                "refs/heads/one:refs/remotes/origin/one",
+                "refs/heads/two:refs/remotes/origin/two",
+            ],
         ] {
             assert!(git_capability(&arguments(values)).is_err(), "{values:?}");
         }
