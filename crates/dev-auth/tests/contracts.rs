@@ -5,6 +5,35 @@ use dev_auth::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[test]
+fn installation_contract_names_every_frontend_and_rolls_back_dispatchers_first() {
+    let documentation = include_str!("../../../docs/dev-auth.md");
+    for frontend in [
+        "`git-dev-auth`",
+        "`git-credential-dev-auth`",
+        "`gh-dev-auth`",
+        "`ssh-keygen-dev-auth`",
+    ] {
+        assert!(documentation.contains(frontend), "missing {frontend}");
+    }
+    let verify = documentation
+        .find("first verify the signed `dev-auth` artifact")
+        .unwrap();
+    let aliases = documentation
+        .find("then create and byte-verify all four aliases")
+        .unwrap();
+    let dispatchers = documentation
+        .find("then install the ordinary `git` and `gh` dispatchers")
+        .unwrap();
+    let validate = documentation
+        .find("finally run offline `dev-auth validate`")
+        .unwrap();
+    assert!(verify < aliases && aliases < dispatchers && dispatchers < validate);
+    assert!(documentation.contains("disable or remove both dispatchers first"));
+    assert!(documentation.contains("remove the four aliases second"));
+    assert!(documentation.contains("core binary or configuration only last"));
+}
+
 fn exact_permissions() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("actions".into(), "read".into()),

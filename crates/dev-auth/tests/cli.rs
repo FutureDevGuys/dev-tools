@@ -429,9 +429,11 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     let runtime = private_runtime();
     for frontend in [
         "git-dev-auth",
+        "git-credential-dev-auth",
         "gh-dev-auth",
         "ssh-keygen-dev-auth",
         "git-dev-auth.exe",
+        "git-credential-dev-auth.exe",
         "gh-dev-auth.exe",
         "ssh-keygen-dev-auth.exe",
     ] {

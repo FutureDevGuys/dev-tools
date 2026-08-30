@@ -629,9 +629,15 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
         builder.recursive(false);
         #[cfg(unix)]
         builder.mode(0o700);
-        builder
-            .create(path)
-            .with_context(|| format!("create private runtime directory {}", path.display()))?;
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create private runtime directory {}", path.display())
+                })
+            }
+        }
     }
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect private runtime directory {}", path.display()))?;
@@ -2685,6 +2691,7 @@ pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
     if config.git.is_some() {
         let git_program_guard = program_guard(&config.programs.git, "Git")?;
         validate_git_version(&config.programs.git, &git_program_guard)?;
+        git_runtime::validate_workspace_policy(&config)?;
     }
     let references = config.declared_secret_references();
     if online {
@@ -2890,7 +2897,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixListener as StdUnixListener;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
 
     fn config_with_profiles(profiles: BTreeMap<String, SshProfile>) -> Config {
@@ -3447,6 +3454,34 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_private_directory_creation_is_idempotent_but_unsafe_objects_fail() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.path().join("runtime");
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                ensure_private_directory(&target)
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        fs::remove_dir(&target).unwrap();
+        std::os::unix::fs::symlink(root.path(), &target).unwrap();
+        assert!(ensure_private_directory(&target).is_err());
     }
 
     #[test]

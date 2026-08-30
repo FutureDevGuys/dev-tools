@@ -1018,14 +1018,17 @@ fn classify_git_invocation_at(
         .transpose()?
         .unwrap_or_default();
     if let Some(destination) = command_targets.destination.as_ref() {
-        let metadata = fs::symlink_metadata(destination).with_context(|| {
-            format!(
-                "Git {} destination must be pre-created for safe routing",
-                command.unwrap_or("operation")
-            )
-        })?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            bail!("Git init or clone destination must be a regular directory");
+        match fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => bail!("Git init or clone destination must be a regular directory"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = destination
+                    .parent()
+                    .context("Git clone destination has no existing parent")?;
+                canonical_existing_directory(parent, "Git clone destination parent")?;
+            }
+            Err(error) => return Err(error).context("inspect Git clone destination"),
         }
     }
     targets.extend(command_targets.paths);
@@ -1562,6 +1565,7 @@ fn validate_local_git_config_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_git_attributes(bytes: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(bytes).context("Git attributes file is not UTF-8")?;
     for line in text.lines() {
@@ -1612,11 +1616,13 @@ fn validate_local_git_configuration(
             bail!("literal local Git configuration contains an empty key");
         }
         let key = std::str::from_utf8(key).context("literal local Git key is not UTF-8")?;
-        validate_local_git_config_key(key)?;
+        validate_local_git_config_key(key)
+            .with_context(|| format!("reject local Git configuration key {key}"))?;
     }
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn read_bounded_public_file(path: &Path, description: &str) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
@@ -1635,62 +1641,56 @@ fn read_bounded_public_file(path: &Path, description: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct RepositoryAttributesSnapshot {
+    working: Vec<(PathBuf, Vec<u8>)>,
+    indexed_entries: Vec<u8>,
+    indexed_objects: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[cfg(target_os = "linux")]
 fn repository_attributes_snapshot(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
     top_level: &Path,
     git_dir: &Path,
     common_dir: &Path,
-) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    const ENTRY_LIMIT: usize = 250_000;
+) -> Result<RepositoryAttributesSnapshot> {
     const TOTAL_ATTRIBUTES_LIMIT: u64 = 16 * 1024 * 1024;
-    let mut stack = vec![top_level.to_path_buf()];
-    let mut attribute_paths = Vec::new();
-    let mut entries = 0_usize;
-    while let Some(directory) = stack.pop() {
-        let mut directory_entries = fs::read_dir(&directory)
-            .with_context(|| format!("enumerate managed repository at {}", directory.display()))?
-            .collect::<io::Result<Vec<_>>>()
-            .context("enumerate managed repository entries")?;
-        directory_entries.sort_by_key(|entry| entry.file_name());
-        for entry in directory_entries {
-            entries += 1;
-            if entries > ENTRY_LIMIT {
-                bail!("managed repository exceeds the attribute-scan entry limit");
-            }
-            let path = entry.path();
-            if path == git_dir || entry.file_name() == OsStr::new(".git") {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("inspect managed repository entry {}", path.display()))?;
-            if metadata.file_type().is_symlink() {
-                if entry.file_name() == OsStr::new(".gitattributes") {
-                    bail!("Git attributes file must not be a symbolic link");
-                }
-                continue;
-            }
-            if metadata.file_type().is_dir() {
-                stack.push(path);
-            } else if entry.file_name() == OsStr::new(".gitattributes") {
-                attribute_paths.push(path);
-            }
+    use std::os::unix::ffi::OsStringExt;
+
+    let indexed = indexed_git_attributes_snapshot(program, program_guard, cwd)?;
+    let mut attribute_paths = vec![top_level.join(".gitattributes")];
+    for path in &indexed.paths {
+        let relative = PathBuf::from(OsString::from_vec(path.clone()));
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("indexed Git attributes path is not a safe relative path");
         }
+        attribute_paths.push(top_level.join(relative));
     }
-    attribute_paths.sort();
     for (index, metadata_directory) in [git_dir, common_dir].into_iter().enumerate() {
         if index == 1 && common_dir == git_dir {
             continue;
         }
         let info_attributes = metadata_directory.join("info/attributes");
-        match fs::symlink_metadata(&info_attributes) {
-            Ok(_) => attribute_paths.push(info_attributes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("inspect Git info attributes file"),
-        }
+        attribute_paths.push(info_attributes);
     }
+    attribute_paths.sort();
+    attribute_paths.dedup();
     let mut snapshot = Vec::with_capacity(attribute_paths.len());
     let mut total = 0_u64;
     for path in attribute_paths {
-        let bytes = read_bounded_public_file(&path, "Git attributes file")?;
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(_) => read_bounded_public_file(&path, "Git attributes file")?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspect Git attributes file"),
+        };
         total = total
             .checked_add(bytes.len() as u64)
             .context("Git attributes size overflow")?;
@@ -1700,15 +1700,45 @@ fn repository_attributes_snapshot(
         validate_git_attributes(&bytes)?;
         snapshot.push((path, bytes));
     }
-    Ok(snapshot)
+    Ok(RepositoryAttributesSnapshot {
+        working: snapshot,
+        indexed_entries: indexed.entries,
+        indexed_objects: indexed.objects,
+    })
 }
 
+#[cfg(target_os = "linux")]
 fn validate_repository_attributes(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
     top_level: &Path,
     git_dir: &Path,
     common_dir: &Path,
 ) -> Result<()> {
-    repository_attributes_snapshot(top_level, git_dir, common_dir).map(|_| ())
+    repository_attributes_snapshot(program, program_guard, cwd, top_level, git_dir, common_dir)
+        .map(|_| ())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_repository_attributes(
+    _program: &str,
+    _program_guard: &ProgramGuard,
+    _cwd: &Path,
+    _top_level: &Path,
+    _git_dir: &Path,
+    _common_dir: &Path,
+) -> Result<()> {
+    bail!("managed Git repository attributes are not accepted on this platform")
+}
+
+fn reject_persistent_alternate_objects_path(common_dir: &Path) -> Result<()> {
+    let alternates = common_dir.join("objects/info/alternates");
+    match fs::symlink_metadata(&alternates) {
+        Ok(_) => bail!("persistent Git alternate object databases are not admitted"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("inspect persistent Git alternates authority"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1748,6 +1778,11 @@ impl HeldRepositoryPath {
             || (!directory && !metadata.file_type().is_file())
         {
             bail!("Git repository authority has an unsafe file type");
+        }
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            bail!("Git repository authority must be current-user owned and not writable by group or others");
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -1918,7 +1953,11 @@ fn git_configuration_scope_snapshot(
 }
 
 #[cfg(target_os = "linux")]
-type IndexedGitAttributesSnapshot = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+struct IndexedGitAttributesSnapshot {
+    entries: Vec<u8>,
+    objects: Vec<(Vec<u8>, Vec<u8>)>,
+    paths: Vec<Vec<u8>>,
+}
 
 #[cfg(target_os = "linux")]
 fn indexed_git_attributes_snapshot(
@@ -1949,6 +1988,7 @@ fn indexed_git_attributes_snapshot(
         bail!("indexed Git attributes cannot be bound safely");
     }
     let mut object_ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
     for entry in output.stdout.split(|byte| *byte == 0) {
         if entry.is_empty() {
             continue;
@@ -1971,6 +2011,11 @@ fn indexed_git_attributes_snapshot(
             bail!("indexed Git attribute entry is ambiguous");
         }
         object_ids.insert(object.to_vec());
+        let path = &entry[tab + 1..];
+        if path.is_empty() || path.contains(&0) {
+            bail!("indexed Git attribute path is ambiguous");
+        }
+        paths.insert(path.to_vec());
     }
     let mut objects = Vec::with_capacity(object_ids.len());
     let mut total = 0_u64;
@@ -1994,7 +2039,30 @@ fn indexed_git_attributes_snapshot(
         validate_git_attributes(&blob.stdout)?;
         objects.push((object, blob.stdout));
     }
-    Ok((output.stdout, objects))
+    Ok(IndexedGitAttributesSnapshot {
+        entries: output.stdout,
+        objects,
+        paths: paths.into_iter().collect(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reject_persistent_alternate_objects(
+    common_dir: &Path,
+    held_paths: &mut Vec<HeldRepositoryPath>,
+) -> Result<()> {
+    let objects = common_dir.join("objects");
+    held_paths.push(HeldRepositoryPath::open(&objects, true)?);
+    let info = objects.join("info");
+    match fs::symlink_metadata(&info) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            held_paths.push(HeldRepositoryPath::open(&info, true)?);
+        }
+        Ok(_) => bail!("Git object-info authority has an unsafe file type"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect Git object-info authority"),
+    }
+    reject_persistent_alternate_objects_path(common_dir)
 }
 
 #[cfg(target_os = "linux")]
@@ -2037,9 +2105,6 @@ fn repository_authority_binding(
     let local_config = git_configuration_scope_snapshot(program, program_guard, cwd, "--local")?;
     let worktree_config =
         git_configuration_scope_snapshot(program, program_guard, cwd, "--worktree")?;
-    let attributes = repository_attributes_snapshot(&top_level, &git_dir, &common_dir)?;
-    let (indexed_entries, indexed_objects) =
-        indexed_git_attributes_snapshot(program, program_guard, cwd)?;
 
     let mut held_paths = Vec::new();
     for directory in [&top_level, &git_dir, &common_dir] {
@@ -2051,13 +2116,23 @@ fn repository_authority_binding(
         }
         held_paths.push(HeldRepositoryPath::open(directory, true)?);
     }
+    reject_persistent_alternate_objects(&common_dir, &mut held_paths)?;
+    let attributes = repository_attributes_snapshot(
+        program,
+        program_guard,
+        cwd,
+        &top_level,
+        &git_dir,
+        &common_dir,
+    )?;
     let mut public_files = vec![top_level.join(".git")];
     for metadata_directory in [&git_dir, &common_dir] {
         for relative in ["config", "config.worktree"] {
             public_files.push(metadata_directory.join(relative));
         }
     }
-    public_files.extend(attributes.iter().map(|(path, _)| path.clone()));
+    public_files.push(git_dir.join("index"));
+    public_files.extend(attributes.working.iter().map(|(path, _)| path.clone()));
     public_files.sort();
     public_files.dedup();
     for path in public_files {
@@ -2085,8 +2160,8 @@ fn repository_authority_binding(
     update_length_prefixed_digest(&mut digest, &local_config);
     update_length_prefixed_digest(&mut digest, b"worktree-config");
     update_length_prefixed_digest(&mut digest, &worktree_config);
-    update_length_prefixed_digest(&mut digest, &indexed_entries);
-    for (object, bytes) in &indexed_objects {
+    update_length_prefixed_digest(&mut digest, &attributes.indexed_entries);
+    for (object, bytes) in &attributes.indexed_objects {
         update_length_prefixed_digest(&mut digest, object);
         update_length_prefixed_digest(&mut digest, bytes);
     }
@@ -2098,7 +2173,7 @@ fn repository_authority_binding(
         };
         held.update_digest(&mut digest, b"path", bytes.as_deref());
     }
-    for (path, bytes) in &attributes {
+    for (path, bytes) in &attributes.working {
         use std::os::unix::ffi::OsStrExt;
         update_length_prefixed_digest(&mut digest, b"attributes");
         update_length_prefixed_digest(&mut digest, path.as_os_str().as_bytes());
@@ -2122,6 +2197,10 @@ fn clone_authority_binding(
     request: GitAuthorityRequest<'_>,
     prepare_destination: bool,
 ) -> Result<GitChildAuthorityBinding> {
+    let parent = destination
+        .parent()
+        .context("managed clone destination has no parent")?;
+    let parent = HeldRepositoryPath::open(parent, true)?;
     match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
@@ -2148,6 +2227,7 @@ fn clone_authority_binding(
         }
         Err(error) => return Err(error).context("inspect managed clone destination"),
     }
+    parent.verify_path_identity_with_mutable_directory(true)?;
     let held = HeldRepositoryPath::open(destination, true)?;
     let mut digest = Sha256::new();
     update_length_prefixed_digest(&mut digest, b"dev-auth-git-clone-authority-v1");
@@ -2163,7 +2243,7 @@ fn clone_authority_binding(
         operation: request.operation.to_owned(),
         digest: format!("{:x}", digest.finalize()),
         root: destination.to_path_buf(),
-        _held_paths: vec![held],
+        _held_paths: vec![parent, held],
     })
 }
 
@@ -2393,7 +2473,15 @@ fn validate_managed_repository_context(
     if !has_repository_hint {
         validate_local_git_configuration(program, program_guard, cwd, environment)?;
     }
-    validate_repository_attributes(&top_level, &git_dir, &common_dir)?;
+    reject_persistent_alternate_objects_path(&common_dir)?;
+    validate_repository_attributes(
+        program,
+        program_guard,
+        cwd,
+        &top_level,
+        &git_dir,
+        &common_dir,
+    )?;
     Ok(Some(top_level))
 }
 
@@ -2431,7 +2519,15 @@ fn validate_managed_repository_context(
         path_guards.push(guard);
     }
     validate_local_git_configuration(program, program_guard, cwd, environment)?;
-    validate_repository_attributes(&top_level, &git_dir, &common_dir)?;
+    reject_persistent_alternate_objects_path(&common_dir)?;
+    validate_repository_attributes(
+        program,
+        program_guard,
+        cwd,
+        &top_level,
+        &git_dir,
+        &common_dir,
+    )?;
     Ok(path_guards)
 }
 
@@ -2443,6 +2539,16 @@ fn workspace_status_at(
     let config = load_config_at(config_path)?;
     let roots = resolved_workspace_roots(&config, home)?;
     classify_existing_directory(current, &roots)
+}
+
+fn validate_workspace_policy_at(config: &Config, home: &Path) -> Result<()> {
+    let _roots = resolved_workspace_roots(config, home)?;
+    Ok(())
+}
+
+pub(super) fn validate_workspace_policy(config: &Config) -> Result<()> {
+    let home = native_current_user_home()?;
+    validate_workspace_policy_at(config, &home)
 }
 
 pub fn workspace_status() -> Result<WorkspaceContext> {
@@ -2462,7 +2568,7 @@ fn literal_origin_repository_at_os(
             "config",
             "--no-includes",
             "--null",
-            "--get",
+            "--get-all",
             "remote.origin.url",
         ])
         .current_dir(working_directory)
@@ -2535,6 +2641,17 @@ fn git_capability_name(capability: crate::GitCapability) -> &'static str {
         crate::GitCapability::NoAuthority => "none",
         crate::GitCapability::GitHubToken => "credential",
         crate::GitCapability::Signing => "signing",
+    }
+}
+
+fn require_supported_managed_git_platform() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!("managed Git execution is accepted only on supported Linux")
     }
 }
 
@@ -2970,12 +3087,16 @@ fn validate_managed_clone_postcondition(
     )
 }
 
-fn run_git_at(
+fn run_git_at_with_signing_key<F>(
     directories: &NativeUserDirs,
     cwd: &Path,
     environment: &BTreeMap<OsString, OsString>,
     arguments: &[OsString],
-) -> Result<ExitStatus> {
+    signing_key_provider: F,
+) -> Result<ExitStatus>
+where
+    F: FnOnce(&RuntimePaths, &Config, &str) -> Result<String>,
+{
     let paths = RuntimePaths::from_native(directories);
     let (config, config_digest) = load_config_snapshot_at(&paths.config)?;
     let roots = resolved_workspace_roots(&config, &directories.home)?;
@@ -3019,6 +3140,7 @@ fn run_git_at(
         }
         GitInvocationRoute::Managed(root_index) => root_index,
     };
+    require_supported_managed_git_platform()?;
     validate_git_version(&config.programs.git, &program_guard)?;
     let unicode_arguments: Vec<String> = arguments
         .iter()
@@ -3108,11 +3230,7 @@ fn run_git_at(
     };
     let frontends = fresh_git_child_frontends(&paths, capability)?;
     let signing_public_key = if capability == crate::GitCapability::Signing {
-        Some(declared_signing_public_key(
-            &paths,
-            &config,
-            &policy.ssh_profile,
-        )?)
+        Some(signing_key_provider(&paths, &config, &policy.ssh_profile)?)
     } else {
         None
     };
@@ -3200,6 +3318,21 @@ fn run_git_at(
     Ok(status)
 }
 
+fn run_git_at(
+    directories: &NativeUserDirs,
+    cwd: &Path,
+    environment: &BTreeMap<OsString, OsString>,
+    arguments: &[OsString],
+) -> Result<ExitStatus> {
+    run_git_at_with_signing_key(
+        directories,
+        cwd,
+        environment,
+        arguments,
+        declared_signing_public_key,
+    )
+}
+
 pub fn run_git(arguments: &[OsString]) -> Result<ExitStatus> {
     let directories = native_routing_directories()?;
     let cwd = env::current_dir().context("read Git invocation directory")?;
@@ -3277,6 +3410,21 @@ private_key_ref = "op://Automation/signing/private-key"
 fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 "#,
             workspace_root.display()
+        );
+        fs::write(config_path, config).unwrap();
+        fs::set_permissions(config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_workspace_config_with_git(
+        config_path: &Path,
+        workspace_root: &Path,
+        git_program: &Path,
+    ) {
+        write_workspace_config(config_path, workspace_root);
+        let config = fs::read_to_string(config_path).unwrap().replace(
+            "git = \"/usr/bin/git\"",
+            &format!("git = \"{}\"", git_program.display()),
         );
         fs::write(config_path, config).unwrap();
         fs::set_permissions(config_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3573,13 +3721,16 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         )
         .is_err());
 
-        assert!(classify_git_invocation_at(
-            &["init".into(), "new-repository".into()],
-            &unmanaged,
-            &roots,
-            &empty_environment,
-        )
-        .is_err());
+        assert_eq!(
+            classify_git_invocation_at(
+                &["init".into(), "new-repository".into()],
+                &unmanaged,
+                &roots,
+                &empty_environment,
+            )
+            .unwrap(),
+            GitInvocationRoute::Unmanaged
+        );
         fs::create_dir(unmanaged.join("new-repository")).unwrap();
         assert_eq!(
             classify_git_invocation_at(
@@ -3901,19 +4052,22 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             });
         }
 
-        for line in [
-            "* filter=lfs",
-            "*.bin -filter",
-            "*.rs diff=rust",
-            "*.lock merge=ours",
-            "[attr]binary -diff -merge -text",
-        ] {
-            assert!(
-                validate_git_attributes(line.as_bytes()).is_err(),
-                "accepted {line}"
-            );
+        #[cfg(target_os = "linux")]
+        {
+            for line in [
+                "* filter=lfs",
+                "*.bin -filter",
+                "*.rs diff=rust",
+                "*.lock merge=ours",
+                "[attr]binary -diff -merge -text",
+            ] {
+                assert!(
+                    validate_git_attributes(line.as_bytes()).is_err(),
+                    "accepted {line}"
+                );
+            }
+            validate_git_attributes(b"* text=auto eol=lf\n*.zip binary export-ignore\n").unwrap();
         }
-        validate_git_attributes(b"* text=auto eol=lf\n*.zip binary export-ignore\n").unwrap();
     }
 
     #[cfg(unix)]
@@ -3930,6 +4084,271 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
         fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
         resolved_workspace_roots(&config, root.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_workspace_policy_validation_matches_runtime_root_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let valid = root.path().join("valid");
+        let missing = root.path().join("missing");
+        let linked = root.path().join("linked");
+        fs::create_dir(&valid).unwrap();
+        fs::set_permissions(&valid, fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = root.path().join("config.toml");
+        write_workspace_config(&config_path, &valid);
+        let mut config = parse_config(&fs::read(&config_path).unwrap()).unwrap();
+        validate_workspace_policy_at(&config, root.path()).unwrap();
+
+        config.git.as_mut().unwrap().workspace_roots = vec![missing.display().to_string()];
+        assert!(validate_workspace_policy_at(&config, root.path()).is_err());
+
+        std::os::unix::fs::symlink(&valid, &linked).unwrap();
+        config.git.as_mut().unwrap().workspace_roots = vec![linked.display().to_string()];
+        assert!(validate_workspace_policy_at(&config, root.path()).is_err());
+
+        config.git.as_mut().unwrap().workspace_roots = vec![valid.display().to_string()];
+        fs::set_permissions(&valid, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(validate_workspace_policy_at(&config, root.path()).is_err());
+        fs::set_permissions(&valid, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let nested = valid.join("nested");
+        fs::create_dir(&nested).unwrap();
+        config.git.as_mut().unwrap().workspace_roots =
+            vec![valid.display().to_string(), nested.display().to_string()];
+        assert!(validate_workspace_policy_at(&config, root.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_repository_authority_rejects_foreign_writable_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let guard = test_git_guard();
+        let config_digest = "00".repeat(32);
+
+        for (path, unsafe_mode, safe_mode) in [
+            (repository.join(".git/config"), 0o664, 0o600),
+            (repository.join(".git"), 0o775, 0o700),
+            (repository.clone(), 0o775, 0o700),
+        ] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(unsafe_mode)).unwrap();
+            for (capability, operation) in [("credential", "fetch"), ("signing", "commit")] {
+                assert!(repository_authority_binding(
+                    "/usr/bin/git",
+                    &guard,
+                    &repository,
+                    GitAuthorityRequest {
+                        config_digest: &config_digest,
+                        capability,
+                        operation,
+                        owner: "ExampleOrg",
+                        repository: "repository",
+                    },
+                )
+                .is_err());
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(safe_mode)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_alternate_object_databases_are_never_private_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let external = root.path().join("external-objects");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(&external).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let alternates = repository.join(".git/objects/info/alternates");
+        let guard = test_git_guard();
+        let config_digest = "00".repeat(32);
+        let capture = || {
+            repository_authority_binding(
+                "/usr/bin/git",
+                &guard,
+                &repository,
+                GitAuthorityRequest {
+                    config_digest: &config_digest,
+                    capability: "credential",
+                    operation: "fetch",
+                    owner: "ExampleOrg",
+                    repository: "repository",
+                },
+            )
+        };
+
+        for value in [
+            external.display().to_string(),
+            "../../../../external-objects".to_owned(),
+        ] {
+            fs::write(&alternates, format!("{value}\n")).unwrap();
+            assert!(capture().is_err());
+            fs::remove_file(&alternates).unwrap();
+        }
+        std::os::unix::fs::symlink(&external, &alternates).unwrap();
+        assert!(capture().is_err());
+        fs::remove_file(&alternates).unwrap();
+
+        let binding = capture().unwrap();
+        fs::write(&alternates, format!("{}\n", external.display())).unwrap();
+        assert!(binding.verify_held_paths().is_err() || capture().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_origin_requires_exactly_one_effective_value() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        for value in [
+            "https://github.com/ExampleOrg/one.git",
+            "https://github.com/ExampleOrg/two.git",
+        ] {
+            assert!(Command::new("/usr/bin/git")
+                .args(["config", "--local", "--add", "remote.origin.url", value])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(literal_origin_repository_at_os(
+            "/usr/bin/git",
+            &test_git_guard(),
+            &repository,
+            &BTreeMap::new(),
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_managed_clone_destination_is_routable_and_reserved_privately() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("managed");
+        fs::create_dir(&managed).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = managed.join("repository");
+        let arguments = [
+            OsString::from("clone"),
+            OsString::from("--no-checkout"),
+            OsString::from("https://github.com/ExampleOrg/repository.git"),
+            OsString::from("repository"),
+        ];
+        assert_eq!(
+            classify_git_invocation_at(
+                &arguments,
+                &managed,
+                &[fs::canonicalize(&managed).unwrap()],
+                &BTreeMap::new(),
+            )
+            .unwrap(),
+            GitInvocationRoute::Managed(0)
+        );
+
+        let config_digest = "00".repeat(32);
+        let binding = stable_clone_authority_binding(
+            &destination,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: "credential",
+                operation: "clone",
+                owner: "ExampleOrg",
+                repository: "repository",
+            },
+        )
+        .unwrap();
+        assert!(destination.is_dir());
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        binding.verify_held_paths().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_authority_ignores_large_irrelevant_untracked_subtrees() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let ignored = repository.join("ignored-generated-tree");
+        fs::create_dir(&ignored).unwrap();
+        for index in 0..4096 {
+            fs::write(ignored.join(format!("artifact-{index}")), b"irrelevant").unwrap();
+        }
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let config_digest = "00".repeat(32);
+        let result = repository_authority_binding(
+            "/usr/bin/git",
+            &test_git_guard(),
+            &repository,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: "credential",
+                operation: "fetch",
+                owner: "ExampleOrg",
+                repository: "repository",
+            },
+        );
+        fs::set_permissions(&ignored, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
     }
 
     #[cfg(unix)]
@@ -4123,6 +4542,12 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .unwrap()
             .success());
         fs::write(repository.join("nested/.gitattributes"), "* filter=evil\n").unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["add", "--", "nested/.gitattributes"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         assert!(validate_managed_repository_context(
             "/usr/bin/git",
             &test_git_guard(),
@@ -4134,6 +4559,12 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         )
         .is_err());
         assert!(!marker.exists());
+        assert!(Command::new("/usr/bin/git")
+            .args(["rm", "--cached", "--force", "--", "nested/.gitattributes"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         fs::remove_file(repository.join("nested/.gitattributes")).unwrap();
         assert!(Command::new("/usr/bin/git")
             .args([
@@ -4368,6 +4799,19 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             &BTreeMap::new(),
         )
         .unwrap();
+        assert!(literal_origin_repository_at_os(
+            "/usr/bin/git",
+            &test_git_guard(),
+            &worktree,
+            &BTreeMap::new(),
+        )
+        .is_err());
+        assert!(Command::new("/usr/bin/git")
+            .args(["config", "--local", "--unset-all", "remote.origin.url"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         assert_eq!(
             literal_origin_repository_at_os(
                 "/usr/bin/git",
@@ -4834,6 +5278,345 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             expected.sort();
             assert_eq!(names, expected);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ignored_untracked_attributes_cannot_select_an_ambient_driver() {
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::create_dir(repository.join("nested")).unwrap();
+        fs::write(repository.join("nested/tracked.txt"), "initial\n").unwrap();
+        fs::write(repository.join(".gitignore"), "nested/.gitattributes\n").unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["add", "--", ".gitignore", "nested/tracked.txt"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+
+        let marker = root.path().join("ambient-filter-ran");
+        let driver = root.path().join("ambient-filter");
+        fs::write(
+            &driver,
+            format!("#!/bin/sh\nprintf invoked > '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o700)).unwrap();
+        let ambient_global = root.path().join("ambient-global-config");
+        fs::write(
+            &ambient_global,
+            format!(
+                "[filter \"evil\"]\n\tclean = {}\n\tsmudge = {}\n[diff \"evil\"]\n\tcommand = {}\n[merge \"evil\"]\n\tdriver = {}\n",
+                driver.display(),
+                driver.display(),
+                driver.display(),
+                driver.display(),
+            ),
+        )
+        .unwrap();
+        let guard = test_git_guard();
+        let config_digest = "00".repeat(32);
+        let request = GitAuthorityRequest {
+            config_digest: &config_digest,
+            capability: "credential",
+            operation: "fetch",
+            owner: "ExampleOrg",
+            repository: "repository",
+        };
+        let before =
+            repository_authority_binding("/usr/bin/git", &guard, &repository, request).unwrap();
+        fs::write(
+            repository.join("nested/.gitattributes"),
+            "* filter=evil diff=evil merge=evil\n",
+        )
+        .unwrap();
+        fs::write(repository.join("nested/tracked.txt"), "changed\n").unwrap();
+
+        let ordinary = Command::new("/usr/bin/git")
+            .args(["status", "--short"])
+            .current_dir(&repository)
+            .env("GIT_CONFIG_GLOBAL", &ambient_global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .status()
+            .unwrap();
+        assert!(ordinary.success());
+        assert!(
+            marker.exists(),
+            "positive control did not invoke the driver"
+        );
+        fs::remove_file(&marker).unwrap();
+
+        let after =
+            repository_authority_binding("/usr/bin/git", &guard, &repository, request).unwrap();
+        assert_eq!(before.digest, after.digest);
+
+        let paths = RuntimePaths {
+            config: root.path().join("config.toml"),
+            runtime: root.path().join("runtime"),
+        };
+        let policy = crate::GitPolicy {
+            workspace_roots: vec![root.path().display().to_string()],
+            author_name: "Automation Worker".into(),
+            author_email: "automation@example.invalid".into(),
+            ssh_profile: "automation".into(),
+        };
+        let frontends =
+            fresh_git_child_frontends(&paths, crate::GitCapability::NoAuthority).unwrap();
+        let hooks = fresh_git_hooks_directory(&paths).unwrap();
+        let input = BTreeMap::from([(
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            ambient_global.into_os_string(),
+        )]);
+        let environment = isolated_git_environment(
+            &input,
+            &paths,
+            frontends.path(),
+            &policy,
+            crate::GitCapability::NoAuthority,
+            &config_digest,
+            None,
+        );
+        let mut arguments = managed_git_configuration_arguments(
+            &paths,
+            &policy,
+            crate::GitCapability::NoAuthority,
+            "ExampleOrg",
+            "repository",
+            None,
+            hooks.path(),
+        )
+        .unwrap();
+        arguments.extend([OsString::from("status"), OsString::from("--short")]);
+        let mut child = guarded_command("/usr/bin/git", &guard).unwrap();
+        let output = child
+            .args(arguments)
+            .current_dir(&repository)
+            .env_clear()
+            .envs(environment)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "managed Git status failed");
+        assert!(!marker.exists(), "managed Git executed the ambient driver");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_public_git_path_succeeds_without_human_configuration() {
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let home = root.path().join("home");
+        let managed = home.join("managed");
+        let repository = managed.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let config_path = home.join(".config/dev-auth/config.toml");
+        write_workspace_config(&config_path, &managed);
+        let directories = NativeUserDirs {
+            home,
+            config: config_path,
+            runtime: root.path().join("runtime"),
+        };
+        let hostile_global = root.path().join("hostile-global");
+        fs::write(
+            &hostile_global,
+            "[alias]\n\tstatus = !exit 97\n[credential]\n\thelper = !exit 98\n",
+        )
+        .unwrap();
+        let environment = BTreeMap::from([
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                hostile_global.into_os_string(),
+            ),
+            (
+                OsString::from("GIT_ASKPASS"),
+                OsString::from("/usr/bin/false"),
+            ),
+        ]);
+        let status = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[OsString::from("status"), OsString::from("--short")],
+        )
+        .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_clone_credential_and_signing_paths_use_only_their_bound_frontend() {
+        let native_home = native_current_user_home().unwrap();
+        let root = tempfile::tempdir_in(native_home).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let home = root.path().join("home");
+        let managed = home.join("managed");
+        let repository = managed.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let marker = root.path().join("managed-child-record");
+        let wrapper = root.path().join("guarded-git");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'git version 2.55.0\n'
+  exit 0
+fi
+verb=
+last=
+for argument in "$@"; do
+  case "$argument" in
+    status|fetch|push|clone|commit|tag) verb=$argument ;;
+  esac
+  last=$argument
+done
+if [ -z "$verb" ]; then
+  exec /usr/bin/git "$@"
+fi
+{{
+  printf 'verb=%s capability=%s\n' "$verb" "$DEV_AUTH_GIT_CAPABILITY"
+  printf 'askpass=%s global=%s\n' "$GIT_ASKPASS" "$GIT_CONFIG_GLOBAL"
+  /usr/bin/find "$PATH" -mindepth 1 -maxdepth 1 -printf 'frontend=%f\n' | /usr/bin/sort
+}} >> '{}'
+if [ "$verb" = clone ]; then
+  /usr/bin/git init --quiet "$last" || exit 80
+  printf '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n[remote "origin"]\n\turl = https://github.com/ExampleOrg/repository.git\n' > "$last/.git/config" || exit 81
+fi
+exit 0
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = home.join(".config/dev-auth/config.toml");
+        write_workspace_config_with_git(&config_path, &managed, &wrapper);
+        let directories = NativeUserDirs {
+            home,
+            config: config_path,
+            runtime: root.path().join("runtime"),
+        };
+        let hostile_global = root.path().join("hostile-global");
+        fs::write(&hostile_global, "[credential]\n\thelper = !exit 99\n").unwrap();
+        let environment = BTreeMap::from([
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                hostile_global.as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("GIT_ASKPASS"),
+                OsString::from("/usr/bin/false"),
+            ),
+        ]);
+        let signing_key = |_paths: &RuntimePaths, _config: &Config, profile: &str| {
+            assert_eq!(profile, "automation");
+            Ok("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest dev-auth:signing".to_owned())
+        };
+
+        let fetch = run_git_at_with_signing_key(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("fetch"),
+                OsString::from("origin"),
+                OsString::from("refs/heads/main:refs/remotes/origin/main"),
+            ],
+            signing_key,
+        )
+        .unwrap();
+        assert!(fetch.success());
+        let commit = run_git_at_with_signing_key(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("commit"),
+                OsString::from("--no-status"),
+                OsString::from("--message"),
+                OsString::from("bounded message"),
+            ],
+            signing_key,
+        )
+        .unwrap();
+        assert!(commit.success());
+        let clone = run_git_at_with_signing_key(
+            &directories,
+            &managed,
+            &environment,
+            &[
+                OsString::from("clone"),
+                OsString::from("--no-checkout"),
+                OsString::from("https://github.com/ExampleOrg/repository.git"),
+                OsString::from("clone-target"),
+            ],
+            signing_key,
+        )
+        .unwrap();
+        assert!(clone.success());
+
+        let record = fs::read_to_string(&marker).unwrap();
+        assert!(record.contains("verb=fetch capability=credential"));
+        assert!(record.contains("verb=commit capability=signing"));
+        assert!(record.contains("verb=clone capability=credential"));
+        assert!(record.contains("frontend=git-credential-dev-auth"));
+        assert!(record.contains("frontend=ssh-keygen-dev-auth"));
+        assert!(!record.contains(&hostile_global.display().to_string()));
+        assert!(!record.contains("askpass=/usr/bin/false"));
     }
 
     #[test]
