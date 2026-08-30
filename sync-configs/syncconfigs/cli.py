@@ -263,6 +263,7 @@ STATUS_COLORS = {
 # Display order and headers for buffered output grouping.
 STATUS_GROUP_ORDER = (
     ("performed", "Performed"),
+    ("info", "Information"),
     ("script_error", "Script Errors"),
     ("script_skipped", "Script Skipped"),
     ("skipped_existing", "Skipped (existing target)"),
@@ -359,10 +360,11 @@ def print_status(
     message: str,
     use_color: bool,
     *,
-    stream=sys.stdout,
+    stream=None,
     entry: "Entry" | None = None,
     widths: "PrintWidths" | None = None,
 ) -> None:
+    output = sys.stdout if stream is None else stream
     prefix = format_status(status_key, use_color)
 
     if entry is not None and widths is not None:
@@ -375,7 +377,7 @@ def print_status(
     else:
         formatted = message
 
-    print(f"{prefix} {formatted}", file=stream)
+    print(f"{prefix} {formatted}", file=output)
 
 
 @dataclass
@@ -1302,7 +1304,8 @@ def entry_signature(
 
 
 def dedupe_and_validate_duplicate_targets(
-    entries: list[Entry], use_color: bool, widths: PrintWidths
+    entries: list[Entry],
+    buffer: list[StatusRecord],
 ) -> tuple[list[Entry], int]:
     buckets: dict[Path, list[Entry]] = defaultdict(list)
     for entry in entries:
@@ -1326,14 +1329,16 @@ def dedupe_and_validate_duplicate_targets(
         signatures = {entry_signature(item) for item in grouped}
         if len(signatures) == 1:
             deduped.append(grouped[0])
-            print_status(
-                "info",
-                "deduplicated "
-                f"{len(grouped) - 1} equivalent duplicate target entries for "
-                f"{grouped[0].target}; keeping first",
-                use_color,
-                entry=grouped[0],
-                widths=widths,
+            buffer.append(
+                StatusRecord(
+                    status_key="info",
+                    message=(
+                        "deduplicated "
+                        f"{len(grouped) - 1} equivalent duplicate target entries for "
+                        f"{grouped[0].target}; keeping first"
+                    ),
+                    entry=grouped[0],
+                )
             )
             continue
 
@@ -2157,9 +2162,16 @@ def flush_status_buffer(
             print(f"  {line}")
             if record.script_output:
                 for output_line in record.script_output.strip().splitlines():
-                    print(f"    {output_line}")
+                    hook_line = format_status_line(
+                        "info",
+                        output_line,
+                        use_color,
+                        entry=record.entry,
+                        widths=widths,
+                    )
+                    print(f"    {hook_line}")
 
-    # Print records with status keys not in STATUS_GROUP_ORDER (e.g. "info")
+    # Print records with status keys not in STATUS_GROUP_ORDER.
     shown_keys = {key for key, _ in STATUS_GROUP_ORDER}
     for status_key, records in grouped.items():
         if status_key in shown_keys or not records:
@@ -2654,7 +2666,7 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
     )
 
     entries, duplicate_conflicts = dedupe_and_validate_duplicate_targets(
-        entries, use_color=use_color, widths=widths
+        entries, buffer=buffer
     )
     if duplicate_conflicts:
         print_status(
