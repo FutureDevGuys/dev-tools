@@ -220,6 +220,118 @@ def test_dry_run_is_structured_and_executes_no_hooks_or_writes(tmp_path: Path) -
     assert not marker.exists()
 
 
+def test_json_output_stays_machine_readable_with_duplicate_target_information(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.conf"
+    target = tmp_path / "target.conf"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text("managed\n", encoding="utf-8")
+    manifest.write_text(
+        "\n".join(
+            [
+                "entries:",
+                "  - name: first",
+                "    group: CLI",
+                "    subgroup: Example",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: copy",
+                "  - name: second",
+                "    group: CLI",
+                "    subgroup: Example",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: copy",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli(
+        "--config", str(manifest), "--dry-run", "--format", "json"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["outcome"] == "completed"
+    assert "\x1b[" not in result.stdout
+    assert "deduplicated" not in result.stdout
+
+
+def test_duplicate_information_is_buffered_in_its_own_group(tmp_path: Path) -> None:
+    source = tmp_path / "source.conf"
+    target = tmp_path / "target.conf"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text("managed\n", encoding="utf-8")
+    manifest.write_text(
+        "\n".join(
+            [
+                "entries:",
+                "  - name: first",
+                "    group: CLI",
+                "    subgroup: Example",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: copy",
+                "  - name: second",
+                "    group: CLI",
+                "    subgroup: Example",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: copy",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli("--config", str(manifest), "--dry-run", "--no-color")
+
+    assert result.returncode == 0, result.stderr
+    assert "Information (1):" in result.stdout
+    assert result.stdout.index("Performed (1):") < result.stdout.index(
+        "Information (1):"
+    )
+    assert "CLI / Example first" in result.stdout
+    assert "deduplicated 1 equivalent duplicate target entries" in result.stdout
+
+
+def test_hook_output_uses_the_colored_aligned_entry_columns(tmp_path: Path) -> None:
+    source = tmp_path / "source.conf"
+    target = tmp_path / "target.conf"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text("managed\n", encoding="utf-8")
+    manifest.write_text(
+        "\n".join(
+            [
+                "entries:",
+                "  - name: generated_surface",
+                "    group: MCP",
+                "    subgroup: Servers",
+                f"    source: {source}",
+                f"    target: {target}",
+                "    mode: copy",
+                "    post_script: printf 'hook detail\\n'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli("--config", str(manifest))
+
+    assert result.returncode == 0, result.stderr
+    hook_line = next(
+        line
+        for line in result.stdout.splitlines()
+        if "hook detail" in line and "post_script ok" not in line
+    )
+    assert "\x1b[34m[info]" in hook_line
+    assert "MCP / Servers" in hook_line
+    assert "generated_surface" in hook_line
+
+
 def test_external_profile_map_preserves_order_and_deduplicates(tmp_path: Path) -> None:
     source = tmp_path / "source.conf"
     target = tmp_path / "target.conf"
