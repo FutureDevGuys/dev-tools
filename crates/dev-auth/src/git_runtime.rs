@@ -432,6 +432,39 @@ fn canonical_candidate_path(path: &Path, base: &Path) -> Result<PathBuf> {
     windows_absolute_path(path, base)
 }
 
+#[cfg(not(windows))]
+fn canonical_search_path_entry(path: &Path, base: &Path) -> Result<PathBuf> {
+    let absolute = lexical_absolute_path(path, base)?;
+    let mut existing = absolute;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let leaf = existing
+                    .file_name()
+                    .context("Git PATH entry has no existing filesystem ancestor")?
+                    .to_os_string();
+                missing.push(leaf);
+                if !existing.pop() {
+                    bail!("Git PATH entry has no existing filesystem ancestor");
+                }
+            }
+            Err(error) => return Err(error).context("inspect Git PATH entry"),
+        }
+    }
+    let mut canonical = fs::canonicalize(&existing).context("resolve Git PATH entry ancestor")?;
+    for leaf in missing.into_iter().rev() {
+        canonical.push(leaf);
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn canonical_search_path_entry(path: &Path, base: &Path) -> Result<PathBuf> {
+    canonical_candidate_path(path, base)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspacePathRelation {
     Outside,
@@ -780,6 +813,8 @@ fn environment_value<'a>(
 struct EnvironmentGitTargets {
     paths: Vec<PathBuf>,
     repository_override: bool,
+    #[cfg(not(windows))]
+    canonical_search_path: Option<OsString>,
 }
 
 fn push_environment_path(
@@ -940,13 +975,25 @@ fn environment_git_targets(
     }
 
     if let Some(path) = environment_value(environment, "PATH") {
+        #[cfg(not(windows))]
+        let mut canonical_entries = Vec::new();
         for entry in env::split_paths(path) {
             let entry = if entry.as_os_str().is_empty() {
                 cwd.to_path_buf()
             } else {
                 entry
             };
-            result.paths.push(canonical_candidate_path(&entry, cwd)?);
+            let canonical = canonical_search_path_entry(&entry, cwd)?;
+            result.paths.push(canonical.clone());
+            #[cfg(not(windows))]
+            canonical_entries.push(canonical);
+        }
+        #[cfg(not(windows))]
+        {
+            result.canonical_search_path = Some(
+                env::join_paths(canonical_entries)
+                    .context("reconstruct canonical Git PATH environment")?,
+            );
         }
     }
     if let Some(home) = environment_value(environment, "HOME") {
@@ -3938,6 +3985,16 @@ where
     let route = classify_git_invocation_at(arguments, cwd, &roots, environment)?;
     let root_index = match route {
         GitInvocationRoute::Unmanaged => {
+            #[cfg(not(windows))]
+            let environment_targets = environment_git_targets(environment, cwd)?;
+            #[cfg(not(windows))]
+            if environment_targets
+                .paths
+                .iter()
+                .any(|path| workspace_path_relation(path, &roots) != WorkspacePathRelation::Outside)
+            {
+                bail!("unmanaged Git may not target a managed workspace; change directory first");
+            }
             #[cfg(windows)]
             let _repository_path_guards = validate_unmanaged_repository_context(
                 &config.programs.git,
@@ -3954,12 +4011,22 @@ where
                 &roots,
                 environment,
             )?;
+            #[cfg(not(windows))]
+            let unmanaged_environment = {
+                let mut normalized = environment.clone();
+                if let Some(path) = environment_targets.canonical_search_path {
+                    normalized.insert(OsString::from("PATH"), path);
+                }
+                normalized
+            };
+            #[cfg(windows)]
+            let unmanaged_environment = environment.clone();
             let mut command = guarded_command(&config.programs.git, &program_guard)?;
             let status = command
                 .args(arguments)
                 .current_dir(cwd)
                 .env_clear()
-                .envs(environment)
+                .envs(&unmanaged_environment)
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -4826,6 +4893,47 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .unwrap(),
             GitInvocationRoute::Unmanaged,
         );
+
+        let human_bin = unmanaged.join("human-bin");
+        fs::create_dir(&human_bin).unwrap();
+        let linked_human_bin = root.path().join("linked-human-bin");
+        std::os::unix::fs::symlink(&human_bin, &linked_human_bin).unwrap();
+        let symlinked_human_path =
+            BTreeMap::from([(OsString::from("PATH"), linked_human_bin.into_os_string())]);
+        assert_eq!(
+            classify_git_invocation_at(
+                &["status".into()],
+                &managed_repository,
+                &roots,
+                &symlinked_human_path,
+            )
+            .unwrap(),
+            GitInvocationRoute::Managed(0),
+        );
+        assert_eq!(
+            classify_git_invocation_at(
+                &["status".into()],
+                &unmanaged_repository,
+                &roots,
+                &symlinked_human_path,
+            )
+            .unwrap(),
+            GitInvocationRoute::Unmanaged,
+        );
+
+        let managed_bin = managed.join("bin");
+        fs::create_dir(&managed_bin).unwrap();
+        let linked_managed_bin = unmanaged.join("linked-managed-bin");
+        std::os::unix::fs::symlink(&managed_bin, &linked_managed_bin).unwrap();
+        let poisoned_linked_path =
+            BTreeMap::from([(OsString::from("PATH"), linked_managed_bin.into_os_string())]);
+        assert!(classify_git_invocation_at(
+            &["status".into()],
+            &unmanaged_repository,
+            &roots,
+            &poisoned_linked_path,
+        )
+        .is_err());
     }
 
     #[test]
@@ -5957,6 +6065,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .unwrap()
             .success());
         let marker = root.path().join("human-alias-ran");
+        let path_marker = root.path().join("human-path");
         let authority_marker = root.path().join("automation-authority-ran");
         let authority = root.path().join("automation-authority");
         fs::write(
@@ -5969,8 +6078,10 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         .unwrap();
         fs::set_permissions(&authority, fs::Permissions::from_mode(0o700)).unwrap();
         let alias = format!("!printf invoked > '{}'", marker.display());
+        let path_alias = format!("!printf '%s' \"$PATH\" > '{}'", path_marker.display());
         for (key, value) in [
             ("alias.human", alias.as_str()),
+            ("alias.human-path", path_alias.as_str()),
             ("credential.helper", "!printf 'username=human\\n'"),
         ] {
             assert!(Command::new("/usr/bin/git")
@@ -6018,6 +6129,28 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         assert!(!authority_marker.exists());
         assert!(!directories.runtime.exists());
         assert_eq!(fs::read(config_path).unwrap(), original_config);
+
+        let human_bin = root.path().join("human-bin");
+        fs::create_dir(&human_bin).unwrap();
+        let linked_human_bin = root.path().join("linked-human-bin");
+        std::os::unix::fs::symlink(&human_bin, &linked_human_bin).unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("PATH"),
+            linked_human_bin.clone().into_os_string(),
+        )]);
+        let status = run_git_at(
+            &directories,
+            &unmanaged,
+            &environment,
+            &[OsString::from("human-path")],
+        )
+        .unwrap();
+        assert!(status.success());
+        let observed_path = fs::read_to_string(path_marker).unwrap();
+        let observed_entries = env::split_paths(OsStr::new(&observed_path)).collect::<Vec<_>>();
+        assert!(observed_entries.contains(&human_bin));
+        assert!(!observed_entries.contains(&linked_human_bin));
+        assert!(!directories.runtime.exists());
     }
 
     #[cfg(unix)]
