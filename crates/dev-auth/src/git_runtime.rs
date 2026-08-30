@@ -108,6 +108,10 @@ fn native_routing_directories() -> Result<NativeUserDirs> {
     })
 }
 
+pub(super) fn native_runtime_paths() -> Result<RuntimePaths> {
+    Ok(RuntimePaths::from_native(&native_routing_directories()?))
+}
+
 pub(super) fn frontend_runtime_and_config() -> Result<(RuntimePaths, Config)> {
     match env::var("DEV_AUTH_GIT_CHILD") {
         Ok(value) if value == "1" => {
@@ -1616,8 +1620,7 @@ fn validate_local_git_configuration(
             bail!("literal local Git configuration contains an empty key");
         }
         let key = std::str::from_utf8(key).context("literal local Git key is not UTF-8")?;
-        validate_local_git_config_key(key)
-            .with_context(|| format!("reject local Git configuration key {key}"))?;
+        validate_local_git_config_key(key).context("reject local Git configuration authority")?;
     }
     Ok(())
 }
@@ -1832,16 +1835,28 @@ impl HeldRepositoryPath {
     }
 
     fn read_bounded(&self, limit: u64) -> Result<Vec<u8>> {
-        let file = self
+        let length = self
             .file
-            .try_clone()
-            .context("clone held Git authority file")?;
-        let mut bytes = Vec::new();
-        file.take(limit + 1)
-            .read_to_end(&mut bytes)
-            .context("read held Git authority file")?;
-        if bytes.len() as u64 > limit {
+            .metadata()
+            .context("inspect held Git authority file before reading")?
+            .len();
+        if length > limit {
             bail!("Git repository authority file exceeds its size limit");
+        }
+        let length = usize::try_from(length).context("Git authority file size is unsupported")?;
+        let mut bytes = vec![0_u8; length];
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let read = std::os::unix::fs::FileExt::read_at(
+                &self.file,
+                &mut bytes[offset..],
+                offset as u64,
+            )
+            .context("read held Git authority file")?;
+            if read == 0 {
+                bail!("Git repository authority changed while being read");
+            }
+            offset += read;
         }
         Ok(bytes)
     }
@@ -1895,6 +1910,18 @@ struct GitChildAuthorityBinding {
     digest: String,
     root: PathBuf,
     #[cfg(target_os = "linux")]
+    ref_selectors: Vec<String>,
+    #[cfg(target_os = "linux")]
+    mutable_ref_selectors: BTreeSet<String>,
+    #[cfg(target_os = "linux")]
+    reference_values: BTreeMap<String, Option<String>>,
+    #[cfg(target_os = "linux")]
+    git_dir: PathBuf,
+    #[cfg(target_os = "linux")]
+    common_dir: PathBuf,
+    #[cfg(target_os = "linux")]
+    mutable_after_child: BTreeSet<PathBuf>,
+    #[cfg(target_os = "linux")]
     _held_paths: Vec<HeldRepositoryPath>,
 }
 
@@ -1906,6 +1933,146 @@ struct GitAuthorityRequest<'a> {
     operation: &'a str,
     owner: &'a str,
     repository: &'a str,
+    ref_selectors: &'a [String],
+    mutable_ref_selectors: &'a [String],
+}
+
+#[cfg(target_os = "linux")]
+fn valid_bound_ref_selector(value: &str) -> bool {
+    if matches!(value, "HEAD" | "FETCH_HEAD") {
+        return true;
+    }
+    let relative = value
+        .strip_prefix("refs/heads/")
+        .or_else(|| value.strip_prefix("refs/tags/"))
+        .or_else(|| value.strip_prefix("refs/remotes/origin/"));
+    relative.is_some_and(|relative| {
+        !relative.is_empty()
+            && relative.len() <= 1024
+            && relative.split('/').all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && !component.starts_with('.')
+                    && !component.ends_with(['.', '/'])
+                    && !component.ends_with(".lock")
+                    && !component.contains("..")
+                    && !component.contains("@{")
+                    && !component.chars().any(|character| {
+                        character.is_control()
+                            || character.is_whitespace()
+                            || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+                    })
+            })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn git_ref_authority_selectors(arguments: &[String]) -> Result<Vec<String>> {
+    let (operation, tail) = arguments
+        .split_first()
+        .context("managed Git operation is missing")?;
+    let mut selectors = Vec::new();
+    match operation.as_str() {
+        "commit" => selectors.push("HEAD".to_owned()),
+        "tag" => {
+            let mut index = 0_usize;
+            let mut positionals = Vec::new();
+            while index < tail.len() {
+                match tail[index].as_str() {
+                    "-m" | "--message" | "-F" | "--file" => index += 2,
+                    "-a" | "--annotate" => index += 1,
+                    value => {
+                        positionals.push(value);
+                        index += 1;
+                    }
+                }
+            }
+            let tag = positionals
+                .first()
+                .context("managed Git tag name is missing")?;
+            selectors.push(format!("refs/tags/{tag}"));
+            match positionals.get(1).copied().unwrap_or("HEAD") {
+                value @ ("HEAD" | "FETCH_HEAD") => selectors.push(value.to_owned()),
+                value if value.starts_with("refs/") => selectors.push(value.to_owned()),
+                value
+                    if matches!(value.len(), 40 | 64)
+                        && value.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
+                _ => bail!("managed Git tag target cannot be bound exactly"),
+            }
+        }
+        "push" | "fetch" => {
+            for refspec in tail.iter().filter(|value| value.contains(':')) {
+                let (source, destination) = refspec
+                    .split_once(':')
+                    .context("managed Git refspec is malformed")?;
+                let selector = if operation == "push" {
+                    source
+                } else {
+                    destination
+                };
+                selectors.push(selector.to_owned());
+            }
+            if operation == "fetch" {
+                selectors.push("FETCH_HEAD".to_owned());
+            }
+        }
+        _ => {}
+    }
+    selectors.sort();
+    selectors.dedup();
+    if selectors.len() > 128 {
+        bail!("managed Git reference authority has too many selectors");
+    }
+    if selectors
+        .iter()
+        .any(|value| !valid_bound_ref_selector(value))
+    {
+        bail!("managed Git reference authority is malformed");
+    }
+    Ok(selectors)
+}
+
+#[cfg(target_os = "linux")]
+fn git_mutable_ref_selectors(arguments: &[String]) -> Result<Vec<String>> {
+    let (operation, tail) = arguments
+        .split_first()
+        .context("managed Git operation is missing")?;
+    let mut selectors = Vec::new();
+    match operation.as_str() {
+        "commit" => selectors.push("HEAD".to_owned()),
+        "tag" => {
+            let mut index = 0_usize;
+            while index < tail.len() {
+                match tail[index].as_str() {
+                    "-m" | "--message" | "-F" | "--file" => index += 2,
+                    "-a" | "--annotate" => index += 1,
+                    value => {
+                        selectors.push(format!("refs/tags/{value}"));
+                        break;
+                    }
+                }
+            }
+        }
+        "fetch" => {
+            selectors.extend(
+                tail.iter()
+                    .filter_map(|value| value.split_once(':').map(|(_, destination)| destination))
+                    .map(ToOwned::to_owned),
+            );
+            selectors.push("FETCH_HEAD".to_owned());
+        }
+        _ => {}
+    }
+    selectors.sort();
+    selectors.dedup();
+    if selectors
+        .iter()
+        .any(|selector| !valid_bound_ref_selector(selector))
+    {
+        bail!("managed Git mutable reference authority is malformed");
+    }
+    Ok(selectors)
 }
 
 impl GitChildAuthorityBinding {
@@ -1916,6 +2083,25 @@ impl GitChildAuthorityBinding {
         }
         Ok(())
     }
+
+    #[cfg(target_os = "linux")]
+    fn verify_after_child(&self) -> Result<()> {
+        for held in &self._held_paths {
+            if self.mutable_after_child.contains(&held.path) {
+                continue;
+            }
+            held.verify_path_identity_with_mutable_directory(held.directory)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn operation_mutates_repository_authority(operation: &str) -> bool {
+    matches!(
+        operation,
+        "add" | "restore" | "branch" | "switch" | "checkout" | "commit" | "tag" | "fetch"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -2017,33 +2203,133 @@ fn indexed_git_attributes_snapshot(
         }
         paths.insert(path.to_vec());
     }
-    let mut objects = Vec::with_capacity(object_ids.len());
-    let mut total = 0_u64;
-    for object in object_ids {
-        let object_text = std::str::from_utf8(&object).context("Git object ID is not ASCII")?;
-        let mut command = guarded_command(program, program_guard)?;
-        let blob = command
-            .args(["cat-file", "blob", object_text])
-            .current_dir(cwd)
-            .env_clear()
-            .envs(git_probe_environment(&BTreeMap::new()))
-            .stdin(Stdio::null())
-            .output()
-            .context("read indexed Git attributes object")?;
-        total = total
-            .checked_add(blob.stdout.len() as u64)
-            .context("indexed Git attributes size overflow")?;
-        if !blob.status.success() || !blob.stderr.is_empty() || total > 16 * 1024 * 1024 {
-            bail!("indexed Git attributes object cannot be bound safely");
-        }
-        validate_git_attributes(&blob.stdout)?;
-        objects.push((object, blob.stdout));
-    }
+    let objects = read_indexed_attribute_objects_batch(program, program_guard, cwd, object_ids)?;
     Ok(IndexedGitAttributesSnapshot {
         entries: output.stdout,
         objects,
         paths: paths.into_iter().collect(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn read_indexed_attribute_objects_batch(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+    object_ids: BTreeSet<Vec<u8>>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    use std::io::{BufRead, BufReader, Write};
+
+    const HEADER_LIMIT: u64 = 1024;
+    const OBJECT_LIMIT: u64 = CONFIG_LIMIT;
+    const AGGREGATE_LIMIT: u64 = 16 * 1024 * 1024;
+
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut requests = Vec::with_capacity(object_ids.len());
+    for object in &object_ids {
+        if object.len() < 40 || !object.iter().all(u8::is_ascii_hexdigit) {
+            bail!("indexed Git attributes object ID is malformed");
+        }
+        requests.extend_from_slice(object);
+        requests.push(b'\n');
+    }
+    let mut command = guarded_command(program, program_guard)?;
+    let mut child = command
+        .args(["cat-file", "--batch"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_probe_environment(&BTreeMap::new()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("start indexed Git attributes object batch")?;
+    let mut input = child
+        .stdin
+        .take()
+        .context("indexed Git attributes batch has no standard input")?;
+    let writer = std::thread::spawn(move || -> io::Result<()> {
+        input.write_all(&requests)?;
+        input.flush()
+    });
+    let output = child
+        .stdout
+        .take()
+        .context("indexed Git attributes batch has no standard output")?;
+    let mut output = BufReader::new(output);
+    let mut objects = Vec::with_capacity(object_ids.len());
+    let mut aggregate = 0_u64;
+    for expected in object_ids {
+        let mut header = Vec::new();
+        let count = output
+            .by_ref()
+            .take(HEADER_LIMIT + 1)
+            .read_until(b'\n', &mut header)
+            .context("read indexed Git attributes object header")?;
+        if count == 0
+            || count as u64 > HEADER_LIMIT
+            || header.last() != Some(&b'\n')
+            || header.contains(&0)
+        {
+            bail!("indexed Git attributes object header is malformed");
+        }
+        header.pop();
+        let mut fields = header.split(|byte| *byte == b' ');
+        let actual = fields.next().unwrap_or_default();
+        let object_type = fields.next().unwrap_or_default();
+        let size = std::str::from_utf8(fields.next().unwrap_or_default())
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .context("indexed Git attributes object size is malformed")?;
+        if actual != expected
+            || object_type != b"blob"
+            || fields.next().is_some()
+            || size > OBJECT_LIMIT
+        {
+            bail!("indexed Git attributes batch returned an unexpected object");
+        }
+        aggregate = aggregate
+            .checked_add(size)
+            .context("indexed Git attributes size overflow")?;
+        if aggregate > AGGREGATE_LIMIT {
+            bail!("indexed Git attributes exceed the aggregate size limit");
+        }
+        let mut bytes = vec![0_u8; size as usize];
+        output
+            .read_exact(&mut bytes)
+            .context("read indexed Git attributes object")?;
+        let mut terminator = [0_u8; 1];
+        output
+            .read_exact(&mut terminator)
+            .context("read indexed Git attributes object terminator")?;
+        if terminator != *b"\n" {
+            bail!("indexed Git attributes object terminator is malformed");
+        }
+        validate_git_attributes(&bytes)?;
+        objects.push((expected, bytes));
+    }
+    let mut trailing = [0_u8; 1];
+    if output
+        .read(&mut trailing)
+        .context("check indexed Git attributes batch completion")?
+        != 0
+    {
+        bail!("indexed Git attributes batch returned trailing output");
+    }
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("indexed Git attributes batch writer failed"))?
+        .context("write indexed Git attributes object requests")?;
+    if !child
+        .wait()
+        .context("wait for indexed Git attributes object batch")?
+        .success()
+    {
+        bail!("indexed Git attributes object batch failed");
+    }
+    Ok(objects)
 }
 
 #[cfg(target_os = "linux")]
@@ -2063,6 +2349,355 @@ fn reject_persistent_alternate_objects(
         Err(error) => return Err(error).context("inspect Git object-info authority"),
     }
     reject_persistent_alternate_objects_path(common_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn push_unique_held_path(
+    held_paths: &mut Vec<HeldRepositoryPath>,
+    path: &Path,
+    directory: bool,
+) -> Result<()> {
+    if held_paths.iter().any(|held| held.path == path) {
+        return Ok(());
+    }
+    held_paths.push(HeldRepositoryPath::open(path, directory)?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn hold_optional_regular_authority(
+    held_paths: &mut Vec<HeldRepositoryPath>,
+    path: &Path,
+) -> Result<Option<usize>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            if let Some(index) = held_paths.iter().position(|held| held.path == path) {
+                return Ok(Some(index));
+            }
+            held_paths.push(HeldRepositoryPath::open(path, false)?);
+            Ok(Some(held_paths.len() - 1))
+        }
+        Ok(_) => bail!("Git reference authority has an unsafe file type"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect Git reference authority"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn hold_loose_ref_authority(
+    common_dir: &Path,
+    selector: &str,
+    held_paths: &mut Vec<HeldRepositoryPath>,
+) -> Result<()> {
+    if !selector.starts_with("refs/") || !valid_bound_ref_selector(selector) {
+        bail!("Git loose-reference authority is malformed");
+    }
+    let relative = Path::new(selector);
+    let final_path = common_dir.join(relative);
+    let parent = final_path
+        .parent()
+        .context("Git loose-reference authority has no parent")?;
+    let mut current = common_dir.to_path_buf();
+    for component in parent
+        .strip_prefix(common_dir)
+        .context("Git loose-reference authority leaves the common directory")?
+        .components()
+    {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            bail!("Git loose-reference authority is not lexical");
+        }
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                push_unique_held_path(held_paths, &current, true)?;
+            }
+            Ok(_) => bail!("Git loose-reference directory has an unsafe file type"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("inspect Git loose-reference directory"),
+        }
+    }
+    hold_optional_regular_authority(held_paths, &final_path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn hold_reference_authority(
+    git_dir: &Path,
+    common_dir: &Path,
+    selectors: &[String],
+    held_paths: &mut Vec<HeldRepositoryPath>,
+) -> Result<Vec<String>> {
+    let mut selectors = selectors.to_vec();
+    selectors.sort();
+    selectors.dedup();
+    if selectors
+        .iter()
+        .any(|value| !valid_bound_ref_selector(value))
+    {
+        bail!("Git reference authority selector is malformed");
+    }
+    if selectors.is_empty() {
+        return Ok(selectors);
+    }
+    hold_optional_regular_authority(held_paths, &common_dir.join("packed-refs"))?;
+    if selectors.iter().any(|value| value == "HEAD") {
+        let index = hold_optional_regular_authority(held_paths, &git_dir.join("HEAD"))?
+            .context("Git HEAD authority is missing")?;
+        let head = held_paths[index].read_bounded(4096)?;
+        let head = std::str::from_utf8(&head).context("Git HEAD authority is not UTF-8")?;
+        let head = head.trim_end_matches(['\r', '\n']);
+        if let Some(symbolic) = head.strip_prefix("ref: ") {
+            if !valid_bound_ref_selector(symbolic) || !symbolic.starts_with("refs/") {
+                bail!("Git symbolic HEAD authority is malformed");
+            }
+            selectors.push(symbolic.to_owned());
+        } else if !matches!(head.len(), 40 | 64)
+            || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("Git detached HEAD authority is malformed");
+        }
+    }
+    if selectors.iter().any(|value| value == "FETCH_HEAD") {
+        hold_optional_regular_authority(held_paths, &git_dir.join("FETCH_HEAD"))?;
+    }
+    selectors.sort();
+    selectors.dedup();
+    for selector in selectors.iter().filter(|value| value.starts_with("refs/")) {
+        hold_loose_ref_authority(common_dir, selector, held_paths)?;
+    }
+    Ok(selectors)
+}
+
+#[cfg(target_os = "linux")]
+fn exact_reference_hash(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes).context("Git reference value is not UTF-8")?;
+    let text = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    if !matches!(text.len(), 40 | 64) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Git reference value is malformed");
+    }
+    Ok(text.to_ascii_lowercase())
+}
+
+#[cfg(target_os = "linux")]
+fn packed_reference_values(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
+    let text = std::str::from_utf8(bytes).context("packed Git references are not UTF-8")?;
+    let mut references = BTreeMap::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(peeled) = line.strip_prefix('^') {
+            exact_reference_hash(peeled.as_bytes())?;
+            continue;
+        }
+        let (hash, reference) = line
+            .split_once(' ')
+            .context("packed Git reference line is malformed")?;
+        if reference.is_empty()
+            || reference.contains(char::is_whitespace)
+            || !reference.starts_with("refs/")
+        {
+            bail!("packed Git reference name is malformed");
+        }
+        let hash = exact_reference_hash(hash.as_bytes())?;
+        if references.insert(reference.to_owned(), hash).is_some() {
+            bail!("packed Git reference is duplicated");
+        }
+    }
+    Ok(references)
+}
+
+#[cfg(target_os = "linux")]
+fn held_file<'a>(
+    held_paths: &'a [HeldRepositoryPath],
+    path: &Path,
+) -> Option<&'a HeldRepositoryPath> {
+    held_paths
+        .iter()
+        .find(|held| held.path == path && !held.directory)
+}
+
+#[cfg(target_os = "linux")]
+fn reference_authority_values(
+    git_dir: &Path,
+    common_dir: &Path,
+    selectors: &[String],
+    held_paths: &[HeldRepositoryPath],
+) -> Result<BTreeMap<String, Option<String>>> {
+    let packed_path = common_dir.join("packed-refs");
+    let packed = match held_file(held_paths, &packed_path) {
+        Some(held) => packed_reference_values(&held.read_bounded(16 * 1024 * 1024)?)?,
+        None => BTreeMap::new(),
+    };
+    let mut values = BTreeMap::new();
+    for selector in selectors {
+        let value = match selector.as_str() {
+            "HEAD" => {
+                let held = held_file(held_paths, &git_dir.join("HEAD"))
+                    .context("Git HEAD authority is missing")?;
+                let bytes = held.read_bounded(4096)?;
+                let text = std::str::from_utf8(&bytes).context("Git HEAD is not UTF-8")?;
+                let text = text.trim_end_matches(['\r', '\n']);
+                if let Some(symbolic) = text.strip_prefix("ref: ") {
+                    if !valid_bound_ref_selector(symbolic) || !symbolic.starts_with("refs/") {
+                        bail!("Git symbolic HEAD authority is malformed");
+                    }
+                    Some(format!("ref:{symbolic}"))
+                } else {
+                    Some(
+                        exact_reference_hash(text.as_bytes())
+                            .context("validate detached Git HEAD authority")?,
+                    )
+                }
+            }
+            "FETCH_HEAD" => match held_file(held_paths, &git_dir.join("FETCH_HEAD")) {
+                Some(held) => {
+                    let bytes = held.read_bounded(16 * 1024 * 1024)?;
+                    if bytes.is_empty() {
+                        bail!("Git FETCH_HEAD authority is empty");
+                    }
+                    for line in bytes
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                    {
+                        let hash = line
+                            .split(|byte| *byte == b'\t' || *byte == b' ')
+                            .next()
+                            .context("Git FETCH_HEAD line is malformed")?;
+                        exact_reference_hash(hash).context("validate Git FETCH_HEAD authority")?;
+                    }
+                    Some(format!("sha256:{:x}", Sha256::digest(&bytes)))
+                }
+                None => None,
+            },
+            reference if reference.starts_with("refs/") => {
+                match held_file(held_paths, &common_dir.join(reference)) {
+                    Some(held) => Some(
+                        exact_reference_hash(&held.read_bounded(4096)?)
+                            .context("validate loose Git reference authority")?,
+                    ),
+                    None => packed.get(reference).cloned(),
+                }
+            }
+            _ => bail!("Git reference authority selector is malformed"),
+        };
+        values.insert(selector.clone(), value);
+    }
+    Ok(values)
+}
+
+#[cfg(target_os = "linux")]
+fn current_reference_authority_values(
+    binding: &GitChildAuthorityBinding,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let mut held_paths = Vec::new();
+    let selectors = hold_reference_authority(
+        &binding.git_dir,
+        &binding.common_dir,
+        &binding.ref_selectors,
+        &mut held_paths,
+    )?;
+    if selectors != binding.ref_selectors {
+        bail!("managed Git symbolic reference authority changed unexpectedly");
+    }
+    let values = reference_authority_values(
+        &binding.git_dir,
+        &binding.common_dir,
+        &binding.ref_selectors,
+        &held_paths,
+    )?;
+    for held in &held_paths {
+        held.verify_path_identity()?;
+    }
+    Ok(values)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_reference_authority_transition(
+    binding: &GitChildAuthorityBinding,
+    child_succeeded: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if binding.ref_selectors.is_empty() {
+        return Ok(());
+    }
+    let current = current_reference_authority_values(binding)?;
+    if !child_succeeded || dry_run {
+        if current != binding.reference_values {
+            bail!("managed Git reference authority changed after a non-mutating result");
+        }
+        return Ok(());
+    }
+    for selector in &binding.ref_selectors {
+        if !binding.mutable_ref_selectors.contains(selector)
+            && current.get(selector) != binding.reference_values.get(selector)
+        {
+            bail!("managed Git changed a reference outside its declared operation");
+        }
+    }
+    match binding.operation.as_str() {
+        "commit" => {
+            let before_head = binding
+                .reference_values
+                .get("HEAD")
+                .and_then(Option::as_deref)
+                .context("managed Git commit has no bound HEAD")?;
+            let after_head = current
+                .get("HEAD")
+                .and_then(Option::as_deref)
+                .context("managed Git commit removed HEAD")?;
+            if let Some(symbolic) = before_head.strip_prefix("ref:") {
+                if after_head != before_head
+                    || current.get(symbolic).and_then(Option::as_deref).is_none()
+                    || current.get(symbolic) == binding.reference_values.get(symbolic)
+                {
+                    bail!("managed Git commit did not produce its declared reference transition");
+                }
+            } else if after_head == before_head {
+                bail!("managed Git commit did not advance detached HEAD");
+            }
+        }
+        "tag" => {
+            if binding.mutable_ref_selectors.len() != 1 {
+                bail!("managed Git tag mutation authority is ambiguous");
+            }
+            let destination = binding
+                .mutable_ref_selectors
+                .iter()
+                .next()
+                .context("managed Git tag destination is missing")?;
+            if current
+                .get(destination)
+                .and_then(Option::as_deref)
+                .is_none()
+                || current.get(destination) == binding.reference_values.get(destination)
+            {
+                bail!("managed Git tag did not create its declared reference");
+            }
+        }
+        "fetch" => {
+            for selector in &binding.mutable_ref_selectors {
+                if current.get(selector).and_then(Option::as_deref).is_none() {
+                    bail!("managed Git fetch did not materialize a declared reference");
+                }
+            }
+        }
+        "push" => {
+            if current != binding.reference_values {
+                bail!("managed Git push changed local reference authority");
+            }
+        }
+        _ if binding.mutable_ref_selectors.is_empty() => {
+            if current != binding.reference_values {
+                bail!("managed Git changed reference authority unexpectedly");
+            }
+        }
+        _ => bail!("managed Git reference mutation has no bounded postcondition"),
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2117,6 +2752,23 @@ fn repository_authority_binding(
         held_paths.push(HeldRepositoryPath::open(directory, true)?);
     }
     reject_persistent_alternate_objects(&common_dir, &mut held_paths)?;
+    let ref_selectors = hold_reference_authority(
+        &git_dir,
+        &common_dir,
+        request.ref_selectors,
+        &mut held_paths,
+    )?;
+    let reference_values =
+        reference_authority_values(&git_dir, &common_dir, &ref_selectors, &held_paths)?;
+    let mut mutable_ref_selectors: BTreeSet<String> =
+        request.mutable_ref_selectors.iter().cloned().collect();
+    if request.operation == "commit" {
+        if let Some(Some(symbolic)) = reference_values.get("HEAD") {
+            if let Some(reference) = symbolic.strip_prefix("ref:") {
+                mutable_ref_selectors.insert(reference.to_owned());
+            }
+        }
+    }
     let attributes = repository_attributes_snapshot(
         program,
         program_guard,
@@ -2156,6 +2808,17 @@ fn repository_authority_binding(
     update_length_prefixed_digest(&mut digest, request.operation.as_bytes());
     update_length_prefixed_digest(&mut digest, request.owner.as_bytes());
     update_length_prefixed_digest(&mut digest, request.repository.as_bytes());
+    for selector in &ref_selectors {
+        update_length_prefixed_digest(&mut digest, b"reference");
+        update_length_prefixed_digest(&mut digest, selector.as_bytes());
+        if let Some(Some(value)) = reference_values.get(selector) {
+            update_length_prefixed_digest(&mut digest, value.as_bytes());
+        }
+    }
+    for selector in &mutable_ref_selectors {
+        update_length_prefixed_digest(&mut digest, b"mutable-reference");
+        update_length_prefixed_digest(&mut digest, selector.as_bytes());
+    }
     update_length_prefixed_digest(&mut digest, b"local-config");
     update_length_prefixed_digest(&mut digest, &local_config);
     update_length_prefixed_digest(&mut digest, b"worktree-config");
@@ -2182,11 +2845,35 @@ fn repository_authority_binding(
     for held in &held_paths {
         held.verify_path_identity()?;
     }
+    let mut mutable_after_child = BTreeSet::new();
+    if operation_mutates_repository_authority(request.operation) {
+        mutable_after_child.extend(mutable_ref_selectors.iter().map(|selector| {
+            match selector.as_str() {
+                "HEAD" | "FETCH_HEAD" => git_dir.join(selector),
+                reference => common_dir.join(reference),
+            }
+        }));
+        if matches!(
+            request.operation,
+            "add" | "restore" | "branch" | "switch" | "checkout" | "commit"
+        ) {
+            mutable_after_child.insert(git_dir.join("index"));
+        }
+        if matches!(request.operation, "restore" | "switch" | "checkout") {
+            mutable_after_child.extend(attributes.working.iter().map(|(path, _)| path.clone()));
+        }
+    }
     Ok(GitChildAuthorityBinding {
         kind: "repository",
         operation: request.operation.to_owned(),
         digest: format!("{:x}", digest.finalize()),
         root: top_level,
+        ref_selectors,
+        mutable_ref_selectors,
+        reference_values,
+        git_dir,
+        common_dir,
+        mutable_after_child,
         _held_paths: held_paths,
     })
 }
@@ -2243,6 +2930,12 @@ fn clone_authority_binding(
         operation: request.operation.to_owned(),
         digest: format!("{:x}", digest.finalize()),
         root: destination.to_path_buf(),
+        ref_selectors: Vec::new(),
+        mutable_ref_selectors: BTreeSet::new(),
+        reference_values: BTreeMap::new(),
+        git_dir: PathBuf::new(),
+        common_dir: PathBuf::new(),
+        mutable_after_child: BTreeSet::new(),
         _held_paths: vec![parent, held],
     })
 }
@@ -2307,6 +3000,8 @@ struct GitAuthorityRevalidation<'a> {
     root: &'a Path,
     expected_digest: &'a str,
     config_digest: &'a str,
+    ref_selectors: &'a [String],
+    mutable_ref_selectors: &'a [String],
     requested_repository: Option<(&'a str, &'a str)>,
 }
 
@@ -2351,6 +3046,8 @@ fn revalidate_git_child_authority_at(
                     operation: request.operation,
                     owner: &repository.0,
                     repository: &repository.1,
+                    ref_selectors: request.ref_selectors,
+                    mutable_ref_selectors: request.mutable_ref_selectors,
                 },
             )?
         }
@@ -2366,6 +3063,8 @@ fn revalidate_git_child_authority_at(
                     operation: request.operation,
                     owner,
                     repository,
+                    ref_selectors: request.ref_selectors,
+                    mutable_ref_selectors: request.mutable_ref_selectors,
                 },
                 false,
             )?
@@ -2398,6 +3097,34 @@ fn revalidate_git_child_authority(
     )?);
     let expected_digest = strict_git_child_digest("DEV_AUTH_GIT_AUTHORITY_SHA256")?;
     let config_digest = strict_git_child_digest("DEV_AUTH_GIT_CONFIG_SHA256")?;
+    let ref_selectors_text = strict_git_child_environment("DEV_AUTH_GIT_REF_SELECTORS")?;
+    let ref_selectors: Vec<String> = serde_json::from_str(&ref_selectors_text)
+        .context("managed Git reference authority is malformed")?;
+    if ref_selectors.len() > 128
+        || ref_selectors
+            .iter()
+            .any(|value| !valid_bound_ref_selector(value))
+        || ref_selectors.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        bail!("managed Git reference authority is malformed");
+    }
+    let mutable_ref_selectors_text =
+        strict_git_child_environment("DEV_AUTH_GIT_MUTABLE_REF_SELECTORS")?;
+    let mutable_ref_selectors: Vec<String> = serde_json::from_str(&mutable_ref_selectors_text)
+        .context("managed Git mutable reference authority is malformed")?;
+    if mutable_ref_selectors.len() > 128
+        || mutable_ref_selectors
+            .iter()
+            .any(|value| !valid_bound_ref_selector(value))
+        || mutable_ref_selectors
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || mutable_ref_selectors
+            .iter()
+            .any(|value| !ref_selectors.contains(value))
+    {
+        bail!("managed Git mutable reference authority is malformed");
+    }
     revalidate_git_child_authority_at(
         config,
         GitAuthorityRevalidation {
@@ -2408,6 +3135,8 @@ fn revalidate_git_child_authority(
             root: &root,
             expected_digest: &expected_digest,
             config_digest: &config_digest,
+            ref_selectors: &ref_selectors,
+            mutable_ref_selectors: &mutable_ref_selectors,
             requested_repository,
         },
     )
@@ -2859,7 +3588,7 @@ fn isolated_git_environment(
     capability: crate::GitCapability,
     config_digest: &str,
     authority: Option<&GitChildAuthorityBinding>,
-) -> BTreeMap<OsString, OsString> {
+) -> Result<BTreeMap<OsString, OsString>> {
     let mut environment = BTreeMap::new();
     for key in [
         "COLORTERM",
@@ -2940,8 +3669,30 @@ fn isolated_git_environment(
             OsString::from("DEV_AUTH_GIT_REPOSITORY_ROOT"),
             authority.root.as_os_str().to_os_string(),
         );
+        #[cfg(target_os = "linux")]
+        let ref_selectors = serde_json::to_string(&authority.ref_selectors)
+            .context("serialize managed Git reference authority")?;
+        #[cfg(target_os = "linux")]
+        environment.insert(
+            OsString::from("DEV_AUTH_GIT_REF_SELECTORS"),
+            OsString::from(ref_selectors),
+        );
+        #[cfg(target_os = "linux")]
+        let mutable_ref_selectors = serde_json::to_string(
+            &authority
+                .mutable_ref_selectors
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .context("serialize managed Git mutable reference authority")?;
+        #[cfg(target_os = "linux")]
+        environment.insert(
+            OsString::from("DEV_AUTH_GIT_MUTABLE_REF_SELECTORS"),
+            OsString::from(mutable_ref_selectors),
+        );
     }
-    environment
+    Ok(environment)
 }
 
 fn fresh_git_hooks_directory(paths: &RuntimePaths) -> Result<tempfile::TempDir> {
@@ -3152,6 +3903,10 @@ where
         })
         .collect::<Result<_>>()?;
     let capability = crate::git_capability(&unicode_arguments)?;
+    #[cfg(target_os = "linux")]
+    let ref_selectors = git_ref_authority_selectors(&unicode_arguments)?;
+    #[cfg(target_os = "linux")]
+    let mutable_ref_selectors = git_mutable_ref_selectors(&unicode_arguments)?;
     let command_name = unicode_arguments
         .first()
         .context("managed Git command is missing")?;
@@ -3192,7 +3947,20 @@ where
         .context("Git workspace policy is not declared")?;
     #[cfg(target_os = "linux")]
     let authority = match capability {
-        crate::GitCapability::NoAuthority => None,
+        crate::GitCapability::NoAuthority => Some(stable_repository_authority_binding(
+            &config.programs.git,
+            &program_guard,
+            cwd,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: git_capability_name(capability),
+                operation: command_name,
+                owner: &repository.0,
+                repository: &repository.1,
+                ref_selectors: &ref_selectors,
+                mutable_ref_selectors: &mutable_ref_selectors,
+            },
+        )?),
         crate::GitCapability::GitHubToken if command_name == "clone" => {
             let destination = managed_clone_destination(arguments, cwd)?;
             Some(stable_clone_authority_binding(
@@ -3203,6 +3971,8 @@ where
                     operation: command_name,
                     owner: &repository.0,
                     repository: &repository.1,
+                    ref_selectors: &ref_selectors,
+                    mutable_ref_selectors: &mutable_ref_selectors,
                 },
             )?)
         }
@@ -3217,6 +3987,8 @@ where
                     operation: command_name,
                     owner: &repository.0,
                     repository: &repository.1,
+                    ref_selectors: &ref_selectors,
+                    mutable_ref_selectors: &mutable_ref_selectors,
                 },
             )?)
         }
@@ -3243,7 +4015,7 @@ where
         capability,
         &config_digest,
         authority.as_ref(),
-    );
+    )?;
     let mut child_arguments = managed_git_configuration_arguments(
         &paths,
         policy,
@@ -3271,8 +4043,15 @@ where
         .context("run bounded managed-workspace Git command")?;
     #[cfg(target_os = "linux")]
     if let Some(expected) = &authority {
-        expected.verify_held_paths()?;
-        if expected.kind == "repository" {
+        expected.verify_after_child()?;
+        verify_reference_authority_transition(
+            expected,
+            status.success(),
+            unicode_arguments
+                .iter()
+                .any(|argument| argument == "--dry-run"),
+        )?;
+        if expected.kind == "repository" && !operation_mutates_repository_authority(command_name) {
             let actual = repository_authority_binding(
                 &config.programs.git,
                 &program_guard,
@@ -3283,6 +4062,8 @@ where
                     operation: command_name,
                     owner: &repository.0,
                     repository: &repository.1,
+                    ref_selectors: &ref_selectors,
+                    mutable_ref_selectors: &mutable_ref_selectors,
                 },
             )?;
             if actual.digest != expected.digest
@@ -4161,12 +4942,660 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                         operation,
                         owner: "ExampleOrg",
                         repository: "repository",
+                        ref_selectors: &[],
+                        mutable_ref_selectors: &[],
                     },
                 )
                 .is_err());
             }
             fs::set_permissions(&path, fs::Permissions::from_mode(safe_mode)).unwrap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_authority_commands_reject_unsafe_effective_repository_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let managed = home.join("managed");
+        let repository = managed.join("repository");
+        let config_path = home.join(".config/dev-auth/config.toml");
+        fs::create_dir_all(&repository).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
+        write_workspace_config(&config_path, &managed);
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::set_permissions(
+            repository.join(".git/config"),
+            fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let directories = NativeUserDirs {
+            home,
+            config: config_path,
+            runtime: runtime.clone(),
+        };
+
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &BTreeMap::new(),
+            &[OsString::from("status"), OsString::from("--short")],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("current-user owned"),
+            "unexpected failure: {error:#}"
+        );
+        assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+
+        fs::set_permissions(
+            repository.join(".git/config"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(repository.join(".gitattributes"), b"* text eol=lf\n").unwrap();
+        fs::set_permissions(
+            repository.join(".gitattributes"),
+            fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &BTreeMap::new(),
+            &[OsString::from("status"), OsString::from("--short")],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("current-user owned"),
+            "unexpected failure: {error:#}"
+        );
+        fs::remove_file(repository.join(".gitattributes")).unwrap();
+
+        assert!(Command::new("/usr/bin/git")
+            .args(["config", "extensions.worktreeConfig", "true"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--worktree",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::set_permissions(
+            repository.join(".git/config.worktree"),
+            fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &BTreeMap::new(),
+            &[OsString::from("status"), OsString::from("--short")],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("current-user owned"),
+            "unexpected failure: {error:#}"
+        );
+        assert!(fs::read_dir(runtime).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_authority_commands_reject_symlinked_common_objects_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let managed = home.join("managed");
+        let repository = managed.join("repository");
+        let external_objects = root.path().join("external-objects");
+        let config_path = home.join(".config/dev-auth/config.toml");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir(&external_objects).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
+        write_workspace_config(&config_path, &managed);
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_dir_all(repository.join(".git/objects")).unwrap();
+        std::os::unix::fs::symlink(&external_objects, repository.join(".git/objects")).unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let directories = NativeUserDirs {
+            home,
+            config: config_path,
+            runtime: runtime.clone(),
+        };
+
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &BTreeMap::new(),
+            &[OsString::from("status"), OsString::from("--short")],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("object"),
+            "unexpected failure: {error:#}"
+        );
+        assert!(fs::read_dir(runtime).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_authority_binds_head_packed_and_loose_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let guard = test_git_guard();
+        let config_digest = "00".repeat(32);
+        let ref_selectors = vec!["HEAD".to_owned()];
+        let capture = || {
+            repository_authority_binding(
+                "/usr/bin/git",
+                &guard,
+                &repository,
+                GitAuthorityRequest {
+                    config_digest: &config_digest,
+                    capability: "signing",
+                    operation: "commit",
+                    owner: "ExampleOrg",
+                    repository: "repository",
+                    ref_selectors: &ref_selectors,
+                    mutable_ref_selectors: &["HEAD".to_owned()],
+                },
+            )
+        };
+        for path in [
+            repository.join(".git/HEAD"),
+            repository.join(".git/packed-refs"),
+            repository.join(".git/refs/heads/main"),
+        ] {
+            if !path.exists() {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, b"0000000000000000000000000000000000000000\n").unwrap();
+            }
+            let original = fs::metadata(&path).unwrap().permissions();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+            assert!(
+                capture().is_err(),
+                "accepted writable ref authority at {}",
+                path.display()
+            );
+            fs::set_permissions(&path, original).unwrap();
+        }
+        for path in [
+            repository.join(".git/refs"),
+            repository.join(".git/refs/heads"),
+        ] {
+            let original = fs::metadata(&path).unwrap().permissions();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(
+                capture().is_err(),
+                "accepted writable ref directory authority at {}",
+                path.display()
+            );
+            fs::set_permissions(&path, original).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn indexed_attributes_use_one_bounded_batch_process() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        for index in 0..1000 {
+            let directory = repository.join(format!("nested-{index}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(
+                directory.join(".gitattributes"),
+                format!("*.txt text eol=lf\n# unique {index}\n"),
+            )
+            .unwrap();
+        }
+        assert!(Command::new("/usr/bin/git")
+            .args(["add", "."])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let program_root = tempfile::Builder::new()
+            .prefix("dev-auth-git-batch-")
+            .tempdir_in(native_current_user_home().unwrap())
+            .unwrap();
+        fs::set_permissions(program_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let counter = program_root.path().join("cat-file-count");
+        let wrapper = program_root.path().join("git-wrapper");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = cat-file ]; then printf x >> '{}'; fi\nexec /usr/bin/git \"$@\"\n",
+                counter.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = program_guard(wrapper.to_str().unwrap(), "test Git").unwrap();
+
+        let snapshot =
+            indexed_git_attributes_snapshot(wrapper.to_str().unwrap(), &guard, &repository)
+                .unwrap();
+        assert_eq!(snapshot.objects.len(), 1000);
+        assert_eq!(fs::read(&counter).unwrap(), b"x");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn indexed_attributes_batch_rejects_malformed_missing_and_trailing_responses() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let program_root = tempfile::Builder::new()
+            .prefix("dev-auth-git-batch-errors-")
+            .tempdir_in(native_current_user_home().unwrap())
+            .unwrap();
+        fs::set_permissions(program_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let requested = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for (name, response) in [
+            (
+                "mismatch",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb blob 0\n\n",
+            ),
+            (
+                "missing",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa missing\n",
+            ),
+            (
+                "bad-size",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa blob nope\n",
+            ),
+            (
+                "trailing",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa blob 0\n\ntrailing",
+            ),
+            (
+                "oversized",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa blob 1048577\n",
+            ),
+        ] {
+            let wrapper = program_root.path().join(format!("git-{name}"));
+            fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\n/usr/bin/cat >/dev/null\nprintf '%s' '{}'\n",
+                    response
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+            let guard = program_guard(wrapper.to_str().unwrap(), "test Git").unwrap();
+            assert!(
+                read_indexed_attribute_objects_batch(
+                    wrapper.to_str().unwrap(),
+                    &guard,
+                    &repository,
+                    BTreeSet::from([requested.to_vec()]),
+                )
+                .is_err(),
+                "accepted {name} batch response"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_ref_selector_grammar_is_operation_exact() {
+        assert_eq!(
+            git_ref_authority_selectors(&[
+                "commit".into(),
+                "--no-status".into(),
+                "--message".into(),
+                "change".into(),
+            ])
+            .unwrap(),
+            vec!["HEAD"]
+        );
+        assert_eq!(
+            git_ref_authority_selectors(&[
+                "push".into(),
+                "origin".into(),
+                "refs/heads/main:refs/heads/main".into(),
+            ])
+            .unwrap(),
+            vec!["refs/heads/main"]
+        );
+        assert_eq!(
+            git_ref_authority_selectors(&[
+                "fetch".into(),
+                "origin".into(),
+                "refs/heads/main:refs/remotes/origin/main".into(),
+            ])
+            .unwrap(),
+            vec!["FETCH_HEAD", "refs/remotes/origin/main"]
+        );
+        assert!(git_ref_authority_selectors(&[
+            "tag".into(),
+            "--message".into(),
+            "release".into(),
+            "v1".into(),
+            "ambiguous-short-name".into(),
+        ])
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_reference_transitions_are_operation_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--message=initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/repository.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let guard = test_git_guard();
+        let config_digest = "00".repeat(32);
+
+        let commit_arguments = vec![
+            "commit".to_owned(),
+            "--no-status".to_owned(),
+            "--allow-empty".to_owned(),
+            "--message".to_owned(),
+            "next".to_owned(),
+        ];
+        let commit_selectors = git_ref_authority_selectors(&commit_arguments).unwrap();
+        let commit_mutations = git_mutable_ref_selectors(&commit_arguments).unwrap();
+        let commit = repository_authority_binding(
+            "/usr/bin/git",
+            &guard,
+            &repository,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: "signing",
+                operation: "commit",
+                owner: "ExampleOrg",
+                repository: "repository",
+                ref_selectors: &commit_selectors,
+                mutable_ref_selectors: &commit_mutations,
+            },
+        )
+        .unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--message=next",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        commit.verify_after_child().unwrap();
+        verify_reference_authority_transition(&commit, true, false).unwrap();
+
+        let tag_arguments = vec![
+            "tag".to_owned(),
+            "--annotate".to_owned(),
+            "--message".to_owned(),
+            "release".to_owned(),
+            "release".to_owned(),
+            "HEAD".to_owned(),
+        ];
+        let tag_selectors = git_ref_authority_selectors(&tag_arguments).unwrap();
+        let tag_mutations = git_mutable_ref_selectors(&tag_arguments).unwrap();
+        let tag = repository_authority_binding(
+            "/usr/bin/git",
+            &guard,
+            &repository,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: "signing",
+                operation: "tag",
+                owner: "ExampleOrg",
+                repository: "repository",
+                ref_selectors: &tag_selectors,
+                mutable_ref_selectors: &tag_mutations,
+            },
+        )
+        .unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "tag",
+                "--annotate",
+                "--message=release",
+                "release",
+                "HEAD",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        tag.verify_after_child().unwrap();
+        verify_reference_authority_transition(&tag, true, false).unwrap();
+
+        let fetch_arguments = vec![
+            "fetch".to_owned(),
+            "origin".to_owned(),
+            "refs/heads/main:refs/remotes/origin/main".to_owned(),
+        ];
+        let fetch_selectors = git_ref_authority_selectors(&fetch_arguments).unwrap();
+        let fetch_mutations = git_mutable_ref_selectors(&fetch_arguments).unwrap();
+        let fetch = repository_authority_binding(
+            "/usr/bin/git",
+            &guard,
+            &repository,
+            GitAuthorityRequest {
+                config_digest: &config_digest,
+                capability: "credential",
+                operation: "fetch",
+                owner: "ExampleOrg",
+                repository: "repository",
+                ref_selectors: &fetch_selectors,
+                mutable_ref_selectors: &fetch_mutations,
+            },
+        )
+        .unwrap();
+        verify_reference_authority_transition(&fetch, true, true).unwrap();
+        let head = Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap();
+        fs::create_dir_all(repository.join(".git/refs/remotes/origin")).unwrap();
+        fs::write(repository.join(".git/refs/remotes/origin/main"), &head).unwrap();
+        fs::write(
+            repository.join(".git/FETCH_HEAD"),
+            format!(
+                "{}\t\tbranch 'main' of https://github.com/ExampleOrg/repository\n",
+                head.trim()
+            ),
+        )
+        .unwrap();
+        verify_reference_authority_transition(&fetch, true, false).unwrap();
+
+        let push_arguments = vec![
+            "push".to_owned(),
+            "origin".to_owned(),
+            "refs/heads/main:refs/heads/main".to_owned(),
+        ];
+        let push_selectors = git_ref_authority_selectors(&push_arguments).unwrap();
+        let packed_refs = repository.join(".git/packed-refs");
+        fs::write(&packed_refs, format!("{} refs/tags/stable\n", head.trim())).unwrap();
+        let capture_push = || {
+            repository_authority_binding(
+                "/usr/bin/git",
+                &guard,
+                &repository,
+                GitAuthorityRequest {
+                    config_digest: &config_digest,
+                    capability: "credential",
+                    operation: "push",
+                    owner: "ExampleOrg",
+                    repository: "repository",
+                    ref_selectors: &push_selectors,
+                    mutable_ref_selectors: &[],
+                },
+            )
+        };
+        let packed_bound = capture_push().unwrap();
+        fs::write(
+            &packed_refs,
+            format!(
+                "{} refs/tags/stable\n{} refs/tags/undeclared\n",
+                head.trim(),
+                head.trim()
+            ),
+        )
+        .unwrap();
+        assert!(packed_bound.verify_after_child().is_err());
+        fs::write(&packed_refs, format!("{} refs/tags/stable\n", head.trim())).unwrap();
+        let push = capture_push().unwrap();
+        fs::write(
+            repository.join(".git/refs/heads/main"),
+            "0".repeat(40) + "\n",
+        )
+        .unwrap();
+        assert!(verify_reference_authority_transition(&push, true, false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_local_config_key_is_value_blind() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let sentinel = "CREDENTIAL-SENTINEL-DO-NOT-PRINT";
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--local",
+                &format!("http.https://{sentinel}@example.invalid.extraheader"),
+                "value",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let error = validate_local_git_configuration(
+            "/usr/bin/git",
+            &test_git_guard(),
+            &repository,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains(sentinel));
     }
 
     #[cfg(target_os = "linux")]
@@ -4207,6 +5636,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                     operation: "fetch",
                     owner: "ExampleOrg",
                     repository: "repository",
+                    ref_selectors: &[],
+                    mutable_ref_selectors: &[],
                 },
             )
         };
@@ -4294,6 +5725,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 operation: "clone",
                 owner: "ExampleOrg",
                 repository: "repository",
+                ref_selectors: &[],
+                mutable_ref_selectors: &[],
             },
         )
         .unwrap();
@@ -4345,6 +5778,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 operation: "fetch",
                 owner: "ExampleOrg",
                 repository: "repository",
+                ref_selectors: &[],
+                mutable_ref_selectors: &[],
             },
         );
         fs::set_permissions(&ignored, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4937,7 +6372,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             crate::GitCapability::Signing,
             "00",
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(
             environment.get(OsStr::new("PATH")),
             Some(&paths.git_child_bin_dir().into_os_string())
@@ -5081,6 +6517,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             operation: "fetch",
             owner: "ExampleOrg",
             repository: "repository",
+            ref_selectors: &[],
+            mutable_ref_selectors: &[],
         };
         let capture =
             || repository_authority_binding("/usr/bin/git", &guard, &repository, request).unwrap();
@@ -5157,6 +6595,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 operation: "fetch",
                 owner: "ExampleOrg",
                 repository: "repository",
+                ref_selectors: &[],
+                mutable_ref_selectors: &[],
             },
         )
         .unwrap();
@@ -5173,6 +6613,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 root: &binding.root,
                 expected_digest: &binding.digest,
                 config_digest: &config_digest,
+                ref_selectors: &binding.ref_selectors,
+                mutable_ref_selectors: &[],
                 requested_repository: Some(("ExampleOrg", "repository")),
             },
         )
@@ -5196,6 +6638,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 operation: "clone",
                 owner: "ExampleOrg",
                 repository: "repository",
+                ref_selectors: &[],
+                mutable_ref_selectors: &[],
             },
         )
         .unwrap();
@@ -5211,6 +6655,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 root: &binding.root,
                 expected_digest: &binding.digest,
                 config_digest: &config_digest,
+                ref_selectors: &binding.ref_selectors,
+                mutable_ref_selectors: &[],
                 requested_repository: Some(("ExampleOrg", "repository")),
             },
         )
@@ -5230,6 +6676,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 root: &binding.root,
                 expected_digest: &binding.digest,
                 config_digest: &config_digest,
+                ref_selectors: &binding.ref_selectors,
+                mutable_ref_selectors: &[],
                 requested_repository: Some(("ExampleOrg", "repository")),
             },
         )
@@ -5342,6 +6790,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             operation: "fetch",
             owner: "ExampleOrg",
             repository: "repository",
+            ref_selectors: &[],
+            mutable_ref_selectors: &[],
         };
         let before =
             repository_authority_binding("/usr/bin/git", &guard, &repository, request).unwrap();
@@ -5396,7 +6846,8 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             crate::GitCapability::NoAuthority,
             &config_digest,
             None,
-        );
+        )
+        .unwrap();
         let mut arguments = managed_git_configuration_arguments(
             &paths,
             &policy,
@@ -5506,6 +6957,21 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .status()
             .unwrap()
             .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--message=initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         let marker = root.path().join("managed-child-record");
         let wrapper = root.path().join("guarded-git");
         fs::write(
@@ -5535,6 +7001,16 @@ fi
 if [ "$verb" = clone ]; then
   /usr/bin/git init --quiet "$last" || exit 80
   printf '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n[remote "origin"]\n\turl = https://github.com/ExampleOrg/repository.git\n' > "$last/.git/config" || exit 81
+elif [ "$verb" = fetch ]; then
+  head=$(/usr/bin/git rev-parse --verify HEAD) || exit 82
+  /usr/bin/mkdir -p .git/refs/remotes/origin || exit 83
+  printf '%s\n' "$head" > .git/refs/remotes/origin/main || exit 84
+  printf '%s\t\tbranch main\n' "$head" > .git/FETCH_HEAD || exit 85
+elif [ "$verb" = commit ]; then
+  tree=$(/usr/bin/git rev-parse --verify 'HEAD^{{tree}}') || exit 86
+  parent=$(/usr/bin/git rev-parse --verify HEAD) || exit 87
+  next=$(printf 'bounded fixture\n' | /usr/bin/git -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree "$tree" -p "$parent") || exit 88
+  /usr/bin/git update-ref HEAD "$next" "$parent" || exit 89
 fi
 exit 0
 "#,
@@ -5701,6 +7177,12 @@ exit 0
             operation: "fetch".into(),
             digest: "11".repeat(32),
             root: root.path().to_path_buf(),
+            ref_selectors: Vec::new(),
+            mutable_ref_selectors: BTreeSet::new(),
+            reference_values: BTreeMap::new(),
+            git_dir: PathBuf::new(),
+            common_dir: PathBuf::new(),
+            mutable_after_child: BTreeSet::new(),
             _held_paths: Vec::new(),
         };
 
@@ -5712,7 +7194,8 @@ exit 0
             crate::GitCapability::NoAuthority,
             &"00".repeat(32),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(
             none.get(OsStr::new("DEV_AUTH_GIT_CAPABILITY")),
             Some(&OsString::from("none"))
@@ -5734,7 +7217,8 @@ exit 0
             crate::GitCapability::GitHubToken,
             &"00".repeat(32),
             Some(&authority),
-        );
+        )
+        .unwrap();
         assert_eq!(
             credential.get(OsStr::new("DEV_AUTH_GIT_CAPABILITY")),
             Some(&OsString::from("credential"))
@@ -5886,7 +7370,8 @@ exit 0
             crate::GitCapability::GitHubToken,
             "00",
             None,
-        );
+        )
+        .unwrap();
         let hooks = tempfile::tempdir_in(paths.git_temp_dir()).unwrap();
         let mut arguments = managed_git_configuration_arguments(
             &paths,

@@ -1086,10 +1086,13 @@ fn validate_git_tag(arguments: &[&str]) -> Result<()> {
     if messages != 1 || !(1..=2).contains(&positionals.len()) {
         bail!("Git tag creation requires exactly one message, a tag name, and an optional target");
     }
-    if positionals
-        .iter()
-        .any(|value| !valid_git_ref_operand(value))
-    {
+    let tag_name = positionals[0];
+    let target_is_exact = positionals.get(1).is_none_or(|value| {
+        *value == "HEAD"
+            || valid_typed_git_ref(value, &["refs/heads/", "refs/tags/"])
+            || matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    if !valid_git_ref_name(tag_name) || tag_name.starts_with("refs/") || !target_is_exact {
         bail!("Git tag name or target is malformed");
     }
     Ok(())

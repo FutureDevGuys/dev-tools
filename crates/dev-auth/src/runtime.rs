@@ -1421,7 +1421,6 @@ fn origin_repository_at(
     command
         .args([
             "config",
-            "--local",
             "--no-includes",
             "--null",
             "--get-all",
@@ -1430,6 +1429,10 @@ fn origin_repository_at(
         .env_clear()
         .envs(environment)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     if let Some(working_directory) = working_directory {
@@ -2684,7 +2687,7 @@ fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
 }
 
 pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
-    let paths = RuntimePaths::discover()?;
+    let paths = git_runtime::native_runtime_paths()?;
     let config = load_config(&paths)?;
     let gh_program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
     validate_gh_version(&config.programs.gh, &paths, &gh_program_guard)?;
@@ -2897,7 +2900,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixListener as StdUnixListener;
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::mpsc;
+    #[cfg(unix)]
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     fn config_with_profiles(profiles: BTreeMap<String, SshProfile>) -> Config {
@@ -3602,6 +3607,82 @@ mod tests {
             .unwrap(),
             "https://github.com/ExampleOrg/sample-repo.git"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh_origin_authority_accepts_one_effective_worktree_origin_and_rejects_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let worktree = root.path().join("worktree");
+        fs::create_dir(&repository).unwrap();
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "Test User"],
+            vec!["config", "user.email", "test@example.invalid"],
+        ] {
+            assert!(Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(repository.join("tracked"), b"tracked\n").unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["add", "tracked"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["commit", "--quiet", "-m", "initial"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["config", "extensions.worktreeConfig", "true"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&worktree)
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--worktree",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/worktree-only.git",
+            ])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success());
+        let environment = BTreeMap::from([("HOME".into(), "/nonexistent".into())]);
+        assert_eq!(
+            origin_repository_at("/usr/bin/git", Some(&worktree), &environment).unwrap(),
+            "https://github.com/ExampleOrg/worktree-only.git"
+        );
+
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://github.com/ExampleOrg/common.git",
+            ])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success());
+        assert!(origin_repository_at("/usr/bin/git", Some(&worktree), &environment).is_err());
     }
 
     #[test]
