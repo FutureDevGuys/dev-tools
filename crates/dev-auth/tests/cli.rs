@@ -1,16 +1,186 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
+use wait_timeout::ChildExt;
+
+const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+fn bounded_reader<T>(mut reader: T) -> thread::JoinHandle<Vec<u8>>
+where
+    T: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader
+            .by_ref()
+            .take(PUBLIC_SUBPROCESS_OUTPUT_LIMIT + 1)
+            .read_to_end(&mut output)
+            .unwrap();
+        output
+    })
+}
+
+fn bounded_output(command: &mut Command) -> Output {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = bounded_reader(child.stdout.take().unwrap());
+    let stderr = bounded_reader(child.stderr.take().unwrap());
+    let status = match child.wait_timeout(PUBLIC_SUBPROCESS_TIMEOUT).unwrap() {
+        Some(status) => status,
+        None => {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("public dev-auth subprocess exceeded its 20 second bound");
+        }
+    };
+    let stdout = stdout.join().unwrap();
+    let stderr = stderr.join().unwrap();
+    assert!(stdout.len() <= PUBLIC_SUBPROCESS_OUTPUT_LIMIT as usize);
+    assert!(stderr.len() <= PUBLIC_SUBPROCESS_OUTPUT_LIMIT as usize);
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
 
 fn private_runtime() -> TempDir {
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     directory
+}
+
+fn private_program_root() -> TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix("dev-auth-cli-programs-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+#[cfg(target_os = "linux")]
+struct NativeUserSandbox {
+    _root: TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    runtime: PathBuf,
+    passwd: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeUserSandbox {
+    fn new() -> Self {
+        assert!(Path::new("/usr/bin/bwrap").is_file());
+        let root = private_program_root();
+        let root_path = root.path().to_path_buf();
+        let home = root_path.join("native-home");
+        let runtime = root_path.join("run-user");
+        let passwd = root_path.join("passwd");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = fs::metadata(&root_path).unwrap();
+        fs::write(
+            &passwd,
+            format!(
+                "dev-auth-test:x:{}:{}::{}:/bin/sh\n",
+                metadata.uid(),
+                metadata.gid(),
+                home.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&passwd, fs::Permissions::from_mode(0o600)).unwrap();
+        Self {
+            _root: root,
+            root: root_path,
+            home,
+            runtime,
+            passwd,
+        }
+    }
+
+    fn command(&self, program: &Path, cwd: &Path) -> Command {
+        let uid = fs::metadata(&self.root).unwrap().uid();
+        let attacker_home = self.root.join("attacker-home");
+        let attacker_config = self.root.join("attacker-config");
+        fs::create_dir_all(&attacker_home).unwrap();
+        fs::create_dir_all(&attacker_config).unwrap();
+        let mut command = Command::new("/usr/bin/bwrap");
+        command
+            .args(["--tmpfs", "/"])
+            .args(["--dir", "/usr"])
+            .args(["--ro-bind", "/usr", "/usr"])
+            .args(["--symlink", "usr/bin", "/bin"])
+            .args(["--symlink", "usr/lib", "/lib"])
+            .args(["--symlink", "usr/lib", "/lib64"])
+            .args(["--dir", "/storage"])
+            .args(["--ro-bind", "/storage", "/storage"])
+            .args(["--dev", "/dev"])
+            .args(["--proc", "/proc"])
+            .args(["--dir", "/etc"])
+            .args(["--dir", "/run"])
+            .args(["--dir", "/run/user"])
+            .args(["--dir", "/tmp"]);
+        let mut ancestor = PathBuf::new();
+        for component in self
+            .root
+            .components()
+            .take(self.root.components().count() - 1)
+        {
+            ancestor.push(component.as_os_str());
+            if ancestor != Path::new("/") {
+                command.arg("--dir").arg(&ancestor);
+            }
+        }
+        command
+            .arg("--bind")
+            .arg(&self.root)
+            .arg(&self.root)
+            .arg("--bind")
+            .arg(&self.passwd)
+            .arg("/etc/passwd")
+            .arg("--bind")
+            .arg(&self.runtime)
+            .arg(format!("/run/user/{uid}"))
+            .arg("--clearenv")
+            .arg("--setenv")
+            .arg("HOME")
+            .arg(&attacker_home)
+            .arg("--setenv")
+            .arg("XDG_CONFIG_HOME")
+            .arg(&attacker_config)
+            .arg("--setenv")
+            .arg("PATH")
+            .arg("/usr/bin")
+            .arg("--chdir")
+            .arg(cwd)
+            .arg("--")
+            .arg(program);
+        command
+    }
+
+    fn install_binary(&self, destination: &Path) {
+        fs::copy(env!("CARGO_BIN_EXE_dev-auth"), destination).unwrap();
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }
 
 fn credential_helper(operation: &str, input: &str) -> std::process::Output {
@@ -92,6 +262,7 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
         "agent-endpoint",
         "ssh-load",
         "ssh-public",
+        "workspace-status",
         "status",
         "purge",
     ] {
@@ -285,10 +456,14 @@ permissions = { actions = "read", checks = "read", contents = "write", metadata 
     assert!(!runtime.path().join("dev-auth").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
-    let home = tempfile::tempdir().unwrap();
-    let gh = home.path().join("gh");
+    let sandbox = NativeUserSandbox::new();
+    let home = &sandbox.home;
+    let gh = home.join("gh");
+    let binary = home.join("dev-auth");
+    sandbox.install_binary(&binary);
     fs::write(
         &gh,
         "#!/bin/sh\n\
@@ -304,13 +479,9 @@ fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
-    let config_dir = home.path().join(".config/dev-auth");
+    let config_dir = home.join(".config/dev-auth");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::set_permissions(
-        home.path().join(".config"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    fs::set_permissions(home.join(".config"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let config = format!(
         r#"version = 1
@@ -344,14 +515,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     fs::write(&config_path, config).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
-        .arg("validate")
-        .env_clear()
-        .env("HOME", home.path())
-        .env("PATH", "/usr/bin")
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .output()
-        .unwrap();
+    let output = bounded_output(sandbox.command(&binary, home).arg("validate"));
     assert!(
         output.status.success(),
         "{}",
@@ -368,14 +532,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         "#!/bin/sh\nprintf 'gh version 2.99.0 (2026-08-28)\\nhttps://github.com/cli/cli/releases/tag/v2.99.0\\n'\n",
     )
     .unwrap();
-    let rejected = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
-        .arg("validate")
-        .env_clear()
-        .env("HOME", home.path())
-        .env("PATH", "/usr/bin")
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .output()
-        .unwrap();
+    let rejected = bounded_output(sandbox.command(&binary, home).arg("validate"));
     assert!(!rejected.status.success());
     assert!(rejected.stdout.is_empty());
     let error = String::from_utf8(rejected.stderr).unwrap();
@@ -418,8 +575,12 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     let home = tempfile::tempdir().unwrap();
     let runtime = private_runtime();
     for frontend in [
+        "git-dev-auth",
+        "git-credential-dev-auth",
         "gh-dev-auth",
         "ssh-keygen-dev-auth",
+        "git-dev-auth.exe",
+        "git-credential-dev-auth.exe",
         "gh-dev-auth.exe",
         "ssh-keygen-dev-auth.exe",
     ] {
@@ -443,9 +604,237 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn public_git_frontend_uses_one_native_policy_and_propagates_managed_results() {
+    let sandbox = NativeUserSandbox::new();
+    let bin = sandbox.home.join("bin");
+    let managed = sandbox.home.join("repos");
+    let repository = managed.join("repository");
+    let attacker_home = sandbox.root.join("attacker-home");
+    let attacker_config = sandbox.root.join("attacker-config");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    fs::create_dir_all(&attacker_home).unwrap();
+    fs::create_dir_all(&attacker_config).unwrap();
+    for path in [
+        &bin,
+        &managed,
+        &repository,
+        &attacker_home,
+        &attacker_config,
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let frontend = bin.join("git-dev-auth");
+    let binary = bin.join("dev-auth");
+    sandbox.install_binary(&binary);
+    symlink(&binary, &frontend).unwrap();
+    let fake_git = bin.join("git");
+    let force_exit = sandbox.root.join("force-exit");
+    fs::write(
+        &fake_git,
+        format!(
+            r#"#!/bin/sh
+if [ "${{1:-}}" = --version ]; then
+  printf 'git version 2.53.0\n'
+  exit 0
+fi
+while [ "${{1:-}}" = -c ]; do shift 2; done
+case "${{1:-}}" in
+  status)
+    [ ! -e '{}' ] || exit 23
+    exec /usr/bin/git "$@"
+    ;;
+  clone)
+    for argument in "$@"; do destination=$argument; done
+    /usr/bin/git init --quiet "$destination" || exit
+    /usr/bin/git -C "$destination" config remote.origin.url https://github.com/ExampleOrg/cloned.git || exit
+    exit 0
+    ;;
+  *) exec /usr/bin/git "$@" ;;
+esac
+"#,
+            force_exit.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake_gh = bin.join("gh");
+    fs::write(
+        &fake_gh,
+        "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'gh version 2.98.0 (2026-08-21)\\nhttps://github.com/cli/cli/releases/tag/v2.98.0\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_gh, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "remote.origin.url",
+            "https://github.com/ExampleOrg/repository.git",
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    let config_dir = sandbox.home.join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(
+        sandbox.home.join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        r#"version = 1
+[programs]
+op = "/usr/bin/false"
+gh = "{}"
+git = "{}"
+ssh_add = "/usr/bin/false"
+ssh_keygen = "/usr/bin/false"
+[git]
+workspace_roots = ["~/repos"]
+author_name = "Automation Worker"
+author_email = "automation@example.invalid"
+ssh_profile = "automation"
+[github]
+app_id = 42
+private_key_ref = "op://Automation/app/private-key"
+repository_selection = "all"
+discover_installations = true
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
+[[ssh_profiles.automation.keys]]
+purpose = "authentication"
+private_key_ref = "op://Automation/authentication/private-key"
+fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+[[ssh_profiles.automation.keys]]
+purpose = "signing"
+private_key_ref = "op://Automation/signing/private-key"
+fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+"#,
+        fake_gh.display(),
+        fake_git.display(),
+    );
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, config).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let human_marker = sandbox.root.join("human-helper-ran");
+    let human_helper = sandbox.root.join("human-helper");
+    fs::write(
+        &human_helper,
+        format!("#!/bin/sh\nprintf invoked > '{}'\n", human_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&human_helper, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        attacker_home.join(".gitconfig"),
+        format!(
+            "[core]\n\tfsmonitor = {}\n[credential]\n\thelper = !{}\n",
+            human_helper.display(),
+            human_helper.display()
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(attacker_config.join("dev-auth")).unwrap();
+    fs::write(
+        attacker_config.join("dev-auth/config.toml"),
+        "this alternate policy must never be parsed\n",
+    )
+    .unwrap();
+
+    let validate = bounded_output(sandbox.command(&binary, &repository).arg("validate"));
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let status = bounded_output(
+        sandbox
+            .command(&binary, &repository)
+            .arg("workspace-status"),
+    );
+    assert_eq!(status.stdout, b"managed\n");
+    assert!(status.stderr.is_empty());
+
+    let managed_status = bounded_output(
+        sandbox
+            .command(&frontend, &repository)
+            .args(["status", "--short"]),
+    );
+    assert!(
+        managed_status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&managed_status.stderr)
+    );
+    assert!(!human_marker.exists());
+
+    let sentinel = "PUBLIC-CREDENTIAL-SENTINEL-DO-NOT-PRINT";
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "--local",
+            &format!("http.https://{sentinel}@example.invalid.extraheader"),
+            "value",
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    let rejected = bounded_output(
+        sandbox
+            .command(&frontend, &repository)
+            .args(["status", "--short"]),
+    );
+    assert!(!rejected.status.success());
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains(sentinel));
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(sentinel));
+    assert!(Command::new("/usr/bin/git")
+        .args([
+            "config",
+            "--local",
+            "--unset-all",
+            &format!("http.https://{sentinel}@example.invalid.extraheader"),
+        ])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+
+    let clone = bounded_output(sandbox.command(&frontend, &managed).args([
+        "clone",
+        "--no-checkout",
+        "https://github.com/ExampleOrg/cloned.git",
+        "cloned",
+    ]));
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert!(managed.join("cloned/.git").is_dir());
+    assert!(!human_marker.exists());
+
+    fs::write(&force_exit, b"exit 23\n").unwrap();
+    let propagated = bounded_output(
+        sandbox
+            .command(&frontend, &repository)
+            .args(["status", "--short"]),
+    );
+    assert_eq!(propagated.status.code(), Some(23));
+    assert!(!human_marker.exists());
+}
+
 #[test]
 fn internal_gh_children_do_not_forward_the_installation_token_to_git() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_program_root();
     let home = tempfile::tempdir().unwrap();
     let git_frontend = directory.path().join("git");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &git_frontend).unwrap();
@@ -665,7 +1054,7 @@ fn windows_credential_helper_name_preserves_fail_closed_git_output() {
 
 #[test]
 fn git_verification_does_not_require_the_secret_runtime_or_ssh_agent() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_program_root();
     let helper = directory.path().join("ssh-keygen-dev-auth");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &helper).unwrap();
     let verifier = directory.path().join("ssh-keygen");

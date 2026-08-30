@@ -27,14 +27,14 @@ use windows_sys::Win32::Security::{
     SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileStandardInfo, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationW, MoveFileExW,
-    CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_NORMAL,
+    CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileIdInfo, FileStandardInfo,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationW,
+    MoveFileExW, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
-    VOLUME_NAME_DOS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS, SECURITY_DESCRIPTOR_REVISION,
@@ -43,6 +43,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 
 const ALL_SHARES: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+const WORKSPACE_HANDLE_SHARES: u32 = FILE_SHARE_READ;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectKind {
@@ -209,6 +210,237 @@ impl CurrentUserSid {
     fn as_psid(&self) -> PSID {
         self.words.as_ptr().cast_mut().cast()
     }
+}
+
+pub(super) struct WorkspacePathAuthority {
+    current_user: CurrentUserSid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceFileIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+pub(super) struct WorkspacePathGuard {
+    identity_chain: Vec<WorkspaceFileIdentity>,
+    target_exists: bool,
+    _handles: Vec<OwnedWinHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkspaceGuardRelation {
+    Outside,
+    Same,
+    Inside,
+    Contains,
+}
+
+impl WorkspacePathAuthority {
+    pub(super) fn current() -> io::Result<Self> {
+        Ok(Self {
+            current_user: CurrentUserSid::load()?,
+        })
+    }
+
+    pub(super) fn lock_root(&self, path: &Path) -> io::Result<WorkspacePathGuard> {
+        self.lock_path(path, true, true, false)
+    }
+
+    pub(super) fn lock_directory(&self, path: &Path) -> io::Result<WorkspacePathGuard> {
+        self.lock_path(path, true, false, false)
+    }
+
+    pub(super) fn lock_target(&self, path: &Path) -> io::Result<WorkspacePathGuard> {
+        self.lock_path(path, false, false, true)
+    }
+
+    fn lock_path(
+        &self,
+        path: &Path,
+        require_directory: bool,
+        require_current_user_owner: bool,
+        allow_missing_final: bool,
+    ) -> io::Result<WorkspacePathGuard> {
+        let mut handles = validate_local_input_path_on_fixed_drive(path, false)?;
+        if handles.len() != path.ancestors().skip(1).count() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "workspace target must have an existing directory parent",
+            ));
+        }
+
+        let desired_access = FILE_READ_ATTRIBUTES
+            | if require_current_user_owner {
+                READ_CONTROL
+            } else {
+                0
+            };
+        let wide = nul_terminated(path.as_os_str())?;
+        // SAFETY: wide is NUL-terminated and all other arguments follow CreateFileW's
+        // contract. OPEN_REPARSE_POINT exposes a final reparse point for rejection, and
+        // BACKUP_SEMANTICS permits the same call to open either a file or directory.
+        let raw_handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                desired_access,
+                WORKSPACE_HANDLE_SHARES,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        let target_exists = match owned_handle(raw_handle) {
+            Ok(handle) => {
+                validate_workspace_final_handle(handle.0, require_directory)?;
+                if require_current_user_owner {
+                    validate_current_user_owner(handle.0, &self.current_user)?;
+                }
+                handles.push(handle);
+                true
+            }
+            Err(error) if allow_missing_final && error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+
+        let identity_chain = handles
+            .iter()
+            .map(|handle| workspace_file_identity(handle.0))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(WorkspacePathGuard {
+            identity_chain,
+            target_exists,
+            _handles: handles,
+        })
+    }
+}
+
+impl WorkspacePathGuard {
+    pub(super) fn relation_to_root(&self, root: &Self) -> WorkspaceGuardRelation {
+        if self.target_exists && self.identity_chain == root.identity_chain {
+            WorkspaceGuardRelation::Same
+        } else if self.identity_chain.starts_with(&root.identity_chain) {
+            WorkspaceGuardRelation::Inside
+        } else if self.target_exists && root.identity_chain.starts_with(&self.identity_chain) {
+            WorkspaceGuardRelation::Contains
+        } else {
+            WorkspaceGuardRelation::Outside
+        }
+    }
+
+    pub(super) fn target_exists(&self) -> bool {
+        self.target_exists
+    }
+}
+
+fn workspace_file_identity(handle: HANDLE) -> io::Result<WorkspaceFileIdentity> {
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: handle is live and information is writable storage of the exact requested
+    // FILE_ID_INFO size. The generated windows-sys declaration supplies the C layout.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(WorkspaceFileIdentity {
+        volume_serial_number: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
+fn validate_workspace_final_handle(handle: HANDLE, require_directory: bool) -> io::Result<()> {
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: handle is live and attributes is exact writable output storage.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE) != 0 {
+        return Err(permission_denied(
+            "workspace object must not be a reparse point or device",
+        ));
+    }
+
+    if require_directory {
+        let mut standard = FILE_STANDARD_INFO::default();
+        // SAFETY: handle is live and standard is exact writable output storage.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if !standard.Directory {
+            return Err(permission_denied(
+                "workspace directory path is not a directory",
+            ));
+        }
+    }
+
+    validate_final_handle_path_with_policy(handle, false)
+}
+
+fn validate_current_user_owner(handle: HANDLE, user: &CurrentUserSid) -> io::Result<()> {
+    let mut owner = null_mut();
+    let mut descriptor = null_mut::<c_void>();
+    // SAFETY: handle was opened with READ_CONTROL, both requested output slots are valid,
+    // and unrequested group, DACL, and SACL outputs are null. The returned descriptor is
+    // LocalFree-owned and keeps its interior owner SID live until the comparison ends.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if descriptor.is_null() {
+        return Err(invalid_data("owner query returned a null descriptor"));
+    }
+    let _descriptor_owner = LocalAllocation(descriptor);
+    // SAFETY: descriptor is the live allocation returned by GetSecurityInfo.
+    if unsafe { IsValidSecurityDescriptor(descriptor) } == 0 {
+        return Err(permission_denied(
+            "workspace root has an invalid security descriptor",
+        ));
+    }
+    // SAFETY: owner is either null or points inside the live descriptor. IsValidSid
+    // validates it before EqualSid compares it with the separately owned current SID.
+    if owner.is_null()
+        || unsafe { IsValidSid(owner) } == 0
+        || unsafe { EqualSid(owner, user.as_psid()) } == 0
+    {
+        return Err(permission_denied(
+            "workspace root must be owned by the current user",
+        ));
+    }
+    Ok(())
 }
 
 fn bounded_sid_length(sid: PSID, start: usize, end: usize) -> Option<u32> {
@@ -852,7 +1084,7 @@ fn open_existing_ancestor_handles(path: &Path) -> io::Result<Vec<OwnedWinHandle>
             CreateFileW(
                 wide.as_ptr(),
                 FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ,
+                WORKSPACE_HANDLE_SHARES,
                 null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1036,7 +1268,7 @@ fn validate_final_handle_path_with_policy(
 ) -> io::Result<()> {
     let final_path = final_path_name(handle)?;
     let drive = local_disk_drive(&final_path, true).ok_or_else(|| {
-        permission_denied("private object resolved to a UNC, device, or non-drive path")
+        permission_denied("open object resolved to a UNC, device, or non-drive path")
     })?;
     validate_fixed_drive(drive)?;
     if require_persistent_acls {
@@ -1283,6 +1515,100 @@ mod tests {
         }
 
         let error = validate_local_program(&link.join("tool.exe")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn workspace_guards_classify_identity_chains_and_planned_leafs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let authority = WorkspacePathAuthority::current().unwrap();
+        let root_path = temporary.path().join("managed");
+        let child_path = root_path.join("repository");
+        let outside_path = temporary.path().join("outside");
+        fs::create_dir(&root_path).unwrap();
+        fs::create_dir(&child_path).unwrap();
+        fs::create_dir(&outside_path).unwrap();
+
+        let root = authority.lock_root(&root_path).unwrap();
+        let same = authority.lock_directory(&root_path).unwrap();
+        let inside = authority.lock_directory(&child_path).unwrap();
+        let contains = authority.lock_directory(temporary.path()).unwrap();
+        let outside = authority.lock_directory(&outside_path).unwrap();
+        let planned = authority.lock_target(&child_path.join("clone")).unwrap();
+
+        assert_eq!(same.relation_to_root(&root), WorkspaceGuardRelation::Same);
+        assert_eq!(
+            inside.relation_to_root(&root),
+            WorkspaceGuardRelation::Inside
+        );
+        assert_eq!(
+            contains.relation_to_root(&root),
+            WorkspaceGuardRelation::Contains
+        );
+        assert_eq!(
+            outside.relation_to_root(&root),
+            WorkspaceGuardRelation::Outside
+        );
+        assert_eq!(
+            planned.relation_to_root(&root),
+            WorkspaceGuardRelation::Inside
+        );
+        assert!(root.target_exists());
+        assert!(!planned.target_exists());
+
+        let error = authority
+            .lock_target(&child_path.join("missing/leaf"))
+            .err()
+            .expect("target with a missing parent must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn workspace_target_identity_uses_file_id_and_retains_handles() {
+        let temporary = tempfile::tempdir().unwrap();
+        let authority = WorkspacePathAuthority::current().unwrap();
+        let target = temporary.path().join("target");
+        let alias = temporary.path().join("alias");
+        fs::write(&target, b"target").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+
+        let target_guard = authority.lock_target(&target).unwrap();
+        let alias_guard = authority.lock_target(&alias).unwrap();
+        assert_eq!(
+            alias_guard.relation_to_root(&target_guard),
+            WorkspaceGuardRelation::Same
+        );
+        assert!(target_guard.target_exists());
+        assert!(!target_guard._handles.is_empty());
+        assert_eq!(WORKSPACE_HANDLE_SHARES, FILE_SHARE_READ);
+
+        drop(alias_guard);
+        drop(target_guard);
+        fs::remove_file(&target).unwrap();
+        fs::remove_file(&alias).unwrap();
+    }
+
+    #[test]
+    fn workspace_guards_reject_final_and_ancestor_reparse_points() {
+        let temporary = tempfile::tempdir().unwrap();
+        let authority = WorkspacePathAuthority::current().unwrap();
+        let target = temporary.path().join("target");
+        let link = temporary.path().join("link");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("child"), b"target").unwrap();
+        if !create_test_directory_symlink(&target, &link) {
+            return;
+        }
+
+        let error = authority
+            .lock_target(&link)
+            .err()
+            .expect("final reparse point must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let error = authority
+            .lock_target(&link.join("child"))
+            .err()
+            .expect("ancestor reparse point must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 

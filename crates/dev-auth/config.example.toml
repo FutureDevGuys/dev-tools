@@ -7,7 +7,9 @@ service = "dev-auth"
 account = "service-account-token"
 
 # All credential-bearing executables must use exact native absolute paths.
-# These examples are appropriate for a typical Linux or WSL installation.
+# These examples are appropriate for the accepted Linux runtime. WSL uses the
+# same native-Linux paths but remains acceptance-pending until its own runtime
+# matrix passes.
 # Native Windows uses drive-qualified paths such as C:\Program Files\...\op.exe.
 [programs]
 op = "/usr/bin/op"
@@ -15,6 +17,15 @@ gh = "/usr/bin/gh"
 git = "/usr/bin/git"
 ssh_add = "/usr/bin/ssh-add"
 ssh_keygen = "/usr/bin/ssh-keygen"
+
+# Git workspace policy is the single source for automation routing and author
+# identity. `~/` resolves through the native current-user home directory, not
+# the caller's HOME or USERPROFILE environment variable.
+[git]
+workspace_roots = ["~/repos"]
+author_name = "Example Automation"
+author_email = "automation@example.invalid"
+ssh_profile = "automation"
 
 # Dynamic discovery asks GitHub which installation owns the requested
 # repository. The App installation remains the repository authority.

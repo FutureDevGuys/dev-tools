@@ -8,9 +8,9 @@ mod runtime;
 
 pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,
-    github_token_for_repository, purge_runtime, run_agent, run_gh, run_gh_git_child,
-    run_ssh_keygen, runtime_status, ssh_load, ssh_public, validate_configuration, RuntimeStatus,
-    ValidationReport,
+    github_token_for_repository, purge_runtime, run_agent, run_gh, run_gh_git_child, run_git,
+    run_ssh_keygen, runtime_status, ssh_load, ssh_public, validate_configuration, workspace_status,
+    RuntimeStatus, ValidationReport, WorkspaceContext,
 };
 
 const MAX_CREDENTIAL_REQUEST_BYTES: usize = 64 * 1024;
@@ -220,6 +220,15 @@ pub struct Programs {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct GitPolicy {
+    pub workspace_roots: Vec<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub ssh_profile: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecProfile {
     pub executables: Vec<String>,
     #[serde(default)]
@@ -254,6 +263,8 @@ pub struct Config {
     #[serde(default)]
     pub credential_store: CredentialStore,
     pub programs: Programs,
+    #[serde(default)]
+    pub git: Option<GitPolicy>,
     pub github: GitHubProfile,
     #[serde(default)]
     pub profiles: BTreeMap<String, ExecProfile>,
@@ -386,7 +397,82 @@ pub fn parse_config(input: &[u8]) -> Result<Config> {
             }
         }
     }
+    if let Some(git) = &config.git {
+        if git.workspace_roots.is_empty() {
+            bail!("Git policy must declare at least one workspace root");
+        }
+        let mut roots = BTreeSet::new();
+        for root in &git.workspace_roots {
+            validate_workspace_root(root)?;
+            let normalized = if cfg!(windows) {
+                root.replace('\\', "/").to_ascii_lowercase()
+            } else {
+                root.clone()
+            };
+            if !roots.insert(normalized) {
+                bail!("Git policy contains a duplicate workspace root");
+            }
+        }
+        validate_git_author(&git.author_name, &git.author_email)?;
+        if git.ssh_profile.is_empty()
+            || !git.ssh_profile.bytes().all(is_profile_character)
+            || !config.ssh_profiles.contains_key(&git.ssh_profile)
+        {
+            bail!("Git policy SSH profile is not declared");
+        }
+    }
     Ok(config)
+}
+
+fn validate_workspace_root(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains(['\n', '\r', '\0'])
+        || value.starts_with("\\\\")
+    {
+        bail!("Git workspace root is malformed");
+    }
+    if let Some(relative) = value.strip_prefix("~/") {
+        if relative.is_empty()
+            || relative.contains('\\')
+            || relative.contains(':')
+            || relative
+                .split('/')
+                .any(|component| matches!(component, "" | "." | ".."))
+        {
+            bail!("home-relative Git workspace root is malformed");
+        }
+        return Ok(());
+    }
+    if value.starts_with('~') || value.contains('$') || value.contains('%') {
+        bail!("Git workspace root uses unsupported expansion");
+    }
+    validate_program(value, "Git workspace root")
+}
+
+fn validate_git_author(name: &str, email: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 256
+        || name.contains(['\n', '\r', '\0', '<', '>'])
+        || name.chars().any(char::is_control)
+    {
+        bail!("Git author name is malformed");
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        bail!("Git author email is malformed");
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || email.len() > 320
+        || !email.is_ascii()
+        || email
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'<' | b'>' | 0))
+    {
+        bail!("Git author email is malformed");
+    }
+    Ok(())
 }
 
 fn approved_github_permissions() -> BTreeMap<String, String> {
@@ -696,6 +782,534 @@ pub fn parse_github_repository(value: &str) -> Result<(String, String)> {
         bail!("GitHub repository identifier contains unsupported characters");
     }
     Ok((owner.to_owned(), repository.to_owned()))
+}
+
+fn git_argument_has_value(argument: &str, name: &str) -> bool {
+    argument == name
+        || argument
+            .strip_prefix(name)
+            .is_some_and(|value| value.starts_with('='))
+}
+
+fn git_argument_is_process_escape(argument: &str) -> bool {
+    [
+        "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
+        "--super-prefix",
+        "--work-tree",
+        "--upload-pack",
+        "--receive-pack",
+        "--template",
+        "--config",
+        "--pathspec-from-file",
+        "--output",
+    ]
+    .iter()
+    .any(|name| git_argument_has_value(argument, name))
+        || matches!(
+            argument,
+            "-C" | "-c"
+                | "--bare"
+                | "--ext-diff"
+                | "--textconv"
+                | "--recurse-submodules"
+                | "--edit-description"
+        )
+        || argument.starts_with("-c") && argument.len() > 2
+        || argument.starts_with("-C") && argument.len() > 2
+}
+
+fn git_argument_is_signing_escape(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--no-gpg-sign"
+            | "--no-sign"
+            | "--author"
+            | "--date"
+            | "--reset-author"
+            | "--gpg-sign"
+            | "-S"
+            | "--local-user"
+    ) || argument.starts_with("--author=")
+        || argument.starts_with("--date=")
+        || argument.starts_with("--gpg-sign=")
+        || argument.starts_with("--local-user=")
+}
+
+fn validate_git_argument_text(arguments: &[&str]) -> Result<()> {
+    for argument in arguments {
+        if argument.is_empty() || argument.contains(['\n', '\r', '\0']) {
+            bail!("Git argument is empty or contains a control character");
+        }
+        if argument.starts_with('-') && !argument.starts_with("--") && argument.len() > 2 {
+            bail!("Git compact, attached, and bundled short options are not admitted");
+        }
+        if git_argument_is_process_escape(argument) || git_argument_is_signing_escape(argument) {
+            bail!("Git argument can override the automation execution boundary");
+        }
+    }
+    Ok(())
+}
+
+fn consume_git_value<'a>(
+    arguments: &'a [&str],
+    index: &mut usize,
+    option: &str,
+) -> Result<&'a str> {
+    *index += 1;
+    arguments
+        .get(*index)
+        .copied()
+        .with_context(|| format!("Git option {option} has no value"))
+}
+
+fn validate_git_status(arguments: &[&str]) -> Result<()> {
+    for argument in arguments {
+        let admitted = matches!(
+            *argument,
+            "-s" | "--short"
+                | "-b"
+                | "--branch"
+                | "--porcelain"
+                | "--porcelain=v1"
+                | "--porcelain=v2"
+                | "--show-stash"
+                | "--ahead-behind"
+                | "--no-ahead-behind"
+                | "--untracked-files=no"
+                | "--untracked-files=normal"
+                | "--untracked-files=all"
+        );
+        if !admitted {
+            bail!("Git status option is outside the bounded automation grammar");
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_add(arguments: &[&str]) -> Result<()> {
+    let mut pathspec = false;
+    let mut paths = 0_usize;
+    let mut whole_tree = false;
+    for argument in arguments {
+        if pathspec {
+            paths += 1;
+            continue;
+        }
+        match *argument {
+            "--" => pathspec = true,
+            "-A" | "--all" | "-u" | "--update" => whole_tree = true,
+            "-N" | "--intent-to-add" | "-n" | "--dry-run" | "-v" | "--verbose" => {}
+            _ => bail!("Git add requires bounded options and explicit -- pathspecs"),
+        }
+    }
+    if !whole_tree && paths == 0 {
+        bail!("Git add requires --all, --update, or an explicit -- pathspec");
+    }
+    Ok(())
+}
+
+fn validate_git_restore(arguments: &[&str]) -> Result<()> {
+    let mut index = 0_usize;
+    let mut pathspec = false;
+    let mut paths = 0_usize;
+    while index < arguments.len() {
+        let argument = arguments[index];
+        if pathspec {
+            paths += 1;
+            index += 1;
+            continue;
+        }
+        match argument {
+            "--" => pathspec = true,
+            "--worktree" | "--ours" | "--theirs" => {}
+            _ => bail!("Git restore requires bounded options and explicit -- pathspecs"),
+        }
+        index += 1;
+    }
+    if paths == 0 {
+        bail!("Git restore requires at least one explicit -- pathspec");
+    }
+    Ok(())
+}
+
+fn validate_git_checkout(arguments: &[&str]) -> Result<()> {
+    let admitted = matches!(arguments, ["--", paths @ ..] if !paths.is_empty());
+    if !admitted {
+        bail!("Git checkout operation is outside the bounded automation grammar");
+    }
+    Ok(())
+}
+
+fn validate_git_history(command: &str, arguments: &[&str]) -> Result<()> {
+    let mut index = 0_usize;
+    let mut objects = 0_usize;
+    while index < arguments.len() {
+        let argument = arguments[index];
+        match argument {
+            "--oneline" | "--graph" | "--stat" | "--name-only" | "--name-status" | "--no-patch"
+            | "--reverse" | "--first-parent" | "--merges" | "--no-merges" | "--no-renames" => {}
+            "-n" | "--max-count" => {
+                let value = consume_git_value(arguments, &mut index, argument)?;
+                if !value.parse::<u64>().is_ok_and(|count| count > 0) {
+                    bail!("Git history count is malformed");
+                }
+            }
+            _ if argument
+                .strip_prefix("--max-count=")
+                .is_some_and(|value| value.parse::<u64>().is_ok_and(|count| count > 0)) => {}
+            _ if matches!(argument.len(), 40 | 64)
+                && argument.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                objects += 1;
+            }
+            _ => bail!("Git {command} option is outside the bounded automation grammar"),
+        }
+        index += 1;
+    }
+    if objects != 1 {
+        bail!("Git {command} requires exactly one full object identifier");
+    }
+    Ok(())
+}
+
+fn validate_git_commit(arguments: &[&str]) -> Result<()> {
+    let mut index = 0_usize;
+    let mut messages = 0_usize;
+    let mut no_status = 0_usize;
+    while index < arguments.len() {
+        let argument = arguments[index];
+        match argument {
+            "-m" | "--message" => {
+                let value = consume_git_value(arguments, &mut index, argument)?;
+                if value.is_empty() {
+                    bail!("Git commit message must not be empty");
+                }
+                messages += 1;
+            }
+            "-F" | "--file" => {
+                if consume_git_value(arguments, &mut index, argument)? != "-" {
+                    bail!("Git commit file input is restricted to standard input");
+                }
+                messages += 1;
+            }
+            "--no-status" => no_status += 1,
+            "--allow-empty" | "--allow-empty-message" | "-s" | "--signoff" | "-q" | "--quiet" => {}
+            _ if argument.starts_with('-') => {
+                bail!("Git commit option is outside the bounded automation grammar")
+            }
+            _ => bail!("Git commit is restricted to the staged index without pathspecs"),
+        }
+        index += 1;
+    }
+    if messages != 1 {
+        bail!("Git commit requires exactly one explicit message source");
+    }
+    if no_status != 1 {
+        bail!("Git commit requires exactly one explicit --no-status");
+    }
+    Ok(())
+}
+
+fn validate_git_tag(arguments: &[&str]) -> Result<()> {
+    let mut index = 0_usize;
+    let mut messages = 0_usize;
+    let mut positionals = Vec::new();
+    while index < arguments.len() {
+        let argument = arguments[index];
+        match argument {
+            "-m" | "--message" => {
+                let value = consume_git_value(arguments, &mut index, argument)?;
+                if value.is_empty() {
+                    bail!("Git tag message must not be empty");
+                }
+                messages += 1;
+            }
+            "-F" | "--file" => {
+                if consume_git_value(arguments, &mut index, argument)? != "-" {
+                    bail!("Git tag file input is restricted to standard input");
+                }
+                messages += 1;
+            }
+            "-a" | "--annotate" => {}
+            "-u" => bail!("Git tag signing key overrides are not admitted"),
+            _ if argument.starts_with('-') => {
+                bail!("Git tag option is outside the bounded automation grammar")
+            }
+            _ => positionals.push(argument),
+        }
+        index += 1;
+    }
+    if messages != 1 || !(1..=2).contains(&positionals.len()) {
+        bail!("Git tag creation requires exactly one message, a tag name, and an optional target");
+    }
+    let tag_name = positionals[0];
+    let target_is_exact = positionals.get(1).is_none_or(|value| {
+        *value == "HEAD"
+            || valid_typed_git_ref(value, &["refs/heads/", "refs/tags/"])
+            || matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    if !valid_git_ref_name(tag_name) || tag_name.starts_with("refs/") || !target_is_exact {
+        bail!("Git tag name or target is malformed");
+    }
+    Ok(())
+}
+
+fn valid_git_ref_operand(value: &str) -> bool {
+    !value.starts_with('-')
+        && (value == "HEAD"
+            || value.len() <= 1024 && valid_git_ref_name(value)
+            || matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn valid_push_refspec(value: &str) -> bool {
+    let Some((source, destination)) = value.split_once(':') else {
+        return false;
+    };
+    !source.starts_with('+')
+        && ((source == "HEAD" && valid_typed_git_ref(destination, &["refs/heads/"]))
+            || (valid_typed_git_ref(source, &["refs/heads/"])
+                && valid_typed_git_ref(destination, &["refs/heads/"]))
+            || (valid_typed_git_ref(source, &["refs/tags/"])
+                && valid_typed_git_ref(destination, &["refs/tags/"])))
+}
+
+fn valid_git_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with(['.', '/'])
+        && !name.ends_with(['.', '/'])
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && name.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.ends_with('.')
+                && !component.ends_with(".lock")
+        })
+}
+
+fn valid_typed_git_ref(value: &str, prefixes: &[&str]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| value.strip_prefix(prefix).is_some_and(valid_git_ref_name))
+}
+
+fn valid_fetch_refspec(value: &str) -> bool {
+    let Some((source, destination)) = value.split_once(':') else {
+        return false;
+    };
+    if source.starts_with('+') || destination.is_empty() {
+        return false;
+    }
+    (valid_typed_git_ref(source, &["refs/heads/"])
+        && valid_typed_git_ref(destination, &["refs/remotes/origin/"]))
+        || (valid_typed_git_ref(source, &["refs/tags/"])
+            && valid_typed_git_ref(destination, &["refs/tags/"]))
+        || (source == "HEAD" && destination == "refs/remotes/origin/HEAD")
+}
+
+fn validate_origin_network_command(command: &str, arguments: &[&str]) -> Result<()> {
+    let mut positionals = Vec::new();
+    for argument in arguments {
+        if argument.starts_with('-') {
+            let admitted = match command {
+                "fetch" => matches!(
+                    *argument,
+                    "-q" | "--quiet" | "-v" | "--verbose" | "--dry-run"
+                ),
+                "push" => matches!(
+                    *argument,
+                    "--atomic"
+                        | "--dry-run"
+                        | "--porcelain"
+                        | "-q"
+                        | "--quiet"
+                        | "-v"
+                        | "--verbose"
+                ),
+                _ => false,
+            };
+            if !admitted {
+                bail!("Git network option is outside the bounded automation grammar");
+            }
+        } else {
+            positionals.push(*argument);
+        }
+    }
+    if positionals.first() != Some(&"origin") {
+        bail!("Git network operations require the literal origin remote");
+    }
+    if positionals.len() != 2 {
+        bail!("Git network operations require exactly one explicit typed refspec");
+    }
+    let invalid_ref = positionals.iter().skip(1).any(|value| {
+        if command == "push" {
+            !valid_push_refspec(value)
+        } else {
+            !valid_fetch_refspec(value)
+        }
+    });
+    if invalid_ref {
+        bail!("Git network refspec is untyped, forceful, deleting, or malformed");
+    }
+    Ok(())
+}
+
+fn valid_git_clone_destination(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['-', '/', '~'])
+        && !value.contains(['\\', ':', '\n', '\r', '\0'])
+        && !value.chars().any(char::is_control)
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.eq_ignore_ascii_case(".git")
+        })
+}
+
+fn validate_git_clone(arguments: &[&str]) -> Result<()> {
+    let mut index = 0_usize;
+    let mut positionals = Vec::new();
+    let mut no_checkout = 0_usize;
+    while index < arguments.len() {
+        let argument = arguments[index];
+        match argument {
+            "--no-checkout" => no_checkout += 1,
+            "--single-branch" | "--no-tags" | "-q" | "--quiet" | "-v" | "--verbose" => {}
+            "-b" | "--branch" => {
+                let value = consume_git_value(arguments, &mut index, argument)?;
+                if !valid_git_ref_operand(value) {
+                    bail!("Git clone option value is malformed");
+                }
+            }
+            "--depth" => {
+                let value = consume_git_value(arguments, &mut index, argument)?;
+                if !value.parse::<u64>().is_ok_and(|depth| depth > 0) {
+                    bail!("Git clone depth is malformed");
+                }
+            }
+            _ if argument.starts_with('-') => {
+                bail!("Git clone option is outside the bounded automation grammar")
+            }
+            _ => positionals.push(argument),
+        }
+        index += 1;
+    }
+    if positionals.len() != 2 {
+        bail!("Git clone requires one repository and one explicit destination");
+    }
+    if no_checkout != 1 {
+        bail!("managed Git clone requires exactly one explicit --no-checkout");
+    }
+    let source = positionals[0];
+    if !(source.starts_with("https://github.com/")
+        || source.starts_with("ssh://git@github.com/")
+        || source.starts_with("git@github.com:"))
+    {
+        bail!("managed Git clone requires an explicit github.com transport URL");
+    }
+    parse_github_repository(source)?;
+    if !valid_git_clone_destination(positionals[1]) {
+        bail!("Git clone destination is malformed");
+    }
+    Ok(())
+}
+
+pub(crate) fn managed_clone_repository<S: AsRef<str>>(
+    arguments: &[S],
+) -> Result<Option<(String, String)>> {
+    let arguments: Vec<&str> = arguments.iter().map(AsRef::as_ref).collect();
+    if arguments.first() != Some(&"clone") {
+        return Ok(None);
+    }
+    admit_git_arguments(&arguments)?;
+    let mut index = 1_usize;
+    let mut positionals = Vec::new();
+    while index < arguments.len() {
+        match arguments[index] {
+            "-b" | "--branch" | "--depth" => index += 1,
+            "--single-branch" | "--no-tags" | "--no-checkout" | "-q" | "--quiet" | "-v"
+            | "--verbose" => {}
+            value if value.starts_with('-') => {
+                bail!("Git clone option is outside the bounded automation grammar")
+            }
+            value => positionals.push(value),
+        }
+        index += 1;
+    }
+    let repository = positionals
+        .first()
+        .context("Git clone repository is missing")?;
+    Ok(Some(parse_github_repository(repository)?))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitCapability {
+    NoAuthority,
+    GitHubToken,
+    Signing,
+}
+
+fn parse_git_capability<S: AsRef<str>>(arguments: &[S]) -> Result<GitCapability> {
+    let arguments: Vec<&str> = arguments.iter().map(AsRef::as_ref).collect();
+    let (command, tail) = arguments.split_first().context("Git command is required")?;
+    if command.starts_with('-') || command.contains(['/', '\\']) {
+        bail!("managed Git does not admit global options or executable paths");
+    }
+    let admitted = matches!(
+        *command,
+        "status"
+            | "add"
+            | "restore"
+            | "checkout"
+            | "log"
+            | "show"
+            | "commit"
+            | "tag"
+            | "fetch"
+            | "push"
+            | "clone"
+    );
+    if !admitted {
+        bail!("Git command is outside the managed automation surface");
+    }
+    validate_git_argument_text(tail)?;
+    let capability = match *command {
+        "status" => validate_git_status(tail).map(|()| GitCapability::NoAuthority),
+        "add" => validate_git_add(tail).map(|()| GitCapability::NoAuthority),
+        "restore" => validate_git_restore(tail).map(|()| GitCapability::NoAuthority),
+        "checkout" => validate_git_checkout(tail).map(|()| GitCapability::NoAuthority),
+        "log" | "show" => validate_git_history(command, tail).map(|()| GitCapability::NoAuthority),
+        "commit" => validate_git_commit(tail).map(|()| GitCapability::Signing),
+        "tag" => validate_git_tag(tail).map(|()| GitCapability::Signing),
+        "fetch" | "push" => {
+            validate_origin_network_command(command, tail).map(|()| GitCapability::GitHubToken)
+        }
+        "clone" => validate_git_clone(tail).map(|()| GitCapability::GitHubToken),
+        _ => bail!("Git command has no managed capability mapping"),
+    }?;
+    Ok(capability)
+}
+
+pub(crate) fn git_capability(arguments: &[String]) -> Result<GitCapability> {
+    parse_git_capability(arguments)
+}
+
+/// Validate the exact managed-workspace Git grammar before configuration,
+/// credentials, agent state, or runtime state may influence the invocation.
+pub fn admit_git_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
+    parse_git_capability(arguments).map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1185,4 +1799,101 @@ pub(crate) fn parse_gh_invocation<S: AsRef<str>>(arguments: &[S]) -> Result<GhIn
 
 pub fn admit_gh_arguments<S: AsRef<str>>(arguments: &[S]) -> Result<()> {
     parse_gh_invocation(arguments).map(|_| ())
+}
+
+#[cfg(test)]
+mod git_capability_tests {
+    use super::{git_capability, GitCapability};
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn managed_git_capability_is_derived_from_the_admitted_command() {
+        for values in [
+            &["status", "--short"][..],
+            &["add", "--", "src/lib.rs"],
+            &["restore", "--", "src/lib.rs"],
+            &["checkout", "--", "src/lib.rs"],
+            &[
+                "log",
+                "--oneline",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            &["show", "--stat", "0123456789abcdef0123456789abcdef01234567"],
+        ] {
+            assert_eq!(
+                git_capability(&arguments(values)).unwrap(),
+                GitCapability::NoAuthority,
+                "{values:?}"
+            );
+        }
+
+        for values in [
+            &[
+                "fetch",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ][..],
+            &["push", "origin", "HEAD:refs/heads/main"],
+            &[
+                "clone",
+                "--no-checkout",
+                "https://github.com/ExampleOrg/repository.git",
+                "repository",
+            ],
+        ] {
+            assert_eq!(
+                git_capability(&arguments(values)).unwrap(),
+                GitCapability::GitHubToken,
+                "{values:?}"
+            );
+        }
+
+        for values in [
+            &["commit", "--no-status", "--message", "bounded change"][..],
+            &["tag", "--message", "release", "v1.2.3"],
+        ] {
+            assert_eq!(
+                git_capability(&arguments(values)).unwrap(),
+                GitCapability::Signing,
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_git_commands_never_receive_a_capability() {
+        for values in [
+            &["pull", "--ff-only", "origin", "main"][..],
+            &["commit", "--message", "missing no-status"],
+            &[
+                "clone",
+                "https://github.com/ExampleOrg/repository.git",
+                "repository",
+            ],
+            &["fetch", "origin", "main"],
+            &[
+                "restore",
+                "--source",
+                "refs/heads/feature",
+                "--",
+                "src/lib.rs",
+            ],
+            &["branch", "new", "refs/heads/feature"],
+            &["switch", "feature"],
+            &["checkout", "feature"],
+            &["log", "feature"],
+            &["show", "refs/heads/feature"],
+            &[
+                "fetch",
+                "origin",
+                "refs/heads/one:refs/remotes/origin/one",
+                "refs/heads/two:refs/remotes/origin/two",
+            ],
+        ] {
+            assert!(git_capability(&arguments(values)).is_err(), "{values:?}");
+        }
+    }
 }
