@@ -915,7 +915,7 @@ fn validate_git_add(arguments: &[&str]) -> Result<()> {
 pub(crate) fn valid_explicit_git_path(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with(['-', '/', '~'])
-        && !value.contains(['\\', ':', '\n', '\r', '\0'])
+        && !value.contains(['\\', ':', '*', '?', '[', ']', '\n', '\r', '\0'])
         && !value.chars().any(char::is_control)
         && value.split('/').all(|component| {
             !component.is_empty()
@@ -1887,6 +1887,8 @@ mod git_capability_tests {
             &["pull", "--ff-only", "origin", "main"][..],
             &["add", "--all"],
             &["add", "--", "nested/../secret.txt"],
+            &["add", "--", "safe*.txt"],
+            &["checkout", "--", "safe[12].txt"],
             &["restore", "--", ":(glob)**"],
             &["commit", "--message", "missing no-status"],
             &[
