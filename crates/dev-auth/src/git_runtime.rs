@@ -4001,6 +4001,19 @@ where
     let (config, config_digest) = load_config_snapshot_at(&paths.config)?;
     let roots = resolved_workspace_roots(&config, &directories.home)?;
     let program_guard = program_guard(&config.programs.git, "Git")?;
+    if arguments == [OsString::from("--version")] {
+        let mut command = guarded_command(&config.programs.git, &program_guard)?;
+        return command
+            .arg("--version")
+            .current_dir(cwd)
+            .env_clear()
+            .envs(sanitized_current_environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run configured Git version query");
+    }
     #[cfg(windows)]
     let routing_decision = classify_git_invocation_at(arguments, cwd, &roots, environment)?;
     #[cfg(windows)]
@@ -6234,6 +6247,44 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             &[OsString::from("pull"), OsString::from("origin")],
         )
         .is_err());
+        assert!(!directories.runtime.exists());
+        assert_eq!(fs::read(config_path).unwrap(), original_config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_git_version_query_uses_no_private_runtime_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let managed = home.join("managed");
+        let config_path = home.join(".config/dev-auth/config.toml");
+        fs::create_dir_all(&managed).unwrap();
+        write_workspace_config(&config_path, &managed);
+        let directories = NativeUserDirs {
+            home,
+            config: config_path.clone(),
+            runtime: root.path().join("runtime"),
+        };
+        let original_config = fs::read(&config_path).unwrap();
+        let hostile_environment = BTreeMap::from([
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                OsString::from("/human/system-gitconfig"),
+            ),
+            (
+                OsString::from("GIT_ASKPASS"),
+                OsString::from("/human/askpass"),
+            ),
+        ]);
+
+        let status = run_git_at(
+            &directories,
+            &managed,
+            &hostile_environment,
+            &[OsString::from("--version")],
+        )
+        .unwrap();
+        assert!(status.success());
         assert!(!directories.runtime.exists());
         assert_eq!(fs::read(config_path).unwrap(), original_config);
     }

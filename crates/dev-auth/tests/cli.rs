@@ -776,6 +776,16 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     );
     assert!(!human_marker.exists());
 
+    let managed_version = bounded_output(sandbox.command(&frontend, &repository).arg("--version"));
+    assert!(
+        managed_version.status.success(),
+        "{}",
+        String::from_utf8_lossy(&managed_version.stderr)
+    );
+    assert_eq!(managed_version.stdout, b"git version 2.53.0\n");
+    assert!(managed_version.stderr.is_empty());
+    assert!(!human_marker.exists());
+
     let sentinel = "PUBLIC-CREDENTIAL-SENTINEL-DO-NOT-PRINT";
     assert!(Command::new("/usr/bin/git")
         .args([
