@@ -1618,24 +1618,231 @@ fn validate_local_git_config_key(key: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn validate_git_attributes(bytes: &[u8]) -> Result<()> {
-    let text = std::str::from_utf8(bytes).context("Git attributes file is not UTF-8")?;
-    for line in text.lines() {
-        let line = line.trim_start();
-        if line.is_empty() || line.starts_with('#') {
+    // Driver selectors in attributes are inert unless configuration supplies a
+    // command. Managed execution rejects driver configuration in every local
+    // scope and replaces system/global configuration with private empty files,
+    // so retaining and digesting the selector is safe without executing it.
+    std::str::from_utf8(bytes).context("Git attributes file is not UTF-8")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn staged_content_paths(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+) -> Result<Vec<String>> {
+    let mut command = guarded_command(program, program_guard)?;
+    let output = command
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACDMRTUXB",
+            "--",
+        ])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_probe_environment(&BTreeMap::new()))
+        .stdin(Stdio::null())
+        .output()
+        .context("enumerate staged managed Git paths")?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || output.stdout.len() as u64 > CONFIG_LIMIT
+    {
+        bail!("staged managed Git paths cannot be validated safely");
+    }
+    let mut paths = Vec::new();
+    for path in output.stdout.split(|byte| *byte == 0) {
+        if path.is_empty() {
             continue;
         }
-        for attribute in line.split_ascii_whitespace().skip(1) {
-            let attribute = attribute
-                .strip_prefix('-')
-                .or_else(|| attribute.strip_prefix('!'))
-                .unwrap_or(attribute);
-            let name = attribute
-                .split_once('=')
-                .map_or(attribute, |(name, _)| name);
-            if matches!(name, "filter" | "diff" | "merge") {
-                bail!("Git attributes select an external content driver");
+        let path = std::str::from_utf8(path).context("staged managed Git path is not UTF-8")?;
+        if !crate::valid_explicit_git_path(path) {
+            bail!("staged managed Git path is not an exact safe relative path");
+        }
+        paths.push(path.to_owned());
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn exact_index_path_exists(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+    path: &str,
+) -> Result<bool> {
+    let mut command = guarded_command(program, program_guard)?;
+    let output = command
+        .args(["ls-files", "--stage", "-z", "--", path])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_probe_environment(&BTreeMap::new()))
+        .stdin(Stdio::null())
+        .output()
+        .context("inspect exact indexed managed Git path")?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || output.stdout.len() as u64 > CONFIG_LIMIT
+    {
+        bail!("exact indexed managed Git path cannot be validated safely");
+    }
+    let mut found = false;
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let separator = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("indexed managed Git path entry is malformed")?;
+        let indexed_path = &entry[separator + 1..];
+        if indexed_path != path.as_bytes() {
+            bail!("managed Git content path expands beyond one exact file");
+        }
+        found = true;
+    }
+    Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_exact_content_paths(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+    paths: &[String],
+) -> Result<()> {
+    for path in paths {
+        let mut current = cwd.to_path_buf();
+        let components: Vec<&str> = path.split('/').collect();
+        for component in &components[..components.len() - 1] {
+            current.push(component);
+            let metadata = fs::symlink_metadata(&current)
+                .context("inspect managed Git content path ancestor")?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                bail!("managed Git content path has an unsafe ancestor");
             }
         }
+        current.push(components[components.len() - 1]);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => bail!("managed Git content path is not one exact file"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !exact_index_path_exists(program, program_guard, cwd, path)? {
+                    bail!("managed Git missing content path is not one exact indexed file");
+                }
+            }
+            Err(error) => return Err(error).context("inspect managed Git content path"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_external_driver_paths(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+    paths: &[String],
+    source: &str,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut arguments = vec![
+        OsString::from("check-attr"),
+        OsString::from("-z"),
+        OsString::from(source),
+        OsString::from("filter"),
+        OsString::from("diff"),
+        OsString::from("merge"),
+        OsString::from("--"),
+    ];
+    arguments.extend(paths.iter().map(OsString::from));
+    let mut environment = git_probe_environment(&BTreeMap::new());
+    environment.insert(OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1"));
+    let mut command = guarded_command(program, program_guard)?;
+    let output = command
+        .args(arguments)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::null())
+        .output()
+        .context("inspect managed Git content attributes")?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || output.stdout.len() as u64 > CONFIG_LIMIT
+        || output.stdout.last() != Some(&0)
+    {
+        bail!("managed Git content attributes cannot be validated safely");
+    }
+    let fields: Vec<&[u8]> = output.stdout[..output.stdout.len() - 1]
+        .split(|byte| *byte == 0)
+        .collect();
+    let expected_attributes = [
+        b"filter".as_slice(),
+        b"diff".as_slice(),
+        b"merge".as_slice(),
+    ];
+    if fields.len() != paths.len() * expected_attributes.len() * 3 {
+        bail!("managed Git content attributes have an unexpected shape");
+    }
+    let (fields, remainder) = fields.as_chunks::<3>();
+    if !remainder.is_empty() {
+        bail!("managed Git content attribute result has trailing fields");
+    }
+    let mut fields = fields.iter();
+    for path in paths {
+        for expected_attribute in expected_attributes {
+            let triple = fields
+                .next()
+                .context("managed Git content attribute result is missing")?;
+            if triple[0] != path.as_bytes() || triple[1] != expected_attribute {
+                bail!("managed Git content attribute result does not match its request");
+            }
+            if !matches!(triple[2], b"unspecified" | b"set" | b"unset") {
+                bail!("managed Git content path selects an external driver");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_managed_content_targets(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+    arguments: &[String],
+) -> Result<()> {
+    let (operation, tail) = arguments
+        .split_first()
+        .context("managed Git operation is missing")?;
+    let explicit_paths = || {
+        tail.iter()
+            .position(|argument| argument == "--")
+            .map(|separator| tail[separator + 1..].to_vec())
+            .context("managed Git content operation has no exact path separator")
+    };
+    match operation.as_str() {
+        "add" | "restore" | "checkout" => {
+            let paths = explicit_paths()?;
+            validate_exact_content_paths(program, program_guard, cwd, &paths)?;
+            reject_external_driver_paths(program, program_guard, cwd, &paths, "--source=HEAD")?;
+        }
+        "commit" => {
+            let paths = staged_content_paths(program, program_guard, cwd)?;
+            reject_external_driver_paths(program, program_guard, cwd, &paths, "--source=HEAD")?;
+            reject_external_driver_paths(program, program_guard, cwd, &paths, "--cached")?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2021,6 +2228,7 @@ fn git_ref_authority_selectors(arguments: &[String]) -> Result<Vec<String>> {
         .context("managed Git operation is missing")?;
     let mut selectors = Vec::new();
     match operation.as_str() {
+        "add" | "restore" | "checkout" => selectors.push("HEAD".to_owned()),
         "commit" => selectors.push("HEAD".to_owned()),
         "tag" => {
             let mut index = 0_usize;
@@ -4118,6 +4326,13 @@ where
         environment,
         command_name != "clone",
     )?;
+    #[cfg(target_os = "linux")]
+    validate_managed_content_targets(
+        &config.programs.git,
+        &program_guard,
+        cwd,
+        &unicode_arguments,
+    )?;
     if !config.github.discover_installations {
         config
             .github
@@ -4193,7 +4408,7 @@ where
         None
     };
     let hooks = fresh_git_hooks_directory(&paths)?;
-    let child_environment = isolated_git_environment(
+    let mut child_environment = isolated_git_environment(
         environment,
         &paths,
         frontends.path(),
@@ -4202,6 +4417,9 @@ where
         &config_digest,
         authority.as_ref(),
     )?;
+    if matches!(command_name.as_str(), "add" | "restore" | "checkout") {
+        child_environment.insert(OsString::from("GIT_ATTR_SOURCE"), OsString::from("HEAD"));
+    }
     let mut child_arguments = managed_git_configuration_arguments(
         &paths,
         policy,
@@ -5069,10 +5287,9 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
                 "*.lock merge=ours",
                 "[attr]binary -diff -merge -text",
             ] {
-                assert!(
-                    validate_git_attributes(line.as_bytes()).is_err(),
-                    "accepted {line}"
-                );
+                validate_git_attributes(line.as_bytes()).unwrap_or_else(|error| {
+                    panic!("rejected inert attribute selector {line}: {error:#}");
+                });
             }
             validate_git_attributes(b"* text=auto eol=lf\n*.zip binary export-ignore\n").unwrap();
         }
@@ -6323,7 +6540,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
     #[cfg(unix)]
     #[test]
-    fn managed_repository_preflight_rejects_local_filters_and_nested_attributes() {
+    fn managed_repository_preflight_rejects_local_driver_configuration_and_holds_attributes() {
         let root = tempfile::tempdir().unwrap();
         let managed = root.path().join("managed");
         let repository = managed.join("repository");
@@ -6390,7 +6607,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             &environment,
             true,
         )
-        .is_err());
+        .is_ok());
         assert!(!marker.exists());
         assert!(Command::new("/usr/bin/git")
             .args(["rm", "--cached", "--force", "--", "nested/.gitattributes"])
@@ -6481,7 +6698,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
     #[cfg(unix)]
     #[test]
-    fn managed_repository_preflight_rejects_info_attributes_without_a_driver_config() {
+    fn managed_repository_preflight_accepts_inert_driver_attributes_without_configuration() {
         let root = tempfile::tempdir().unwrap();
         let managed = root.path().join("managed");
         let repository = managed.join("repository");
@@ -6503,7 +6720,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             &BTreeMap::new(),
             true,
         )
-        .is_err());
+        .is_ok());
     }
 
     #[cfg(unix)]
@@ -6596,7 +6813,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             &BTreeMap::new(),
             true,
         )
-        .is_err());
+        .is_ok());
     }
 
     #[cfg(target_os = "linux")]
@@ -7412,6 +7629,33 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .status()
             .unwrap()
             .success());
+        fs::write(
+            repository.join(".gitattributes"),
+            "secret.txt filter=evil diff=evil merge=evil\n",
+        )
+        .unwrap();
+        fs::write(repository.join("secret.txt"), "initial\n").unwrap();
+        fs::write(repository.join("removed.txt"), "remove me\n").unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["add", "--", ".gitattributes", "removed.txt", "secret.txt",])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--message=initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         let config_path = home.join(".config/dev-auth/config.toml");
         write_workspace_config(&config_path, &managed);
         let directories = NativeUserDirs {
@@ -7419,12 +7663,41 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             config: config_path,
             runtime: root.path().join("runtime"),
         };
+        let marker = root.path().join("ambient-filter-ran");
+        let driver = root.path().join("ambient-filter");
+        fs::write(
+            &driver,
+            format!("#!/bin/sh\nprintf invoked > '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o700)).unwrap();
         let hostile_global = root.path().join("hostile-global");
         fs::write(
             &hostile_global,
-            "[alias]\n\tstatus = !exit 97\n[credential]\n\thelper = !exit 98\n",
+            format!(
+                "[alias]\n\tstatus = !exit 97\n[credential]\n\thelper = !exit 98\n[filter \"evil\"]\n\tclean = {}\n\tsmudge = {}\n[diff \"evil\"]\n\tcommand = {}\n[merge \"evil\"]\n\tdriver = {}\n",
+                driver.display(),
+                driver.display(),
+                driver.display(),
+                driver.display(),
+            ),
         )
         .unwrap();
+        fs::write(repository.join("secret.txt"), "changed\n").unwrap();
+        let ordinary = Command::new("/usr/bin/git")
+            .args(["status", "--short"])
+            .current_dir(&repository)
+            .env("GIT_CONFIG_GLOBAL", &hostile_global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .status()
+            .unwrap();
+        assert!(ordinary.success());
+        assert!(
+            marker.exists(),
+            "positive control did not invoke the driver"
+        );
+        fs::remove_file(&marker).unwrap();
         let environment = BTreeMap::from([
             (
                 OsString::from("GIT_CONFIG_GLOBAL"),
@@ -7443,6 +7716,171 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         )
         .unwrap();
         assert!(status.success());
+        assert!(!marker.exists(), "managed Git executed the ambient driver");
+
+        fs::write(repository.join("safe.txt"), "safe\n").unwrap();
+        let status = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("add"),
+                OsString::from("--"),
+                OsString::from("safe.txt"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            status.success(),
+            "managed Git did not stage a safe exact path"
+        );
+        assert!(!marker.exists(), "managed Git executed the ambient driver");
+
+        fs::create_dir(repository.join("nested")).unwrap();
+        fs::write(repository.join("nested/file.txt"), "nested\n").unwrap();
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("add"),
+                OsString::from("--"),
+                OsString::from("nested"),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not one exact file"),
+            "unexpected directory staging rejection: {error:#}"
+        );
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, repository.join("linked")).unwrap();
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("add"),
+                OsString::from("--"),
+                OsString::from("linked/file.txt"),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsafe ancestor"),
+            "unexpected linked-ancestor rejection: {error:#}"
+        );
+
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("add"),
+                OsString::from("--"),
+                OsString::from("secret.txt"),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("selects an external driver"),
+            "unexpected driver-path rejection: {error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "rejected managed Git add executed a driver"
+        );
+        for operation in ["restore", "checkout"] {
+            let error = run_git_at(
+                &directories,
+                &repository,
+                &environment,
+                &[
+                    OsString::from(operation),
+                    OsString::from("--"),
+                    OsString::from("secret.txt"),
+                ],
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("selects an external driver"),
+                "unexpected {operation} driver-path rejection: {error:#}"
+            );
+        }
+        let staged = Command::new("/usr/bin/git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        assert_eq!(staged.stdout, b"safe.txt\n");
+
+        fs::remove_file(repository.join("removed.txt")).unwrap();
+        let status = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("add"),
+                OsString::from("--"),
+                OsString::from("removed.txt"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            status.success(),
+            "managed Git did not stage an exact deletion"
+        );
+
+        let mut hash_child = Command::new("/usr/bin/git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(&repository)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        hash_child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"staged ciphertext fixture\n")
+            .unwrap();
+        let hash = hash_child.wait_with_output().unwrap();
+        assert!(hash.status.success());
+        let object = std::str::from_utf8(&hash.stdout).unwrap().trim();
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{object},secret.txt"),
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let error = run_git_at(
+            &directories,
+            &repository,
+            &environment,
+            &[
+                OsString::from("commit"),
+                OsString::from("--no-status"),
+                OsString::from("--message"),
+                OsString::from("bounded fixture"),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("selects an external driver"),
+            "unexpected staged driver-path rejection: {error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "rejected managed Git commit executed a driver"
+        );
     }
 
     #[cfg(target_os = "linux")]

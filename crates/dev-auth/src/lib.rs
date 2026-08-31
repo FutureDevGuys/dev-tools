@@ -892,23 +892,37 @@ fn validate_git_status(arguments: &[&str]) -> Result<()> {
 fn validate_git_add(arguments: &[&str]) -> Result<()> {
     let mut pathspec = false;
     let mut paths = 0_usize;
-    let mut whole_tree = false;
     for argument in arguments {
         if pathspec {
+            if !valid_explicit_git_path(argument) {
+                bail!("Git add path is not an exact safe relative path");
+            }
             paths += 1;
             continue;
         }
         match *argument {
             "--" => pathspec = true,
-            "-A" | "--all" | "-u" | "--update" => whole_tree = true,
             "-N" | "--intent-to-add" | "-n" | "--dry-run" | "-v" | "--verbose" => {}
             _ => bail!("Git add requires bounded options and explicit -- pathspecs"),
         }
     }
-    if !whole_tree && paths == 0 {
-        bail!("Git add requires --all, --update, or an explicit -- pathspec");
+    if paths == 0 {
+        bail!("Git add requires at least one explicit -- path");
     }
     Ok(())
+}
+
+pub(crate) fn valid_explicit_git_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['-', '/', '~'])
+        && !value.contains(['\\', ':', '*', '?', '[', ']', '\n', '\r', '\0'])
+        && !value.chars().any(char::is_control)
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.eq_ignore_ascii_case(".git")
+        })
 }
 
 fn validate_git_restore(arguments: &[&str]) -> Result<()> {
@@ -918,6 +932,9 @@ fn validate_git_restore(arguments: &[&str]) -> Result<()> {
     while index < arguments.len() {
         let argument = arguments[index];
         if pathspec {
+            if !valid_explicit_git_path(argument) {
+                bail!("Git restore path is not an exact safe relative path");
+            }
             paths += 1;
             index += 1;
             continue;
@@ -936,7 +953,8 @@ fn validate_git_restore(arguments: &[&str]) -> Result<()> {
 }
 
 fn validate_git_checkout(arguments: &[&str]) -> Result<()> {
-    let admitted = matches!(arguments, ["--", paths @ ..] if !paths.is_empty());
+    let admitted = matches!(arguments, ["--", paths @ ..]
+        if !paths.is_empty() && paths.iter().all(|path| valid_explicit_git_path(path)));
     if !admitted {
         bail!("Git checkout operation is outside the bounded automation grammar");
     }
@@ -1867,6 +1885,11 @@ mod git_capability_tests {
     fn rejected_git_commands_never_receive_a_capability() {
         for values in [
             &["pull", "--ff-only", "origin", "main"][..],
+            &["add", "--all"],
+            &["add", "--", "nested/../secret.txt"],
+            &["add", "--", "safe*.txt"],
+            &["checkout", "--", "safe[12].txt"],
+            &["restore", "--", ":(glob)**"],
             &["commit", "--message", "missing no-status"],
             &[
                 "clone",

@@ -962,12 +962,18 @@ fn internal_gh_git_child_rejects_url_scoped_repository_credential_helpers() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
+    let write_result = child
         .stdin
         .take()
         .unwrap()
-        .write_all(b"protocol=https\nhost=github.com\npath=ExampleOrg/repository.git\n\n")
-        .unwrap();
+        .write_all(b"protocol=https\nhost=github.com\npath=ExampleOrg/repository.git\n\n");
+    if let Err(error) = write_result {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "unexpected credential-input write failure: {error}"
+        );
+    }
     let output = child.wait_with_output().unwrap();
 
     assert!(!output.status.success());
