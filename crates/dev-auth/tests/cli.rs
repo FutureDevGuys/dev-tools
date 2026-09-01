@@ -104,6 +104,28 @@ fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
     assert!(error.contains("accepts only a full setup plan v3"));
 }
 
+#[test]
+fn typed_reconcile_cli_reserves_only_the_fixed_protocol_grammar() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "reconcile",
+                "plan",
+                "--source",
+                "relative.toml",
+                "--output",
+                "/tmp/plan.json",
+                "--format",
+                "json",
+            ])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("source and output paths must be absolute"));
+    assert!(!error.contains("unknown command"));
+}
+
 #[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,

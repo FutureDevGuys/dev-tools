@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import fnmatch
 import glob
+import hashlib
 import importlib.resources
 import io
 import json
@@ -15,10 +16,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -36,6 +39,11 @@ import yaml
 
 
 MODES = {"symlink", "copy", "json_overlay", "toml_overlay"}
+RECONCILER_PROTOCOL = "dev-tools-reconcile-v1"
+RECONCILER_SCOPES = {"user", "system"}
+RECONCILER_PRIVILEGES = {"user", "sudo"}
+RECONCILER_OUTPUT_LIMIT = 1024 * 1024
+RECONCILER_TIMEOUT_SECONDS = 120
 DIRECTORY_STRATEGIES = {"as_directory", "children", "recursive"}
 SCRIPT_ON_FAIL_POLICIES = {"abort", "skip", "continue"}
 SCRIPT_PRIVILEGES = {"user", "sudo"}
@@ -234,6 +242,8 @@ STATUS_KEYS = (
     "script_error",
     "script_skipped",
     "errors",
+    "deferred",
+    "input_required",
 )
 
 STATUS_LABELS = {
@@ -245,6 +255,8 @@ STATUS_LABELS = {
     "script_skipped": "[skip]",
     "info": "[info]",
     "errors": "[error]",
+    "deferred": "[defer]",
+    "input_required": "[input]",
     "suppressed_comment": "[note]",
 }
 
@@ -257,6 +269,8 @@ STATUS_COLORS = {
     "script_skipped": "33",  # yellow
     "info": "34",  # blue
     "errors": "31",  # red
+    "deferred": "33",  # yellow
+    "input_required": "33",  # yellow
     "suppressed_comment": "33",  # yellow
 }
 
@@ -269,6 +283,8 @@ STATUS_GROUP_ORDER = (
     ("skipped_existing", "Skipped (existing target)"),
     ("missing_source", "Skipped (missing source)"),
     ("errors", "Errors"),
+    ("input_required", "Input Required"),
+    ("deferred", "Deferred"),
     ("suppressed_comment", "Suppressed by comments"),
     ("up_to_date", "Up-to-date"),
 )
@@ -411,6 +427,20 @@ class Entry:
     exclusive_sibling_groups: tuple[
         tuple[tuple[str, ...], tuple[str, ...]], ...
     ] = ()
+
+
+@dataclass(frozen=True)
+class ReconcilerEntry:
+    name: str
+    executable: Path
+    source: Path
+    scope: str
+    privilege: str
+    protocol: str = RECONCILER_PROTOCOL
+    profiles: tuple[str, ...] = ()
+    group: Optional[str] = None
+    subgroup: Optional[str] = None
+    scope_label: str = "root"
 
 
 @dataclass
@@ -1665,6 +1695,81 @@ def load_config(config_path: Path, default_mode: str | None) -> Iterable[Entry]:
     return entries
 
 
+def load_reconcilers(config_path: Path) -> list[ReconcilerEntry]:
+    payload = load_yaml_mapping(config_path)
+    raw_reconcilers = payload.get("reconcilers", [])
+    if not isinstance(raw_reconcilers, list):
+        raise ConfigError("Config 'reconcilers' must be a list.")
+    reconcilers: list[ReconcilerEntry] = []
+    names: set[str] = set()
+    allowed = {
+        "name", "executable", "source", "scope", "privilege", "protocol",
+        "profiles", "group", "subgroup",
+    }
+    for index, raw in enumerate(raw_reconcilers):
+        if not isinstance(raw, dict):
+            raise ConfigError(f"Reconciler {index} must be a mapping.")
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ConfigError(f"Reconciler {index} contains unsupported keys: {unknown}")
+        name = raw.get("name")
+        executable = raw.get("executable")
+        source = raw.get("source")
+        scope = raw.get("scope", "user")
+        privilege = raw.get("privilege", "user")
+        protocol = raw.get("protocol")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"Reconciler {index} requires a non-empty name.")
+        name = name.strip()
+        if name in names:
+            raise ConfigError(f"Duplicate reconciler name: {name}")
+        names.add(name)
+        if not isinstance(executable, str) or not Path(executable).is_absolute():
+            raise ConfigError(f"Reconciler '{name}' requires an absolute executable path.")
+        if not isinstance(source, str) or not source:
+            raise ConfigError(f"Reconciler '{name}' requires a source path.")
+        source_path = Path(normalize_user_path(source))
+        if not source_path.is_absolute():
+            source_path = Path(os.path.abspath(config_path.parent / source_path))
+        if scope not in RECONCILER_SCOPES:
+            raise ConfigError(f"Reconciler '{name}' has an unsupported scope.")
+        if privilege not in RECONCILER_PRIVILEGES:
+            raise ConfigError(f"Reconciler '{name}' has an unsupported privilege.")
+        if protocol != RECONCILER_PROTOCOL:
+            raise ConfigError(f"Reconciler '{name}' has an unsupported protocol.")
+        group = raw.get("group")
+        subgroup = raw.get("subgroup")
+        if group is not None and not isinstance(group, str):
+            raise ConfigError(f"Reconciler '{name}' group must be a string.")
+        if subgroup is not None and not isinstance(subgroup, str):
+            raise ConfigError(f"Reconciler '{name}' subgroup must be a string.")
+        reconcilers.append(ReconcilerEntry(
+            name=name,
+            executable=Path(executable),
+            source=source_path,
+            scope=scope,
+            privilege=privilege,
+            protocol=protocol,
+            profiles=parse_profiles(raw.get("profiles")),
+            group=group,
+            subgroup=subgroup,
+            scope_label=compose_scope_label(group, subgroup),
+        ))
+    return reconcilers
+
+
+def select_reconcilers_for_profiles(
+    reconcilers: Iterable[ReconcilerEntry], active_profiles: Iterable[str]
+) -> list[ReconcilerEntry]:
+    active = {profile.strip() for profile in active_profiles if profile.strip()}
+    return [
+        reconciler
+        for reconciler in reconcilers
+        if (not active and not reconciler.profiles)
+        or (active and bool(set(reconciler.profiles) & active))
+    ]
+
+
 def load_json_state_preconditions(config_path: Path) -> tuple[JsonStatePrecondition, ...]:
     payload = load_yaml_mapping(config_path)
     raw_rows = payload.get("state_preconditions", [])
@@ -2099,6 +2204,150 @@ def acquire_shared_sudo_session() -> str:
     return sudo_path
 
 
+def _public_reconciler_token(value: object, description: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,127}", value)
+    ):
+        raise ConfigError(f"external reconciler returned an invalid {description}")
+    return value
+
+
+def _parse_reconciler_result(output: bytes) -> dict[str, object]:
+    try:
+        value = json.loads(output.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("external reconciler returned invalid JSON") from exc
+    required = {
+        "schema", "changed", "verified", "deferred", "input_required",
+        "next_action", "diagnostics",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ConfigError("external reconciler returned an unsupported result shape")
+    if value["schema"] != "dev-tools-reconcile-result-v1":
+        raise ConfigError("external reconciler returned an unsupported result schema")
+    for key in ("changed", "verified", "deferred"):
+        if not isinstance(value[key], bool):
+            raise ConfigError(f"external reconciler returned an invalid {key} field")
+    for key in ("input_required", "diagnostics"):
+        if not isinstance(value[key], list):
+            raise ConfigError(f"external reconciler returned an invalid {key} field")
+        value[key] = [_public_reconciler_token(item, key) for item in value[key]]
+    value["next_action"] = _public_reconciler_token(value["next_action"], "next_action")
+    if value["verified"] and (value["deferred"] or value["input_required"]):
+        raise ConfigError("external reconciler returned contradictory terminal state")
+    return value
+
+
+def _invoke_reconciler(
+    entry: ReconcilerEntry,
+    arguments: list[str],
+    temporary: Path,
+    sudo_path: str | None,
+) -> dict[str, object]:
+    executable_metadata = entry.executable.lstat()
+    if (
+        not entry.executable.is_absolute()
+        or entry.executable != Path(os.path.abspath(entry.executable))
+        or entry.executable.is_symlink()
+        or not entry.executable.is_file()
+        or executable_metadata.st_mode & 0o111 == 0
+    ):
+        raise ConfigError(f"Reconciler '{entry.name}' executable has unsafe authority.")
+    command = [str(entry.executable), *arguments]
+    if entry.privilege == "sudo":
+        if sudo_path is None:
+            raise ConfigError(f"Reconciler '{entry.name}' requires a shared sudo session.")
+        command = [sudo_path, "-n", "--", *command]
+    stdout_path = temporary / "stdout"
+    stderr_path = temporary / "stderr"
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        process = subprocess.Popen(
+            command,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + RECONCILER_TIMEOUT_SECONDS
+        while True:
+            try:
+                return_code = process.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired as exc:
+                oversized = (
+                    stdout_path.stat().st_size > RECONCILER_OUTPUT_LIMIT
+                    or stderr_path.stat().st_size > RECONCILER_OUTPUT_LIMIT
+                )
+                timed_out = time.monotonic() >= deadline
+                if not oversized and not timed_out:
+                    continue
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                reason = "output limit" if oversized else "execution timeout"
+                raise ConfigError(
+                    f"Reconciler '{entry.name}' exceeded its {reason}."
+                ) from exc
+    if (
+        stdout_path.stat().st_size > RECONCILER_OUTPUT_LIMIT
+        or stderr_path.stat().st_size > RECONCILER_OUTPUT_LIMIT
+    ):
+        raise ConfigError(f"Reconciler '{entry.name}' exceeded its output limit.")
+    if return_code != 0:
+        raise ConfigError(
+            f"Reconciler '{entry.name}' failed during {arguments[1]} with exit {return_code}."
+        )
+    return _parse_reconciler_result(stdout_path.read_bytes())
+
+
+def run_external_reconciler(
+    entry: ReconcilerEntry,
+    *,
+    dry_run: bool,
+    sudo_path: str | None,
+) -> dict[str, object]:
+    if entry.protocol != RECONCILER_PROTOCOL:
+        raise ConfigError(f"Reconciler '{entry.name}' protocol changed after validation.")
+    source_metadata = entry.source.lstat()
+    if entry.source.is_symlink() or not entry.source.is_file() or source_metadata.st_size > RECONCILER_OUTPUT_LIMIT:
+        raise ConfigError(f"Reconciler '{entry.name}' source has unsafe authority.")
+    with tempfile.TemporaryDirectory(prefix="sync-configs-reconcile-") as directory:
+        temporary = Path(directory)
+        temporary.chmod(0o700)
+        plan = temporary / "plan.json"
+        planned = _invoke_reconciler(
+            entry,
+            ["reconcile", "plan", "--source", str(entry.source), "--output", str(plan), "--format", "json"],
+            temporary,
+            sudo_path,
+        )
+        if planned["deferred"] or planned["input_required"] or dry_run:
+            return planned
+        plan_metadata = plan.lstat()
+        if plan.is_symlink() or not plan.is_file() or plan_metadata.st_size > RECONCILER_OUTPUT_LIMIT:
+            raise ConfigError(f"Reconciler '{entry.name}' produced an unsafe plan.")
+        plan_sha256 = hashlib.sha256(plan.read_bytes()).hexdigest()
+        applied = _invoke_reconciler(
+            entry,
+            ["reconcile", "apply", "--plan", str(plan), "--sha256", plan_sha256, "--format", "json"],
+            temporary,
+            sudo_path,
+        )
+        if applied["deferred"] or applied["input_required"]:
+            return applied
+        verified = _invoke_reconciler(
+            entry,
+            ["reconcile", "verify", "--source", str(entry.source), "--format", "json"],
+            temporary,
+            sudo_path,
+        )
+        if not verified["verified"] or verified["changed"] or verified["deferred"] or verified["input_required"]:
+            raise ConfigError(f"Reconciler '{entry.name}' did not verify its postcondition.")
+        verified["changed"] = applied["changed"]
+        return verified
+
+
 def format_status_line(
     status_key: str,
     message: str,
@@ -2446,8 +2695,10 @@ def print_summary(
     missing_source = stats.get("missing_source", 0)
     script_error = stats.get("script_error", 0)
     script_skipped = stats.get("script_skipped", 0)
+    deferred = stats.get("deferred", 0)
+    input_required = stats.get("input_required", 0)
     errors = stats.get("errors", 0)
-    skipped_total = skipped_existing + missing_source + script_skipped
+    skipped_total = skipped_existing + missing_source + script_skipped + deferred + input_required
     error_total = errors + script_error
 
     summary = (
@@ -2460,6 +2711,10 @@ def print_summary(
     )
     if script_skipped:
         summary += f", script: {format_count(script_skipped, 'script_skipped', use_color)}"
+    if deferred:
+        summary += f", deferred: {format_count(deferred, 'deferred', use_color)}"
+    if input_required:
+        summary += f", input: {format_count(input_required, 'input_required', use_color)}"
     summary += (
         f"), "
         f"{format_count(error_total, 'errors', use_color)} errors"
@@ -2489,6 +2744,8 @@ def print_summary(
                 counts.get("skipped_existing", 0)
                 + counts.get("missing_source", 0)
                 + counts.get("script_skipped", 0)
+                + counts.get("deferred", 0)
+                + counts.get("input_required", 0)
             )
             group_errors = counts.get("errors", 0) + counts.get("script_error", 0)
             print(
@@ -2500,7 +2757,11 @@ def print_summary(
             )
 
 
-def run(args: argparse.Namespace, script_dir: Path) -> int:
+def run(
+    args: argparse.Namespace,
+    script_dir: Path,
+    structured_reconciler_results: list[dict[str, object]] | None = None,
+) -> int:
     use_color = not args.no_color
     config_path = resolve_config_path(args.config, script_dir)
     # Typed reconciliation hooks consume the same selected profile set without
@@ -2522,6 +2783,10 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             if override_path:
                 all_entries.extend(load_config(override_path, default_mode=args.mode))
             select_entries_for_profiles(all_entries, args.profile)
+            all_reconcilers = load_reconcilers(config_path)
+            if override_path:
+                all_reconcilers.extend(load_reconcilers(override_path))
+            select_reconcilers_for_profiles(all_reconcilers, args.profile)
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -2534,10 +2799,17 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             override_path = find_override_path(config_path)
             if override_path:
                 all_entries.extend(load_config(override_path, default_mode=args.mode))
+            all_reconcilers = load_reconcilers(config_path)
+            if override_path:
+                all_reconcilers.extend(load_reconcilers(override_path))
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        for profile in collect_profile_names(all_entries):
+        profile_names = set(collect_profile_names(all_entries))
+        profile_names.update(
+            profile for reconciler in all_reconcilers for profile in reconciler.profiles
+        )
+        for profile in sorted(profile_names):
             print(profile)
         return 0
 
@@ -2557,6 +2829,7 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
         return 1
 
     override_entries: list[Entry] = []
+    reconcilers: list[ReconcilerEntry] = []
     override_path = find_override_path(config_path)
     if override_path:
         try:
@@ -2567,12 +2840,23 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    try:
+        reconcilers = load_reconcilers(config_path)
+        if override_path:
+            reconcilers.extend(load_reconcilers(override_path))
+        names = [reconciler.name for reconciler in reconcilers]
+        if len(names) != len(set(names)):
+            raise ConfigError("Reconciler names must be unique across base and override manifests.")
+        reconcilers = select_reconcilers_for_profiles(reconcilers, args.profile)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     privileged_scripts_selected = any(
         (entry.pre_script is not None and entry.pre_script_privilege == "sudo")
         or (entry.post_script is not None and entry.post_script_privilege == "sudo")
         for entry in [*entries, *override_entries]
-    )
+    ) or any(reconciler.privilege == "sudo" for reconciler in reconcilers)
     sudo_path: str | None = None
     if privileged_scripts_selected and not args.dry_run:
         try:
@@ -2592,11 +2876,11 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
     entries_to_expand: list[Entry] = []
     progress_widths = PrintWidths(
         scope=max(
-            (len(entry.scope_label) for entry in [*entries, *override_entries]),
+            (len(entry.scope_label) for entry in [*entries, *override_entries, *reconcilers]),
             default=0,
         ),
         name=max(
-            (len(entry.name) for entry in [*entries, *override_entries]),
+            (len(entry.name) for entry in [*entries, *override_entries, *reconcilers]),
             default=0,
         ),
     )
@@ -2676,13 +2960,13 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
         entries, prefer_overrides=not args.no_source_overrides
     )
 
-    if not entries and not buffer:
+    if not entries and not reconcilers and not buffer:
         print("No entries defined in config; nothing to do.")
         return 0
 
     widths = PrintWidths(
-        scope=max((len(entry.scope_label) for entry in entries), default=0),
-        name=max((len(entry.name) for entry in entries), default=0),
+        scope=max((len(entry.scope_label) for entry in [*entries, *reconcilers]), default=0),
+        name=max((len(entry.name) for entry in [*entries, *reconcilers]), default=0),
     )
 
     entries, duplicate_conflicts = dedupe_and_validate_duplicate_targets(
@@ -2718,6 +3002,50 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
             stats["errors"] = stats.get("errors", 0) + 1
             increment_group_stat(group_stats, entry, "errors")
             continue
+
+    # --- Typed owner-tool reconciliation: fixed protocol, no shell templates ---
+    for reconciler in reconcilers:
+        try:
+            result = run_external_reconciler(
+                reconciler,
+                dry_run=args.dry_run,
+                sudo_path=sudo_path,
+            )
+            if result["input_required"]:
+                status = "input_required"
+            elif result["deferred"]:
+                status = "deferred"
+            elif result["changed"]:
+                status = "performed"
+            elif result["verified"]:
+                status = "up_to_date"
+            else:
+                status = "deferred"
+            diagnostics = result["diagnostics"]
+            suffix = f" diagnostics={','.join(diagnostics)}" if diagnostics else ""
+            buffer.append(StatusRecord(
+                status_key=status,
+                message=f"reconciler next={result['next_action']}{suffix}",
+                entry=reconciler,
+            ))
+            stats[status] = stats.get(status, 0) + 1
+            increment_group_stat(group_stats, reconciler, status)
+            if structured_reconciler_results is not None:
+                structured_reconciler_results.append({
+                    "name": reconciler.name,
+                    "group": reconciler.group,
+                    "subgroup": reconciler.subgroup,
+                    "scope": reconciler.scope,
+                    **result,
+                })
+        except (ConfigError, OSError) as exc:
+            buffer.append(StatusRecord(
+                status_key="errors",
+                message=format_exception(exc),
+                entry=reconciler,
+            ))
+            stats["errors"] = stats.get("errors", 0) + 1
+            increment_group_stat(group_stats, reconciler, "errors")
 
     # --- Post-scripts: run after all entries are processed ---
     for entry in post_script_entries:
@@ -2778,6 +3106,7 @@ def run(args: argparse.Namespace, script_dir: Path) -> int:
     # Total includes expanded entries plus any pre-script-filtered entries.
     total = (
         len(entries)
+        + len(reconcilers)
         + stats.get("script_error", 0)
         + stats.get("script_skipped", 0)
     )
@@ -2796,15 +3125,19 @@ def main() -> int:
 
     stdout = io.StringIO()
     stderr = io.StringIO()
+    reconciler_results: list[dict[str, object]] = []
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        exit_code = run(args, script_dir)
-    print(json.dumps({
+        exit_code = run(args, script_dir, reconciler_results)
+    payload: dict[str, object] = {
         "schema_version": 1,
         "outcome": "completed" if exit_code == 0 else "failed",
         "exit_code": exit_code,
         "dry_run": bool(args.dry_run),
         "profiles": list(args.profile),
-    }, sort_keys=True))
+    }
+    if reconciler_results:
+        payload["reconcilers"] = reconciler_results
+    print(json.dumps(payload, sort_keys=True))
     return exit_code
 
 

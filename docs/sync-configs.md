@@ -6,6 +6,26 @@ Results remain buffered into deterministic status groups. Informational records 
 
 Dry-run writes nothing and executes no hooks. The command never installs packages, applications, Dev Tools products, or itself.
 
+## Typed external reconcilers
+
+The fixed `dev-tools-reconcile-v1` protocol lets an owner tool reconcile its own user configuration without turning `sync-configs` into an orchestration language. A reconciler entry declares one absolute executable, one desired-state source, a user or system scope, user or sudo privilege, and the fixed protocol identifier. Arbitrary commands, flags, shell strings, and templates are rejected.
+
+```yaml
+reconcilers:
+  - name: dev-auth-user-config
+    group: Identity
+    subgroup: Dev Auth
+    executable: /usr/local/bin/dev-auth
+    source: ./dev-auth/config-v2.toml
+    scope: user
+    privilege: sudo
+    protocol: dev-tools-reconcile-v1
+```
+
+For each selected entry, `sync-configs` runs only `reconcile plan --source PATH --output PLAN --format json`, `reconcile apply --plan PLAN --sha256 HEX --format json`, and `reconcile verify --source PATH --format json`. Plans stay in a private temporary directory and are removed after the terminal result. Subprocesses have fixed time and output bounds; their result must use the value-free `dev-tools-reconcile-result-v1` schema. Human output uses the existing group, color, and summary presentation. JSON output includes structured reconciler results and never includes captured owner-tool output. Dry-run executes planning only. A sudo reconciler shares the same one-time native sudo session used by privileged legacy hooks.
+
+The owner tool remains solely responsible for domain validation, action planning, mutation, receipts, and verification. In particular, the dev-auth reconciler manages only the current user configuration; it cannot install dev-auth, alter administrator policy, manage services, activate same-name launchers, or enroll credentials.
+
 The release artifact is a platform-neutral Python zip application containing its hash-locked Python dependency and third-party license. It requires Python 3.11 or newer, but does not resolve or install packages on the target host. Release builds normalize archive metadata and validate the artifact under `python -S` so globally installed packages cannot satisfy its imports.
 
 ## Comment-aware TOML overlays

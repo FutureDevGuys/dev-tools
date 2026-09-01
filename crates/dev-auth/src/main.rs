@@ -19,7 +19,7 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -946,6 +946,91 @@ fn run_setup(_arguments: impl Iterator<Item = String>) -> Result<i32> {
     bail!("dev-auth setup is not supported on this platform yet")
 }
 
+#[cfg(unix)]
+fn run_reconcile(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
+    let operation = arguments
+        .next()
+        .context("reconcile requires plan, apply, or verify")?;
+    let mut source = None;
+    let mut plan = None;
+    let mut output = None;
+    let mut digest = None;
+    let mut format = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" if source.is_none() => {
+                source = Some(arguments.next().context("--source requires PATH")?)
+            }
+            "--plan" if plan.is_none() => {
+                plan = Some(arguments.next().context("--plan requires PATH")?)
+            }
+            "--output" if output.is_none() => {
+                output = Some(arguments.next().context("--output requires PATH")?)
+            }
+            "--sha256" if digest.is_none() => {
+                digest = Some(arguments.next().context("--sha256 requires HEX")?)
+            }
+            "--format" if format.is_none() => {
+                format = Some(arguments.next().context("--format requires json")?)
+            }
+            _ => bail!("reconcile received an unsupported or duplicate argument"),
+        }
+    }
+    if format.as_deref() != Some("json") {
+        bail!("reconcile requires --format json");
+    }
+    let report = match operation.as_str() {
+        "plan" => {
+            if plan.is_some() || digest.is_some() {
+                bail!("reconcile plan accepts only source and output paths");
+            }
+            let source =
+                std::path::PathBuf::from(source.context("reconcile plan requires --source PATH")?);
+            let output =
+                std::path::PathBuf::from(output.context("reconcile plan requires --output PLAN")?);
+            if !source.is_absolute() || !output.is_absolute() {
+                bail!("reconcile source and output paths must be absolute");
+            }
+            let (plan, report) = dev_auth::reconcile::plan_user_config(&source)?;
+            dev_auth::reconcile::write_plan(&output, &plan)?;
+            report
+        }
+        "apply" => {
+            if source.is_some() || output.is_some() {
+                bail!("reconcile apply accepts only a plan and digest");
+            }
+            let plan_path =
+                std::path::PathBuf::from(plan.context("reconcile apply requires --plan PLAN")?);
+            if !plan_path.is_absolute() {
+                bail!("reconcile plan path must be absolute");
+            }
+            let digest = digest.context("reconcile apply requires --sha256 HEX")?;
+            let plan = dev_auth::reconcile::read_plan(&plan_path)?;
+            dev_auth::reconcile::apply_user_config(&plan, &digest)?
+        }
+        "verify" => {
+            if plan.is_some() || output.is_some() || digest.is_some() {
+                bail!("reconcile verify accepts only a source path");
+            }
+            let source = std::path::PathBuf::from(
+                source.context("reconcile verify requires --source PATH")?,
+            );
+            if !source.is_absolute() {
+                bail!("reconcile source path must be absolute");
+            }
+            dev_auth::reconcile::verify_user_config(&source)?
+        }
+        _ => bail!("reconcile requires plan, apply, or verify"),
+    };
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+fn run_reconcile(_arguments: impl Iterator<Item = String>) -> Result<i32> {
+    bail!("dev-auth reconciliation is not supported on this platform yet")
+}
+
 fn run() -> Result<i32> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next().context(usage())?;
@@ -958,6 +1043,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         "setup" => run_setup(arguments),
+        "reconcile" => run_reconcile(arguments),
         "broker" => {
             if arguments.next().as_deref() != Some("serve") || arguments.next().is_some() {
                 bail!("broker requires the exact operation: serve");

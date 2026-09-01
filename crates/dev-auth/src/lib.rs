@@ -25,6 +25,8 @@ pub mod linux_admission;
 #[cfg(unix)]
 pub mod policy_store;
 pub mod policy_v2;
+#[cfg(unix)]
+pub mod reconcile;
 pub mod release_manifest;
 mod runtime;
 #[cfg(unix)]
