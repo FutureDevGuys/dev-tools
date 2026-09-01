@@ -177,6 +177,43 @@ fn stable_selection_is_product_scoped_and_rejects_prereleases() {
 }
 
 #[test]
+fn github_release_selection_ignores_unrelated_api_fields() {
+    let releases = br#"[
+      {
+        "url": "https://api.github.com/repos/example/tools/releases/1",
+        "tag_name": "dev-auth/v0.3.1",
+        "draft": false,
+        "prerelease": false,
+        "created_at": "2026-09-01T00:00:00Z",
+        "assets": [
+          {
+            "id": 1,
+            "name": "dev-tools-root.json",
+            "browser_download_url": "https://github.com/example/tools/releases/download/dev-auth%2Fv0.3.1/dev-tools-root.json",
+            "content_type": "application/json"
+          },
+          {
+            "id": 2,
+            "name": "dev-auth-stable.json",
+            "browser_download_url": "https://github.com/example/tools/releases/download/dev-auth%2Fv0.3.1/dev-auth-stable.json",
+            "content_type": "application/json"
+          }
+        ]
+      }
+    ]"#;
+
+    let selected = select_stable_release_assets(
+        releases,
+        "dev-auth",
+        "dev-tools-root.json",
+        "dev-auth-stable.json",
+    )
+    .unwrap();
+
+    assert_eq!(selected.version.to_string(), "0.3.1");
+}
+
+#[test]
 fn https_transport_rejects_untrusted_origins_before_network_access() {
     let policy = HttpsPolicy {
         allowed_hosts: BTreeSet::from(["api.github.com".into()]),
