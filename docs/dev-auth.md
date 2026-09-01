@@ -8,6 +8,8 @@ The signed dev-auth release owns authenticated stable-release selection, immutab
 
 `dev-auth setup plan` normalizes deployment TOML and equivalent CLI inputs into one value-free desired-state plan. `dev-auth setup apply` revalidates the approved digest, release, documents, native accounts, current state, and credential inputs before mutation. It stages the inactive release first, accepts credentials only through standard input, a private file descriptor, or an approved private file, and activates receipt-owned `git`/`gh` launchers last. A missing required credential leaves the candidate inactive and returns structured `input_required`; rerunning the same approved plan resumes without installation churn. `dev-auth setup rollback` deactivates same-name launchers and the broker before atomically swapping the shared active/previous release and its authenticated product metadata. Uninstall removes only receipt-owned artifacts and preserves policy and credential state until a separate purge.
 
+The strong Linux supervisor renews each 15-minute admission lease while it owns the complete transient systemd workload. A broker restart does not promote environment hints into authority: the root supervisor retries for a bounded 30-second window and can re-register only the same session, authority, root-owned cgroup, and still-live supervisor pidfd. Broker-backed operations fail closed during that window, and an unprovable boundary terminates the supervised workload before its authority can resume.
+
 The generic `dev-tools-reconcile-v1` surface deliberately exposes only current-user configuration reconciliation:
 
 ```text

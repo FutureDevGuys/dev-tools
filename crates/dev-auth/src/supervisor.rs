@@ -25,6 +25,8 @@ const ENVIRONMENT_MAGIC: &[u8] = b"DEV-AUTH-ENV-V1\0";
 const ENVIRONMENT_ENTRY_LIMIT: usize = 4096;
 const SESSION_LEASE_SECONDS: i64 = 15 * 60;
 const SESSION_RENEW_SECONDS: u64 = 10 * 60;
+const SESSION_REASSOCIATION_SECONDS: u64 = 30;
+const SESSION_REASSOCIATION_RETRY_MILLIS: u64 = 250;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ENVIRONMENT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -729,7 +731,7 @@ pub fn run_root_supervisor(
             return Err(error);
         }
     };
-    if let Err(error) = register_session(SessionRegistration {
+    let mut registration = SessionRegistration {
         session_id: session_id.to_owned(),
         owner_uid,
         workload: workload_name.to_owned(),
@@ -737,7 +739,8 @@ pub fn run_root_supervisor(
         authority: session_authority_from_resolved(profile),
         cgroup: cgroup.clone(),
         expires_at_unix: lease_expiry(),
-    }) {
+    };
+    if let Err(error) = register_session(registration.clone()) {
         let _ = gated.child.kill();
         let _ = gated.child.wait();
         stop_agent_proxies(&mut agent_proxies);
@@ -753,9 +756,9 @@ pub fn run_root_supervisor(
     }
     drop(gated.release);
 
-    let result = supervise_child(&mut gated.child, session_id);
+    let result = supervise_child(&mut gated.child, &mut registration);
     stop_agent_proxies(&mut agent_proxies);
-    let revoke_result = revoke_session(session_id);
+    let revoke_result = revoke_supervised_session(&mut registration);
     let status = result?;
     revoke_result?;
     Ok(status)
@@ -1470,14 +1473,17 @@ fn revoke_session(session_id: &str) -> Result<()> {
     }
 }
 
-fn supervise_child(child: &mut Child, session_id: &str) -> Result<ExitStatus> {
+fn supervise_child(
+    child: &mut Child,
+    registration: &mut SessionRegistration,
+) -> Result<ExitStatus> {
     let mut next_renewal = Instant::now() + Duration::from_secs(SESSION_RENEW_SECONDS);
     loop {
         if let Some(status) = child.try_wait().context("poll supervised workload")? {
             return Ok(status);
         }
         if Instant::now() >= next_renewal {
-            if let Err(error) = renew_session(session_id) {
+            if let Err(error) = renew_or_reassociate(registration) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error).context("renew workload admission lease");
@@ -1486,6 +1492,50 @@ fn supervise_child(child: &mut Child, session_id: &str) -> Result<ExitStatus> {
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn renew_or_reassociate(registration: &mut SessionRegistration) -> Result<()> {
+    renew_or_reassociate_with(
+        registration,
+        Duration::from_secs(SESSION_REASSOCIATION_SECONDS),
+        renew_session,
+        register_session,
+    )
+}
+
+fn renew_or_reassociate_with<Renew, Register>(
+    registration: &mut SessionRegistration,
+    timeout: Duration,
+    mut renew: Renew,
+    mut register: Register,
+) -> Result<()>
+where
+    Renew: FnMut(&str) -> Result<()>,
+    Register: FnMut(SessionRegistration) -> Result<()>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        registration.expires_at_unix = lease_expiry();
+        if renew(&registration.session_id).is_ok() {
+            return Ok(());
+        }
+        if register(registration.clone()).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("broker did not re-associate the retained workload boundary");
+        }
+        thread::sleep(Duration::from_millis(SESSION_REASSOCIATION_RETRY_MILLIS));
+    }
+}
+
+fn revoke_supervised_session(registration: &mut SessionRegistration) -> Result<()> {
+    if revoke_session(&registration.session_id).is_ok() {
+        return Ok(());
+    }
+    renew_or_reassociate(registration)
+        .context("re-associate workload boundary before terminal revocation")?;
+    revoke_session(&registration.session_id)
 }
 
 fn lease_expiry() -> i64 {
@@ -1507,6 +1557,91 @@ fn validate_identifier(value: &str, description: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session_registration() -> SessionRegistration {
+        SessionRegistration {
+            session_id: "a".repeat(32),
+            owner_uid: 1000,
+            workload: "codex".into(),
+            profile: "automation".into(),
+            authority: crate::linux_admission::SessionAuthorityGrant {
+                github: None,
+                signing: None,
+                ssh: Vec::new(),
+            },
+            cgroup: "/sys/fs/cgroup/system.slice/dev-auth-workload-a.scope".into(),
+            expires_at_unix: 1,
+        }
+    }
+
+    #[test]
+    fn retained_workload_boundary_reassociates_after_broker_restart() {
+        let mut registration = test_session_registration();
+        let mut renewals = 0;
+        let mut registrations = 0;
+
+        renew_or_reassociate_with(
+            &mut registration,
+            Duration::ZERO,
+            |_| {
+                renewals += 1;
+                bail!("session was lost with the prior broker")
+            },
+            |candidate| {
+                registrations += 1;
+                assert_eq!(candidate.session_id, "a".repeat(32));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(renewals, 1);
+        assert_eq!(registrations, 1);
+        assert!(registration.expires_at_unix > 1);
+    }
+
+    #[test]
+    fn transient_lost_response_retries_renewal_without_duplicate_admission() {
+        let mut registration = test_session_registration();
+        let mut renewals = 0;
+        let mut registrations = 0;
+
+        renew_or_reassociate_with(
+            &mut registration,
+            Duration::from_secs(1),
+            |_| {
+                renewals += 1;
+                if renewals == 1 {
+                    bail!("first response was lost")
+                }
+                Ok(())
+            },
+            |_| {
+                registrations += 1;
+                bail!("the original broker still owns the session")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(renewals, 2);
+        assert_eq!(registrations, 1);
+    }
+
+    #[test]
+    fn unprovable_restart_fails_after_the_bounded_reassociation_window() {
+        let mut registration = test_session_registration();
+        let error = renew_or_reassociate_with(
+            &mut registration,
+            Duration::ZERO,
+            |_| bail!("broker unavailable"),
+            |_| bail!("boundary rejected"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("did not re-associate the retained workload boundary"));
+    }
 
     #[test]
     fn workload_environment_removes_auth_and_loader_injection_but_keeps_ui_settings() {
