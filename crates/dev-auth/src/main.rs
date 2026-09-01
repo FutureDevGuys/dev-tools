@@ -19,7 +19,7 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -910,7 +910,64 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             println!("{}", serde_json::to_string(&report)?);
             Ok(0)
         }
-        "verify" | "repair" | "rollback" | "activate" | "deactivate" | "uninstall" => {
+        "verify" => {
+            let mut mode = None;
+            let mut plan = None;
+            let mut digest = None;
+            let mut format = None;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--mode" if mode.is_none() => {
+                        mode = Some(arguments.next().context("--mode requires a value")?)
+                    }
+                    "--plan" if plan.is_none() => {
+                        plan = Some(arguments.next().context("--plan requires a path")?)
+                    }
+                    "--sha256" if digest.is_none() => {
+                        digest = Some(arguments.next().context("--sha256 requires a digest")?)
+                    }
+                    "--format" if format.is_none() => {
+                        format = Some(arguments.next().context("--format requires a value")?)
+                    }
+                    _ => bail!("setup verify received an unsupported or duplicate argument"),
+                }
+            }
+            if let Some(plan) = plan {
+                if mode.is_some() {
+                    bail!("desired-state verification cannot mix --plan with --mode");
+                }
+                let plan = std::path::PathBuf::from(plan);
+                if !plan.is_absolute() {
+                    bail!("setup verify plan path must be absolute");
+                }
+                let format = format.as_deref().unwrap_or("json");
+                if !matches!(format, "human" | "json") {
+                    bail!("setup verify format must be human or json");
+                }
+                let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan)
+                    .context("setup verify accepts only a full setup plan v3")?;
+                let report = dev_auth::setup_v3::verify_setup_plan_v3(
+                    &plan,
+                    &digest.context("setup verify requires --sha256 HEX with --plan")?,
+                )?;
+                if format == "json" {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else {
+                    println!("changed={}", report.changed);
+                    println!("verified={}", report.verified);
+                    println!("next_action={}", report.next_action);
+                }
+                return Ok(if report.verified { 0 } else { 2 });
+            }
+            if digest.is_some() || format.is_some() {
+                bail!("setup verify --sha256 and --format require --plan");
+            }
+            let paths = setup_paths(setup_mode(mode.as_deref())?)?;
+            let report = dev_auth::setup::verify_at(&paths)?;
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(0)
+        }
+        "repair" | "rollback" | "activate" | "deactivate" | "uninstall" => {
             let mut mode = None;
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
@@ -927,7 +984,6 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 return Ok(0);
             }
             let report = match operation.as_str() {
-                "verify" => dev_auth::setup::verify_at(&paths)?,
                 "repair" => dev_auth::setup::repair_at(&paths)?,
                 "rollback" => dev_auth::setup::rollback_at(&paths)?,
                 "activate" => dev_auth::setup::activate_transparent_launchers_at(&paths)?,

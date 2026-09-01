@@ -7,7 +7,7 @@ use dev_auth::deployment::{
 use dev_auth::setup::{build_plan, InstallMode, InstallRequest, SetupPaths};
 use dev_auth::setup_v3::{
     build_setup_plan_v3_at, credential_requirements, render_setup_plan_v3,
-    setup_apply_candidate_path,
+    setup_apply_candidate_path, verify_setup_plan_v3,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -244,6 +244,10 @@ config = "{}"
     );
     assert_eq!(document_plan.actions.last().unwrap().kind, "verify");
     let (_, digest) = render_setup_plan_v3(&document_plan).unwrap();
+    let verification = verify_setup_plan_v3(&document_plan, &digest).unwrap();
+    assert!(!verification.changed);
+    assert!(!verification.verified);
+    assert_eq!(verification.next_action, "apply");
     assert_eq!(
         setup_apply_candidate_path(&document_plan, &digest).unwrap(),
         Some(document_plan.installation.request.source_executable.clone())

@@ -235,6 +235,28 @@ pub fn apply_setup_plan_v3(
     })
 }
 
+pub fn verify_setup_plan_v3(
+    plan: &SetupPlanV3,
+    approved_sha256: &str,
+) -> Result<SetupApplyReportV3> {
+    let (_, digest) = render_setup_plan_v3(plan)?;
+    if digest != approved_sha256.to_ascii_lowercase() {
+        bail!("setup plan v3 does not match the approved digest");
+    }
+    require_apply_identity(plan)?;
+    revalidate_public_plan_inputs(plan)?;
+    let verified = postcondition_satisfied(plan, &digest);
+    Ok(SetupApplyReportV3 {
+        schema: "dev-auth-setup-verify-v3".into(),
+        changed: false,
+        verified,
+        input_required: Vec::new(),
+        blocked: Vec::new(),
+        next_action: if verified { "none" } else { "apply" }.into(),
+        actions: Vec::new(),
+    })
+}
+
 pub fn setup_apply_candidate_path(
     plan: &SetupPlanV3,
     approved_sha256: &str,
