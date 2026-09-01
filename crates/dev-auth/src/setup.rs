@@ -54,6 +54,81 @@ const SYSTEM_ASSETS: [(&str, &str, u32); 5] = [
     ),
 ];
 
+pub(crate) fn installation_current_state_paths(
+    paths: &SetupPaths,
+    mode: InstallMode,
+) -> Vec<(String, String, PathBuf)> {
+    let mut current = vec![
+        (
+            "installation_receipt".into(),
+            "system".into(),
+            paths.data_root.join("install-v2.json"),
+        ),
+        (
+            "shared_installation_receipt".into(),
+            "system".into(),
+            paths.data_root.join("installation-receipt-v1.json"),
+        ),
+        (
+            "active_release_pointer".into(),
+            "system".into(),
+            paths.data_root.join("active"),
+        ),
+        (
+            "previous_release_pointer".into(),
+            "system".into(),
+            paths.data_root.join("previous"),
+        ),
+    ];
+    current.extend(PRODUCT_ALIASES.into_iter().map(|alias| {
+        (
+            "product_launcher".into(),
+            alias.into(),
+            paths.bin_dir.join(alias),
+        )
+    }));
+    current.extend(TRANSPARENT_ALIASES.into_iter().map(|alias| {
+        (
+            "transparent_launcher".into(),
+            alias.into(),
+            paths.bin_dir.join(alias),
+        )
+    }));
+    if mode == InstallMode::Strong {
+        current.push((
+            "privileged_workload_launcher".into(),
+            "system".into(),
+            PathBuf::from(PRIVILEGED_LAUNCHER_PATH),
+        ));
+        current.extend(linux_system_assets().into_iter().map(|(path, _, _)| {
+            (
+                "system_integration".into(),
+                path.display().to_string(),
+                path.to_path_buf(),
+            )
+        }));
+    }
+    current
+}
+
+pub(crate) fn user_integration_receipt_paths(
+    home: &Path,
+    user: &str,
+) -> Vec<(String, String, PathBuf)> {
+    vec![
+        (
+            "workload_launcher_receipt".into(),
+            user.into(),
+            workload_alias_receipt_path(home),
+        ),
+        (
+            "desktop_entry_receipt".into(),
+            user.into(),
+            desktop_entry_receipt_path(home),
+        ),
+    ]
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallMode {

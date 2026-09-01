@@ -227,7 +227,7 @@ config = "{}"
             offline: Some(false),
             activation: Some(Activation::Transparent),
             administrator_policy: Some(policy),
-            user_configs: vec![(user.name, config)],
+            user_configs: vec![(user.name.clone(), config)],
             user_policies: Vec::new(),
             credential_intents: Vec::new(),
         },
@@ -254,6 +254,52 @@ config = "{}"
         "activate_transparent_launchers"
     );
     assert_eq!(document_plan.actions.last().unwrap().kind, "verify");
+    for (kind, subject, path) in [
+        (
+            "shared_installation_receipt",
+            "system",
+            document_plan
+                .installation
+                .paths
+                .data_root
+                .join("installation-receipt-v1.json"),
+        ),
+        (
+            "active_release_pointer",
+            "system",
+            document_plan.installation.paths.data_root.join("active"),
+        ),
+        (
+            "product_launcher",
+            "git-dev-auth",
+            document_plan
+                .installation
+                .paths
+                .bin_dir
+                .join("git-dev-auth"),
+        ),
+        (
+            "transparent_launcher",
+            "git",
+            document_plan.installation.paths.bin_dir.join("git"),
+        ),
+        (
+            "workload_launcher_receipt",
+            user.name.as_str(),
+            user.dir
+                .join(".local/share/dev-auth/workload-aliases-v1.json"),
+        ),
+        (
+            "desktop_entry_receipt",
+            user.name.as_str(),
+            user.dir
+                .join(".local/share/dev-auth/desktop-entries-v1.json"),
+        ),
+    ] {
+        assert!(document_plan.current_paths.iter().any(|current| {
+            current.kind == kind && current.subject == subject && current.path == path
+        }));
+    }
     let (_, digest) = render_setup_plan_v3(&document_plan).unwrap();
     let verification = verify_setup_plan_v3(&document_plan, &digest).unwrap();
     assert!(!verification.changed);
@@ -364,6 +410,16 @@ config = "{}"
         DeploymentCliInput::default(),
     )
     .unwrap();
+
+    let mut displaced = installation.clone();
+    displaced.paths = SetupPaths {
+        data_root: root.path().join("displaced-data"),
+        bin_dir: root.path().join("displaced-bin"),
+    };
+    let error = build_setup_plan_v3_at(intent.clone(), displaced, false).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("deployment installation layout is not canonical"));
 
     let error = build_setup_plan_v3_at(intent.clone(), installation.clone(), false).unwrap_err();
     assert!(error

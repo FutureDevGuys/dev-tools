@@ -13,10 +13,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const DOCUMENT_LIMIT: u64 = 1024 * 1024;
+const CURRENT_OBJECT_LIMIT: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -40,10 +42,14 @@ pub struct NativeAccountIdentity {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentFileIdentity {
+    pub object_type: String,
     pub owner_uid: u32,
     pub mode: u32,
+    pub link_count: u64,
     pub length: u64,
     pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -829,6 +835,8 @@ pub fn build_setup_plan_v3_at(
     let intent_bytes = canonical_deployment_intent(&intent)?;
     let intent_sha256 = sha256_hex(&intent_bytes);
     render_plan(&installation).context("validate staged installation plan")?;
+    let current_user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
+        .context("effective native account does not exist")?;
     let expected_install_mode = match intent.mode {
         DeploymentMode::Strong => crate::setup::InstallMode::Strong,
         DeploymentMode::UserOnly => crate::setup::InstallMode::UserOnly,
@@ -838,6 +846,11 @@ pub fn build_setup_plan_v3_at(
     {
         bail!("deployment intent and staged installation plan disagree");
     }
+    require_canonical_installation_layout(
+        intent.mode,
+        &installation.paths,
+        Some(&current_user.dir),
+    )?;
     if require_privileged
         && intent.mode == DeploymentMode::Strong
         && !nix::unistd::Uid::effective().is_root()
@@ -868,8 +881,6 @@ pub fn build_setup_plan_v3_at(
         );
     }
 
-    let current_user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
-        .context("effective native account does not exist")?;
     validate_policy_program_authority(
         &administrator_policy,
         intent.mode,
@@ -984,6 +995,23 @@ pub fn build_setup_plan_v3_at(
     Ok(plan)
 }
 
+fn require_canonical_installation_layout(
+    mode: DeploymentMode,
+    paths: &crate::setup::SetupPaths,
+    user_home: Option<&Path>,
+) -> Result<()> {
+    let expected = match mode {
+        DeploymentMode::Strong => crate::setup::SetupPaths::strong(),
+        DeploymentMode::UserOnly => crate::setup::SetupPaths::user_only(
+            user_home.context("user-only deployment has no native account home")?,
+        ),
+    };
+    if paths != &expected {
+        bail!("deployment installation layout is not canonical");
+    }
+    Ok(())
+}
+
 fn validate_policy_program_authority(
     policy: &crate::policy_v2::SystemPolicyV2,
     mode: DeploymentMode,
@@ -1091,6 +1119,11 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
     {
         bail!("setup plan v3 current-state paths do not match the deployment authority");
     }
+    require_canonical_installation_layout(
+        plan.intent.mode,
+        &plan.installation.paths,
+        plan.accounts.first().map(|account| account.home.as_path()),
+    )?;
     render_plan(&plan.installation).context("validate nested installation plan")?;
     if plan.installation.request.activate_transparent_launchers {
         bail!("setup plan v3 must stage the release with transparent launchers inactive");
@@ -1110,21 +1143,18 @@ fn expected_current_path_keys(
     intent: &DeploymentIntent,
     accounts: &[NativeAccountIdentity],
 ) -> Vec<(String, String, PathBuf)> {
-    let mut paths = vec![
-        (
-            "installation_receipt".to_owned(),
-            "system".to_owned(),
-            installation.paths.data_root.join("install-v2.json"),
-        ),
-        (
-            "credential_actions".to_owned(),
-            "system".to_owned(),
-            installation
-                .paths
-                .data_root
-                .join("credential-actions-v1.json"),
-        ),
-    ];
+    let mut paths = crate::setup::installation_current_state_paths(
+        &installation.paths,
+        installation.request.mode,
+    );
+    paths.push((
+        "credential_actions".to_owned(),
+        "system".to_owned(),
+        installation
+            .paths
+            .data_root
+            .join("credential-actions-v1.json"),
+    ));
     match intent.mode {
         DeploymentMode::Strong => paths.push((
             "administrator_policy".into(),
@@ -1142,6 +1172,10 @@ fn expected_current_path_keys(
         }
     }
     for account in accounts {
+        paths.extend(crate::setup::user_integration_receipt_paths(
+            &account.home,
+            &account.name,
+        ));
         paths.push((
             "user_configuration".into(),
             account.name.clone(),
@@ -1204,16 +1238,38 @@ fn current_state_snapshot(
     for (kind, subject, path) in paths {
         let identity = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                    bail!("setup current-state path is not a regular non-link file");
+                if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                    let document =
+                        read_bounded_at(&path, CURRENT_OBJECT_LIMIT, "setup current-state file")?;
+                    Some(CurrentFileIdentity {
+                        object_type: "file".into(),
+                        owner_uid: metadata.uid(),
+                        mode: metadata.mode() & 0o777,
+                        link_count: metadata.nlink(),
+                        length: document.len() as u64,
+                        sha256: sha256_hex(&document),
+                        link_target: None,
+                    })
+                } else if metadata.file_type().is_symlink() {
+                    let target = fs::read_link(&path).with_context(|| {
+                        format!("read setup current-state link {}", path.display())
+                    })?;
+                    let target_bytes = target.as_os_str().as_bytes();
+                    if target_bytes.is_empty() || target_bytes.len() > 4096 {
+                        bail!("setup current-state link target is invalid");
+                    }
+                    Some(CurrentFileIdentity {
+                        object_type: "symlink".into(),
+                        owner_uid: metadata.uid(),
+                        mode: metadata.mode() & 0o777,
+                        link_count: metadata.nlink(),
+                        length: target_bytes.len() as u64,
+                        sha256: sha256_hex(target_bytes),
+                        link_target: Some(target),
+                    })
+                } else {
+                    bail!("setup current-state path has an unsupported object type");
                 }
-                let document = read_bounded(&path)?;
-                Some(CurrentFileIdentity {
-                    owner_uid: metadata.uid(),
-                    mode: metadata.mode() & 0o777,
-                    length: document.len() as u64,
-                    sha256: sha256_hex(&document),
-                })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("inspect setup current-state path"),
@@ -1285,31 +1341,37 @@ fn read_document(path: &Path, kind: &str, subject: &str) -> Result<OpenedDocumen
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    read_bounded_at(path, DOCUMENT_LIMIT, "setup source document")
+}
+
+fn read_bounded_at(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
     if !path.is_absolute() {
-        bail!("setup source document path must be absolute");
+        bail!("{description} path must be absolute");
     }
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
         .open(path)
-        .with_context(|| format!("open setup source document {}", path.display()))?;
+        .with_context(|| format!("open {description} {}", path.display()))?;
     let before = file
         .metadata()
-        .with_context(|| format!("inspect setup source document {}", path.display()))?;
+        .with_context(|| format!("inspect {description} {}", path.display()))?;
     if !before.file_type().is_file()
         || before.nlink() != 1
         || before.len() == 0
-        || before.len() > DOCUMENT_LIMIT
+        || before.len() > limit
         || before.mode() & 0o022 != 0
     {
-        bail!("setup source document has unsafe filesystem authority");
+        bail!("{description} has unsafe filesystem authority");
     }
     let mut bytes = Vec::with_capacity(before.len() as usize);
     Read::by_ref(&mut file)
-        .take(DOCUMENT_LIMIT + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
-        .context("read setup source document")?;
-    let after = file.metadata().context("reinspect setup source document")?;
+        .with_context(|| format!("read {description}"))?;
+    let after = file
+        .metadata()
+        .with_context(|| format!("reinspect {description}"))?;
     if bytes.len() as u64 != before.len()
         || before.dev() != after.dev()
         || before.ino() != after.ino()
@@ -1317,7 +1379,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
         || before.mtime() != after.mtime()
         || before.mtime_nsec() != after.mtime_nsec()
     {
-        bail!("setup source document changed while being read");
+        bail!("{description} changed while being read");
     }
     Ok(bytes)
 }
