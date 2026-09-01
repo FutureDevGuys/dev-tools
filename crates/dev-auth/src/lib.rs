@@ -15,6 +15,7 @@ pub mod broker_protocol;
 pub mod broker_server;
 #[cfg(target_os = "linux")]
 pub mod control_protocol;
+pub mod deployment;
 #[cfg(unix)]
 pub mod diagnostics;
 #[cfg(target_os = "linux")]
@@ -26,6 +27,8 @@ pub mod release_manifest;
 mod runtime;
 #[cfg(unix)]
 pub mod setup;
+#[cfg(unix)]
+pub mod setup_v3;
 #[cfg(target_os = "linux")]
 pub mod supervisor;
 
