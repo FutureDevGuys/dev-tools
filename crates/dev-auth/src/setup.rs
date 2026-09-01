@@ -601,26 +601,41 @@ pub fn discover_setup(mode: InstallMode) -> Result<SetupDiscoveryReport> {
             ),
         ),
     ]);
-    let blockers = setup_prerequisite_blockers(mode, &programs);
+    let strong_blockers = setup_prerequisite_blockers(InstallMode::Strong, &programs);
+    let strong_backend_available = strong_backend_available_from_blockers(&strong_blockers);
+    let blockers = if mode == InstallMode::Strong {
+        strong_blockers
+    } else {
+        setup_prerequisite_blockers(mode, &programs)
+    };
     Ok(SetupDiscoveryReport {
         schema: "dev-auth-setup-discovery-v1".into(),
         mode,
         platform: std::env::consts::OS.into(),
-        strong_backend_available: cfg!(target_os = "linux")
-            && [
-                "/usr/bin/pkexec",
-                "/usr/bin/systemd-run",
-                "/usr/bin/systemd-creds",
-                "/usr/bin/systemctl",
-            ]
-            .iter()
-            .all(|path| validate_root_owned_executable(Path::new(path), "strong backend").is_ok()),
+        strong_backend_available,
         running_executable: running_executable.display().to_string(),
         programs,
         workload_launchers,
         desktop_entries,
         blockers,
     })
+}
+
+fn strong_backend_available_from_blockers(blockers: &[SetupPrerequisiteBlocker]) -> bool {
+    cfg!(target_os = "linux")
+        && !blockers.iter().any(|blocker| {
+            matches!(
+                blocker.component.as_str(),
+                "linux_strong_backend"
+                    | "pkexec"
+                    | "systemd_run"
+                    | "systemd_creds"
+                    | "systemctl"
+                    | "cgroup_v2"
+                    | "pidfd"
+                    | "systemd_runtime"
+            )
+        })
 }
 
 fn setup_prerequisite_blockers(
@@ -4365,6 +4380,23 @@ fn read_receipt(path: &Path) -> Result<InstallReceipt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strong_backend_availability_includes_runtime_admission_blockers() {
+        let runtime_blocker = prerequisite_blocker(
+            "cgroup_v2",
+            DiscoveryStatus::Absent,
+            "strong_admission",
+        );
+        assert!(!strong_backend_available_from_blockers(&[runtime_blocker]));
+
+        let unrelated_blocker = prerequisite_blocker(
+            "git",
+            DiscoveryStatus::Absent,
+            "strong_setup",
+        );
+        assert!(strong_backend_available_from_blockers(&[unrelated_blocker]));
+    }
 
     #[test]
     fn authenticated_installations_reject_unsigned_and_generation_rollback_updates() {
