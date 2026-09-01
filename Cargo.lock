@@ -985,6 +985,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-tools-installation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "dev-tools-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ed25519-dalek 3.0.0",
+ "semver",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3787,6 +3815,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "ctrlc",
+ "dev-tools-release",
  "ed25519-dalek 3.0.0",
  "is-terminal",
  "libc",

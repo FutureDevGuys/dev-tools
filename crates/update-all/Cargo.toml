@@ -11,12 +11,10 @@ description = "Run supported software updaters through one deterministic plan"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-base64 = "0.22"
-ed25519-dalek = "3"
+dev-tools-release = { path = "../dev-tools-release" }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_jcs = "0.2"
 sha2 = "0.10"
 toml = "1.0"
 ureq = "3.4"
@@ -32,7 +30,10 @@ uuid = { version = "1", default-features = false, features = ["serde", "v4"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+base64 = "0.22"
+ed25519-dalek = "3"
 predicates = "3"
+serde_jcs = "0.2"
 tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
