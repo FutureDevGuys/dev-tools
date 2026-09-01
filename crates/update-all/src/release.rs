@@ -1,7 +1,15 @@
 use crate::IntegrityFailure;
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64;
+#[cfg(test)]
 use base64::Engine as _;
+use dev_tools_release::{
+    accept_verified_release, select_stable_release_assets, verify_release_metadata,
+    ArtifactUrlPolicy, ReleaseAuthority, ReleaseMetadata, ReleaseState as SharedReleaseState,
+    VerifiedRelease as SharedVerifiedRelease,
+};
+#[cfg(test)]
 use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -63,6 +71,7 @@ impl Product {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SignedEnvelope<T> {
@@ -70,6 +79,7 @@ pub(crate) struct SignedEnvelope<T> {
     pub signatures: Vec<DocumentSignature>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DocumentSignature {
@@ -77,6 +87,7 @@ pub(crate) struct DocumentSignature {
     pub signature: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RootDocument {
@@ -85,6 +96,7 @@ pub(crate) struct RootDocument {
     pub release_keys: Vec<ReleaseKey>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReleaseKey {
@@ -202,7 +214,6 @@ pub(crate) fn check(product: Product) -> Result<Check> {
     let paths = Paths::resolve(product)?;
     let mut state = load_state(&paths)?;
     let verified = fetch_verified_manifest(product, &paths, &state)?;
-    accept_root_metadata(&mut state, &verified);
     accept_manifest_metadata(&mut state, &verified)?;
     state.last_successful_check_unix = Some(now_unix());
     save_state(&paths, &state)?;
@@ -216,7 +227,6 @@ pub(crate) fn update(product: Product) -> Result<Activation> {
     }
     let mut state = load_state(&paths)?;
     let verified = fetch_verified_manifest(product, &paths, &state)?;
-    accept_root_metadata(&mut state, &verified);
     accept_manifest_metadata(&mut state, &verified)?;
     if activation_is_current(&paths, &state, &verified)? {
         state.last_successful_check_unix = Some(now_unix());
@@ -407,49 +417,56 @@ fn fetch_verified_manifest(
         &paths.root_etag,
         METADATA_LIMIT,
     )?;
-    let root: SignedEnvelope<RootDocument> = parse_trusted_json(&root_bytes, "root document")?;
-    verify_root(&root)?;
-    let root_hash = sha256_hex(&root_bytes);
-    if root.signed.generation < state.accepted_root_generation {
-        return integrity("root document generation is older than trusted state");
-    }
-    if root.signed.generation == state.accepted_root_generation
-        && state
-            .accepted_root_sha256
-            .as_ref()
-            .is_some_and(|accepted| accepted != &root_hash)
-    {
-        return integrity("root document equivocation detected");
-    }
-
     let manifest_bytes = fetch_cached(
         &manifest_url,
         &paths.manifest_cache,
         &paths.manifest_etag,
         METADATA_LIMIT,
     )?;
-    let envelope: SignedEnvelope<ProductManifest> =
-        parse_trusted_json(&manifest_bytes, "product manifest")?;
-    verify_product_manifest(&envelope, &root.signed)?;
-    validate_manifest(product, &envelope.signed)?;
-    let artifact = envelope
-        .signed
-        .artifacts
-        .get(&target_id())
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("release does not provide target {}", target_id()))?;
-    if artifact.length > ARTIFACT_LIMIT {
-        return integrity("artifact length exceeds the supported limit");
-    }
+    let verified = verify_release_metadata(
+        &ReleaseMetadata {
+            root: root_bytes,
+            manifest: manifest_bytes,
+        },
+        &ReleaseAuthority {
+            trusted_root_key: env!("UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY").into(),
+            product: product.id().into(),
+            accepted_manifest_schemas: vec!["dev-tools-product-v1".into()],
+            target: target_id(),
+            artifact_url: ArtifactUrlPolicy::GitHubRelease {
+                owner: "FutureDevGuys".into(),
+                repository: "dev-tools".into(),
+            },
+            require_source_commit: false,
+            engine_protocol: ENGINE_PROTOCOL,
+        },
+    )
+    .map_err(|error| {
+        IntegrityFailure(format!("authenticated release metadata failed: {error:#}"))
+    })?;
+    let artifact = Artifact {
+        url: verified.artifact_url,
+        length: verified.artifact_length,
+        sha256: verified.artifact_sha256,
+    };
+    let manifest = ProductManifest {
+        schema: verified.manifest_schema,
+        product: verified.product,
+        generation: verified.manifest_generation,
+        version: verified.version.to_string(),
+        engine_protocol: ENGINE_PROTOCOL,
+        artifacts: BTreeMap::from([(target_id(), artifact.clone())]),
+    };
     Ok(VerifiedManifest {
-        root_generation: root.signed.generation,
-        root_sha256: root_hash,
-        manifest: envelope.signed,
+        root_generation: verified.root_generation,
+        root_sha256: verified.root_sha256,
+        manifest,
         artifact,
-        manifest_sha256: sha256_hex(&manifest_bytes),
+        manifest_sha256: verified.manifest_sha256,
     })
 }
 
+#[cfg(test)]
 fn verify_root(envelope: &SignedEnvelope<RootDocument>) -> Result<()> {
     if envelope.signed.schema != "dev-tools-root-v1" {
         return integrity("unsupported root document schema");
@@ -458,6 +475,7 @@ fn verify_root(envelope: &SignedEnvelope<RootDocument>) -> Result<()> {
     verify_any_signature(envelope, &key)
 }
 
+#[cfg(test)]
 fn verify_product_manifest(
     envelope: &SignedEnvelope<ProductManifest>,
     root: &RootDocument,
@@ -479,6 +497,7 @@ fn verify_product_manifest(
     integrity("product manifest has no valid signature from an authorized release key")
 }
 
+#[cfg(test)]
 fn verify_any_signature<T: Serialize>(
     envelope: &SignedEnvelope<T>,
     key: &VerifyingKey,
@@ -492,6 +511,7 @@ fn verify_any_signature<T: Serialize>(
     integrity("root document signature is invalid")
 }
 
+#[cfg(test)]
 fn verify_signature(key: &VerifyingKey, message: &[u8], encoded: &str) -> Result<()> {
     let bytes = BASE64
         .decode(encoded.trim())
@@ -501,6 +521,7 @@ fn verify_signature(key: &VerifyingKey, message: &[u8], encoded: &str) -> Result
         .context("verify Ed25519 signature")
 }
 
+#[cfg(test)]
 fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
     let bytes = decode_hex(encoded).context("decode Ed25519 public key")?;
     let array: [u8; 32] = bytes
@@ -509,6 +530,7 @@ fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&array).context("parse Ed25519 public key")
 }
 
+#[cfg(test)]
 fn validate_manifest(product: Product, manifest: &ProductManifest) -> Result<()> {
     if manifest.schema != "dev-tools-product-v1" {
         return integrity("unsupported product manifest schema");
@@ -524,35 +546,40 @@ fn validate_manifest(product: Product, manifest: &ProductManifest) -> Result<()>
 }
 
 fn accept_manifest_metadata(state: &mut ReleaseState, verified: &VerifiedManifest) -> Result<()> {
-    let generation = verified.manifest.generation;
-    if generation < state.accepted_generation {
-        return integrity("product manifest generation rollback detected");
-    }
-    if generation == state.accepted_generation {
-        if let Some(hash) = &state.accepted_manifest_sha256 {
-            if hash != &verified.manifest_sha256 {
-                return integrity("product manifest equivocation detected");
-            }
-        }
-    }
-    if let Some(current) = &state.accepted_version {
-        let accepted = Version::parse(current).context("parse trusted release version")?;
-        let offered =
-            Version::parse(&verified.manifest.version).context("parse offered release version")?;
-        if offered < accepted {
-            return integrity("product version rollback detected");
-        }
-    }
-    state.accepted_generation = generation;
-    state.accepted_version = Some(verified.manifest.version.clone());
-    state.accepted_manifest_sha256 = Some(verified.manifest_sha256.clone());
-    state.accepted_binary_sha256 = Some(verified.artifact.sha256.clone());
+    let mut shared = SharedReleaseState {
+        accepted_root_generation: state.accepted_root_generation,
+        accepted_root_sha256: state.accepted_root_sha256.clone(),
+        accepted_generation: state.accepted_generation,
+        accepted_version: state.accepted_version.clone(),
+        accepted_manifest_sha256: state.accepted_manifest_sha256.clone(),
+        accepted_binary_sha256: state.accepted_binary_sha256.clone(),
+    };
+    accept_verified_release(
+        &mut shared,
+        &SharedVerifiedRelease {
+            root_generation: verified.root_generation,
+            root_sha256: verified.root_sha256.clone(),
+            manifest_generation: verified.manifest.generation,
+            manifest_sha256: verified.manifest_sha256.clone(),
+            manifest_schema: verified.manifest.schema.clone(),
+            product: verified.manifest.product.clone(),
+            version: Version::parse(&verified.manifest.version)
+                .context("parse offered release version")?,
+            source_commit: None,
+            target: target_id(),
+            artifact_url: verified.artifact.url.clone(),
+            artifact_length: verified.artifact.length,
+            artifact_sha256: verified.artifact.sha256.clone(),
+        },
+    )
+    .map_err(|error| IntegrityFailure(format!("release state rejected metadata: {error:#}")))?;
+    state.accepted_root_generation = shared.accepted_root_generation;
+    state.accepted_root_sha256 = shared.accepted_root_sha256;
+    state.accepted_generation = shared.accepted_generation;
+    state.accepted_version = shared.accepted_version;
+    state.accepted_manifest_sha256 = shared.accepted_manifest_sha256;
+    state.accepted_binary_sha256 = shared.accepted_binary_sha256;
     Ok(())
-}
-
-fn accept_root_metadata(state: &mut ReleaseState, verified: &VerifiedManifest) {
-    state.accepted_root_generation = verified.root_generation;
-    state.accepted_root_sha256 = Some(verified.root_sha256.clone());
 }
 
 fn fetch_artifact(artifact: &Artifact) -> Result<Vec<u8>> {
@@ -807,8 +834,13 @@ fn resolve_release_urls(product: Product) -> Result<(String, String)> {
     let releases_url =
         env::var("DEV_TOOLS_RELEASES_URL").unwrap_or_else(|_| RELEASES_URL.to_string());
     let bytes = https_get(&releases_url, None, METADATA_LIMIT)?.bytes;
-    let releases: Vec<GitHubRelease> = parse_json(&bytes, "GitHub releases response")?;
-    select_release_urls(&releases, product)
+    let selected = select_stable_release_assets(
+        &bytes,
+        product.id(),
+        "dev-tools-root.json",
+        &format!("{}-stable.json", product.id()),
+    )?;
+    Ok((selected.root_url, selected.manifest_url))
 }
 
 fn select_release_urls(releases: &[GitHubRelease], product: Product) -> Result<(String, String)> {
@@ -893,6 +925,7 @@ fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], label: &str) -> Result
     serde_json::from_slice(bytes).with_context(|| format!("parse {label}"))
 }
 
+#[cfg(test)]
 fn parse_trusted_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], label: &str) -> Result<T> {
     serde_json::from_slice(bytes)
         .map_err(|error| IntegrityFailure(format!("invalid {label}: {error}")).into())
@@ -916,6 +949,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(test)]
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
     if value.len() % 2 != 0 {
         bail!("hex value has odd length");
