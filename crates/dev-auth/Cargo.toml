@@ -1,14 +1,15 @@
 [package]
 name = "dev-auth"
-version = "0.2.8"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Broker bounded post-login automation credentials"
+description = "Transparent workload-identity broker for Git and GitHub CLI"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 directories = "6"
 ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
 fs2 = "0.4"
@@ -17,6 +18,7 @@ keyring = "4.1.6"
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_jcs = "0.2"
 sha2 = "0.10"
 signature = "2"
 ssh-agent-lib = "0.6"
@@ -40,7 +42,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["user"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "socket", "user"] }
 
 [dev-dependencies]
 wait-timeout = "0.2"

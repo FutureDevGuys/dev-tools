@@ -41,6 +41,7 @@ def test_release_builder_remaps_checkout_output_and_home_paths(tmp_path: Path) -
     assert f"--remap-path-prefix={tmp_path.resolve()}=/dev-tools/output" in flags
     assert f"--remap-path-prefix={Path.home().resolve()}=/dev-tools/home" in flags
     assert "RUSTFLAGS" not in environment
+    assert environment["DEV_AUTH_SOURCE_COMMIT"] == "a" * 40
 
 
 def test_release_builder_captures_zipapp_stdout(monkeypatch) -> None:
@@ -157,7 +158,7 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
     release = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
     root_file = tmp_path / "root.key"
     release_file = tmp_path / "release.key"
-    artifact = tmp_path / "dev-cache"
+    artifact = tmp_path / "dev-auth"
     write_key(root_file, root)
     write_key(release_file, release)
     artifact.write_bytes(b"fixture artifact")
@@ -175,7 +176,7 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
                 sys.executable,
                 str(SCRIPT),
                 "--product",
-                "dev-cache",
+                "dev-auth",
                 "--version",
                 "1.2.3",
                 "--target",
@@ -190,6 +191,8 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
                 str(trust),
                 "--manifest-generation",
                 "2",
+                "--source-commit",
+                "a" * 40,
                 "--output",
                 str(output),
             ],
@@ -201,14 +204,16 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
         )
         assert result.returncode == 0, result.stderr
         outputs.append(output)
-    for filename in ("dev-tools-root.json", "dev-cache-stable.json"):
+    for filename in ("dev-tools-root.json", "dev-auth-stable.json"):
         assert (outputs[0] / filename).read_bytes() == (outputs[1] / filename).read_bytes()
-    manifest = json.loads((outputs[0] / "dev-cache-stable.json").read_text())
+    manifest = json.loads((outputs[0] / "dev-auth-stable.json").read_text())
     signed = manifest["signed"]
-    assert signed["product"] == "dev-cache"
+    assert signed["product"] == "dev-auth"
+    assert signed["schema"] == "dev-auth-product-v2"
     assert signed["generation"] == 2
+    assert signed["source_commit"] == "a" * 40
     assert signed["artifacts"]["linux-x86_64"]["length"] == len(b"fixture artifact")
-    assert (outputs[0] / "dev-cache-1.2.3-linux-x86_64").stat().st_mode & 0o111
+    assert (outputs[0] / "dev-auth-1.2.3-linux-x86_64").stat().st_mode & 0o111
 
 
 def test_release_recipe_emits_dual_root_signatures_for_rotation(tmp_path: Path) -> None:

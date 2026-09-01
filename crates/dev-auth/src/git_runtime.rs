@@ -832,30 +832,6 @@ fn push_environment_path(
     Ok(())
 }
 
-fn push_program_environment_path(
-    targets: &mut Vec<PathBuf>,
-    environment: &BTreeMap<OsString, OsString>,
-    variable: &str,
-    cwd: &Path,
-) -> Result<()> {
-    let Some(value) = environment_value(environment, variable) else {
-        return Ok(());
-    };
-    if value.is_empty() {
-        return Ok(());
-    }
-    let text = os_argument(value, "Git program environment value")?;
-    if text.bytes().any(|byte| byte.is_ascii_whitespace())
-        || text.contains(['\'', '"', '`', '$', ';', '&', '|', '<', '>', '(', ')'])
-    {
-        bail!("Git environment variable {variable} contains an ambiguous command");
-    }
-    if Path::new(value).is_absolute() || text.contains(['/', '\\']) {
-        targets.push(canonical_candidate_path(Path::new(value), cwd)?);
-    }
-    Ok(())
-}
-
 fn push_trace_environment_path(
     targets: &mut Vec<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
@@ -942,20 +918,9 @@ fn environment_git_targets(
     ] {
         push_environment_path(&mut result.paths, environment, variable, cwd)?;
     }
-    for variable in [
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "GIT_SSH",
-        "GIT_EDITOR",
-        "GIT_SEQUENCE_EDITOR",
-        "GIT_PAGER",
-        "PAGER",
-    ] {
-        push_program_environment_path(&mut result.paths, environment, variable, cwd)?;
-    }
-    if environment_value(environment, "GIT_SSH_COMMAND").is_some() {
-        bail!("Git shell-command environment is not admitted by the routing boundary");
-    }
+    // Editors, pagers, askpass helpers, and SSH command strings affect the eventual
+    // Git child, not repository routing. Proven-human passthrough must preserve them
+    // verbatim, while managed execution replaces them with its isolated environment.
     for variable in [
         "GIT_TRACE",
         "GIT_TRACE_FSMONITOR",
@@ -5072,9 +5037,6 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             ("GIT_CONFIG_SYSTEM", managed.join("system-config")),
             ("GIT_EXEC_PATH", managed.join("git-exec")),
             ("GIT_TEMPLATE_DIR", managed.join("templates")),
-            ("GIT_ASKPASS", managed.join("askpass")),
-            ("SSH_ASKPASS", managed.join("ssh-askpass")),
-            ("GIT_SSH", managed.join("ssh")),
             ("GIT_TRACE", managed.join("trace")),
         ] {
             let poisoned = BTreeMap::from([(OsString::from(variable), value.into_os_string())]);
@@ -5108,11 +5070,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             );
         }
 
-        for variable in [
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_SSH_COMMAND",
-        ] {
+        for variable in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
             let poisoned = BTreeMap::from([(
                 OsString::from(variable),
                 OsString::from("ambiguous injected authority"),
@@ -5141,6 +5099,27 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             (OsString::from("PATH"), OsString::from("/usr/bin")),
             (OsString::from("GIT_PAGER"), OsString::from("cat")),
             (OsString::from("PAGER"), OsString::from("cat")),
+            (
+                OsString::from("GIT_EDITOR"),
+                OsString::from("code-insiders --wait"),
+            ),
+            (
+                OsString::from("GIT_SEQUENCE_EDITOR"),
+                OsString::from("code-insiders --wait"),
+            ),
+            (
+                OsString::from("GIT_ASKPASS"),
+                OsString::from("/usr/bin/false --human-option"),
+            ),
+            (
+                OsString::from("SSH_ASKPASS"),
+                OsString::from("/usr/bin/false --human-option"),
+            ),
+            (OsString::from("GIT_SSH"), OsString::from("/usr/bin/ssh")),
+            (
+                OsString::from("GIT_SSH_COMMAND"),
+                OsString::from("ssh -o IdentitiesOnly=yes"),
+            ),
         ]);
         assert_eq!(
             classify_git_invocation_at(
@@ -5151,6 +5130,16 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             )
             .unwrap(),
             GitInvocationRoute::Unmanaged,
+        );
+        assert_eq!(
+            classify_git_invocation_at(
+                &["status".into()],
+                &managed_repository,
+                &roots,
+                &safe_human_environment,
+            )
+            .unwrap(),
+            GitInvocationRoute::Managed(0),
         );
 
         let human_bin = unmanaged.join("human-bin");

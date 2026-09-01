@@ -4,17 +4,65 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
+pub mod broker_agent;
+#[cfg(target_os = "linux")]
+mod broker_backend;
+#[cfg(unix)]
+pub mod broker_client;
+pub mod broker_protocol;
+#[cfg(target_os = "linux")]
+pub mod broker_server;
+#[cfg(target_os = "linux")]
+pub mod control_protocol;
+#[cfg(unix)]
+pub mod diagnostics;
+#[cfg(target_os = "linux")]
+pub mod linux_admission;
+#[cfg(unix)]
+pub mod policy_store;
+pub mod policy_v2;
+pub mod release_manifest;
 mod runtime;
+#[cfg(unix)]
+pub mod setup;
+#[cfg(target_os = "linux")]
+pub mod supervisor;
 
 pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,
     github_token_for_repository, purge_runtime, run_agent, run_gh, run_gh_git_child, run_git,
-    run_ssh_keygen, runtime_status, ssh_load, ssh_public, validate_configuration, workspace_status,
-    RuntimeStatus, ValidationReport, WorkspaceContext,
+    run_native_gh, run_native_git, run_ssh_keygen, runtime_status, ssh_load, ssh_public,
+    validate_configuration, workspace_status, RuntimeStatus, ValidationReport, WorkspaceContext,
 };
+#[cfg(target_os = "linux")]
+pub use runtime::{
+    broker_credential_erase, broker_credential_get, enroll_user_broker_service_token,
+    exec_broker_gh, exec_broker_git, exec_broker_ssh_keygen, revoke_user_broker_service_token,
+    rotate_user_broker_service_token,
+};
+#[cfg(unix)]
+pub use runtime::{exec_native_gh, exec_native_git};
 
 const MAX_CREDENTIAL_REQUEST_BYTES: usize = 64 * 1024;
 const TOKEN_REFRESH_MARGIN_SECONDS: i64 = 300;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BuildInfo {
+    pub product: &'static str,
+    pub version: &'static str,
+    pub source_commit: Option<&'static str>,
+}
+
+pub fn build_info() -> BuildInfo {
+    let source_commit = option_env!("DEV_AUTH_SOURCE_COMMIT")
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    BuildInfo {
+        product: "dev-auth",
+        version: env!("CARGO_PKG_VERSION"),
+        source_commit,
+    }
+}
 
 #[derive(Clone)]
 pub struct SecretString(Zeroizing<String>);
