@@ -870,6 +870,11 @@ pub fn build_setup_plan_v3_at(
 
     let current_user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective native account does not exist")?;
+    validate_policy_program_authority(
+        &administrator_policy,
+        intent.mode,
+        current_user.uid.as_raw(),
+    )?;
     if intent.mode == DeploymentMode::UserOnly
         && (intent.users.len() != 1 || intent.users[0].name != current_user.name)
     {
@@ -977,6 +982,45 @@ pub fn build_setup_plan_v3_at(
     };
     validate_setup_plan_v3(&plan)?;
     Ok(plan)
+}
+
+fn validate_policy_program_authority(
+    policy: &crate::policy_v2::SystemPolicyV2,
+    mode: DeploymentMode,
+    owner_uid: u32,
+) -> Result<()> {
+    let mut programs = vec![
+        ("1Password CLI", policy.programs.op.as_str()),
+        ("native Git", policy.programs.git.as_str()),
+        ("native GitHub CLI", policy.programs.gh.as_str()),
+        ("native SSH", policy.programs.ssh.as_str()),
+        ("native SSH key tool", policy.programs.ssh_keygen.as_str()),
+    ];
+    programs.extend(
+        policy
+            .trusted_launchers
+            .iter()
+            .map(|(name, path)| (name.as_str(), path.as_str())),
+    );
+    programs.extend(
+        policy
+            .sandbox_adapters
+            .iter()
+            .map(|(name, adapter)| (name.as_str(), adapter.executable.as_str())),
+    );
+    for (description, path) in programs {
+        match mode {
+            DeploymentMode::Strong => {
+                crate::setup::validate_root_owned_executable(Path::new(path), description)?
+            }
+            DeploymentMode::UserOnly => crate::setup::validate_user_or_root_executable(
+                Path::new(path),
+                owner_uid,
+                description,
+            )?,
+        }
+    }
+    Ok(())
 }
 
 pub fn render_setup_plan_v3(plan: &SetupPlanV3) -> Result<(Vec<u8>, String)> {

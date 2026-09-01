@@ -135,16 +135,22 @@ intent = "preserve"
 
 #[test]
 fn equivalent_intents_produce_identical_setup_v3_actions_and_digest() {
-    let root = tempfile::tempdir().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .unwrap()
         .unwrap();
+    let root = tempfile::Builder::new()
+        .prefix(".dev-auth-deployment-test-")
+        .tempdir_in(&user.dir)
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let policy = root.path().join("policy.toml");
     let config = root.path().join("config.toml");
     let candidate = root.path().join("dev-auth");
+    let op = root.path().join("op");
     let git = root.path().join("git");
     let gh = root.path().join("gh");
+    let ssh = root.path().join("ssh");
+    let ssh_keygen = root.path().join("ssh-keygen");
     fs::write(
         &policy,
         format!(
@@ -152,11 +158,11 @@ fn equivalent_intents_produce_identical_setup_v3_actions_and_digest() {
 mode = "user_only"
 allowed_users = ["{}"]
 [programs]
-op = "/usr/bin/op"
+op = "{}"
 git = "{}"
 gh = "{}"
-ssh = "/usr/bin/ssh"
-ssh_keygen = "/usr/bin/ssh-keygen"
+ssh = "{}"
+ssh_keygen = "{}"
 [trusted_launchers]
 [github_apps]
 [credential_slots]
@@ -164,8 +170,11 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [workspace_caps]
 "#,
             user.name,
+            op.display(),
             git.display(),
-            gh.display()
+            gh.display(),
+            ssh.display(),
+            ssh_keygen.display()
         ),
     )
     .unwrap();
@@ -173,7 +182,7 @@ ssh_keygen = "/usr/bin/ssh-keygen"
     for path in [&policy, &config] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    for path in [&candidate, &git, &gh] {
+    for path in [&candidate, &op, &git, &gh, &ssh, &ssh_keygen] {
         fs::write(path, b"fixture").unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -258,17 +267,23 @@ config = "{}"
 
 #[test]
 fn setup_plan_binds_transparent_upstreams_to_administrator_policy() {
-    let root = tempfile::tempdir().unwrap();
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .unwrap()
         .unwrap();
+    let root = tempfile::Builder::new()
+        .prefix(".dev-auth-deployment-test-")
+        .tempdir_in(&user.dir)
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let policy = root.path().join("policy.toml");
     let config = root.path().join("config.toml");
     let candidate = root.path().join("dev-auth");
+    let op = root.path().join("op");
     let installed_git = root.path().join("installed-git");
     let policy_git = root.path().join("policy-git");
     let native_gh = root.path().join("gh");
+    let ssh = root.path().join("ssh");
+    let ssh_keygen = root.path().join("ssh-keygen");
     fs::write(
         &policy,
         format!(
@@ -276,11 +291,11 @@ fn setup_plan_binds_transparent_upstreams_to_administrator_policy() {
 mode = "user_only"
 allowed_users = ["{}"]
 [programs]
-op = "/usr/bin/op"
+op = "{}"
 git = "{}"
 gh = "{}"
-ssh = "/usr/bin/ssh"
-ssh_keygen = "/usr/bin/ssh-keygen"
+ssh = "{}"
+ssh_keygen = "{}"
 [trusted_launchers]
 [github_apps]
 [credential_slots]
@@ -288,8 +303,11 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [workspace_caps]
 "#,
             user.name,
+            op.display(),
             policy_git.display(),
-            native_gh.display()
+            native_gh.display(),
+            ssh.display(),
+            ssh_keygen.display()
         ),
     )
     .unwrap();
@@ -298,16 +316,19 @@ ssh_keygen = "/usr/bin/ssh-keygen"
         &policy,
         &config,
         &candidate,
+        &op,
         &installed_git,
         &policy_git,
         &native_gh,
+        &ssh,
+        &ssh_keygen,
     ] {
         if !path.exists() {
             fs::write(path, b"fixture").unwrap();
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let installation = build_plan(
+    let mut installation = build_plan(
         &SetupPaths::user_only(&user.dir),
         &InstallRequest {
             mode: InstallMode::UserOnly,
@@ -344,10 +365,17 @@ config = "{}"
     )
     .unwrap();
 
-    let error = build_setup_plan_v3_at(intent, installation, false).unwrap_err();
+    let error = build_setup_plan_v3_at(intent.clone(), installation.clone(), false).unwrap_err();
     assert!(error
         .to_string()
         .contains("administrator-pinned native Git"));
+
+    installation.request.native_git = policy_git;
+    fs::set_permissions(&op, fs::Permissions::from_mode(0o777)).unwrap();
+    let error = build_setup_plan_v3_at(intent, installation, false).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("1Password CLI is group- or world-writable"));
 }
 
 #[test]

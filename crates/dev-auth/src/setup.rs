@@ -3944,7 +3944,7 @@ fn validate_native_program(path: &Path, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_root_owned_executable(path: &Path, description: &str) -> Result<()> {
+pub(crate) fn validate_root_owned_executable(path: &Path, description: &str) -> Result<()> {
     validate_native_program(path, description)?;
     let mut current = PathBuf::from("/");
     for component in path.components().skip(1) {
@@ -3959,7 +3959,11 @@ fn validate_root_owned_executable(path: &Path, description: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_user_or_root_executable(path: &Path, owner_uid: u32, description: &str) -> Result<()> {
+pub(crate) fn validate_user_or_root_executable(
+    path: &Path,
+    owner_uid: u32,
+    description: &str,
+) -> Result<()> {
     validate_native_program(path, description)?;
     let mut current = PathBuf::from("/");
     for component in path.components().skip(1) {
