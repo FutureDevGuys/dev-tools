@@ -415,8 +415,7 @@ fn read_service_credentials(
     let effective_uid = nix::unistd::Uid::effective().as_raw();
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
-        || (metadata.uid() != 0 && metadata.uid() != effective_uid)
-        || metadata.mode() & 0o077 != 0
+        || !credential_metadata_mode_is_safe(metadata.uid(), effective_uid, metadata.mode())
     {
         bail!("broker credential directory has unsafe filesystem authority");
     }
@@ -445,8 +444,7 @@ fn read_service_credential(path: &Path) -> Result<SecretString> {
     let effective_uid = nix::unistd::Uid::effective().as_raw();
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
-        || (metadata.uid() != 0 && metadata.uid() != effective_uid)
-        || metadata.mode() & 0o077 != 0
+        || !credential_metadata_mode_is_safe(metadata.uid(), effective_uid, metadata.mode())
         || metadata.nlink() != 1
         || metadata.len() > CREDENTIAL_LIMIT
     {
@@ -480,6 +478,15 @@ fn read_service_credential(path: &Path) -> Result<SecretString> {
         bail!("broker service credential is malformed");
     }
     Ok(SecretString::new(value))
+}
+
+fn credential_metadata_mode_is_safe(owner_uid: u32, effective_uid: u32, mode: u32) -> bool {
+    let permissions = mode & 0o777;
+    if owner_uid == 0 {
+        permissions & 0o027 == 0
+    } else {
+        owner_uid == effective_uid && permissions & 0o077 == 0
+    }
 }
 
 fn read_bounded_reader(reader: impl Read, limit: u64, description: &str) -> Result<Vec<u8>> {
@@ -632,5 +639,24 @@ mod tests {
             .join(format!("{SERVICE_CREDENTIAL_PREFIX}alpha"));
         std::fs::hard_link(&alpha, root.path().join("linked-copy")).unwrap();
         assert!(read_service_credentials(root.path(), &policy).is_err());
+    }
+
+    #[test]
+    fn systemd_root_credential_modes_are_not_general_group_read_authority() {
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        assert!(credential_metadata_mode_is_safe(0, effective_uid, 0o550));
+        assert!(credential_metadata_mode_is_safe(0, effective_uid, 0o440));
+        assert!(!credential_metadata_mode_is_safe(0, effective_uid, 0o570));
+        assert!(!credential_metadata_mode_is_safe(0, effective_uid, 0o444));
+        assert!(!credential_metadata_mode_is_safe(
+            effective_uid,
+            effective_uid,
+            0o550
+        ));
+        assert!(credential_metadata_mode_is_safe(
+            effective_uid,
+            effective_uid,
+            0o500
+        ));
     }
 }
