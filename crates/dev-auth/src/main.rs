@@ -563,11 +563,10 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 &release_storage,
                 intent.offline,
             )?;
-            let installation =
-                dev_auth::setup::build_verified_release_plan(install_mode, false, staged.verified);
-            let plan = installation.and_then(|installation| {
-                dev_auth::setup_v3::build_setup_plan_v3(intent, installation)
-            });
+            let plan = dev_auth::setup_v3::build_setup_plan_v3_for_verified_release(
+                intent,
+                staged.verified,
+            );
             let result = plan.and_then(|plan| {
                 dev_auth::setup_v3::write_setup_plan_v3_at(&output, &plan)
                     .map(|digest| (plan, digest))

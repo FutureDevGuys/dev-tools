@@ -362,6 +362,22 @@ pub fn build_verified_release_plan(
     activate_transparent_launchers: bool,
     verified: crate::release_manifest::VerifiedDevAuthRelease,
 ) -> Result<SetupPlan> {
+    build_verified_release_plan_with_native_programs(
+        mode,
+        activate_transparent_launchers,
+        verified,
+        PathBuf::from("/usr/bin/git"),
+        PathBuf::from("/usr/bin/gh"),
+    )
+}
+
+pub fn build_verified_release_plan_with_native_programs(
+    mode: InstallMode,
+    activate_transparent_launchers: bool,
+    verified: crate::release_manifest::VerifiedDevAuthRelease,
+    native_git: PathBuf,
+    native_gh: PathBuf,
+) -> Result<SetupPlan> {
     let artifact = fs::canonicalize(&verified.artifact_path)
         .context("resolve the verified release artifact")?;
     let paths = match mode {
@@ -376,8 +392,8 @@ pub fn build_verified_release_plan(
         mode,
         version: verified.version.clone(),
         source_executable: artifact,
-        native_git: PathBuf::from("/usr/bin/git"),
-        native_gh: PathBuf::from("/usr/bin/gh"),
+        native_git,
+        native_gh,
         activate_transparent_launchers,
     };
     let mut plan = build_plan(&paths, &request)?;

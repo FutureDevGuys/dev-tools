@@ -796,6 +796,31 @@ pub fn build_setup_plan_v3(
     build_setup_plan_v3_at(intent, installation, true)
 }
 
+pub fn build_setup_plan_v3_for_verified_release(
+    intent: DeploymentIntent,
+    verified: crate::release_manifest::VerifiedDevAuthRelease,
+) -> Result<SetupPlanV3> {
+    let administrator = read_document(
+        &intent.administrator_policy,
+        "administrator_policy",
+        "system",
+    )?;
+    let policy =
+        parse_system_policy_v2(&administrator.bytes).context("validate administrator policy")?;
+    let mode = match intent.mode {
+        DeploymentMode::Strong => crate::setup::InstallMode::Strong,
+        DeploymentMode::UserOnly => crate::setup::InstallMode::UserOnly,
+    };
+    let installation = crate::setup::build_verified_release_plan_with_native_programs(
+        mode,
+        false,
+        verified,
+        PathBuf::from(&policy.programs.git),
+        PathBuf::from(&policy.programs.gh),
+    )?;
+    build_setup_plan_v3(intent, installation)
+}
+
 pub fn build_setup_plan_v3_at(
     intent: DeploymentIntent,
     installation: SetupPlan,
