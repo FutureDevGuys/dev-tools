@@ -74,6 +74,87 @@ fn private_program_root() -> TempDir {
     directory
 }
 
+#[test]
+fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
+    let root = private_runtime();
+    let plan = root.path().join("setup-plan.json");
+    fs::write(
+        &plan,
+        br#"{"schema":"dev-auth-setup-plan-v2","actions":[]}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "setup",
+                "apply",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--sha256",
+                &"0".repeat(64),
+                "--format",
+                "json",
+            ])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("accepts only a full setup plan v3"));
+}
+
+#[test]
+fn typed_reconcile_cli_reserves_only_the_fixed_protocol_grammar() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "reconcile",
+                "plan",
+                "--source",
+                "relative.toml",
+                "--output",
+                "/tmp/plan.json",
+                "--format",
+                "json",
+            ])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("source and output paths must be absolute"));
+    assert!(!error.contains("unknown command"));
+}
+
+#[test]
+fn typed_reconcile_defers_when_standalone_system_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("config-v2.toml");
+    let plan = root.path().join("plan.json");
+    fs::write(&source, b"version = 2\n").unwrap();
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "reconcile",
+                "plan",
+                "--source",
+                source.to_str().unwrap(),
+                "--output",
+                plan.to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+            .env_clear(),
+    );
+
+    assert!(output.status.success(), "{:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["deferred"], true);
+    assert_eq!(report["next_action"], "setup");
+    assert_eq!(report["diagnostics"][0], "system_installation_absent");
+    assert!(!plan.exists());
+}
+
 #[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,
@@ -600,6 +681,35 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
                 .unwrap()
                 .starts_with(&format!("{frontend}: ")),
             "{frontend}"
+        );
+    }
+}
+
+#[test]
+fn managed_git_child_admits_only_its_exact_private_helper_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+    for (frontend, arguments) in [
+        ("git-credential-dev-auth", vec!["get"]),
+        ("ssh-keygen-dev-auth", vec!["--help"]),
+    ] {
+        let path = directory.path().join(frontend);
+        symlink(env!("CARGO_BIN_EXE_dev-auth"), &path).unwrap();
+        let mut command = Command::new(&path);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("DEV_AUTH_GIT_CHILD", "1")
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin")
+            .env("XDG_RUNTIME_DIR", runtime.path());
+        let output = bounded_output(&mut command);
+        assert!(!output.status.success(), "{frontend}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !error.contains("unrecognized private child launcher identity"),
+            "{frontend}: {error}"
         );
     }
 }

@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--manifest-generation", required=True, type=int)
+    parser.add_argument("--source-commit")
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
 
@@ -53,6 +54,17 @@ def main() -> int:
         raise SystemExit(f"artifact does not exist: {args.artifact}")
     if args.manifest_generation < 1:
         raise SystemExit("manifest generation must be positive")
+    if args.product == "dev-auth":
+        if args.source_commit is None or len(args.source_commit) != 40:
+            raise SystemExit("dev-auth source commit must be 40 hexadecimal characters")
+        try:
+            bytes.fromhex(args.source_commit)
+        except ValueError as exc:
+            raise SystemExit(
+                "dev-auth source commit must be 40 hexadecimal characters"
+            ) from exc
+    elif args.source_commit is not None:
+        raise SystemExit("source commit is supported only by the dev-auth v2 manifest")
 
     release_key = read_private_key(args.release_private_key)
     trusted_root = read_public_key(args.trusted_root_public_key)
@@ -71,7 +83,11 @@ def main() -> int:
     )
 
     manifest = {
-        "schema": "dev-tools-product-v1",
+        "schema": (
+            "dev-auth-product-v2"
+            if args.product == "dev-auth"
+            else "dev-tools-product-v1"
+        ),
         "product": args.product,
         "generation": args.manifest_generation,
         "version": args.version,
@@ -84,6 +100,8 @@ def main() -> int:
             }
         },
     }
+    if args.product == "dev-auth":
+        manifest["source_commit"] = args.source_commit.lower()
 
     destination = args.output.resolve()
     if destination.exists() and any(destination.iterdir()):
@@ -107,6 +125,8 @@ def main() -> int:
         "target": args.target,
         "version": args.version,
     }
+    if args.product == "dev-auth":
+        summary["source_commit"] = args.source_commit.lower()
     print(json.dumps(summary, sort_keys=True))
     return 0
 

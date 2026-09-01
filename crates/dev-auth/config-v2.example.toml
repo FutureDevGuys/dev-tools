@@ -1,0 +1,31 @@
+version = 2
+
+[routing]
+no_session = "native_passthrough"
+help_footer = false
+
+[authority_profiles.source-maintenance]
+cap = "source-maintenance"
+signing = false
+ssh = false
+git_identity = { name = "Automation Agent", email = "automation@example.invalid" }
+secret_references = []
+
+[authority_profiles.source-maintenance.github]
+app_cap = "automation"
+private_key_ref = "op://Automation/GitHub App/private-key"
+owners = ["ExampleOrg"]
+repositories = ["example-repository"]
+permissions = { contents = "write", metadata = "read", pull_requests = "write" }
+
+[[workloads]]
+name = "automation-agent"
+launcher = "automation-agent"
+profile = "source-maintenance"
+secret_references = []
+workspace_roots = [{ cap = "source", path = "/home/example-user/repos/example-repository", access = "read_write" }]
+desktop = { display_name = "Automation Agent", icon = "utilities-terminal", terminal = false }
+
+[workloads.sandbox]
+mode = "auto"
+adapters = ["bubblewrap"]

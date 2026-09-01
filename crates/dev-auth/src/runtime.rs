@@ -33,7 +33,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -783,6 +783,140 @@ fn service_account_token(store: &CredentialStore) -> Result<SecretString> {
     Ok(SecretString::new(value))
 }
 
+#[cfg(target_os = "linux")]
+fn user_broker_credential_store(slot: &str) -> Result<CredentialStore> {
+    validate_broker_credential_slot(slot)?;
+    Ok(CredentialStore {
+        service: "dev-auth-v3".into(),
+        account: format!("user-broker-service-account-token-{slot}"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_broker_credential_slot(slot: &str) -> Result<()> {
+    let mut bytes = slot.bytes();
+    if slot.is_empty()
+        || slot.len() > 64
+        || !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("broker credential slot is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn user_broker_service_tokens<'a>(
+    slots: impl Iterator<Item = &'a str>,
+) -> Result<BTreeMap<String, SecretString>> {
+    slots
+        .map(|slot| {
+            Ok((
+                slot.to_owned(),
+                service_account_token(&user_broker_credential_store(slot)?)?,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn user_broker_service_token_for_slot(slot: &str) -> Result<SecretString> {
+    service_account_token(&user_broker_credential_store(slot)?)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn user_broker_service_token() -> Result<SecretString> {
+    user_broker_service_token_for_slot("automation")
+}
+
+#[cfg(target_os = "linux")]
+pub fn enroll_user_broker_service_token_for_slot(slot: &str, value: &[u8]) -> Result<()> {
+    let store = user_broker_credential_store(slot)?;
+    enroll_user_broker_service_token_at(&store, value)
+}
+
+#[cfg(target_os = "linux")]
+fn enroll_user_broker_service_token_at(store: &CredentialStore, value: &[u8]) -> Result<()> {
+    let value = std::str::from_utf8(value).context("service credential is not UTF-8")?;
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(value);
+    if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+        bail!("service credential must be exactly one nonempty line");
+    }
+    let entry = credential_entry(store)?;
+    match entry.get_password() {
+        Ok(existing) => {
+            let _existing = zeroize::Zeroizing::new(existing);
+            bail!("user-broker credential is already enrolled; use explicit rotation")
+        }
+        Err(keyring::Error::NoEntry) => entry
+            .set_password(value)
+            .context("store user-broker credential in the native OS credential store"),
+        Err(error) => Err(error).context("inspect existing user-broker credential"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn enroll_user_broker_service_token(value: &[u8]) -> Result<()> {
+    enroll_user_broker_service_token_for_slot("automation", value)
+}
+
+#[cfg(target_os = "linux")]
+pub fn rotate_user_broker_service_token_for_slot(slot: &str, value: &[u8]) -> Result<()> {
+    if !matches!(
+        crate::broker_client::active_claim_and_probe()?.0,
+        crate::broker_protocol::LocalSessionClaim::Absent
+    ) {
+        bail!("user-broker credential cannot rotate inside an admitted workload");
+    }
+    let value = std::str::from_utf8(value).context("service credential is not UTF-8")?;
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(value);
+    if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+        bail!("service credential must be exactly one nonempty line");
+    }
+    let entry = credential_entry(&user_broker_credential_store(slot)?)?;
+    let existing = entry
+        .get_password()
+        .context("user-broker credential is not enrolled")?;
+    let _existing = zeroize::Zeroizing::new(existing);
+    entry
+        .set_password(value)
+        .context("rotate user-broker credential in the native OS credential store")
+}
+
+#[cfg(target_os = "linux")]
+pub fn rotate_user_broker_service_token(value: &[u8]) -> Result<()> {
+    rotate_user_broker_service_token_for_slot("automation", value)
+}
+
+#[cfg(target_os = "linux")]
+pub fn revoke_user_broker_service_token_for_slot(slot: &str) -> Result<()> {
+    if !matches!(
+        crate::broker_client::active_claim_and_probe()?.0,
+        crate::broker_protocol::LocalSessionClaim::Absent
+    ) {
+        bail!("user-broker credential cannot be removed inside an admitted workload");
+    }
+    match credential_entry(&user_broker_credential_store(slot)?)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => {
+            Err(error).context("remove user-broker credential from the native OS credential store")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn revoke_user_broker_service_token() -> Result<()> {
+    revoke_user_broker_service_token_for_slot("automation")
+}
+
 pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
@@ -800,10 +934,18 @@ pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
 }
 
 fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString> {
-    crate::validate_op_reference(reference)?;
-    let program_guard = program_guard(&config.programs.op, "1Password CLI")?;
     let service_token = service_account_token(&config.credential_store)?;
-    let output = guarded_command(&config.programs.op, &program_guard)?
+    read_declared_secret_with_token(&config.programs.op, &service_token, reference)
+}
+
+pub(crate) fn read_declared_secret_with_token(
+    op_program: &str,
+    service_token: &SecretString,
+    reference: &str,
+) -> Result<SecretString> {
+    crate::validate_op_reference(reference)?;
+    let program_guard = program_guard(op_program, "1Password CLI")?;
+    let output = guarded_command(op_program, &program_guard)?
         .args(["read", "--no-newline", reference])
         .env_clear()
         .envs(sanitized_current_environment())
@@ -831,7 +973,7 @@ struct AppJwtClaims {
 
 #[derive(Debug, Serialize)]
 struct InstallationTokenRequest<'a> {
-    repositories: [&'a str; 1],
+    repositories: &'a [String],
     permissions: &'a BTreeMap<String, String>,
 }
 
@@ -841,6 +983,7 @@ struct InstallationTokenResponse {
     expires_at: String,
     permissions: BTreeMap<String, String>,
     repository_selection: String,
+    repositories: Vec<RepositoryResponse>,
 }
 
 #[derive(Deserialize)]
@@ -866,6 +1009,10 @@ struct RepositoryInstallationResponse {
 
 fn github_app_jwt(config: &Config, now: i64) -> Result<String> {
     let private_key = read_declared_secret(config, &config.github.private_key_ref)?;
+    github_app_jwt_with_key(config.github.app_id, &private_key, now)
+}
+
+fn github_app_jwt_with_key(app_id: u64, private_key: &SecretString, now: i64) -> Result<String> {
     let key = EncodingKey::from_rsa_pem(private_key.expose().as_bytes())
         .context("GitHub App private key is not a valid RSA PEM key")?;
     encode(
@@ -873,7 +1020,7 @@ fn github_app_jwt(config: &Config, now: i64) -> Result<String> {
         &AppJwtClaims {
             iat: now - 60,
             exp: now + 540,
-            iss: config.github.app_id.to_string(),
+            iss: app_id.to_string(),
         },
         &key,
     )
@@ -898,6 +1045,15 @@ fn discover_repository_installation(
     now: i64,
 ) -> Result<SelectedRepository> {
     let jwt = github_app_jwt(config, now)?;
+    discover_repository_installation_with_jwt(&config.github, owner, repository, &jwt)
+}
+
+fn discover_repository_installation_with_jwt(
+    profile: &crate::GitHubProfile,
+    owner: &str,
+    repository: &str,
+    jwt: &str,
+) -> Result<SelectedRepository> {
     let url = format!("https://api.github.com/repos/{owner}/{repository}/installation");
     let mut response = github_api_agent()
         .get(&url)
@@ -918,11 +1074,11 @@ fn discover_repository_installation(
         .limit(RESPONSE_LIMIT)
         .read_to_vec()
         .context("read bounded GitHub App installation response")?;
-    validate_repository_installation_response(config, owner, repository, &bytes)
+    validate_repository_installation_response(profile, owner, repository, &bytes)
 }
 
 fn validate_repository_installation_response(
-    config: &Config,
+    profile: &crate::GitHubProfile,
     owner: &str,
     repository: &str,
     bytes: &[u8],
@@ -930,10 +1086,10 @@ fn validate_repository_installation_response(
     let installation: RepositoryInstallationResponse = serde_json::from_slice(bytes)
         .context("parse GitHub App repository installation response")?;
     if installation.id == 0
-        || installation.app_id != config.github.app_id
+        || installation.app_id != profile.app_id
         || !installation.account.login.eq_ignore_ascii_case(owner)
-        || installation.permissions != config.github.permissions
-        || installation.repository_selection != config.github.repository_selection
+        || installation.permissions != profile.permissions
+        || installation.repository_selection != profile.repository_selection
         || installation.suspended_at.is_some()
     {
         bail!("GitHub App repository installation does not match the declared authority");
@@ -953,6 +1109,67 @@ fn mint_installation_token(
     now: i64,
 ) -> Result<CacheEntry> {
     let jwt = github_app_jwt(config, now)?;
+    mint_installation_token_with_jwt(
+        &config.github,
+        &jwt,
+        installation_id,
+        owner,
+        repository,
+        now,
+    )
+}
+
+fn mint_installation_token_with_jwt(
+    profile: &crate::GitHubProfile,
+    jwt: &str,
+    installation_id: u64,
+    owner: &str,
+    repository: &str,
+    now: i64,
+) -> Result<CacheEntry> {
+    let repositories = [repository.to_owned()];
+    let token = mint_scoped_installation_token_with_jwt(
+        profile,
+        jwt,
+        installation_id,
+        owner,
+        &repositories,
+        now,
+    )?;
+    Ok(CacheEntry::new(
+        token.token,
+        token.expires_at,
+        profile.app_id,
+        installation_id,
+        owner.to_ascii_lowercase(),
+        repository.to_owned(),
+        profile.permissions.clone(),
+    ))
+}
+
+fn mint_scoped_installation_token_with_jwt(
+    profile: &crate::GitHubProfile,
+    jwt: &str,
+    installation_id: u64,
+    owner: &str,
+    repositories: &[String],
+    now: i64,
+) -> Result<BrokerGitHubToken> {
+    if repositories.is_empty() || repositories.len() > 500 {
+        bail!("GitHub token scope must contain between one and 500 repositories");
+    }
+    let expected_repositories = repositories
+        .iter()
+        .map(|repository| {
+            if !crate::is_github_component(repository) {
+                bail!("GitHub token scope contains an invalid repository name");
+            }
+            Ok(format!("{owner}/{repository}").to_ascii_lowercase())
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if expected_repositories.len() != repositories.len() {
+        bail!("GitHub token scope contains a duplicate repository");
+    }
     let agent = github_api_agent();
     let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
     let mut response = agent
@@ -961,8 +1178,8 @@ fn mint_installation_token(
         .header("Authorization", format!("Bearer {jwt}"))
         .header("X-GitHub-Api-Version", "2026-03-10")
         .send_json(&InstallationTokenRequest {
-            repositories: [repository],
-            permissions: &config.github.permissions,
+            repositories,
+            permissions: &profile.permissions,
         })
         .context("request narrowed GitHub App installation token")?;
     if !response.status().is_success() {
@@ -986,50 +1203,123 @@ fn mint_installation_token(
         || response.token.contains(['\n', '\r', '\0'])
         || expires_at <= now + 300
         || expires_at > now + 3700
-        || response.permissions != config.github.permissions
+        || response.permissions != profile.permissions
         || response.repository_selection != "selected"
     {
         bail!("GitHub returned an invalid installation token contract");
     }
-    let expected_full_name = format!("{owner}/{repository}");
-    let repository_url = format!("https://api.github.com/repos/{expected_full_name}");
-    let mut repository_response = agent
-        .get(&repository_url)
+    let returned_repositories = response
+        .repositories
+        .iter()
+        .map(|repository| {
+            if repository.id == 0 {
+                bail!("GitHub token scope contains an invalid repository identity");
+            }
+            Ok(repository.full_name.to_ascii_lowercase())
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if returned_repositories.len() != response.repositories.len()
+        || returned_repositories != expected_repositories
+    {
+        bail!("GitHub token scope does not exactly match the requested repositories");
+    }
+    Ok(BrokerGitHubToken {
+        token: SecretString::new(response.token),
+        expires_at,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct BrokerGitHubAuthority<'a> {
+    pub op_program: &'a str,
+    pub service_token: &'a SecretString,
+    pub app_id: u64,
+    pub private_key_ref: &'a str,
+    pub permissions: BTreeMap<String, String>,
+    pub installation_ids: &'a [u64],
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct BrokerGitHubToken {
+    pub token: SecretString,
+    pub expires_at: i64,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn broker_revoke_github_token(token: &SecretString) -> Result<()> {
+    let response = github_api_agent()
+        .delete("https://api.github.com/installation/token")
         .header("Accept", "application/vnd.github+json")
-        .header("Authorization", format!("Bearer {}", response.token))
+        .header("Authorization", format!("token {}", token.expose()))
         .header("X-GitHub-Api-Version", "2026-03-10")
         .call()
-        .context("validate narrowed GitHub App repository token")?;
-    if !repository_response.status().is_success() {
-        bail!(
-            "GitHub repository scope validation returned HTTP {}",
-            repository_response.status()
-        );
+        .context("revoke GitHub App installation token")?;
+    if response.status().as_u16() != 204 {
+        bail!("GitHub App token revocation was rejected");
     }
-    let repository_bytes = repository_response
-        .body_mut()
-        .with_config()
-        .limit(RESPONSE_LIMIT)
-        .read_to_vec()
-        .context("read bounded GitHub repository response")?;
-    let repository_response: RepositoryResponse = serde_json::from_slice(&repository_bytes)
-        .context("parse GitHub repository scope response")?;
-    if repository_response.id == 0
-        || !repository_response
-            .full_name
-            .eq_ignore_ascii_case(&expected_full_name)
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn broker_github_token_for_repository(
+    authority: BrokerGitHubAuthority<'_>,
+    owner: &str,
+    repository: &str,
+) -> Result<BrokerGitHubToken> {
+    broker_github_token_for_repositories(authority, owner, &[repository.to_owned()])
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn broker_github_token_for_repositories(
+    authority: BrokerGitHubAuthority<'_>,
+    owner: &str,
+    repositories: &[String],
+) -> Result<BrokerGitHubToken> {
+    if repositories.is_empty() || repositories.len() > 500 {
+        bail!("GitHub CLI authority requires a finite repository set");
+    }
+    let private_key = read_declared_secret_with_token(
+        authority.op_program,
+        authority.service_token,
+        authority.private_key_ref,
+    )?;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let jwt = github_app_jwt_with_key(authority.app_id, &private_key, now)?;
+    let profile = crate::GitHubProfile {
+        app_id: authority.app_id,
+        private_key_ref: authority.private_key_ref.to_owned(),
+        repository_selection: crate::RepositorySelection::Selected,
+        discover_installations: true,
+        installations: Vec::new(),
+        permissions: authority.permissions,
+    };
+    let mut installation_id = None;
+    for repository in repositories {
+        let selected =
+            discover_repository_installation_with_jwt(&profile, owner, repository, &jwt)?;
+        match installation_id {
+            None => installation_id = Some(selected.installation_id),
+            Some(expected) if expected == selected.installation_id => {}
+            Some(_) => bail!("GitHub CLI repository scope crosses App installations"),
+        }
+    }
+    let installation_id = installation_id.context("GitHub CLI authority has no repository")?;
+    if !authority.installation_ids.is_empty()
+        && authority
+            .installation_ids
+            .binary_search(&installation_id)
+            .is_err()
     {
-        bail!("GitHub repository token scope does not match the requested repository");
+        bail!("GitHub App installation is outside the workload authority cap");
     }
-    Ok(CacheEntry::new(
-        SecretString::new(response.token),
-        expires_at,
-        config.github.app_id,
+    mint_scoped_installation_token_with_jwt(
+        &profile,
+        &jwt,
         installation_id,
-        owner.to_ascii_lowercase(),
-        repository.to_owned(),
-        config.github.permissions.clone(),
-    ))
+        owner,
+        repositories,
+        now,
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1378,6 +1668,70 @@ pub fn credential_get(input: &[u8]) -> Result<String> {
         |owner, repository| validate_bound_git_credential_authority(&config, owner, repository),
         |owner, repository| token_entry_for_repository(&paths, &config, owner, repository),
     )
+}
+
+#[cfg(target_os = "linux")]
+pub fn broker_credential_get(input: &[u8]) -> Result<String> {
+    let request = CredentialRequest::parse(input)?;
+    let (owner, repository) = request.repository()?;
+    match crate::broker_client::request_active(
+        crate::broker_protocol::BrokerRequest::GitCredential {
+            protocol: "https".into(),
+            host: "github.com".into(),
+            owner: owner.into(),
+            repository: repository.into(),
+        },
+    )? {
+        crate::broker_protocol::BrokerResponse::GitCredential {
+            username,
+            password,
+            expires_at,
+        } => {
+            if username != "x-access-token" {
+                bail!("broker returned an unsupported Git credential username");
+            }
+            let expires_at = OffsetDateTime::parse(&expires_at, &Rfc3339)
+                .context("parse broker Git credential expiry")?
+                .unix_timestamp();
+            render_git_credential(password.expose(), expires_at)
+        }
+        crate::broker_protocol::BrokerResponse::Denied { code, message } => {
+            bail!("broker denied Git credentials ({code}): {message}")
+        }
+        crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::Accepted
+        | crate::broker_protocol::BrokerResponse::Ready { .. }
+        | crate::broker_protocol::BrokerResponse::GhExecutionToken { .. }
+        | crate::broker_protocol::BrokerResponse::Signature { .. } => {
+            bail!("broker returned an invalid Git credential response")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn broker_credential_erase(input: &[u8]) -> Result<()> {
+    let request = CredentialRequest::parse(input)?;
+    let (owner, repository) = request.repository()?;
+    match crate::broker_client::request_active(
+        crate::broker_protocol::BrokerRequest::InvalidateGitCredential {
+            protocol: "https".into(),
+            host: "github.com".into(),
+            owner: owner.into(),
+            repository: repository.into(),
+        },
+    )? {
+        crate::broker_protocol::BrokerResponse::Accepted => Ok(()),
+        crate::broker_protocol::BrokerResponse::Denied { code, message } => {
+            bail!("broker denied Git credential invalidation ({code}): {message}")
+        }
+        crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::Ready { .. }
+        | crate::broker_protocol::BrokerResponse::GitCredential { .. }
+        | crate::broker_protocol::BrokerResponse::GhExecutionToken { .. }
+        | crate::broker_protocol::BrokerResponse::Signature { .. } => {
+            bail!("broker returned an invalid credential-invalidation response")
+        }
+    }
 }
 
 fn credential_get_with_sources<A, T>(input: &[u8], authorize: A, token_source: T) -> Result<String>
@@ -1766,6 +2120,355 @@ pub fn run_gh(arguments: &[String]) -> Result<ExitStatus> {
         .stderr(Stdio::inherit())
         .status()
         .context("run repository-scoped gh command")
+}
+
+fn run_native_program(
+    program: &str,
+    description: &str,
+    arguments: &[OsString],
+) -> Result<ExitStatus> {
+    let guard = program_guard(program, description)?;
+    guarded_command(program, &guard)?
+        .args(arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("run configured native {description}"))
+}
+
+#[cfg(unix)]
+fn exec_native_program(program: &str, description: &str, arguments: &[OsString]) -> Result<()> {
+    let guard = program_guard(program, description)?;
+    let error = guarded_command(program, &guard)?
+        .args(arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .exec();
+    Err(error).with_context(|| format!("exec configured native {description}"))
+}
+
+pub fn run_native_git(arguments: &[OsString]) -> Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        let (_, receipt) = crate::setup::current_installation()?;
+        run_native_program(&receipt.native_git, "Git", arguments)
+    }
+    #[cfg(not(unix))]
+    {
+        let paths = RuntimePaths::discover()?;
+        let config = load_config(&paths)?;
+        run_native_program(&config.programs.git, "Git", arguments)
+    }
+}
+
+pub fn run_native_gh(arguments: &[OsString]) -> Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        let (_, receipt) = crate::setup::current_installation()?;
+        run_native_program(&receipt.native_gh, "GitHub CLI", arguments)
+    }
+    #[cfg(not(unix))]
+    {
+        let paths = RuntimePaths::discover()?;
+        let config = load_config(&paths)?;
+        run_native_program(&config.programs.gh, "GitHub CLI", arguments)
+    }
+}
+
+#[cfg(unix)]
+pub fn exec_native_git(arguments: &[OsString]) -> Result<()> {
+    let (_, receipt) = crate::setup::current_installation()?;
+    exec_native_program(&receipt.native_git, "Git", arguments)
+}
+
+#[cfg(unix)]
+pub fn exec_native_gh(arguments: &[OsString]) -> Result<()> {
+    let (_, receipt) = crate::setup::current_installation()?;
+    exec_native_program(&receipt.native_gh, "GitHub CLI", arguments)
+}
+
+#[cfg(target_os = "linux")]
+pub fn exec_broker_git(arguments: &[OsString]) -> Result<()> {
+    let (paths, receipt) = crate::setup::current_installation()?;
+    let (session_id, profile, policy) = active_broker_profile(&receipt)?;
+    let helper = paths.bin_dir.join("git-credential-dev-auth");
+    let helper = helper
+        .to_str()
+        .context("broker Git credential-helper path is not UTF-8")?;
+    if helper.chars().any(char::is_whitespace) {
+        bail!("broker Git credential-helper path contains whitespace");
+    }
+    let ssh_keygen = paths.bin_dir.join("ssh-keygen-dev-auth");
+    let ssh_keygen = ssh_keygen
+        .to_str()
+        .context("broker ssh-keygen adapter path is not UTF-8")?;
+    if ssh_keygen.chars().any(char::is_whitespace) {
+        bail!("broker ssh-keygen adapter path contains whitespace");
+    }
+    let ssh_command = if profile.ssh_keys.is_empty() {
+        "/usr/bin/false"
+    } else {
+        &policy.programs.ssh
+    };
+    let configuration = broker_git_configuration(&profile, helper, ssh_keygen, ssh_command);
+    let signing_socket = validated_agent_socket(
+        crate::broker_agent::SIGNING_AGENT_ENV,
+        crate::broker_protocol::SshOperationPurpose::GitSigning,
+        &session_id,
+        profile.signing_key.is_some(),
+    )?;
+    let authentication_socket = validated_agent_socket(
+        "SSH_AUTH_SOCK",
+        crate::broker_protocol::SshOperationPurpose::Authentication,
+        &session_id,
+        !profile.ssh_keys.is_empty(),
+    )?;
+    let guard = program_guard(&receipt.native_git, "Git")?;
+    let mut command = guarded_command(&receipt.native_git, &guard)?;
+    remove_automation_credential_environment(&mut command);
+    command
+        .args(arguments)
+        .env("GIT_CONFIG_COUNT", configuration.len().to_string())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/usr/bin/false")
+        .env("SSH_ASKPASS", "/usr/bin/false")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for (index, (key, value)) in configuration.iter().enumerate() {
+        command.env(format!("GIT_CONFIG_KEY_{index}"), key);
+        command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    if let Some(socket) = authentication_socket {
+        command
+            .env("SSH_AUTH_SOCK", socket)
+            .env("GIT_SSH", &policy.programs.ssh)
+            .env("GIT_SSH_VARIANT", "ssh");
+    } else {
+        command.env("GIT_SSH", "/usr/bin/false");
+    }
+    if let Some(socket) = signing_socket {
+        command.env(crate::broker_agent::SIGNING_AGENT_ENV, socket);
+    }
+    let error = command.exec();
+    Err(error).context("exec broker-authorized native Git")
+}
+
+#[cfg(target_os = "linux")]
+fn broker_git_configuration(
+    profile: &crate::policy_v2::ResolvedAuthorityProfile,
+    credential_helper: &str,
+    ssh_keygen: &str,
+    ssh_command: &str,
+) -> Vec<(String, String)> {
+    let mut configuration = vec![
+        ("credential.helper".to_owned(), String::new()),
+        ("credential.helper".to_owned(), credential_helper.to_owned()),
+        ("credential.useHttpPath".to_owned(), "true".to_owned()),
+        ("credential.interactive".to_owned(), "never".to_owned()),
+        ("core.askPass".to_owned(), "/usr/bin/false".to_owned()),
+        ("core.sshCommand".to_owned(), ssh_command.to_owned()),
+        ("http.extraHeader".to_owned(), String::new()),
+        ("gpg.program".to_owned(), "/usr/bin/false".to_owned()),
+    ];
+    if let Some(identity) = &profile.git_identity {
+        configuration.extend([
+            ("user.name".to_owned(), identity.name.clone()),
+            ("user.email".to_owned(), identity.email.clone()),
+        ]);
+    }
+    if let Some(signing_key) = &profile.signing_key {
+        configuration.extend([
+            ("gpg.format".to_owned(), "ssh".to_owned()),
+            ("gpg.ssh.program".to_owned(), ssh_keygen.to_owned()),
+            (
+                "user.signingKey".to_owned(),
+                format!("key::{}", signing_key.public_key),
+            ),
+            ("commit.gpgSign".to_owned(), "true".to_owned()),
+            ("tag.gpgSign".to_owned(), "true".to_owned()),
+        ]);
+    } else {
+        configuration.extend([
+            ("gpg.ssh.program".to_owned(), "/usr/bin/false".to_owned()),
+            ("commit.gpgSign".to_owned(), "false".to_owned()),
+            ("tag.gpgSign".to_owned(), "false".to_owned()),
+        ]);
+    }
+    configuration
+}
+
+#[cfg(target_os = "linux")]
+pub fn exec_broker_ssh_keygen(arguments: &[OsString]) -> Result<()> {
+    let (_, receipt) = crate::setup::current_installation()?;
+    let (session_id, profile, policy) = active_broker_profile(&receipt)?;
+    if profile.signing_key.is_none() {
+        bail!("workload profile has no broker signing authority");
+    }
+    let socket = validated_agent_socket(
+        crate::broker_agent::SIGNING_AGENT_ENV,
+        crate::broker_protocol::SshOperationPurpose::GitSigning,
+        &session_id,
+        true,
+    )?
+    .context("signing agent socket is unavailable")?;
+    let guard = program_guard(&policy.programs.ssh_keygen, "ssh-keygen")?;
+    let mut command = guarded_command(&policy.programs.ssh_keygen, &guard)?;
+    remove_automation_credential_environment(&mut command);
+    command
+        .args(arguments)
+        .env("SSH_AUTH_SOCK", socket)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let error = command.exec();
+    Err(error).context("exec broker-backed native ssh-keygen")
+}
+
+#[cfg(target_os = "linux")]
+fn active_broker_profile(
+    receipt: &crate::setup::InstallReceipt,
+) -> Result<(
+    String,
+    crate::policy_v2::ResolvedAuthorityProfile,
+    crate::policy_v2::ResolvedPolicy,
+)> {
+    let (_, probe) = crate::broker_client::active_claim_and_probe()?;
+    let (session_id, profile_name) = match probe {
+        crate::broker_protocol::BrokerSessionProbe::Verified {
+            session_id,
+            profile,
+            ..
+        } => (session_id, profile),
+        _ => bail!("caller is outside a verified workload session"),
+    };
+    let owner_uid = nix::unistd::Uid::effective().as_raw();
+    let policy = match receipt.mode {
+        crate::setup::InstallMode::Strong => {
+            crate::policy_store::load_resolved_policy_for_uid(owner_uid)?
+        }
+        crate::setup::InstallMode::UserOnly => {
+            crate::policy_store::load_user_only_resolved_policy_for_uid(owner_uid)?
+        }
+    };
+    let profile = policy
+        .authority_profiles
+        .get(&profile_name)
+        .context("active broker profile is no longer configured")?
+        .clone();
+    Ok((session_id, profile, policy))
+}
+
+#[cfg(target_os = "linux")]
+fn validated_agent_socket(
+    variable: &str,
+    purpose: crate::broker_protocol::SshOperationPurpose,
+    session_id: &str,
+    required: bool,
+) -> Result<Option<PathBuf>> {
+    let value = std::env::var_os(variable).map(PathBuf::from);
+    let Some(socket) = value else {
+        if required {
+            bail!("configured workload capability has no broker SSH agent socket");
+        }
+        return Ok(None);
+    };
+    if !required {
+        bail!("workload environment exposes an undeclared broker SSH agent");
+    }
+    let owner_uid = nix::unistd::Uid::effective().as_raw();
+    if socket != crate::broker_agent::agent_socket_path(owner_uid, session_id, purpose) {
+        bail!("broker SSH agent socket does not match the admitted session");
+    }
+    let metadata = fs::symlink_metadata(&socket).context("inspect broker SSH agent socket")?;
+    if !metadata.file_type().is_socket()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != owner_uid
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!("broker SSH agent socket has unsafe authority");
+    }
+    Ok(Some(socket))
+}
+
+#[cfg(target_os = "linux")]
+pub fn exec_broker_gh(arguments: &[OsString], session_id: &str) -> Result<()> {
+    if session_id.len() != 32 || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("broker session identifier is invalid");
+    }
+    let token = match crate::broker_client::request_active(
+        crate::broker_protocol::BrokerRequest::GhExecutionToken,
+    )? {
+        crate::broker_protocol::BrokerResponse::GhExecutionToken { token, .. } => token,
+        crate::broker_protocol::BrokerResponse::Denied { code, message } => {
+            bail!("broker denied GitHub CLI authority ({code}): {message}")
+        }
+        crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::Accepted
+        | crate::broker_protocol::BrokerResponse::Ready { .. }
+        | crate::broker_protocol::BrokerResponse::GitCredential { .. }
+        | crate::broker_protocol::BrokerResponse::Signature { .. } => {
+            bail!("broker returned an invalid GitHub CLI response")
+        }
+    };
+    let runtime = PathBuf::from(format!(
+        "/run/user/{}/dev-auth-v3",
+        rustix::process::geteuid().as_raw()
+    ));
+    validate_private_directory(
+        runtime.parent().context("broker runtime has no parent")?,
+        "native-user login runtime",
+    )?;
+    ensure_private_directory(&runtime)?;
+    let session_runtime = runtime.join(session_id);
+    ensure_private_directory(&session_runtime)?;
+    let gh_config = session_runtime.join("gh");
+    ensure_private_directory(&gh_config)?;
+
+    let (_, receipt) = crate::setup::current_installation()?;
+    let guard = program_guard(&receipt.native_gh, "GitHub CLI")?;
+    let mut command = guarded_command(&receipt.native_gh, &guard)?;
+    remove_automation_credential_environment(&mut command);
+    command
+        .args(arguments)
+        .env("GH_TOKEN", token.expose())
+        .env("GH_CONFIG_DIR", &gh_config)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let error = command.exec();
+    Err(error).context("exec broker-authorized native GitHub CLI")
+}
+
+#[cfg(target_os = "linux")]
+fn remove_automation_credential_environment(command: &mut Command) {
+    for variable in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        command.env_remove(variable);
+    }
+    for key in env::vars_os().map(|(key, _)| key) {
+        let text = key.to_string_lossy();
+        if text.starts_with("GIT_CONFIG_KEY_") || text.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(key);
+        }
+    }
 }
 
 fn gh_version_is_supported(stdout: &[u8], stderr: &[u8]) -> bool {
@@ -2673,6 +3376,33 @@ impl Agent<PrivateNamedPipeListener> for DeclaredAgent {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn broker_sign_ssh(
+    op_program: &str,
+    service_token: &SecretString,
+    private_key_ref: &str,
+    declared_public_key: &str,
+    declared_fingerprint: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if payload.is_empty() || payload.len() > 1024 * 1024 {
+        bail!("SSH signing payload size is invalid");
+    }
+    let source = read_declared_secret_with_token(op_program, service_token, private_key_ref)?;
+    let private_key = parse_declared_ssh_private_key(&source)?;
+    let public_key = PublicKey::from_openssh(declared_public_key)
+        .context("declared operation public key is invalid")?;
+    if private_key.public_key().key_data() != public_key.key_data()
+        || public_key.fingerprint(HashAlg::Sha256).to_string() != declared_fingerprint
+    {
+        bail!("declared operation key identity does not match private material");
+    }
+    let signature = private_key
+        .try_sign(payload)
+        .context("perform broker-backed SSH signature")?;
+    Vec::<u8>::try_from(signature).context("encode broker-backed SSH signature")
+}
+
 fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
     if let Ok(private_key) = PrivateKey::from_openssh(source.expose().as_bytes()) {
         return Ok(private_key);
@@ -3101,8 +3831,9 @@ mod tests {
     #[test]
     fn installation_token_request_is_narrowed_by_repository_name() {
         let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let repositories = vec!["brand-new-repository".to_owned()];
         let request = InstallationTokenRequest {
-            repositories: ["brand-new-repository"],
+            repositories: &repositories,
             permissions: &permissions,
         };
         assert_eq!(
@@ -4103,7 +4834,7 @@ mod tests {
             "suspended_at": null
         });
         let selected = validate_repository_installation_response(
-            &config,
+            &config.github,
             "exampleorg",
             "New-Repository",
             &serde_json::to_vec(&response).unwrap(),
@@ -4116,7 +4847,7 @@ mod tests {
         let mut wrong_selection = response.clone();
         wrong_selection["repository_selection"] = serde_json::json!("selected");
         assert!(validate_repository_installation_response(
-            &config,
+            &config.github,
             "exampleorg",
             "New-Repository",
             &serde_json::to_vec(&wrong_selection).unwrap(),
@@ -4126,7 +4857,7 @@ mod tests {
         let mut wrong_app = response;
         wrong_app["app_id"] = serde_json::json!(99);
         assert!(validate_repository_installation_response(
-            &config,
+            &config.github,
             "exampleorg",
             "New-Repository",
             &serde_json::to_vec(&wrong_app).unwrap(),
@@ -4257,6 +4988,105 @@ mod tests {
         let parsed =
             parse_declared_ssh_private_key(&SecretString::new(native.to_string())).unwrap();
         assert_eq!(parsed.algorithm(), SshAlgorithm::Ed25519);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_signing_returns_only_a_verifiable_signature_for_the_declared_key() {
+        let directory = linux_program_test_directory();
+        let private_key = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[29; 32])),
+            "broker signing test key",
+        )
+        .unwrap();
+        let public_key = private_key.public_key().clone();
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        let key_path = directory.path().join("private-key");
+        fs::write(
+            &key_path,
+            private_key.to_openssh(ssh_key::LineEnding::LF).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let op = directory.path().join("op");
+        fs::write(
+            &op,
+            format!(
+                "#!/usr/bin/bash\n/usr/bin/cat -- '{}'\n",
+                key_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&op, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let payload = b"broker-backed commit signature";
+        let encoded = broker_sign_ssh(
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/signing/private-key",
+            &public_key.to_openssh().unwrap(),
+            &fingerprint,
+            payload,
+        )
+        .unwrap();
+        let signature = Signature::try_from(encoded.as_slice()).unwrap();
+        signature::Verifier::verify(&public_key, payload, &signature).unwrap();
+
+        assert!(broker_sign_ssh(
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/signing/private-key",
+            &public_key.to_openssh().unwrap(),
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            payload,
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transparent_broker_git_configuration_is_profile_derived_and_operation_only() {
+        let key = crate::policy_v2::OperationKeyConfig {
+            private_key_ref: "op://Automation/signing/private-key".into(),
+            public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test".into(),
+            fingerprint: "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI".into(),
+        };
+        let profile = crate::policy_v2::ResolvedAuthorityProfile {
+            system_cap: "release".into(),
+            credential_slot: "automation".into(),
+            github: None,
+            signing: true,
+            signing_key: Some(key.clone()),
+            ssh: true,
+            ssh_keys: vec![key],
+            git_identity: Some(crate::policy_v2::GitIdentityConfig {
+                name: "Automation Agent".into(),
+                email: "automation@example.invalid".into(),
+            }),
+            secret_references: BTreeSet::new(),
+        };
+        let configuration = broker_git_configuration(
+            &profile,
+            "/opt/dev-auth/bin/git-credential-dev-auth",
+            "/opt/dev-auth/bin/ssh-keygen-dev-auth",
+            "/usr/bin/ssh",
+        );
+        assert!(configuration.contains(&(
+            "credential.helper".into(),
+            "/opt/dev-auth/bin/git-credential-dev-auth".into()
+        )));
+        assert!(configuration.contains(&(
+            "gpg.ssh.program".into(),
+            "/opt/dev-auth/bin/ssh-keygen-dev-auth".into()
+        )));
+        assert!(configuration.contains(&("commit.gpgSign".into(), "true".into())));
+        assert!(configuration.contains(&("core.sshCommand".into(), "/usr/bin/ssh".into())));
+        assert!(configuration.contains(&("http.extraHeader".into(), String::new())));
+        assert!(configuration.contains(&("user.name".into(), "Automation Agent".into())));
+        assert!(configuration.contains(&("user.email".into(), "automation@example.invalid".into())));
+        assert!(!configuration
+            .iter()
+            .any(|(_, value)| value.contains("private-key")));
     }
 
     #[cfg(target_os = "linux")]

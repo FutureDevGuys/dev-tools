@@ -9,7 +9,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 | Product | Use it for |
 |---|---|
 | [`update-all`](docs/update-all.md) | Run supported package and tool updaters through one dependable plan and dashboard. |
-| [`dev-auth`](docs/dev-auth.md) | Supply bounded post-login automation credentials to standard Git, GitHub CLI, child-process, and OpenSSH-agent interfaces. |
+| [`dev-auth`](docs/dev-auth.md) | Supply bounded automation credentials to standard Git, GitHub CLI, child-process, and OpenSSH-agent interfaces. The standalone transparent-broker successor is documented in [dev-auth v0.3 architecture](docs/dev-auth-v0.3.md). |
 | [`dev-cache`](docs/dev-cache.md) | Route and automatically maintain known disposable build caches on storage you select without moving source or deliverables. |
 | [`sync-configs`](docs/sync-configs.md) | Converge explicitly selected files, directories, and structured overlays from a trusted manifest. |
 | [`skills-sync`](docs/skills-sync.md) | Reconcile installed agent skills and their links from an explicit lock and provider selection. |
@@ -27,7 +27,7 @@ On Linux x86-64, download `update-all-0.1.5-linux-x86_64` from the [`update-all/
 ~/.local/bin/update-all product install skills-sync
 ```
 
-`dev-auth` is distributed through the same signed release format but is provisioned by the workstation configuration authority because enrollment, GitHub installation scope, and OS-keyring state are machine policy. It is deliberately not an `update-all` product target.
+The current stable `dev-auth` is distributed through the same signed release format but remains provisioned by the workstation configuration authority during the reversible v0.3 transition. The v0.3 successor owns its installer, broker services, same-name launchers, migration, diagnostics, and credential lifecycle; Syscfg becomes only an optional policy and deployment client after standalone clean-device acceptance. `dev-auth` remains deliberately outside unattended `update-all` product installation because setup includes administrator policy and explicit credential enrollment.
 
 After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer.
 

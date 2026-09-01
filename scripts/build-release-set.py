@@ -126,6 +126,7 @@ def release_environment(commit: str, timestamp: str, output: Path) -> dict[str, 
     environment.update({
         "CARGO_ENCODED_RUSTFLAGS": encoded_rustflags,
         "DEV_TOOLS_GIT_COMMIT": commit,
+        "DEV_AUTH_SOURCE_COMMIT": commit,
         "DEV_TOOLS_GIT_DIRTY": "0",
         "SOURCE_DATE_EPOCH": timestamp,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -248,6 +249,8 @@ def main() -> int:
             "--output",
             str(destination),
         ]
+        if product == "dev-auth":
+            command.extend(["--source-commit", commit])
         summaries.append(json.loads(run(*command, env=env)))
     shutil.rmtree(build_root, ignore_errors=True)
     print(

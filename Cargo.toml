@@ -2,6 +2,8 @@
 members = [
     "crates/dev-auth",
     "crates/dev-cache",
+    "crates/dev-tools-installation",
+    "crates/dev-tools-release",
     "crates/skills-sync",
     "crates/update-all",
 ]

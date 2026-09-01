@@ -938,9 +938,12 @@ dependencies = [
 
 [[package]]
 name = "dev-auth"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "dev-tools-installation",
+ "dev-tools-release",
  "directories",
  "ed25519-dalek 2.2.0",
  "fs2",
@@ -948,7 +951,9 @@ dependencies = [
  "keyring",
  "nix 0.31.3",
  "rustix",
+ "semver",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "signature 2.2.0",
@@ -982,6 +987,38 @@ dependencies = [
  "wait-timeout",
  "walkdir",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dev-tools-installation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "dev-tools-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "dev-tools-installation",
+ "ed25519-dalek 3.0.0",
+ "semver",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]
@@ -2011,6 +2048,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3007,6 +3045,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -3787,6 +3829,8 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "ctrlc",
+ "dev-tools-installation",
+ "dev-tools-release",
  "ed25519-dalek 3.0.0",
  "is-terminal",
  "libc",
