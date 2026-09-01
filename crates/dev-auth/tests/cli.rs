@@ -685,6 +685,35 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     }
 }
 
+#[test]
+fn managed_git_child_admits_only_its_exact_private_helper_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = private_runtime();
+    for (frontend, arguments) in [
+        ("git-credential-dev-auth", vec!["get"]),
+        ("ssh-keygen-dev-auth", vec!["--help"]),
+    ] {
+        let path = directory.path().join(frontend);
+        symlink(env!("CARGO_BIN_EXE_dev-auth"), &path).unwrap();
+        let mut command = Command::new(&path);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("DEV_AUTH_GIT_CHILD", "1")
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin")
+            .env("XDG_RUNTIME_DIR", runtime.path());
+        let output = bounded_output(&mut command);
+        assert!(!output.status.success(), "{frontend}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !error.contains("unrecognized private child launcher identity"),
+            "{frontend}: {error}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn public_git_frontend_uses_one_native_policy_and_propagates_managed_results() {

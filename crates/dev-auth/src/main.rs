@@ -1497,6 +1497,8 @@ fn main() {
         ("false", true, _) => Ok(1),
         ("cat", _, true) => run_gh_pager_frontend(),
         ("false", _, true) => Ok(1),
+        ("git-credential-dev-auth", false, true) => run_credential_frontend(),
+        ("ssh-keygen-dev-auth", false, true) => run_ssh_keygen_frontend(),
         (_, true, _) | (_, _, true) => Err(anyhow::anyhow!(
             "unrecognized private child launcher identity"
         )),
