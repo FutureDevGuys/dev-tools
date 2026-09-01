@@ -795,7 +795,12 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
     if receipt.mode != mode {
         bail!("installed dev-auth mode does not match the requested readiness mode");
     }
-    let setup = verify_at(paths)?;
+    let privileged = nix::unistd::Uid::effective().is_root();
+    let setup = if readiness_requires_private_installation_verification(mode, privileged) {
+        verify_at(paths)?
+    } else {
+        verify_receipted_installation_at(paths, &receipt, false)?
+    };
     report.installed = true;
     report.transparent_launchers_active = setup.transparent_launchers_active;
     report.authenticated_release = receipt.source_commit.is_some()
@@ -863,7 +868,6 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
                 crate::broker_protocol::BrokerSessionProbe::NoSession
                     | crate::broker_protocol::BrokerSessionProbe::Verified { .. }
             );
-            let privileged = nix::unistd::Uid::effective().is_root();
             let privileged_credential_ready = privileged
                 && required_slots
                     .iter()
@@ -934,6 +938,13 @@ fn strong_runtime_readiness(
         return (false, false, Some("enroll_system_credential"));
     }
     (true, false, Some("start_system_broker"))
+}
+
+fn readiness_requires_private_installation_verification(
+    mode: InstallMode,
+    privileged: bool,
+) -> bool {
+    mode == InstallMode::UserOnly || privileged
 }
 
 pub fn transparent_launchers_resolve_first_at(
@@ -1664,6 +1675,14 @@ pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
 
 pub fn verify_at(paths: &SetupPaths) -> Result<SetupReport> {
     let receipt = read_receipt(&paths.receipt_path())?;
+    verify_receipted_installation_at(paths, &receipt, true)
+}
+
+fn verify_receipted_installation_at(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+    verify_private_shared_receipt: bool,
+) -> Result<SetupReport> {
     if receipt.schema != RECEIPT_SCHEMA {
         bail!("dev-auth installation receipt schema is unsupported");
     }
@@ -1679,7 +1698,9 @@ pub fn verify_at(paths: &SetupPaths) -> Result<SetupReport> {
     if length != receipt.executable_length || digest != receipt.executable_sha256 {
         bail!("installed dev-auth executable does not match its receipt");
     }
-    verify_shared_installation(paths, &receipt)?;
+    if verify_private_shared_receipt {
+        verify_shared_installation(paths, receipt)?;
+    }
     verify_exact_alias_set(
         &paths.bin_dir,
         &paths.data_root.join("active"),
@@ -1700,19 +1721,19 @@ pub fn verify_at(paths: &SetupPaths) -> Result<SetupReport> {
         if receipt.system_assets != system_asset_digests() {
             bail!("dev-auth system asset receipt does not match this product version");
         }
-        verify_privileged_launcher(&executable, &receipt)?;
+        verify_privileged_launcher(&executable, receipt)?;
         verify_linux_system_assets()?;
     }
 
     Ok(SetupReport {
         schema: "dev-auth-setup-report-v1".into(),
         mode: receipt.mode,
-        version: receipt.version,
+        version: receipt.version.clone(),
         executable: executable.display().to_string(),
         product_aliases_ready: true,
         transparent_launchers_active: !receipt.transparent_aliases.is_empty(),
-        native_git: receipt.native_git,
-        native_gh: receipt.native_gh,
+        native_git: receipt.native_git.clone(),
+        native_gh: receipt.native_gh.clone(),
     })
 }
 
@@ -4466,6 +4487,18 @@ mod tests {
 
     #[test]
     fn unprivileged_strong_readiness_uses_the_live_broker_as_credential_proof() {
+        assert!(!readiness_requires_private_installation_verification(
+            InstallMode::Strong,
+            false
+        ));
+        assert!(readiness_requires_private_installation_verification(
+            InstallMode::Strong,
+            true
+        ));
+        assert!(readiness_requires_private_installation_verification(
+            InstallMode::UserOnly,
+            false
+        ));
         assert_eq!(
             strong_runtime_readiness(false, false, false),
             (false, false, Some("run_privileged_setup_plan"))
