@@ -185,6 +185,24 @@ pub struct InstallReceipt {
     pub privileged_launcher: Option<String>,
     #[serde(default)]
     pub system_assets: BTreeMap<String, String>,
+    #[serde(default)]
+    pub previous_release: Option<RetainedRelease>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedRelease {
+    pub version: String,
+    pub executable_length: u64,
+    pub executable_sha256: String,
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    #[serde(default)]
+    pub root_generation: Option<u64>,
+    #[serde(default)]
+    pub manifest_generation: Option<u64>,
+    #[serde(default)]
+    pub system_assets: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1245,6 +1263,11 @@ fn install_at_with_release(
         .map(|release| release.manifest_generation)
         .or_else(|| preserved_provenance.and_then(|prior| prior.manifest_generation));
 
+    let previous_release = match prior_receipt.as_ref() {
+        Some(prior) if prior.version == request.version => prior.previous_release.clone(),
+        Some(prior) => Some(retained_release(prior)),
+        None => None,
+    };
     let receipt = InstallReceipt {
         schema: RECEIPT_SCHEMA.into(),
         mode: request.mode,
@@ -1274,6 +1297,7 @@ fn install_at_with_release(
         } else {
             BTreeMap::new()
         },
+        previous_release,
     };
     write_receipt(&paths.receipt_path(), &receipt)?;
     verify_at(paths)
@@ -1444,16 +1468,85 @@ pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
 }
 
 pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
-    let receipt = read_receipt(&paths.receipt_path())?;
-    let report = if receipt.transparent_aliases.is_empty() {
-        verify_at(paths)?
-    } else {
-        deactivate_transparent_launchers_at(paths)?
-    };
-    if receipt.mode == InstallMode::Strong {
-        return stop_system_broker();
+    let mut receipt = read_receipt(&paths.receipt_path())?;
+    verify_at(paths)?;
+    if !receipt.transparent_aliases.is_empty() {
+        deactivate_transparent_launchers_at(paths)?;
+        receipt = read_receipt(&paths.receipt_path())?;
     }
-    Ok(report)
+    if receipt.mode == InstallMode::Strong {
+        stop_system_broker_at(paths)?;
+    }
+    let Some(previous) = receipt.previous_release.clone() else {
+        return verify_at(paths);
+    };
+    validate_version(&previous.version)?;
+    let layout = shared_installation_layout(paths, receipt.mode);
+    let shared = dev_tools_installation::verify_versioned_installation(&layout)?;
+    if shared.active_version == receipt.version {
+        let expected = dev_tools_installation::ArtifactIdentity {
+            length: previous.executable_length,
+            sha256: previous.executable_sha256.clone(),
+        };
+        let rolled_back =
+            dev_tools_installation::rollback_versioned_installation(&layout, |candidate| {
+                let (length, sha256) = file_identity(candidate)?;
+                if length != expected.length || sha256 != expected.sha256 {
+                    bail!("retained dev-auth release does not match product metadata");
+                }
+                Ok(())
+            })?;
+        if rolled_back.receipt.active_version != previous.version
+            || rolled_back.receipt.active_identity != expected
+        {
+            bail!("shared installation rollback selected an unexpected release");
+        }
+    } else if shared.active_version != previous.version
+        || shared.previous_version.as_deref() != Some(receipt.version.as_str())
+        || shared.active_identity.length != previous.executable_length
+        || shared.active_identity.sha256 != previous.executable_sha256
+    {
+        bail!("shared installation state cannot resume the product rollback");
+    }
+
+    let current = retained_release(&receipt);
+    receipt.version = previous.version;
+    receipt.executable = paths
+        .versioned_binary(&receipt.version)
+        .display()
+        .to_string();
+    receipt.executable_length = previous.executable_length;
+    receipt.executable_sha256 = previous.executable_sha256;
+    receipt.source_commit = previous.source_commit;
+    receipt.root_generation = previous.root_generation;
+    receipt.manifest_generation = previous.manifest_generation;
+    receipt.system_assets = previous.system_assets;
+    receipt.previous_release = Some(current);
+    receipt.transparent_aliases.clear();
+    if receipt.mode == InstallMode::Strong {
+        if receipt.system_assets != system_asset_digests() {
+            bail!("retained release requires incompatible system service assets");
+        }
+        install_privileged_launcher(
+            Path::new(&receipt.executable),
+            Path::new(PRIVILEGED_LAUNCHER_PATH),
+            paths,
+        )?;
+    }
+    write_receipt(&paths.receipt_path(), &receipt)?;
+    verify_at(paths)
+}
+
+fn retained_release(receipt: &InstallReceipt) -> RetainedRelease {
+    RetainedRelease {
+        version: receipt.version.clone(),
+        executable_length: receipt.executable_length,
+        executable_sha256: receipt.executable_sha256.clone(),
+        source_commit: receipt.source_commit.clone(),
+        root_generation: receipt.root_generation,
+        manifest_generation: receipt.manifest_generation,
+        system_assets: receipt.system_assets.clone(),
+    }
 }
 
 pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
@@ -4065,6 +4158,7 @@ mod tests {
             transparent_aliases: Vec::new(),
             privileged_launcher: None,
             system_assets: BTreeMap::new(),
+            previous_release: None,
         };
         let mut request = InstallRequest {
             mode: InstallMode::UserOnly,

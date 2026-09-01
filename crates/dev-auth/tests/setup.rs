@@ -143,6 +143,43 @@ fn rollback_removes_same_name_routing_but_preserves_the_reversible_installation(
 }
 
 #[test]
+fn rollback_switches_to_the_retained_release_and_is_resume_safe() {
+    let (root, paths, mut request) = fixture();
+    request.version = "0.3.0-old".into();
+    request.activate_transparent_launchers = true;
+    let old_source = request.source_executable.clone();
+    executable(&old_source, "candidate-v0.3-old");
+    let old = install_at(&paths, &request).unwrap();
+    deactivate_transparent_launchers_at(&paths).unwrap();
+
+    let new_source = root.path().join("native/dev-auth-new");
+    executable(&new_source, "candidate-v0.3-new");
+    request.version = "0.3.1-new".into();
+    request.source_executable = new_source;
+    request.activate_transparent_launchers = false;
+    let new = install_at(&paths, &request).unwrap();
+    assert_eq!(new.version, "0.3.1-new");
+
+    let rolled_back = rollback_at(&paths).unwrap();
+    assert_eq!(rolled_back.version, old.version);
+    assert_eq!(rolled_back.executable, old.executable);
+    assert!(!rolled_back.transparent_launchers_active);
+    assert_eq!(
+        fs::read_link(paths.bin_dir.join("dev-auth")).unwrap(),
+        paths.data_root.join("active")
+    );
+    assert_eq!(
+        fs::canonicalize(paths.bin_dir.join("dev-auth")).unwrap(),
+        fs::canonicalize(old.executable).unwrap()
+    );
+
+    let restored = rollback_at(&paths).unwrap();
+    assert_eq!(restored.version, new.version);
+    assert_eq!(restored.executable, new.executable);
+    assert!(!restored.transparent_launchers_active);
+}
+
+#[test]
 fn uninstall_removes_only_receipted_product_files_and_preserves_native_tools() {
     let (_root, paths, mut request) = fixture();
     request.activate_transparent_launchers = true;
