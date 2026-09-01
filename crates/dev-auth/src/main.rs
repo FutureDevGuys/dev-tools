@@ -666,73 +666,70 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if !matches!(format, "human" | "json") {
                 bail!("setup apply format must be human or json");
             }
-            match dev_auth::setup_v3::read_setup_plan_v3_at(&plan_path) {
-                Ok(plan) => {
-                    let declared = plan
-                        .intent
-                        .credentials
-                        .iter()
-                        .map(|credential| credential.slot.clone())
-                        .collect::<std::collections::BTreeSet<_>>();
-                    let requirements =
-                        dev_auth::setup_v3::required_credential_slots_for_plan(&plan)?;
-                    let required = requirements
-                        .required
-                        .into_iter()
-                        .filter(|slot| slot == "automation")
-                        .collect::<std::collections::BTreeSet<_>>();
-                    let mut allowed_owner_uids = plan
-                        .accounts
-                        .iter()
-                        .map(|account| account.uid)
-                        .collect::<std::collections::BTreeSet<_>>();
-                    if plan.intent.mode == dev_auth::deployment::DeploymentMode::Strong {
-                        allowed_owner_uids.insert(0);
-                    }
-                    let mut stdin = std::io::stdin().lock();
-                    let credentials = dev_auth::credential_input::load_credential_inputs(
-                        &declared,
-                        &required,
-                        &credential_sources,
-                        &dev_auth::credential_input::CredentialInputContext {
-                            mode: plan.intent.mode,
-                            allowed_owner_uids,
-                        },
-                        &mut stdin,
-                    )?;
-                    let report =
-                        dev_auth::setup_v3::apply_setup_plan_v3(&plan, &digest, &credentials)?;
-                    if format == "json" {
-                        println!("{}", serde_json::to_string(&report)?);
-                    } else {
-                        println!("changed={}", report.changed);
-                        println!("verified={}", report.verified);
-                        println!("next_action={}", report.next_action);
-                        for slot in &report.input_required {
-                            println!("input_required={slot}");
-                        }
-                        for slot in &report.blocked {
-                            println!("blocked={slot}");
-                        }
-                    }
-                    Ok(if !report.input_required.is_empty() {
-                        3
-                    } else if !report.blocked.is_empty() {
-                        2
-                    } else {
-                        0
-                    })
+            let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan_path)
+                .context("setup apply accepts only a full setup plan v3")?;
+            if let Some(candidate) = dev_auth::setup_v3::setup_apply_candidate_path(&plan, &digest)?
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let error = std::process::Command::new(&candidate)
+                        .args(std::env::args_os().skip(1))
+                        .exec();
+                    return Err(error).with_context(|| {
+                        format!("execute verified setup candidate {}", candidate.display())
+                    });
                 }
-                Err(v3_error) => {
-                    if !credential_sources.is_empty() {
-                        return Err(v3_error).context("credential inputs require a setup plan v3");
-                    }
-                    let plan = dev_auth::setup::read_plan_at(&plan_path)?;
-                    let report = dev_auth::setup::apply_plan(&plan, &digest)?;
-                    println!("{}", serde_json::to_string(&report)?);
-                    Ok(0)
+                #[cfg(not(unix))]
+                bail!("setup candidate handoff is unavailable on this platform");
+            }
+            let declared = plan
+                .intent
+                .credentials
+                .iter()
+                .map(|credential| credential.slot.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let required = dev_auth::setup_v3::required_credential_slots_for_plan(&plan)?.required;
+            let mut allowed_owner_uids = plan
+                .accounts
+                .iter()
+                .map(|account| account.uid)
+                .collect::<std::collections::BTreeSet<_>>();
+            if plan.intent.mode == dev_auth::deployment::DeploymentMode::Strong {
+                allowed_owner_uids.insert(0);
+            }
+            let mut stdin = std::io::stdin().lock();
+            let credentials = dev_auth::credential_input::load_credential_inputs(
+                &declared,
+                &required,
+                &credential_sources,
+                &dev_auth::credential_input::CredentialInputContext {
+                    mode: plan.intent.mode,
+                    allowed_owner_uids,
+                },
+                &mut stdin,
+            )?;
+            let report = dev_auth::setup_v3::apply_setup_plan_v3(&plan, &digest, &credentials)?;
+            if format == "json" {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("changed={}", report.changed);
+                println!("verified={}", report.verified);
+                println!("next_action={}", report.next_action);
+                for slot in &report.input_required {
+                    println!("input_required={slot}");
+                }
+                for slot in &report.blocked {
+                    println!("blocked={slot}");
                 }
             }
+            Ok(if !report.input_required.is_empty() {
+                3
+            } else if !report.blocked.is_empty() {
+                2
+            } else {
+                0
+            })
         }
         "migrate-v1-preview" => {
             if arguments.next().as_deref() != Some("--output") {

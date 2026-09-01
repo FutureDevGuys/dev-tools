@@ -3910,6 +3910,10 @@ fn file_identity(path: &Path) -> Result<(u64, String)> {
     Ok((metadata.len(), format!("{:x}", hasher.finalize())))
 }
 
+pub(crate) fn setup_executable_identity(path: &Path) -> Result<(u64, String)> {
+    file_identity(path)
+}
+
 fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
     let content = serde_json::to_vec_pretty(receipt).context("serialize install receipt")?;
     if content.len() as u64 > RECEIPT_LIMIT {

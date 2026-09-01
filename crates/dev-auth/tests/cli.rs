@@ -74,6 +74,36 @@ fn private_program_root() -> TempDir {
     directory
 }
 
+#[test]
+fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
+    let root = private_runtime();
+    let plan = root.path().join("setup-plan.json");
+    fs::write(
+        &plan,
+        br#"{"schema":"dev-auth-setup-plan-v2","actions":[]}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "setup",
+                "apply",
+                "--plan",
+                plan.to_str().unwrap(),
+                "--sha256",
+                &"0".repeat(64),
+                "--format",
+                "json",
+            ])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("accepts only a full setup plan v3"));
+}
+
 #[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,

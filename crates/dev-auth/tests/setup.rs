@@ -321,7 +321,7 @@ fn v1_migration_preview_is_read_only_private_and_never_exports_secret_references
 }
 
 #[test]
-fn setup_cli_applies_only_a_digest_bound_plan() {
+fn setup_cli_never_treats_a_binary_install_plan_as_full_desired_state() {
     let (_root, paths, request) = fixture();
     let plan = build_plan(&paths, &request).unwrap();
     let plan_path = paths.data_root.parent().unwrap().join("approved-plan.json");
@@ -341,7 +341,7 @@ fn setup_cli_applies_only_a_digest_bound_plan() {
         .unwrap();
     assert!(!rejected.success());
 
-    let applied = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+    let rejected_even_with_the_matching_digest = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
         .args([
             "setup",
             "apply",
@@ -353,13 +353,14 @@ fn setup_cli_applies_only_a_digest_bound_plan() {
         .output()
         .unwrap();
     assert!(
-        applied.status.success(),
+        !rejected_even_with_the_matching_digest.status.success(),
         "{}",
-        String::from_utf8_lossy(&applied.stderr)
+        String::from_utf8_lossy(&rejected_even_with_the_matching_digest.stderr)
     );
-    let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
-    assert_eq!(report["schema"], "dev-auth-setup-report-v1");
-    assert_eq!(report["product_aliases_ready"], true);
+    assert!(
+        String::from_utf8_lossy(&rejected_even_with_the_matching_digest.stderr)
+            .contains("accepts only a full setup plan v3")
+    );
 }
 
 #[test]

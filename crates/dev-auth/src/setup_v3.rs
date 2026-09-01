@@ -235,6 +235,31 @@ pub fn apply_setup_plan_v3(
     })
 }
 
+pub fn setup_apply_candidate_path(
+    plan: &SetupPlanV3,
+    approved_sha256: &str,
+) -> Result<Option<PathBuf>> {
+    let (_, digest) = render_setup_plan_v3(plan)?;
+    if digest != approved_sha256.to_ascii_lowercase() {
+        bail!("setup plan v3 does not match the approved digest");
+    }
+    let source = &plan.installation.request.source_executable;
+    let (source_length, source_sha256) = crate::setup::setup_executable_identity(source)?;
+    if source_length != plan.installation.source_length
+        || source_sha256 != plan.installation.source_sha256
+    {
+        bail!("verified setup candidate changed before apply handoff");
+    }
+    let current =
+        fs::canonicalize(std::env::current_exe()?).context("resolve running setup executable")?;
+    let (current_length, current_sha256) = crate::setup::setup_executable_identity(&current)?;
+    if current_length == source_length && current_sha256 == source_sha256 {
+        Ok(None)
+    } else {
+        Ok(Some(source.clone()))
+    }
+}
+
 fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
     match plan.intent.mode {
         DeploymentMode::Strong if !nix::unistd::Uid::effective().is_root() => {
