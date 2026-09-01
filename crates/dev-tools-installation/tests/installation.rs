@@ -141,6 +141,20 @@ fn atomic_documents_are_idempotent_compare_and_swap_state() {
 }
 
 #[test]
+fn absent_atomic_document_under_absent_parent_is_empty_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("not-installed/yet/release.json");
+    let authority = DocumentAuthority {
+        owner_uid: fs::metadata(temp.path()).unwrap().uid(),
+        mode: 0o600,
+        limit: 4096,
+    };
+
+    assert!(read_atomic_document(&path, &authority).unwrap().is_none());
+    assert!(!temp.path().join("not-installed").exists());
+}
+
+#[test]
 fn atomic_documents_reject_links_and_unsafe_modes() {
     let temp = tempfile::tempdir().unwrap();
     let authority = DocumentAuthority {
