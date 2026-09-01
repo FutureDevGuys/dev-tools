@@ -114,7 +114,6 @@ pub struct HttpsResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReleaseCandidate {
     tag_name: String,
     draft: bool,
@@ -123,7 +122,6 @@ struct ReleaseCandidate {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReleaseAsset {
     name: String,
     browser_download_url: String,
