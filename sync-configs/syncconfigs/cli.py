@@ -48,6 +48,7 @@ RECONCILER_TIMEOUT_SECONDS = 120
 DIRECTORY_STRATEGIES = {"as_directory", "children", "recursive"}
 SCRIPT_ON_FAIL_POLICIES = {"abort", "skip", "continue"}
 SCRIPT_PRIVILEGES = {"user", "sudo"}
+TARGET_PRIVILEGES = {"user", "sudo"}
 PYTHON_HOOK_COMMANDS = {"python", "python3"}
 SHELL_META_CHARS = re.compile(r"[\n;&|<>`$]")
 
@@ -108,6 +109,9 @@ Entry modes:
   - `toml_overlay`: overlay source TOML into the target, preferring source values on conflicts,
     materializing a symlink target into a normal file, and respecting recognizable
     commented target keys by default (`commented_target_policy`: respect|activate|error)
+  - A regular-file `copy` may set `target_privilege: sudo` with explicit target
+    owner, group, parent mode, and `permissions.file`; only differing postconditions
+    authenticate, and the staged file is atomically replaced after verification
 
 Root `state_preconditions` may require exact non-secret JSON fields before any
 entry runs. These checks are read-only and direct stale state to caller-authored remediation.
@@ -228,6 +232,19 @@ entries:
   #   source: ../cli/codex/config.toml
   #   target: ~/.codex/config.toml
   #   mode: toml_overlay
+  #
+  # Privileged regular-file copy (POSIX only):
+  # - name: system_policy
+  #   source: ../system/example.conf
+  #   target: /etc/example/example.conf
+  #   mode: copy
+  #   target_privilege: sudo
+  #   target_owner: root
+  #   target_group: root
+  #   target_parent_mode: "0755"
+  #   permissions:
+  #     file: "0644"
+  #   reconcile_existing: true
 """
 
 DEFAULT_IGNORE_FILE_NAMES = (".gitignore", ".ignore", ".rgignore", ".fdignore")
@@ -421,6 +438,10 @@ class Entry:
     post_script: Optional[str] = None
     post_script_on_fail: str = "continue"
     post_script_privilege: str = "user"
+    target_privilege: str = "user"
+    target_owner: Optional[str] = None
+    target_group: Optional[str] = None
+    target_parent_mode: Optional[int] = None
     reconcile_existing: bool = False
     reconcile_removed_keys: bool = False
     managed_overlay_id: Optional[str] = None
@@ -511,6 +532,59 @@ class PermissionPolicy:
     file_mode: int | None = None
     dir_mode: int | None = None
     recursive: bool = False
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    exists: bool
+    device: int | None = None
+    inode: int | None = None
+    size: int | None = None
+    mtime_ns: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    mode: int | None = None
+    digest: str | None = None
+
+
+@dataclass(frozen=True)
+class DirectoryComponentSnapshot:
+    path: Path
+    exists: bool
+    device: int | None = None
+    inode: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    mode: int | None = None
+
+
+@dataclass(frozen=True)
+class PrivilegedCopyPlan:
+    entry: Entry
+    owner_uid: int
+    group_gid: int
+    file_mode: int
+    parent_mode: int
+    source_snapshot: FileSnapshot
+    target_snapshot: FileSnapshot
+    parent_snapshots: tuple[DirectoryComponentSnapshot, ...]
+    parent_needs_update: bool
+    target_needs_update: bool
+    blocked_existing: bool
+
+    @property
+    def needs_mutation(self) -> bool:
+        return not self.blocked_existing and (
+            self.parent_needs_update or self.target_needs_update
+        )
+
+
+@dataclass(frozen=True)
+class PrivilegedCommands:
+    chmod: str
+    install: str
+    move: str
+    remove: str
 
 
 def normalize_permission_mode(value: object, key: str) -> int:
@@ -604,6 +678,14 @@ def parse_bool_option(value: object, key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"Entry '{key}' must be a boolean if provided.")
     return value
+
+
+def parse_optional_nonempty_string(value: object, key: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"Entry '{key}' must be a non-empty string if provided.")
+    return value.strip()
 
 
 def parse_exclusive_sibling_groups(
@@ -1287,6 +1369,10 @@ def apply_source_overrides(entries: list[Entry], prefer_overrides: bool) -> list
                 scope_label=entry.scope_label,
                 permissions=entry.permissions,
                 source_permissions=entry.source_permissions,
+                target_privilege=entry.target_privilege,
+                target_owner=entry.target_owner,
+                target_group=entry.target_group,
+                target_parent_mode=entry.target_parent_mode,
                 reconcile_existing=entry.reconcile_existing,
                 reconcile_removed_keys=entry.reconcile_removed_keys,
                 managed_overlay_id=entry.managed_overlay_id,
@@ -1328,7 +1414,7 @@ def permission_signature(policy: PermissionPolicy | None) -> tuple[int | None, i
 
 def entry_signature(
     entry: Entry,
-) -> tuple[str, Path, str, tuple[int | None, int | None, bool] | None, tuple[int | None, int | None, bool] | None]:
+) -> tuple[object, ...]:
     source_key, source_kind = source_identity(entry)
     return (
         entry.mode,
@@ -1336,6 +1422,11 @@ def entry_signature(
         source_kind,
         permission_signature(entry.permissions),
         permission_signature(entry.source_permissions),
+        entry.target_privilege,
+        entry.target_owner,
+        entry.target_group,
+        entry.target_parent_mode,
+        entry.reconcile_existing,
     )
 
 
@@ -1497,6 +1588,28 @@ def parse_entries_block(
         source_permissions = parse_permission_policy(
             entry.get("source_permissions"), "source_permissions"
         )
+        target_privilege = entry.get("target_privilege", "user")
+        if (
+            not isinstance(target_privilege, str)
+            or target_privilege not in TARGET_PRIVILEGES
+        ):
+            raise ConfigError(
+                "Entry 'target_privilege' must be one of "
+                f"{sorted(TARGET_PRIVILEGES)}."
+            )
+        target_owner = parse_optional_nonempty_string(
+            entry.get("target_owner"), "target_owner"
+        )
+        target_group = parse_optional_nonempty_string(
+            entry.get("target_group"), "target_group"
+        )
+        target_parent_mode = (
+            normalize_permission_mode(
+                entry["target_parent_mode"], "target_parent_mode"
+            )
+            if "target_parent_mode" in entry
+            else None
+        )
 
         pre_script = entry.get("pre_script")
         if pre_script is not None and not isinstance(pre_script, str):
@@ -1575,11 +1688,74 @@ def parse_entries_block(
 
         source_path = Path(normalize_user_path(source_raw))
         if not source_path.is_absolute():
-            source_path = (config_dir / source_path).resolve()
+            source_path = config_dir / source_path
+        if target_privilege == "sudo":
+            source_path = Path(os.path.abspath(source_path))
         else:
             source_path = source_path.resolve()
 
         target_path = Path(normalize_user_path(str(target_raw)))
+
+        privileged_metadata = (
+            target_owner is not None
+            or target_group is not None
+            or target_parent_mode is not None
+        )
+        if target_privilege == "user" and privileged_metadata:
+            raise ConfigError(
+                "Entry target_owner, target_group, and target_parent_mode require "
+                "target_privilege: sudo."
+            )
+        if target_privilege == "sudo":
+            if os.name == "nt":
+                raise ConfigError("Entry target_privilege: sudo is unavailable on Windows.")
+            if mode_raw != "copy":
+                raise ConfigError(
+                    "Entry target_privilege: sudo initially supports only mode: copy."
+                )
+            if has_glob_pattern(source_path):
+                raise ConfigError(
+                    "Entry target_privilege: sudo requires a literal source path."
+                )
+            if not target_path.is_absolute() or ".." in target_path.parts:
+                raise ConfigError(
+                    "Entry target_privilege: sudo requires a literal absolute target path."
+                )
+            uses_filters = bool(
+                include
+                or exclude
+                or ignore_files
+                or not discover_ignore_files
+                or not use_default_filters
+            )
+            if directory_strategy != "as_directory" or uses_filters:
+                raise ConfigError(
+                    "Entry target_privilege: sudo does not support directory expansion or filters."
+                )
+            if permissions is None or permissions.file_mode is None:
+                raise ConfigError(
+                    "Entry target_privilege: sudo requires permissions.file."
+                )
+            if permissions.dir_mode is not None or permissions.recursive:
+                raise ConfigError(
+                    "Entry target_privilege: sudo supports only permissions.file."
+                )
+            if source_permissions is not None:
+                raise ConfigError(
+                    "Entry target_privilege: sudo does not support source_permissions."
+                )
+            if target_owner is None or target_group is None:
+                raise ConfigError(
+                    "Entry target_privilege: sudo requires target_owner and target_group."
+                )
+            if target_parent_mode is None:
+                raise ConfigError(
+                    "Entry target_privilege: sudo requires target_parent_mode."
+                )
+            if pre_script is not None or post_script is not None:
+                raise ConfigError(
+                    "Entry target_privilege: sudo does not support per-entry scripts."
+                )
 
         if mode_raw in {"symlink", "json_overlay", "toml_overlay"} and permissions is not None:
             raise ConfigError(
@@ -1621,6 +1797,10 @@ def parse_entries_block(
                 post_script=post_script,
                 post_script_on_fail=post_script_on_fail,
                 post_script_privilege=post_script_privilege,
+                target_privilege=target_privilege,
+                target_owner=target_owner,
+                target_group=target_group,
+                target_parent_mode=target_parent_mode,
                 reconcile_existing=reconcile_existing,
                 reconcile_removed_keys=reconcile_removed_keys,
                 managed_overlay_id=managed_overlay_id,
@@ -2181,12 +2361,12 @@ def run_entry_script(
 
 
 def acquire_shared_sudo_session() -> str:
-    """Authenticate one native sudo timestamp for all selected privileged scripts."""
+    """Authenticate one native sudo timestamp for all selected operations."""
     if os.name == "nt":
-        raise ConfigError("sudo script privilege is unavailable on Windows")
+        raise ConfigError("sudo privilege is unavailable on Windows")
     sudo_path = shutil.which("sudo")
     if sudo_path is None:
-        raise ConfigError("sudo script privilege requires sudo on PATH")
+        raise ConfigError("sudo privilege requires sudo on PATH")
     cached = subprocess.run(
         [sudo_path, "-n", "-v"],
         check=False,
@@ -2203,6 +2383,423 @@ def acquire_shared_sudo_session() -> str:
     if authenticated.returncode != 0:
         raise ConfigError("unable to authenticate one shared sudo session")
     return sudo_path
+
+
+def snapshot_regular_file(
+    path: Path, *, label: str, missing_ok: bool
+) -> FileSnapshot:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return FileSnapshot(exists=False)
+        raise ConfigError(f"{label} is missing: {path}") from None
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect {label} before authentication: {path}: {exc}") from exc
+
+    if stat.S_ISLNK(before.st_mode):
+        raise ConfigError(f"{label} must not be a symbolic link: {path}")
+    if not stat.S_ISREG(before.st_mode):
+        raise ConfigError(f"{label} must be a regular file: {path}")
+
+    try:
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        after = path.lstat()
+    except OSError as exc:
+        raise ConfigError(
+            f"{label} must be readable before authentication: {path}: {exc}"
+        ) from exc
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_uid,
+        before.st_gid,
+        stat.S_IMODE(before.st_mode),
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_uid,
+        after.st_gid,
+        stat.S_IMODE(after.st_mode),
+    )
+    if before_identity != after_identity or stat.S_ISLNK(after.st_mode):
+        raise ConfigError(f"{label} changed while it was being inspected: {path}")
+    return FileSnapshot(
+        exists=True,
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+        uid=after.st_uid,
+        gid=after.st_gid,
+        mode=stat.S_IMODE(after.st_mode),
+        digest=digest,
+    )
+
+
+def snapshot_directory_path(path: Path) -> tuple[DirectoryComponentSnapshot, ...]:
+    if not path.is_absolute():
+        raise ConfigError(f"privileged target parent must be absolute: {path}")
+    current = Path(path.anchor)
+    components: list[DirectoryComponentSnapshot] = []
+    missing = False
+    parts = path.parts[1:] if path.parts and path.parts[0] == path.anchor else path.parts
+    paths = [current]
+    for part in parts:
+        current = current / part
+        paths.append(current)
+
+    for current in paths:
+        if missing:
+            components.append(DirectoryComponentSnapshot(path=current, exists=False))
+            continue
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            missing = True
+            components.append(DirectoryComponentSnapshot(path=current, exists=False))
+            continue
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot inspect privileged target parent before authentication: {current}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ConfigError(
+                f"privileged target parent must not traverse a symbolic link: {current}"
+            )
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise ConfigError(f"privileged target parent component is not a directory: {current}")
+        components.append(
+            DirectoryComponentSnapshot(
+                path=current,
+                exists=True,
+                device=current_stat.st_dev,
+                inode=current_stat.st_ino,
+                uid=current_stat.st_uid,
+                gid=current_stat.st_gid,
+                mode=stat.S_IMODE(current_stat.st_mode),
+            )
+        )
+    return tuple(components)
+
+
+def identity_has_access(owner_uid: int, group_gid: int, mode: int, permission: int) -> bool:
+    current_uid = os.geteuid()
+    if current_uid == owner_uid:
+        shift = 6
+    elif group_gid in {os.getegid(), *os.getgroups()}:
+        shift = 3
+    else:
+        shift = 0
+    return bool(mode & (permission << shift))
+
+
+def resolve_privileged_identity(entry: Entry) -> tuple[int, int, int, int]:
+    try:
+        import grp
+        import pwd
+    except ImportError as exc:
+        raise ConfigError("target_privilege: sudo requires POSIX identities") from exc
+
+    assert entry.target_owner is not None
+    assert entry.target_group is not None
+    assert entry.target_parent_mode is not None
+    assert entry.permissions is not None
+    assert entry.permissions.file_mode is not None
+    try:
+        owner_uid = pwd.getpwnam(entry.target_owner).pw_uid
+    except KeyError as exc:
+        raise ConfigError(
+            f"unknown target_owner for entry '{entry.name}': {entry.target_owner}"
+        ) from exc
+    try:
+        group_gid = grp.getgrnam(entry.target_group).gr_gid
+    except KeyError as exc:
+        raise ConfigError(
+            f"unknown target_group for entry '{entry.name}': {entry.target_group}"
+        ) from exc
+    file_mode = entry.permissions.file_mode
+    parent_mode = entry.target_parent_mode
+    if not identity_has_access(owner_uid, group_gid, file_mode, 0o4):
+        raise ConfigError(
+            f"entry '{entry.name}' would make its privileged target unreadable to the invoking user"
+        )
+    if not identity_has_access(owner_uid, group_gid, parent_mode, 0o1):
+        raise ConfigError(
+            f"entry '{entry.name}' would make its privileged target parent inaccessible to the invoking user"
+        )
+    return owner_uid, group_gid, file_mode, parent_mode
+
+
+def plan_privileged_copy(entry: Entry, *, force: bool) -> PrivilegedCopyPlan:
+    if entry.target_privilege != "sudo":
+        raise ConfigError(f"entry '{entry.name}' is not a privileged target")
+    owner_uid, group_gid, file_mode, parent_mode = resolve_privileged_identity(entry)
+    source_snapshot = snapshot_regular_file(
+        entry.source, label="privileged copy source", missing_ok=False
+    )
+    parent_snapshots = snapshot_directory_path(entry.target.parent)
+    parent_snapshot = parent_snapshots[-1]
+    target_snapshot = snapshot_regular_file(
+        entry.target, label="privileged copy target", missing_ok=True
+    )
+    parent_needs_update = not (
+        parent_snapshot.exists and parent_snapshot.mode == parent_mode
+    )
+    content_differs = (
+        not target_snapshot.exists
+        or target_snapshot.digest != source_snapshot.digest
+    )
+    metadata_differs = target_snapshot.exists and (
+        target_snapshot.uid != owner_uid
+        or target_snapshot.gid != group_gid
+        or target_snapshot.mode != file_mode
+    )
+    blocked_existing = bool(
+        target_snapshot.exists
+        and content_differs
+        and not (entry.reconcile_existing or force)
+    )
+    return PrivilegedCopyPlan(
+        entry=entry,
+        owner_uid=owner_uid,
+        group_gid=group_gid,
+        file_mode=file_mode,
+        parent_mode=parent_mode,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+        parent_snapshots=parent_snapshots,
+        parent_needs_update=parent_needs_update,
+        target_needs_update=content_differs or metadata_differs,
+        blocked_existing=blocked_existing,
+    )
+
+
+def resolve_privileged_commands() -> PrivilegedCommands:
+    resolved: dict[str, str] = {}
+    for name in ("chmod", "install", "mv", "rm"):
+        path = shutil.which(name, path=os.defpath)
+        if path is None:
+            raise ConfigError(f"target_privilege: sudo requires system command: {name}")
+        resolved[name] = path
+    return PrivilegedCommands(
+        chmod=resolved["chmod"],
+        install=resolved["install"],
+        move=resolved["mv"],
+        remove=resolved["rm"],
+    )
+
+
+def run_privileged_command(sudo_path: str, argv: list[str], *, operation: str) -> None:
+    try:
+        result = subprocess.run(
+            [sudo_path, "-n", "--", *argv],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise OSError(f"failed to launch privileged {operation}: {exc}") from exc
+    if result.returncode != 0:
+        raise OSError(f"privileged {operation} failed with exit {result.returncode}")
+
+
+def privileged_temp_target(target: Path) -> Path:
+    return target.with_name(f".{target.name}.sync-configs-{os.getpid()}.tmp")
+
+
+def snapshots_match_for_revalidation(
+    original: PrivilegedCopyPlan, current: PrivilegedCopyPlan
+) -> bool:
+    if (
+        original.source_snapshot != current.source_snapshot
+        or original.target_snapshot != current.target_snapshot
+    ):
+        return False
+    if original.parent_snapshots == current.parent_snapshots:
+        return True
+    return not current.parent_needs_update
+
+
+def snapshots_match_exactly(
+    original: PrivilegedCopyPlan, current: PrivilegedCopyPlan
+) -> bool:
+    return (
+        original.source_snapshot == current.source_snapshot
+        and original.target_snapshot == current.target_snapshot
+        and original.parent_snapshots == current.parent_snapshots
+    )
+
+
+def process_privileged_copy(
+    plan: PrivilegedCopyPlan,
+    *,
+    dry_run: bool,
+    force: bool,
+    sudo_path: str | None,
+    commands: PrivilegedCommands | None,
+    buffer: list[StatusRecord],
+) -> str:
+    entry = plan.entry
+    if plan.blocked_existing:
+        buffer.append(
+            StatusRecord(
+                status_key="skipped_existing",
+                message=(
+                    f"privileged target exists with different content ({entry.target}); "
+                    "use --managed-path-policy takeover to replace"
+                ),
+                entry=entry,
+            )
+        )
+        return "skipped_existing"
+    if not plan.needs_mutation:
+        buffer.append(
+            StatusRecord(
+                status_key="up_to_date",
+                message="privileged copy already up to date",
+                entry=entry,
+            )
+        )
+        return "up_to_date"
+    if dry_run:
+        buffer.append(
+            StatusRecord(
+                status_key="performed",
+                message=f"would install privileged copy {entry.source} -> {entry.target}",
+                entry=entry,
+            )
+        )
+        return "performed"
+    if sudo_path is None or commands is None:
+        raise ConfigError("privileged copy mutation requires one shared sudo session")
+
+    current = plan_privileged_copy(entry, force=force)
+    if not snapshots_match_for_revalidation(plan, current):
+        raise ConfigError(
+            f"privileged copy state drifted between plan and apply: {entry.target}"
+        )
+    if current.blocked_existing:
+        raise ConfigError(f"privileged copy became blocked before apply: {entry.target}")
+
+    if current.parent_needs_update:
+        parent_snapshot = current.parent_snapshots[-1]
+        if parent_snapshot.exists:
+            run_privileged_command(
+                sudo_path,
+                [
+                    commands.chmod,
+                    f"{plan.parent_mode:04o}",
+                    "--",
+                    str(entry.target.parent),
+                ],
+                operation="parent chmod",
+            )
+        else:
+            run_privileged_command(
+                sudo_path,
+                [
+                    commands.install,
+                    "-d",
+                    "-o",
+                    str(plan.owner_uid),
+                    "-g",
+                    str(plan.group_gid),
+                    "-m",
+                    f"{plan.parent_mode:04o}",
+                    "--",
+                    str(entry.target.parent),
+                ],
+                operation="parent install",
+            )
+
+    after_parent = plan_privileged_copy(entry, force=force)
+    if (
+        current.source_snapshot != after_parent.source_snapshot
+        or current.target_snapshot != after_parent.target_snapshot
+    ):
+        raise ConfigError(
+            f"privileged copy state drifted immediately before file install: {entry.target}"
+        )
+
+    temporary = privileged_temp_target(entry.target)
+    if after_parent.target_needs_update:
+        if temporary.exists() or temporary.is_symlink():
+            raise ConfigError(f"privileged copy temporary target already exists: {temporary}")
+        primary_error: BaseException | None = None
+        try:
+            run_privileged_command(
+                sudo_path,
+                [
+                    commands.install,
+                    "-o",
+                    str(plan.owner_uid),
+                    "-g",
+                    str(plan.group_gid),
+                    "-m",
+                    f"{plan.file_mode:04o}",
+                    "--",
+                    str(entry.source),
+                    str(temporary),
+                ],
+                operation="file install",
+            )
+            temporary_snapshot = snapshot_regular_file(
+                temporary, label="privileged copy temporary target", missing_ok=False
+            )
+            if (
+                temporary_snapshot.digest != plan.source_snapshot.digest
+                or temporary_snapshot.uid != plan.owner_uid
+                or temporary_snapshot.gid != plan.group_gid
+                or temporary_snapshot.mode != plan.file_mode
+            ):
+                raise ConfigError(
+                    f"privileged copy temporary target failed verification: {temporary}"
+                )
+            before_replace = plan_privileged_copy(entry, force=force)
+            if not snapshots_match_exactly(after_parent, before_replace):
+                raise ConfigError(
+                    "privileged copy state drifted immediately before atomic replace: "
+                    f"{entry.target}"
+                )
+            run_privileged_command(
+                sudo_path,
+                [commands.move, "-f", "--", str(temporary), str(entry.target)],
+                operation="atomic replace",
+            )
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if temporary.exists() or temporary.is_symlink():
+                try:
+                    run_privileged_command(
+                        sudo_path,
+                        [commands.remove, "-f", "--", str(temporary)],
+                        operation="temporary cleanup",
+                    )
+                except OSError:
+                    if primary_error is None:
+                        raise
+
+    verified = plan_privileged_copy(entry, force=force)
+    if verified.blocked_existing or verified.needs_mutation:
+        raise ConfigError(f"privileged copy failed exact postcondition verification: {entry.target}")
+    buffer.append(
+        StatusRecord(
+            status_key="performed",
+            message=f"installed privileged copy {entry.source} -> {entry.target}",
+            entry=entry,
+        )
+    )
+    return "performed"
 
 
 def _public_reconciler_token(value: object, description: str) -> str:
@@ -2394,8 +2991,6 @@ def run_external_reconciler(
             raise ConfigError(f"Reconciler '{entry.name}' did not verify its postcondition.")
         verified["changed"] = applied["changed"]
         return verified
-
-
 def format_status_line(
     status_key: str,
     message: str,
@@ -2495,11 +3090,26 @@ def process_entry(
     force: bool,
     buffer: list[StatusRecord],
     managed_path_policy_name: str = "safe",
+    privileged_plan: PrivilegedCopyPlan | None = None,
+    sudo_path: str | None = None,
+    privileged_commands: PrivilegedCommands | None = None,
 ) -> str:
     """Sync a single entry, appending status records to *buffer*.
 
     Returns the final status key for this entry (used for stats).
     """
+    if entry.target_privilege == "sudo":
+        if privileged_plan is None:
+            raise ConfigError(f"missing privileged copy plan for entry '{entry.name}'")
+        return process_privileged_copy(
+            privileged_plan,
+            dry_run=dry_run,
+            force=force,
+            sudo_path=sudo_path,
+            commands=privileged_commands,
+            buffer=buffer,
+        )
+
     if not entry.source.exists():
         buffer.append(StatusRecord(
             status_key="missing_source",
@@ -2900,6 +3510,23 @@ def run(
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    preflight_entries = merge_entries(entries, override_entries)
+    selected_privileged_entries = [
+        entry for entry in preflight_entries if entry.target_privilege == "sudo"
+    ]
+    try:
+        for entry in apply_source_overrides(
+            selected_privileged_entries,
+            prefer_overrides=not args.no_source_overrides,
+        ):
+            plan_privileged_copy(
+                entry,
+                force=args.managed_path_policy == "takeover",
+            )
+    except (ConfigError, OSError) as exc:
+        print(f"error: {format_exception(exc)}", file=sys.stderr)
+        return 1
+
     privileged_scripts_selected = any(
         (entry.pre_script is not None and entry.pre_script_privilege == "sudo")
         or (entry.post_script is not None and entry.post_script_privilege == "sudo")
@@ -3029,6 +3656,32 @@ def run(
         )
         return 1
 
+    privileged_plans: dict[Path, PrivilegedCopyPlan] = {}
+    try:
+        for entry in entries:
+            if entry.target_privilege != "sudo":
+                continue
+            privileged_plans[canonical_target_key(entry.target)] = plan_privileged_copy(
+                entry,
+                force=args.managed_path_policy == "takeover",
+            )
+    except (ConfigError, OSError) as exc:
+        print(f"error: {format_exception(exc)}", file=sys.stderr)
+        return 1
+
+    privileged_commands: PrivilegedCommands | None = None
+    privileged_mutation_selected = any(
+        plan.needs_mutation for plan in privileged_plans.values()
+    )
+    if privileged_mutation_selected and not args.dry_run:
+        try:
+            privileged_commands = resolve_privileged_commands()
+            if sudo_path is None:
+                sudo_path = acquire_shared_sudo_session()
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     # --- Main processing loop: sync each entry ---
     for entry in entries:
         try:
@@ -3038,6 +3691,11 @@ def run(
                 force=args.managed_path_policy == "takeover",
                 managed_path_policy_name=args.managed_path_policy,
                 buffer=buffer,
+                privileged_plan=privileged_plans.get(
+                    canonical_target_key(entry.target)
+                ),
+                sudo_path=sudo_path,
+                privileged_commands=privileged_commands,
             )
             stats[status] = stats.get(status, 0) + 1
             increment_group_stat(group_stats, entry, status)
