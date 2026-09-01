@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
 use dev_tools_installation::{
-    apply_versioned_installation, publish_executable, read_atomic_document, remove_owned_file,
-    remove_owned_installation, rollback_versioned_installation, uninstall_versioned_installation,
-    verify_owned_installation, verify_versioned_installation, write_atomic_document,
-    ArtifactIdentity, DocumentAuthority, InstallationLock, InstallationReceipt, ReceiptArtifact,
+    adopt_versioned_installation, apply_versioned_installation, publish_executable,
+    read_atomic_document, remove_owned_file, remove_owned_installation,
+    rollback_versioned_installation, uninstall_versioned_installation, verify_owned_installation,
+    verify_versioned_installation, write_atomic_document, ArtifactIdentity, DocumentAuthority,
+    InstallationLock, InstallationReceipt, ReceiptArtifact, VersionedAdoption,
     VersionedInstallRequest, VersionedLayout,
 };
 use std::fs;
@@ -217,6 +218,16 @@ fn versioned_install_upgrade_rollback_and_uninstall_are_receipt_owned() {
             .unwrap()
             .changed
     );
+    fs::remove_file(first.layout.bin_dir.join("fixture-helper")).unwrap();
+    assert!(
+        apply_versioned_installation(&first, |_| Ok(()))
+            .unwrap()
+            .changed
+    );
+    assert_eq!(
+        fs::read_link(first.layout.bin_dir.join("fixture-helper")).unwrap(),
+        first.layout.data_root.join("active")
+    );
 
     let second = versioned_fixture(temp.path(), "1.1.0", b"second");
     let second_report = apply_versioned_installation(&second, |candidate| {
@@ -309,4 +320,65 @@ fn versioned_receipt_rejects_writable_or_wrong_owner_artifact_authority() {
     let artifact = request.layout.data_root.join("versions/1.0.0/fixture");
     fs::set_permissions(&artifact, fs::Permissions::from_mode(0o777)).unwrap();
     assert!(verify_versioned_installation(&request.layout).is_err());
+}
+
+#[test]
+fn validated_legacy_layout_is_adopted_without_losing_upgrade_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = versioned_fixture(temp.path(), "1.0.0", b"first");
+    let artifact = first.layout.data_root.join("versions/1.0.0/fixture");
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        &first.layout.data_root,
+        fs::Permissions::from_mode(first.layout.directory_mode),
+    )
+    .unwrap();
+    fs::set_permissions(
+        first.layout.data_root.join("versions"),
+        fs::Permissions::from_mode(first.layout.directory_mode),
+    )
+    .unwrap();
+    fs::set_permissions(
+        artifact.parent().unwrap(),
+        fs::Permissions::from_mode(first.layout.directory_mode),
+    )
+    .unwrap();
+    fs::create_dir(&first.layout.bin_dir).unwrap();
+    fs::set_permissions(
+        &first.layout.bin_dir,
+        fs::Permissions::from_mode(first.layout.directory_mode),
+    )
+    .unwrap();
+    fs::copy(&first.source, &artifact).unwrap();
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    for alias in &first.aliases {
+        symlink(&artifact, first.layout.bin_dir.join(alias)).unwrap();
+    }
+
+    let adopted = adopt_versioned_installation(
+        &VersionedAdoption {
+            layout: first.layout.clone(),
+            version: first.version.clone(),
+            identity: first.identity.clone(),
+            aliases: first.aliases.clone(),
+        },
+        |candidate| {
+            assert_eq!(candidate, artifact);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(adopted.changed);
+    assert_eq!(adopted.receipt.active_version, "1.0.0");
+    for alias in &first.aliases {
+        assert_eq!(
+            fs::read_link(first.layout.bin_dir.join(alias)).unwrap(),
+            first.layout.data_root.join("active")
+        );
+    }
+
+    let second = versioned_fixture(temp.path(), "1.1.0", b"second");
+    let upgraded = apply_versioned_installation(&second, |_| Ok(())).unwrap();
+    assert_eq!(upgraded.receipt.active_version, "1.1.0");
+    assert_eq!(upgraded.receipt.previous_version.as_deref(), Some("1.0.0"));
 }

@@ -8,7 +8,7 @@ use dev_auth::setup::{
     write_plan_at, write_v1_migration_preview_at, InstallMode, InstallRequest, SetupPaths,
 };
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::process::Command;
 
 fn executable(path: &std::path::Path, body: &str) {
@@ -206,15 +206,96 @@ fn setup_is_idempotent_for_the_exact_versioned_artifact() {
 }
 
 #[test]
+fn setup_adopts_the_validated_legacy_layout_and_retains_it_for_rollback() {
+    use sha2::{Digest, Sha256};
+
+    let (_root, paths, request) = fixture();
+    let legacy_version = "0.2.8";
+    let legacy = paths
+        .data_root
+        .join("versions")
+        .join(legacy_version)
+        .join("dev-auth");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::create_dir_all(&paths.bin_dir).unwrap();
+    for directory in [
+        &paths.data_root,
+        &paths.data_root.join("versions"),
+        legacy.parent().unwrap(),
+        &paths.bin_dir,
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let bytes = fs::read(&request.source_executable).unwrap();
+    fs::write(&legacy, &bytes).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+    let product_aliases = [
+        "dev-auth",
+        "git-credential-dev-auth",
+        "git-dev-auth",
+        "gh-dev-auth",
+        "ssh-keygen-dev-auth",
+    ];
+    for alias in product_aliases {
+        symlink(&legacy, paths.bin_dir.join(alias)).unwrap();
+    }
+    let receipt = serde_json::json!({
+        "schema": "dev-auth-install-v2",
+        "mode": "user_only",
+        "version": legacy_version,
+        "executable": legacy,
+        "bin_dir": paths.bin_dir,
+        "executable_length": bytes.len(),
+        "executable_sha256": format!("{:x}", Sha256::digest(&bytes)),
+        "source_commit": null,
+        "root_generation": null,
+        "manifest_generation": null,
+        "native_git": request.native_git,
+        "native_gh": request.native_gh,
+        "product_aliases": product_aliases,
+        "transparent_aliases": [],
+        "privileged_launcher": null,
+        "system_assets": {}
+    });
+    let receipt_path = paths.data_root.join("install-v2.json");
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = install_at(&paths, &request).unwrap();
+    assert_eq!(report.version, request.version);
+    let shared = dev_tools_installation::verify_versioned_installation(
+        &dev_tools_installation::VersionedLayout {
+            product: "dev-auth".into(),
+            data_root: paths.data_root.clone(),
+            bin_dir: paths.bin_dir.clone(),
+            artifact_name: "dev-auth".into(),
+            owner_uid: fs::metadata(paths.data_root.parent().unwrap())
+                .unwrap()
+                .uid(),
+            directory_mode: 0o755,
+        },
+    )
+    .unwrap();
+    assert_eq!(shared.active_version, request.version);
+    assert_eq!(shared.previous_version.as_deref(), Some(legacy_version));
+    assert_eq!(
+        fs::read_link(paths.bin_dir.join("dev-auth")).unwrap(),
+        paths.data_root.join("active")
+    );
+}
+
+#[test]
 fn repair_reconstructs_only_receipt_owned_aliases() {
     let (_root, paths, request) = fixture();
     let installed = install_at(&paths, &request).unwrap();
-    let installed_executable = std::path::PathBuf::from(&installed.executable);
     let alias = paths.bin_dir.join("gh-dev-auth");
     fs::remove_file(&alias).unwrap();
 
     assert_eq!(repair_at(&paths).unwrap(), installed);
-    assert_eq!(fs::read_link(&alias).unwrap(), installed_executable);
+    assert_eq!(
+        fs::read_link(&alias).unwrap(),
+        paths.data_root.join("active")
+    );
 
     fs::remove_file(&alias).unwrap();
     executable(&alias, "unowned");

@@ -11,6 +11,7 @@ description = "Transparent workload-identity broker for Git and GitHub CLI"
 anyhow = "1"
 base64 = "0.22"
 directories = "6"
+dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-release = { path = "../dev-tools-release" }
 ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
 fs2 = "0.4"

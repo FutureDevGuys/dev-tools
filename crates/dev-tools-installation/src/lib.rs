@@ -132,6 +132,15 @@ pub struct VersionedInstallRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct VersionedAdoption {
+    pub layout: VersionedLayout,
+    pub version: String,
+    pub identity: ArtifactIdentity,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VersionedReceipt {
     pub schema: String,
     pub product: String,
@@ -255,6 +264,10 @@ where
     recover_versioned_installation_locked(&request.layout)?;
 
     let prior = read_versioned_receipt(&request.layout)?;
+    let repaired = match &prior {
+        Some(receipt) => repair_missing_receipt_links(&request.layout, receipt)?,
+        None => false,
+    };
     if let Some(receipt) = &prior {
         verify_versioned_receipt(&request.layout, receipt)?;
         if receipt.active_version == request.version {
@@ -266,7 +279,7 @@ where
             }
             post_install_verify(&request.layout.version_artifact(&request.version))?;
             return Ok(VersionedApplyReport {
-                changed: false,
+                changed: repaired,
                 receipt: receipt.clone(),
             });
         }
@@ -301,6 +314,103 @@ where
     })
 }
 
+pub fn adopt_versioned_installation<F>(
+    adoption: &VersionedAdoption,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    validate_version_and_aliases(
+        &adoption.layout,
+        &adoption.version,
+        &adoption.identity,
+        &adoption.aliases,
+    )?;
+    prepare_layout(&adoption.layout, Some(&adoption.version))?;
+    let _lock = InstallationLock::acquire(&adoption.layout.lock_path())?;
+    recover_versioned_installation_locked(&adoption.layout)?;
+    if let Some(receipt) = read_versioned_receipt(&adoption.layout)? {
+        verify_versioned_receipt(&adoption.layout, &receipt)?;
+        if receipt.active_version != adoption.version
+            || receipt.active_identity != adoption.identity
+            || receipt.previous_version.is_some()
+            || receipt.aliases != adoption.aliases
+        {
+            bail!("existing shared installation receipt conflicts with legacy adoption");
+        }
+        post_install_verify(&adoption.layout.version_artifact(&adoption.version))?;
+        return Ok(VersionedApplyReport {
+            changed: false,
+            receipt,
+        });
+    }
+
+    let artifact = adoption.layout.version_artifact(&adoption.version);
+    verify_versioned_artifact_authority(&artifact, adoption.layout.owner_uid, &adoption.identity)?;
+    post_install_verify(&artifact).context("adopted product verification failed")?;
+    for alias in &adoption.aliases {
+        let path = adoption.layout.bin_dir.join(alias);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() && fs::read_link(&path)? == artifact => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => bail!("legacy installation alias is not owned by the adopted artifact"),
+            Err(error) => return Err(error).context("inspect legacy installation alias"),
+        }
+    }
+    require_path_absent(&adoption.layout.active_pointer())?;
+    require_path_absent(&adoption.layout.previous_pointer())?;
+    let next = VersionedReceipt {
+        schema: VERSIONED_RECEIPT_SCHEMA.into(),
+        product: adoption.layout.product.clone(),
+        data_root: adoption.layout.data_root.clone(),
+        bin_dir: adoption.layout.bin_dir.clone(),
+        artifact_name: adoption.layout.artifact_name.clone(),
+        active_version: adoption.version.clone(),
+        active_identity: adoption.identity.clone(),
+        previous_version: None,
+        previous_identity: None,
+        aliases: adoption.aliases.clone(),
+    };
+    let journal = VersionedTransitionJournal {
+        schema: VERSIONED_JOURNAL_SCHEMA.into(),
+        prior: None,
+        next: next.clone(),
+    };
+    write_transition_journal(&adoption.layout, &journal)?;
+    let transition = (|| -> Result<()> {
+        for alias in &adoption.aliases {
+            let path = adoption.layout.bin_dir.join(alias);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => remove_exact_symlink(&path, &artifact)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect adopted installation alias"),
+            }
+        }
+        replace_owned_symlink(&adoption.layout.active_pointer(), Some(&artifact), None)?;
+        for alias in &adoption.aliases {
+            replace_owned_symlink(
+                &adoption.layout.bin_dir.join(alias),
+                Some(&adoption.layout.active_pointer()),
+                None,
+            )?;
+        }
+        write_versioned_receipt(&adoption.layout, &next)?;
+        verify_versioned_receipt(&adoption.layout, &next)
+    })();
+    if let Err(error) = transition {
+        return Err(error).context(
+            "legacy installation adoption was interrupted; the next operation will recover",
+        );
+    }
+    remove_transition_journal(&adoption.layout)?;
+    Ok(VersionedApplyReport {
+        changed: true,
+        receipt: next,
+    })
+}
+
 pub fn verify_versioned_installation(layout: &VersionedLayout) -> Result<VersionedReceipt> {
     validate_layout(layout)?;
     let _lock = InstallationLock::acquire(&layout.lock_path())?;
@@ -308,6 +418,38 @@ pub fn verify_versioned_installation(layout: &VersionedLayout) -> Result<Version
     let receipt = read_versioned_receipt(layout)?.context("installation receipt is absent")?;
     verify_versioned_receipt(layout, &receipt)?;
     Ok(receipt)
+}
+
+pub fn inspect_versioned_installation(
+    layout: &VersionedLayout,
+) -> Result<Option<VersionedReceipt>> {
+    validate_layout(layout)?;
+    match fs::symlink_metadata(&layout.data_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => {}
+        Err(error) => return Err(error).context("inspect versioned installation root"),
+    }
+    prepare_layout(layout, None)?;
+    let _lock = InstallationLock::acquire(&layout.lock_path())?;
+    recover_versioned_installation_locked(layout)?;
+    let receipt = read_versioned_receipt(layout)?;
+    if let Some(receipt) = &receipt {
+        verify_versioned_receipt(layout, receipt)?;
+    }
+    Ok(receipt)
+}
+
+pub fn versioned_installation_receipt_exists(layout: &VersionedLayout) -> Result<bool> {
+    validate_layout(layout)?;
+    match fs::symlink_metadata(&layout.data_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Ok(_) => {}
+        Err(error) => return Err(error).context("inspect versioned installation root"),
+    }
+    prepare_layout(layout, None)?;
+    let _lock = InstallationLock::acquire(&layout.lock_path())?;
+    recover_versioned_installation_locked(layout)?;
+    Ok(read_versioned_receipt(layout)?.is_some())
 }
 
 pub fn rollback_versioned_installation<F>(
@@ -392,6 +534,8 @@ pub fn uninstall_versioned_installation(
         remove_directory_if_empty(&layout.versions_dir().join(version))?;
     }
     remove_directory_if_empty(&layout.versions_dir())?;
+    fs::remove_file(layout.lock_path()).context("remove versioned installation lock")?;
+    sync_directory(&layout.data_root)?;
     Ok(VersionedUninstallReport {
         removed_versions,
         removed_aliases: receipt.aliases.len(),
@@ -399,28 +543,36 @@ pub fn uninstall_versioned_installation(
 }
 
 fn validate_versioned_request(request: &VersionedInstallRequest) -> Result<()> {
-    validate_layout(&request.layout)?;
-    validate_component(&request.version, "version")?;
-    if !request.source.is_absolute()
-        || request.identity.length == 0
-        || request.identity.sha256.len() != 64
-        || !request
-            .identity
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
+    validate_version_and_aliases(
+        &request.layout,
+        &request.version,
+        &request.identity,
+        &request.aliases,
+    )?;
+    if !request.source.is_absolute() {
         bail!("versioned installation request has an invalid source identity");
     }
     let actual = ArtifactIdentity::from_file(&request.source, request.identity.length)?;
     if actual != request.identity {
         bail!("versioned installation source does not match its approved identity");
     }
-    if request.aliases.is_empty() {
+    Ok(())
+}
+
+fn validate_version_and_aliases(
+    layout: &VersionedLayout,
+    version: &str,
+    identity: &ArtifactIdentity,
+    aliases: &[String],
+) -> Result<()> {
+    validate_layout(layout)?;
+    validate_component(version, "version")?;
+    validate_identity(identity)?;
+    if aliases.is_empty() {
         bail!("versioned installation requires at least one owned alias");
     }
     let mut prior: Option<&String> = None;
-    for alias in &request.aliases {
+    for alias in aliases {
         validate_component(alias, "alias")?;
         if prior.is_some_and(|prior| prior >= alias) {
             bail!("versioned installation aliases must be sorted and unique");
@@ -625,6 +777,43 @@ fn verify_versioned_receipt(layout: &VersionedLayout, receipt: &VersionedReceipt
         verify_exact_symlink(&layout.bin_dir.join(alias), &layout.active_pointer())?;
     }
     Ok(())
+}
+
+fn repair_missing_receipt_links(
+    layout: &VersionedLayout,
+    receipt: &VersionedReceipt,
+) -> Result<bool> {
+    validate_versioned_receipt(layout, receipt)?;
+    let active = layout.version_artifact(&receipt.active_version);
+    verify_versioned_artifact_authority(&active, layout.owner_uid, &receipt.active_identity)?;
+    let mut changed = ensure_receipt_symlink(&layout.active_pointer(), &active)?;
+    match (&receipt.previous_version, &receipt.previous_identity) {
+        (Some(version), Some(identity)) => {
+            let previous = layout.version_artifact(version);
+            verify_versioned_artifact_authority(&previous, layout.owner_uid, identity)?;
+            changed |= ensure_receipt_symlink(&layout.previous_pointer(), &previous)?;
+        }
+        (None, None) => require_path_absent(&layout.previous_pointer())?,
+        _ => bail!("previous version receipt is incomplete"),
+    }
+    for alias in &receipt.aliases {
+        changed |= ensure_receipt_symlink(&layout.bin_dir.join(alias), &layout.active_pointer())?;
+    }
+    Ok(changed)
+}
+
+fn ensure_receipt_symlink(path: &Path, expected: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() && fs::read_link(path)? == expected => {
+            Ok(false)
+        }
+        Ok(_) => bail!("receipt-owned installation pointer has unowned drift"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            replace_owned_symlink(path, Some(expected), None)?;
+            Ok(true)
+        }
+        Err(error) => Err(error).context("inspect receipt-owned installation pointer"),
+    }
 }
 
 fn verify_versioned_artifact_authority(

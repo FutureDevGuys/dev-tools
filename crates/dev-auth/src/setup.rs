@@ -95,6 +95,49 @@ impl SetupPaths {
     }
 }
 
+fn shared_installation_layout(
+    paths: &SetupPaths,
+    mode: InstallMode,
+) -> dev_tools_installation::VersionedLayout {
+    dev_tools_installation::VersionedLayout {
+        product: "dev-auth".into(),
+        data_root: paths.data_root.clone(),
+        bin_dir: paths.bin_dir.clone(),
+        artifact_name: "dev-auth".into(),
+        owner_uid: match mode {
+            InstallMode::Strong => 0,
+            InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
+        },
+        directory_mode: 0o755,
+    }
+}
+
+fn shared_product_aliases() -> Vec<String> {
+    let mut aliases = PRODUCT_ALIASES
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    aliases.sort();
+    aliases
+}
+
+fn verify_shared_installation(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+) -> Result<dev_tools_installation::VersionedReceipt> {
+    let shared = dev_tools_installation::verify_versioned_installation(
+        &shared_installation_layout(paths, receipt.mode),
+    )?;
+    if shared.active_version != receipt.version
+        || shared.active_identity.length != receipt.executable_length
+        || shared.active_identity.sha256 != receipt.executable_sha256
+        || shared.aliases != shared_product_aliases()
+    {
+        bail!("shared installation receipt disagrees with dev-auth product metadata");
+    }
+    Ok(shared)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
@@ -1139,21 +1182,43 @@ fn install_at_with_release(
     }
     ensure_directory_chain(&paths.data_root, request.mode)?;
     ensure_directory_chain(&paths.bin_dir, request.mode)?;
-    let versions = paths.data_root.join("versions");
-    ensure_directory_chain(&versions, request.mode)?;
-    let version_dir = versions.join(&request.version);
-    ensure_directory_chain(&version_dir, request.mode)?;
-
-    let executable = paths.versioned_binary(&request.version);
-    install_versioned_binary(&request.source_executable, &executable)?;
-    let (executable_length, executable_sha256) = file_identity(&executable)?;
-
-    install_aliases(
-        &paths.bin_dir,
-        &executable,
-        &PRODUCT_ALIASES,
-        prior_receipt.as_ref(),
+    let shared_layout = shared_installation_layout(paths, request.mode);
+    let shared_aliases = shared_product_aliases();
+    if !dev_tools_installation::versioned_installation_receipt_exists(&shared_layout)? {
+        if let Some(prior) = prior_receipt.as_ref() {
+            let prior_executable = PathBuf::from(&prior.executable);
+            if prior.mode == InstallMode::Strong {
+                detach_legacy_privileged_launcher(&prior_executable, prior)?;
+            }
+            dev_tools_installation::adopt_versioned_installation(
+                &dev_tools_installation::VersionedAdoption {
+                    layout: shared_layout.clone(),
+                    version: prior.version.clone(),
+                    identity: dev_tools_installation::ArtifactIdentity {
+                        length: prior.executable_length,
+                        sha256: prior.executable_sha256.clone(),
+                    },
+                    aliases: shared_aliases.clone(),
+                },
+                |_| Ok(()),
+            )?;
+        }
+    }
+    let shared_report = dev_tools_installation::apply_versioned_installation(
+        &dev_tools_installation::VersionedInstallRequest {
+            layout: shared_layout,
+            version: request.version.clone(),
+            source: request.source_executable.clone(),
+            identity: dev_tools_installation::ArtifactIdentity {
+                length: fs::symlink_metadata(&request.source_executable)?.len(),
+                sha256: requested_source_sha256.clone(),
+            },
+            aliases: shared_aliases,
+        },
+        |_| Ok(()),
     )?;
+    let executable = paths.versioned_binary(&shared_report.receipt.active_version);
+    let (executable_length, executable_sha256) = file_identity(&executable)?;
     if request.mode == InstallMode::Strong {
         install_privileged_launcher(&executable, Path::new(PRIVILEGED_LAUNCHER_PATH), paths)?;
         install_linux_system_assets(prior_receipt.as_ref())?;
@@ -1293,9 +1358,10 @@ pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
     if receipted_executable != executable || Path::new(&receipt.executable) != executable {
         bail!("running dev-auth executable is not the receipt-owned active version");
     }
+    verify_shared_installation(&paths, &receipt)?;
     verify_exact_alias_set(
         &paths.bin_dir,
-        &executable,
+        &paths.data_root.join("active"),
         &receipt.product_aliases,
         &PRODUCT_ALIASES,
         false,
@@ -1327,9 +1393,10 @@ pub fn verify_at(paths: &SetupPaths) -> Result<SetupReport> {
     if length != receipt.executable_length || digest != receipt.executable_sha256 {
         bail!("installed dev-auth executable does not match its receipt");
     }
+    verify_shared_installation(paths, &receipt)?;
     verify_exact_alias_set(
         &paths.bin_dir,
-        &executable,
+        &paths.data_root.join("active"),
         &receipt.product_aliases,
         &PRODUCT_ALIASES,
         false,
@@ -1418,17 +1485,15 @@ pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
     }
 
     let executable = PathBuf::from(&receipt.executable);
-    for alias in &receipt.product_aliases {
-        remove_owned_alias(&paths.bin_dir.join(alias), &executable)?;
-    }
     if receipt.mode == InstallMode::Strong {
         remove_privileged_launcher(&executable, &receipt)?;
         remove_linux_system_assets(&receipt)?;
     }
-    remove_receipted_executable(&executable, &receipt)?;
+    dev_tools_installation::uninstall_versioned_installation(&shared_installation_layout(
+        paths,
+        receipt.mode,
+    ))?;
     fs::remove_file(paths.receipt_path()).context("remove installation receipt")?;
-    remove_directory_if_empty(executable.parent())?;
-    remove_directory_if_empty(executable.parent().and_then(Path::parent))?;
     remove_directory_if_empty(Some(&paths.data_root))?;
     if receipt.mode == InstallMode::Strong {
         run_system_command(
@@ -1685,14 +1750,6 @@ fn remove_linux_system_assets(receipt: &InstallReceipt) -> Result<()> {
             .with_context(|| format!("remove dev-auth system asset {}", path.display()))?;
     }
     Ok(())
-}
-
-fn remove_receipted_executable(executable: &Path, receipt: &InstallReceipt) -> Result<()> {
-    let (length, digest) = file_identity(executable)?;
-    if length != receipt.executable_length || digest != receipt.executable_sha256 {
-        bail!("refusing to remove a drifted installed executable");
-    }
-    fs::remove_file(executable).context("remove installed dev-auth executable")
 }
 
 fn remove_directory_if_empty(path: Option<&Path>) -> Result<()> {
@@ -3678,46 +3735,6 @@ fn validate_user_or_root_executable(path: &Path, owner_uid: u32, description: &s
     Ok(())
 }
 
-fn install_versioned_binary(source: &Path, destination: &Path) -> Result<()> {
-    let (source_length, source_digest) = file_identity(source)?;
-    if destination.exists() {
-        let (destination_length, destination_digest) = file_identity(destination)?;
-        if source_length == destination_length && source_digest == destination_digest {
-            return Ok(());
-        }
-        bail!("a different dev-auth executable already occupies the requested version");
-    }
-
-    let temporary = destination.with_extension(format!("new-{}", std::process::id()));
-    let mut input = File::open(source).context("open setup executable")?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&temporary)
-        .with_context(|| format!("create {}", temporary.display()))?;
-    std::io::copy(&mut input, &mut output).context("copy setup executable")?;
-    output.sync_all().context("sync setup executable")?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
-        .context("set installed executable permissions")?;
-    match fs::hard_link(&temporary, destination) {
-        Ok(()) => {
-            fs::remove_file(&temporary).context("remove temporary setup executable")?;
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error).context("publish installed dev-auth executable");
-        }
-    }
-    let (destination_length, destination_digest) = file_identity(destination)?;
-    if source_length != destination_length || source_digest != destination_digest {
-        fs::remove_file(destination)
-            .context("remove an installed executable that failed identity verification")?;
-        bail!("installed dev-auth executable failed identity verification");
-    }
-    Ok(())
-}
-
 fn install_privileged_launcher(
     executable: &Path,
     launcher: &Path,
@@ -3730,28 +3747,31 @@ fn install_privileged_launcher(
     }
     let executable_metadata = fs::symlink_metadata(executable)
         .context("inspect versioned executable for privileged launcher")?;
-    if executable_metadata.uid() != 0 {
+    if executable_metadata.uid() != 0 || executable_metadata.nlink() != 1 {
         bail!("privileged launcher source is not root-owned");
     }
+    let executable_identity = file_identity(executable)?;
     match fs::symlink_metadata(launcher) {
         Ok(metadata) => {
             if !metadata.file_type().is_file()
                 || metadata.file_type().is_symlink()
                 || metadata.uid() != 0
-                || metadata.mode() & 0o022 != 0
+                || metadata.mode() & 0o777 != 0o755
+                || metadata.nlink() != 1
             {
                 bail!("privileged workload launcher has unsafe authority");
             }
-            if same_file_identity(&metadata, &executable_metadata) {
+            if file_identity(launcher)? == executable_identity {
                 return Ok(());
             }
             let prior = read_receipt(&paths.receipt_path())?;
             let prior_executable = PathBuf::from(&prior.executable);
-            let prior_metadata = fs::symlink_metadata(&prior_executable)
-                .context("inspect prior receipt executable")?;
             if prior.mode != InstallMode::Strong
                 || prior.privileged_launcher.as_deref() != launcher.to_str()
-                || !same_file_identity(&metadata, &prior_metadata)
+                || file_identity(launcher)?
+                    != (prior.executable_length, prior.executable_sha256.clone())
+                || file_identity(&prior_executable)?
+                    != (prior.executable_length, prior.executable_sha256.clone())
             {
                 bail!("refusing to replace an unowned privileged workload launcher");
             }
@@ -3760,12 +3780,80 @@ fn install_privileged_launcher(
         Err(error) => return Err(error).context("inspect privileged workload launcher"),
     }
     let temporary = launcher.with_extension(format!("new-{}", std::process::id()));
-    fs::hard_link(executable, &temporary).context("stage privileged workload launcher")?;
+    stage_executable_copy(executable, &temporary, &executable_identity)?;
     if let Err(error) = fs::rename(&temporary, launcher) {
         let _ = fs::remove_file(&temporary);
         return Err(error).context("publish privileged workload launcher");
     }
-    verify_hard_link(executable, launcher, "privileged workload launcher")
+    verify_privileged_launcher_copy(executable, launcher)
+}
+
+fn detach_legacy_privileged_launcher(executable: &Path, receipt: &InstallReceipt) -> Result<()> {
+    if receipt.mode != InstallMode::Strong
+        || receipt.privileged_launcher.as_deref() != Some(PRIVILEGED_LAUNCHER_PATH)
+        || Path::new(&receipt.executable) != executable
+    {
+        bail!("legacy privileged launcher receipt is invalid");
+    }
+    let launcher = Path::new(PRIVILEGED_LAUNCHER_PATH);
+    let executable_metadata =
+        fs::symlink_metadata(executable).context("inspect legacy versioned executable")?;
+    let launcher_metadata =
+        fs::symlink_metadata(launcher).context("inspect legacy privileged launcher")?;
+    if !launcher_metadata.file_type().is_file()
+        || launcher_metadata.file_type().is_symlink()
+        || launcher_metadata.uid() != 0
+        || launcher_metadata.mode() & 0o777 != 0o755
+        || file_identity(executable)?
+            != (receipt.executable_length, receipt.executable_sha256.clone())
+        || file_identity(launcher)?
+            != (receipt.executable_length, receipt.executable_sha256.clone())
+    {
+        bail!("legacy privileged launcher does not match its receipt");
+    }
+    if !same_file_identity(&launcher_metadata, &executable_metadata) {
+        if executable_metadata.nlink() != 1 || launcher_metadata.nlink() != 1 {
+            bail!("legacy privileged launcher has unexpected link authority");
+        }
+        return Ok(());
+    }
+    if executable_metadata.nlink() != 2 {
+        bail!("legacy privileged launcher has unexpected hardlink authority");
+    }
+    let temporary = launcher.with_extension(format!("detach-{}", std::process::id()));
+    stage_executable_copy(
+        executable,
+        &temporary,
+        &(receipt.executable_length, receipt.executable_sha256.clone()),
+    )?;
+    if let Err(error) = fs::rename(&temporary, launcher) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("detach legacy privileged launcher hardlink");
+    }
+    verify_privileged_launcher_copy(executable, launcher)
+}
+
+fn stage_executable_copy(source: &Path, temporary: &Path, expected: &(u64, String)) -> Result<()> {
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(source)
+        .context("open executable copy source")?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(temporary)
+        .context("create executable copy temporary")?;
+    std::io::copy(&mut input, &mut output).context("copy executable")?;
+    output.sync_all().context("sync executable copy")?;
+    fs::set_permissions(temporary, fs::Permissions::from_mode(0o755))
+        .context("protect executable copy")?;
+    if &file_identity(temporary)? != expected {
+        let _ = fs::remove_file(temporary);
+        bail!("executable copy changed before publication");
+    }
+    Ok(())
 }
 
 fn verify_privileged_launcher(executable: &Path, receipt: &InstallReceipt) -> Result<()> {
@@ -3774,25 +3862,23 @@ fn verify_privileged_launcher(executable: &Path, receipt: &InstallReceipt) -> Re
     {
         bail!("strong installation receipt does not own the privileged launcher");
     }
-    verify_hard_link(
-        executable,
-        Path::new(PRIVILEGED_LAUNCHER_PATH),
-        "privileged workload launcher",
-    )
+    verify_privileged_launcher_copy(executable, Path::new(PRIVILEGED_LAUNCHER_PATH))
 }
 
-fn verify_hard_link(source: &Path, target: &Path, description: &str) -> Result<()> {
+fn verify_privileged_launcher_copy(source: &Path, target: &Path) -> Result<()> {
     let source_metadata =
-        fs::symlink_metadata(source).with_context(|| format!("inspect {description} source"))?;
+        fs::symlink_metadata(source).context("inspect privileged launcher source")?;
     let target_metadata =
-        fs::symlink_metadata(target).with_context(|| format!("inspect {description}"))?;
+        fs::symlink_metadata(target).context("inspect privileged workload launcher")?;
     if !target_metadata.file_type().is_file()
         || target_metadata.file_type().is_symlink()
         || target_metadata.uid() != 0
-        || target_metadata.mode() & 0o022 != 0
-        || !same_file_identity(&source_metadata, &target_metadata)
+        || target_metadata.mode() & 0o777 != 0o755
+        || target_metadata.nlink() != 1
+        || source_metadata.nlink() != 1
+        || file_identity(source)? != file_identity(target)?
     {
-        bail!("{description} does not match the receipt-owned executable");
+        bail!("privileged workload launcher does not match the receipt-owned executable");
     }
     Ok(())
 }
