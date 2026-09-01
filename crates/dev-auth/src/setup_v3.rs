@@ -834,6 +834,14 @@ pub fn build_setup_plan_v3_at(
     if administrator_policy.mode != expected_policy_mode {
         bail!("administrator policy mode does not match deployment mode");
     }
+    if installation.request.native_git != Path::new(&administrator_policy.programs.git) {
+        bail!("staged transparent launcher does not target the administrator-pinned native Git");
+    }
+    if installation.request.native_gh != Path::new(&administrator_policy.programs.gh) {
+        bail!(
+            "staged transparent launcher does not target the administrator-pinned native GitHub CLI"
+        );
+    }
 
     let current_user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective native account does not exist")?;

@@ -153,8 +153,8 @@ mode = "user_only"
 allowed_users = ["{}"]
 [programs]
 op = "/usr/bin/op"
-git = "/usr/bin/git"
-gh = "/usr/bin/gh"
+git = "{}"
+gh = "{}"
 ssh = "/usr/bin/ssh"
 ssh_keygen = "/usr/bin/ssh-keygen"
 [trusted_launchers]
@@ -163,7 +163,9 @@ ssh_keygen = "/usr/bin/ssh-keygen"
 [authority_caps]
 [workspace_caps]
 "#,
-            user.name
+            user.name,
+            git.display(),
+            gh.display()
         ),
     )
     .unwrap();
@@ -252,6 +254,100 @@ config = "{}"
         setup_apply_candidate_path(&document_plan, &digest).unwrap(),
         Some(document_plan.installation.request.source_executable.clone())
     );
+}
+
+#[test]
+fn setup_plan_binds_transparent_upstreams_to_administrator_policy() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let policy = root.path().join("policy.toml");
+    let config = root.path().join("config.toml");
+    let candidate = root.path().join("dev-auth");
+    let installed_git = root.path().join("installed-git");
+    let policy_git = root.path().join("policy-git");
+    let native_gh = root.path().join("gh");
+    fs::write(
+        &policy,
+        format!(
+            r#"version = 2
+mode = "user_only"
+allowed_users = ["{}"]
+[programs]
+op = "/usr/bin/op"
+git = "{}"
+gh = "{}"
+ssh = "/usr/bin/ssh"
+ssh_keygen = "/usr/bin/ssh-keygen"
+[trusted_launchers]
+[github_apps]
+[credential_slots]
+[authority_caps]
+[workspace_caps]
+"#,
+            user.name,
+            policy_git.display(),
+            native_gh.display()
+        ),
+    )
+    .unwrap();
+    fs::write(&config, "version = 2\n").unwrap();
+    for path in [
+        &policy,
+        &config,
+        &candidate,
+        &installed_git,
+        &policy_git,
+        &native_gh,
+    ] {
+        if !path.exists() {
+            fs::write(path, b"fixture").unwrap();
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let installation = build_plan(
+        &SetupPaths::user_only(&user.dir),
+        &InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.3.0-test".into(),
+            source_executable: candidate,
+            native_git: installed_git,
+            native_gh,
+            activate_transparent_launchers: false,
+        },
+    )
+    .unwrap();
+    let intent = normalize_deployment(
+        Some(
+            parse_deployment_document(
+                format!(
+                    r#"schema = "dev-auth-deployment-v1"
+mode = "user-only"
+channel = "stable"
+activation = "inactive"
+administrator_policy = "{}"
+[[users]]
+name = "{}"
+config = "{}"
+"#,
+                    policy.display(),
+                    user.name,
+                    config.display()
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        ),
+        DeploymentCliInput::default(),
+    )
+    .unwrap();
+
+    let error = build_setup_plan_v3_at(intent, installation, false).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("administrator-pinned native Git"));
 }
 
 #[test]
