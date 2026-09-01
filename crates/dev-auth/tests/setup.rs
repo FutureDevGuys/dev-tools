@@ -101,6 +101,12 @@ fn setup_discovery_is_value_free_and_never_trusts_caller_path() {
     assert_eq!(report["mode"], "user_only");
     assert_eq!(report["programs"]["git"][0]["path"], "/usr/bin/git");
     assert_eq!(report["programs"]["op"][0]["path"], "/usr/bin/op");
+    assert!(report["blockers"].is_array());
+    for blocker in report["blockers"].as_array().unwrap() {
+        assert!(blocker["component"].as_str().is_some());
+        assert!(blocker["required_for"].as_str().is_some());
+        assert!(blocker["package_hints"].is_object());
+    }
     assert!(!String::from_utf8(output.stdout)
         .unwrap()
         .contains("attacker-bin"));

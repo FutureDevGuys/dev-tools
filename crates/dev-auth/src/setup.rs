@@ -271,6 +271,7 @@ pub enum DiscoveryStatus {
     Usable,
     Absent,
     Unsafe,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -291,6 +292,16 @@ pub struct SetupDiscoveryReport {
     pub programs: BTreeMap<String, Vec<DiscoveredPath>>,
     pub workload_launchers: BTreeMap<String, Vec<DiscoveredPath>>,
     pub desktop_entries: BTreeMap<String, Vec<DiscoveredPath>>,
+    pub blockers: Vec<SetupPrerequisiteBlocker>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetupPrerequisiteBlocker {
+    pub component: String,
+    pub status: DiscoveryStatus,
+    pub required_for: String,
+    pub package_hints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -499,6 +510,7 @@ pub fn discover_setup(mode: InstallMode) -> Result<SetupDiscoveryReport> {
             ),
         ),
     ]);
+    let blockers = setup_prerequisite_blockers(mode, &programs);
     Ok(SetupDiscoveryReport {
         schema: "dev-auth-setup-discovery-v1".into(),
         mode,
@@ -516,7 +528,127 @@ pub fn discover_setup(mode: InstallMode) -> Result<SetupDiscoveryReport> {
         programs,
         workload_launchers,
         desktop_entries,
+        blockers,
     })
+}
+
+fn setup_prerequisite_blockers(
+    mode: InstallMode,
+    programs: &BTreeMap<String, Vec<DiscoveredPath>>,
+) -> Vec<SetupPrerequisiteBlocker> {
+    let mut required = vec!["git", "gh", "op", "ssh", "ssh_keygen"];
+    if mode == InstallMode::Strong {
+        required.extend(["pkexec", "systemd_run", "systemd_creds", "systemctl"]);
+    }
+    let mut blockers = required
+        .into_iter()
+        .filter_map(|component| {
+            let candidates = programs.get(component)?;
+            if candidates
+                .iter()
+                .any(|candidate| candidate.status == DiscoveryStatus::Usable)
+            {
+                return None;
+            }
+            let status = if candidates
+                .iter()
+                .any(|candidate| candidate.status == DiscoveryStatus::Unsafe)
+            {
+                DiscoveryStatus::Unsafe
+            } else {
+                DiscoveryStatus::Absent
+            };
+            Some(prerequisite_blocker(
+                component,
+                status,
+                if mode == InstallMode::Strong {
+                    "strong_setup"
+                } else {
+                    "user_only_setup"
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    if mode == InstallMode::Strong {
+        if !cfg!(target_os = "linux") {
+            blockers.push(prerequisite_blocker(
+                "linux_strong_backend",
+                DiscoveryStatus::Unsupported,
+                "strong_setup",
+            ));
+        } else {
+            if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
+                blockers.push(prerequisite_blocker(
+                    "cgroup_v2",
+                    DiscoveryStatus::Absent,
+                    "strong_admission",
+                ));
+            }
+            if rustix::process::pidfd_open(
+                rustix::process::getpid(),
+                rustix::process::PidfdFlags::empty(),
+            )
+            .is_err()
+            {
+                blockers.push(prerequisite_blocker(
+                    "pidfd",
+                    DiscoveryStatus::Unsupported,
+                    "strong_admission",
+                ));
+            }
+            if !Path::new("/run/systemd/system").is_dir() {
+                blockers.push(prerequisite_blocker(
+                    "systemd_runtime",
+                    DiscoveryStatus::Absent,
+                    "strong_admission",
+                ));
+            }
+        }
+    }
+    blockers.sort_by(|left, right| left.component.cmp(&right.component));
+    blockers
+}
+
+fn prerequisite_blocker(
+    component: &str,
+    status: DiscoveryStatus,
+    required_for: &str,
+) -> SetupPrerequisiteBlocker {
+    let packages = match component {
+        "git" => [("arch", "git"), ("debian", "git"), ("fedora", "git")],
+        "gh" => [("arch", "github-cli"), ("debian", "gh"), ("fedora", "gh")],
+        "op" => [
+            ("arch", "1password-cli"),
+            ("debian", "1password-cli"),
+            ("fedora", "1password-cli"),
+        ],
+        "ssh" | "ssh_keygen" => [
+            ("arch", "openssh"),
+            ("debian", "openssh-client"),
+            ("fedora", "openssh-clients"),
+        ],
+        "pkexec" => [
+            ("arch", "polkit"),
+            ("debian", "polkitd-pkla"),
+            ("fedora", "polkit"),
+        ],
+        "systemd_run" | "systemd_creds" | "systemctl" | "systemd_runtime" => [
+            ("arch", "systemd"),
+            ("debian", "systemd"),
+            ("fedora", "systemd"),
+        ],
+        _ => [("arch", ""), ("debian", ""), ("fedora", "")],
+    };
+    SetupPrerequisiteBlocker {
+        component: component.into(),
+        status,
+        required_for: required_for.into(),
+        package_hints: packages
+            .into_iter()
+            .filter(|(_, package)| !package.is_empty())
+            .map(|(distribution, package)| (distribution.into(), package.into()))
+            .collect(),
+    }
 }
 
 pub fn setup_readiness(mode: InstallMode) -> Result<SetupReadinessReport> {
