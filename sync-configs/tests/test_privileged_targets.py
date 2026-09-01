@@ -361,6 +361,62 @@ def test_target_drift_after_authentication_fails_before_install(tmp_path: Path) 
     assert sudo_history(sudo_log) == [["-n", "-v"], ["-v"]]
 
 
+def test_existing_parent_mode_is_reconciled_without_reowning_parent(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "etc"
+    parent.mkdir(mode=0o700)
+    source = tmp_path / "source.conf"
+    target = parent / "target.conf"
+    manifest = tmp_path / "manifest.yaml"
+    source.write_text("managed\n", encoding="utf-8")
+    write_manifest(manifest, source, target, parent_mode=0o755)
+    environment, sudo_log = sudo_fixture(tmp_path)
+
+    result = run_cli(manifest, environment)
+
+    assert result.returncode == 0, result.stderr
+    history = sudo_history(sudo_log)
+    assert history[:2] == [["-n", "-v"], ["-v"]]
+    assert history[2] == [
+        "-n",
+        "--",
+        expected_system_command("chmod"),
+        "0755",
+        "--",
+        str(parent),
+    ]
+    temporary = Path(history[3][-1])
+    owner, group = current_identity()
+    assert history[3:] == [
+        [
+            "-n",
+            "--",
+            expected_system_command("install"),
+            "-o",
+            str(pwd.getpwnam(owner).pw_uid),
+            "-g",
+            str(grp.getgrnam(group).gr_gid),
+            "-m",
+            "0600",
+            "--",
+            str(source),
+            str(temporary),
+        ],
+        [
+            "-n",
+            "--",
+            expected_system_command("mv"),
+            "-f",
+            "--",
+            str(temporary),
+            str(target),
+        ],
+    ]
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert target.read_text(encoding="utf-8") == "managed\n"
+
+
 def test_source_drift_after_authentication_fails_before_install(tmp_path: Path) -> None:
     source = tmp_path / "source.conf"
     target = tmp_path / "target.conf"
@@ -503,8 +559,15 @@ def test_parent_metadata_only_drift_does_not_reinstall_target(tmp_path: Path) ->
     assert stat.S_IMODE(parent.stat().st_mode) == 0o700
     assert target.stat().st_ino == original_inode
     history = sudo_history(sudo_log)
-    assert [Path(row[2]).name for row in history[2:]] == ["install"]
-    assert history[2][3] == "-d"
+    assert [Path(row[2]).name for row in history[2:]] == ["chmod"]
+    assert history[2] == [
+        "-n",
+        "--",
+        expected_system_command("chmod"),
+        "0700",
+        "--",
+        str(parent),
+    ]
 
 
 def test_differing_existing_target_without_reconcile_is_nonmutating(

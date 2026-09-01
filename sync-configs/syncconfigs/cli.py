@@ -552,6 +552,7 @@ class PrivilegedCopyPlan:
 
 @dataclass(frozen=True)
 class PrivilegedCommands:
+    chmod: str
     install: str
     move: str
     remove: str
@@ -2445,10 +2446,7 @@ def plan_privileged_copy(entry: Entry, *, force: bool) -> PrivilegedCopyPlan:
         entry.target, label="privileged copy target", missing_ok=True
     )
     parent_needs_update = not (
-        parent_snapshot.exists
-        and parent_snapshot.uid == owner_uid
-        and parent_snapshot.gid == group_gid
-        and parent_snapshot.mode == parent_mode
+        parent_snapshot.exists and parent_snapshot.mode == parent_mode
     )
     content_differs = (
         not target_snapshot.exists
@@ -2481,12 +2479,13 @@ def plan_privileged_copy(entry: Entry, *, force: bool) -> PrivilegedCopyPlan:
 
 def resolve_privileged_commands() -> PrivilegedCommands:
     resolved: dict[str, str] = {}
-    for name in ("install", "mv", "rm"):
+    for name in ("chmod", "install", "mv", "rm"):
         path = shutil.which(name, path=os.defpath)
         if path is None:
             raise ConfigError(f"target_privilege: sudo requires system command: {name}")
         resolved[name] = path
     return PrivilegedCommands(
+        chmod=resolved["chmod"],
         install=resolved["install"],
         move=resolved["mv"],
         remove=resolved["rm"],
@@ -2587,22 +2586,35 @@ def process_privileged_copy(
         raise ConfigError(f"privileged copy became blocked before apply: {entry.target}")
 
     if current.parent_needs_update:
-        run_privileged_command(
-            sudo_path,
-            [
-                commands.install,
-                "-d",
-                "-o",
-                str(plan.owner_uid),
-                "-g",
-                str(plan.group_gid),
-                "-m",
-                f"{plan.parent_mode:04o}",
-                "--",
-                str(entry.target.parent),
-            ],
-            operation="parent install",
-        )
+        parent_snapshot = current.parent_snapshots[-1]
+        if parent_snapshot.exists:
+            run_privileged_command(
+                sudo_path,
+                [
+                    commands.chmod,
+                    f"{plan.parent_mode:04o}",
+                    "--",
+                    str(entry.target.parent),
+                ],
+                operation="parent chmod",
+            )
+        else:
+            run_privileged_command(
+                sudo_path,
+                [
+                    commands.install,
+                    "-d",
+                    "-o",
+                    str(plan.owner_uid),
+                    "-g",
+                    str(plan.group_gid),
+                    "-m",
+                    f"{plan.parent_mode:04o}",
+                    "--",
+                    str(entry.target.parent),
+                ],
+                operation="parent install",
+            )
 
     after_parent = plan_privileged_copy(entry, force=force)
     if (
