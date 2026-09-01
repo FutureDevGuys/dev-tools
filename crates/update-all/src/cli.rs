@@ -731,6 +731,7 @@ fn now_unix_ms_u64() -> u64 {
 
 struct CompletionPaths {
     rc_root: PathBuf,
+    managed_root: PathBuf,
     powershell_root: Option<PathBuf>,
     catalog_path: PathBuf,
     registry_path: PathBuf,
@@ -799,12 +800,54 @@ fn resolve_completion_paths() -> CompletionPaths {
                 .map(|h| PathBuf::from(h).join(".config/update-all/powershell"))
         });
 
+    let managed_root = env::var("UPDATE_ALL_COMPLETION_ROOT")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_completion_managed_root);
+
     CompletionPaths {
         rc_root,
+        managed_root,
         powershell_root,
         catalog_path,
         registry_path,
     }
+}
+
+pub(crate) fn default_completion_managed_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("update-all/completions");
+        }
+    }
+
+    if let Some(xdg_data_home) = env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(xdg_data_home).join("update-all/completions");
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/update-all/completions");
+    }
+
+    env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("/"))
+        .join(".local/share/update-all/completions")
+}
+
+fn resolve_managed_completion_root(
+    explicit: Option<PathBuf>,
+    defaults: &CompletionPaths,
+) -> Result<PathBuf> {
+    let root = explicit.unwrap_or_else(|| defaults.managed_root.clone());
+    if !root.is_absolute() {
+        bail!(
+            "managed completion root must be absolute: {}",
+            root.display()
+        );
+    }
+    Ok(root)
 }
 
 fn write_completion_apply_managed_catalog(
@@ -980,6 +1023,10 @@ enum CompletionsCmd {
     Sync(CompletionsSyncCli),
     /// Install the binary-owned shell bootstrap for managed completions.
     Install(CompletionsInstallCli),
+    /// Emit read-only shell init code for the active managed completion snapshot.
+    Init(CompletionsInitCli),
+    /// Inspect the active managed completion snapshot.
+    Status(CompletionsStatusCli),
 }
 
 #[derive(clap::Args, Debug)]
@@ -1020,9 +1067,15 @@ struct CompletionsSyncCli {
 
     #[arg(
         long = "rc-root",
-        help = "Shell rc root where managed completions and bootstrap files are written"
+        help = "Legacy shell rc root where managed completions and bootstrap files are written"
     )]
-    rc_root: PathBuf,
+    rc_root: Option<PathBuf>,
+
+    #[arg(
+        long = "managed-root",
+        help = "Absolute public root where immutable managed completion snapshots are published"
+    )]
+    managed_root: Option<PathBuf>,
 
     #[arg(
         long = "powershell-root",
@@ -1075,6 +1128,32 @@ struct CompletionsInstallCli {
     powershell_root: Option<PathBuf>,
 }
 
+#[derive(clap::Args, Debug)]
+#[command(about = "Emit read-only shell init code for the active managed completion snapshot.")]
+struct CompletionsInitCli {
+    #[arg(value_name = "SHELL")]
+    shell: String,
+
+    #[arg(
+        long = "managed-root",
+        help = "Absolute public root where immutable managed completion snapshots are published"
+    )]
+    managed_root: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(about = "Inspect the active managed completion snapshot.")]
+struct CompletionsStatusCli {
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
+
+    #[arg(
+        long = "managed-root",
+        help = "Absolute public root where immutable managed completion snapshots are published"
+    )]
+    managed_root: Option<PathBuf>,
+}
+
 impl CompletionsCli {
     pub fn run(self, default_path: Option<PathBuf>) -> Result<()> {
         match self.cmd {
@@ -1084,7 +1163,8 @@ impl CompletionsCli {
                 let registry_path = cli
                     .registry
                     .unwrap_or_else(|| defaults.registry_path.clone());
-                let rc_root = cli.rc_root.clone();
+                let rc_root = cli.rc_root.unwrap_or_else(|| defaults.rc_root.clone());
+                let managed_root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
                 let providers = cli.providers.clone();
                 let res = crate::completions::completion_sync(CompletionSyncArgs {
                     providers_csv: providers.clone(),
@@ -1092,7 +1172,8 @@ impl CompletionsCli {
                     report: cli.report,
                     catalog_path,
                     config_path: default_path,
-                    rc_root,
+                    rc_root: rc_root.clone(),
+                    managed_root,
                     progress_cb: None,
                 })?;
 
@@ -1108,7 +1189,7 @@ impl CompletionsCli {
                     let install = crate::completions::completion_install(
                         crate::completions::CompletionInstallArgs {
                             shell: cli.shell.clone(),
-                            rc_root: cli.rc_root.clone(),
+                            rc_root: rc_root.clone(),
                             powershell_root: powershell_root.clone(),
                         },
                     )?;
@@ -1126,7 +1207,7 @@ impl CompletionsCli {
                     let applied = crate::completions::completion_apply(
                         crate::completions::CompletionApplyArgs {
                             shell: cli.shell,
-                            rc_root: cli.rc_root,
+                            rc_root,
                             powershell_root,
                             registry_path,
                             managed_catalog_path: managed_catalog
@@ -1152,6 +1233,38 @@ impl CompletionsCli {
                 )?;
                 for line in install.events {
                     crate::ua_outln!("{line}");
+                }
+            }
+            CompletionsCmd::Init(cli) => {
+                let defaults = resolve_completion_paths();
+                let root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
+                let init = crate::completions::completion_init(&cli.shell, root)?;
+                crate::ua_out!("{}", init.shell_code);
+            }
+            CompletionsCmd::Status(cli) => {
+                let defaults = resolve_completion_paths();
+                let root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
+                let status = crate::completions::completion_status(root)?;
+                if cli.json {
+                    crate::ua_outln!("{}", serde_json::to_string_pretty(&status.status)?);
+                } else {
+                    crate::ua_outln!("managed_root={}", status.status.root.display());
+                    crate::ua_outln!(
+                        "current_snapshot={}",
+                        status
+                            .status
+                            .current_snapshot
+                            .as_deref()
+                            .unwrap_or("<none>")
+                    );
+                    crate::ua_outln!(
+                        "available_shells={}",
+                        if status.status.available_shells.is_empty() {
+                            "<none>".to_string()
+                        } else {
+                            status.status.available_shells.join(",")
+                        }
+                    );
                 }
             }
         }

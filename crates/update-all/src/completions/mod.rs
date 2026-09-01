@@ -1,10 +1,14 @@
 mod generator;
 pub(crate) mod registry;
+mod store;
 
 use crate::completions::generator::{
     generate_tool_completion, write_bytes_if_changed, GeneratedCompletion,
 };
 use crate::completions::registry::{Registry, RegistryCommandCandidate, RegistryTool};
+use crate::completions::store::{
+    CompletionSnapshotPublishOutcome, ManagedCompletionRoot, ManagedCompletionRootStatus,
+};
 use crate::config::{load_runtime_config, merge_user_completion_catalog};
 use anyhow::{Context, Result};
 use clap::CommandFactory;
@@ -32,6 +36,7 @@ pub struct CompletionSyncArgs {
     pub catalog_path: PathBuf,
     pub config_path: Option<PathBuf>,
     pub rc_root: PathBuf,
+    pub managed_root: PathBuf,
     pub progress_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
@@ -131,6 +136,16 @@ pub struct CompletionApplyArgs {
 #[derive(Debug)]
 pub struct CompletionApplyResult {
     pub events: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct CompletionInitResult {
+    pub shell_code: String,
+}
+
+#[derive(Debug)]
+pub struct CompletionStatusResult {
+    pub status: ManagedCompletionRootStatus,
 }
 
 #[derive(Debug)]
@@ -413,25 +428,47 @@ fn enabled_catalog_tool(
         .is_some_and(|tools| tools.contains(tool))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompletionShell {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CompletionShell {
+    Bash,
+    Elvish,
+    Fish,
     Zsh,
     PowerShell,
 }
 
 impl CompletionShell {
-    fn parse(raw: &str) -> Result<Self> {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "bash" => Ok(Self::Bash),
+            "elvish" => Ok(Self::Elvish),
+            "fish" => Ok(Self::Fish),
             "zsh" => Ok(Self::Zsh),
             "powershell" | "pwsh" | "ps1" => Ok(Self::PowerShell),
-            other => anyhow::bail!("unsupported shell '{}' (supported: zsh, powershell)", other),
+            other => anyhow::bail!(
+                "unsupported shell '{}' (supported: bash, elvish, fish, zsh, powershell)",
+                other
+            ),
         }
     }
 
-    fn as_event_name(self) -> &'static str {
+    pub(crate) fn as_event_name(self) -> &'static str {
         match self {
+            Self::Bash => "bash",
+            Self::Elvish => "elvish",
+            Self::Fish => "fish",
             Self::Zsh => "zsh",
             Self::PowerShell => "powershell",
+        }
+    }
+
+    pub(crate) fn view_file_name(self) -> &'static str {
+        match self {
+            Self::Bash => "update-all.bash",
+            Self::Elvish => "update-all.elv",
+            Self::Fish => "update-all.fish",
+            Self::Zsh => "_update-all",
+            Self::PowerShell => "update-all.ps1",
         }
     }
 }
@@ -442,6 +479,24 @@ pub fn generate_update_all_completion(shell: &str) -> Result<String> {
     let mut out = Vec::new();
 
     match shell {
+        CompletionShell::Bash => clap_complete::generate(
+            clap_complete::shells::Bash,
+            &mut command,
+            "update-all",
+            &mut out,
+        ),
+        CompletionShell::Elvish => clap_complete::generate(
+            clap_complete::shells::Elvish,
+            &mut command,
+            "update-all",
+            &mut out,
+        ),
+        CompletionShell::Fish => clap_complete::generate(
+            clap_complete::shells::Fish,
+            &mut command,
+            "update-all",
+            &mut out,
+        ),
         CompletionShell::Zsh => clap_complete::generate(
             clap_complete::shells::Zsh,
             &mut command,
@@ -1380,6 +1435,8 @@ pub fn completion_sync(args: CompletionSyncArgs) -> Result<CompletionSyncResult>
     events.push(format!(
         "__UA_COMP_SUMMARY|generated={generated}|unchanged={unchanged}|skipped={skipped}"
     ));
+    publish_public_self_completion_snapshot(&args.managed_root, &mut events)?;
+
     Ok(CompletionSyncResult {
         generated,
         unchanged,
@@ -1388,6 +1445,21 @@ pub fn completion_sync(args: CompletionSyncArgs) -> Result<CompletionSyncResult>
         records,
         catalog_used: args.catalog_path,
         effective_catalog: registry,
+    })
+}
+
+pub fn completion_init(shell: &str, managed_root: PathBuf) -> Result<CompletionInitResult> {
+    let shell = CompletionShell::parse(shell)?;
+    let root = ManagedCompletionRoot::new(managed_root)?;
+    Ok(CompletionInitResult {
+        shell_code: root.init_script(shell)?,
+    })
+}
+
+pub fn completion_status(managed_root: PathBuf) -> Result<CompletionStatusResult> {
+    let root = ManagedCompletionRoot::new(managed_root)?;
+    Ok(CompletionStatusResult {
+        status: root.status()?,
     })
 }
 
@@ -1466,6 +1538,12 @@ fn normalize_npm_discovered_tool(name: &str) -> Option<String> {
 
 pub fn completion_install(args: CompletionInstallArgs) -> Result<CompletionInstallResult> {
     match CompletionShell::parse(&args.shell)? {
+        CompletionShell::Bash | CompletionShell::Elvish | CompletionShell::Fish => {
+            anyhow::bail!(
+                "legacy completion install only supports zsh and powershell; use `update-all completions init {}` for read-only startup wiring",
+                args.shell
+            )
+        }
         CompletionShell::Zsh => completion_install_zsh(args.rc_root),
         CompletionShell::PowerShell => {
             let powershell_root = args
@@ -1829,6 +1907,37 @@ fn managed_overlay_dir(rc_root: &Path) -> PathBuf {
     rc_root.join("shell/completions-managed")
 }
 
+fn publish_public_self_completion_snapshot(
+    managed_root: &Path,
+    events: &mut Vec<String>,
+) -> Result<()> {
+    let root = ManagedCompletionRoot::new(managed_root.to_path_buf())?;
+    let mut payloads = BTreeMap::new();
+    for shell in [
+        CompletionShell::Bash,
+        CompletionShell::Elvish,
+        CompletionShell::Fish,
+        CompletionShell::PowerShell,
+        CompletionShell::Zsh,
+    ] {
+        payloads.insert(
+            shell,
+            generate_update_all_completion(shell.as_event_name())?,
+        );
+    }
+
+    match root.publish_shell_completions(&payloads)? {
+        CompletionSnapshotPublishOutcome::Published { snapshot } => {
+            events.push(format!("__UA_COMP_PUBLIC|published|{}", snapshot.display()));
+        }
+        CompletionSnapshotPublishOutcome::Unchanged { snapshot } => {
+            events.push(format!("__UA_COMP_PUBLIC|unchanged|{}", snapshot.display()));
+        }
+    }
+
+    Ok(())
+}
+
 fn managed_payload_basename(provider: &str, tool: &str) -> String {
     format!("_managed_{provider}_{tool}")
 }
@@ -2070,6 +2179,7 @@ mod tests {
             catalog_path,
             config_path: Some(config_path),
             rc_root,
+            managed_root: temp.path().join("managed-root"),
             progress_cb: Some(Arc::new(move |line| {
                 progress_for_cb.lock().unwrap().push(line);
             })),
@@ -2087,5 +2197,16 @@ mod tests {
         assert!(progress
             .iter()
             .any(|line| { line == "completion-sync go: no configured tools (discover=0)" }));
+    }
+
+    #[test]
+    fn generate_update_all_completion_supports_five_shells() {
+        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+            let payload = generate_update_all_completion(shell).unwrap();
+            assert!(
+                !payload.trim().is_empty(),
+                "expected non-empty completion for {shell}"
+            );
+        }
     }
 }

@@ -1622,6 +1622,7 @@ impl SyncContext {
             catalog_path: self.completion_catalog_path.clone(),
             config_path: self.completion_config_path.clone(),
             rc_root: self.rc_root.clone(),
+            managed_root: crate::cli::default_completion_managed_root(),
             progress_cb: self.completion_progress_cb(task_id),
         })
     }
