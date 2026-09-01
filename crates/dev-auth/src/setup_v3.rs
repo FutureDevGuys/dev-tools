@@ -4,7 +4,8 @@ use crate::deployment::{
     DeploymentIntent, DeploymentMode,
 };
 use crate::policy_v2::{
-    parse_system_policy_v2, parse_user_config_v2, resolve_policy_for_user, SystemMode,
+    parse_system_policy_v2, parse_user_config_v2, require_system_policy_narrows,
+    resolve_policy_for_user, SystemMode,
 };
 use crate::setup::{render_plan, SetupPlan};
 use anyhow::{bail, Context, Result};
@@ -925,6 +926,12 @@ pub fn build_setup_plan_v3_at(
             if intent.mode != DeploymentMode::UserOnly || parsed.mode != SystemMode::UserOnly {
                 bail!("per-user policy is valid only for user-only deployment");
             }
+            require_system_policy_narrows(&administrator_policy, &parsed).with_context(|| {
+                format!(
+                    "prove user-only policy narrows administrator policy for {}",
+                    account.name
+                )
+            })?;
             let resolved = resolve_policy_for_user(&parsed, &account.name, &user_config)
                 .with_context(|| format!("resolve user-only policy for {}", account.name))?;
             used_credential_slots.extend(

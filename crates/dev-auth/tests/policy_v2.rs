@@ -1,6 +1,6 @@
 use dev_auth::policy_v2::{
-    parse_system_policy_v2, parse_user_config_v2, resolve_policy, InvalidSessionRouting,
-    NoSessionRouting, Permission, SandboxMode, SystemMode, WorkspaceAccess,
+    parse_system_policy_v2, parse_user_config_v2, require_system_policy_narrows, resolve_policy,
+    InvalidSessionRouting, NoSessionRouting, Permission, SandboxMode, SystemMode, WorkspaceAccess,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -102,6 +102,57 @@ fn published_user_only_policy_example_is_explicitly_degraded_and_resolves() {
         resolve_policy(&policy, &user).expect("published user-only examples must resolve");
     assert_eq!(resolved.mode, SystemMode::UserOnly);
     assert!(resolved.workloads.contains_key("automation-agent"));
+}
+
+#[test]
+fn per_user_policy_must_narrow_the_administrator_policy() {
+    let administrator = parse_system_policy_v2(
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .as_bytes(),
+    )
+    .unwrap();
+    let narrowed = parse_system_policy_v2(
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .replace(
+                "owners = [\"ExampleOrg\", \"SecondOrg\"]",
+                "owners = [\"ExampleOrg\"]",
+            )
+            .replace(
+                "repositories = [\"api\", \"website\"]",
+                "repositories = [\"api\"]",
+            )
+            .replace("installation_ids = [101, 102]", "installation_ids = [101]")
+            .replace("signing = true", "signing = false")
+            .as_bytes(),
+    )
+    .unwrap();
+    require_system_policy_narrows(&administrator, &narrowed).unwrap();
+
+    for wider in [
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .replace("git = \"/usr/bin/git\"", "git = \"/usr/local/bin/git\""),
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .replace(
+                "owners = [\"ExampleOrg\", \"SecondOrg\"]",
+                "owners = [\"ExampleOrg\", \"SecondOrg\", \"OtherOrg\"]",
+            ),
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .replace("metadata = \"read\"", "metadata = \"write\""),
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .replace("path = \"/srv/source\"", "path = \"/etc\""),
+        SYSTEM_POLICY
+            .replace("mode = \"strong\"", "mode = \"user_only\"")
+            .replace("\"--share-net\"", "\"--unshare-net\""),
+    ] {
+        let wider = parse_system_policy_v2(wider.as_bytes()).unwrap();
+        assert!(require_system_policy_narrows(&administrator, &wider).is_err());
+    }
 }
 
 #[test]

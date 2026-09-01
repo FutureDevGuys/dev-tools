@@ -304,6 +304,172 @@ pub fn parse_system_policy_v2(input: &[u8]) -> Result<SystemPolicyV2> {
     Ok(policy)
 }
 
+pub fn require_system_policy_narrows(
+    administrator: &SystemPolicyV2,
+    candidate: &SystemPolicyV2,
+) -> Result<()> {
+    validate_system_policy(administrator).context("validate administrator policy")?;
+    validate_system_policy(candidate).context("validate narrowing policy")?;
+    if candidate.mode != administrator.mode {
+        bail!("narrowing policy changes the administrator policy mode");
+    }
+    if candidate.programs != administrator.programs {
+        bail!("narrowing policy changes an administrator-pinned program");
+    }
+
+    let administrator_users = administrator
+        .allowed_users
+        .iter()
+        .map(|user| user.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if candidate
+        .allowed_users
+        .iter()
+        .map(|user| user.to_ascii_lowercase())
+        .any(|user| !administrator_users.contains(&user))
+    {
+        bail!("narrowing policy widens the administrator user cap");
+    }
+
+    require_exact_map_subset(
+        &administrator.trusted_launchers,
+        &candidate.trusted_launchers,
+        "trusted launcher",
+    )?;
+    require_exact_map_subset(
+        &administrator.sandbox_adapters,
+        &candidate.sandbox_adapters,
+        "sandbox adapter",
+    )?;
+
+    for (name, app) in &candidate.github_apps {
+        let administrator_app = administrator
+            .github_apps
+            .get(name)
+            .with_context(|| format!("narrowing policy introduces GitHub App cap {name}"))?;
+        if app.app_id != administrator_app.app_id
+            || !is_subset(
+                &app.private_key_references,
+                &administrator_app.private_key_references,
+            )
+        {
+            bail!("narrowing policy widens GitHub App cap {name}");
+        }
+    }
+
+    for (name, slot) in &candidate.credential_slots {
+        let administrator_slot = administrator
+            .credential_slots
+            .get(name)
+            .with_context(|| format!("narrowing policy introduces credential slot {name}"))?;
+        if !is_case_insensitive_subset(&slot.users, &administrator_slot.users)
+            || !is_subset(&slot.authority_caps, &administrator_slot.authority_caps)
+            || !is_subset(
+                &slot.secret_references,
+                &administrator_slot.secret_references,
+            )
+        {
+            bail!("narrowing policy widens credential slot {name}");
+        }
+    }
+
+    for (name, cap) in &candidate.authority_caps {
+        let administrator_cap = administrator
+            .authority_caps
+            .get(name)
+            .with_context(|| format!("narrowing policy introduces authority cap {name}"))?;
+        if !is_subset(&cap.github_apps, &administrator_cap.github_apps)
+            || !is_case_insensitive_subset(&cap.owners, &administrator_cap.owners)
+            || !bounded_optional_scope(&cap.repositories, &administrator_cap.repositories, true)
+            || !bounded_optional_scope(
+                &cap.installation_ids,
+                &administrator_cap.installation_ids,
+                false,
+            )
+            || (cap.signing && !administrator_cap.signing)
+            || (cap.ssh && !administrator_cap.ssh)
+            || !is_subset(&cap.git_identities, &administrator_cap.git_identities)
+            || !is_subset(&cap.secret_references, &administrator_cap.secret_references)
+        {
+            bail!("narrowing policy widens authority cap {name}");
+        }
+        for (permission, requested) in &cap.permissions {
+            let Some(allowed) = administrator_cap.permissions.get(permission) else {
+                bail!("narrowing policy adds permission {permission} to authority cap {name}");
+            };
+            if requested > allowed {
+                bail!("narrowing policy widens permission {permission} in authority cap {name}");
+            }
+        }
+    }
+
+    for (name, cap) in &candidate.workspace_caps {
+        let administrator_cap = administrator
+            .workspace_caps
+            .get(name)
+            .with_context(|| format!("narrowing policy introduces workspace cap {name}"))?;
+        if cap.access > administrator_cap.access
+            || !path_is_within(&cap.path, &administrator_cap.path)
+        {
+            bail!("narrowing policy widens workspace cap {name}");
+        }
+    }
+    Ok(())
+}
+
+fn require_exact_map_subset<T: PartialEq>(
+    administrator: &BTreeMap<String, T>,
+    candidate: &BTreeMap<String, T>,
+    description: &str,
+) -> Result<()> {
+    for (name, value) in candidate {
+        if administrator.get(name) != Some(value) {
+            bail!("narrowing policy changes or introduces {description} {name}");
+        }
+    }
+    Ok(())
+}
+
+fn is_subset<T: Ord + Clone>(candidate: &[T], administrator: &[T]) -> bool {
+    let administrator = administrator.iter().cloned().collect::<BTreeSet<_>>();
+    candidate.iter().all(|value| administrator.contains(value))
+}
+
+fn is_case_insensitive_subset(candidate: &[String], administrator: &[String]) -> bool {
+    let administrator = administrator
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    candidate
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .all(|value| administrator.contains(&value))
+}
+
+fn bounded_optional_scope<T>(candidate: &[T], administrator: &[T], case_insensitive: bool) -> bool
+where
+    T: Clone + Ord + ToString,
+{
+    if administrator.is_empty() {
+        return true;
+    }
+    if candidate.is_empty() {
+        return false;
+    }
+    if case_insensitive {
+        let administrator = administrator
+            .iter()
+            .map(|value| value.to_string().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        candidate
+            .iter()
+            .map(|value| value.to_string().to_ascii_lowercase())
+            .all(|value| administrator.contains(&value))
+    } else {
+        is_subset(candidate, administrator)
+    }
+}
+
 fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
     if policy.version != 2 {
         bail!("unsupported system policy version");
