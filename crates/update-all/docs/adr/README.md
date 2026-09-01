@@ -20,6 +20,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0008](0008-shared-release-and-installation-foundations.md) | Shared release and installation foundations | proposed | pending |
 | [0009](0009-managed-completion-root.md) | Managed completion publication root and snapshot health | proposed | pending |
 | [0010](0010-completion-inventory-and-binding-authority.md) | Completion inventory and binding authority | proposed | pending |
+| [0011](0011-native-completion-protocol-and-trust-authority.md) | Native completion protocol and trust authority | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

@@ -2,20 +2,19 @@ use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::OnceLock;
-use std::thread::JoinHandle;
-use std::time::Duration;
-use wait_timeout::ChildExt;
 
-use crate::completions::registry::RegistryCommandCandidate;
-use crate::util::process::{command_for_executable, resolve_executable, which};
-
-const GENERATOR_PROBE_TIMEOUT: &str = "generator_probe_timeout";
+use super::native::{
+    plan_native_completion, NativeCandidateOrigin, NativeCompletionRequest, NativePlannerOutcome,
+    NativeProbeSession, NativeRecipeMemo,
+};
+use super::registry::{
+    RegistryBundledCompletion, RegistryCommandCandidate, RegistryCompletionRecipe,
+};
+use super::{CompletionArtifactClassification, CompletionShell};
+use crate::util::process::which;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CompletionCommandSpec {
@@ -29,9 +28,25 @@ pub(super) struct CompletionCommandPlan {
     pub selection_probe_args: Vec<String>,
 }
 
+pub(super) struct CompletionGenerationRequest<'a> {
+    pub provider: &'a str,
+    pub tool: &'a str,
+    pub shell: CompletionShell,
+    pub rc_root: &'a Path,
+    pub command: &'a CompletionCommandSpec,
+    pub provider_bin_dir: &'a Path,
+    pub bundled_completions: &'a [RegistryBundledCompletion],
+    pub catalog_recipes: &'a [RegistryCompletionRecipe],
+    pub previous_recipe: Option<&'a NativeRecipeMemo>,
+    pub origin: NativeCandidateOrigin,
+    pub trust_dynamic: bool,
+}
+
 pub(super) struct GeneratedCompletion {
     pub path: PathBuf,
     pub changed: bool,
+    pub classification: CompletionArtifactClassification,
+    pub native_recipe: Option<NativeRecipeMemo>,
 }
 
 pub(super) fn completion_command_plans(
@@ -52,56 +67,96 @@ pub(super) fn completion_command_plans(
 
 pub(super) fn select_completion_command_plan(
     plans: &[CompletionCommandPlan],
-) -> Option<CompletionCommandPlan> {
-    plans.iter().find_map(|plan| {
+    session: &mut NativeProbeSession,
+) -> std::result::Result<Option<CompletionCommandPlan>, String> {
+    for (index, plan) in plans.iter().enumerate() {
         if plan.selection_probe_args.is_empty() {
-            return Some(plan.clone());
+            return Ok(Some(plan.clone()));
         }
-        let probe = run_probe(
+        let output = session.run_process(
             &plan.command,
-            plan.selection_probe_args.iter().map(String::as_str),
-            Duration::from_secs(5),
-        )
-        .ok()?;
-        probe.success.then(|| plan.clone())
-    })
+            &plan.selection_probe_args,
+            &BTreeMap::new(),
+            &format!("command-selection-{index}"),
+        )?;
+        if output.success {
+            return Ok(Some(plan.clone()));
+        }
+    }
+    Ok(None)
 }
 
 pub(super) fn generate_tool_completion(
-    provider: &str,
-    tool: &str,
-    rc_root: &Path,
-    command_spec: &CompletionCommandSpec,
+    request: CompletionGenerationRequest<'_>,
+    session: &mut NativeProbeSession,
 ) -> std::result::Result<Option<GeneratedCompletion>, String> {
     static VALID_RE: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
     let valid_re = VALID_RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$"));
     let valid_re = valid_re
         .as_ref()
         .map_err(|_| "internal_error: completion validator failed to initialize".to_string())?;
-    if !valid_re.is_match(tool) {
+    if !valid_re.is_match(request.tool) || !valid_re.is_match(request.provider) {
         return Err("invalid_identifier".to_string());
     }
 
-    let managed_dir = rc_root.join("shell").join("completions");
-    let managed_path = managed_dir.join(format!("_managed_{provider}_{tool}"));
-
-    let hard_timeout = env::var("UPDATE_ALL_COMPLETION_PROBE_HARD_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(15);
-
-    let timeout = Duration::from_secs(hard_timeout);
-    let output = select_completion_payload(tool, command_spec, timeout)?;
-    let Some(output) = output else {
-        return Ok(None);
+    let (bytes, classification, native_recipe) = match plan_native_completion(
+        NativeCompletionRequest {
+            shell: request.shell,
+            command_name: request.tool,
+            command: request.command,
+            provider_bin_dir: request.provider_bin_dir,
+            bundled_completions: request.bundled_completions,
+            catalog_recipes: request.catalog_recipes,
+            previous_recipe: request.previous_recipe,
+            origin: request.origin,
+            trust_dynamic: request.trust_dynamic,
+        },
+        session,
+    )? {
+        NativePlannerOutcome::Completion(completion) => (
+            completion.bytes,
+            completion.classification,
+            Some(completion.recipe),
+        ),
+        NativePlannerOutcome::NotFound {
+            root_help,
+            diagnostics,
+        } if request.shell == CompletionShell::Zsh => {
+            if let Some(fallback) = generate_help_fallback_completion(
+                request.tool,
+                request.command,
+                session,
+                root_help,
+            )? {
+                (
+                    fallback.into_bytes(),
+                    CompletionArtifactClassification::Static,
+                    None,
+                )
+            } else if diagnostics.is_empty() {
+                return Ok(None);
+            } else {
+                return Err(format!("native_output_rejected:{}", diagnostics.summary()));
+            }
+        }
+        NativePlannerOutcome::NotFound { diagnostics, .. } => {
+            if diagnostics.is_empty() {
+                return Ok(None);
+            }
+            return Err(format!("native_output_rejected:{}", diagnostics.summary()));
+        }
     };
 
-    fs::create_dir_all(&managed_dir).map_err(|e| e.to_string())?;
+    let managed_dir = request.rc_root.join("shell").join("completions");
+    let managed_path = managed_dir.join(format!("_managed_{}_{}", request.provider, request.tool));
+    fs::create_dir_all(&managed_dir).map_err(|error| error.to_string())?;
     let changed =
-        write_bytes_if_changed(&managed_path, output.as_bytes()).map_err(|e| e.to_string())?;
+        write_bytes_if_changed(&managed_path, &bytes).map_err(|error| error.to_string())?;
     Ok(Some(GeneratedCompletion {
         path: managed_path,
         changed,
+        classification,
+        native_recipe,
     }))
 }
 
@@ -116,153 +171,19 @@ pub(super) fn write_bytes_if_changed(path: &Path, content: &[u8]) -> io::Result<
     Ok(true)
 }
 
-fn select_completion_payload(
-    tool: &str,
-    command_spec: &CompletionCommandSpec,
-    timeout: Duration,
-) -> std::result::Result<Option<String>, String> {
-    let mut unsafe_native = false;
-    let mut native_probe_timeout = false;
-    let native = match probe_completion_generator(command_spec, timeout) {
-        Ok(native) => native,
-        Err(e) if e == GENERATOR_PROBE_TIMEOUT => {
-            native_probe_timeout = true;
-            String::new()
-        }
-        Err(e) => return Err(e),
-    };
-    let native = if native.trim().is_empty() {
-        None
-    } else if !native.contains("#compdef") {
-        None
-    } else if is_unsafe_completion_payload(&native) {
-        unsafe_native = true;
-        None
-    } else {
-        Some(native)
-    };
-
-    if let Some(native) = native {
-        let native_needs_fallback =
-            native_payload_missing_help_flags(command_spec, &native, timeout).unwrap_or(false);
-        if !native_needs_fallback {
-            return Ok(Some(native));
-        }
-        return match generate_help_fallback_completion(tool, command_spec, timeout) {
-            Ok(Some(fallback)) => Ok(Some(fallback)),
-            Ok(None) | Err(_) => Ok(Some(native)),
-        };
-    }
-
-    match generate_help_fallback_completion(tool, command_spec, timeout)? {
-        Some(fallback) => Ok(Some(fallback)),
-        None if unsafe_native => Err("unsafe_output".to_string()),
-        None if native_probe_timeout => Err(GENERATOR_PROBE_TIMEOUT.to_string()),
-        None => Ok(None),
-    }
-}
-
-fn is_unsafe_completion_payload(payload: &str) -> bool {
-    static UNSAFE_RE: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
-    let unsafe_re = UNSAFE_RE.get_or_init(|| {
-        Regex::new(
-            r#"(?mx)
-(?:^|[;\n])\s*eval(?:\s|["'])    # eval with whitespace or quoted arg
-|(?:^|[;\n])\s*(?:source|\.)\s+   # source or dot command invocation
-"#,
-        )
-    });
-    let Ok(unsafe_re) = unsafe_re else {
-        return true;
-    };
-    unsafe_re.is_match(payload) || contains_executable_substitution(payload)
-}
-
-fn contains_executable_substitution(payload: &str) -> bool {
-    let mut in_single_quote = false;
-    let mut escaped = false;
-
-    for (idx, ch) in payload.char_indices() {
-        if in_single_quote {
-            if ch == '\'' {
-                in_single_quote = false;
-            }
-            continue;
-        }
-
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        match ch {
-            '\\' => escaped = true,
-            '\'' => in_single_quote = true,
-            '`' => return true,
-            '$' => {
-                let after = idx + ch.len_utf8();
-                if payload[after..].starts_with('(')
-                    && !payload[after + '('.len_utf8()..].starts_with('(')
-                {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    false
-}
-
-fn probe_completion_generator(
-    command_spec: &CompletionCommandSpec,
-    timeout: Duration,
-) -> std::result::Result<String, String> {
-    let patterns: &[&[&str]] = &[
-        &["completion", "zsh"],
-        &["completion", "--shell", "zsh"],
-        &["completions", "zsh"],
-        &["--completions", "zsh"],
-    ];
-
-    for argv in patterns {
-        let probe = run_probe(command_spec, argv.iter().copied(), timeout)?;
-        if probe.success {
-            if let Some(out) = native_completion_payload(&probe.stdout) {
-                return Ok(out);
-            }
-        }
-    }
-
-    Ok(String::new())
-}
-
-fn native_completion_payload(stdout: &[u8]) -> Option<String> {
-    let output = String::from_utf8_lossy(stdout).to_string();
-    let mut offset = 0usize;
-    for line in output.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("#compdef") {
-            let leading = line.len().saturating_sub(trimmed.len());
-            return Some(output[offset + leading..].to_string());
-        }
-        offset += line.len();
-    }
-    None
-}
-
 fn generate_help_fallback_completion(
     tool: &str,
     command_spec: &CompletionCommandSpec,
-    timeout: Duration,
+    session: &mut NativeProbeSession,
+    root_help: Option<String>,
 ) -> std::result::Result<Option<String>, String> {
     let max_depth = env::var("UPDATE_ALL_COMPLETION_HELP_DEPTH")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4);
     let max_probes = env::var("UPDATE_ALL_COMPLETION_HELP_PROBE_LIMIT")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(32)
         .max(1);
     let mut visited = HashSet::new();
@@ -270,41 +191,13 @@ fn generate_help_fallback_completion(
     let root = probe_help_node(
         command_spec,
         Vec::new(),
-        timeout,
+        session,
         max_depth,
         &mut visited,
         &mut probe_budget,
+        root_help.as_deref(),
     )?;
     Ok(root.map(|node| build_help_completion_payload(tool, &node)))
-}
-
-fn native_payload_missing_help_flags(
-    command_spec: &CompletionCommandSpec,
-    payload: &str,
-    timeout: Duration,
-) -> std::result::Result<bool, String> {
-    let help_probe = run_probe(command_spec, ["--help"], timeout)?;
-    if !help_probe.success {
-        return Ok(false);
-    }
-
-    let mut help_text = String::from_utf8_lossy(&help_probe.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&help_probe.stderr);
-    if !stderr.trim().is_empty() {
-        if !help_text.is_empty() {
-            help_text.push('\n');
-        }
-        help_text.push_str(&stderr);
-    }
-
-    let help_flags = extract_flags_from_text(&strip_ansi(&help_text));
-    if help_flags.is_empty() {
-        return Ok(false);
-    }
-    let completion_flags = extract_flags_from_text(payload);
-    Ok(help_flags
-        .iter()
-        .any(|flag| !completion_flags.contains(flag)))
 }
 
 fn build_help_completion_payload(tool: &str, root: &HelpNode) -> String {
@@ -347,10 +240,11 @@ fn build_help_completion_payload(tool: &str, root: &HelpNode) -> String {
 fn probe_help_node(
     command_spec: &CompletionCommandSpec,
     path_args: Vec<String>,
-    timeout: Duration,
+    session: &mut NativeProbeSession,
     depth_left: usize,
     visited: &mut HashSet<String>,
     probe_budget: &mut HelpProbeBudget,
+    preloaded_help: Option<&str>,
 ) -> std::result::Result<Option<HelpNode>, String> {
     let path_key = path_args.join("\x1f");
     if !visited.insert(path_key) {
@@ -360,21 +254,27 @@ fn probe_help_node(
         return Ok(None);
     }
 
-    let mut probe_args = path_args.clone();
-    probe_args.push("--help".to_string());
-    let help_probe = run_probe(command_spec, probe_args.iter().map(String::as_str), timeout)?;
-    if !help_probe.success {
-        return Ok(None);
-    }
-
-    let mut merged = String::from_utf8_lossy(&help_probe.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&help_probe.stderr);
-    if !stderr.trim().is_empty() {
-        if !merged.is_empty() {
-            merged.push('\n');
+    let merged = if let Some(preloaded_help) = preloaded_help {
+        preloaded_help.to_string()
+    } else {
+        let mut probe_args = path_args.clone();
+        probe_args.push("--help".to_string());
+        let help_probe =
+            session.run_process(command_spec, &probe_args, &BTreeMap::new(), "help_fallback")?;
+        if !help_probe.success {
+            return Ok(None);
         }
-        merged.push_str(&stderr);
-    }
+
+        let mut merged = String::from_utf8_lossy(&help_probe.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&help_probe.stderr);
+        if !stderr.trim().is_empty() {
+            if !merged.is_empty() {
+                merged.push('\n');
+            }
+            merged.push_str(&stderr);
+        }
+        merged
+    };
 
     let stripped = strip_ansi(&merged);
     let command_rows = parse_help_command_rows(&stripped);
@@ -398,10 +298,11 @@ fn probe_help_node(
                 probe_help_node(
                     command_spec,
                     child_path.clone(),
-                    timeout,
+                    session,
                     depth_left.saturating_sub(1),
                     visited,
                     probe_budget,
+                    None,
                 )?
                 .map(Box::new)
             } else {
@@ -951,12 +852,6 @@ fn resolve_existing_program(program: &str) -> Option<PathBuf> {
     which(program)
 }
 
-struct ProbeOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
 struct HelpProbeBudget {
     remaining: usize,
 }
@@ -973,80 +868,6 @@ impl HelpProbeBudget {
         self.remaining -= 1;
         true
     }
-}
-
-fn run_probe<I, S>(
-    command_spec: &CompletionCommandSpec,
-    args: I,
-    timeout: Duration,
-) -> std::result::Result<ProbeOutput, String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let resolved_program = command_spec
-        .program
-        .to_str()
-        .map(resolve_executable)
-        .unwrap_or_else(|| command_spec.program.clone());
-    let mut cmd = command_for_executable(&resolved_program);
-    cmd.args(command_spec.args.iter().map(String::as_str));
-    cmd.args(args.into_iter().map(|arg| arg.as_ref().to_string()));
-    cmd.current_dir(std::env::temp_dir());
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let mut stdout_reader = child.stdout.take().map(read_pipe_thread);
-    let mut stderr_reader = child.stderr.take().map(read_pipe_thread);
-
-    let status = match child.wait_timeout(timeout).map_err(|e| e.to_string())? {
-        Some(status) => status,
-        None => {
-            crate::util::process::terminate_process_group(child.id());
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill();
-            }
-            let _ = child.wait();
-            if let Some(handle) = stdout_reader.take() {
-                let _ = handle.join();
-            }
-            if let Some(handle) = stderr_reader.take() {
-                let _ = handle.join();
-            }
-            return Err(GENERATOR_PROBE_TIMEOUT.to_string());
-        }
-    };
-
-    Ok(ProbeOutput {
-        success: status.success(),
-        stdout: stdout_reader
-            .take()
-            .map(join_pipe_reader)
-            .unwrap_or_default(),
-        stderr: stderr_reader
-            .take()
-            .map(join_pipe_reader)
-            .unwrap_or_default(),
-    })
-}
-
-fn read_pipe_thread<R: Read + Send + 'static>(mut reader: R) -> JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = reader.read_to_end(&mut bytes);
-        bytes
-    })
-}
-
-fn join_pipe_reader(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1257,115 +1078,6 @@ Experimental Sync Options:
     }
 
     #[test]
-    fn unsafe_completion_payload_allows_arithmetic_expansion() {
-        let payload = r#"#compdef arith
-_arith() {
-  local depth=$((CURRENT - 1))
-  _arguments '--count[Use arithmetic state]'
-}
-"#;
-
-        assert!(!is_unsafe_completion_payload(payload));
-        assert!(is_unsafe_completion_payload(
-            "#compdef dyn\n_dyn() { reply=($(dyn completion-server)); }\n"
-        ));
-    }
-
-    #[test]
-    fn unsafe_completion_payload_allows_quoted_description_substitution_tokens() {
-        let payload = r#"#compdef docs
-_docs() {
-  _arguments '--save-dev[Save package to your `devDependencies`]' \
-    '--manual[Run $(tool) yourself when needed]'
-}
-"#;
-
-        assert!(!is_unsafe_completion_payload(payload));
-        assert!(is_unsafe_completion_payload(
-            "#compdef dyn\n_dyn() { reply=(`dyn completion-server`); }\n"
-        ));
-        assert!(is_unsafe_completion_payload(
-            "#compdef dyn\n_dyn() { reply=(\"$(dyn completion-server)\"); }\n"
-        ));
-    }
-
-    #[test]
-    fn native_completion_payload_strips_leading_status_banner() {
-        let payload = native_completion_payload(
-            b"tool: config=/tmp/example.toml status=ready\n  #compdef tool\n_tool() {}\n",
-        )
-        .unwrap();
-
-        assert_eq!(payload, "#compdef tool\n_tool() {}\n");
-    }
-
-    #[test]
-    fn native_probe_timeout_uses_help_fallback_when_available() {
-        let temp = tempfile::TempDir::new().unwrap();
-        #[cfg(windows)]
-        let script = temp.path().join("sleepy.cmd");
-        #[cfg(not(windows))]
-        let script = temp.path().join("sleepy");
-        std::fs::write(
-            &script,
-            #[cfg(windows)]
-            r#"@echo off
-if "%~1"=="completion" if "%~2"=="zsh" (
-  powershell -NoProfile -Command "Start-Sleep -Milliseconds 500"
-  exit /b 1
-)
-if "%~1"=="--help" (
-  echo Usage: sleepy [options]
-  echo.
-  echo Options:
-  echo   --alpha    Alpha mode
-  exit /b 0
-)
-exit /b 1
-"#,
-            #[cfg(not(windows))]
-            r#"#!/bin/sh
-set -eu
-if [ "${1:-}" = "completion" ] && [ "${2:-}" = "zsh" ]; then
-  sleep 1
-  exit 1
-fi
-if [ "${1:-}" = "--help" ]; then
-  printf '%s\n' \
-    'Usage: sleepy [options]' \
-    '' \
-    'Options:' \
-    '  --alpha    Alpha mode'
-  exit 0
-fi
-exit 1
-"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-
-        let payload = select_completion_payload(
-            "sleepy",
-            &CompletionCommandSpec {
-                program: script,
-                args: Vec::new(),
-            },
-            Duration::from_millis(100),
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(payload.contains("#compdef sleepy"), "{payload}");
-        assert!(payload.contains("--alpha"), "{payload}");
-    }
-
-    #[test]
     fn build_help_completion_payload_inherits_section_options_for_aliases() {
         let root = HelpNode {
             path: Vec::new(),
@@ -1404,78 +1116,5 @@ exit 1
         assert!(payload.contains("'list')"));
         assert!(payload.contains("'ls')"));
         assert!(payload.contains("'(-a --agent)'{-a,--agent}'[Filter by agent]'"));
-    }
-
-    #[test]
-    fn native_payload_missing_help_flags_detects_drift() {
-        let temp = tempfile::TempDir::new().unwrap();
-        #[cfg(windows)]
-        let script = temp.path().join("flaggy.cmd");
-        #[cfg(not(windows))]
-        let script = temp.path().join("flaggy");
-        std::fs::write(
-            &script,
-            #[cfg(windows)]
-            r#"@echo off
-if "%~1"=="--help" (
-  echo Usage: flaggy [options]
-  echo.
-  echo Options:
-  echo   --alpha    Alpha mode
-  echo   --beta     Beta mode
-  exit /b 0
-)
-if "%~1"=="completion" if "%~2"=="zsh" (
-  echo #compdef flaggy
-  echo _flaggy^(^) {
-  echo   _arguments '--alpha[Alpha mode]'
-  echo }
-  exit /b 0
-)
-exit /b 1
-"#,
-            #[cfg(not(windows))]
-            r#"#!/bin/sh
-set -eu
-if [ "${1:-}" = "--help" ]; then
-  printf '%s\n' \
-    'Usage: flaggy [options]' \
-    '' \
-    'Options:' \
-    '  --alpha    Alpha mode' \
-    '  --beta     Beta mode'
-  exit 0
-fi
-if [ "${1:-}" = "completion" ] && [ "${2:-}" = "zsh" ]; then
-  printf '%s\n' \
-    '#compdef flaggy' \
-    '_flaggy() {' \
-    "  _arguments '--alpha[Alpha mode]'" \
-    '}'
-  exit 0
-fi
-exit 1
-"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-
-        let missing = native_payload_missing_help_flags(
-            &CompletionCommandSpec {
-                program: script,
-                args: Vec::new(),
-            },
-            "#compdef flaggy\n_flaggy() { _arguments '--alpha[Alpha mode]' }\n",
-            Duration::from_secs(2),
-        )
-        .unwrap();
-
-        assert!(missing);
     }
 }

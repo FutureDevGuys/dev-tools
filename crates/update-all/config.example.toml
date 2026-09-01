@@ -326,6 +326,7 @@ catalogs = []
 # enabled = true
 # managed_required = true  # Optional: report missing/unsupported generators as failures.
 # priority = 100           # Optional: override PATH when providers share this command binding.
+# trust_dynamic = false     # Set true only to trust runtime-evaluating native output from an ambient tool.
 
 # Example 2: provider-owned tool
 # [[completions.tools]]

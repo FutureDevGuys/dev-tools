@@ -1,8 +1,14 @@
 use super::generator::{
     completion_command_plans, generate_tool_completion, select_completion_command_plan,
-    CompletionCommandPlan, GeneratedCompletion,
+    CompletionCommandPlan, CompletionGenerationRequest, GeneratedCompletion,
 };
-use super::registry::{Registry, RegistryCommandCandidate};
+use super::native::{
+    provider_bundled_artifact_identity, stored_artifact_is_healthy, NativeCandidateOrigin,
+    NativeProbeSession, NATIVE_PROTOCOL_REGISTRY_VERSION, NATIVE_TRUST_CLASSIFICATION_VERSION,
+};
+use super::registry::{
+    Registry, RegistryBundledCompletion, RegistryCommandCandidate, RegistryCompletionRecipe,
+};
 use super::state::{
     CompletionBindingMemo, CompletionCandidateMemo, CompletionCandidateSlot,
     CompletionIdentityMemo, CompletionIdentityStore,
@@ -11,10 +17,10 @@ use super::{
     completion_provider_no_configured_tools, completion_provider_progress,
     filter_completion_catalog_for_providers, managed_completion_dir, managed_payload_basename,
     publish_public_self_completion_snapshot, read_usable_completion_payload,
-    remove_managed_overlay_shim, tool_key, usable_completion_payload_file,
-    validate_completion_overlay_names, write_bytes_if_changed, write_managed_overlay_shim,
+    remove_managed_overlay_shim, tool_key, validate_completion_overlay_names,
+    write_bytes_if_changed, write_managed_overlay_shim, CompletionArtifactClassification,
     CompletionBindingIdentity, CompletionCandidateIdentity, CompletionProviderInventoryRecord,
-    CompletionProviderInventoryStatus, CompletionSyncArgs, CompletionSyncRecord,
+    CompletionProviderInventoryStatus, CompletionShell, CompletionSyncArgs, CompletionSyncRecord,
     CompletionSyncRecordStatus, CompletionSyncResult,
 };
 use crate::config::{load_runtime_config, merge_user_completion_catalog};
@@ -42,6 +48,9 @@ enum ToolOrigin {
 struct ToolMetadata {
     command: Option<String>,
     command_candidates: Vec<RegistryCommandCandidate>,
+    bundled_completions: Vec<RegistryBundledCompletion>,
+    completion_recipes: Vec<RegistryCompletionRecipe>,
+    trust_dynamic: bool,
     priority: Option<i64>,
     managed_required: bool,
     origin: ToolOrigin,
@@ -52,6 +61,9 @@ impl Default for ToolMetadata {
         Self {
             command: None,
             command_candidates: Vec::new(),
+            bundled_completions: Vec::new(),
+            completion_recipes: Vec::new(),
+            trust_dynamic: false,
             priority: None,
             managed_required: false,
             origin: ToolOrigin::Ambient,
@@ -387,12 +399,16 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
     }
 
     for (memo, reason) in &retired {
-        direct_records.push(CompletionSyncRecord::with_status(
+        direct_records.push(CompletionSyncRecord::with_artifact_details(
             &memo.slot.provider,
             &memo.binding.command,
             CompletionSyncRecordStatus::Retired,
             Some(&memo.artifact_path),
             Some(reason.clone()),
+            memo.artifact_classification,
+            memo.successful_recipe
+                .as_ref()
+                .map(|recipe| recipe.report_name()),
         ));
     }
 
@@ -508,6 +524,9 @@ fn build_catalog_index(registry: &Registry) -> CatalogIndex {
             ToolMetadata {
                 command: tool.command.clone(),
                 command_candidates: tool.command_candidates.clone(),
+                bundled_completions: tool.bundled_completions.clone(),
+                completion_recipes: tool.completion_recipes.clone(),
+                trust_dynamic: tool.trust_dynamic,
                 priority: tool.priority,
                 managed_required: tool.managed_required.unwrap_or(false),
                 origin: if tool.ambient {
@@ -1076,13 +1095,25 @@ fn process_candidate(
         }
     }
 
-    let selected = select_completion_command_plan(
-        &prepared
-            .iter()
-            .map(|prepared| prepared.plan.clone())
-            .collect::<Vec<_>>(),
-    )
-    .and_then(|selected| {
+    let mut session = NativeProbeSession::from_env();
+    let selectable = prepared
+        .iter()
+        .map(|prepared| prepared.plan.clone())
+        .collect::<Vec<_>>();
+    let selected_plan = match select_completion_command_plan(&selectable, &mut session) {
+        Ok(selected) => selected,
+        Err(error) => {
+            return retain_or_record_failure(
+                item,
+                prior,
+                error,
+                candidates,
+                outcomes,
+                direct_records,
+            );
+        }
+    };
+    let selected = selected_plan.and_then(|selected| {
         prepared
             .iter()
             .find(|prepared| prepared.plan == selected)
@@ -1093,7 +1124,30 @@ fn process_candidate(
         return retain_or_record_failure(item, prior, reason, candidates, outcomes, direct_records);
     };
 
-    match generate_tool_completion(&item.provider, &item.tool, rc_root, &selected.plan.command) {
+    let native_origin = match item.metadata.origin {
+        ToolOrigin::Registry => NativeCandidateOrigin::Managed,
+        ToolOrigin::Ambient => NativeCandidateOrigin::Ambient,
+    };
+    let previous_recipe = prior
+        .as_ref()
+        .filter(|memo| memo.identity == selected.identity)
+        .and_then(|memo| memo.successful_recipe.as_ref());
+    match generate_tool_completion(
+        CompletionGenerationRequest {
+            provider: &item.provider,
+            tool: &item.tool,
+            shell: CompletionShell::Zsh,
+            rc_root,
+            command: &selected.plan.command,
+            provider_bin_dir: &item.provider_bin_dir,
+            bundled_completions: &item.metadata.bundled_completions,
+            catalog_recipes: &item.metadata.completion_recipes,
+            previous_recipe,
+            origin: native_origin,
+            trust_dynamic: item.metadata.trust_dynamic,
+        },
+        &mut session,
+    ) {
         Ok(Some(completion)) => {
             finish_probed_candidate(item, prior, selected, completion, candidates, outcomes)
         }
@@ -1122,7 +1176,7 @@ fn process_candidate(
 
 fn prepare_plan(
     item: &InventoryCandidate,
-    plan: CompletionCommandPlan,
+    mut plan: CompletionCommandPlan,
     index: usize,
 ) -> std::result::Result<PreparedPlan, String> {
     let exact_executable = absolutize_existing_path(&plan.command.program)
@@ -1146,11 +1200,30 @@ fn prepare_plan(
             item.provider_native_seed
         ),
     };
+    plan.command.program = exact_executable.clone();
+    let bundled_artifact_fingerprint = provider_bundled_artifact_identity(
+        CompletionShell::Zsh,
+        &item.binding.command,
+        &plan.command,
+        &item.provider_bin_dir,
+        &item.metadata.bundled_completions,
+    )?;
     let fingerprint_bytes = serde_json::to_vec(&serde_json::json!({
+        "native_protocol_registry_version": NATIVE_PROTOCOL_REGISTRY_VERSION,
+        "native_trust_classification_version": NATIVE_TRUST_CLASSIFICATION_VERSION,
+        "shell": CANDIDATE_SHELL,
         "index": index,
         "program": &exact_executable,
         "args": &plan.command.args,
         "selection_probe_args": &plan.selection_probe_args,
+        "bundled_completions": &item.metadata.bundled_completions,
+        "bundled_artifact_fingerprint": bundled_artifact_fingerprint,
+        "completion_recipes": &item.metadata.completion_recipes,
+        "trust_dynamic": item.metadata.trust_dynamic,
+        "origin": match item.metadata.origin {
+            ToolOrigin::Registry => "managed",
+            ToolOrigin::Ambient => "ambient",
+        },
     }))
     .map_err(|error| error.to_string())?;
     Ok(PreparedPlan {
@@ -1190,6 +1263,8 @@ fn finish_probed_candidate(
         resolution_fingerprint: selected.resolution_fingerprint,
         artifact_path: completion.path,
         artifact_digest,
+        artifact_classification: Some(completion.classification),
+        successful_recipe: completion.native_recipe,
         priority: item.metadata.priority,
         managed_required: item.metadata.managed_required,
     };
@@ -1263,6 +1338,8 @@ fn import_static_completion(
     Ok(Some(GeneratedCompletion {
         path: managed_path,
         changed,
+        classification: CompletionArtifactClassification::Static,
+        native_recipe: None,
     }))
 }
 
@@ -1271,8 +1348,9 @@ fn expected_artifact_path(rc_root: &Path, item: &InventoryCandidate) -> PathBuf 
 }
 
 fn memo_artifact_is_healthy(memo: &CompletionCandidateMemo) -> bool {
-    usable_completion_payload_file(&memo.artifact_path)
-        && sha256_file(&memo.artifact_path).is_ok_and(|digest| digest == memo.artifact_digest)
+    fs::read(&memo.artifact_path).is_ok_and(|bytes| {
+        stored_artifact_is_healthy(&memo.binding.shell, &memo.binding.command, &bytes)
+    }) && sha256_file(&memo.artifact_path).is_ok_and(|digest| digest == memo.artifact_digest)
 }
 
 fn record_inventory_failure(
@@ -1383,12 +1461,16 @@ fn activate_bindings(
                     } else {
                         (outcome_status(outcome.kind), outcome.reason)
                     };
-                records.push(CompletionSyncRecord::with_status(
+                records.push(CompletionSyncRecord::with_artifact_details(
                     &memo.slot.provider,
                     &binding.command,
                     status,
                     Some(&memo.artifact_path),
                     reason,
+                    memo.artifact_classification,
+                    memo.successful_recipe
+                        .as_ref()
+                        .map(|recipe| recipe.report_name()),
                 ));
             } else {
                 let reason = if let Some(winner) = winner {
@@ -1407,12 +1489,16 @@ fn activate_bindings(
                 } else {
                     format!("shadowed;candidate_status={}", outcome_name(outcome.kind))
                 };
-                records.push(CompletionSyncRecord::with_status(
+                records.push(CompletionSyncRecord::with_artifact_details(
                     &memo.slot.provider,
                     &binding.command,
                     CompletionSyncRecordStatus::Shadowed,
                     Some(&memo.artifact_path),
                     Some(reason),
+                    memo.artifact_classification,
+                    memo.successful_recipe
+                        .as_ref()
+                        .map(|recipe| recipe.report_name()),
                 ));
             }
         }
@@ -1551,6 +1637,11 @@ fn push_inventory_event(events: &mut Vec<String>, inventory: &CompletionProvider
 fn push_record_event(events: &mut Vec<String>, record: &CompletionSyncRecord) {
     let artifact = record.artifact.as_deref().unwrap_or("-");
     let reason = record.reason.as_deref().unwrap_or("-");
+    let classification = record
+        .classification
+        .map(CompletionArtifactClassification::as_str)
+        .unwrap_or("-");
+    let recipe = record.recipe.as_deref().unwrap_or("-");
     let tag = match record.status {
         CompletionSyncRecordStatus::Generated => "GENERATED",
         CompletionSyncRecordStatus::Unchanged => "UNCHANGED",
@@ -1563,7 +1654,7 @@ fn push_record_event(events: &mut Vec<String>, record: &CompletionSyncRecord) {
         CompletionSyncRecordStatus::Failed => "FAILED",
     };
     events.push(format!(
-        "__UA_COMP_{tag}|{}|{}|{}|{}",
+        "__UA_COMP_{tag}|{}|{}|{}|{}|classification={classification}|recipe={recipe}",
         record.provider, record.tool, artifact, reason
     ));
 }
@@ -1722,7 +1813,13 @@ mod tests {
     fn clean_probe_environment() -> Vec<EnvVarGuard> {
         [
             "UPDATE_ALL_COMPLETION_PROVIDER_TIMEOUT",
+            "UPDATE_ALL_COMPLETION_PROBE_TIMEOUT_MS",
             "UPDATE_ALL_COMPLETION_PROBE_HARD_TIMEOUT",
+            "UPDATE_ALL_COMPLETION_TOTAL_TIMEOUT_MS",
+            "UPDATE_ALL_COMPLETION_TOTAL_TIMEOUT",
+            "UPDATE_ALL_COMPLETION_ATTEMPT_LIMIT",
+            "UPDATE_ALL_COMPLETION_STDOUT_LIMIT",
+            "UPDATE_ALL_COMPLETION_STDERR_LIMIT",
             "UPDATE_ALL_COMPLETION_HELP_DEPTH",
             "UPDATE_ALL_COMPLETION_HELP_PROBE_LIMIT",
         ]
@@ -2093,7 +2190,26 @@ exit 2
         write_native_command(&bin.join("a"), "a", "a");
         write_native_command(&bin.join("b"), "b", "b");
         let _path = path_with_first(&[&bin]);
-        write_catalog(&layout.catalog, &["uv"], Vec::new());
+        write_catalog(
+            &layout.catalog,
+            &["uv"],
+            vec![
+                json!({
+                    "name": "a",
+                    "provider": "uv",
+                    "enabled": true,
+                    "ambient": true,
+                    "trust_dynamic": true,
+                }),
+                json!({
+                    "name": "b",
+                    "provider": "uv",
+                    "enabled": true,
+                    "ambient": true,
+                    "trust_dynamic": true,
+                }),
+            ],
+        );
 
         fs::write(&mode, "complete_ab\n").unwrap();
         let first = layout.sync("uv", true);
@@ -2237,6 +2353,121 @@ exit 2
             .any(|record| record.status == CompletionSyncRecordStatus::Failed));
         let overlay = overlay_target(&layout.rc_root, "demo");
         assert!(overlay.contains("# update-all-managed-target: _managed_path_demo"));
+    }
+
+    #[test]
+    fn bundled_artifact_presence_and_content_change_invalidate_reuse_then_stabilize() {
+        let _env = env_guard();
+        let _probe_environment = clean_probe_environment();
+        let layout = TestLayout::new();
+        let bin = layout._temp.path().join("bin");
+        let completions = bin.join("completions");
+        fs::create_dir_all(&completions).unwrap();
+        let runner = bin.join("demo");
+        let counter = layout._temp.path().join("probe-count");
+        let fail_marker = layout._temp.path().join("fail-if-probed");
+        write_identity_runner(&runner, &counter, &fail_marker);
+        let bundled = completions.join("demo.zsh");
+        let _path = path_with_first(&[&bin]);
+        let mut candidate = configured_candidate("demo", "uv", &runner, &["A"]);
+        candidate["bundled_completions"] = json!([{
+            "shell": "zsh",
+            "path": "completions/demo.zsh",
+            "id": "provider-zsh",
+        }]);
+        write_catalog(&layout.catalog, &["uv"], vec![candidate]);
+
+        let artifact_x = "#compdef demo\n_demo() {\n  _arguments '--stable[stable artifact]'\n}\n";
+        let artifact_y = "#compdef demo\n_demo() {\n  _arguments '--mutate[mutate artifact]'\n}\n";
+        assert_eq!(
+            artifact_x.len(),
+            artifact_y.len(),
+            "the content-change regression must not be satisfiable by hashing file length alone"
+        );
+
+        let first = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&first, "uv", "demo"),
+            CompletionSyncRecordStatus::Generated
+        );
+        let probes_after_first = read_counter(&counter);
+        assert!(probes_after_first > 0);
+        let artifact_path = first
+            .records
+            .iter()
+            .find(|record| record.provider == "uv" && record.tool == "demo")
+            .and_then(|record| record.artifact.as_deref())
+            .map(PathBuf::from)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&artifact_path).unwrap(), artifact_x);
+
+        let immutable_before_presence = tree_fingerprint(&layout.managed_root, true);
+        let rc_before_presence = tree_fingerprint(&layout.rc_root, false);
+        let current_before_presence = fs::read(layout.managed_root.join("current")).unwrap();
+        let memo_before_presence =
+            fs::read(layout.managed_root.join("identity-memo.json")).unwrap();
+        fs::write(&bundled, artifact_x).unwrap();
+
+        let second = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&second, "uv", "demo"),
+            CompletionSyncRecordStatus::ProbedUnchanged,
+            "a missing bundled artifact becoming present must invalidate strong reuse"
+        );
+        assert_eq!(second.generated, 0);
+        assert_eq!(read_counter(&counter), probes_after_first);
+        assert_eq!(
+            immutable_before_presence,
+            tree_fingerprint(&layout.managed_root, true)
+        );
+        assert_eq!(rc_before_presence, tree_fingerprint(&layout.rc_root, false));
+        assert_eq!(
+            current_before_presence,
+            fs::read(layout.managed_root.join("current")).unwrap()
+        );
+        assert_ne!(
+            memo_before_presence,
+            fs::read(layout.managed_root.join("identity-memo.json")).unwrap()
+        );
+
+        fs::write(&fail_marker, "fail on process probe\n").unwrap();
+        let managed_before_third = tree_fingerprint(&layout.managed_root, false);
+        let rc_before_third = tree_fingerprint(&layout.rc_root, false);
+        let third = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&third, "uv", "demo"),
+            CompletionSyncRecordStatus::Reused
+        );
+        assert_eq!(read_counter(&counter), probes_after_first);
+        assert_eq!(
+            managed_before_third,
+            tree_fingerprint(&layout.managed_root, false)
+        );
+        assert_eq!(rc_before_third, tree_fingerprint(&layout.rc_root, false));
+
+        fs::write(&bundled, artifact_y).unwrap();
+        let fourth = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&fourth, "uv", "demo"),
+            CompletionSyncRecordStatus::Generated,
+            "same-path bundled content changes must invalidate strong reuse"
+        );
+        assert_eq!(read_counter(&counter), probes_after_first);
+        assert_eq!(fs::read_to_string(&artifact_path).unwrap(), artifact_y);
+
+        let managed_before_fifth = tree_fingerprint(&layout.managed_root, false);
+        let rc_before_fifth = tree_fingerprint(&layout.rc_root, false);
+        let fifth = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&fifth, "uv", "demo"),
+            CompletionSyncRecordStatus::Reused
+        );
+        assert_eq!(read_counter(&counter), probes_after_first);
+        assert_eq!(
+            managed_before_fifth,
+            tree_fingerprint(&layout.managed_root, false)
+        );
+        assert_eq!(rc_before_fifth, tree_fingerprint(&layout.rc_root, false));
     }
 
     #[test]

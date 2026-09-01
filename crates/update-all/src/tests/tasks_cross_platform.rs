@@ -2377,6 +2377,8 @@ fn completion_sync_records_render_generation_rows() {
                         .to_string(),
                 ),
                 reason: None,
+                classification: Some(crate::completions::CompletionArtifactClassification::Static),
+                recipe: Some("stdout_protocol:v1:completion-positional:zsh".to_string()),
             },
             crate::completions::CompletionSyncRecord {
                 provider: "npm".to_string(),
@@ -2384,6 +2386,8 @@ fn completion_sync_records_render_generation_rows() {
                 status: CompletionSyncRecordStatus::Unchanged,
                 artifact: Some("/home/example-user/.shellrc.d/shell/completions/_just".to_string()),
                 reason: Some("unchanged".to_string()),
+                classification: Some(crate::completions::CompletionArtifactClassification::Static),
+                recipe: None,
             },
             crate::completions::CompletionSyncRecord {
                 provider: "npm".to_string(),
@@ -2391,6 +2395,8 @@ fn completion_sync_records_render_generation_rows() {
                 status: CompletionSyncRecordStatus::Skipped,
                 artifact: None,
                 reason: Some("unsupported_generator".to_string()),
+                classification: None,
+                recipe: None,
             },
         ],
         catalog_used: PathBuf::from("catalog.json"),

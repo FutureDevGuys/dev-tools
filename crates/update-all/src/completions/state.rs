@@ -1,4 +1,7 @@
-use super::{CompletionBindingIdentity, CompletionCandidateIdentity};
+use super::native::NativeRecipeMemo;
+use super::{
+    CompletionArtifactClassification, CompletionBindingIdentity, CompletionCandidateIdentity,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -23,6 +26,10 @@ pub(super) struct CompletionCandidateMemo {
     pub resolution_fingerprint: String,
     pub artifact_path: PathBuf,
     pub artifact_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_classification: Option<CompletionArtifactClassification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successful_recipe: Option<NativeRecipeMemo>,
     pub priority: Option<i64>,
     pub managed_required: bool,
 }

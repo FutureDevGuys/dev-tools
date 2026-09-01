@@ -310,6 +310,7 @@ pub struct CompletionToolConfig {
     pub enabled: bool,
     pub managed_required: bool,
     pub priority: Option<i64>,
+    pub trust_dynamic: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -565,6 +566,7 @@ struct FileCompletionToolConfig {
     enabled: Option<bool>,
     managed_required: Option<bool>,
     priority: Option<i64>,
+    trust_dynamic: Option<bool>,
 }
 
 pub struct ConfigValidationReport {
@@ -1055,6 +1057,7 @@ fn parse_completion_tool_config(
         enabled: tool.enabled.unwrap_or(true),
         managed_required: tool.managed_required.unwrap_or(false),
         priority: tool.priority,
+        trust_dynamic: tool.trust_dynamic.unwrap_or(false),
     })
 }
 
@@ -1989,6 +1992,7 @@ pub fn merge_user_completion_catalog(
             existing.enabled = Some(tool.enabled);
             existing.managed_required = Some(tool.managed_required);
             existing.priority = tool.priority;
+            existing.trust_dynamic = tool.trust_dynamic;
         } else {
             tools.push(RegistryTool {
                 name: tool.name.clone(),
@@ -1996,9 +2000,12 @@ pub fn merge_user_completion_catalog(
                 enabled: Some(tool.enabled),
                 managed_required: Some(tool.managed_required),
                 priority: tool.priority,
-                ambient: false,
+                ambient: tool.provider == "path",
+                trust_dynamic: tool.trust_dynamic,
                 command: None,
                 command_candidates: Vec::new(),
+                bundled_completions: Vec::new(),
+                completion_recipes: Vec::new(),
             });
         }
     }

@@ -1,5 +1,6 @@
 mod engine;
 mod generator;
+mod native;
 pub(crate) mod registry;
 mod state;
 mod store;
@@ -81,6 +82,22 @@ pub struct CompletionSyncResult {
     pub effective_catalog: Registry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionArtifactClassification {
+    Static,
+    Dynamic,
+}
+
+impl CompletionArtifactClassification {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionSyncRecord {
     pub provider: String,
@@ -88,6 +105,8 @@ pub struct CompletionSyncRecord {
     pub status: CompletionSyncRecordStatus,
     pub artifact: Option<String>,
     pub reason: Option<String>,
+    pub classification: Option<CompletionArtifactClassification>,
+    pub recipe: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +136,28 @@ impl CompletionSyncRecord {
             status,
             artifact: artifact.map(|path| path.display().to_string()),
             reason,
+            classification: None,
+            recipe: None,
+        }
+    }
+
+    fn with_artifact_details(
+        provider: &str,
+        tool: &str,
+        status: CompletionSyncRecordStatus,
+        artifact: Option<&Path>,
+        reason: Option<String>,
+        classification: Option<CompletionArtifactClassification>,
+        recipe: Option<String>,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            tool: tool.to_string(),
+            status,
+            artifact: artifact.map(|path| path.display().to_string()),
+            reason,
+            classification,
+            recipe,
         }
     }
 
@@ -127,6 +168,8 @@ impl CompletionSyncRecord {
             status: CompletionSyncRecordStatus::Skipped,
             artifact: None,
             reason: Some(reason.into()),
+            classification: None,
+            recipe: None,
         }
     }
 
@@ -137,6 +180,8 @@ impl CompletionSyncRecord {
             status: CompletionSyncRecordStatus::Failed,
             artifact: None,
             reason: Some(reason.into()),
+            classification: None,
+            recipe: None,
         }
     }
 }
@@ -436,6 +481,9 @@ fn validate_completion_overlay_names(registry: &Registry) -> Result<()> {
         let provider = tool.provider.as_deref().unwrap_or("npm").trim();
         if provider.is_empty() {
             continue;
+        }
+        if let Err(reason) = native::validate_catalog_native_tool(tool) {
+            anyhow::bail!(reason);
         }
         if !slots.insert((provider.to_string(), name.to_string())) {
             anyhow::bail!(
