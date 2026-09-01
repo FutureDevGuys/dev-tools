@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -76,7 +76,6 @@ pub fn build_setup_plan_v3_at(
     };
     if installation.request.mode != expected_install_mode
         || installation.request.activate_transparent_launchers
-            != (intent.activation == Activation::Transparent)
     {
         bail!("deployment intent and staged installation plan disagree");
     }
@@ -175,6 +174,41 @@ pub fn render_setup_plan_v3(plan: &SetupPlanV3) -> Result<(Vec<u8>, String)> {
     Ok((bytes, digest))
 }
 
+pub fn write_setup_plan_v3_at(path: &Path, plan: &SetupPlanV3) -> Result<String> {
+    if !path.is_absolute() {
+        bail!("setup plan v3 output path must be absolute");
+    }
+    let parent = path.parent().context("setup plan v3 path has no parent")?;
+    if !parent.is_dir() {
+        bail!("setup plan v3 parent is not a directory");
+    }
+    let (bytes, digest) = render_setup_plan_v3(plan)?;
+    let temporary = path.with_extension(format!("new-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .context("create temporary setup plan v3")?;
+    file.write_all(&bytes).context("write setup plan v3")?;
+    file.sync_all().context("sync setup plan v3")?;
+    drop(file);
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(digest),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error).context("publish setup plan v3")
+        }
+    }
+}
+
+pub fn read_setup_plan_v3_at(path: &Path) -> Result<SetupPlanV3> {
+    let bytes = read_bounded(path)?;
+    let plan: SetupPlanV3 = serde_json::from_slice(&bytes).context("parse setup plan v3")?;
+    validate_setup_plan_v3(&plan)?;
+    Ok(plan)
+}
+
 fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
     if plan.schema != "dev-auth-setup-plan-v3"
         || plan.intent_sha256 != sha256_hex(&canonical_deployment_intent(&plan.intent)?)
@@ -191,6 +225,9 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
         bail!("dev-auth setup plan v3 has an unsupported contract");
     }
     render_plan(&plan.installation).context("validate nested installation plan")?;
+    if plan.installation.request.activate_transparent_launchers {
+        bail!("setup plan v3 must stage the release with transparent launchers inactive");
+    }
     Ok(())
 }
 
@@ -318,7 +355,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
         bail!("setup source document has unsafe filesystem authority");
     }
     let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(DOCUMENT_LIMIT + 1)
         .read_to_end(&mut bytes)
         .context("read setup source document")?;

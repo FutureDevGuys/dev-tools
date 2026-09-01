@@ -29,6 +29,8 @@ mod runtime;
 pub mod setup;
 #[cfg(unix)]
 pub mod setup_v3;
+#[cfg(unix)]
+pub mod stable_release;
 #[cfg(target_os = "linux")]
 pub mod supervisor;
 

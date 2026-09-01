@@ -6,6 +6,8 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+use ureq::ResponseExt;
 
 const METADATA_LIMIT: usize = 512 * 1024;
 const ARTIFACT_LIMIT: usize = 256 * 1024 * 1024;
@@ -72,6 +74,20 @@ pub struct SelectedReleaseAssets {
     pub version: Version,
     pub root_url: String,
     pub manifest_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsPolicy {
+    pub allowed_hosts: BTreeSet<String>,
+    pub max_redirects: u32,
+    pub timeout: Duration,
+    pub user_agent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsResponse {
+    pub bytes: Vec<u8>,
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +269,105 @@ pub fn select_stable_release_assets(
         root_url: find_asset(root_asset_name)?,
         manifest_url: find_asset(manifest_asset_name)?,
     })
+}
+
+pub fn fetch_https(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    etag: Option<&str>,
+) -> Result<HttpsResponse> {
+    validate_https_request(url, policy, limit)?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .http_status_as_error(false)
+        .max_redirects(policy.max_redirects)
+        .max_redirects_will_error(true)
+        .save_redirect_history(true)
+        .timeout_global(Some(policy.timeout))
+        .user_agent(policy.user_agent.clone())
+        .build()
+        .into();
+    let mut request = agent.get(url).header(
+        "Accept",
+        if url.starts_with("https://api.github.com/") {
+            "application/vnd.github+json"
+        } else {
+            "application/octet-stream"
+        },
+    );
+    if let Some(etag) = etag {
+        if etag.is_empty() || etag.contains(['\r', '\n', '\0']) {
+            bail!("release ETag is invalid");
+        }
+        request = request.header("If-None-Match", etag);
+    }
+    let mut response = request.call().with_context(|| format!("GET {url}"))?;
+    if response.status().as_u16() == 304 {
+        bail!("release response was not modified");
+    }
+    if !response.status().is_success() {
+        bail!("GET {url} returned HTTP {}", response.status());
+    }
+    if let Some(history) = response.get_redirect_history() {
+        for uri in history {
+            if uri.scheme_str() != Some("https")
+                || !policy
+                    .allowed_hosts
+                    .contains(uri.host().unwrap_or_default())
+            {
+                bail!("release request traversed an untrusted redirect");
+            }
+        }
+    }
+    let final_uri = response.get_uri();
+    if final_uri.scheme_str() != Some("https")
+        || !policy
+            .allowed_hosts
+            .contains(final_uri.host().unwrap_or_default())
+    {
+        bail!("release request resolved to an untrusted origin");
+    }
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_vec()
+        .with_context(|| format!("read bounded response from {url}"))?;
+    if bytes.is_empty() || bytes.len() as u64 > limit {
+        bail!("release response is empty or exceeds its size bound");
+    }
+    Ok(HttpsResponse { bytes, etag })
+}
+
+fn validate_https_request(url: &str, policy: &HttpsPolicy, limit: u64) -> Result<()> {
+    if limit == 0 || limit as usize > ARTIFACT_LIMIT {
+        bail!("release response size bound is invalid");
+    }
+    if policy.allowed_hosts.is_empty()
+        || policy.max_redirects > 5
+        || policy.timeout.is_zero()
+        || policy.timeout > Duration::from_secs(120)
+        || policy.user_agent.is_empty()
+        || policy.user_agent.len() > 256
+        || policy.user_agent.contains(['\r', '\n', '\0'])
+    {
+        bail!("release HTTPS policy is invalid");
+    }
+    let parsed: ureq::http::Uri = url.parse().context("parse release URL")?;
+    if parsed.scheme_str() != Some("https")
+        || !policy
+            .allowed_hosts
+            .contains(parsed.host().unwrap_or_default())
+    {
+        bail!("release URL is outside the allowed HTTPS origins");
+    }
+    Ok(())
 }
 
 pub fn accept_verified_release(

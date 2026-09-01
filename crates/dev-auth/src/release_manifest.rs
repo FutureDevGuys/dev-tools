@@ -1,9 +1,13 @@
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64;
+#[cfg(test)]
 use base64::Engine as _;
-use ed25519_dalek::{Signature, VerifyingKey};
+use dev_tools_release::{ArtifactUrlPolicy, ReleaseAuthority, ReleaseBundle};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -17,6 +21,7 @@ const TRUSTED_ROOT: &str = include_str!("../trust/root-public-key.txt");
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct SignedEnvelope<T> {
     signed: T,
     signatures: Vec<DocumentSignature>,
@@ -24,6 +29,7 @@ struct SignedEnvelope<T> {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct DocumentSignature {
     key_id: String,
     signature: String,
@@ -31,6 +37,7 @@ struct DocumentSignature {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct RootDocument {
     schema: String,
     generation: u64,
@@ -39,6 +46,7 @@ struct RootDocument {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct ReleaseKey {
     key_id: String,
     public_key: String,
@@ -48,6 +56,7 @@ struct ReleaseKey {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct DevAuthManifest {
     schema: String,
     product: String,
@@ -60,6 +69,7 @@ struct DevAuthManifest {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct ArtifactIdentity {
     url: String,
     length: u64,
@@ -121,132 +131,45 @@ fn verify_release_documents(
     trusted_root: &str,
     target: &str,
 ) -> Result<VerifiedDevAuthRelease> {
-    let root: SignedEnvelope<RootDocument> =
-        serde_json::from_slice(root_bytes).context("parse trusted root document")?;
-    if root.signed.schema != "dev-tools-root-v1" || root.signed.generation == 0 {
-        bail!("release root document has an unsupported contract");
-    }
-    verify_any_signature(&root, &parse_public_key(trusted_root)?)
-        .context("verify release root document")?;
-
-    let manifest: SignedEnvelope<DevAuthManifest> =
-        serde_json::from_slice(manifest_bytes).context("parse dev-auth release manifest")?;
-    verify_release_signature(&manifest, &root.signed)?;
-    validate_manifest(&manifest.signed, target)?;
-    let artifact = manifest
-        .signed
-        .artifacts
-        .get(target)
-        .context("release manifest has no artifact for this platform")?;
-    if artifact.length != artifact_bytes.len() as u64
-        || artifact.sha256 != format!("{:x}", Sha256::digest(artifact_bytes))
-    {
-        bail!("release artifact does not match the signed manifest");
-    }
+    let verified = dev_tools_release::verify_release_bytes(
+        &ReleaseBundle {
+            root: root_bytes.to_vec(),
+            manifest: manifest_bytes.to_vec(),
+            artifact: artifact_bytes.to_vec(),
+        },
+        &ReleaseAuthority {
+            trusted_root_key: trusted_root.into(),
+            product: "dev-auth".into(),
+            accepted_manifest_schemas: vec!["dev-auth-product-v2".into()],
+            target: target.into(),
+            artifact_url: ArtifactUrlPolicy::GitHubRelease {
+                owner: "FutureDevGuys".into(),
+                repository: "dev-tools".into(),
+            },
+            require_source_commit: true,
+            engine_protocol: 1,
+        },
+    )?;
+    let source_commit = verified
+        .source_commit
+        .context("verified dev-auth release has no source commit")?;
 
     Ok(VerifiedDevAuthRelease {
         schema: "dev-auth-verified-release-v1".into(),
         root_path: paths.root.to_path_buf(),
         manifest_path: paths.manifest.to_path_buf(),
-        root_generation: root.signed.generation,
-        manifest_generation: manifest.signed.generation,
-        version: manifest.signed.version,
-        source_commit: manifest.signed.source_commit,
-        target: target.to_owned(),
+        root_generation: verified.root_generation,
+        manifest_generation: verified.manifest_generation,
+        version: verified.version.to_string(),
+        source_commit,
+        target: verified.target,
         artifact_path: paths.artifact.to_path_buf(),
-        artifact_url: artifact.url.clone(),
-        artifact_length: artifact.length,
-        artifact_sha256: artifact.sha256.clone(),
-        root_sha256: format!("{:x}", Sha256::digest(root_bytes)),
-        manifest_sha256: format!("{:x}", Sha256::digest(manifest_bytes)),
+        artifact_url: verified.artifact_url,
+        artifact_length: verified.artifact_length,
+        artifact_sha256: verified.artifact_sha256,
+        root_sha256: verified.root_sha256,
+        manifest_sha256: verified.manifest_sha256,
     })
-}
-
-fn validate_manifest(manifest: &DevAuthManifest, target: &str) -> Result<()> {
-    if manifest.schema != "dev-auth-product-v2"
-        || manifest.product != "dev-auth"
-        || manifest.engine_protocol != 1
-        || manifest.generation == 0
-        || !valid_version(&manifest.version)
-        || !valid_hex(&manifest.source_commit, 40)
-        || manifest.artifacts.len() != 1
-    {
-        bail!("release manifest has an unsupported contract");
-    }
-    let artifact = manifest
-        .artifacts
-        .get(target)
-        .context("release manifest has no artifact for this platform")?;
-    if artifact.length == 0 || artifact.length > ARTIFACT_LIMIT || !valid_hex(&artifact.sha256, 64)
-    {
-        bail!("release manifest artifact identity is invalid");
-    }
-    let encoded_tag = format!("dev-auth%2Fv{}", manifest.version);
-    let expected_name = format!("dev-auth-{}-{target}", manifest.version);
-    let expected_url = format!(
-        "https://github.com/FutureDevGuys/dev-tools/releases/download/{encoded_tag}/{expected_name}"
-    );
-    if artifact.url != expected_url {
-        bail!("release manifest artifact URL is outside the product authority");
-    }
-    Ok(())
-}
-
-fn verify_release_signature(
-    manifest: &SignedEnvelope<DevAuthManifest>,
-    root: &RootDocument,
-) -> Result<()> {
-    let canonical = serde_jcs::to_vec(&manifest.signed).context("canonicalize release manifest")?;
-    for signature in &manifest.signatures {
-        let Some(key) = root
-            .release_keys
-            .iter()
-            .find(|key| key.key_id == signature.key_id && !key.revoked)
-        else {
-            continue;
-        };
-        let key = parse_public_key(&key.public_key)?;
-        if verify_signature(&key, &canonical, &signature.signature).is_ok() {
-            return Ok(());
-        }
-    }
-    bail!("release manifest has no valid authorized signature")
-}
-
-fn verify_any_signature<T: Serialize>(
-    envelope: &SignedEnvelope<T>,
-    key: &VerifyingKey,
-) -> Result<()> {
-    let canonical = serde_jcs::to_vec(&envelope.signed).context("canonicalize signed document")?;
-    if envelope
-        .signatures
-        .iter()
-        .any(|signature| verify_signature(key, &canonical, &signature.signature).is_ok())
-    {
-        return Ok(());
-    }
-    bail!("signed document has no valid trusted signature")
-}
-
-fn verify_signature(key: &VerifyingKey, message: &[u8], encoded: &str) -> Result<()> {
-    let bytes = BASE64.decode(encoded).context("decode Ed25519 signature")?;
-    let signature = Signature::try_from(bytes.as_slice()).context("parse Ed25519 signature")?;
-    key.verify_strict(message, &signature)
-        .context("verify Ed25519 signature")
-}
-
-fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
-    if !valid_hex(encoded, 64) {
-        bail!("release public key is invalid");
-    }
-    let bytes = (0..encoded.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("release public key length is invalid"))?;
-    VerifyingKey::from_bytes(&bytes).context("parse release public key")
 }
 
 fn read_public_file(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
@@ -279,19 +202,7 @@ fn open_public_file(path: &Path) -> Result<File> {
     options.open(path).context("open public release file")
 }
 
-fn valid_hex(value: &str, length: usize) -> bool {
-    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn valid_version(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
-}
-
-fn target_id() -> Result<String> {
+pub fn target_id() -> Result<String> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "macos",

@@ -289,17 +289,8 @@ pub fn build_verified_release_plan(
     activate_transparent_launchers: bool,
     verified: crate::release_manifest::VerifiedDevAuthRelease,
 ) -> Result<SetupPlan> {
-    let current = fs::canonicalize(std::env::current_exe()?)
-        .context("resolve the running release candidate")?;
     let artifact = fs::canonicalize(&verified.artifact_path)
         .context("resolve the verified release artifact")?;
-    let build = crate::build_info();
-    if current != artifact
-        || build.version != verified.version
-        || build.source_commit != Some(verified.source_commit.as_str())
-    {
-        bail!("verified release identity does not match the running setup executable");
-    }
     let paths = match mode {
         InstallMode::Strong => SetupPaths::strong(),
         InstallMode::UserOnly => {
@@ -1778,11 +1769,19 @@ pub fn start_system_broker() -> Result<SetupReport> {
     if !nix::unistd::Uid::effective().is_root() {
         bail!("system broker activation requires root");
     }
-    let (paths, receipt) = current_installation()?;
+    let (paths, _) = current_installation()?;
+    start_system_broker_at(&paths)
+}
+
+pub fn start_system_broker_at(paths: &SetupPaths) -> Result<SetupReport> {
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("system broker activation requires root and the system layout");
+    }
+    let receipt = read_receipt(&paths.receipt_path())?;
     if receipt.mode != InstallMode::Strong {
         bail!("system broker activation requires a strong installation");
     }
-    verify_at(&paths)?;
+    verify_at(paths)?;
     let policy = crate::policy_store::load_system_policy()?;
     if Path::new(&policy.programs.git) != Path::new(&receipt.native_git)
         || Path::new(&policy.programs.gh) != Path::new(&receipt.native_gh)
@@ -1820,7 +1819,7 @@ pub fn start_system_broker() -> Result<SetupReport> {
         "activate broker sockets",
     )?;
     match crate::broker_client::probe_system_broker() {
-        crate::broker_protocol::BrokerSessionProbe::NoSession => verify_at(&paths),
+        crate::broker_protocol::BrokerSessionProbe::NoSession => verify_at(paths),
         crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {
             bail!("system broker activation ran inside an admitted workload")
         }
@@ -1835,7 +1834,15 @@ pub fn stop_system_broker() -> Result<SetupReport> {
     if !nix::unistd::Uid::effective().is_root() {
         bail!("system broker deactivation requires root");
     }
-    let (paths, receipt) = current_installation()?;
+    let (paths, _) = current_installation()?;
+    stop_system_broker_at(&paths)
+}
+
+pub fn stop_system_broker_at(paths: &SetupPaths) -> Result<SetupReport> {
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("system broker deactivation requires root and the system layout");
+    }
+    let receipt = read_receipt(&paths.receipt_path())?;
     if receipt.mode != InstallMode::Strong {
         bail!("system broker deactivation requires a strong installation");
     }
@@ -1853,7 +1860,7 @@ pub fn stop_system_broker() -> Result<SetupReport> {
         ],
         "stop broker services",
     )?;
-    verify_at(&paths)
+    verify_at(paths)
 }
 
 fn run_system_command(program: &Path, arguments: &[&OsStr], description: &str) -> Result<()> {
@@ -1939,7 +1946,15 @@ pub fn rotate_system_service_credential(value: &[u8]) -> Result<()> {
     if nix::unistd::Uid::effective().as_raw() != 0 {
         bail!("system service credential rotation requires root");
     }
-    require_stopped_strong_installation()?;
+    let (paths, _) = current_installation()?;
+    rotate_system_service_credential_at(&paths, value)
+}
+
+pub fn rotate_system_service_credential_at(paths: &SetupPaths, value: &[u8]) -> Result<()> {
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("system service credential rotation requires root and the system layout");
+    }
+    require_stopped_strong_installation_at(paths)?;
     store_system_service_credential_at(
         Path::new("/usr/bin/systemd-creds"),
         Path::new(SYSTEM_CREDENTIAL_PATH),
@@ -1953,7 +1968,15 @@ pub fn revoke_system_service_credential() -> Result<()> {
     if nix::unistd::Uid::effective().as_raw() != 0 {
         bail!("system service credential revocation requires root");
     }
-    require_stopped_strong_installation()?;
+    let (paths, _) = current_installation()?;
+    revoke_system_service_credential_at(&paths)
+}
+
+pub fn revoke_system_service_credential_at(paths: &SetupPaths) -> Result<()> {
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("system service credential revocation requires root and the system layout");
+    }
+    require_stopped_strong_installation_at(paths)?;
     let path = Path::new(SYSTEM_CREDENTIAL_PATH);
     let metadata = fs::symlink_metadata(path).context("inspect system service credential")?;
     if !metadata.file_type().is_file()
@@ -1967,7 +1990,12 @@ pub fn revoke_system_service_credential() -> Result<()> {
 }
 
 fn require_stopped_strong_installation() -> Result<()> {
-    let (_, receipt) = current_installation()?;
+    let (paths, _) = current_installation()?;
+    require_stopped_strong_installation_at(&paths)
+}
+
+fn require_stopped_strong_installation_at(paths: &SetupPaths) -> Result<()> {
+    let receipt = read_receipt(&paths.receipt_path())?;
     if receipt.mode != InstallMode::Strong || !receipt.transparent_aliases.is_empty() {
         bail!("operation requires a stopped, deactivated strong installation");
     }
@@ -1991,6 +2019,10 @@ pub fn system_service_credential_ready() -> bool {
             && metadata.len() > 0
             && metadata.len() <= BINARY_LIMIT
     })
+}
+
+pub fn user_service_credential_ready() -> bool {
+    crate::runtime::user_broker_service_token().is_ok()
 }
 
 pub fn install_system_policy(source: &Path, approved_sha256: &str) -> Result<PathBuf> {
@@ -2041,6 +2073,30 @@ pub fn install_user_policy(source: &Path, approved_sha256: &str) -> Result<PathB
     Ok(destination)
 }
 
+pub fn install_user_policy_for_account_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+) -> Result<PathBuf> {
+    let user = nix::unistd::User::from_name(user_name)?
+        .context("user-only policy names an unknown native account")?;
+    let owner_uid = user.uid.as_raw();
+    if nix::unistd::Uid::effective() != user.uid || *paths != SetupPaths::user_only(&user.dir) {
+        bail!("user-only policy requires its native account layout");
+    }
+    let receipt = read_receipt(&paths.receipt_path())?;
+    if receipt.mode != InstallMode::UserOnly {
+        bail!("user-only policy cannot configure a strong installation");
+    }
+    let bytes = read_approved_public_document(source, approved_sha256)?;
+    let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
+    validate_user_policy_programs(&policy, &user, owner_uid)?;
+    let destination = crate::policy_store::user_policy_path(&user);
+    install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
+    Ok(destination)
+}
+
 pub fn update_user_policy(
     source: &Path,
     approved_sha256: &str,
@@ -2078,6 +2134,81 @@ pub fn update_user_policy(
 
 pub fn install_user_config(source: &Path, approved_sha256: &str) -> Result<PathBuf> {
     install_or_update_user_config(source, approved_sha256, None)
+}
+
+pub fn install_strong_user_config(
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+) -> Result<PathBuf> {
+    install_user_config_for_account_at(&SetupPaths::strong(), source, approved_sha256, user_name)
+}
+
+pub fn install_user_config_for_account_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+) -> Result<PathBuf> {
+    let user = nix::unistd::User::from_name(user_name)?
+        .context("user configuration names an unknown native account")?;
+    let bytes = read_approved_public_document(source, approved_sha256)?;
+    let user_config = crate::policy_v2::parse_user_config_v2(&bytes)?;
+    let installation = read_receipt(&paths.receipt_path())?;
+    match installation.mode {
+        InstallMode::Strong => {
+            if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+                bail!("strong user configuration requires root and the system layout");
+            }
+        }
+        InstallMode::UserOnly => {
+            if nix::unistd::Uid::effective() != user.uid
+                || *paths != SetupPaths::user_only(&user.dir)
+            {
+                bail!("user-only configuration requires its native account layout");
+            }
+        }
+    }
+    let policy = match installation.mode {
+        InstallMode::Strong => crate::policy_store::load_system_policy()?,
+        InstallMode::UserOnly => crate::policy_store::load_user_policy_at(
+            &crate::policy_store::user_policy_path(&user),
+            user.uid.as_raw(),
+        )?,
+    };
+    if !policy
+        .allowed_users
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
+    {
+        bail!("native user is outside administrator policy");
+    }
+    let resolved = crate::policy_v2::resolve_policy(&policy, &user_config)?;
+    let executable = PathBuf::from(&installation.executable);
+    let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
+    let owner_uid = user.uid.as_raw();
+    preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
+    preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+    let destination = crate::policy_store::user_config_path(&user);
+    reconcile_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
+    reconcile_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != owner_uid
+                || metadata.mode() & 0o777 != 0o600
+                || fs::read(&destination)? != bytes
+            {
+                bail!("user configuration already exists with unapproved drift");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
+        }
+        Err(error) => return Err(error).context("inspect user configuration"),
+    }
+    Ok(destination)
 }
 
 pub fn update_user_config(
@@ -2411,7 +2542,13 @@ pub fn reconcile_desktop_entries_at(
         owner_uid,
         0o755,
     )?;
-    write_private_public_document(&receipt_path, &bytes, "desktop entry receipt")
+    write_owned_public_document(
+        &receipt_path,
+        &bytes,
+        owner_uid,
+        0o600,
+        "desktop entry receipt",
+    )
 }
 
 fn write_public_user_file(
@@ -2438,6 +2575,7 @@ fn write_public_user_file(
         .with_context(|| format!("sync {description}"))?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
         .with_context(|| format!("set {description} permissions"))?;
+    set_owner_if_root(&temporary, owner_uid)?;
     match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -2572,7 +2710,56 @@ pub fn reconcile_workload_launchers_at(
         .parent()
         .context("workload alias receipt has no parent")?;
     ensure_directory_chain_for_owner(parent, owner_uid, 0o755)?;
-    write_private_public_document(&path, &bytes, "workload alias receipt")
+    write_owned_public_document(&path, &bytes, owner_uid, 0o600, "workload alias receipt")
+}
+
+fn write_owned_public_document(
+    path: &Path,
+    content: &[u8],
+    owner_uid: u32,
+    mode: u32,
+    description: &str,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{description} path has no parent"))?;
+    ensure_directory_chain_for_owner(parent, owner_uid, 0o755)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != owner_uid
+                || metadata.mode() & 0o777 != mode
+            {
+                bail!("{description} has unsafe replacement authority");
+            }
+            if fs::read(path)? == content {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {description}")),
+    }
+    let temporary = path.with_extension(format!("new-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .with_context(|| format!("create temporary {description}"))?;
+    if let Err(error) = (|| -> Result<()> {
+        file.write_all(content)?;
+        file.sync_all()?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        set_owner_if_root(&temporary, owner_uid)?;
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("publish {description}"));
+    }
+    Ok(())
 }
 
 fn read_workload_alias_receipt(
@@ -2868,6 +3055,7 @@ fn install_policy_document(
     file.sync_all().context("sync configuration document")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
         .context("set configuration document permissions")?;
+    set_owner_if_root(&temporary, owner_uid)?;
     fs::rename(&temporary, destination).context("publish configuration document")
 }
 
@@ -2995,7 +3183,22 @@ fn ensure_directory_chain_for_owner(path: &Path, owner_uid: u32, mode: u32) -> R
     fs::create_dir(path).with_context(|| format!("create {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("set permissions on {}", path.display()))?;
+    set_owner_if_root(path, owner_uid)?;
     Ok(())
+}
+
+fn set_owner_if_root(path: &Path, owner_uid: u32) -> Result<()> {
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect owned path {}", path.display()))?
+        .uid();
+    if current == owner_uid {
+        return Ok(());
+    }
+    if !nix::unistd::Uid::effective().is_root() {
+        bail!("created path does not belong to the native user");
+    }
+    nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(owner_uid)), None)
+        .with_context(|| format!("assign native ownership to {}", path.display()))
 }
 
 fn system_asset_digests() -> BTreeMap<String, String> {

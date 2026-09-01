@@ -187,7 +187,7 @@ ssh_keygen = "/usr/bin/ssh-keygen"
             r#"schema = "dev-auth-deployment-v1"
 mode = "user-only"
 channel = "stable"
-activation = "inactive"
+activation = "transparent"
 administrator_policy = "{}"
 [[users]]
 name = "{}"
@@ -207,7 +207,7 @@ config = "{}"
         DeploymentCliInput {
             mode: Some(DeploymentMode::UserOnly),
             channel: Some(Channel::Stable),
-            activation: Some(Activation::Inactive),
+            activation: Some(Activation::Transparent),
             administrator_policy: Some(policy),
             user_configs: vec![(user.name, config)],
             user_policies: Vec::new(),
@@ -225,5 +225,15 @@ config = "{}"
         render_setup_plan_v3(&cli_plan).unwrap()
     );
     assert_eq!(document_plan.schema, "dev-auth-setup-plan-v3");
+    assert!(
+        !document_plan
+            .installation
+            .request
+            .activate_transparent_launchers
+    );
+    assert_eq!(
+        document_plan.actions[document_plan.actions.len() - 2].kind,
+        "activate_transparent_launchers"
+    );
     assert_eq!(document_plan.actions.last().unwrap().kind, "verify");
 }

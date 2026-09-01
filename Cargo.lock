@@ -942,6 +942,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "dev-tools-release",
  "directories",
  "ed25519-dalek 2.2.0",
  "fs2",
@@ -1012,6 +1013,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

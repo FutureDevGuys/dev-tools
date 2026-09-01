@@ -1,7 +1,12 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 const DOCUMENT_LIMIT: usize = 1024 * 1024;
 
@@ -96,6 +101,41 @@ pub fn parse_deployment_document(input: &[u8]) -> Result<DeploymentDocument> {
         toml::from_str(text).context("parse dev-auth deployment document")?;
     validate_document(&document)?;
     Ok(document)
+}
+
+pub fn read_deployment_document(path: &Path) -> Result<DeploymentDocument> {
+    if !path.is_absolute() {
+        bail!("deployment document path must be absolute");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open deployment document {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect deployment document {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() as usize > DOCUMENT_LIMIT
+    {
+        bail!("deployment document has unsafe filesystem authority");
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 || metadata.mode() & 0o022 != 0 {
+        bail!("deployment document has unsafe filesystem authority");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(DOCUMENT_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("read deployment document")?;
+    if bytes.len() as u64 != metadata.len() {
+        bail!("deployment document changed while being read");
+    }
+    parse_deployment_document(&bytes)
 }
 
 pub fn normalize_deployment(
@@ -358,6 +398,55 @@ fn normalized_absolute_path(path: &Path, description: &str) -> Result<PathBuf> {
         bail!("{description} path cannot be the filesystem root");
     }
     Ok(normalized)
+}
+
+impl FromStr for DeploymentMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "strong" => Ok(Self::Strong),
+            "user-only" => Ok(Self::UserOnly),
+            _ => bail!("deployment mode must be strong or user-only"),
+        }
+    }
+}
+
+impl FromStr for Channel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "stable" => Ok(Self::Stable),
+            _ => bail!("release channel must be stable"),
+        }
+    }
+}
+
+impl FromStr for Activation {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "transparent" => Ok(Self::Transparent),
+            "inactive" => Ok(Self::Inactive),
+            _ => bail!("activation must be transparent or inactive"),
+        }
+    }
+}
+
+impl FromStr for CredentialIntent {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "preserve" => Ok(Self::Preserve),
+            "enroll-if-absent" => Ok(Self::EnrollIfAbsent),
+            "rotate" => Ok(Self::Rotate),
+            "revoke" => Ok(Self::Revoke),
+            _ => bail!("credential intent must be preserve, enroll-if-absent, rotate, or revoke"),
+        }
+    }
 }
 
 #[cfg(test)]

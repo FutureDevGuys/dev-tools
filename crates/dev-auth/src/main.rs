@@ -19,7 +19,7 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup apply --plan PATH --sha256 HEX\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -456,18 +456,81 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             Ok(0)
         }
         "plan" => {
-            let mut mode = None;
+            let mut deployment = None;
             let mut output = None;
-            let mut activate = false;
+            let mut format = None;
+            let mut cli = dev_auth::deployment::DeploymentCliInput::default();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
-                    "--mode" if mode.is_none() => {
-                        mode = Some(arguments.next().context("--mode requires a value")?)
+                    "--deployment" if deployment.is_none() => {
+                        deployment = Some(arguments.next().context("--deployment requires a path")?)
+                    }
+                    "--mode" if cli.mode.is_none() => {
+                        cli.mode = Some(
+                            arguments
+                                .next()
+                                .context("--mode requires a value")?
+                                .parse()?,
+                        )
+                    }
+                    "--channel" if cli.channel.is_none() => {
+                        cli.channel = Some(
+                            arguments
+                                .next()
+                                .context("--channel requires a value")?
+                                .parse()?,
+                        )
+                    }
+                    "--activation" if cli.activation.is_none() => {
+                        cli.activation = Some(
+                            arguments
+                                .next()
+                                .context("--activation requires a value")?
+                                .parse()?,
+                        )
+                    }
+                    "--administrator-policy" if cli.administrator_policy.is_none() => {
+                        cli.administrator_policy = Some(std::path::PathBuf::from(
+                            arguments
+                                .next()
+                                .context("--administrator-policy requires a path")?,
+                        ))
+                    }
+                    "--user-config" => {
+                        let value = arguments
+                            .next()
+                            .context("--user-config requires USER=PATH")?;
+                        let (user, path) = value
+                            .split_once('=')
+                            .context("--user-config requires USER=PATH")?;
+                        cli.user_configs
+                            .push((user.into(), std::path::PathBuf::from(path)));
+                    }
+                    "--user-policy" => {
+                        let value = arguments
+                            .next()
+                            .context("--user-policy requires USER=PATH")?;
+                        let (user, path) = value
+                            .split_once('=')
+                            .context("--user-policy requires USER=PATH")?;
+                        cli.user_policies
+                            .push((user.into(), std::path::PathBuf::from(path)));
+                    }
+                    "--credential-intent" => {
+                        let value = arguments
+                            .next()
+                            .context("--credential-intent requires SLOT=INTENT")?;
+                        let (slot, intent) = value
+                            .split_once('=')
+                            .context("--credential-intent requires SLOT=INTENT")?;
+                        cli.credential_intents.push((slot.into(), intent.parse()?));
                     }
                     "--output" if output.is_none() => {
                         output = Some(arguments.next().context("--output requires a path")?)
                     }
-                    "--activate" if !activate => activate = true,
+                    "--format" if format.is_none() => {
+                        format = Some(arguments.next().context("--format requires a value")?)
+                    }
                     _ => bail!("setup plan received an unsupported or duplicate argument"),
                 }
             }
@@ -476,10 +539,61 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if !output.is_absolute() {
                 bail!("setup plan output path must be absolute");
             }
-            let plan = dev_auth::setup::discover_plan(setup_mode(mode.as_deref())?, activate)?;
-            let digest = dev_auth::setup::write_plan_at(&output, &plan)?;
-            println!("setup_plan_path={}", output.display());
-            println!("setup_plan_sha256={digest}");
+            let format = format.as_deref().unwrap_or("human");
+            if !matches!(format, "human" | "json") {
+                bail!("setup plan format must be human or json");
+            }
+            let document = deployment
+                .map(|value| {
+                    dev_auth::deployment::read_deployment_document(&std::path::PathBuf::from(value))
+                })
+                .transpose()?;
+            let intent = dev_auth::deployment::normalize_deployment(document, cli)?;
+            let stage = output.with_extension(format!("stage-{}", std::process::id()));
+            let staged = dev_auth::stable_release::stage_latest_stable_release(&stage)?;
+            let installation = dev_auth::setup::build_verified_release_plan(
+                match intent.mode {
+                    dev_auth::deployment::DeploymentMode::Strong => {
+                        dev_auth::setup::InstallMode::Strong
+                    }
+                    dev_auth::deployment::DeploymentMode::UserOnly => {
+                        dev_auth::setup::InstallMode::UserOnly
+                    }
+                },
+                false,
+                staged.verified,
+            );
+            let plan = installation.and_then(|installation| {
+                dev_auth::setup_v3::build_setup_plan_v3(intent, installation)
+            });
+            let result = plan.and_then(|plan| {
+                dev_auth::setup_v3::write_setup_plan_v3_at(&output, &plan)
+                    .map(|digest| (plan, digest))
+            });
+            let (plan, digest) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&staged.directory);
+                    return Err(error);
+                }
+            };
+            match format {
+                "human" => {
+                    println!("setup_plan_path={}", output.display());
+                    println!("setup_plan_sha256={digest}");
+                    println!("release_version={}", plan.installation.request.version);
+                }
+                "json" => println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "dev-auth-setup-plan-result-v1",
+                        "plan": output,
+                        "sha256": digest,
+                        "release_version": plan.installation.request.version,
+                    })
+                ),
+                _ => unreachable!("format was validated before release staging"),
+            }
             Ok(0)
         }
         "apply" => {

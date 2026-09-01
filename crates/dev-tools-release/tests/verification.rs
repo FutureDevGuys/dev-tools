@@ -1,13 +1,15 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dev_tools_release::{
-    accept_verified_release, select_stable_release_assets, verify_artifact_bytes,
-    verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy, ReleaseAuthority,
-    ReleaseBundle, ReleaseMetadata, ReleaseState,
+    accept_verified_release, fetch_https, select_stable_release_assets, verify_artifact_bytes,
+    verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy, HttpsPolicy,
+    ReleaseAuthority, ReleaseBundle, ReleaseMetadata, ReleaseState,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::time::Duration;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -169,6 +171,26 @@ fn stable_selection_is_product_scoped_and_rejects_prereleases() {
     assert_eq!(selected.version.to_string(), "1.2.3");
     assert_eq!(selected.root_url, "https://github.com/root");
     assert_eq!(selected.manifest_url, "https://github.com/manifest");
+}
+
+#[test]
+fn https_transport_rejects_untrusted_origins_before_network_access() {
+    let policy = HttpsPolicy {
+        allowed_hosts: BTreeSet::from(["api.github.com".into()]),
+        max_redirects: 3,
+        timeout: Duration::from_secs(30),
+        user_agent: "dev-tools-release-test".into(),
+    };
+    assert!(fetch_https("http://api.github.com/releases", &policy, 1024, None).is_err());
+    assert!(fetch_https("https://example.invalid/releases", &policy, 1024, None).is_err());
+    assert!(fetch_https("https://api.github.com/releases", &policy, 0, None).is_err());
+    assert!(fetch_https(
+        "https://api.github.com/releases",
+        &policy,
+        1024,
+        Some("bad\nheader")
+    )
+    .is_err());
 }
 
 #[test]
