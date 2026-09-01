@@ -24,6 +24,7 @@ const PRODUCT_ALIASES: [&str; 5] = [
 ];
 const TRANSPARENT_ALIASES: [&str; 2] = ["git", "gh"];
 const SYSTEM_CREDENTIAL_PATH: &str = "/etc/credstore.encrypted/dev-auth.op-service-account-token";
+const SYSTEM_CREDENTIAL_DIRECTORY: &str = "/etc/credstore.encrypted/dev-auth-slots";
 const PRIVILEGED_LAUNCHER_PATH: &str = "/usr/local/lib/dev-auth/dev-auth-workload-launcher";
 const SYSTEM_ASSETS: [(&str, &str, u32); 5] = [
     (
@@ -43,7 +44,7 @@ const SYSTEM_ASSETS: [(&str, &str, u32); 5] = [
     ),
     (
         "/etc/systemd/system/dev-auth-broker.service",
-        "[Unit]\nDescription=Dev Auth protected workload identity broker\nRequires=dev-auth-broker.socket dev-auth-broker-control.socket\nAfter=network-online.target\n\n[Service]\nType=simple\nUser=dev-auth\nGroup=dev-auth\nSockets=dev-auth-broker.socket dev-auth-broker-control.socket\nExecStart=/usr/local/bin/dev-auth broker serve\nLoadCredentialEncrypted=op-service-account-token:/etc/credstore.encrypted/dev-auth.op-service-account-token\nRestart=on-failure\nRestartSec=2s\nUMask=0077\nNoNewPrivileges=yes\nPrivateDevices=yes\nPrivateTmp=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectHome=yes\nProtectHostname=yes\nProtectKernelLogs=yes\nProtectKernelModules=yes\nProtectKernelTunables=yes\nProtectSystem=strict\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Dev Auth protected workload identity broker\nRequires=dev-auth-broker.socket dev-auth-broker-control.socket\nAfter=network-online.target\n\n[Service]\nType=simple\nUser=dev-auth\nGroup=dev-auth\nSockets=dev-auth-broker.socket dev-auth-broker-control.socket\nExecStart=/usr/local/bin/dev-auth broker serve\nLoadCredentialEncrypted=op-service-account-token:/etc/credstore.encrypted/dev-auth-slots\nRestart=on-failure\nRestartSec=2s\nUMask=0077\nNoNewPrivileges=yes\nPrivateDevices=yes\nPrivateTmp=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectHome=yes\nProtectHostname=yes\nProtectKernelLogs=yes\nProtectKernelModules=yes\nProtectKernelTunables=yes\nProtectSystem=strict\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\n\n[Install]\nWantedBy=multi-user.target\n",
         0o644,
     ),
     (
@@ -548,13 +549,18 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
     {
         bail!("effective user is outside the administrator policy");
     }
-    let resolved = crate::policy_v2::resolve_policy(&policy, &user_config)?;
+    let resolved = crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &user_config)?;
     report.policy_resolution_ready = true;
 
-    report.credential_ready = match mode {
-        InstallMode::Strong => system_service_credential_ready(),
-        InstallMode::UserOnly => crate::runtime::user_broker_service_token().is_ok(),
-    };
+    let required_slots = resolved
+        .authority_profiles
+        .values()
+        .map(|profile| profile.credential_slot.as_str())
+        .collect::<BTreeSet<_>>();
+    report.credential_ready = required_slots.iter().all(|slot| match mode {
+        InstallMode::Strong => system_service_credential_slot_ready(slot),
+        InstallMode::UserOnly => crate::runtime::user_broker_service_token_for_slot(slot).is_ok(),
+    });
     if !report.credential_ready {
         report.next_action = match mode {
             InstallMode::Strong => "enroll_system_credential",
@@ -881,7 +887,8 @@ pub fn migrate_v1_configuration(
             owner_uid,
         )?,
     };
-    let resolved = crate::policy_v2::resolve_policy(&system_policy, &user_config)?;
+    let resolved =
+        crate::policy_v2::resolve_policy_for_user(&system_policy, &user.name, &user_config)?;
     validate_v1_migration_resolution(&legacy, &resolved, &user.dir)?;
 
     let backup = user
@@ -1445,20 +1452,22 @@ pub fn purge_system_state() -> Result<StateCleanupReport> {
     }
     require_uninstalled_layout(&SetupPaths::strong())?;
     require_broker_sockets_absent()?;
-    let policy_removed = remove_optional_state_file(
-        Path::new(crate::policy_store::SYSTEM_POLICY_PATH),
-        0,
-        0o022,
-        POLICY_LIMIT,
-        "administrator policy",
-    )?;
-    let credential_revoked = remove_optional_state_file(
+    let policy_path = Path::new(crate::policy_store::SYSTEM_POLICY_PATH);
+    let policy = match fs::symlink_metadata(policy_path) {
+        Ok(_) => Some(crate::policy_store::load_system_policy()?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspect administrator policy before cleanup"),
+    };
+    let mut credential_revoked = remove_system_credential_slots(policy.as_ref())?;
+    credential_revoked |= remove_optional_state_file(
         Path::new(SYSTEM_CREDENTIAL_PATH),
         0,
         0o077,
         BINARY_LIMIT,
-        "encrypted system credential",
+        "legacy encrypted system credential",
     )?;
+    let policy_removed =
+        remove_optional_state_file(policy_path, 0, 0o022, POLICY_LIMIT, "administrator policy")?;
     Ok(StateCleanupReport {
         schema: "dev-auth-state-cleanup-v1".into(),
         mode: InstallMode::Strong,
@@ -1482,8 +1491,24 @@ pub fn purge_user_state() -> Result<StateCleanupReport> {
     ) {
         bail!("user state cannot be removed inside an admitted workload");
     }
+    let policy_path = crate::policy_store::user_policy_path(&user);
+    let policy = match fs::symlink_metadata(&policy_path) {
+        Ok(_) => Some(crate::policy_store::load_user_policy_at(
+            &policy_path,
+            owner_uid,
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspect user policy before cleanup"),
+    };
+    if let Some(policy) = &policy {
+        for slot in policy.credential_slots.keys() {
+            crate::runtime::revoke_user_broker_service_token_for_slot(slot)?;
+        }
+    } else {
+        crate::revoke_user_broker_service_token()?;
+    }
     let policy_removed = remove_optional_state_file(
-        &crate::policy_store::user_policy_path(&user),
+        &policy_path,
         owner_uid,
         0o077,
         POLICY_LIMIT,
@@ -1496,7 +1521,6 @@ pub fn purge_user_state() -> Result<StateCleanupReport> {
         POLICY_LIMIT,
         "user configuration",
     )?;
-    crate::revoke_user_broker_service_token()?;
     Ok(StateCleanupReport {
         schema: "dev-auth-state-cleanup-v1".into(),
         mode: InstallMode::UserOnly,
@@ -1504,6 +1528,52 @@ pub fn purge_user_state() -> Result<StateCleanupReport> {
         user_config_removed,
         credential_revoked: true,
     })
+}
+
+fn remove_system_credential_slots(
+    policy: Option<&crate::policy_v2::SystemPolicyV2>,
+) -> Result<bool> {
+    let directory = Path::new(SYSTEM_CREDENTIAL_DIRECTORY);
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspect system credential slot directory"),
+    };
+    let policy = policy
+        .context("system credential slots remain without administrator policy cleanup authority")?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!("system credential slot directory has unsafe cleanup authority");
+    }
+    let declared = policy.credential_slots.keys().collect::<BTreeSet<_>>();
+    let mut entries = fs::read_dir(directory)
+        .context("enumerate system credential slots")?
+        .map(|entry| entry.context("read system credential slot entry"))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut removed = false;
+    for entry in entries {
+        let slot = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("system credential slot name is not UTF-8"))?;
+        validate_credential_slot(&slot)?;
+        if !declared.contains(&slot) {
+            bail!("system credential slot is not owned by administrator policy");
+        }
+        removed |= remove_optional_state_file(
+            &entry.path(),
+            0,
+            0o077,
+            BINARY_LIMIT,
+            "encrypted system credential slot",
+        )?;
+    }
+    fs::remove_dir(directory).context("remove empty system credential slot directory")?;
+    Ok(removed)
 }
 
 fn require_uninstalled_layout(paths: &SetupPaths) -> Result<()> {
@@ -1788,15 +1858,10 @@ pub fn start_system_broker_at(paths: &SetupPaths) -> Result<SetupReport> {
     {
         bail!("administrator policy and installation receipt disagree on native tools");
     }
-    let credential = Path::new(SYSTEM_CREDENTIAL_PATH);
-    let metadata =
-        fs::symlink_metadata(credential).context("inspect encrypted system broker credential")?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("encrypted system broker credential is unsafe");
+    for slot in policy.credential_slots.keys() {
+        if !system_service_credential_slot_ready(slot) {
+            bail!("encrypted system broker credential slot is not ready");
+        }
     }
     run_system_command(
         Path::new("/usr/bin/systemd-sysusers"),
@@ -1931,14 +1996,21 @@ pub fn linux_system_assets() -> Vec<(&'static Path, &'static str, u32)> {
 }
 
 pub fn enroll_system_service_credential(value: &[u8]) -> Result<()> {
+    enroll_system_service_credential_slot("automation", value)
+}
+
+pub fn enroll_system_service_credential_slot(slot: &str, value: &[u8]) -> Result<()> {
     if nix::unistd::Uid::effective().as_raw() != 0 {
         bail!("system service credential enrollment requires root");
     }
-    enroll_system_service_credential_at(
+    let destination = system_credential_slot_path(slot)?;
+    store_system_service_credential_at(
         Path::new("/usr/bin/systemd-creds"),
-        Path::new(SYSTEM_CREDENTIAL_PATH),
+        &destination,
+        slot,
         value,
         0,
+        false,
     )
 }
 
@@ -1951,13 +2023,23 @@ pub fn rotate_system_service_credential(value: &[u8]) -> Result<()> {
 }
 
 pub fn rotate_system_service_credential_at(paths: &SetupPaths, value: &[u8]) -> Result<()> {
+    rotate_system_service_credential_slot_at(paths, "automation", value)
+}
+
+pub fn rotate_system_service_credential_slot_at(
+    paths: &SetupPaths,
+    slot: &str,
+    value: &[u8],
+) -> Result<()> {
     if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
         bail!("system service credential rotation requires root and the system layout");
     }
     require_stopped_strong_installation_at(paths)?;
+    let destination = system_credential_slot_path(slot)?;
     store_system_service_credential_at(
         Path::new("/usr/bin/systemd-creds"),
-        Path::new(SYSTEM_CREDENTIAL_PATH),
+        &destination,
+        slot,
         value,
         0,
         true,
@@ -1973,12 +2055,20 @@ pub fn revoke_system_service_credential() -> Result<()> {
 }
 
 pub fn revoke_system_service_credential_at(paths: &SetupPaths) -> Result<()> {
+    revoke_system_service_credential_slot_at(paths, "automation")
+}
+
+pub fn revoke_system_service_credential_slot_at(paths: &SetupPaths, slot: &str) -> Result<()> {
     if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
         bail!("system service credential revocation requires root and the system layout");
     }
     require_stopped_strong_installation_at(paths)?;
-    let path = Path::new(SYSTEM_CREDENTIAL_PATH);
-    let metadata = fs::symlink_metadata(path).context("inspect system service credential")?;
+    let path = system_credential_slot_path(slot)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect system service credential"),
+    };
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.uid() != 0
@@ -2011,14 +2101,50 @@ fn require_stopped_strong_installation_at(paths: &SetupPaths) -> Result<()> {
 }
 
 pub fn system_service_credential_ready() -> bool {
-    fs::symlink_metadata(SYSTEM_CREDENTIAL_PATH).is_ok_and(|metadata| {
-        metadata.file_type().is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == 0
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() > 0
-            && metadata.len() <= BINARY_LIMIT
-    })
+    system_service_credential_slot_ready("automation")
+}
+
+pub fn system_service_credential_slot_ready(slot: &str) -> bool {
+    let Ok(path) = system_credential_slot_path(slot) else {
+        return false;
+    };
+    let parent_ready = path.parent().is_some_and(|parent| {
+        fs::symlink_metadata(parent).is_ok_and(|metadata| {
+            metadata.file_type().is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == 0
+                && metadata.mode() & 0o077 == 0
+        })
+    });
+    parent_ready
+        && fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == 0
+                && metadata.mode() & 0o077 == 0
+                && metadata.nlink() == 1
+                && metadata.len() > 0
+                && metadata.len() <= BINARY_LIMIT
+        })
+}
+
+fn system_credential_slot_path(slot: &str) -> Result<PathBuf> {
+    validate_credential_slot(slot)?;
+    Ok(Path::new(SYSTEM_CREDENTIAL_DIRECTORY).join(slot))
+}
+
+fn validate_credential_slot(slot: &str) -> Result<()> {
+    let mut bytes = slot.bytes();
+    if slot.is_empty()
+        || slot.len() > 64
+        || !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("credential slot is invalid");
+    }
+    Ok(())
 }
 
 pub fn user_service_credential_ready() -> bool {
@@ -2157,7 +2283,7 @@ pub fn reconcile_user_policy_for_account_at(
                 &crate::policy_store::user_config_path(&user),
                 owner_uid,
             )?;
-            crate::policy_v2::resolve_policy(&policy, &config)
+            crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &config)
                 .context("updated user-only policy would invalidate the user configuration")?;
             replace_policy_document(&destination, &bytes, owner_uid, 0o600, current)?;
         }
@@ -2194,7 +2320,7 @@ pub fn update_user_policy(
         &crate::policy_store::user_config_path(&user),
         owner_uid,
     )?;
-    crate::policy_v2::resolve_policy(&policy, &config)
+    crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &config)
         .context("updated user-only policy would invalidate the active user configuration")?;
     let destination = crate::policy_store::user_policy_path(&user);
     replace_policy_document(&destination, &bytes, owner_uid, 0o600, current_sha256)?;
@@ -2262,7 +2388,7 @@ pub fn reconcile_user_config_for_account_at(
     {
         bail!("native user is outside administrator policy");
     }
-    let resolved = crate::policy_v2::resolve_policy(&policy, &user_config)?;
+    let resolved = crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &user_config)?;
     let executable = PathBuf::from(&installation.executable);
     let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
     let owner_uid = user.uid.as_raw();
@@ -2275,6 +2401,7 @@ pub fn reconcile_user_config_for_account_at(
         current_sha256,
         owner_uid,
         &policy,
+        &user.name,
     )?;
     let old_aliases = old_workloads.keys().cloned().collect::<Vec<_>>();
     let result = (|| {
@@ -2335,7 +2462,8 @@ fn install_or_update_user_config(
     {
         bail!("native user is outside administrator policy");
     }
-    let resolved = crate::policy_v2::resolve_policy(&system_policy, &user_config)?;
+    let resolved =
+        crate::policy_v2::resolve_policy_for_user(&system_policy, &user.name, &user_config)?;
     let (installation_paths, installation) = current_installation()?;
     let executable = PathBuf::from(&installation.executable);
     let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
@@ -2348,6 +2476,7 @@ fn install_or_update_user_config(
         current_sha256,
         owner_uid,
         &system_policy,
+        &user.name,
     )?;
     let old_aliases = old_workloads.keys().cloned().collect::<Vec<_>>();
     let result = (|| {
@@ -3029,6 +3158,7 @@ fn preflight_user_config_destination(
     current_sha256: Option<&str>,
     owner_uid: u32,
     system_policy: &crate::policy_v2::SystemPolicyV2,
+    native_user: &str,
 ) -> Result<BTreeMap<String, crate::policy_v2::ResolvedWorkload>> {
     match fs::symlink_metadata(destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3047,7 +3177,10 @@ fn preflight_user_config_destination(
                 None if current_bytes == new_bytes => {}
                 None => bail!("user configuration already exists; use a digest-bound update"),
             }
-            Ok(crate::policy_v2::resolve_policy(system_policy, &current)?.workloads)
+            Ok(
+                crate::policy_v2::resolve_policy_for_user(system_policy, native_user, &current)?
+                    .workloads,
+            )
         }
     }
 }
@@ -3148,23 +3281,33 @@ fn install_policy_document(
     fs::rename(&temporary, destination).context("publish configuration document")
 }
 
+#[cfg(test)]
 fn enroll_system_service_credential_at(
     systemd_creds: &Path,
     destination: &Path,
     value: &[u8],
     owner_uid: u32,
 ) -> Result<()> {
-    store_system_service_credential_at(systemd_creds, destination, value, owner_uid, false)
+    store_system_service_credential_at(
+        systemd_creds,
+        destination,
+        "automation",
+        value,
+        owner_uid,
+        false,
+    )
 }
 
 fn store_system_service_credential_at(
     systemd_creds: &Path,
     destination: &Path,
+    slot: &str,
     value: &[u8],
     owner_uid: u32,
     replace: bool,
 ) -> Result<()> {
     validate_native_program(systemd_creds, "systemd-creds")?;
+    validate_credential_slot(slot)?;
     if value.is_empty()
         || value.len() as u64 > RECEIPT_LIMIT
         || value.contains(&b'\0')
@@ -3179,7 +3322,12 @@ fn store_system_service_credential_at(
     let parent = destination
         .parent()
         .context("system credential path has no parent")?;
-    ensure_directory_chain_for_owner(parent, owner_uid, 0o755)?;
+    ensure_directory_chain_for_owner(parent, owner_uid, 0o700)?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).context("inspect private system credential directory")?;
+    if parent_metadata.mode() & 0o077 != 0 {
+        bail!("system credential directory is not private");
+    }
     match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if !replace {
@@ -3202,10 +3350,11 @@ fn store_system_service_credential_at(
         Err(error) => return Err(error).context("inspect system service credential"),
     }
     let temporary = destination.with_extension(format!("new-{}", std::process::id()));
+    let credential_name = format!("--name=op-service-account-token_{slot}");
     let mut child = Command::new(systemd_creds)
         .args([
             "encrypt",
-            "--name=op-service-account-token",
+            &credential_name,
             "-",
             temporary
                 .to_str()
@@ -3902,7 +4051,7 @@ mod tests {
         let tool = root.path().join("systemd-creds");
         fs::write(
             &tool,
-            "#!/bin/sh\nset -eu\ntest \"$1\" = encrypt\ntest \"$2\" = --name=op-service-account-token\ntest \"$3\" = -\numask 077\ncat > \"$4\"\n",
+            "#!/bin/sh\nset -eu\ntest \"$1\" = encrypt\ntest \"$2\" = --name=op-service-account-token_automation\ntest \"$3\" = -\numask 077\ncat > \"$4\"\n",
         )
         .unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3919,8 +4068,15 @@ mod tests {
             enroll_system_service_credential_at(&tool, &destination, b"replacement\n", owner,)
                 .is_err()
         );
-        store_system_service_credential_at(&tool, &destination, b"replacement\n", owner, true)
-            .unwrap();
+        store_system_service_credential_at(
+            &tool,
+            &destination,
+            "automation",
+            b"replacement\n",
+            owner,
+            true,
+        )
+        .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"replacement\n");
         assert_eq!(
             fs::symlink_metadata(&destination).unwrap().mode() & 0o777,
@@ -3931,6 +4087,7 @@ mod tests {
         assert!(store_system_service_credential_at(
             &tool,
             &destination,
+            "automation",
             b"missing-current\n",
             owner,
             true,
@@ -4058,6 +4215,11 @@ agent = "/opt/dev-auth/agent"
 [github_apps.automation]
 app_id = 42
 private_key_references = ["op://Machine Vault/github-app/private-key"]
+
+[credential_slots.automation]
+users = ["automation"]
+authority_caps = ["release"]
+secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/signing-private-key"]
 
 [authority_caps.release]
 github_apps = ["automation"]

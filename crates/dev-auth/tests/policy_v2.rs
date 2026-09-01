@@ -28,6 +28,11 @@ argument_separator = true
 app_id = 42
 private_key_references = ["op://Machine Vault/github-app/private-key"]
 
+[credential_slots.automation]
+users = ["automation"]
+authority_caps = ["release"]
+secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+
 [authority_caps.release]
 github_apps = ["automation"]
 owners = ["ExampleOrg", "SecondOrg"]
@@ -132,6 +137,7 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
 
     let profile = &resolved.authority_profiles["publish"];
     assert_eq!(profile.system_cap, "release");
+    assert_eq!(profile.credential_slot, "automation");
     let github = profile.github.as_ref().unwrap();
     assert_eq!(github.owners, BTreeSet::from(["exampleorg".to_owned()]));
     assert_eq!(github.repositories, BTreeSet::from(["api".to_owned()]));
@@ -244,6 +250,28 @@ fn user_configuration_cannot_select_an_uncapped_github_app_or_key() {
     ] {
         let user = parse_user_config_v2(invalid.as_bytes()).unwrap();
         assert!(resolve_policy(&system, &user).is_err());
+    }
+}
+
+#[test]
+fn credential_slots_bind_users_caps_and_secret_references() {
+    let system = parse_system_policy_v2(SYSTEM_POLICY.as_bytes()).unwrap();
+    let user = parse_user_config_v2(USER_CONFIG.as_bytes()).unwrap();
+    assert!(dev_auth::policy_v2::resolve_policy_for_user(&system, "automation", &user).is_ok());
+    assert!(dev_auth::policy_v2::resolve_policy_for_user(&system, "other-user", &user).is_err());
+
+    for invalid in [
+        SYSTEM_POLICY.replace(
+            "[credential_slots.automation]\nusers = [\"automation\"]",
+            "[credential_slots.automation]\nusers = [\"other-user\"]",
+        ),
+        SYSTEM_POLICY.replace("authority_caps = [\"release\"]", "authority_caps = [\"other\"]"),
+        SYSTEM_POLICY.replace(
+            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\"]\n\n[authority_caps.release]",
+            "secret_references = [\"op://Machine Vault/github-app/private-key\"]\n\n[authority_caps.release]",
+        ),
+    ] {
+        assert!(parse_system_policy_v2(invalid.as_bytes()).is_err());
     }
 }
 

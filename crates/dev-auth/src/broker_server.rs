@@ -878,6 +878,7 @@ mod tests {
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
                 github: Some(crate::linux_admission::SessionGitHubGrant {
+                    credential_slot: "automation".into(),
                     app_id: 42,
                     private_key_ref: "op://Automation/app/private-key".into(),
                     owners: vec!["ExampleOrg".into()],
@@ -912,6 +913,7 @@ mod tests {
     #[test]
     fn signing_request_uses_only_the_session_bound_operation_key() {
         let key = crate::linux_admission::SessionOperationKeyGrant {
+            credential_slot: "automation".into(),
             private_key_ref: "op://Automation/signing/private-key".into(),
             public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test".into(),
             fingerprint: "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI".into(),

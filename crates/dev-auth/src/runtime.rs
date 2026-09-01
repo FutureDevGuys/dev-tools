@@ -784,20 +784,61 @@ fn service_account_token(store: &CredentialStore) -> Result<SecretString> {
 }
 
 #[cfg(target_os = "linux")]
-fn user_broker_credential_store() -> CredentialStore {
-    CredentialStore {
+fn user_broker_credential_store(slot: &str) -> Result<CredentialStore> {
+    validate_broker_credential_slot(slot)?;
+    Ok(CredentialStore {
         service: "dev-auth-v3".into(),
-        account: "user-broker-service-account-token".into(),
+        account: format!("user-broker-service-account-token-{slot}"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_broker_credential_slot(slot: &str) -> Result<()> {
+    let mut bytes = slot.bytes();
+    if slot.is_empty()
+        || slot.len() > 64
+        || !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("broker credential slot is invalid");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn user_broker_service_tokens<'a>(
+    slots: impl Iterator<Item = &'a str>,
+) -> Result<BTreeMap<String, SecretString>> {
+    slots
+        .map(|slot| {
+            Ok((
+                slot.to_owned(),
+                service_account_token(&user_broker_credential_store(slot)?)?,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn user_broker_service_token_for_slot(slot: &str) -> Result<SecretString> {
+    service_account_token(&user_broker_credential_store(slot)?)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn user_broker_service_token() -> Result<SecretString> {
-    service_account_token(&user_broker_credential_store())
+    user_broker_service_token_for_slot("automation")
 }
 
 #[cfg(target_os = "linux")]
-pub fn enroll_user_broker_service_token(value: &[u8]) -> Result<()> {
+pub fn enroll_user_broker_service_token_for_slot(slot: &str, value: &[u8]) -> Result<()> {
+    let store = user_broker_credential_store(slot)?;
+    enroll_user_broker_service_token_at(&store, value)
+}
+
+#[cfg(target_os = "linux")]
+fn enroll_user_broker_service_token_at(store: &CredentialStore, value: &[u8]) -> Result<()> {
     let value = std::str::from_utf8(value).context("service credential is not UTF-8")?;
     let value = value
         .strip_suffix("\r\n")
@@ -806,7 +847,7 @@ pub fn enroll_user_broker_service_token(value: &[u8]) -> Result<()> {
     if value.is_empty() || value.contains(['\n', '\r', '\0']) {
         bail!("service credential must be exactly one nonempty line");
     }
-    let entry = credential_entry(&user_broker_credential_store())?;
+    let entry = credential_entry(store)?;
     match entry.get_password() {
         Ok(existing) => {
             let _existing = zeroize::Zeroizing::new(existing);
@@ -820,7 +861,12 @@ pub fn enroll_user_broker_service_token(value: &[u8]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn rotate_user_broker_service_token(value: &[u8]) -> Result<()> {
+pub fn enroll_user_broker_service_token(value: &[u8]) -> Result<()> {
+    enroll_user_broker_service_token_for_slot("automation", value)
+}
+
+#[cfg(target_os = "linux")]
+pub fn rotate_user_broker_service_token_for_slot(slot: &str, value: &[u8]) -> Result<()> {
     if !matches!(
         crate::broker_client::active_claim_and_probe()?.0,
         crate::broker_protocol::LocalSessionClaim::Absent
@@ -835,7 +881,7 @@ pub fn rotate_user_broker_service_token(value: &[u8]) -> Result<()> {
     if value.is_empty() || value.contains(['\n', '\r', '\0']) {
         bail!("service credential must be exactly one nonempty line");
     }
-    let entry = credential_entry(&user_broker_credential_store())?;
+    let entry = credential_entry(&user_broker_credential_store(slot)?)?;
     let existing = entry
         .get_password()
         .context("user-broker credential is not enrolled")?;
@@ -846,19 +892,29 @@ pub fn rotate_user_broker_service_token(value: &[u8]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn revoke_user_broker_service_token() -> Result<()> {
+pub fn rotate_user_broker_service_token(value: &[u8]) -> Result<()> {
+    rotate_user_broker_service_token_for_slot("automation", value)
+}
+
+#[cfg(target_os = "linux")]
+pub fn revoke_user_broker_service_token_for_slot(slot: &str) -> Result<()> {
     if !matches!(
         crate::broker_client::active_claim_and_probe()?.0,
         crate::broker_protocol::LocalSessionClaim::Absent
     ) {
         bail!("user-broker credential cannot be removed inside an admitted workload");
     }
-    match credential_entry(&user_broker_credential_store())?.delete_credential() {
+    match credential_entry(&user_broker_credential_store(slot)?)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => {
             Err(error).context("remove user-broker credential from the native OS credential store")
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn revoke_user_broker_service_token() -> Result<()> {
+    revoke_user_broker_service_token_for_slot("automation")
 }
 
 pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
@@ -4997,6 +5053,7 @@ mod tests {
         };
         let profile = crate::policy_v2::ResolvedAuthorityProfile {
             system_cap: "release".into(),
+            credential_slot: "automation".into(),
             github: None,
             signing: true,
             signing_key: Some(key.clone()),

@@ -21,6 +21,11 @@ argument_separator = true
 app_id = 123456
 private_key_references = ["op://Automation/GitHub App/private-key"]
 
+[credential_slots.automation]
+users = ["example-user"]
+authority_caps = ["source-maintenance"]
+secret_references = ["op://Automation/GitHub App/private-key"]
+
 [authority_caps.source-maintenance]
 github_apps = ["automation"]
 owners = ["ExampleOrg"]

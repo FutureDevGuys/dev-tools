@@ -63,6 +63,14 @@ pub struct GitHubAppCap {
     pub private_key_references: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialSlotCap {
+    pub users: Vec<String>,
+    pub authority_caps: Vec<String>,
+    pub secret_references: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceAccess {
@@ -96,6 +104,7 @@ pub struct SystemPolicyV2 {
     pub programs: SystemPrograms,
     pub trusted_launchers: BTreeMap<String, String>,
     pub github_apps: BTreeMap<String, GitHubAppCap>,
+    pub credential_slots: BTreeMap<String, CredentialSlotCap>,
     pub authority_caps: BTreeMap<String, AuthorityCap>,
     pub workspace_caps: BTreeMap<String, WorkspaceCap>,
     #[serde(default)]
@@ -242,6 +251,7 @@ pub struct ResolvedGitHubAuthority {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAuthorityProfile {
     pub system_cap: String,
+    pub credential_slot: String,
     pub github: Option<ResolvedGitHubAuthority>,
     pub signing: bool,
     pub signing_key: Option<OperationKeyConfig>,
@@ -365,6 +375,48 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
         }
     }
 
+    for (name, slot) in &policy.credential_slots {
+        validate_policy_identifier(name, "credential slot")?;
+        validate_unique(
+            &slot.users,
+            "credential slot contains a duplicate native user",
+            |user| {
+                validate_public_name(user, "credential slot native user")?;
+                if !policy
+                    .allowed_users
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(user))
+                {
+                    bail!("credential slot names a user outside system policy");
+                }
+                Ok(())
+            },
+            |user| user.to_ascii_lowercase(),
+        )?;
+        if slot.users.is_empty() {
+            bail!("credential slot must name at least one native user");
+        }
+        validate_unique(
+            &slot.authority_caps,
+            "credential slot contains a duplicate authority cap",
+            |cap| {
+                validate_policy_identifier(cap, "credential slot authority cap")?;
+                if !policy.authority_caps.contains_key(cap) {
+                    bail!("credential slot references an unknown authority cap");
+                }
+                Ok(())
+            },
+            Clone::clone,
+        )?;
+        if slot.authority_caps.is_empty() {
+            bail!("credential slot must name at least one authority cap");
+        }
+        validate_secret_references(&slot.secret_references, "credential slot")?;
+        if slot.secret_references.is_empty() {
+            bail!("credential slot must declare at least one secret reference");
+        }
+    }
+
     for (name, cap) in &policy.authority_caps {
         validate_policy_identifier(name, "authority cap")?;
         validate_unique(
@@ -396,6 +448,26 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
             )?;
         }
         validate_secret_references(&cap.secret_references, "authority cap")?;
+        let matching_slots = policy
+            .credential_slots
+            .iter()
+            .filter(|(_, slot)| slot.authority_caps.contains(name))
+            .collect::<Vec<_>>();
+        if matching_slots.len() != 1 {
+            bail!("authority cap must belong to exactly one credential slot");
+        }
+        let slot_references = matching_slots[0]
+            .1
+            .secret_references
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if cap
+            .secret_references
+            .iter()
+            .any(|reference| !slot_references.contains(reference))
+        {
+            bail!("authority cap widens its credential slot secret references");
+        }
         if cap.installation_ids.contains(&0)
             || cap
                 .installation_ids
@@ -540,6 +612,30 @@ fn validate_user_config(config: &UserConfigV2) -> Result<()> {
 }
 
 pub fn resolve_policy(system: &SystemPolicyV2, user: &UserConfigV2) -> Result<ResolvedPolicy> {
+    resolve_policy_inner(system, None, user)
+}
+
+pub fn resolve_policy_for_user(
+    system: &SystemPolicyV2,
+    native_user: &str,
+    user: &UserConfigV2,
+) -> Result<ResolvedPolicy> {
+    validate_public_name(native_user, "native user")?;
+    if !system
+        .allowed_users
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(native_user))
+    {
+        bail!("native user is outside system policy");
+    }
+    resolve_policy_inner(system, Some(native_user), user)
+}
+
+fn resolve_policy_inner(
+    system: &SystemPolicyV2,
+    native_user: Option<&str>,
+    user: &UserConfigV2,
+) -> Result<ResolvedPolicy> {
     validate_system_policy(system)?;
     validate_user_config(user)?;
 
@@ -548,6 +644,19 @@ pub fn resolve_policy(system: &SystemPolicyV2, user: &UserConfigV2) -> Result<Re
         let cap = system.authority_caps.get(&requested.cap).with_context(|| {
             format!("authority profile {name} references an unknown system cap")
         })?;
+        let (credential_slot, slot) = system
+            .credential_slots
+            .iter()
+            .find(|(_, slot)| slot.authority_caps.contains(&requested.cap))
+            .context("authority profile has no credential slot")?;
+        if native_user.is_some_and(|native_user| {
+            !slot
+                .users
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(native_user))
+        }) {
+            bail!("authority profile {name} credential slot denies the native user");
+        }
         let github = requested
             .github
             .as_ref()
@@ -576,6 +685,7 @@ pub fn resolve_policy(system: &SystemPolicyV2, user: &UserConfigV2) -> Result<Re
             name.clone(),
             ResolvedAuthorityProfile {
                 system_cap: requested.cap.clone(),
+                credential_slot: credential_slot.clone(),
                 github,
                 signing: requested.signing,
                 signing_key: requested.signing_key.clone(),

@@ -3,7 +3,9 @@ use crate::deployment::{
     canonical_deployment_intent, Activation, CredentialIntent, DeploymentCredential,
     DeploymentIntent, DeploymentMode,
 };
-use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2, resolve_policy, SystemMode};
+use crate::policy_v2::{
+    parse_system_policy_v2, parse_user_config_v2, resolve_policy_for_user, SystemMode,
+};
 use crate::setup::{render_plan, SetupPlan};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -72,7 +74,7 @@ pub struct SetupPlanV3 {
     pub source_documents: Vec<DocumentIdentity>,
     pub accounts: Vec<NativeAccountIdentity>,
     pub current_paths: Vec<CurrentPathIdentity>,
-    pub current_credential_ready: bool,
+    pub current_credential_ready: BTreeSet<String>,
     pub current_broker_state: String,
     pub current_state_sha256: String,
     pub actions: Vec<SetupActionV3>,
@@ -189,19 +191,13 @@ pub fn apply_setup_plan_v3(
     install_configuration(plan, &mut actions)?;
 
     let requirements = required_credential_slots_for_plan(plan)?;
-    let unsupported = declared
-        .iter()
-        .filter(|slot| slot.as_str() != "automation")
-        .cloned()
-        .collect::<Vec<_>>();
     let mut blocked = requirements.blocked;
-    blocked.extend(unsupported);
     blocked.sort();
     blocked.dedup();
     let input_required = requirements
         .required
         .iter()
-        .filter(|slot| slot.as_str() == "automation" && !credentials.contains_key(*slot))
+        .filter(|slot| !credentials.contains_key(*slot))
         .cloned()
         .collect::<Vec<_>>();
     if !blocked.is_empty() || !input_required.is_empty() {
@@ -375,14 +371,14 @@ fn apply_credential_actions(
 ) -> Result<()> {
     let mut completed = read_credential_action_receipt(plan, digest)?;
     for credential in &plan.intent.credentials {
-        let ready = credential_ready(plan.intent.mode);
+        let ready = credential_slot_ready(plan.intent.mode, &credential.slot);
         match credential.intent {
             CredentialIntent::Preserve => {}
             CredentialIntent::EnrollIfAbsent if !ready => {
                 let material = credentials
                     .get(&credential.slot)
                     .context("required credential input disappeared before enrollment")?;
-                enroll_credential(plan, material.expose())?;
+                enroll_credential(plan, &credential.slot, material.expose())?;
                 actions.push(format!("enroll_credential:{}", credential.slot));
             }
             CredentialIntent::EnrollIfAbsent => {}
@@ -390,14 +386,14 @@ fn apply_credential_actions(
                 let material = credentials
                     .get(&credential.slot)
                     .context("required credential input disappeared before rotation")?;
-                rotate_credential(plan, material.expose())?;
+                rotate_credential(plan, &credential.slot, material.expose())?;
                 completed.insert(credential.slot.clone());
                 actions.push(format!("rotate_credential:{}", credential.slot));
             }
             CredentialIntent::Rotate => {}
             CredentialIntent::Revoke => {
                 if ready {
-                    revoke_credential(plan)?;
+                    revoke_credential(plan, &credential.slot)?;
                     actions.push(format!("revoke_credential:{}", credential.slot));
                 }
                 completed.insert(credential.slot.clone());
@@ -407,28 +403,34 @@ fn apply_credential_actions(
     write_credential_action_receipt(plan, digest, &completed)
 }
 
-fn enroll_credential(plan: &SetupPlanV3, value: &[u8]) -> Result<()> {
+fn enroll_credential(plan: &SetupPlanV3, slot: &str, value: &[u8]) -> Result<()> {
     match plan.intent.mode {
-        DeploymentMode::Strong => crate::setup::enroll_system_service_credential(value),
-        DeploymentMode::UserOnly => crate::enroll_user_broker_service_token(value),
+        DeploymentMode::Strong => crate::setup::enroll_system_service_credential_slot(slot, value),
+        DeploymentMode::UserOnly => {
+            crate::runtime::enroll_user_broker_service_token_for_slot(slot, value)
+        }
     }
 }
 
-fn rotate_credential(plan: &SetupPlanV3, value: &[u8]) -> Result<()> {
+fn rotate_credential(plan: &SetupPlanV3, slot: &str, value: &[u8]) -> Result<()> {
     match plan.intent.mode {
-        DeploymentMode::Strong => {
-            crate::setup::rotate_system_service_credential_at(&plan.installation.paths, value)
+        DeploymentMode::Strong => crate::setup::rotate_system_service_credential_slot_at(
+            &plan.installation.paths,
+            slot,
+            value,
+        ),
+        DeploymentMode::UserOnly => {
+            crate::runtime::rotate_user_broker_service_token_for_slot(slot, value)
         }
-        DeploymentMode::UserOnly => crate::rotate_user_broker_service_token(value),
     }
 }
 
-fn revoke_credential(plan: &SetupPlanV3) -> Result<()> {
+fn revoke_credential(plan: &SetupPlanV3, slot: &str) -> Result<()> {
     match plan.intent.mode {
         DeploymentMode::Strong => {
-            crate::setup::revoke_system_service_credential_at(&plan.installation.paths)
+            crate::setup::revoke_system_service_credential_slot_at(&plan.installation.paths, slot)
         }
-        DeploymentMode::UserOnly => crate::revoke_user_broker_service_token(),
+        DeploymentMode::UserOnly => crate::runtime::revoke_user_broker_service_token_for_slot(slot),
     }
 }
 
@@ -483,7 +485,7 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
                 parse_system_policy_v2(&read_document_bytes(&path)?)?
             }
         };
-        let resolved = resolve_policy(&policy, &user_config)?;
+        let resolved = resolve_policy_for_user(&policy, &account.name, &user_config)?;
         crate::setup::verify_user_integrations_at(
             &account.home,
             Path::new(&setup.executable),
@@ -512,9 +514,9 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
 }
 
 fn verify_credential_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
-    let ready = credential_ready(plan.intent.mode);
     let completed = read_credential_action_receipt(plan, digest)?;
     for credential in &plan.intent.credentials {
+        let ready = credential_slot_ready(plan.intent.mode, &credential.slot);
         match credential.intent {
             CredentialIntent::Preserve | CredentialIntent::EnrollIfAbsent if !ready => {
                 bail!("required credential slot is not enrolled")
@@ -536,23 +538,28 @@ fn verify_credential_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<(
 
 fn ready_credential_slots(plan: &SetupPlanV3) -> Result<BTreeSet<String>> {
     let mut ready = BTreeSet::new();
-    if credential_ready(plan.intent.mode) {
-        ready.insert("automation".into());
+    for credential in &plan.intent.credentials {
+        if credential_slot_ready(plan.intent.mode, &credential.slot) {
+            ready.insert(credential.slot.clone());
+        }
     }
     Ok(ready)
 }
 
-fn credential_ready(mode: DeploymentMode) -> bool {
+fn credential_slot_ready(mode: DeploymentMode, slot: &str) -> bool {
     match mode {
-        DeploymentMode::Strong => crate::setup::system_service_credential_ready(),
-        DeploymentMode::UserOnly => crate::setup::user_service_credential_ready(),
+        DeploymentMode::Strong => crate::setup::system_service_credential_slot_ready(slot),
+        DeploymentMode::UserOnly => {
+            crate::runtime::user_broker_service_token_for_slot(slot).is_ok()
+        }
     }
 }
 
 fn broker_desired(intent: &DeploymentIntent) -> bool {
-    !intent.credentials.iter().any(|credential| {
-        credential.slot == "automation" && credential.intent == CredentialIntent::Revoke
-    })
+    intent
+        .credentials
+        .iter()
+        .any(|credential| credential.intent != CredentialIntent::Revoke)
 }
 
 fn document_identity<'a>(
@@ -677,7 +684,7 @@ fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
     #[derive(Serialize)]
     struct State<'a> {
         files: Vec<(PathBuf, Option<(u64, String)>)>,
-        credential_ready: bool,
+        credential_ready: BTreeSet<String>,
         broker: &'a str,
     }
     let mut paths = vec![
@@ -728,7 +735,7 @@ fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
     Ok(sha256_hex(
         &serde_jcs::to_vec(&State {
             files,
-            credential_ready: credential_ready(plan.intent.mode),
+            credential_ready: ready_credential_slots(plan)?,
             broker,
         })
         .context("serialize deployment state")?,
@@ -758,18 +765,6 @@ pub fn build_setup_plan_v3_at(
         || installation.request.activate_transparent_launchers
     {
         bail!("deployment intent and staged installation plan disagree");
-    }
-    let automation = intent
-        .credentials
-        .iter()
-        .find(|credential| credential.slot == "automation");
-    if intent.mode == DeploymentMode::Strong && automation.is_none() {
-        bail!("strong deployment must declare the automation credential slot");
-    }
-    if intent.activation == Activation::Transparent
-        && automation.is_some_and(|credential| credential.intent == CredentialIntent::Revoke)
-    {
-        bail!("transparent activation conflicts with automation credential revocation");
     }
     if require_privileged
         && intent.mode == DeploymentMode::Strong
@@ -804,6 +799,7 @@ pub fn build_setup_plan_v3_at(
     let mut documents = vec![administrator.identity];
     let mut accounts = Vec::with_capacity(intent.users.len());
     let mut account_names = BTreeSet::new();
+    let mut used_credential_slots = BTreeSet::new();
     for user in &intent.users {
         let account = nix::unistd::User::from_name(&user.name)?
             .with_context(|| format!("native account {} does not exist", user.name))?;
@@ -817,8 +813,14 @@ pub fn build_setup_plan_v3_at(
         let user_config = parse_user_config_v2(&config.bytes).with_context(|| {
             format!("validate configuration for native account {}", account.name)
         })?;
-        resolve_policy(&administrator_policy, &user_config)
+        let resolved = resolve_policy_for_user(&administrator_policy, &account.name, &user_config)
             .with_context(|| format!("resolve policy for native account {}", account.name))?;
+        used_credential_slots.extend(
+            resolved
+                .authority_profiles
+                .values()
+                .map(|profile| profile.credential_slot.clone()),
+        );
         documents.push(config.identity);
         if let Some(policy_path) = &user.policy {
             let user_policy = read_document(policy_path, "user_policy", &account.name)?;
@@ -827,8 +829,14 @@ pub fn build_setup_plan_v3_at(
             if intent.mode != DeploymentMode::UserOnly || parsed.mode != SystemMode::UserOnly {
                 bail!("per-user policy is valid only for user-only deployment");
             }
-            resolve_policy(&parsed, &user_config)
+            let resolved = resolve_policy_for_user(&parsed, &account.name, &user_config)
                 .with_context(|| format!("resolve user-only policy for {}", account.name))?;
+            used_credential_slots.extend(
+                resolved
+                    .authority_profiles
+                    .values()
+                    .map(|profile| profile.credential_slot.clone()),
+            );
             documents.push(user_policy.identity);
         }
         accounts.push(NativeAccountIdentity {
@@ -843,11 +851,34 @@ pub fn build_setup_plan_v3_at(
     });
     accounts.sort_by(|left, right| left.name.cmp(&right.name));
 
+    let declared_credential_slots = intent
+        .credentials
+        .iter()
+        .map(|credential| credential.slot.clone())
+        .collect::<BTreeSet<_>>();
+    if declared_credential_slots
+        .iter()
+        .any(|slot| !administrator_policy.credential_slots.contains_key(slot))
+    {
+        bail!("deployment intent names a credential slot outside administrator policy");
+    }
+    if !used_credential_slots.is_subset(&declared_credential_slots) {
+        bail!("deployment intent omits a credential slot required by a user authority profile");
+    }
+    if intent.activation == Activation::Transparent
+        && intent.credentials.iter().any(|credential| {
+            used_credential_slots.contains(&credential.slot)
+                && credential.intent == CredentialIntent::Revoke
+        })
+    {
+        bail!("transparent activation conflicts with required credential revocation");
+    }
+
     let (current_paths, current_credential_ready, current_broker_state) =
         current_state_snapshot(&installation, &intent, &accounts)?;
     let current_state_sha256 = stored_current_state_digest(
         &current_paths,
-        current_credential_ready,
+        &current_credential_ready,
         &current_broker_state,
     )?;
     let actions = planned_actions(&intent);
@@ -919,7 +950,7 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
         || plan.current_state_sha256
             != stored_current_state_digest(
                 &plan.current_paths,
-                plan.current_credential_ready,
+                &plan.current_credential_ready,
                 &plan.current_broker_state,
             )?
         || plan.actions.last().map(|action| action.kind.as_str()) != Some("verify")
@@ -1043,7 +1074,7 @@ fn current_state_snapshot(
     installation: &SetupPlan,
     intent: &DeploymentIntent,
     accounts: &[NativeAccountIdentity],
-) -> Result<(Vec<CurrentPathIdentity>, bool, String)> {
+) -> Result<(Vec<CurrentPathIdentity>, BTreeSet<String>, String)> {
     let paths = expected_current_path_keys(installation, intent, accounts);
     let mut entries = Vec::with_capacity(paths.len());
     for (kind, subject, path) in paths {
@@ -1080,18 +1111,24 @@ fn current_state_snapshot(
             crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => "unavailable",
         }
     };
-    Ok((entries, credential_ready(intent.mode), broker.to_owned()))
+    let credential_ready = intent
+        .credentials
+        .iter()
+        .filter(|credential| credential_slot_ready(intent.mode, &credential.slot))
+        .map(|credential| credential.slot.clone())
+        .collect();
+    Ok((entries, credential_ready, broker.to_owned()))
 }
 
 fn stored_current_state_digest(
     paths: &[CurrentPathIdentity],
-    credential_ready: bool,
+    credential_ready: &BTreeSet<String>,
     broker: &str,
 ) -> Result<String> {
     #[derive(Serialize)]
     struct CurrentState<'a> {
         files: &'a [CurrentPathIdentity],
-        credential_ready: bool,
+        credential_ready: &'a BTreeSet<String>,
         broker: &'a str,
     }
     Ok(sha256_hex(

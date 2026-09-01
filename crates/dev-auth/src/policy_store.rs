@@ -1,4 +1,4 @@
-use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2, resolve_policy};
+use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2, resolve_policy_for_user};
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
 use std::io::Read;
@@ -64,7 +64,7 @@ pub fn load_user_only_resolved_policy_for_uid(
         bail!("workload owner is outside user-only policy");
     }
     let config = load_user_config_at(&user_config_path(&user), owner_uid)?;
-    resolve_policy(&system, &config)
+    resolve_policy_for_user(&system, &user.name, &config)
 }
 
 pub fn load_resolved_policy_for_uid(owner_uid: u32) -> Result<crate::policy_v2::ResolvedPolicy> {
@@ -79,7 +79,7 @@ pub fn load_resolved_policy_for_uid(owner_uid: u32) -> Result<crate::policy_v2::
         bail!("workload owner is outside administrator policy");
     }
     let config = load_user_config_at(&user_config_path(&user), owner_uid)?;
-    resolve_policy(&system, &config)
+    resolve_policy_for_user(&system, &user.name, &config)
 }
 
 fn read_policy_file(

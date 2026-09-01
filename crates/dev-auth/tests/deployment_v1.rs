@@ -156,6 +156,7 @@ ssh = "/usr/bin/ssh"
 ssh_keygen = "/usr/bin/ssh-keygen"
 [trusted_launchers]
 [github_apps]
+[credential_slots]
 [authority_caps]
 [workspace_caps]
 "#,

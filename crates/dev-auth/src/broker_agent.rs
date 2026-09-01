@@ -138,6 +138,7 @@ pub fn run_agent_proxy(
                 public_key: PublicKey::from_openssh(&grant.public_key)
                     .context("parse broker SSH agent public key")?,
                 grant: SessionOperationKeyGrant {
+                    credential_slot: profile.credential_slot.clone(),
                     private_key_ref: grant.private_key_ref.clone(),
                     public_key: grant.public_key.clone(),
                     fingerprint: grant.fingerprint.clone(),
@@ -325,6 +326,7 @@ mod tests {
             stream.write_all(&response).unwrap();
         });
         let grant = SessionOperationKeyGrant {
+            credential_slot: "automation".into(),
             private_key_ref: "op://Automation/ssh/private-key".into(),
             public_key: public_key.to_openssh().unwrap(),
             fingerprint,

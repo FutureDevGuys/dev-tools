@@ -57,6 +57,7 @@ pub struct SessionAuthorityGrant {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionOperationKeyGrant {
+    pub credential_slot: String,
     pub private_key_ref: String,
     pub public_key: String,
     pub fingerprint: String,
@@ -65,6 +66,7 @@ pub struct SessionOperationKeyGrant {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionGitHubGrant {
+    pub credential_slot: String,
     pub app_id: u64,
     pub private_key_ref: String,
     pub owners: Vec<String>,
@@ -102,6 +104,7 @@ pub fn session_authority_from_resolved(
 ) -> SessionAuthorityGrant {
     SessionAuthorityGrant {
         github: profile.github.as_ref().map(|github| SessionGitHubGrant {
+            credential_slot: profile.credential_slot.clone(),
             app_id: github.app_id,
             private_key_ref: github.private_key_ref.clone(),
             owners: github.owners.iter().cloned().collect(),
@@ -109,13 +112,24 @@ pub fn session_authority_from_resolved(
             permissions: github.permissions.clone(),
             installation_ids: github.installation_ids.iter().copied().collect(),
         }),
-        signing: profile.signing_key.as_ref().map(operation_key_grant),
-        ssh: profile.ssh_keys.iter().map(operation_key_grant).collect(),
+        signing: profile
+            .signing_key
+            .as_ref()
+            .map(|key| operation_key_grant(&profile.credential_slot, key)),
+        ssh: profile
+            .ssh_keys
+            .iter()
+            .map(|key| operation_key_grant(&profile.credential_slot, key))
+            .collect(),
     }
 }
 
-fn operation_key_grant(key: &crate::policy_v2::OperationKeyConfig) -> SessionOperationKeyGrant {
+fn operation_key_grant(
+    credential_slot: &str,
+    key: &crate::policy_v2::OperationKeyConfig,
+) -> SessionOperationKeyGrant {
     SessionOperationKeyGrant {
+        credential_slot: credential_slot.to_owned(),
         private_key_ref: key.private_key_ref.clone(),
         public_key: key.public_key.clone(),
         fingerprint: key.fingerprint.clone(),
@@ -429,6 +443,7 @@ fn validate_session_registration(registration: &SessionRegistration) -> Result<(
 
 fn validate_session_authority(authority: &SessionAuthorityGrant) -> Result<()> {
     if let Some(github) = &authority.github {
+        validate_public_identifier(&github.credential_slot, "credential slot")?;
         if github.app_id == 0 {
             bail!("session GitHub App ID is invalid");
         }
@@ -490,6 +505,7 @@ fn validate_session_authority(authority: &SessionAuthorityGrant) -> Result<()> {
 }
 
 fn validate_operation_key_grant(key: &SessionOperationKeyGrant) -> Result<()> {
+    validate_public_identifier(&key.credential_slot, "credential slot")?;
     crate::validate_op_reference(&key.private_key_ref)?;
     let public_key = PublicKey::from_openssh(&key.public_key)
         .context("session operation public key is not valid OpenSSH data")?;
