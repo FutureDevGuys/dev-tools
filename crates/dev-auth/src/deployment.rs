@@ -61,6 +61,8 @@ pub struct DeploymentDocument {
     pub schema: String,
     pub mode: DeploymentMode,
     pub channel: Channel,
+    #[serde(default)]
+    pub offline: bool,
     pub activation: Activation,
     pub administrator_policy: PathBuf,
     #[serde(default)]
@@ -73,6 +75,7 @@ pub struct DeploymentDocument {
 pub struct DeploymentCliInput {
     pub mode: Option<DeploymentMode>,
     pub channel: Option<Channel>,
+    pub offline: Option<bool>,
     pub activation: Option<Activation>,
     pub administrator_policy: Option<PathBuf>,
     pub user_configs: Vec<(String, PathBuf)>,
@@ -86,6 +89,7 @@ pub struct DeploymentIntent {
     pub schema: String,
     pub mode: DeploymentMode,
     pub channel: Channel,
+    pub offline: bool,
     pub activation: Activation,
     pub administrator_policy: PathBuf,
     pub users: Vec<DeploymentUser>,
@@ -158,6 +162,13 @@ pub fn normalize_deployment(
         cli.channel,
         "release channel",
     )?;
+    let offline = match (document.as_ref().map(|value| value.offline), cli.offline) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("offline release resolution conflicts between deployment document and CLI")
+        }
+        (Some(value), _) | (_, Some(value)) => value,
+        (None, None) => false,
+    };
     let activation = agree(
         document.as_ref().map(|value| value.activation),
         cli.activation,
@@ -194,6 +205,7 @@ pub fn normalize_deployment(
         schema: "dev-auth-deployment-intent-v1".into(),
         mode,
         channel,
+        offline,
         activation,
         administrator_policy: normalized_absolute_path(
             &administrator_policy,

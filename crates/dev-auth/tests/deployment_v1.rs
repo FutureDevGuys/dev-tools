@@ -14,6 +14,7 @@ const DEPLOYMENT: &str = r#"
 schema = "dev-auth-deployment-v1"
 mode = "strong"
 channel = "stable"
+offline = true
 activation = "transparent"
 administrator_policy = "/srv/dev-auth/policy.toml"
 
@@ -34,6 +35,7 @@ fn cli_equivalent() -> DeploymentCliInput {
     DeploymentCliInput {
         mode: Some(DeploymentMode::Strong),
         channel: Some(Channel::Stable),
+        offline: Some(true),
         activation: Some(Activation::Transparent),
         administrator_policy: Some(PathBuf::from("/srv/dev-auth/policy.toml")),
         user_configs: vec![
@@ -207,6 +209,7 @@ config = "{}"
         DeploymentCliInput {
             mode: Some(DeploymentMode::UserOnly),
             channel: Some(Channel::Stable),
+            offline: Some(false),
             activation: Some(Activation::Transparent),
             administrator_policy: Some(policy),
             user_configs: vec![(user.name, config)],

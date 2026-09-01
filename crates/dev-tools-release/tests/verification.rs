@@ -1,14 +1,17 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dev_tools_release::{
-    accept_verified_release, fetch_https, select_stable_release_assets, verify_artifact_bytes,
-    verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy, HttpsPolicy,
-    ReleaseAuthority, ReleaseBundle, ReleaseMetadata, ReleaseState,
+    accept_verified_release, accept_verified_release_at, cache_verified_release, fetch_https,
+    load_cached_release, load_release_state_at, select_stable_release_assets,
+    verify_artifact_bytes, verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy,
+    HttpsPolicy, ReleaseAuthority, ReleaseBundle, ReleaseMetadata, ReleaseState,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fs;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::time::Duration;
 
 fn hex(bytes: &[u8]) -> String {
@@ -213,4 +216,82 @@ fn release_state_rejects_rollback_and_equivocation() {
     version_rollback.manifest_generation += 1;
     version_rollback.version = semver::Version::parse("1.2.2").unwrap();
     assert!(accept_verified_release(&mut state, &version_rollback).is_err());
+}
+
+#[test]
+fn accepted_release_state_is_locked_persistent_and_idempotent() {
+    let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"e".repeat(40)));
+    let verified = verify_release_bytes(&bundle, &authority).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let state_path = root.path().join("release/state.json");
+    let owner = fs::metadata(root.path()).unwrap().uid();
+    assert!(accept_verified_release_at(&state_path, owner, &verified).unwrap());
+    assert!(!accept_verified_release_at(&state_path, owner, &verified).unwrap());
+    assert_eq!(
+        load_release_state_at(&state_path, owner)
+            .unwrap()
+            .accepted_version
+            .as_deref(),
+        Some("1.2.3")
+    );
+    let mut rollback = verified;
+    rollback.manifest_generation -= 1;
+    assert!(accept_verified_release_at(&state_path, owner, &rollback).is_err());
+}
+
+#[test]
+fn verified_release_cache_round_trips_only_authenticated_exact_bytes() {
+    let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"f".repeat(40)));
+    let root = tempfile::tempdir().unwrap();
+    let owner = fs::metadata(root.path()).unwrap().uid();
+    let cached = cache_verified_release(
+        root.path(),
+        &authority,
+        &ReleaseMetadata {
+            root: bundle.root.clone(),
+            manifest: bundle.manifest.clone(),
+        },
+        &bundle.artifact,
+        owner,
+    )
+    .unwrap();
+    assert_eq!(cached.verified.version.to_string(), "1.2.3");
+    let loaded = load_cached_release(
+        root.path(),
+        &authority,
+        &semver::Version::parse("1.2.3").unwrap(),
+        owner,
+    )
+    .unwrap();
+    assert_eq!(loaded.verified, cached.verified);
+    assert_eq!(fs::read(loaded.artifact_path).unwrap(), bundle.artifact);
+}
+
+#[test]
+fn verified_release_cache_resumes_receipt_last_and_rejects_linked_entries() {
+    let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"1".repeat(40)));
+    let root = tempfile::tempdir().unwrap();
+    let owner = fs::metadata(root.path()).unwrap().uid();
+    let metadata = ReleaseMetadata {
+        root: bundle.root.clone(),
+        manifest: bundle.manifest.clone(),
+    };
+    let cached =
+        cache_verified_release(root.path(), &authority, &metadata, &bundle.artifact, owner)
+            .unwrap();
+    let entry = cached.root_path.parent().unwrap().to_path_buf();
+    fs::remove_file(entry.join("receipt.json")).unwrap();
+    let resumed =
+        cache_verified_release(root.path(), &authority, &metadata, &bundle.artifact, owner)
+            .unwrap();
+    assert_eq!(resumed.verified, cached.verified);
+
+    fs::remove_dir_all(&entry).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), &entry).unwrap();
+    assert!(
+        cache_verified_release(root.path(), &authority, &metadata, &bundle.artifact, owner,)
+            .is_err()
+    );
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }

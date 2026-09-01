@@ -6,8 +6,16 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use ureq::ResponseExt;
+
+use dev_tools_installation::{
+    read_atomic_document, write_atomic_document, DocumentAuthority, InstallationLock,
+};
 
 const METADATA_LIMIT: usize = 512 * 1024;
 const ARTIFACT_LIMIT: usize = 256 * 1024 * 1024;
@@ -42,7 +50,7 @@ pub enum ArtifactUrlPolicy {
     GitHubRelease { owner: String, repository: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VerifiedRelease {
     pub root_generation: u64,
     pub root_sha256: String,
@@ -56,6 +64,21 @@ pub struct VerifiedRelease {
     pub artifact_url: String,
     pub artifact_length: u64,
     pub artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedRelease {
+    pub verified: VerifiedRelease,
+    pub root_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub artifact_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CachedReleaseReceipt {
+    schema: String,
+    verified: VerifiedRelease,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -421,6 +444,222 @@ pub fn accept_verified_release(
     state.accepted_version = Some(verified_version);
     state.accepted_binary_sha256 = Some(verified.artifact_sha256.clone());
     Ok(changed)
+}
+
+pub fn load_release_state_at(path: &Path, owner_uid: u32) -> Result<ReleaseState> {
+    let authority = release_state_authority(owner_uid);
+    let Some(document) = read_atomic_document(path, &authority)? else {
+        return Ok(ReleaseState::default());
+    };
+    serde_json::from_slice(&document.bytes).context("parse persisted release state")
+}
+
+pub fn accept_verified_release_at(
+    path: &Path,
+    owner_uid: u32,
+    verified: &VerifiedRelease,
+) -> Result<bool> {
+    if !path.is_absolute() {
+        bail!("persisted release state path must be absolute");
+    }
+    let lock_path = path.with_extension("lock");
+    let _lock = InstallationLock::acquire(&lock_path)?;
+    let authority = release_state_authority(owner_uid);
+    let current = read_atomic_document(path, &authority)?;
+    let mut state = current
+        .as_ref()
+        .map(|document| {
+            serde_json::from_slice(&document.bytes).context("parse persisted release state")
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let changed = accept_verified_release(&mut state, verified)?;
+    if changed {
+        let bytes = serde_jcs::to_vec(&state).context("serialize persisted release state")?;
+        write_atomic_document(
+            path,
+            &bytes,
+            &authority,
+            current.as_ref().map(|document| &document.identity),
+        )?;
+    }
+    Ok(changed)
+}
+
+pub fn cache_verified_release(
+    cache_root: &Path,
+    authority: &ReleaseAuthority,
+    metadata: &ReleaseMetadata,
+    artifact: &[u8],
+    owner_uid: u32,
+) -> Result<CachedRelease> {
+    if !cache_root.is_absolute() {
+        bail!("verified release cache root must be absolute");
+    }
+    let verified = verify_release_metadata(metadata, authority)?;
+    verify_artifact_bytes(&verified, artifact)?;
+    let _lock = InstallationLock::acquire(&cache_root.join("release-cache.lock"))?;
+    let directory = cache_directory(
+        cache_root,
+        &verified.product,
+        &verified.version,
+        &verified.target,
+    );
+    ensure_release_cache_directory(&directory, owner_uid)?;
+    let metadata_authority = DocumentAuthority {
+        owner_uid,
+        mode: 0o600,
+        limit: METADATA_LIMIT as u64,
+    };
+    let artifact_authority = DocumentAuthority {
+        owner_uid,
+        mode: 0o700,
+        limit: ARTIFACT_LIMIT as u64,
+    };
+    write_atomic_document(
+        &directory.join("root.json"),
+        &metadata.root,
+        &metadata_authority,
+        None,
+    )?;
+    write_atomic_document(
+        &directory.join("manifest.json"),
+        &metadata.manifest,
+        &metadata_authority,
+        None,
+    )?;
+    write_atomic_document(
+        &directory.join("artifact"),
+        artifact,
+        &artifact_authority,
+        None,
+    )?;
+    let receipt = CachedReleaseReceipt {
+        schema: "dev-tools-release-cache-v1".into(),
+        verified: verified.clone(),
+    };
+    write_atomic_document(
+        &directory.join("receipt.json"),
+        &serde_jcs::to_vec(&receipt).context("serialize verified release cache receipt")?,
+        &metadata_authority,
+        None,
+    )?;
+    std::fs::File::open(&directory)
+        .context("open verified release cache entry")?
+        .sync_all()
+        .context("sync verified release cache entry")?;
+    let cached = load_cached_release_unlocked(cache_root, authority, &verified.version, owner_uid)?;
+    if cached.verified != verified {
+        bail!("verified release cache contains an equivocal release identity");
+    }
+    Ok(cached)
+}
+
+pub fn load_cached_release(
+    cache_root: &Path,
+    authority: &ReleaseAuthority,
+    version: &Version,
+    owner_uid: u32,
+) -> Result<CachedRelease> {
+    if !cache_root.is_absolute() {
+        bail!("verified release cache root must be absolute");
+    }
+    let _lock = InstallationLock::acquire(&cache_root.join("release-cache.lock"))?;
+    load_cached_release_unlocked(cache_root, authority, version, owner_uid)
+}
+
+fn load_cached_release_unlocked(
+    cache_root: &Path,
+    authority: &ReleaseAuthority,
+    version: &Version,
+    owner_uid: u32,
+) -> Result<CachedRelease> {
+    let directory = cache_directory(cache_root, &authority.product, version, &authority.target);
+    let metadata_authority = DocumentAuthority {
+        owner_uid,
+        mode: 0o600,
+        limit: METADATA_LIMIT as u64,
+    };
+    let artifact_authority = DocumentAuthority {
+        owner_uid,
+        mode: 0o700,
+        limit: ARTIFACT_LIMIT as u64,
+    };
+    let root_path = directory.join("root.json");
+    let manifest_path = directory.join("manifest.json");
+    let artifact_path = directory.join("artifact");
+    let receipt_path = directory.join("receipt.json");
+    let root = read_atomic_document(&root_path, &metadata_authority)?
+        .context("cached release root is absent")?;
+    let manifest = read_atomic_document(&manifest_path, &metadata_authority)?
+        .context("cached release manifest is absent")?;
+    let artifact = read_atomic_document(&artifact_path, &artifact_authority)?
+        .context("cached release artifact is absent")?;
+    let receipt = read_atomic_document(&receipt_path, &metadata_authority)?
+        .context("cached release receipt is absent")?;
+    let receipt: CachedReleaseReceipt =
+        serde_json::from_slice(&receipt.bytes).context("parse cached release receipt")?;
+    if receipt.schema != "dev-tools-release-cache-v1" {
+        bail!("cached release receipt has an unsupported contract");
+    }
+    let verified = verify_release_bytes(
+        &ReleaseBundle {
+            root: root.bytes,
+            manifest: manifest.bytes,
+            artifact: artifact.bytes,
+        },
+        authority,
+    )?;
+    if verified.version != *version || verified != receipt.verified {
+        bail!("cached release receipt does not match its authenticated bytes");
+    }
+    Ok(CachedRelease {
+        verified,
+        root_path,
+        manifest_path,
+        artifact_path,
+    })
+}
+
+fn release_state_authority(owner_uid: u32) -> DocumentAuthority {
+    DocumentAuthority {
+        owner_uid,
+        mode: 0o600,
+        limit: 64 * 1024,
+    }
+}
+
+fn cache_directory(cache_root: &Path, product: &str, version: &Version, target: &str) -> PathBuf {
+    let key = sha256_hex(format!("{product}\0{version}\0{target}").as_bytes());
+    cache_root.join(format!("release-{key}"))
+}
+
+fn ensure_release_cache_directory(path: &Path, owner_uid: u32) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                bail!("verified release cache entry is not a directory");
+            }
+            #[cfg(unix)]
+            if metadata.uid() != owner_uid || metadata.mode() & 0o777 != 0o700 {
+                bail!("verified release cache entry has unsafe filesystem authority");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).context("reserve verified release cache entry")?;
+            #[cfg(unix)]
+            {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .context("protect verified release cache entry")?;
+                if fs::metadata(path)?.uid() != owner_uid {
+                    std::os::unix::fs::chown(path, Some(owner_uid), None)
+                        .context("set verified release cache entry owner")?;
+                }
+            }
+        }
+        Err(error) => return Err(error).context("inspect verified release cache entry"),
+    }
+    Ok(())
 }
 
 fn validate_authority(authority: &ReleaseAuthority) -> Result<()> {

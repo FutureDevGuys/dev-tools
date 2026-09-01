@@ -19,7 +19,7 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -481,6 +481,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                                 .parse()?,
                         )
                     }
+                    "--offline" if cli.offline.is_none() => cli.offline = Some(true),
                     "--activation" if cli.activation.is_none() => {
                         cli.activation = Some(
                             arguments
@@ -549,20 +550,21 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 })
                 .transpose()?;
             let intent = dev_auth::deployment::normalize_deployment(document, cli)?;
-            let stage = output.with_extension(format!("stage-{}", std::process::id()));
-            let staged = dev_auth::stable_release::stage_latest_stable_release(&stage)?;
-            let installation = dev_auth::setup::build_verified_release_plan(
-                match intent.mode {
-                    dev_auth::deployment::DeploymentMode::Strong => {
-                        dev_auth::setup::InstallMode::Strong
-                    }
-                    dev_auth::deployment::DeploymentMode::UserOnly => {
-                        dev_auth::setup::InstallMode::UserOnly
-                    }
-                },
-                false,
-                staged.verified,
-            );
+            let install_mode = match intent.mode {
+                dev_auth::deployment::DeploymentMode::Strong => {
+                    dev_auth::setup::InstallMode::Strong
+                }
+                dev_auth::deployment::DeploymentMode::UserOnly => {
+                    dev_auth::setup::InstallMode::UserOnly
+                }
+            };
+            let release_storage = dev_auth::stable_release::native_release_storage(install_mode)?;
+            let staged = dev_auth::stable_release::stage_latest_stable_release(
+                &release_storage,
+                intent.offline,
+            )?;
+            let installation =
+                dev_auth::setup::build_verified_release_plan(install_mode, false, staged.verified);
             let plan = installation.and_then(|installation| {
                 dev_auth::setup_v3::build_setup_plan_v3(intent, installation)
             });
@@ -570,13 +572,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 dev_auth::setup_v3::write_setup_plan_v3_at(&output, &plan)
                     .map(|digest| (plan, digest))
             });
-            let (plan, digest) = match result {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = std::fs::remove_dir_all(&staged.directory);
-                    return Err(error);
-                }
-            };
+            let (plan, digest) = result?;
             match format {
                 "human" => {
                     println!("setup_plan_path={}", output.display());

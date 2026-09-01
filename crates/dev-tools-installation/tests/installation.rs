@@ -1,11 +1,12 @@
 #![cfg(unix)]
 
 use dev_tools_installation::{
-    publish_executable, remove_owned_file, remove_owned_installation, verify_owned_installation,
-    ArtifactIdentity, InstallationLock, InstallationReceipt, ReceiptArtifact,
+    publish_executable, read_atomic_document, remove_owned_file, remove_owned_installation,
+    verify_owned_installation, write_atomic_document, ArtifactIdentity, DocumentAuthority,
+    InstallationLock, InstallationReceipt, ReceiptArtifact,
 };
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
 #[test]
 fn publication_is_atomic_idempotent_and_refuses_symlink_authority() {
@@ -111,4 +112,67 @@ fn installation_lock_serializes_mutation() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn atomic_documents_are_idempotent_compare_and_swap_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state/release.json");
+    let authority = DocumentAuthority {
+        owner_uid: fs::metadata(temp.path()).unwrap().uid(),
+        mode: 0o600,
+        limit: 4096,
+    };
+    assert!(write_atomic_document(&path, b"one", &authority, None).unwrap());
+    assert!(!write_atomic_document(&path, b"one", &authority, None).unwrap());
+    let current = read_atomic_document(&path, &authority).unwrap().unwrap();
+    assert!(write_atomic_document(&path, b"two", &authority, Some(&current.identity)).unwrap());
+    assert_eq!(
+        read_atomic_document(&path, &authority)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"two"
+    );
+    assert!(write_atomic_document(&path, b"three", &authority, Some(&current.identity)).is_err());
+}
+
+#[test]
+fn atomic_documents_reject_links_and_unsafe_modes() {
+    let temp = tempfile::tempdir().unwrap();
+    let authority = DocumentAuthority {
+        owner_uid: fs::metadata(temp.path()).unwrap().uid(),
+        mode: 0o600,
+        limit: 4096,
+    };
+    let outside = temp.path().join("outside");
+    fs::write(&outside, b"outside").unwrap();
+    let path = temp.path().join("state");
+    symlink(&outside, &path).unwrap();
+    assert!(read_atomic_document(&path, &authority).is_err());
+    assert!(write_atomic_document(&path, b"new", &authority, None).is_err());
+
+    let real_parent = temp.path().join("real-parent");
+    fs::create_dir(&real_parent).unwrap();
+    let document = real_parent.join("document");
+    fs::write(&document, b"document").unwrap();
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o600)).unwrap();
+    let linked_parent = temp.path().join("linked-parent");
+    symlink(&real_parent, &linked_parent).unwrap();
+    assert!(read_atomic_document(&linked_parent.join("document"), &authority).is_err());
+}
+
+#[test]
+fn installation_lock_rejects_symlink_and_hardlink_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside.lock");
+    fs::write(&outside, b"").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let symlinked = temp.path().join("symlinked.lock");
+    symlink(&outside, &symlinked).unwrap();
+    assert!(InstallationLock::acquire(&symlinked).is_err());
+
+    let hardlinked = temp.path().join("hardlinked.lock");
+    fs::hard_link(&outside, &hardlinked).unwrap();
+    assert!(InstallationLock::acquire(&hardlinked).is_err());
 }

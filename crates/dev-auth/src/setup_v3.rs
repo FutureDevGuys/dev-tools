@@ -261,6 +261,11 @@ fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
 }
 
 fn revalidate_public_plan_inputs(plan: &SetupPlanV3) -> Result<()> {
+    if let Some(release) = &plan.installation.verified_release {
+        let storage =
+            crate::stable_release::native_release_storage(plan.installation.request.mode)?;
+        crate::stable_release::require_accepted_release(&storage, release)?;
+    }
     let rebuilt = build_setup_plan_v3_at(plan.intent.clone(), plan.installation.clone(), false)?;
     if rebuilt.intent_sha256 != plan.intent_sha256
         || rebuilt.source_documents != plan.source_documents
