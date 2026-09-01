@@ -354,16 +354,28 @@ pub fn fetch_https(
         .get("etag")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
+    let bytes = read_bounded_body(response.body_mut(), limit)
         .with_context(|| format!("read bounded response from {url}"))?;
+    Ok(HttpsResponse { bytes, etag })
+}
+
+fn read_bounded_body(body: &mut ureq::Body, limit: u64) -> Result<Vec<u8>> {
+    // ureq's reader treats consuming exactly its configured limit as an error
+    // because `read_to_end` performs one final EOF probe. Read at most one byte
+    // beyond our authenticated bound, then enforce the actual inclusive bound
+    // ourselves.
+    let transport_limit = limit
+        .checked_add(1)
+        .context("release response size bound overflowed")?;
+    let bytes = body
+        .with_config()
+        .limit(transport_limit)
+        .read_to_vec()
+        .context("read bounded release response body")?;
     if bytes.is_empty() || bytes.len() as u64 > limit {
         bail!("release response is empty or exceeds its size bound");
     }
-    Ok(HttpsResponse { bytes, etag })
+    Ok(bytes)
 }
 
 fn validate_https_request(url: &str, policy: &HttpsPolicy, limit: u64) -> Result<()> {
@@ -825,4 +837,18 @@ fn valid_github_component(value: &str) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_bounded_body;
+
+    #[test]
+    fn bounded_body_accepts_the_exact_authenticated_length() {
+        let mut exact = ureq::Body::builder().data(b"exact".to_vec());
+        assert_eq!(read_bounded_body(&mut exact, 5).unwrap(), b"exact");
+
+        let mut oversized = ureq::Body::builder().data(b"larger".to_vec());
+        assert!(read_bounded_body(&mut oversized, 5).is_err());
+    }
 }
