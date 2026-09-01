@@ -832,19 +832,7 @@ pub fn run_sandbox_child(
     if matches!(claim, crate::broker_protocol::LocalSessionClaim::Absent) {
         bail!("sandbox adapter is outside an admitted workload boundary");
     }
-    let profile = match probe {
-        crate::broker_protocol::BrokerSessionProbe::Verified {
-            session_id: verified,
-            workload,
-            profile,
-        } if verified == session_id && workload == workload_name => profile,
-        crate::broker_protocol::BrokerSessionProbe::Verified { .. }
-        | crate::broker_protocol::BrokerSessionProbe::NoSession
-        | crate::broker_protocol::BrokerSessionProbe::Invalid { .. }
-        | crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
-            bail!("sandbox adapter did not preserve the admitted broker identity")
-        }
-    };
+    let profile = require_sandbox_broker_identity(probe, session_id, workload_name)?;
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     let (_, receipt) = crate::setup::current_installation()?;
     let policy = match receipt.mode {
@@ -868,6 +856,32 @@ pub fn run_sandbox_child(
     }
     let error = Command::new(launcher).args(arguments).exec();
     Err(error).context("replace sandbox probe with the configured workload launcher")
+}
+
+fn require_sandbox_broker_identity(
+    probe: crate::broker_protocol::BrokerSessionProbe,
+    session_id: &str,
+    workload_name: &str,
+) -> Result<String> {
+    match probe {
+        crate::broker_protocol::BrokerSessionProbe::Verified {
+            session_id: verified,
+            workload,
+            profile,
+        } if verified == session_id && workload == workload_name => Ok(profile),
+        crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {
+            bail!("sandbox adapter crossed its admitted session boundary")
+        }
+        crate::broker_protocol::BrokerSessionProbe::NoSession => {
+            bail!("sandbox adapter lost the admitted broker session")
+        }
+        crate::broker_protocol::BrokerSessionProbe::Invalid { .. } => {
+            bail!("sandbox adapter did not preserve broker peer identity")
+        }
+        crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
+            bail!("sandbox adapter cannot reach the admitted broker socket")
+        }
+    }
 }
 
 fn wait_for_admission_gate(gate_fd: RawFd) -> Result<()> {
@@ -1952,6 +1966,53 @@ mod tests {
                 OsString::from("--future-flag"),
                 OsString::from("value"),
             ]
+        );
+    }
+
+    #[test]
+    fn sandbox_failures_identify_the_broken_containment_property() {
+        let session = "0123456789abcdef0123456789abcdef";
+        for (probe, expected) in [
+            (
+                crate::broker_protocol::BrokerSessionProbe::Unavailable {
+                    reason: "socket hidden".into(),
+                },
+                "cannot reach the admitted broker socket",
+            ),
+            (
+                crate::broker_protocol::BrokerSessionProbe::Invalid {
+                    reason: "peer mismatch".into(),
+                },
+                "did not preserve broker peer identity",
+            ),
+            (
+                crate::broker_protocol::BrokerSessionProbe::NoSession,
+                "lost the admitted broker session",
+            ),
+            (
+                crate::broker_protocol::BrokerSessionProbe::Verified {
+                    session_id: "fedcba9876543210fedcba9876543210".into(),
+                    workload: "codex".into(),
+                    profile: "automation".into(),
+                },
+                "crossed its admitted session boundary",
+            ),
+        ] {
+            let error = require_sandbox_broker_identity(probe, session, "codex").unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
+        assert_eq!(
+            require_sandbox_broker_identity(
+                crate::broker_protocol::BrokerSessionProbe::Verified {
+                    session_id: session.into(),
+                    workload: "codex".into(),
+                    profile: "automation".into(),
+                },
+                session,
+                "codex",
+            )
+            .unwrap(),
+            "automation"
         );
     }
 }
