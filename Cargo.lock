@@ -3829,6 +3829,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "ctrlc",
+ "dev-tools-installation",
  "dev-tools-release",
  "ed25519-dalek 3.0.0",
  "is-terminal",

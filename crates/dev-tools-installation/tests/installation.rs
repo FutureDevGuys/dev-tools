@@ -328,19 +328,15 @@ fn validated_legacy_layout_is_adopted_without_losing_upgrade_rollback() {
     let first = versioned_fixture(temp.path(), "1.0.0", b"first");
     let artifact = first.layout.data_root.join("versions/1.0.0/fixture");
     fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-    fs::set_permissions(
-        &first.layout.data_root,
-        fs::Permissions::from_mode(first.layout.directory_mode),
-    )
-    .unwrap();
+    fs::set_permissions(&first.layout.data_root, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(
         first.layout.data_root.join("versions"),
-        fs::Permissions::from_mode(first.layout.directory_mode),
+        fs::Permissions::from_mode(0o755),
     )
     .unwrap();
     fs::set_permissions(
         artifact.parent().unwrap(),
-        fs::Permissions::from_mode(first.layout.directory_mode),
+        fs::Permissions::from_mode(0o755),
     )
     .unwrap();
     fs::create_dir(&first.layout.bin_dir).unwrap();
@@ -370,6 +366,17 @@ fn validated_legacy_layout_is_adopted_without_losing_upgrade_rollback() {
     .unwrap();
     assert!(adopted.changed);
     assert_eq!(adopted.receipt.active_version, "1.0.0");
+    let versions = first.layout.data_root.join("versions");
+    for directory in [
+        first.layout.data_root.as_path(),
+        versions.as_path(),
+        artifact.parent().unwrap(),
+    ] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
     for alias in &first.aliases {
         assert_eq!(
             fs::read_link(first.layout.bin_dir.join(alias)).unwrap(),

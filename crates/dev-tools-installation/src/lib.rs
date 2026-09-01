@@ -327,6 +327,7 @@ where
         &adoption.identity,
         &adoption.aliases,
     )?;
+    harden_legacy_adoption_layout(&adoption.layout, &adoption.version)?;
     prepare_layout(&adoption.layout, Some(&adoption.version))?;
     let _lock = InstallationLock::acquire(&adoption.layout.lock_path())?;
     recover_versioned_installation_locked(&adoption.layout)?;
@@ -409,6 +410,67 @@ where
         changed: true,
         receipt: next,
     })
+}
+
+fn harden_legacy_adoption_layout(layout: &VersionedLayout, version: &str) -> Result<()> {
+    for path in [
+        layout.data_root.clone(),
+        layout.bin_dir.clone(),
+        layout.versions_dir(),
+        layout.versions_dir().join(version),
+    ] {
+        harden_legacy_adoption_directory(&path, layout.owner_uid, layout.directory_mode)?;
+    }
+    Ok(())
+}
+
+fn harden_legacy_adoption_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(_) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect legacy installation directory {}", path.display())
+            });
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let (directory, _) = open_directory_chain(path, false)?;
+        let metadata =
+            rustix::fs::fstat(&directory).context("inspect legacy installation directory")?;
+        if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::Directory
+            || metadata.st_uid != owner_uid
+            || metadata.st_mode & 0o022 != 0
+        {
+            bail!("legacy installation directory has unsafe filesystem authority");
+        }
+        rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(mode))
+            .context("protect adopted installation directory")?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect legacy installation directory {}", path.display()))?;
+        #[cfg(unix)]
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != owner_uid
+            || metadata.mode() & 0o022 != 0
+        {
+            bail!("legacy installation directory has unsafe filesystem authority");
+        }
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
+            format!("protect adopted installation directory {}", path.display())
+        })?;
+        #[cfg(not(unix))]
+        if !metadata.file_type().is_dir() {
+            bail!("legacy installation directory has unsafe filesystem authority");
+        }
+        Ok(())
+    }
 }
 
 pub fn verify_versioned_installation(layout: &VersionedLayout) -> Result<VersionedReceipt> {

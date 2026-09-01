@@ -4,6 +4,12 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(test)]
 use base64::Engine as _;
+#[cfg(unix)]
+use dev_tools_installation::{
+    adopt_versioned_installation, apply_versioned_installation, rollback_versioned_installation,
+    verify_versioned_installation, ArtifactIdentity, VersionedAdoption, VersionedInstallRequest,
+    VersionedLayout, VersionedReceipt,
+};
 use dev_tools_release::{
     accept_verified_release, select_stable_release_assets, verify_release_metadata,
     ArtifactUrlPolicy, ReleaseAuthority, ReleaseMetadata, ReleaseState as SharedReleaseState,
@@ -68,6 +74,13 @@ impl Product {
 
     fn health_args(self) -> &'static [&'static str] {
         &["--version"]
+    }
+
+    fn from_id(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|product| product.id() == value)
+            .with_context(|| format!("unsupported release product {value}"))
     }
 }
 
@@ -226,6 +239,8 @@ pub(crate) fn update(product: Product) -> Result<Activation> {
         return Ok(externally_managed(product, &paths));
     }
     let mut state = load_state(&paths)?;
+    #[cfg(unix)]
+    adopt_legacy_installation(product, &paths, &mut state)?;
     let verified = fetch_verified_manifest(product, &paths, &state)?;
     accept_manifest_metadata(&mut state, &verified)?;
     if activation_is_current(&paths, &state, &verified)? {
@@ -269,19 +284,25 @@ fn activation_is_current(
     if state.active_version.as_ref() != Some(version) || !is_managed_install(paths) {
         return Ok(false);
     }
-    let target = version_binary(paths, version);
-    if !target.is_file()
-        || sha256_file(&target)? != verified.artifact.sha256
-        || sha256_file(&paths.public_binary)? != verified.artifact.sha256
-    {
-        return Ok(false);
-    }
     #[cfg(unix)]
     {
-        return Ok(fs::canonicalize(&paths.public_binary)? == fs::canonicalize(target)?);
+        let receipt = verify_versioned_installation(&shared_installation_layout(
+            Product::from_id(&verified.manifest.product)?,
+            paths,
+        )?)?;
+        return Ok(receipt.active_version == *version
+            && receipt.active_identity.length == verified.artifact.length
+            && receipt.active_identity.sha256 == verified.artifact.sha256.to_ascii_lowercase());
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
+        let target = version_binary(paths, version);
+        if !target.is_file()
+            || sha256_file(&target)? != verified.artifact.sha256
+            || sha256_file(&paths.public_binary)? != verified.artifact.sha256
+        {
+            return Ok(false);
+        }
         Ok(true)
     }
 }
@@ -297,12 +318,22 @@ fn activate_retained_verified(
     if !target.is_file() || sha256_file(&target)? != verified.artifact.sha256 {
         return Ok(false);
     }
-    let previous = state.active_version.clone();
-    activate_link(product, paths, version)?;
-    state.previous_version = previous.filter(|value| value != version);
-    state.active_version = Some(version.clone());
-    prune_versions(paths, state)?;
-    Ok(true)
+    #[cfg(unix)]
+    {
+        let identity = artifact_identity(&verified.artifact);
+        let receipt = activate_existing_shared(product, paths, version, &identity)?;
+        synchronize_installation_state(state, &receipt);
+        return Ok(true);
+    }
+    #[cfg(not(unix))]
+    {
+        let previous = state.active_version.clone();
+        activate_link(product, paths, version)?;
+        state.previous_version = previous.filter(|value| value != version);
+        state.active_version = Some(version.clone());
+        prune_versions(paths, state)?;
+        Ok(true)
+    }
 }
 
 pub(crate) fn install(product: Product) -> Result<Activation> {
@@ -327,28 +358,56 @@ pub(crate) fn update_if_installed(product: Product) -> Result<Activation> {
 pub(crate) fn rollback(product: Product) -> Result<Activation> {
     let paths = Paths::resolve(product)?;
     let mut state = load_state(&paths)?;
-    let previous = state.previous_version.clone().with_context(|| {
-        format!(
-            "no retained {} version is available for rollback",
-            product.id()
-        )
-    })?;
-    let binary = version_binary(&paths, &previous);
-    if !binary.is_file() {
-        bail!("retained rollback binary is missing: {}", binary.display());
+    #[cfg(unix)]
+    {
+        adopt_legacy_installation(product, &paths, &mut state)?;
+        let report = rollback_versioned_installation(
+            &shared_installation_layout(product, &paths)?,
+            |candidate| {
+                let version = candidate
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|value| value.to_str())
+                    .context("rollback candidate has no version directory")?;
+                verify_candidate_health(product, candidate, version)
+            },
+        )?;
+        synchronize_installation_state(&mut state, &report.receipt);
+        save_state(&paths, &state)?;
+        return Ok(Activation {
+            product,
+            version: Some(report.receipt.active_version.clone()),
+            changed: report.changed,
+            managed: true,
+            outcome: "rolled_back".into(),
+            path: Some(version_binary(&paths, &report.receipt.active_version)),
+        });
     }
-    activate_link(product, &paths, &previous)?;
-    let old_active = state.active_version.replace(previous.clone());
-    state.previous_version = old_active;
-    save_state(&paths, &state)?;
-    Ok(Activation {
-        product,
-        version: Some(previous),
-        changed: true,
-        managed: true,
-        outcome: "rolled_back".into(),
-        path: Some(binary),
-    })
+    #[cfg(not(unix))]
+    {
+        let previous = state.previous_version.clone().with_context(|| {
+            format!(
+                "no retained {} version is available for rollback",
+                product.id()
+            )
+        })?;
+        let binary = version_binary(&paths, &previous);
+        if !binary.is_file() {
+            bail!("retained rollback binary is missing: {}", binary.display());
+        }
+        activate_link(product, &paths, &previous)?;
+        let old_active = state.active_version.replace(previous.clone());
+        state.previous_version = old_active;
+        save_state(&paths, &state)?;
+        Ok(Activation {
+            product,
+            version: Some(previous),
+            changed: true,
+            managed: true,
+            outcome: "rolled_back".into(),
+            path: Some(binary),
+        })
+    }
 }
 
 pub(crate) fn maybe_auto_update() -> Result<Option<Activation>> {
@@ -606,35 +665,68 @@ fn activate(
 ) -> Result<Activation> {
     let version = &verified.manifest.version;
     let target = version_binary(paths, version);
-    if target.is_file() && sha256_file(&target)? == verified.artifact.sha256 {
-        activate_link(product, paths, version)?;
-        state.active_version = Some(version.clone());
+    #[cfg(unix)]
+    {
+        let staged = paths
+            .product_root
+            .join("cache")
+            .join(format!(".{}.candidate", product.id()));
+        atomic_write(&staged, bytes, true)?;
+        let identity = artifact_identity(&verified.artifact);
+        let report = apply_versioned_installation(
+            &VersionedInstallRequest {
+                layout: shared_installation_layout(product, paths)?,
+                version: version.clone(),
+                source: staged.clone(),
+                identity,
+                aliases: vec![paths.executable_name.clone()],
+            },
+            |candidate| verify_candidate_health(product, candidate, version),
+        );
+        let _ = fs::remove_file(staged);
+        let report = report?;
+        synchronize_installation_state(state, &report.receipt);
         return Ok(Activation {
             product,
             version: Some(version.clone()),
-            changed: false,
+            changed: report.changed,
             managed: true,
-            outcome: "no_op".into(),
+            outcome: if report.changed { "updated" } else { "no_op" }.into(),
             path: Some(target),
         });
     }
-    let parent = target.parent().context("version binary has no parent")?;
-    create_private_dir(parent)?;
-    atomic_write(&target, bytes, true)?;
-    verify_candidate_health(product, &target, version)?;
-    let previous = state.active_version.clone();
-    activate_link(product, paths, version)?;
-    state.previous_version = previous.filter(|value| value != version);
-    state.active_version = Some(version.clone());
-    prune_versions(paths, state)?;
-    Ok(Activation {
-        product,
-        version: Some(version.clone()),
-        changed: true,
-        managed: true,
-        outcome: "updated".into(),
-        path: Some(target),
-    })
+    #[cfg(not(unix))]
+    {
+        if target.is_file() && sha256_file(&target)? == verified.artifact.sha256 {
+            activate_link(product, paths, version)?;
+            state.active_version = Some(version.clone());
+            return Ok(Activation {
+                product,
+                version: Some(version.clone()),
+                changed: false,
+                managed: true,
+                outcome: "no_op".into(),
+                path: Some(target),
+            });
+        }
+        let parent = target.parent().context("version binary has no parent")?;
+        create_private_dir(parent)?;
+        atomic_write(&target, bytes, true)?;
+        verify_candidate_health(product, &target, version)?;
+        let previous = state.active_version.clone();
+        activate_link(product, paths, version)?;
+        state.previous_version = previous.filter(|value| value != version);
+        state.active_version = Some(version.clone());
+        prune_versions(paths, state)?;
+        Ok(Activation {
+            product,
+            version: Some(version.clone()),
+            changed: true,
+            managed: true,
+            outcome: "updated".into(),
+            path: Some(target),
+        })
+    }
 }
 
 fn activate_link(product: Product, paths: &Paths, version: &str) -> Result<()> {
@@ -906,6 +998,145 @@ fn target_id() -> String {
 
 fn version_binary(paths: &Paths, version: &str) -> PathBuf {
     paths.versions.join(version).join(&paths.executable_name)
+}
+
+#[cfg(unix)]
+fn shared_installation_layout(product: Product, paths: &Paths) -> Result<VersionedLayout> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut authority_path = paths.product_root.as_path();
+    let owner_uid = loop {
+        match fs::symlink_metadata(authority_path) {
+            Ok(metadata) => break metadata.uid(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                authority_path = authority_path
+                    .parent()
+                    .context("managed product root has no existing authority ancestor")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect installation authority {}",
+                        authority_path.display()
+                    )
+                });
+            }
+        }
+    };
+    Ok(VersionedLayout {
+        product: product.id().into(),
+        data_root: paths.product_root.clone(),
+        bin_dir: paths.bin_dir.clone(),
+        artifact_name: paths.executable_name.clone(),
+        owner_uid,
+        directory_mode: 0o700,
+    })
+}
+
+#[cfg(unix)]
+fn adopt_legacy_installation(
+    product: Product,
+    paths: &Paths,
+    state: &mut ReleaseState,
+) -> Result<()> {
+    let layout = shared_installation_layout(product, paths)?;
+    if fs::symlink_metadata(paths.product_root.join("installation-receipt-v1.json")).is_ok() {
+        verify_versioned_installation(&layout)?;
+        return Ok(());
+    }
+    let Some(version) = state.active_version.as_deref() else {
+        return Ok(());
+    };
+    let artifact = version_binary(paths, version);
+    let identity = ArtifactIdentity::from_file(&artifact, ARTIFACT_LIMIT)?;
+    if state
+        .accepted_binary_sha256
+        .as_deref()
+        .is_some_and(|approved| approved != identity.sha256)
+    {
+        bail!("legacy managed artifact does not match authenticated release state");
+    }
+    let expected_current = paths.versions.join(version);
+    let expected_public = paths.current.join(product.id());
+    let current_present = verify_optional_legacy_symlink(&paths.current, &expected_current)?;
+    let public_present = verify_optional_legacy_symlink(&paths.public_binary, &expected_public)?;
+    verify_candidate_health(product, &artifact, version)?;
+    if public_present {
+        fs::remove_file(&paths.public_binary).context("detach legacy public command pointer")?;
+    }
+    if current_present {
+        fs::remove_file(&paths.current).context("detach legacy current-version pointer")?;
+    }
+    adopt_versioned_installation(
+        &VersionedAdoption {
+            layout,
+            version: version.into(),
+            identity,
+            aliases: vec![paths.executable_name.clone()],
+        },
+        |candidate| verify_candidate_health(product, candidate, version),
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_optional_legacy_symlink(path: &Path, expected: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() && fs::read_link(path)? == expected => {
+            Ok(true)
+        }
+        Ok(_) => bail!("legacy managed installation pointer does not match authenticated state"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect legacy managed installation pointer"),
+    }
+}
+
+#[cfg(unix)]
+fn artifact_identity(artifact: &Artifact) -> ArtifactIdentity {
+    ArtifactIdentity {
+        length: artifact.length,
+        sha256: artifact.sha256.to_ascii_lowercase(),
+    }
+}
+
+#[cfg(unix)]
+fn activate_existing_shared(
+    product: Product,
+    paths: &Paths,
+    version: &str,
+    identity: &ArtifactIdentity,
+) -> Result<VersionedReceipt> {
+    let layout = shared_installation_layout(product, paths)?;
+    let receipt_path = paths.product_root.join("installation-receipt-v1.json");
+    if fs::symlink_metadata(receipt_path).is_ok() {
+        return Ok(apply_versioned_installation(
+            &VersionedInstallRequest {
+                layout,
+                version: version.into(),
+                source: version_binary(paths, version),
+                identity: identity.clone(),
+                aliases: vec![paths.executable_name.clone()],
+            },
+            |candidate| verify_candidate_health(product, candidate, version),
+        )?
+        .receipt);
+    }
+    Ok(adopt_versioned_installation(
+        &VersionedAdoption {
+            layout,
+            version: version.into(),
+            identity: identity.clone(),
+            aliases: vec![paths.executable_name.clone()],
+        },
+        |candidate| verify_candidate_health(product, candidate, version),
+    )?
+    .receipt)
+}
+
+#[cfg(unix)]
+fn synchronize_installation_state(state: &mut ReleaseState, receipt: &VersionedReceipt) {
+    state.active_version = Some(receipt.active_version.clone());
+    state.previous_version = receipt.previous_version.clone();
 }
 
 fn load_state(paths: &Paths) -> Result<ReleaseState> {
@@ -1263,10 +1494,15 @@ mod tests {
             product_root,
             executable_name: "update-all".into(),
         };
-        let bytes = b"authenticated release";
         let version = "1.2.3";
         let target = version_binary(&paths, version);
-        atomic_write(&target, bytes, true).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &target,
+            "#!/bin/sh\nprintf '%s\\n' 'update-all 1.2.3 profile=release'\n",
+        )
+        .unwrap();
+        let bytes = fs::read(&target).unwrap();
         let verified = VerifiedManifest {
             root_generation: 1,
             root_sha256: "root".into(),
@@ -1281,7 +1517,7 @@ mod tests {
             artifact: Artifact {
                 url: "https://github.com/example".into(),
                 length: bytes.len() as u64,
-                sha256: sha256_hex(bytes),
+                sha256: sha256_hex(&bytes),
             },
             manifest_sha256: "manifest".into(),
         };
@@ -1292,6 +1528,55 @@ mod tests {
         );
         assert!(activation_is_current(&paths, &state, &verified).unwrap());
         assert_eq!(fs::canonicalize(paths.public_binary).unwrap(), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_layout_is_adopted_by_the_shared_installation_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let product_root = temp.path().join("products/update-all");
+        let bin_dir = temp.path().join("bin");
+        let paths = Paths {
+            versions: product_root.join("versions"),
+            current: product_root.join("current"),
+            state: product_root.join("state.json"),
+            root_cache: product_root.join("cache/root.json"),
+            root_etag: product_root.join("cache/root.etag"),
+            manifest_cache: product_root.join("cache/manifest.json"),
+            manifest_etag: product_root.join("cache/manifest.etag"),
+            public_binary: bin_dir.join("update-all"),
+            bin_dir,
+            product_root,
+            executable_name: "update-all".into(),
+        };
+        let version = "1.2.3";
+        let target = version_binary(&paths, version);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &target,
+            "#!/bin/sh\nprintf '%s\\n' 'update-all 1.2.3 profile=release'\n",
+        )
+        .unwrap();
+        activate_link(Product::UpdateAll, &paths, version).unwrap();
+        let identity =
+            dev_tools_installation::ArtifactIdentity::from_file(&target, ARTIFACT_LIMIT).unwrap();
+        let mut state = ReleaseState {
+            active_version: Some(version.into()),
+            accepted_binary_sha256: Some(identity.sha256.clone()),
+            ..ReleaseState::default()
+        };
+
+        adopt_legacy_installation(Product::UpdateAll, &paths, &mut state).unwrap();
+
+        let receipt = dev_tools_installation::verify_versioned_installation(
+            &shared_installation_layout(Product::UpdateAll, &paths).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.active_version, version);
+        assert_eq!(receipt.active_identity, identity);
+        assert_eq!(receipt.aliases, vec!["update-all"]);
+        assert_eq!(fs::canonicalize(paths.public_binary).unwrap(), target);
+        assert!(!paths.current.exists());
     }
 
     #[cfg(unix)]
