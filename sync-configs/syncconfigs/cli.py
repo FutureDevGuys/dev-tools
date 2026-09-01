@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2301,6 +2302,54 @@ def _invoke_reconciler(
     return _parse_reconciler_result(stdout_path.read_bytes())
 
 
+def _read_private_reconciler_plan(entry: ReconcilerEntry, plan: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(plan, flags)
+    except OSError as exc:
+        raise ConfigError(f"Reconciler '{entry.name}' produced an unsafe plan.") from exc
+    try:
+        before = os.fstat(descriptor)
+        unsafe = (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size == 0
+            or before.st_size > RECONCILER_OUTPUT_LIMIT
+        )
+        effective_uid = getattr(os, "geteuid", lambda: None)()
+        if effective_uid is not None:
+            unsafe = (
+                unsafe
+                or before.st_uid != effective_uid
+                or stat.S_IMODE(before.st_mode) != 0o600
+            )
+        if unsafe:
+            raise ConfigError(f"Reconciler '{entry.name}' produced an unsafe plan.")
+        chunks: list[bytes] = []
+        remaining = RECONCILER_OUTPUT_LIMIT + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) != before.st_size
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        ):
+            raise ConfigError(f"Reconciler '{entry.name}' plan changed while it was read.")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
 def run_external_reconciler(
     entry: ReconcilerEntry,
     *,
@@ -2324,10 +2373,9 @@ def run_external_reconciler(
         )
         if planned["deferred"] or planned["input_required"] or dry_run:
             return planned
-        plan_metadata = plan.lstat()
-        if plan.is_symlink() or not plan.is_file() or plan_metadata.st_size > RECONCILER_OUTPUT_LIMIT:
-            raise ConfigError(f"Reconciler '{entry.name}' produced an unsafe plan.")
-        plan_sha256 = hashlib.sha256(plan.read_bytes()).hexdigest()
+        plan_sha256 = hashlib.sha256(
+            _read_private_reconciler_plan(entry, plan)
+        ).hexdigest()
         applied = _invoke_reconciler(
             entry,
             ["reconcile", "apply", "--plan", str(plan), "--sha256", plan_sha256, "--format", "json"],

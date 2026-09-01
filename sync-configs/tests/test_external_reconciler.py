@@ -161,3 +161,38 @@ def test_reconciler_rejects_arbitrary_command_surfaces(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "unsupported keys" in result.stderr
+
+
+def test_reconciler_rejects_public_plan_custody(tmp_path: Path) -> None:
+    program, marker, _log = fake_reconciler(tmp_path)
+    manifest = manifest_for(tmp_path, program)
+    program.write_text(
+        program.read_text(encoding="utf-8").replace(
+            "output.chmod(0o600)", "output.chmod(0o644)"
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli(manifest, "--no-color")
+
+    assert result.returncode == 1
+    assert not marker.exists()
+    assert "unsafe plan" in result.stdout
+
+
+def test_reconciler_rejects_hardlinked_plan_custody(tmp_path: Path) -> None:
+    program, marker, _log = fake_reconciler(tmp_path)
+    manifest = manifest_for(tmp_path, program)
+    program.write_text(
+        program.read_text(encoding="utf-8").replace(
+            "output.chmod(0o600)",
+            'output.chmod(0o600)\n    output.with_name("second-link").hardlink_to(output)',
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_cli(manifest, "--no-color")
+
+    assert result.returncode == 1
+    assert not marker.exists()
+    assert "unsafe plan" in result.stdout

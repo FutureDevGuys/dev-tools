@@ -47,6 +47,63 @@ pub struct ReconcileResult {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserConfigPlanOutcome {
+    Ready {
+        plan: Box<UserConfigReconcilePlan>,
+        result: ReconcileResult,
+    },
+    Deferred(ReconcileResult),
+}
+
+pub fn plan_user_config_for_protocol(source: &Path) -> Result<UserConfigPlanOutcome> {
+    if !source.is_absolute() {
+        bail!("reconcile source path must be absolute");
+    }
+    if current_installation_receipt()?.is_none() {
+        return Ok(UserConfigPlanOutcome::Deferred(deferred_result(
+            "setup",
+            "system_installation_absent",
+        )));
+    }
+    let (_, installation) = crate::setup::current_installation()?;
+    let user = native_user()?;
+    let policy = match installation.mode {
+        crate::setup::InstallMode::Strong => PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH),
+        crate::setup::InstallMode::UserOnly => crate::policy_store::user_policy_path(&user),
+    };
+    match fs::symlink_metadata(&policy) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserConfigPlanOutcome::Deferred(deferred_result(
+                "install_policy",
+                "administrator_policy_absent",
+            )));
+        }
+        Err(error) => return Err(error).context("inspect reconcile policy readiness"),
+        Ok(_) => {}
+    }
+    if installation.mode == crate::setup::InstallMode::Strong {
+        match crate::broker_client::probe_system_broker() {
+            crate::broker_protocol::BrokerSessionProbe::NoSession
+            | crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {}
+            crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
+                return Ok(UserConfigPlanOutcome::Deferred(deferred_result(
+                    "start_broker",
+                    "system_broker_unavailable",
+                )));
+            }
+            crate::broker_protocol::BrokerSessionProbe::Invalid { .. } => {
+                bail!("system broker returned an invalid session result")
+            }
+        }
+    }
+    let (plan, result) = plan_user_config(source)?;
+    Ok(UserConfigPlanOutcome::Ready {
+        plan: Box::new(plan),
+        result,
+    })
+}
+
 pub fn plan_user_config(source: &Path) -> Result<(UserConfigReconcilePlan, ReconcileResult)> {
     if !source.is_absolute() {
         bail!("reconcile source path must be absolute");
@@ -151,13 +208,19 @@ pub fn write_plan(path: &Path, plan: &UserConfigReconcilePlan) -> Result<String>
         .open(&temporary)
         .context("create reconcile plan")?;
     file.write_all(&bytes).context("write reconcile plan")?;
+    let user = native_user()?;
+    if nix::unistd::Uid::effective().is_root() {
+        nix::unistd::fchown(&file, Some(user.uid), Some(user.gid))
+            .context("assign reconcile plan to native caller")?;
+    }
     file.sync_all().context("sync reconcile plan")?;
     fs::rename(&temporary, path).context("publish reconcile plan")?;
     Ok(digest)
 }
 
 pub fn read_plan(path: &Path) -> Result<UserConfigReconcilePlan> {
-    let (bytes, _) = read_public_document(path, nix::unistd::Uid::effective().as_raw())?;
+    let user = native_user()?;
+    let (bytes, _) = read_public_document(path, user.uid.as_raw())?;
     let plan: UserConfigReconcilePlan =
         serde_json::from_slice(&bytes).context("parse user reconcile plan")?;
     validate_plan(&plan)?;
@@ -300,9 +363,49 @@ fn result(changed: bool, verified: bool, next_action: &str) -> ReconcileResult {
     }
 }
 
+fn deferred_result(next_action: &str, diagnostic: &str) -> ReconcileResult {
+    ReconcileResult {
+        schema: RESULT_SCHEMA.into(),
+        changed: false,
+        verified: false,
+        deferred: true,
+        input_required: Vec::new(),
+        next_action: next_action.into(),
+        diagnostics: vec![diagnostic.into()],
+    }
+}
+
+fn current_installation_receipt() -> Result<Option<PathBuf>> {
+    let executable = fs::canonicalize(std::env::current_exe()?)
+        .context("resolve current executable for reconciliation")?;
+    let Some(version_directory) = executable.parent() else {
+        return Ok(None);
+    };
+    let Some(versions_directory) = version_directory.parent() else {
+        return Ok(None);
+    };
+    if versions_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("versions")
+    {
+        return Ok(None);
+    }
+    let Some(data_root) = versions_directory.parent() else {
+        return Ok(None);
+    };
+    let receipt = data_root.join("install-v2.json");
+    match fs::symlink_metadata(&receipt) {
+        Ok(_) => Ok(Some(receipt)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect installation receipt readiness"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn canonical_plan_digest_is_stable_and_value_free() {
@@ -332,5 +435,42 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first_digest, second_digest);
         assert!(!String::from_utf8(first).unwrap().contains("credential"));
+    }
+
+    #[test]
+    fn published_plan_is_private_and_owned_by_native_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("plan.json");
+        let user = native_user().unwrap();
+        let plan = UserConfigReconcilePlan {
+            schema: PLAN_SCHEMA.into(),
+            installation_paths: crate::setup::SetupPaths::user_only(&user.dir),
+            installation_version: "0.3.0".into(),
+            installation_sha256: "a".repeat(64),
+            account_name: user.name,
+            account_uid: user.uid.as_raw(),
+            account_home: user.dir.clone(),
+            source: user.dir.join("desired-config.toml"),
+            source_state: FileState {
+                length: 10,
+                sha256: "b".repeat(64),
+            },
+            policy: user.dir.join("policy.toml"),
+            policy_state: FileState {
+                length: 20,
+                sha256: "c".repeat(64),
+            },
+            destination: user.dir.join(".config/dev-auth/config-v2.toml"),
+            current_state: None,
+        };
+
+        write_plan(&output, &plan).unwrap();
+
+        let metadata = fs::symlink_metadata(&output).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.uid(), plan.account_uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(read_plan(&output).unwrap(), plan);
     }
 }

@@ -16,7 +16,7 @@ dev-auth reconcile apply --plan PLAN --sha256 HEX --format json
 dev-auth reconcile verify --source PATH --format json
 ```
 
-Each operation binds the installed release, native account, administrator/user-only policy, source document, installed destination, and exact precondition identities. It returns the common value-free result schema for `sync-configs`. It cannot install releases, change administrator policy, manage broker services, activate launchers, or enroll credentials.
+Each operation binds the installed release, native account, administrator/user-only policy, source document, installed destination, and exact precondition identities. It returns the common value-free result schema for `sync-configs`. When invoked through sudo, planning publishes the nonsecret mode-`0600` plan to the verified native sudo caller so the configuration client can approve its digest without gaining access to broker credentials. If the standalone installation, administrator policy, or strong broker is absent, planning returns a value-free structured deferred result. The reconciler cannot install releases, change administrator policy, manage broker services, activate launchers, or enroll credentials.
 
 `dev-auth` is a cross-platform, system-agnostic, account-agnostic credential adapter for one bounded automation principal shared by processes running as the same operating-system user. It has no provider-state model, deployment behavior, arbitrary vault browser, human-credential fallback, or owner-specific policy.
 

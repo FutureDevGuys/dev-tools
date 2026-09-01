@@ -991,9 +991,13 @@ fn run_reconcile(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if !source.is_absolute() || !output.is_absolute() {
                 bail!("reconcile source and output paths must be absolute");
             }
-            let (plan, report) = dev_auth::reconcile::plan_user_config(&source)?;
-            dev_auth::reconcile::write_plan(&output, &plan)?;
-            report
+            match dev_auth::reconcile::plan_user_config_for_protocol(&source)? {
+                dev_auth::reconcile::UserConfigPlanOutcome::Ready { plan, result } => {
+                    dev_auth::reconcile::write_plan(&output, &plan)?;
+                    result
+                }
+                dev_auth::reconcile::UserConfigPlanOutcome::Deferred(result) => result,
+            }
         }
         "apply" => {
             if source.is_some() || output.is_some() {

@@ -126,6 +126,35 @@ fn typed_reconcile_cli_reserves_only_the_fixed_protocol_grammar() {
     assert!(!error.contains("unknown command"));
 }
 
+#[test]
+fn typed_reconcile_defers_when_standalone_system_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("config-v2.toml");
+    let plan = root.path().join("plan.json");
+    fs::write(&source, b"version = 2\n").unwrap();
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "reconcile",
+                "plan",
+                "--source",
+                source.to_str().unwrap(),
+                "--output",
+                plan.to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+            .env_clear(),
+    );
+
+    assert!(output.status.success(), "{:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["deferred"], true);
+    assert_eq!(report["next_action"], "setup");
+    assert_eq!(report["diagnostics"][0], "system_installation_absent");
+    assert!(!plan.exists());
+}
+
 #[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,
