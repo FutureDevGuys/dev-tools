@@ -4383,18 +4383,12 @@ mod tests {
 
     #[test]
     fn strong_backend_availability_includes_runtime_admission_blockers() {
-        let runtime_blocker = prerequisite_blocker(
-            "cgroup_v2",
-            DiscoveryStatus::Absent,
-            "strong_admission",
-        );
+        let runtime_blocker =
+            prerequisite_blocker("cgroup_v2", DiscoveryStatus::Absent, "strong_admission");
         assert!(!strong_backend_available_from_blockers(&[runtime_blocker]));
 
-        let unrelated_blocker = prerequisite_blocker(
-            "git",
-            DiscoveryStatus::Absent,
-            "strong_setup",
-        );
+        let unrelated_blocker =
+            prerequisite_blocker("git", DiscoveryStatus::Absent, "strong_setup");
         assert!(strong_backend_available_from_blockers(&[unrelated_blocker]));
     }
 
