@@ -8,6 +8,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn install_frontends(root: &Path, git: &Path, gh: &Path) -> dev_auth::setup::SetupPaths {
+    let candidate = root.join("dev-auth-candidate");
+    fs::copy(env!("CARGO_BIN_EXE_dev-auth"), &candidate).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
     let paths = dev_auth::setup::SetupPaths {
         data_root: root.join("data/dev-auth"),
         bin_dir: root.join("bin"),
@@ -17,7 +20,7 @@ fn install_frontends(root: &Path, git: &Path, gh: &Path) -> dev_auth::setup::Set
         &dev_auth::setup::InstallRequest {
             mode: dev_auth::setup::InstallMode::UserOnly,
             version: "0.3.0-test".into(),
-            source_executable: Path::new(env!("CARGO_BIN_EXE_dev-auth")).to_path_buf(),
+            source_executable: candidate,
             native_git: git.to_path_buf(),
             native_gh: gh.to_path_buf(),
             activate_transparent_launchers: true,
