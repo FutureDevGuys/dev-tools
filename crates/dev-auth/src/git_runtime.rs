@@ -832,30 +832,6 @@ fn push_environment_path(
     Ok(())
 }
 
-fn push_program_environment_path(
-    targets: &mut Vec<PathBuf>,
-    environment: &BTreeMap<OsString, OsString>,
-    variable: &str,
-    cwd: &Path,
-) -> Result<()> {
-    let Some(value) = environment_value(environment, variable) else {
-        return Ok(());
-    };
-    if value.is_empty() {
-        return Ok(());
-    }
-    let text = os_argument(value, "Git program environment value")?;
-    if text.bytes().any(|byte| byte.is_ascii_whitespace())
-        || text.contains(['\'', '"', '`', '$', ';', '&', '|', '<', '>', '(', ')'])
-    {
-        bail!("Git environment variable {variable} contains an ambiguous command");
-    }
-    if Path::new(value).is_absolute() || text.contains(['/', '\\']) {
-        targets.push(canonical_candidate_path(Path::new(value), cwd)?);
-    }
-    Ok(())
-}
-
 fn push_trace_environment_path(
     targets: &mut Vec<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
@@ -942,20 +918,9 @@ fn environment_git_targets(
     ] {
         push_environment_path(&mut result.paths, environment, variable, cwd)?;
     }
-    for variable in [
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "GIT_SSH",
-        "GIT_EDITOR",
-        "GIT_SEQUENCE_EDITOR",
-        "GIT_PAGER",
-        "PAGER",
-    ] {
-        push_program_environment_path(&mut result.paths, environment, variable, cwd)?;
-    }
-    if environment_value(environment, "GIT_SSH_COMMAND").is_some() {
-        bail!("Git shell-command environment is not admitted by the routing boundary");
-    }
+    // Editors, pagers, askpass helpers, and SSH command strings affect the eventual
+    // Git child, not repository routing. Proven-human passthrough must preserve them
+    // verbatim, while managed execution replaces them with its isolated environment.
     for variable in [
         "GIT_TRACE",
         "GIT_TRACE_FSMONITOR",
@@ -2390,6 +2355,51 @@ fn git_configuration_scope_snapshot(
 }
 
 #[cfg(target_os = "linux")]
+fn git_worktree_configuration_enabled(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+) -> Result<bool> {
+    let mut command = guarded_command(program, program_guard)?;
+    let output = command
+        .args([
+            "config",
+            "--local",
+            "--no-includes",
+            "--type=bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_probe_environment(&BTreeMap::new()))
+        .stdin(Stdio::null())
+        .output()
+        .context("resolve Git worktree configuration mode")?;
+    match output.status.code() {
+        Some(0) if output.stderr.is_empty() && output.stdout == b"true\n" => Ok(true),
+        Some(0) if output.stderr.is_empty() && output.stdout == b"false\n" => Ok(false),
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(false),
+        _ => bail!("Git worktree configuration mode cannot be bound safely"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn git_repository_configuration_scope_snapshots(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let local = git_configuration_scope_snapshot(program, program_guard, cwd, "--local")?;
+    let worktree = if git_worktree_configuration_enabled(program, program_guard, cwd)? {
+        git_configuration_scope_snapshot(program, program_guard, cwd, "--worktree")?
+    } else {
+        Vec::new()
+    };
+    Ok((local, worktree))
+}
+
+#[cfg(target_os = "linux")]
 struct IndexedGitAttributesSnapshot {
     entries: Vec<u8>,
     objects: Vec<(Vec<u8>, Vec<u8>)>,
@@ -3065,9 +3075,8 @@ fn repository_authority_binding(
         bail!("managed Git origin changed after repository selection");
     }
     validate_local_git_configuration(program, program_guard, cwd, &BTreeMap::new())?;
-    let local_config = git_configuration_scope_snapshot(program, program_guard, cwd, "--local")?;
-    let worktree_config =
-        git_configuration_scope_snapshot(program, program_guard, cwd, "--worktree")?;
+    let (local_config, worktree_config) =
+        git_repository_configuration_scope_snapshots(program, program_guard, cwd)?;
 
     let mut held_paths = held_selectors;
     for directory in [&top_level, &git_dir, &common_dir] {
@@ -5072,9 +5081,6 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             ("GIT_CONFIG_SYSTEM", managed.join("system-config")),
             ("GIT_EXEC_PATH", managed.join("git-exec")),
             ("GIT_TEMPLATE_DIR", managed.join("templates")),
-            ("GIT_ASKPASS", managed.join("askpass")),
-            ("SSH_ASKPASS", managed.join("ssh-askpass")),
-            ("GIT_SSH", managed.join("ssh")),
             ("GIT_TRACE", managed.join("trace")),
         ] {
             let poisoned = BTreeMap::from([(OsString::from(variable), value.into_os_string())]);
@@ -5108,11 +5114,7 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             );
         }
 
-        for variable in [
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_SSH_COMMAND",
-        ] {
+        for variable in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
             let poisoned = BTreeMap::from([(
                 OsString::from(variable),
                 OsString::from("ambiguous injected authority"),
@@ -5141,6 +5143,27 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             (OsString::from("PATH"), OsString::from("/usr/bin")),
             (OsString::from("GIT_PAGER"), OsString::from("cat")),
             (OsString::from("PAGER"), OsString::from("cat")),
+            (
+                OsString::from("GIT_EDITOR"),
+                OsString::from("code-insiders --wait"),
+            ),
+            (
+                OsString::from("GIT_SEQUENCE_EDITOR"),
+                OsString::from("code-insiders --wait"),
+            ),
+            (
+                OsString::from("GIT_ASKPASS"),
+                OsString::from("/usr/bin/false --human-option"),
+            ),
+            (
+                OsString::from("SSH_ASKPASS"),
+                OsString::from("/usr/bin/false --human-option"),
+            ),
+            (OsString::from("GIT_SSH"), OsString::from("/usr/bin/ssh")),
+            (
+                OsString::from("GIT_SSH_COMMAND"),
+                OsString::from("ssh -o IdentitiesOnly=yes"),
+            ),
         ]);
         assert_eq!(
             classify_git_invocation_at(
@@ -5151,6 +5174,16 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             )
             .unwrap(),
             GitInvocationRoute::Unmanaged,
+        );
+        assert_eq!(
+            classify_git_invocation_at(
+                &["status".into()],
+                &managed_repository,
+                &roots,
+                &safe_human_environment,
+            )
+            .unwrap(),
+            GitInvocationRoute::Managed(0),
         );
 
         let human_bin = unmanaged.join("human-bin");
@@ -6767,6 +6800,56 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .unwrap()
             .success());
         (repository, worktree)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linked_worktree_without_worktree_config_has_no_separate_config_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let worktree = root.path().join("worktree");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+
+        let (local, worktree_scope) = git_repository_configuration_scope_snapshots(
+            "/usr/bin/git",
+            &test_git_guard(),
+            &worktree,
+        )
+        .unwrap();
+        assert!(!local.is_empty());
+        assert!(worktree_scope.is_empty());
     }
 
     #[cfg(unix)]

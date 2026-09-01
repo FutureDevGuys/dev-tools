@@ -1,5 +1,25 @@
 # dev-auth
 
+> The v0.3 branch is a standalone transparent workload-identity broker. The detailed v0.2 behavior below remains the rollback contract until Linux strong-mode acceptance and cutover are complete.
+
+## Standalone v0.3 ownership
+
+The signed dev-auth release owns authenticated stable-release selection, immutable versioned installation, product and same-name aliases, policy/config validation, credential enrollment, systemd and polkit assets, workload/desktop launchers, setup-plan v3, verification, repair, rollback, uninstall, and state purge. `dev-auth setup discover` checks fixed platform candidates and reports structured absent, unsafe, or unsupported blockers with common Arch, Debian, and Fedora package hints for native Git, GitHub CLI, 1Password CLI, OpenSSH, polkit, systemd, cgroup v2, and pidfd support. It never trusts caller `PATH` and never invokes a platform package manager. Dev Tools and Syscfg source checkouts are not runtime dependencies.
+
+`dev-auth setup plan` normalizes deployment TOML and equivalent CLI inputs into one value-free desired-state plan. `dev-auth setup apply` revalidates the approved digest, release, documents, native accounts, current state, and credential inputs before mutation. It stages the inactive release first, accepts credentials only through standard input, a private file descriptor, or an approved private file, and activates receipt-owned `git`/`gh` launchers last. A missing required credential leaves the candidate inactive and returns structured `input_required`; rerunning the same approved plan resumes without installation churn. `dev-auth setup verify --plan PATH --sha256 HEX --format json` non-mutatingly checks the complete approved postcondition, including release, policy, every native account integration, credential intent, broker state, and launcher activation. `dev-auth setup rollback` deactivates same-name launchers and the broker before atomically swapping the shared active/previous release and its authenticated product metadata. Uninstall removes only receipt-owned artifacts and preserves policy and credential state until a separate purge.
+
+The strong Linux supervisor renews each 15-minute admission lease while it owns the complete transient systemd workload. A broker restart does not promote environment hints into authority: the root supervisor retries for a bounded 30-second window and can re-register only the same session, authority, root-owned cgroup, and still-live supervisor pidfd. Broker-backed operations fail closed during that window, and an unprovable boundary terminates the supervised workload before its authority can resume.
+
+The generic `dev-tools-reconcile-v1` surface deliberately exposes only current-user configuration reconciliation:
+
+```text
+dev-auth reconcile plan --source PATH --output PLAN --format json
+dev-auth reconcile apply --plan PLAN --sha256 HEX --format json
+dev-auth reconcile verify --source PATH --format json
+```
+
+Each operation binds the installed release, native account, administrator/user-only policy, source document, installed destination, and exact precondition identities. It returns the common value-free result schema for `sync-configs`. When invoked through sudo, planning publishes the nonsecret mode-`0600` plan to the verified native sudo caller so the configuration client can approve its digest without gaining access to broker credentials. If the standalone installation, administrator policy, or strong broker is absent, planning returns a value-free structured deferred result. The reconciler cannot install releases, change administrator policy, manage broker services, activate launchers, or enroll credentials.
+
 `dev-auth` is a cross-platform, system-agnostic, account-agnostic credential adapter for one bounded automation principal shared by processes running as the same operating-system user. It has no provider-state model, deployment behavior, arbitrary vault browser, human-credential fallback, or owner-specific policy.
 
 The workstation authority writes `config.toml` under the native current-user application configuration directory and enrolls one 1Password Service Account token through `dev-auth enroll`. Enrollment reads standard input and writes directly to the configured native credential-store entry: Secret Service on Linux and WSL, Keychain on macOS, and Credential Manager on Windows. Each device requires one intentional enrollment because a credential cannot securely retrieve itself. The binary contains no vault name, account owner, GitHub owner, repository, installation ID, executable location, or operating-system account name.

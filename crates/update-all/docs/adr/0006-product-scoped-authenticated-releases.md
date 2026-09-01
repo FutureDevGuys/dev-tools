@@ -5,8 +5,9 @@ owner: dev-tools
 
 # ADR 0006: Product-scoped authenticated releases
 
-status: proposed
+status: superseded
 verification: pending
+replacement: 0008-shared-release-and-installation-foundations.md
 
 ## Context
 
@@ -61,3 +62,5 @@ Publish a clean Linux release for each product. Install through the shared engin
 ## Supersession conditions
 
 Supersede this record if products move to independent repositories, release discovery moves to another signed distribution authority, or a stronger shared framework replaces this trust and activation protocol.
+
+ADR [0008](0008-shared-release-and-installation-foundations.md) supersedes this proposal by moving the authenticated-release and receipt-owned installation mechanisms into product-neutral workspace crates. `update-all` retains its product orchestration and user-facing behavior.

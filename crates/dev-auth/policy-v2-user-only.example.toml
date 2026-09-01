@@ -1,0 +1,42 @@
+version = 2
+mode = "user_only"
+allowed_users = ["example-user"]
+
+[programs]
+op = "/usr/bin/op"
+git = "/usr/bin/git"
+gh = "/usr/bin/gh"
+ssh = "/usr/bin/ssh"
+ssh_keygen = "/usr/bin/ssh-keygen"
+
+[trusted_launchers]
+automation-agent = "/home/example-user/.local/bin/automation-agent-real"
+
+[sandbox_adapters.bubblewrap]
+executable = "/usr/bin/bwrap"
+arguments = ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--share-net"]
+argument_separator = true
+
+[github_apps.automation]
+app_id = 123456
+private_key_references = ["op://Automation/GitHub App/private-key"]
+
+[credential_slots.automation]
+users = ["example-user"]
+authority_caps = ["source-maintenance"]
+secret_references = ["op://Automation/GitHub App/private-key"]
+
+[authority_caps.source-maintenance]
+github_apps = ["automation"]
+owners = ["ExampleOrg"]
+repositories = ["example-repository"]
+permissions = { contents = "write", metadata = "read", pull_requests = "write" }
+installation_ids = []
+signing = false
+ssh = false
+git_identities = [{ name = "Automation Agent", email = "automation@example.invalid" }]
+secret_references = ["op://Automation/GitHub App/private-key"]
+
+[workspace_caps.source]
+path = "/home/example-user/repos"
+access = "read_write"
