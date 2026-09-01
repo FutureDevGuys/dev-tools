@@ -309,6 +309,7 @@ pub struct CompletionToolConfig {
     pub provider: String,
     pub enabled: bool,
     pub managed_required: bool,
+    pub priority: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -563,6 +564,7 @@ struct FileCompletionToolConfig {
     provider: Option<String>,
     enabled: Option<bool>,
     managed_required: Option<bool>,
+    priority: Option<i64>,
 }
 
 pub struct ConfigValidationReport {
@@ -1052,6 +1054,7 @@ fn parse_completion_tool_config(
         provider,
         enabled: tool.enabled.unwrap_or(true),
         managed_required: tool.managed_required.unwrap_or(false),
+        priority: tool.priority,
     })
 }
 
@@ -1985,12 +1988,14 @@ pub fn merge_user_completion_catalog(
         }) {
             existing.enabled = Some(tool.enabled);
             existing.managed_required = Some(tool.managed_required);
+            existing.priority = tool.priority;
         } else {
             tools.push(RegistryTool {
                 name: tool.name.clone(),
                 provider: Some(tool.provider.clone()),
                 enabled: Some(tool.enabled),
                 managed_required: Some(tool.managed_required),
+                priority: tool.priority,
                 ambient: false,
                 command: None,
                 command_candidates: Vec::new(),

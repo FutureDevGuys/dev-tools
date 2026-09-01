@@ -2365,6 +2365,7 @@ fn completion_sync_records_render_generation_rows() {
         generated: 1,
         unchanged: 1,
         skipped: 1,
+        inventories: Vec::new(),
         events: Vec::new(),
         records: vec![
             crate::completions::CompletionSyncRecord {

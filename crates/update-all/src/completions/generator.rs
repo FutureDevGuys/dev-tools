@@ -17,10 +17,16 @@ use crate::util::process::{command_for_executable, resolve_executable, which};
 
 const GENERATOR_PROBE_TIMEOUT: &str = "generator_probe_timeout";
 
-#[derive(Clone, Debug)]
-struct CommandSpec {
-    program: PathBuf,
-    args: Vec<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CompletionCommandSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CompletionCommandPlan {
+    pub command: CompletionCommandSpec,
+    pub selection_probe_args: Vec<String>,
 }
 
 pub(super) struct GeneratedCompletion {
@@ -28,13 +34,44 @@ pub(super) struct GeneratedCompletion {
     pub changed: bool,
 }
 
-pub(super) fn generate_tool_completion(
+pub(super) fn completion_command_plans(
     provider: &str,
     tool: &str,
     provider_bin_dir: &Path,
-    rc_root: &Path,
     command: Option<&str>,
     command_candidates: &[RegistryCommandCandidate],
+) -> Vec<CompletionCommandPlan> {
+    resolve_command_plans(
+        provider,
+        tool,
+        provider_bin_dir,
+        command,
+        command_candidates,
+    )
+}
+
+pub(super) fn select_completion_command_plan(
+    plans: &[CompletionCommandPlan],
+) -> Option<CompletionCommandPlan> {
+    plans.iter().find_map(|plan| {
+        if plan.selection_probe_args.is_empty() {
+            return Some(plan.clone());
+        }
+        let probe = run_probe(
+            &plan.command,
+            plan.selection_probe_args.iter().map(String::as_str),
+            Duration::from_secs(5),
+        )
+        .ok()?;
+        probe.success.then(|| plan.clone())
+    })
+}
+
+pub(super) fn generate_tool_completion(
+    provider: &str,
+    tool: &str,
+    rc_root: &Path,
+    command_spec: &CompletionCommandSpec,
 ) -> std::result::Result<Option<GeneratedCompletion>, String> {
     static VALID_RE: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
     let valid_re = VALID_RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$"));
@@ -45,16 +82,6 @@ pub(super) fn generate_tool_completion(
         return Err("invalid_identifier".to_string());
     }
 
-    let Some(command_spec) = resolve_command_spec(
-        provider,
-        tool,
-        provider_bin_dir,
-        command,
-        command_candidates,
-    ) else {
-        return Ok(None);
-    };
-
     let managed_dir = rc_root.join("shell").join("completions");
     let managed_path = managed_dir.join(format!("_managed_{provider}_{tool}"));
 
@@ -64,7 +91,7 @@ pub(super) fn generate_tool_completion(
         .unwrap_or(15);
 
     let timeout = Duration::from_secs(hard_timeout);
-    let output = select_completion_payload(tool, &command_spec, timeout)?;
+    let output = select_completion_payload(tool, command_spec, timeout)?;
     let Some(output) = output else {
         return Ok(None);
     };
@@ -91,7 +118,7 @@ pub(super) fn write_bytes_if_changed(path: &Path, content: &[u8]) -> io::Result<
 
 fn select_completion_payload(
     tool: &str,
-    command_spec: &CommandSpec,
+    command_spec: &CompletionCommandSpec,
     timeout: Duration,
 ) -> std::result::Result<Option<String>, String> {
     let mut unsafe_native = false;
@@ -188,7 +215,7 @@ fn contains_executable_substitution(payload: &str) -> bool {
 }
 
 fn probe_completion_generator(
-    command_spec: &CommandSpec,
+    command_spec: &CompletionCommandSpec,
     timeout: Duration,
 ) -> std::result::Result<String, String> {
     let patterns: &[&[&str]] = &[
@@ -226,7 +253,7 @@ fn native_completion_payload(stdout: &[u8]) -> Option<String> {
 
 fn generate_help_fallback_completion(
     tool: &str,
-    command_spec: &CommandSpec,
+    command_spec: &CompletionCommandSpec,
     timeout: Duration,
 ) -> std::result::Result<Option<String>, String> {
     let max_depth = env::var("UPDATE_ALL_COMPLETION_HELP_DEPTH")
@@ -252,7 +279,7 @@ fn generate_help_fallback_completion(
 }
 
 fn native_payload_missing_help_flags(
-    command_spec: &CommandSpec,
+    command_spec: &CompletionCommandSpec,
     payload: &str,
     timeout: Duration,
 ) -> std::result::Result<bool, String> {
@@ -318,7 +345,7 @@ fn build_help_completion_payload(tool: &str, root: &HelpNode) -> String {
 }
 
 fn probe_help_node(
-    command_spec: &CommandSpec,
+    command_spec: &CompletionCommandSpec,
     path_args: Vec<String>,
     timeout: Duration,
     depth_left: usize,
@@ -824,82 +851,93 @@ fn render_option_spec(option: &HelpOption) -> String {
     }
 }
 
-fn resolve_command_spec(
+fn resolve_command_plans(
     provider: &str,
     tool: &str,
     provider_bin_dir: &Path,
     command: Option<&str>,
     command_candidates: &[RegistryCommandCandidate],
-) -> Option<CommandSpec> {
+) -> Vec<CompletionCommandPlan> {
     if let Some(command) = command.and_then(resolve_configured_command) {
-        return Some(command);
+        return vec![CompletionCommandPlan {
+            command,
+            selection_probe_args: Vec::new(),
+        }];
     }
 
     if provider == "npm" {
         if let Some(command) = resolve_npm_exec_path(provider_bin_dir, tool)
             .or_else(|| which(tool))
-            .map(|path| CommandSpec {
+            .map(|path| CompletionCommandSpec {
                 program: path,
                 args: Vec::new(),
             })
         {
-            return Some(command);
+            return vec![CompletionCommandPlan {
+                command,
+                selection_probe_args: Vec::new(),
+            }];
         }
-        return resolve_command_candidate(command_candidates);
+        return resolve_command_candidates(command_candidates);
     }
 
     if provider == "path" {
-        if let Some(command) = which(tool).map(|path| CommandSpec {
+        if let Some(command) = which(tool).map(|path| CompletionCommandSpec {
             program: path,
             args: Vec::new(),
         }) {
-            return Some(command);
+            return vec![CompletionCommandPlan {
+                command,
+                selection_probe_args: Vec::new(),
+            }];
         }
-        return resolve_command_candidate(command_candidates);
+        return resolve_command_candidates(command_candidates);
     }
 
-    if let Some(command) = resolve_command_candidate(command_candidates) {
-        return Some(command);
+    let candidates = resolve_command_candidates(command_candidates);
+    if !candidates.is_empty() {
+        return candidates;
     }
 
-    Some(CommandSpec {
-        program: PathBuf::from(tool),
-        args: Vec::new(),
-    })
+    which(tool)
+        .map(|program| CompletionCommandPlan {
+            command: CompletionCommandSpec {
+                program,
+                args: Vec::new(),
+            },
+            selection_probe_args: Vec::new(),
+        })
+        .into_iter()
+        .collect()
 }
 
-fn resolve_configured_command(program: &str) -> Option<CommandSpec> {
+fn resolve_configured_command(program: &str) -> Option<CompletionCommandSpec> {
     let program = program.trim();
     if program.is_empty() {
         return None;
     }
-    Some(CommandSpec {
+    Some(CompletionCommandSpec {
         program: resolve_existing_program(program)?,
         args: Vec::new(),
     })
 }
 
-fn resolve_command_candidate(candidates: &[RegistryCommandCandidate]) -> Option<CommandSpec> {
+fn resolve_command_candidates(
+    candidates: &[RegistryCommandCandidate],
+) -> Vec<CompletionCommandPlan> {
     candidates
         .iter()
         .filter_map(|candidate| {
             let program = resolve_existing_program(candidate.program.trim())?;
-            let spec = CommandSpec {
-                program,
-                args: candidate.args.clone(),
-            };
-            if candidate.probe_args.is_empty() {
-                return Some(spec);
-            }
-            let probe = run_probe(
-                &spec,
-                candidate.probe_args.iter().map(String::as_str),
-                Duration::from_secs(5),
-            )
-            .ok()?;
-            probe.success.then_some(spec)
+            Some(CompletionCommandPlan {
+                command: CompletionCommandSpec {
+                    program,
+                    args: candidate.args.clone(),
+                },
+                selection_probe_args: candidate.probe_args.clone(),
+            })
         })
-        .next()
+        .collect()
 }
 
 fn resolve_existing_program(program: &str) -> Option<PathBuf> {
@@ -938,7 +976,7 @@ impl HelpProbeBudget {
 }
 
 fn run_probe<I, S>(
-    command_spec: &CommandSpec,
+    command_spec: &CompletionCommandSpec,
     args: I,
     timeout: Duration,
 ) -> std::result::Result<ProbeOutput, String>
@@ -1314,7 +1352,7 @@ exit 1
 
         let payload = select_completion_payload(
             "sleepy",
-            &CommandSpec {
+            &CompletionCommandSpec {
                 program: script,
                 args: Vec::new(),
             },
@@ -1429,7 +1467,7 @@ exit 1
         }
 
         let missing = native_payload_missing_help_flags(
-            &CommandSpec {
+            &CompletionCommandSpec {
                 program: script,
                 args: Vec::new(),
             },

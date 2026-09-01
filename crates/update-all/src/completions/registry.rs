@@ -22,6 +22,9 @@ pub struct RegistryTool {
     pub provider: Option<String>,
     pub enabled: Option<bool>,
     pub managed_required: Option<bool>,
+    /// Explicit binding preference. A higher configured value overrides PATH
+    /// resolution when multiple providers publish the same command binding.
+    pub priority: Option<i64>,
     #[serde(default)]
     pub ambient: bool,
     #[allow(dead_code)] // Reason: accepted for forward-compatible schema parsing.

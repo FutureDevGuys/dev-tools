@@ -183,6 +183,26 @@ fn strict_validation_accepts_minimal_current_config() {
 }
 
 #[test]
+fn completion_binding_priority_survives_runtime_config_parsing() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        concat!(
+            "[[completions.tools]]\n",
+            "name = \"demo\"\n",
+            "provider = \"path\"\n",
+            "priority = 73\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = load_runtime_config(Some(config)).unwrap();
+    assert_eq!(runtime.completions.tools.len(), 1);
+    assert_eq!(runtime.completions.tools[0].priority, Some(73));
+}
+
+#[test]
 fn catalog_protocols_locks_authority_and_result_contract_are_validated() {
     let tmp = TempDir::new().unwrap();
     let config = tmp.path().join("config.toml");

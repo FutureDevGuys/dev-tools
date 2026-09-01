@@ -3304,8 +3304,14 @@ fn completion_report_sections(sync: &CompletionSyncResult) -> Vec<TaskReportSect
         .iter()
         .map(|record| {
             let status = match record.status {
-                CompletionSyncRecordStatus::Generated => TaskReportStatus::Updated,
-                CompletionSyncRecordStatus::Unchanged => TaskReportStatus::Unchanged,
+                CompletionSyncRecordStatus::Generated | CompletionSyncRecordStatus::Retired => {
+                    TaskReportStatus::Updated
+                }
+                CompletionSyncRecordStatus::Unchanged
+                | CompletionSyncRecordStatus::ProbedUnchanged
+                | CompletionSyncRecordStatus::Reused => TaskReportStatus::Unchanged,
+                CompletionSyncRecordStatus::Retained => TaskReportStatus::Blocked,
+                CompletionSyncRecordStatus::Shadowed => TaskReportStatus::Info,
                 CompletionSyncRecordStatus::Skipped => TaskReportStatus::Skipped,
                 CompletionSyncRecordStatus::Failed => TaskReportStatus::Failed,
             };

@@ -325,6 +325,7 @@ catalogs = []
 # provider = "path"
 # enabled = true
 # managed_required = true  # Optional: report missing/unsupported generators as failures.
+# priority = 100           # Optional: override PATH when providers share this command binding.
 
 # Example 2: provider-owned tool
 # [[completions.tools]]

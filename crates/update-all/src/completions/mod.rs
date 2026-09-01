@@ -1,32 +1,61 @@
+mod engine;
 mod generator;
 pub(crate) mod registry;
+mod state;
 mod store;
 
-use crate::completions::generator::{
-    generate_tool_completion, write_bytes_if_changed, GeneratedCompletion,
-};
-use crate::completions::registry::{Registry, RegistryCommandCandidate, RegistryTool};
+use crate::completions::generator::write_bytes_if_changed;
+use crate::completions::registry::Registry;
 use crate::completions::store::{
     CompletionSnapshotPublishOutcome, ManagedCompletionRoot, ManagedCompletionRootStatus,
 };
-use crate::config::{load_runtime_config, merge_user_completion_catalog};
 use anyhow::{Context, Result};
 use clap::CommandFactory;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::util::cancel;
-use crate::util::process::{run_capture, which};
+use crate::util::process::which;
 use std::process::Command;
 
 const MANAGED_OVERLAY_MARKER: &str = "# managed by update-all; overlay shim";
 const POWERSHELL_SELF_COMPLETION_FILE: &str = "update-all.generated.ps1";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CompletionBindingIdentity {
+    pub shell: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionCandidateIdentity {
+    pub provider: String,
+    pub installation: String,
+    pub command_entry_point: String,
+    pub exact_executable: PathBuf,
+    pub launch_argv: Vec<String>,
+    pub provider_native_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionProviderInventoryStatus {
+    Complete,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionProviderInventoryRecord {
+    pub provider: String,
+    pub status: CompletionProviderInventoryStatus,
+    pub candidates: usize,
+    pub reason: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct CompletionSyncArgs {
@@ -45,6 +74,7 @@ pub struct CompletionSyncResult {
     pub generated: usize,
     pub unchanged: usize,
     pub skipped: usize,
+    pub inventories: Vec<CompletionProviderInventoryRecord>,
     pub events: Vec<String>,
     pub records: Vec<CompletionSyncRecord>,
     pub catalog_used: PathBuf,
@@ -64,28 +94,29 @@ pub struct CompletionSyncRecord {
 pub enum CompletionSyncRecordStatus {
     Generated,
     Unchanged,
+    ProbedUnchanged,
+    Reused,
+    Retained,
+    Shadowed,
+    Retired,
     Skipped,
     Failed,
 }
 
 impl CompletionSyncRecord {
-    fn generated(provider: &str, tool: &str, artifact: &Path) -> Self {
+    fn with_status(
+        provider: &str,
+        tool: &str,
+        status: CompletionSyncRecordStatus,
+        artifact: Option<&Path>,
+        reason: Option<String>,
+    ) -> Self {
         Self {
             provider: provider.to_string(),
             tool: tool.to_string(),
-            status: CompletionSyncRecordStatus::Generated,
-            artifact: Some(artifact.display().to_string()),
-            reason: None,
-        }
-    }
-
-    fn unchanged(provider: &str, tool: &str, artifact: &Path) -> Self {
-        Self {
-            provider: provider.to_string(),
-            tool: tool.to_string(),
-            status: CompletionSyncRecordStatus::Unchanged,
-            artifact: Some(artifact.display().to_string()),
-            reason: Some("unchanged".to_string()),
+            status,
+            artifact: artifact.map(|path| path.display().to_string()),
+            reason,
         }
     }
 
@@ -167,12 +198,6 @@ impl fmt::Display for CompletionApplyFailure {
 
 impl std::error::Error for CompletionApplyFailure {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolOrigin {
-    Registry,
-    Ambient,
-}
-
 fn tool_key(provider: &str, tool: &str) -> (String, String) {
     (provider.to_string(), tool.to_string())
 }
@@ -196,37 +221,6 @@ fn completion_provider_no_configured_tools(provider: &str) -> String {
     format!("completion-sync {provider}: no configured tools (discover=0)")
 }
 
-#[derive(Clone, Debug, Default)]
-struct CompletionCommandMetadata {
-    command: Option<String>,
-    command_candidates: Vec<RegistryCommandCandidate>,
-}
-
-fn managed_required_reason(reason: &str, required: bool) -> String {
-    if required {
-        format!("managed_required:{reason}")
-    } else {
-        reason.to_string()
-    }
-}
-
-fn tool_is_managed_required(
-    managed_required_tools: &BTreeSet<(String, String)>,
-    provider: &str,
-    tool: &str,
-) -> bool {
-    managed_required_tools.contains(&tool_key(provider, tool))
-}
-
-fn provider_has_managed_required(
-    managed_required_tools: &BTreeSet<(String, String)>,
-    provider: &str,
-) -> bool {
-    managed_required_tools
-        .iter()
-        .any(|(required_provider, _)| required_provider == provider)
-}
-
 fn completion_record_from_skip(provider: &str, tool: &str, reason: &str) -> CompletionSyncRecord {
     if reason.starts_with("managed_required:") {
         CompletionSyncRecord::failed(provider, tool, reason)
@@ -238,166 +232,6 @@ fn completion_record_from_skip(provider: &str, tool: &str, reason: &str) -> Comp
     } else {
         CompletionSyncRecord::failed(provider, tool, reason)
     }
-}
-
-fn push_completion_generated(
-    events: &mut Vec<String>,
-    records: &mut Vec<CompletionSyncRecord>,
-    provider: &str,
-    tool: &str,
-    artifact: &Path,
-) {
-    events.push(format!(
-        "__UA_COMP_GENERATED|{provider}|{tool}|{}",
-        artifact.display()
-    ));
-    records.push(CompletionSyncRecord::generated(provider, tool, artifact));
-}
-
-fn push_completion_unchanged(
-    events: &mut Vec<String>,
-    records: &mut Vec<CompletionSyncRecord>,
-    provider: &str,
-    tool: &str,
-    artifact: &Path,
-) {
-    events.push(format!(
-        "__UA_COMP_UNCHANGED|{provider}|{tool}|{}",
-        artifact.display()
-    ));
-    records.push(CompletionSyncRecord::unchanged(provider, tool, artifact));
-}
-
-fn push_completion_skipped(
-    events: &mut Vec<String>,
-    records: &mut Vec<CompletionSyncRecord>,
-    provider: &str,
-    tool: &str,
-    reason: impl Into<String>,
-) {
-    let reason = reason.into();
-    events.push(format!("__UA_COMP_SKIPPED|{provider}|{tool}|{reason}"));
-    records.push(completion_record_from_skip(provider, tool, &reason));
-}
-
-fn push_provider_init_skips(
-    events: &mut Vec<String>,
-    records: &mut Vec<CompletionSyncRecord>,
-    tools_by_provider: &BTreeMap<String, BTreeSet<String>>,
-    managed_required_tools: &BTreeSet<(String, String)>,
-    provider: &str,
-    reason: &str,
-    compact_reason: &str,
-    report: &str,
-) -> usize {
-    if report != "json" {
-        events.push(format!("{provider}:provider_init:{compact_reason}"));
-    }
-
-    let configured_tools = tools_by_provider.get(provider).cloned().unwrap_or_default();
-    if configured_tools.is_empty() {
-        let reason = managed_required_reason(
-            reason,
-            provider_has_managed_required(managed_required_tools, provider),
-        );
-        push_completion_skipped(events, records, provider, "provider_init", reason);
-        return 1;
-    }
-
-    let mut count = 0usize;
-    for tool in configured_tools {
-        let required = tool_is_managed_required(managed_required_tools, provider, &tool);
-        let reason = managed_required_reason(reason, required);
-        events.push(format!("__UA_COMP_SKIPPED|{provider}|{tool}|{reason}"));
-        if required {
-            records.push(CompletionSyncRecord::failed(provider, &tool, reason));
-        } else {
-            records.push(CompletionSyncRecord::skipped(provider, &tool, reason));
-        }
-        count += 1;
-    }
-    count
-}
-
-fn finish_generated_completion(
-    rc_root: &Path,
-    events: &mut Vec<String>,
-    records: &mut Vec<CompletionSyncRecord>,
-    keep_by_provider: &mut BTreeMap<String, BTreeSet<String>>,
-    generated: &mut usize,
-    unchanged: &mut usize,
-    provider: &str,
-    tool: &str,
-    completion: GeneratedCompletion,
-) -> Result<()> {
-    let overlay = write_managed_overlay_shim(rc_root, provider, tool)?;
-    keep_by_provider
-        .entry(provider.to_string())
-        .or_default()
-        .insert(tool.to_string());
-    if completion.changed || overlay.changed {
-        *generated += 1;
-        push_completion_generated(events, records, provider, tool, &completion.path);
-    } else {
-        *unchanged += 1;
-        push_completion_unchanged(events, records, provider, tool, &completion.path);
-    }
-    Ok(())
-}
-
-fn finish_existing_completion_if_available(
-    rc_root: &Path,
-    events: &mut Vec<String>,
-    records: &mut Vec<CompletionSyncRecord>,
-    keep_by_provider: &mut BTreeMap<String, BTreeSet<String>>,
-    generated: &mut usize,
-    unchanged: &mut usize,
-    provider: &str,
-    tool: &str,
-) -> Result<bool> {
-    let Some(completion) = existing_completion_payload(rc_root, provider, tool)? else {
-        return Ok(false);
-    };
-    finish_generated_completion(
-        rc_root,
-        events,
-        records,
-        keep_by_provider,
-        generated,
-        unchanged,
-        provider,
-        tool,
-        completion,
-    )?;
-    Ok(true)
-}
-
-fn existing_completion_payload(
-    rc_root: &Path,
-    provider: &str,
-    tool: &str,
-) -> Result<Option<GeneratedCompletion>> {
-    let managed_dir = managed_completion_dir(rc_root);
-    let managed_path = managed_dir.join(managed_payload_basename(provider, tool));
-    if usable_completion_payload_file(&managed_path) {
-        return Ok(Some(GeneratedCompletion {
-            path: managed_path,
-            changed: false,
-        }));
-    }
-
-    let static_path = managed_dir.join(format!("_{tool}"));
-    let Some(payload) = read_usable_completion_payload(&static_path) else {
-        return Ok(None);
-    };
-    fs::create_dir_all(&managed_dir)
-        .with_context(|| format!("create managed completion dir {}", managed_dir.display()))?;
-    let changed = write_bytes_if_changed(&managed_path, payload.as_bytes())
-        .with_context(|| format!("write {}", managed_path.display()))?;
-    Ok(Some(GeneratedCompletion {
-        path: managed_path,
-        changed,
-    }))
 }
 
 fn usable_completion_payload_file(path: &Path) -> bool {
@@ -416,16 +250,6 @@ fn usable_completion_payload(payload: &str) -> bool {
             || trimmed.contains("_arguments")
             || trimmed.starts_with("compdef ")
             || trimmed.contains("\ncompdef "))
-}
-
-fn enabled_catalog_tool(
-    tools_by_provider: &BTreeMap<String, BTreeSet<String>>,
-    provider: &str,
-    tool: &str,
-) -> bool {
-    tools_by_provider
-        .get(provider)
-        .is_some_and(|tools| tools.contains(tool))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -515,937 +339,7 @@ pub fn generate_update_all_completion(shell: &str) -> Result<String> {
 }
 
 pub fn completion_sync(args: CompletionSyncArgs) -> Result<CompletionSyncResult> {
-    let registry_text = fs::read_to_string(&args.catalog_path)
-        .with_context(|| format!("read catalog {}", args.catalog_path.display()))?;
-    let base_registry: Registry = serde_json::from_str(&registry_text).context("parse catalog")?;
-    let runtime_cfg = load_runtime_config(args.config_path.clone())?;
-    let registry = merge_user_completion_catalog(base_registry, Some(&runtime_cfg));
-    let validation_registry =
-        filter_completion_catalog_for_providers(&registry, &args.providers_csv);
-    validate_completion_overlay_names(&validation_registry)?;
-
-    let disabled_providers: BTreeSet<String> = registry
-        .providers
-        .iter()
-        .filter(|p| !p.enabled.unwrap_or(true))
-        .map(|p| p.name.as_str())
-        .map(str::to_string)
-        .collect();
-    let known_providers: BTreeSet<String> = registry
-        .providers
-        .iter()
-        .map(|p| p.name.as_str())
-        .map(str::to_string)
-        .collect();
-
-    let mut tools_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut catalog_tools_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut managed_required_tools: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut tool_origins: BTreeMap<(String, String), ToolOrigin> = BTreeMap::new();
-    let mut command_metadata: BTreeMap<(String, String), CompletionCommandMetadata> =
-        BTreeMap::new();
-    for tool in &registry.tools {
-        let provider = tool.provider.as_deref().unwrap_or("npm");
-        let key = tool_key(provider, &tool.name);
-        catalog_tools_by_provider
-            .entry(provider.to_string())
-            .or_default()
-            .insert(tool.name.clone());
-        tool_origins.insert(
-            key.clone(),
-            if tool.ambient {
-                ToolOrigin::Ambient
-            } else {
-                ToolOrigin::Registry
-            },
-        );
-        command_metadata.insert(
-            key,
-            CompletionCommandMetadata {
-                command: tool.command.clone(),
-                command_candidates: tool.command_candidates.clone(),
-            },
-        );
-        if !tool.enabled.unwrap_or(true) {
-            continue;
-        }
-        tools_by_provider
-            .entry(provider.to_string())
-            .or_default()
-            .insert(tool.name.clone());
-        if tool.managed_required.unwrap_or(false) {
-            managed_required_tools.insert(tool_key(provider, &tool.name));
-        }
-    }
-
-    let mut events = Vec::new();
-    let mut records = Vec::new();
-    let mut generated = 0usize;
-    let mut unchanged = 0usize;
-    let mut skipped = 0usize;
-    let mut keep_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-
-    let report = args.report.to_lowercase();
-    let heartbeat_secs = env::var("UPDATE_ALL_COMPLETION_HEARTBEAT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(2);
-    let heartbeat = Duration::from_secs(heartbeat_secs.max(1));
-
-    for provider in args
-        .providers_csv
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        if disabled_providers.contains(provider) {
-            continue;
-        }
-        if report == "verbose" {
-            events.push(format!("__UA_COMP_INFO|provider_scan|{provider}:"));
-        }
-        if !args.discover
-            && known_providers.contains(provider)
-            && tools_by_provider
-                .get(provider)
-                .is_none_or(BTreeSet::is_empty)
-        {
-            let msg = completion_provider_no_configured_tools(provider);
-            if let Some(cb) = &args.progress_cb {
-                cb(msg.clone());
-            }
-            if report == "verbose" {
-                events.push(format!("__UA_COMP_INFO|provider_empty|{provider}:"));
-            }
-            continue;
-        }
-
-        match provider {
-            "npm" => {
-                let start = Instant::now();
-                let mut last_heartbeat = Instant::now();
-                let budget = env::var("UPDATE_ALL_COMPLETION_PROVIDER_TIMEOUT")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(120);
-                let budget = Duration::from_secs(budget.max(1));
-
-                let prefix =
-                    match run_capture("npm", ["prefix", "-g"], Some(Duration::from_secs(5))) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            skipped += push_provider_init_skips(
-                                &mut events,
-                                &mut records,
-                                &tools_by_provider,
-                                &managed_required_tools,
-                                "npm",
-                                &format!("npm_prefix_failed:{e}"),
-                                "npm_prefix_failed",
-                                &report,
-                            );
-                            continue;
-                        }
-                    };
-                let prefix = prefix.lines().next().unwrap_or("").trim().to_string();
-                if prefix.is_empty() {
-                    skipped += push_provider_init_skips(
-                        &mut events,
-                        &mut records,
-                        &tools_by_provider,
-                        &managed_required_tools,
-                        "npm",
-                        "npm_prefix_empty",
-                        "npm_prefix_empty",
-                        &report,
-                    );
-                    continue;
-                }
-                let bin_dir = Path::new(&prefix).join("bin");
-
-                let registry_set = tools_by_provider.get("npm").cloned().unwrap_or_default();
-                let catalog_set = catalog_tools_by_provider
-                    .get("npm")
-                    .cloned()
-                    .unwrap_or_default();
-                let mut tools: BTreeMap<String, ToolOrigin> = if args.discover {
-                    let mut discovered = BTreeSet::new();
-                    if let Ok(entries) = fs::read_dir(&bin_dir) {
-                        for e in entries.flatten() {
-                            if let Some(name) = e.file_name().to_str() {
-                                if let Some(normalized) = normalize_npm_discovered_tool(name) {
-                                    discovered.insert(normalized);
-                                }
-                            }
-                        }
-                    }
-                    discovered
-                        .into_iter()
-                        .filter(|tool| registry_set.contains(tool) || !catalog_set.contains(tool))
-                        .map(|tool| {
-                            let origin = tool_origins
-                                .get(&tool_key("npm", &tool))
-                                .copied()
-                                .unwrap_or_else(|| {
-                                    if registry_set.contains(&tool) {
-                                        ToolOrigin::Registry
-                                    } else {
-                                        ToolOrigin::Ambient
-                                    }
-                                });
-                            (tool, origin)
-                        })
-                        .collect()
-                } else {
-                    registry_set
-                        .iter()
-                        .cloned()
-                        .map(|tool| {
-                            let origin = tool_origins
-                                .get(&tool_key("npm", &tool))
-                                .copied()
-                                .unwrap_or(ToolOrigin::Registry);
-                            (tool, origin)
-                        })
-                        .collect()
-                };
-
-                let total = tools.len();
-                let mut probed = 0usize;
-                let generated_before = generated;
-                let unchanged_before = unchanged;
-                let skipped_before = skipped;
-
-                for (tool_name, origin) in tools {
-                    if cancel::is_cancel_requested() {
-                        return Err(anyhow::anyhow!(crate::Cancelled));
-                    }
-                    if start.elapsed() > budget {
-                        events.push("__UA_COMP_INFO|provider_budget_exceeded|npm:".to_string());
-                        break;
-                    }
-
-                    if let Some(cb) = &args.progress_cb {
-                        cb(format!(
-                            "completion-sync npm: probing {tool_name} ({}/{})",
-                            probed + 1,
-                            total
-                        ));
-                    }
-
-                    let metadata = command_metadata
-                        .get(&tool_key("npm", &tool_name))
-                        .cloned()
-                        .unwrap_or_default();
-                    match generate_tool_completion(
-                        "npm",
-                        &tool_name,
-                        &bin_dir,
-                        &args.rc_root,
-                        metadata.command.as_deref(),
-                        &metadata.command_candidates,
-                    ) {
-                        Ok(Some(completion)) => {
-                            finish_generated_completion(
-                                &args.rc_root,
-                                &mut events,
-                                &mut records,
-                                &mut keep_by_provider,
-                                &mut generated,
-                                &mut unchanged,
-                                "npm",
-                                &tool_name,
-                                completion,
-                            )?;
-                            if report != "json" {
-                                events.push(format!("npm:{tool_name}"));
-                            }
-                        }
-                        Ok(None) => {
-                            if origin == ToolOrigin::Registry
-                                && finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "npm",
-                                    &tool_name,
-                                )?
-                            {
-                                if report != "json" {
-                                    events.push(format!("npm:{tool_name}"));
-                                }
-                            } else if origin == ToolOrigin::Registry {
-                                skipped += 1;
-                                let reason = managed_required_reason(
-                                    "unsupported_generator",
-                                    tool_is_managed_required(
-                                        &managed_required_tools,
-                                        "npm",
-                                        &tool_name,
-                                    ),
-                                );
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "npm",
-                                    &tool_name,
-                                    reason,
-                                );
-                                if report != "json" {
-                                    events.push(format!("npm:{tool_name}:unsupported_generator"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if origin == ToolOrigin::Registry
-                                && finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "npm",
-                                    &tool_name,
-                                )?
-                            {
-                                if report != "json" {
-                                    events.push(format!("npm:{tool_name}"));
-                                }
-                            } else {
-                                skipped += 1;
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "npm",
-                                    &tool_name,
-                                    e.to_string(),
-                                );
-                            }
-                        }
-                    }
-
-                    probed += 1;
-                    if last_heartbeat.elapsed() >= heartbeat {
-                        last_heartbeat = Instant::now();
-                        let msg = completion_provider_progress(
-                            "npm",
-                            probed,
-                            total,
-                            generated.saturating_sub(generated_before),
-                            unchanged.saturating_sub(unchanged_before),
-                            skipped.saturating_sub(skipped_before),
-                            start.elapsed(),
-                        );
-                        if let Some(cb) = &args.progress_cb {
-                            cb(msg.clone());
-                        }
-                        if report == "verbose" {
-                            events.push(format!("__UA_COMP_INFO|heartbeat|{msg}"));
-                        }
-                    }
-                }
-            }
-            "pipx" => {
-                let mut apps = BTreeSet::new();
-                if args.discover {
-                    let list_json = match run_capture(
-                        "pipx",
-                        ["list", "--json"],
-                        Some(Duration::from_secs(10)),
-                    ) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            skipped += push_provider_init_skips(
-                                &mut events,
-                                &mut records,
-                                &tools_by_provider,
-                                &managed_required_tools,
-                                "pipx",
-                                &format!("pipx_list_failed:{e}"),
-                                "pipx_list_failed",
-                                &report,
-                            );
-                            continue;
-                        }
-                    };
-                    let state: PipxState = match serde_json::from_str(&list_json) {
-                        Ok(parsed) => parsed,
-                        Err(e) => {
-                            skipped += push_provider_init_skips(
-                                &mut events,
-                                &mut records,
-                                &tools_by_provider,
-                                &managed_required_tools,
-                                "pipx",
-                                &format!("pipx_parse_failed:{e}"),
-                                "pipx_parse_failed",
-                                &report,
-                            );
-                            continue;
-                        }
-                    };
-                    for (_, venv) in state.venvs {
-                        if let Some(main) = venv.metadata.and_then(|m| m.main_package) {
-                            if let Some(a) = main.apps {
-                                for app in a {
-                                    apps.insert(app);
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(registry_apps) = tools_by_provider.get("pipx") {
-                    apps.extend(registry_apps.iter().cloned());
-                }
-                for app in apps {
-                    let metadata = command_metadata
-                        .get(&tool_key("pipx", &app))
-                        .cloned()
-                        .unwrap_or_default();
-                    match generate_tool_completion(
-                        "pipx",
-                        &app,
-                        Path::new(""),
-                        &args.rc_root,
-                        metadata.command.as_deref(),
-                        &metadata.command_candidates,
-                    ) {
-                        Ok(Some(completion)) => {
-                            finish_generated_completion(
-                                &args.rc_root,
-                                &mut events,
-                                &mut records,
-                                &mut keep_by_provider,
-                                &mut generated,
-                                &mut unchanged,
-                                "pipx",
-                                &app,
-                                completion,
-                            )?;
-                        }
-                        Ok(None) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "pipx", &app)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "pipx",
-                                    &app,
-                                )?
-                            {
-                                skipped += 1;
-                                let reason = managed_required_reason(
-                                    "unsupported_generator",
-                                    tool_is_managed_required(&managed_required_tools, "pipx", &app),
-                                );
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "pipx",
-                                    &app,
-                                    reason,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "pipx", &app)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "pipx",
-                                    &app,
-                                )?
-                            {
-                                skipped += 1;
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "pipx",
-                                    &app,
-                                    e.to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            "uv" => {
-                let mut tools = BTreeSet::new();
-                if args.discover {
-                    let mut tried_json = false;
-                    if let Ok(tools_json) = run_capture(
-                        "uv",
-                        ["tool", "list", "--json"],
-                        Some(Duration::from_secs(10)),
-                    ) {
-                        tried_json = true;
-                        match serde_json::from_str::<UvTools>(&tools_json) {
-                            Ok(parsed) => {
-                                for tool in parsed.tools {
-                                    tools.insert(tool.name);
-                                }
-                            }
-                            Err(e) => {
-                                if report == "verbose" {
-                                    events.push(format!(
-                                        "__UA_COMP_INFO|uv|json_discovery_parse_failed:{e}"
-                                    ));
-                                }
-                            }
-                        }
-                    } else if report == "verbose" {
-                        events.push("__UA_COMP_INFO|uv|json_discovery_unsupported".to_string());
-                    }
-
-                    if tools.is_empty() {
-                        let plain = match run_capture(
-                            "uv",
-                            ["tool", "list"],
-                            Some(Duration::from_secs(10)),
-                        ) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                let reason = if tried_json {
-                                    format!("uv_tool_list_plain_failed:{e}")
-                                } else {
-                                    format!("uv_tool_list_failed:{e}")
-                                };
-                                skipped += push_provider_init_skips(
-                                    &mut events,
-                                    &mut records,
-                                    &tools_by_provider,
-                                    &managed_required_tools,
-                                    "uv",
-                                    &reason,
-                                    "uv_tool_list_failed",
-                                    &report,
-                                );
-                                continue;
-                            }
-                        };
-                        let parsed = parse_uv_tool_list(&plain);
-                        if parsed.is_empty() {
-                            skipped += push_provider_init_skips(
-                                &mut events,
-                                &mut records,
-                                &tools_by_provider,
-                                &managed_required_tools,
-                                "uv",
-                                "uv_tool_list_empty",
-                                "uv_tool_list_empty",
-                                &report,
-                            );
-                            continue;
-                        }
-                        tools.extend(parsed);
-                    }
-                } else if let Some(registry_tools) = tools_by_provider.get("uv") {
-                    tools.extend(registry_tools.iter().cloned());
-                }
-                for name in tools {
-                    let metadata = command_metadata
-                        .get(&tool_key("uv", &name))
-                        .cloned()
-                        .unwrap_or_default();
-                    match generate_tool_completion(
-                        "uv",
-                        &name,
-                        Path::new(""),
-                        &args.rc_root,
-                        metadata.command.as_deref(),
-                        &metadata.command_candidates,
-                    ) {
-                        Ok(Some(completion)) => {
-                            finish_generated_completion(
-                                &args.rc_root,
-                                &mut events,
-                                &mut records,
-                                &mut keep_by_provider,
-                                &mut generated,
-                                &mut unchanged,
-                                "uv",
-                                &name,
-                                completion,
-                            )?;
-                        }
-                        Ok(None) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "uv", &name)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "uv",
-                                    &name,
-                                )?
-                            {
-                                skipped += 1;
-                                let reason = managed_required_reason(
-                                    "unsupported_generator",
-                                    tool_is_managed_required(&managed_required_tools, "uv", &name),
-                                );
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "uv",
-                                    &name,
-                                    reason,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "uv", &name)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "uv",
-                                    &name,
-                                )?
-                            {
-                                skipped += 1;
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "uv",
-                                    &name,
-                                    e.to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            "go" => {
-                let mut tools = BTreeSet::new();
-                if args.discover {
-                    let gobin =
-                        match run_capture("go", ["env", "GOBIN"], Some(Duration::from_secs(5))) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                skipped += push_provider_init_skips(
-                                    &mut events,
-                                    &mut records,
-                                    &tools_by_provider,
-                                    &managed_required_tools,
-                                    "go",
-                                    &format!("go_env_gobin_failed:{e}"),
-                                    "go_env_gobin_failed",
-                                    &report,
-                                );
-                                continue;
-                            }
-                        };
-                    let gobin_dir = gobin.lines().next().unwrap_or("").trim().to_string();
-                    let go_bin_dir = if gobin_dir.is_empty() {
-                        let gopath = match run_capture(
-                            "go",
-                            ["env", "GOPATH"],
-                            Some(Duration::from_secs(5)),
-                        ) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                skipped += push_provider_init_skips(
-                                    &mut events,
-                                    &mut records,
-                                    &tools_by_provider,
-                                    &managed_required_tools,
-                                    "go",
-                                    &format!("go_env_gopath_failed:{e}"),
-                                    "go_env_gopath_failed",
-                                    &report,
-                                );
-                                continue;
-                            }
-                        };
-                        match std::env::split_paths(gopath.lines().next().unwrap_or("").trim())
-                            .next()
-                        {
-                            Some(path) => path.join("bin"),
-                            None => {
-                                skipped += push_provider_init_skips(
-                                    &mut events,
-                                    &mut records,
-                                    &tools_by_provider,
-                                    &managed_required_tools,
-                                    "go",
-                                    "go_bin_dir_empty",
-                                    "go_bin_dir_empty",
-                                    &report,
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        PathBuf::from(gobin_dir)
-                    };
-                    if let Ok(entries) = fs::read_dir(&go_bin_dir) {
-                        for e in entries.flatten() {
-                            if let Some(name) = e.file_name().to_str() {
-                                tools.insert(name.to_string());
-                            }
-                        }
-                    }
-                } else if let Some(registry_tools) = tools_by_provider.get("go") {
-                    tools.extend(registry_tools.iter().cloned());
-                }
-                for name in tools {
-                    let metadata = command_metadata
-                        .get(&tool_key("go", &name))
-                        .cloned()
-                        .unwrap_or_default();
-                    match generate_tool_completion(
-                        "go",
-                        &name,
-                        Path::new(""),
-                        &args.rc_root,
-                        metadata.command.as_deref(),
-                        &metadata.command_candidates,
-                    ) {
-                        Ok(Some(completion)) => {
-                            finish_generated_completion(
-                                &args.rc_root,
-                                &mut events,
-                                &mut records,
-                                &mut keep_by_provider,
-                                &mut generated,
-                                &mut unchanged,
-                                "go",
-                                &name,
-                                completion,
-                            )?;
-                        }
-                        Ok(None) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "go", &name)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "go",
-                                    &name,
-                                )?
-                            {
-                                skipped += 1;
-                                let reason = managed_required_reason(
-                                    "unsupported_generator",
-                                    tool_is_managed_required(&managed_required_tools, "go", &name),
-                                );
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "go",
-                                    &name,
-                                    reason,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "go", &name)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "go",
-                                    &name,
-                                )?
-                            {
-                                skipped += 1;
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "go",
-                                    &name,
-                                    e.to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            "path" => {
-                let registry_set = tools_by_provider.get("path").cloned().unwrap_or_default();
-                let total = registry_set.len();
-                let generated_before = generated;
-                let unchanged_before = unchanged;
-                let skipped_before = skipped;
-                let provider_start = Instant::now();
-                let mut probed = 0usize;
-                let empty_bin_dir = Path::new("");
-
-                for (idx, tool_name) in registry_set.into_iter().enumerate() {
-                    if cancel::is_cancel_requested() {
-                        return Err(anyhow::anyhow!(crate::Cancelled));
-                    }
-
-                    if let Some(cb) = &args.progress_cb {
-                        cb(format!(
-                            "completion-sync path: probing {tool_name} ({}/{})",
-                            idx + 1,
-                            total
-                        ));
-                    }
-
-                    let metadata = command_metadata
-                        .get(&tool_key("path", &tool_name))
-                        .cloned()
-                        .unwrap_or_default();
-                    match generate_tool_completion(
-                        "path",
-                        &tool_name,
-                        empty_bin_dir,
-                        &args.rc_root,
-                        metadata.command.as_deref(),
-                        &metadata.command_candidates,
-                    ) {
-                        Ok(Some(completion)) => {
-                            finish_generated_completion(
-                                &args.rc_root,
-                                &mut events,
-                                &mut records,
-                                &mut keep_by_provider,
-                                &mut generated,
-                                &mut unchanged,
-                                "path",
-                                &tool_name,
-                                completion,
-                            )?;
-                        }
-                        Ok(None) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "path", &tool_name)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "path",
-                                    &tool_name,
-                                )?
-                            {
-                                skipped += 1;
-                                let reason = managed_required_reason(
-                                    "unsupported_generator",
-                                    tool_is_managed_required(
-                                        &managed_required_tools,
-                                        "path",
-                                        &tool_name,
-                                    ),
-                                );
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "path",
-                                    &tool_name,
-                                    reason,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if !enabled_catalog_tool(&tools_by_provider, "path", &tool_name)
-                                || !finish_existing_completion_if_available(
-                                    &args.rc_root,
-                                    &mut events,
-                                    &mut records,
-                                    &mut keep_by_provider,
-                                    &mut generated,
-                                    &mut unchanged,
-                                    "path",
-                                    &tool_name,
-                                )?
-                            {
-                                skipped += 1;
-                                push_completion_skipped(
-                                    &mut events,
-                                    &mut records,
-                                    "path",
-                                    &tool_name,
-                                    e.to_string(),
-                                );
-                            }
-                        }
-                    }
-                    probed += 1;
-                }
-                if probed > 0 {
-                    let provider_generated = generated.saturating_sub(generated_before);
-                    let provider_unchanged = unchanged.saturating_sub(unchanged_before);
-                    let provider_skipped = skipped.saturating_sub(skipped_before);
-                    if let Some(cb) = &args.progress_cb {
-                        cb(completion_provider_progress(
-                            "path",
-                            probed,
-                            total,
-                            provider_generated,
-                            provider_unchanged,
-                            provider_skipped,
-                            provider_start.elapsed(),
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for provider in args
-        .providers_csv
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        prune_managed_provider_artifacts(
-            &args.rc_root,
-            provider,
-            keep_by_provider.get(provider).cloned().unwrap_or_default(),
-        )?;
-    }
-    prune_orphan_managed_overlay_shims(&args.rc_root)?;
-
-    if report == "json" {
-        let payload = serde_json::json!({
-            "generated": generated,
-            "unchanged": unchanged,
-            "skipped": skipped,
-        });
-        events.push(format!("__UA_COMP_REPORT_JSON|{}", payload));
-    }
-
-    events.push(format!(
-        "__UA_COMP_SUMMARY|generated={generated}|unchanged={unchanged}|skipped={skipped}"
-    ));
-    publish_public_self_completion_snapshot(&args.managed_root, &mut events)?;
-
-    Ok(CompletionSyncResult {
-        generated,
-        unchanged,
-        skipped,
-        events,
-        records,
-        catalog_used: args.catalog_path,
-        effective_catalog: registry,
-    })
+    engine::run_completion_sync(args)
 }
 
 pub fn completion_init(shell: &str, managed_root: PathBuf) -> Result<CompletionInitResult> {
@@ -1461,6 +355,38 @@ pub fn completion_status(managed_root: PathBuf) -> Result<CompletionStatusResult
     Ok(CompletionStatusResult {
         status: root.status()?,
     })
+}
+
+fn normalize_npm_discovered_tool(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for suffix in [".cmd", ".ps1", ".exe", ".bat"] {
+        if lower.ends_with(suffix) && trimmed.len() > suffix.len() {
+            return Some(trimmed[..trimmed.len() - suffix.len()].to_string());
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+pub fn completion_install(args: CompletionInstallArgs) -> Result<CompletionInstallResult> {
+    match CompletionShell::parse(&args.shell)? {
+        CompletionShell::Bash | CompletionShell::Elvish | CompletionShell::Fish => {
+            anyhow::bail!(
+                "legacy completion install only supports zsh and powershell; use `update-all completions init {}` for read-only startup wiring",
+                args.shell
+            )
+        }
+        CompletionShell::Zsh => completion_install_zsh(args.rc_root),
+        CompletionShell::PowerShell => {
+            let powershell_root = args
+                .powershell_root
+                .context("missing PowerShell root for powershell completion install")?;
+            completion_install_powershell(&powershell_root)
+        }
+    }
 }
 
 pub(crate) fn filter_completion_catalog_for_providers(
@@ -1497,7 +423,7 @@ pub(crate) fn filter_completion_catalog_for_providers(
 }
 
 fn validate_completion_overlay_names(registry: &Registry) -> Result<()> {
-    let mut owners = BTreeMap::new();
+    let mut slots = BTreeSet::new();
     for tool in registry
         .tools
         .iter()
@@ -1511,47 +437,13 @@ fn validate_completion_overlay_names(registry: &Registry) -> Result<()> {
         if provider.is_empty() {
             continue;
         }
-        if let Some(existing) = owners.insert(name.to_string(), provider.to_string()) {
-            if existing != provider {
-                anyhow::bail!(
-                    "completion tool '{name}' is configured for multiple providers ({existing}, {provider}); managed overlay shims are keyed by tool name, so disable one entry or choose a unique command name"
-                );
-            }
+        if !slots.insert((provider.to_string(), name.to_string())) {
+            anyhow::bail!(
+                "completion tool '{name}' is configured more than once for provider '{provider}'"
+            );
         }
     }
     Ok(())
-}
-
-fn normalize_npm_discovered_tool(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    for suffix in [".cmd", ".ps1", ".exe", ".bat"] {
-        if lower.ends_with(suffix) && trimmed.len() > suffix.len() {
-            return Some(trimmed[..trimmed.len() - suffix.len()].to_string());
-        }
-    }
-    Some(trimmed.to_string())
-}
-
-pub fn completion_install(args: CompletionInstallArgs) -> Result<CompletionInstallResult> {
-    match CompletionShell::parse(&args.shell)? {
-        CompletionShell::Bash | CompletionShell::Elvish | CompletionShell::Fish => {
-            anyhow::bail!(
-                "legacy completion install only supports zsh and powershell; use `update-all completions init {}` for read-only startup wiring",
-                args.shell
-            )
-        }
-        CompletionShell::Zsh => completion_install_zsh(args.rc_root),
-        CompletionShell::PowerShell => {
-            let powershell_root = args
-                .powershell_root
-                .context("missing PowerShell root for powershell completion install")?;
-            completion_install_powershell(&powershell_root)
-        }
-    }
 }
 
 fn completion_install_zsh(rc_root: PathBuf) -> Result<CompletionInstallResult> {
@@ -1950,7 +842,7 @@ fn managed_overlay_basename(tool: &str) -> String {
 }
 
 struct ManagedOverlayWrite {
-    changed: bool,
+    pub(super) changed: bool,
 }
 
 fn write_managed_overlay_shim(
@@ -1977,6 +869,26 @@ fn write_managed_overlay_shim(
     let changed = write_bytes_if_changed(&overlay_path, payload.as_bytes())
         .with_context(|| format!("write {}", overlay_path.display()))?;
     Ok(ManagedOverlayWrite { changed })
+}
+
+fn remove_managed_overlay_shim(rc_root: &Path, tool: &str) -> Result<bool> {
+    let overlay_path = managed_overlay_dir(rc_root).join(managed_overlay_basename(tool));
+    let payload = match fs::read_to_string(&overlay_path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", overlay_path.display()));
+        }
+    };
+    if !payload
+        .lines()
+        .any(|line| line.trim() == MANAGED_OVERLAY_MARKER)
+    {
+        return Ok(false);
+    }
+    fs::remove_file(&overlay_path)
+        .with_context(|| format!("remove managed overlay {}", overlay_path.display()))?;
+    Ok(true)
 }
 
 fn prune_managed_provider_artifacts(
@@ -2037,42 +949,6 @@ fn prune_orphan_managed_overlay_shims(rc_root: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[derive(Deserialize, Debug)]
-struct PipxState {
-    venvs: BTreeMap<String, PipxVenv>,
-}
-
-#[derive(Deserialize, Debug)]
-struct PipxVenv {
-    metadata: Option<PipxMetadata>,
-}
-
-#[derive(Deserialize, Debug)]
-struct PipxMetadata {
-    main_package: Option<PipxMainPackage>,
-}
-
-#[derive(Deserialize, Debug)]
-struct PipxMainPackage {
-    #[allow(dead_code)] // Reason: accepted for forward-compatible JSON parsing.
-    package: String,
-    #[allow(dead_code)] // Reason: accepted for forward-compatible JSON parsing.
-    package_or_url: String,
-    #[allow(dead_code)] // Reason: accepted for forward-compatible JSON parsing.
-    package_version: Option<String>,
-    apps: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, Debug)]
-struct UvTools {
-    tools: Vec<UvTool>,
-}
-
-#[derive(Deserialize, Debug)]
-struct UvTool {
-    name: String,
 }
 
 fn parse_uv_tool_list(text: &str) -> BTreeSet<String> {

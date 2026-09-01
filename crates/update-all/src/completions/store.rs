@@ -104,16 +104,6 @@ impl ManagedCompletionRoot {
         &self,
         payloads: &BTreeMap<CompletionShell, String>,
     ) -> Result<CompletionSnapshotPublishOutcome> {
-        let _lock = try_acquire_pid_lock(
-            &self.root,
-            PidLockOptions {
-                file_name: ".sync.lock",
-                label: "managed completion sync",
-                active_detail: "another completion sync is already publishing this managed root",
-                retry_detail: "retry after the active completion sync finishes",
-                stale_after: Duration::from_secs(6 * 60 * 60),
-            },
-        )?;
         let manifest = SnapshotManifest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             views: payloads
@@ -137,6 +127,24 @@ impl ManagedCompletionRoot {
         let current_is_target =
             self.read_current_snapshot()?.as_deref() == Some(snapshot_name.as_str());
 
+        if current_is_target && self.validate_snapshot(&snapshot_name).is_ok() {
+            return Ok(CompletionSnapshotPublishOutcome::Unchanged {
+                snapshot: snapshot_dir,
+            });
+        }
+
+        let _lock = try_acquire_pid_lock(
+            &self.root,
+            PidLockOptions {
+                file_name: ".sync.lock",
+                label: "managed completion sync",
+                active_detail: "another completion sync is already publishing this managed root",
+                retry_detail: "retry after the active completion sync finishes",
+                stale_after: Duration::from_secs(6 * 60 * 60),
+            },
+        )?;
+        let current_is_target =
+            self.read_current_snapshot()?.as_deref() == Some(snapshot_name.as_str());
         if current_is_target && self.validate_snapshot(&snapshot_name).is_ok() {
             return Ok(CompletionSnapshotPublishOutcome::Unchanged {
                 snapshot: snapshot_dir,
