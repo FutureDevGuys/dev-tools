@@ -311,8 +311,13 @@ catalogs = []
 # Authoring loop for beginners:
 # 1. Add one [[completions.tools]] entry.
 # 2. Run `update-all config validate --strict`.
-# 3. Run `update-all completions sync --providers path --apply --shell zsh`
+# 3. Run `update-all completions sync --providers path`
 #    (or swap `path` for the provider you configured).
+# 4. Run `update-all completions init <shell>` and add the printed line to that
+#    shell's startup file. Supported shells: bash, zsh, fish, elvish, powershell.
+#
+# The optional `--apply --shell <shell>` bridge is explicit legacy compatibility
+# wiring for Zsh and PowerShell only; it is not the public startup contract.
 
 # Example 1: PATH-visible tool such as `privatebin`
 # [[completions.tools]]

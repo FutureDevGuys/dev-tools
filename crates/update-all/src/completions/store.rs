@@ -23,6 +23,7 @@ pub struct ManagedCompletionRootStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionSnapshotPublishOutcome {
     Published { snapshot: PathBuf },
+    Repaired { snapshot: PathBuf },
     Unchanged { snapshot: PathBuf },
 }
 
@@ -36,6 +37,11 @@ struct SnapshotManifest {
 struct SnapshotView {
     file_name: String,
     object_digest: String,
+}
+
+struct ActiveSnapshot {
+    name: String,
+    manifest: SnapshotManifest,
 }
 
 pub(crate) struct ManagedCompletionRoot {
@@ -54,15 +60,13 @@ impl ManagedCompletionRoot {
     }
 
     pub(crate) fn status(&self) -> Result<ManagedCompletionRootStatus> {
-        let current_snapshot = self.read_current_snapshot()?;
-        let available_shells = match current_snapshot.as_deref() {
-            Some(snapshot) => self
-                .read_manifest(snapshot)?
-                .views
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
+        let active = self.read_active_snapshot()?;
+        let (current_snapshot, available_shells) = match active {
+            Some(active) => (
+                Some(active.name),
+                active.manifest.views.keys().cloned().collect::<Vec<_>>(),
+            ),
+            None => (None, Vec::new()),
         };
         Ok(ManagedCompletionRootStatus {
             root: self.root.clone(),
@@ -72,23 +76,14 @@ impl ManagedCompletionRoot {
     }
 
     pub(crate) fn init_script(&self, shell: CompletionShell) -> Result<String> {
-        let Some(snapshot) = self.read_current_snapshot()? else {
+        let Some(active) = self.read_active_snapshot()? else {
             return Ok(String::new());
         };
-        let manifest = self.read_manifest(&snapshot)?;
         let shell_name = shell.as_event_name();
-        let Some(view) = manifest.views.get(shell_name) else {
+        let Some(view) = active.manifest.views.get(shell_name) else {
             return Ok(String::new());
         };
-        let path = self.view_path(&snapshot, shell_name, view)?;
-        let payload = fs::read(&path)
-            .with_context(|| format!("read managed completion view {}", path.display()))?;
-        if sha256_hex(&payload) != view.object_digest {
-            anyhow::bail!(
-                "managed completion view digest mismatch: {}",
-                path.display()
-            );
-        }
+        let path = self.view_path(&active.name, shell_name, view)?;
         Ok(match shell {
             CompletionShell::Bash | CompletionShell::Zsh => {
                 format!(". '{}'\n", shell_single_quote_path(&path))
@@ -139,8 +134,10 @@ impl ManagedCompletionRoot {
             .context("serialize completion snapshot manifest")?;
         let snapshot_name = sha256_hex(&manifest_bytes);
         let snapshot_dir = self.snapshot_dir(&snapshot_name);
+        let current_is_target =
+            self.read_current_snapshot()?.as_deref() == Some(snapshot_name.as_str());
 
-        if self.read_current_snapshot()?.as_deref() == Some(snapshot_name.as_str()) {
+        if current_is_target && self.validate_snapshot(&snapshot_name).is_ok() {
             return Ok(CompletionSnapshotPublishOutcome::Unchanged {
                 snapshot: snapshot_dir,
             });
@@ -155,14 +152,43 @@ impl ManagedCompletionRoot {
             self.write_object(payload.as_bytes())?;
         }
 
-        if !snapshot_dir.exists() {
+        if !snapshot_dir.exists() || self.validate_snapshot(&snapshot_name).is_err() {
             self.write_snapshot(&snapshot_name, &manifest, &manifest_bytes, payloads)?;
         }
-        self.write_current(&snapshot_name)?;
+        if current_is_target {
+            return Ok(CompletionSnapshotPublishOutcome::Repaired {
+                snapshot: snapshot_dir,
+            });
+        }
 
+        self.write_current(&snapshot_name)?;
         Ok(CompletionSnapshotPublishOutcome::Published {
             snapshot: snapshot_dir,
         })
+    }
+
+    fn read_active_snapshot(&self) -> Result<Option<ActiveSnapshot>> {
+        let Some(name) = self.read_current_snapshot()? else {
+            return Ok(None);
+        };
+        let manifest = self.validate_snapshot(&name)?;
+        Ok(Some(ActiveSnapshot { name, manifest }))
+    }
+
+    fn validate_snapshot(&self, snapshot: &str) -> Result<SnapshotManifest> {
+        let manifest = self.read_manifest(snapshot)?;
+        for (shell_name, view) in &manifest.views {
+            let path = self.view_path(snapshot, shell_name, view)?;
+            let payload = fs::read(&path)
+                .with_context(|| format!("read managed completion view {}", path.display()))?;
+            if sha256_hex(&payload) != view.object_digest {
+                anyhow::bail!(
+                    "managed completion view digest mismatch: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(manifest)
     }
 
     fn read_current_snapshot(&self) -> Result<Option<String>> {
@@ -235,6 +261,10 @@ impl ManagedCompletionRoot {
         }
         fs::write(staging_dir.join("manifest.json"), manifest_bytes)
             .with_context(|| format!("write {}", staging_dir.join("manifest.json").display()))?;
+        if final_dir.exists() {
+            fs::remove_dir_all(&final_dir)
+                .with_context(|| format!("remove broken snapshot {}", final_dir.display()))?;
+        }
         fs::rename(&staging_dir, &final_dir)
             .with_context(|| format!("activate snapshot {}", final_dir.display()))?;
         Ok(())
@@ -406,6 +436,35 @@ mod tests {
     }
 
     #[test]
+    fn publish_repairs_missing_active_snapshot_without_rewriting_current() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let mut payloads = BTreeMap::new();
+        payloads.insert(
+            CompletionShell::Bash,
+            "complete -F _update_all update-all\n".to_string(),
+        );
+
+        root.publish_shell_completions(&payloads).unwrap();
+        let snapshot = root.read_current_snapshot().unwrap().unwrap();
+        let current_before = fs::read(root.current_path()).unwrap();
+        fs::remove_dir_all(root.snapshot_dir(&snapshot)).unwrap();
+
+        let outcome = root.publish_shell_completions(&payloads).unwrap();
+
+        assert!(matches!(
+            outcome,
+            CompletionSnapshotPublishOutcome::Repaired { .. }
+        ));
+        assert_eq!(fs::read(root.current_path()).unwrap(), current_before);
+        assert_eq!(
+            root.status().unwrap().available_shells,
+            vec!["bash".to_string()]
+        );
+        assert!(!root.init_script(CompletionShell::Bash).unwrap().is_empty());
+    }
+
+    #[test]
     fn init_script_is_empty_without_snapshot() {
         let temp = TempDir::new().unwrap();
         let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
@@ -498,6 +557,31 @@ mod tests {
             status.available_shells,
             vec!["bash".to_string(), "fish".to_string()]
         );
+    }
+
+    #[test]
+    fn status_and_init_reject_an_active_snapshot_with_a_missing_view() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let mut payloads = BTreeMap::new();
+        payloads.insert(
+            CompletionShell::Bash,
+            "complete -F _update_all update-all\n".to_string(),
+        );
+        payloads.insert(CompletionShell::Fish, "complete update-all\n".to_string());
+
+        root.publish_shell_completions(&payloads).unwrap();
+        let snapshot = root.read_current_snapshot().unwrap().unwrap();
+        fs::remove_file(
+            root.snapshot_dir(&snapshot)
+                .join("views/bash/update-all.bash"),
+        )
+        .unwrap();
+
+        let status_error = root.status().unwrap_err();
+        assert!(format!("{status_error:#}").contains("view is missing"));
+        let init_error = root.init_script(CompletionShell::Fish).unwrap_err();
+        assert!(format!("{init_error:#}").contains("view is missing"));
     }
 
     #[test]

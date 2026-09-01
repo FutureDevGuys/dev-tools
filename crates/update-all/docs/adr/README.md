@@ -18,6 +18,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0006](0006-product-scoped-authenticated-releases.md) | Product-scoped authenticated releases | superseded | pending |
 | [0007](0007-npm-global-mutation-authority.md) | NPM global mutation authority | proposed | pending |
 | [0008](0008-shared-release-and-installation-foundations.md) | Shared release and installation foundations | proposed | pending |
+| [0009](0009-managed-completion-root.md) | Managed completion publication root and snapshot health | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

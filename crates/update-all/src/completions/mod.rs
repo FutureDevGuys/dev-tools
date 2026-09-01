@@ -1930,6 +1930,9 @@ fn publish_public_self_completion_snapshot(
         CompletionSnapshotPublishOutcome::Published { snapshot } => {
             events.push(format!("__UA_COMP_PUBLIC|published|{}", snapshot.display()));
         }
+        CompletionSnapshotPublishOutcome::Repaired { snapshot } => {
+            events.push(format!("__UA_COMP_PUBLIC|repaired|{}", snapshot.display()));
+        }
         CompletionSnapshotPublishOutcome::Unchanged { snapshot } => {
             events.push(format!("__UA_COMP_PUBLIC|unchanged|{}", snapshot.display()));
         }

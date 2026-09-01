@@ -84,3 +84,38 @@ fn resolve_managed_completion_root_rejects_relative_paths() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("managed completion root must be absolute"));
 }
+
+#[test]
+fn completion_paths_resolve_the_managed_root_environment_override() {
+    let _lock = crate::test_support::env_guard();
+    let temp = tempfile::TempDir::new().unwrap();
+    let managed_root = temp.path().join("managed-root");
+    let original = std::env::var_os("UPDATE_ALL_COMPLETION_ROOT");
+    std::env::set_var("UPDATE_ALL_COMPLETION_ROOT", &managed_root);
+
+    let paths = resolve_completion_paths();
+
+    match original {
+        Some(value) => std::env::set_var("UPDATE_ALL_COMPLETION_ROOT", value),
+        None => std::env::remove_var("UPDATE_ALL_COMPLETION_ROOT"),
+    }
+    assert_eq!(paths.managed_root, managed_root);
+}
+
+#[test]
+fn completion_sync_help_leads_with_public_init_and_labels_the_legacy_bridge() {
+    use clap::CommandFactory;
+
+    let mut command = RunCli::command();
+    let sync = command
+        .find_subcommand_mut("completions")
+        .unwrap()
+        .find_subcommand_mut("sync")
+        .unwrap();
+    let help = sync.render_long_help().to_string();
+
+    assert!(help.contains("update-all completions sync --providers <provider>"));
+    assert!(help.contains("update-all completions init <shell>"));
+    assert!(help.contains("`bash`, `zsh`, `fish`, `elvish`, and `powershell`"));
+    assert!(help.contains("explicit `--apply --shell <shell>` bridge is legacy compatibility"));
+}

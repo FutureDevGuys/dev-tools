@@ -340,6 +340,7 @@ pub struct SyncContext {
     pub(crate) event_tx: Option<DashboardSender>,
     pub run_log: Option<Arc<RunLogSink>>,
     pub rc_root: PathBuf,
+    pub completion_managed_root: PathBuf,
     pub completion_config_path: Option<PathBuf>,
     pub completion_catalog_path: PathBuf,
     pub completion_registry_path: PathBuf,
@@ -631,6 +632,7 @@ pub struct AsyncContext {
     pub completion_report: String,
     pub filter_progress_noise: bool,
     pub rc_root: PathBuf,
+    pub completion_managed_root: PathBuf,
     pub completion_config_path: Option<PathBuf>,
     pub completion_catalog_path: PathBuf,
     pub completion_registry_path: PathBuf,
@@ -1622,7 +1624,7 @@ impl SyncContext {
             catalog_path: self.completion_catalog_path.clone(),
             config_path: self.completion_config_path.clone(),
             rc_root: self.rc_root.clone(),
-            managed_root: crate::cli::default_completion_managed_root(),
+            managed_root: self.completion_managed_root.clone(),
             progress_cb: self.completion_progress_cb(task_id),
         })
     }
@@ -13682,6 +13684,7 @@ fn ctx_clone_for_task(
         event_tx: tx,
         run_log: ctx.run_log.clone(),
         rc_root: ctx.rc_root.clone(),
+        completion_managed_root: ctx.completion_managed_root.clone(),
         completion_config_path: ctx.completion_config_path.clone(),
         completion_catalog_path: ctx.completion_catalog_path.clone(),
         completion_registry_path: ctx.completion_registry_path.clone(),

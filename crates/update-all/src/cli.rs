@@ -326,6 +326,7 @@ impl RunCli {
                         completion_report,
                         filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
                         rc_root: completion_paths.rc_root,
+                        completion_managed_root: completion_paths.managed_root,
                         completion_config_path: runtime_cfg.source_path.clone(),
                         completion_catalog_path: completion_paths.catalog_path,
                         completion_registry_path: completion_paths.registry_path,
@@ -362,6 +363,7 @@ impl RunCli {
                         event_tx: None,
                         run_log: Some(run_log.clone()),
                         rc_root: completion_paths.rc_root.clone(),
+                        completion_managed_root: completion_paths.managed_root.clone(),
                         completion_config_path: runtime_cfg.source_path.clone(),
                         completion_catalog_path: completion_paths.catalog_path.clone(),
                         completion_registry_path: completion_paths.registry_path.clone(),
@@ -390,6 +392,7 @@ impl RunCli {
                 completion_report,
                 filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
                 rc_root: completion_paths.rc_root,
+                completion_managed_root: completion_paths.managed_root,
                 completion_config_path: runtime_cfg.source_path.clone(),
                 completion_catalog_path: completion_paths.catalog_path,
                 completion_registry_path: completion_paths.registry_path,
@@ -1009,8 +1012,8 @@ fn resolve_mouse_row_stride(runtime_cfg: &crate::config::RuntimeConfig) -> Mouse
 
 #[derive(clap::Args, Debug)]
 #[command(
-    about = "Generate, install, and audit managed shell completions.",
-    long_about = "Generate, install, and audit managed shell completions.\n\nUse `sync` to probe enabled providers and write managed completion files. Use `install` to add the binary-owned shell bootstrap. Managed completion sync starts from the repo catalog, then additively merges user entries from your config under `[[completions.tools]]`. Matching `(provider, name)` entries can disable a repo-managed tool on your machine without editing the repository. Catalog entries can mark trusted optional tools as ambient and can declare generic command candidates for fallback launch forms such as local package runners.\n\nWhen your config is not in the default location, pass the global `--config <path>` flag before `completions` so sync uses the same file."
+    about = "Generate, publish, and inspect managed shell completions.",
+    long_about = "Generate, publish, and inspect managed shell completions.\n\nUse `sync` to probe enabled providers and publish an immutable snapshot, then `init <shell>` to print the read-only startup line for Bash, Zsh, Fish, Elvish, or PowerShell. The `install` command and sync's `--apply` flag are explicit legacy compatibility surfaces for Zsh and PowerShell only. Managed completion sync starts from the repo catalog, then additively merges user entries from your config under `[[completions.tools]]`. Matching `(provider, name)` entries can disable a repo-managed tool on your machine without editing the repository. Catalog entries can mark trusted optional tools as ambient and can declare generic command candidates for fallback launch forms such as local package runners.\n\nWhen your config is not in the default location, pass the global `--config <path>` flag before `completions` so sync uses the same file."
 )]
 pub struct CompletionsCli {
     #[command(subcommand)]
@@ -1021,7 +1024,7 @@ pub struct CompletionsCli {
 enum CompletionsCmd {
     /// Probe providers and write managed completion payloads.
     Sync(CompletionsSyncCli),
-    /// Install the binary-owned shell bootstrap for managed completions.
+    /// Install the legacy binary-owned bootstrap for Zsh or PowerShell.
     Install(CompletionsInstallCli),
     /// Emit read-only shell init code for the active managed completion snapshot.
     Init(CompletionsInitCli),
@@ -1033,7 +1036,7 @@ enum CompletionsCmd {
 #[command(
     about = "Probe completion-capable tools and write managed completion files.",
     long_about = "Probe completion-capable tools and write managed completion files.",
-    after_help = "Managed completion sync starts from the repo catalog, then additively merges user config from `[[completions.tools]]` in the active update-all config file.\n\nBeginner authoring loop:\n  1. `update-all config init`\n  2. Add one `[[completions.tools]]` entry\n  3. `update-all config validate --strict`\n  4. `update-all completions sync --providers <provider> --apply --shell zsh`\n\nIf you keep your config somewhere else, use `update-all --config /path/to/config.toml completions sync ...`."
+    after_help = "Managed completion sync starts from the repo catalog, then additively merges user config from `[[completions.tools]]` in the active update-all config file.\n\nBeginner authoring loop:\n  1. `update-all config init`\n  2. Add one `[[completions.tools]]` entry\n  3. `update-all config validate --strict`\n  4. `update-all completions sync --providers <provider>`\n  5. Run `update-all completions init <shell>` and add its printed line to that shell's startup file. Supported values are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.\n\nThe explicit `--apply --shell <shell>` bridge is legacy compatibility wiring for Zsh and PowerShell only. If you keep your config somewhere else, use `update-all --config /path/to/config.toml completions sync ...`."
 )]
 struct CompletionsSyncCli {
     #[arg(
@@ -1086,14 +1089,14 @@ struct CompletionsSyncCli {
     #[arg(
         long = "apply",
         default_value_t = false,
-        help = "Install the binary-owned completion bootstrap and run completion apply/audit"
+        help = "Explicitly run legacy Zsh or PowerShell bootstrap wiring and apply/audit"
     )]
     apply: bool,
 
     #[arg(
         long = "shell",
         default_value = "zsh",
-        help = "Shell bootstrap target used with --apply"
+        help = "Legacy Zsh or PowerShell bootstrap target used only with --apply"
     )]
     shell: String,
 
@@ -1106,7 +1109,7 @@ struct CompletionsSyncCli {
 }
 
 #[derive(clap::Args, Debug)]
-#[command(about = "Install the binary-owned shell bootstrap for managed completions.")]
+#[command(about = "Install the legacy binary-owned bootstrap for Zsh or PowerShell.")]
 struct CompletionsInstallCli {
     #[arg(
         long = "shell",
