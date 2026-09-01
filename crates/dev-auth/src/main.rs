@@ -19,7 +19,7 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -592,13 +592,15 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                         "release_version": plan.installation.request.version,
                     })
                 ),
-                _ => unreachable!("format was validated before release staging"),
+                _ => bail!("setup plan format changed after validation"),
             }
             Ok(0)
         }
         "apply" => {
             let mut plan_path = None;
             let mut digest = None;
+            let mut format = None;
+            let mut credential_sources = std::collections::BTreeMap::new();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--plan" if plan_path.is_none() => {
@@ -606,6 +608,54 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     }
                     "--sha256" if digest.is_none() => {
                         digest = Some(arguments.next().context("--sha256 requires a digest")?)
+                    }
+                    "--credential-stdin" => {
+                        let slot = arguments
+                            .next()
+                            .context("--credential-stdin requires SLOT")?;
+                        if credential_sources
+                            .insert(
+                                slot,
+                                dev_auth::credential_input::CredentialInputSource::Stdin,
+                            )
+                            .is_some()
+                        {
+                            bail!("credential input slot was defined more than once");
+                        }
+                    }
+                    "--credential-fd" => {
+                        let value = arguments
+                            .next()
+                            .context("--credential-fd requires SLOT=FD")?;
+                        let (slot, fd) = value
+                            .split_once('=')
+                            .context("--credential-fd requires SLOT=FD")?;
+                        let source = dev_auth::credential_input::CredentialInputSource::Fd(
+                            fd.parse()
+                                .context("credential file descriptor is invalid")?,
+                        );
+                        if credential_sources.insert(slot.into(), source).is_some() {
+                            bail!("credential input slot was defined more than once");
+                        }
+                    }
+                    "--credential-file" => {
+                        let value = arguments
+                            .next()
+                            .context("--credential-file requires SLOT=PATH")?;
+                        let (slot, path) = value
+                            .split_once('=')
+                            .context("--credential-file requires SLOT=PATH")?;
+                        let path = std::path::PathBuf::from(path);
+                        if !path.is_absolute() {
+                            bail!("credential file path must be absolute");
+                        }
+                        let source = dev_auth::credential_input::CredentialInputSource::File(path);
+                        if credential_sources.insert(slot.into(), source).is_some() {
+                            bail!("credential input slot was defined more than once");
+                        }
+                    }
+                    "--format" if format.is_none() => {
+                        format = Some(arguments.next().context("--format requires a value")?)
                     }
                     _ => bail!("setup apply received an unsupported or duplicate argument"),
                 }
@@ -615,13 +665,78 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if !plan_path.is_absolute() {
                 bail!("setup plan path must be absolute");
             }
-            let plan = dev_auth::setup::read_plan_at(&plan_path)?;
-            let report = dev_auth::setup::apply_plan(
-                &plan,
-                &digest.context("setup apply requires --sha256 HEX")?,
-            )?;
-            println!("{}", serde_json::to_string(&report)?);
-            Ok(0)
+            let digest = digest.context("setup apply requires --sha256 HEX")?;
+            let format = format.as_deref().unwrap_or("json");
+            if !matches!(format, "human" | "json") {
+                bail!("setup apply format must be human or json");
+            }
+            match dev_auth::setup_v3::read_setup_plan_v3_at(&plan_path) {
+                Ok(plan) => {
+                    let declared = plan
+                        .intent
+                        .credentials
+                        .iter()
+                        .map(|credential| credential.slot.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let requirements =
+                        dev_auth::setup_v3::required_credential_slots_for_plan(&plan)?;
+                    let required = requirements
+                        .required
+                        .into_iter()
+                        .filter(|slot| slot == "automation")
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let mut allowed_owner_uids = plan
+                        .accounts
+                        .iter()
+                        .map(|account| account.uid)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if plan.intent.mode == dev_auth::deployment::DeploymentMode::Strong {
+                        allowed_owner_uids.insert(0);
+                    }
+                    let mut stdin = std::io::stdin().lock();
+                    let credentials = dev_auth::credential_input::load_credential_inputs(
+                        &declared,
+                        &required,
+                        &credential_sources,
+                        &dev_auth::credential_input::CredentialInputContext {
+                            mode: plan.intent.mode,
+                            allowed_owner_uids,
+                        },
+                        &mut stdin,
+                    )?;
+                    let report =
+                        dev_auth::setup_v3::apply_setup_plan_v3(&plan, &digest, &credentials)?;
+                    if format == "json" {
+                        println!("{}", serde_json::to_string(&report)?);
+                    } else {
+                        println!("changed={}", report.changed);
+                        println!("verified={}", report.verified);
+                        println!("next_action={}", report.next_action);
+                        for slot in &report.input_required {
+                            println!("input_required={slot}");
+                        }
+                        for slot in &report.blocked {
+                            println!("blocked={slot}");
+                        }
+                    }
+                    Ok(if !report.input_required.is_empty() {
+                        3
+                    } else if !report.blocked.is_empty() {
+                        2
+                    } else {
+                        0
+                    })
+                }
+                Err(v3_error) => {
+                    if !credential_sources.is_empty() {
+                        return Err(v3_error).context("credential inputs require a setup plan v3");
+                    }
+                    let plan = dev_auth::setup::read_plan_at(&plan_path)?;
+                    let report = dev_auth::setup::apply_plan(&plan, &digest)?;
+                    println!("{}", serde_json::to_string(&report)?);
+                    Ok(0)
+                }
+            }
         }
         "migrate-v1-preview" => {
             if arguments.next().as_deref() != Some("--output") {

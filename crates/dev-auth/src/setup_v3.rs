@@ -1,12 +1,14 @@
+use crate::credential_input::CredentialMaterial;
 use crate::deployment::{
-    canonical_deployment_intent, Activation, DeploymentIntent, DeploymentMode,
+    canonical_deployment_intent, Activation, CredentialIntent, DeploymentCredential,
+    DeploymentIntent, DeploymentMode,
 };
 use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2, resolve_policy, SystemMode};
 use crate::setup::{render_plan, SetupPlan};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -35,6 +37,24 @@ pub struct NativeAccountIdentity {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct CurrentFileIdentity {
+    pub owner_uid: u32,
+    pub mode: u32,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentPathIdentity {
+    pub kind: String,
+    pub subject: String,
+    pub path: PathBuf,
+    pub identity: Option<CurrentFileIdentity>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SetupActionV3 {
     pub order: u32,
     pub kind: String,
@@ -51,8 +71,663 @@ pub struct SetupPlanV3 {
     pub installation: SetupPlan,
     pub source_documents: Vec<DocumentIdentity>,
     pub accounts: Vec<NativeAccountIdentity>,
+    pub current_paths: Vec<CurrentPathIdentity>,
+    pub current_credential_ready: bool,
+    pub current_broker_state: String,
     pub current_state_sha256: String,
     pub actions: Vec<SetupActionV3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRequirements {
+    pub required: BTreeSet<String>,
+    pub blocked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetupApplyReportV3 {
+    pub schema: String,
+    pub changed: bool,
+    pub verified: bool,
+    pub input_required: Vec<String>,
+    pub blocked: Vec<String>,
+    pub next_action: String,
+    pub actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CredentialActionReceipt {
+    schema: String,
+    plan_sha256: String,
+    completed: BTreeSet<String>,
+}
+
+pub fn credential_requirements(
+    credentials: &[DeploymentCredential],
+    ready_slots: &BTreeSet<String>,
+) -> CredentialRequirements {
+    let mut required = BTreeSet::new();
+    let mut blocked = Vec::new();
+    for credential in credentials {
+        match credential.intent {
+            CredentialIntent::Preserve if !ready_slots.contains(&credential.slot) => {
+                blocked.push(credential.slot.clone());
+            }
+            CredentialIntent::EnrollIfAbsent if !ready_slots.contains(&credential.slot) => {
+                required.insert(credential.slot.clone());
+            }
+            CredentialIntent::Rotate => {
+                required.insert(credential.slot.clone());
+            }
+            CredentialIntent::Preserve
+            | CredentialIntent::EnrollIfAbsent
+            | CredentialIntent::Revoke => {}
+        }
+    }
+    CredentialRequirements { required, blocked }
+}
+
+pub fn required_credential_slots_for_plan(plan: &SetupPlanV3) -> Result<CredentialRequirements> {
+    validate_setup_plan_v3(plan)?;
+    let ready = ready_credential_slots(plan)?;
+    let mut requirements = credential_requirements(&plan.intent.credentials, &ready);
+    let (_, digest) = render_setup_plan_v3(plan)?;
+    let completed = read_credential_action_receipt(plan, &digest)?;
+    requirements.required.retain(|slot| {
+        let intent = plan
+            .intent
+            .credentials
+            .iter()
+            .find(|credential| &credential.slot == slot)
+            .map(|credential| credential.intent);
+        intent != Some(CredentialIntent::Rotate) || !completed.contains(slot)
+    });
+    Ok(requirements)
+}
+
+pub fn apply_setup_plan_v3(
+    plan: &SetupPlanV3,
+    approved_sha256: &str,
+    credentials: &BTreeMap<String, CredentialMaterial>,
+) -> Result<SetupApplyReportV3> {
+    let (_, digest) = render_setup_plan_v3(plan)?;
+    if digest != approved_sha256.to_ascii_lowercase() {
+        bail!("setup plan v3 does not match the approved digest");
+    }
+    require_apply_identity(plan)?;
+    revalidate_public_plan_inputs(plan)?;
+    let declared = plan
+        .intent
+        .credentials
+        .iter()
+        .map(|credential| credential.slot.clone())
+        .collect::<BTreeSet<_>>();
+    if credentials.keys().any(|slot| !declared.contains(slot)) {
+        bail!("credential material names a slot outside the approved setup plan");
+    }
+    let before = deployment_state_fingerprint(plan)?;
+    if postcondition_satisfied(plan, &digest) {
+        return Ok(SetupApplyReportV3 {
+            schema: "dev-auth-setup-apply-v3".into(),
+            changed: false,
+            verified: true,
+            input_required: Vec::new(),
+            blocked: Vec::new(),
+            next_action: "none".into(),
+            actions: Vec::new(),
+        });
+    }
+    require_initial_or_resumable_state(plan)?;
+
+    let mut actions = Vec::new();
+    deactivate_and_stop_candidate(plan, &mut actions)?;
+    let (_, install_digest) = render_plan(&plan.installation)?;
+    crate::setup::apply_plan(&plan.installation, &install_digest)?;
+    actions.push("install_release".into());
+    install_configuration(plan, &mut actions)?;
+
+    let requirements = required_credential_slots_for_plan(plan)?;
+    let unsupported = declared
+        .iter()
+        .filter(|slot| slot.as_str() != "automation")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut blocked = requirements.blocked;
+    blocked.extend(unsupported);
+    blocked.sort();
+    blocked.dedup();
+    let input_required = requirements
+        .required
+        .iter()
+        .filter(|slot| slot.as_str() == "automation" && !credentials.contains_key(*slot))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !blocked.is_empty() || !input_required.is_empty() {
+        let after = deployment_state_fingerprint(plan)?;
+        let next_action = if input_required.is_empty() {
+            "resolve_blocked_credential_slots"
+        } else {
+            "provide_credential_input"
+        };
+        return Ok(SetupApplyReportV3 {
+            schema: "dev-auth-setup-apply-v3".into(),
+            changed: before != after,
+            verified: false,
+            input_required,
+            blocked,
+            next_action: next_action.into(),
+            actions,
+        });
+    }
+
+    apply_credential_actions(plan, &digest, credentials, &mut actions)?;
+    start_and_activate_candidate(plan, &mut actions)?;
+    if !postcondition_satisfied(plan, &digest) {
+        bail!("setup plan v3 postcondition verification failed");
+    }
+    let after = deployment_state_fingerprint(plan)?;
+    Ok(SetupApplyReportV3 {
+        schema: "dev-auth-setup-apply-v3".into(),
+        changed: before != after,
+        verified: true,
+        input_required: Vec::new(),
+        blocked: Vec::new(),
+        next_action: "none".into(),
+        actions,
+    })
+}
+
+fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
+    match plan.intent.mode {
+        DeploymentMode::Strong if !nix::unistd::Uid::effective().is_root() => {
+            bail!("strong setup apply requires root")
+        }
+        DeploymentMode::UserOnly => {
+            let current = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
+                .context("effective native account does not exist")?;
+            if current.uid.is_root()
+                || plan.accounts.len() != 1
+                || plan.accounts[0].uid != current.uid.as_raw()
+                || plan.accounts[0].name != current.name
+            {
+                bail!("user-only setup apply requires its exact native account");
+            }
+        }
+        DeploymentMode::Strong => {}
+    }
+    Ok(())
+}
+
+fn revalidate_public_plan_inputs(plan: &SetupPlanV3) -> Result<()> {
+    let rebuilt = build_setup_plan_v3_at(plan.intent.clone(), plan.installation.clone(), false)?;
+    if rebuilt.intent_sha256 != plan.intent_sha256
+        || rebuilt.source_documents != plan.source_documents
+        || rebuilt.accounts != plan.accounts
+        || rebuilt.actions != plan.actions
+    {
+        bail!("setup plan v3 public inputs changed after approval");
+    }
+    Ok(())
+}
+
+fn require_initial_or_resumable_state(plan: &SetupPlanV3) -> Result<()> {
+    let rebuilt = build_setup_plan_v3_at(plan.intent.clone(), plan.installation.clone(), false)?;
+    if rebuilt.current_state_sha256 == plan.current_state_sha256 {
+        return Ok(());
+    }
+    let report = crate::setup::verify_at(&plan.installation.paths)
+        .context("setup state changed and is not a receipt-owned resumable candidate")?;
+    if report.version != plan.installation.request.version
+        || Path::new(&report.executable)
+            != plan
+                .installation
+                .paths
+                .data_root
+                .join("versions")
+                .join(&plan.installation.request.version)
+                .join("dev-auth")
+    {
+        bail!("setup state changed outside the approved resumable candidate");
+    }
+    Ok(())
+}
+
+fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<()> {
+    if fs::symlink_metadata(installation_receipt_path(plan)).is_err() {
+        return Ok(());
+    }
+    let report = crate::setup::verify_at(&plan.installation.paths)?;
+    if report.transparent_launchers_active {
+        crate::setup::deactivate_transparent_launchers_at(&plan.installation.paths)?;
+        actions.push("deactivate_transparent_launchers".into());
+    }
+    if plan.intent.mode == DeploymentMode::Strong {
+        crate::setup::stop_system_broker_at(&plan.installation.paths)?;
+        actions.push("stop_broker".into());
+    }
+    Ok(())
+}
+
+fn install_configuration(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<()> {
+    let administrator = document_identity(plan, "administrator_policy", "system")?;
+    match plan.intent.mode {
+        DeploymentMode::Strong => {
+            crate::setup::reconcile_system_policy_at(
+                &plan.installation.paths,
+                &administrator.path,
+                &administrator.sha256,
+                current_document_sha(plan, "administrator_policy", "system")?,
+            )?;
+            actions.push("install_administrator_policy".into());
+            for account in &plan.accounts {
+                let config = document_identity(plan, "user_configuration", &account.name)?;
+                crate::setup::reconcile_user_config_for_account_at(
+                    &plan.installation.paths,
+                    &config.path,
+                    &config.sha256,
+                    &account.name,
+                    current_document_sha(plan, "user_configuration", &account.name)?,
+                )?;
+                actions.push(format!("install_user_configuration:{}", account.name));
+            }
+        }
+        DeploymentMode::UserOnly => {
+            let account = plan
+                .accounts
+                .first()
+                .context("user-only deployment has no native account")?;
+            let policy =
+                document_identity(plan, "user_policy", &account.name).unwrap_or(administrator);
+            crate::setup::reconcile_user_policy_for_account_at(
+                &plan.installation.paths,
+                &policy.path,
+                &policy.sha256,
+                &account.name,
+                current_document_sha(plan, "user_policy", &account.name)?,
+            )?;
+            actions.push(format!("install_user_policy:{}", account.name));
+            let config = document_identity(plan, "user_configuration", &account.name)?;
+            crate::setup::reconcile_user_config_for_account_at(
+                &plan.installation.paths,
+                &config.path,
+                &config.sha256,
+                &account.name,
+                current_document_sha(plan, "user_configuration", &account.name)?,
+            )?;
+            actions.push(format!("install_user_configuration:{}", account.name));
+        }
+    }
+    Ok(())
+}
+
+fn apply_credential_actions(
+    plan: &SetupPlanV3,
+    digest: &str,
+    credentials: &BTreeMap<String, CredentialMaterial>,
+    actions: &mut Vec<String>,
+) -> Result<()> {
+    let mut completed = read_credential_action_receipt(plan, digest)?;
+    for credential in &plan.intent.credentials {
+        let ready = credential_ready(plan.intent.mode);
+        match credential.intent {
+            CredentialIntent::Preserve => {}
+            CredentialIntent::EnrollIfAbsent if !ready => {
+                let material = credentials
+                    .get(&credential.slot)
+                    .context("required credential input disappeared before enrollment")?;
+                enroll_credential(plan, material.expose())?;
+                actions.push(format!("enroll_credential:{}", credential.slot));
+            }
+            CredentialIntent::EnrollIfAbsent => {}
+            CredentialIntent::Rotate if !completed.contains(&credential.slot) => {
+                let material = credentials
+                    .get(&credential.slot)
+                    .context("required credential input disappeared before rotation")?;
+                rotate_credential(plan, material.expose())?;
+                completed.insert(credential.slot.clone());
+                actions.push(format!("rotate_credential:{}", credential.slot));
+            }
+            CredentialIntent::Rotate => {}
+            CredentialIntent::Revoke => {
+                if ready {
+                    revoke_credential(plan)?;
+                    actions.push(format!("revoke_credential:{}", credential.slot));
+                }
+                completed.insert(credential.slot.clone());
+            }
+        }
+    }
+    write_credential_action_receipt(plan, digest, &completed)
+}
+
+fn enroll_credential(plan: &SetupPlanV3, value: &[u8]) -> Result<()> {
+    match plan.intent.mode {
+        DeploymentMode::Strong => crate::setup::enroll_system_service_credential(value),
+        DeploymentMode::UserOnly => crate::enroll_user_broker_service_token(value),
+    }
+}
+
+fn rotate_credential(plan: &SetupPlanV3, value: &[u8]) -> Result<()> {
+    match plan.intent.mode {
+        DeploymentMode::Strong => {
+            crate::setup::rotate_system_service_credential_at(&plan.installation.paths, value)
+        }
+        DeploymentMode::UserOnly => crate::rotate_user_broker_service_token(value),
+    }
+}
+
+fn revoke_credential(plan: &SetupPlanV3) -> Result<()> {
+    match plan.intent.mode {
+        DeploymentMode::Strong => {
+            crate::setup::revoke_system_service_credential_at(&plan.installation.paths)
+        }
+        DeploymentMode::UserOnly => crate::revoke_user_broker_service_token(),
+    }
+}
+
+fn start_and_activate_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<()> {
+    if plan.intent.mode == DeploymentMode::Strong && broker_desired(&plan.intent) {
+        crate::setup::start_system_broker_at(&plan.installation.paths)?;
+        actions.push("start_broker".into());
+    }
+    if plan.intent.activation == Activation::Transparent {
+        crate::setup::activate_transparent_launchers_at(&plan.installation.paths)?;
+        actions.push("activate_transparent_launchers".into());
+    }
+    Ok(())
+}
+
+fn postcondition_satisfied(plan: &SetupPlanV3, digest: &str) -> bool {
+    verify_postcondition(plan, digest).is_ok()
+}
+
+fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
+    let setup = crate::setup::verify_at(&plan.installation.paths)?;
+    if setup.version != plan.installation.request.version
+        || setup.transparent_launchers_active != (plan.intent.activation == Activation::Transparent)
+    {
+        bail!("installed release does not match the deployment intent");
+    }
+    let administrator = document_identity(plan, "administrator_policy", "system")?;
+    let system_policy = parse_system_policy_v2(&read_document_bytes(&administrator.path)?)?;
+    match plan.intent.mode {
+        DeploymentMode::Strong => {
+            require_exact_document(
+                Path::new(crate::policy_store::SYSTEM_POLICY_PATH),
+                administrator,
+            )?;
+        }
+        DeploymentMode::UserOnly => {}
+    }
+    for account in &plan.accounts {
+        let user = nix::unistd::User::from_name(&account.name)?
+            .context("deployment account disappeared during verification")?;
+        let config_identity = document_identity(plan, "user_configuration", &account.name)?;
+        let config_path = crate::policy_store::user_config_path(&user);
+        require_exact_document(&config_path, config_identity)?;
+        let user_config = parse_user_config_v2(&read_document_bytes(&config_path)?)?;
+        let policy = match plan.intent.mode {
+            DeploymentMode::Strong => system_policy.clone(),
+            DeploymentMode::UserOnly => {
+                let policy_identity =
+                    document_identity(plan, "user_policy", &account.name).unwrap_or(administrator);
+                let path = crate::policy_store::user_policy_path(&user);
+                require_exact_document(&path, policy_identity)?;
+                parse_system_policy_v2(&read_document_bytes(&path)?)?
+            }
+        };
+        let resolved = resolve_policy(&policy, &user_config)?;
+        crate::setup::verify_user_integrations_at(
+            &account.home,
+            Path::new(&setup.executable),
+            &resolved.workloads,
+            account.uid,
+        )?;
+    }
+    verify_credential_postcondition(plan, digest)?;
+    if plan.intent.mode == DeploymentMode::Strong {
+        let probe = crate::broker_client::probe_system_broker();
+        if broker_desired(&plan.intent)
+            && !matches!(probe, crate::broker_protocol::BrokerSessionProbe::NoSession)
+        {
+            bail!("system broker is not ready outside a workload session");
+        }
+        if !broker_desired(&plan.intent)
+            && !matches!(
+                probe,
+                crate::broker_protocol::BrokerSessionProbe::Unavailable { .. }
+            )
+        {
+            bail!("system broker remains active after credential revocation");
+        }
+    }
+    Ok(())
+}
+
+fn verify_credential_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
+    let ready = credential_ready(plan.intent.mode);
+    let completed = read_credential_action_receipt(plan, digest)?;
+    for credential in &plan.intent.credentials {
+        match credential.intent {
+            CredentialIntent::Preserve | CredentialIntent::EnrollIfAbsent if !ready => {
+                bail!("required credential slot is not enrolled")
+            }
+            CredentialIntent::Rotate if !ready || !completed.contains(&credential.slot) => {
+                bail!("credential rotation is not complete")
+            }
+            CredentialIntent::Revoke if ready || !completed.contains(&credential.slot) => {
+                bail!("credential revocation is not complete")
+            }
+            CredentialIntent::Preserve
+            | CredentialIntent::EnrollIfAbsent
+            | CredentialIntent::Rotate
+            | CredentialIntent::Revoke => {}
+        }
+    }
+    Ok(())
+}
+
+fn ready_credential_slots(plan: &SetupPlanV3) -> Result<BTreeSet<String>> {
+    let mut ready = BTreeSet::new();
+    if credential_ready(plan.intent.mode) {
+        ready.insert("automation".into());
+    }
+    Ok(ready)
+}
+
+fn credential_ready(mode: DeploymentMode) -> bool {
+    match mode {
+        DeploymentMode::Strong => crate::setup::system_service_credential_ready(),
+        DeploymentMode::UserOnly => crate::setup::user_service_credential_ready(),
+    }
+}
+
+fn broker_desired(intent: &DeploymentIntent) -> bool {
+    !intent.credentials.iter().any(|credential| {
+        credential.slot == "automation" && credential.intent == CredentialIntent::Revoke
+    })
+}
+
+fn document_identity<'a>(
+    plan: &'a SetupPlanV3,
+    kind: &str,
+    subject: &str,
+) -> Result<&'a DocumentIdentity> {
+    plan.source_documents
+        .iter()
+        .find(|document| document.kind == kind && document.subject == subject)
+        .with_context(|| format!("setup plan is missing {kind} for {subject}"))
+}
+
+fn current_document_sha<'a>(
+    plan: &'a SetupPlanV3,
+    kind: &str,
+    subject: &str,
+) -> Result<Option<&'a str>> {
+    let current = plan
+        .current_paths
+        .iter()
+        .find(|identity| identity.kind == kind && identity.subject == subject)
+        .with_context(|| format!("setup plan is missing current {kind} state for {subject}"))?;
+    Ok(current
+        .identity
+        .as_ref()
+        .map(|identity| identity.sha256.as_str()))
+}
+
+fn require_exact_document(path: &Path, identity: &DocumentIdentity) -> Result<()> {
+    let bytes = read_document_bytes(path)?;
+    if bytes.len() as u64 != identity.length || sha256_hex(&bytes) != identity.sha256 {
+        bail!("installed configuration does not match the approved source");
+    }
+    Ok(())
+}
+
+fn read_document_bytes(path: &Path) -> Result<Vec<u8>> {
+    read_bounded(path)
+}
+
+fn installation_receipt_path(plan: &SetupPlanV3) -> PathBuf {
+    plan.installation.paths.data_root.join("install-v2.json")
+}
+
+fn credential_action_receipt_path(plan: &SetupPlanV3) -> PathBuf {
+    plan.installation
+        .paths
+        .data_root
+        .join("credential-actions-v1.json")
+}
+
+fn read_credential_action_receipt(plan: &SetupPlanV3, digest: &str) -> Result<BTreeSet<String>> {
+    let path = credential_action_receipt_path(plan);
+    let bytes = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error).context("inspect credential action receipt"),
+        Ok(metadata) => {
+            let owner = apply_owner_uid(plan)?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != owner
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.len() > DOCUMENT_LIMIT
+            {
+                bail!("credential action receipt has unsafe authority");
+            }
+            read_bounded(&path)?
+        }
+    };
+    let receipt: CredentialActionReceipt =
+        serde_json::from_slice(&bytes).context("parse credential action receipt")?;
+    if receipt.schema != "dev-auth-credential-actions-v1" || receipt.plan_sha256 != digest {
+        return Ok(BTreeSet::new());
+    }
+    Ok(receipt.completed)
+}
+
+fn write_credential_action_receipt(
+    plan: &SetupPlanV3,
+    digest: &str,
+    completed: &BTreeSet<String>,
+) -> Result<()> {
+    let receipt = CredentialActionReceipt {
+        schema: "dev-auth-credential-actions-v1".into(),
+        plan_sha256: digest.into(),
+        completed: completed.clone(),
+    };
+    let bytes = serde_jcs::to_vec(&receipt).context("serialize credential action receipt")?;
+    let path = credential_action_receipt_path(plan);
+    let parent = path
+        .parent()
+        .context("credential action receipt has no parent")?;
+    if !parent.is_dir() {
+        bail!("credential action receipt parent is absent");
+    }
+    let temporary = path.with_extension(format!("new-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .context("create credential action receipt")?;
+    file.write_all(&bytes)
+        .context("write credential action receipt")?;
+    file.sync_all().context("sync credential action receipt")?;
+    fs::rename(&temporary, &path).context("publish credential action receipt")
+}
+
+fn apply_owner_uid(plan: &SetupPlanV3) -> Result<u32> {
+    match plan.intent.mode {
+        DeploymentMode::Strong => Ok(0),
+        DeploymentMode::UserOnly => Ok(plan
+            .accounts
+            .first()
+            .context("user-only plan has no native account")?
+            .uid),
+    }
+}
+
+fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
+    #[derive(Serialize)]
+    struct State<'a> {
+        files: Vec<(PathBuf, Option<(u64, String)>)>,
+        credential_ready: bool,
+        broker: &'a str,
+    }
+    let mut paths = vec![
+        installation_receipt_path(plan),
+        credential_action_receipt_path(plan),
+    ];
+    match plan.intent.mode {
+        DeploymentMode::Strong => {
+            paths.push(PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH));
+        }
+        DeploymentMode::UserOnly => {}
+    }
+    for account in &plan.accounts {
+        let user = nix::unistd::User::from_name(&account.name)?
+            .context("deployment account disappeared while fingerprinting state")?;
+        paths.push(crate::policy_store::user_config_path(&user));
+        if plan.intent.mode == DeploymentMode::UserOnly {
+            paths.push(crate::policy_store::user_policy_path(&user));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let identity = match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect deployment state"),
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    bail!("deployment state contains an unsafe object");
+                }
+                let bytes = read_bounded(&path)?;
+                Some((bytes.len() as u64, sha256_hex(&bytes)))
+            }
+        };
+        files.push((path, identity));
+    }
+    let broker = if plan.intent.mode == DeploymentMode::UserOnly {
+        "user_only"
+    } else {
+        match crate::broker_client::probe_system_broker() {
+            crate::broker_protocol::BrokerSessionProbe::NoSession => "ready",
+            crate::broker_protocol::BrokerSessionProbe::Verified { .. } => "admitted",
+            crate::broker_protocol::BrokerSessionProbe::Invalid { .. } => "invalid",
+            crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => "unavailable",
+        }
+    };
+    Ok(sha256_hex(
+        &serde_jcs::to_vec(&State {
+            files,
+            credential_ready: credential_ready(plan.intent.mode),
+            broker,
+        })
+        .context("serialize deployment state")?,
+    ))
 }
 
 pub fn build_setup_plan_v3(
@@ -78,6 +753,18 @@ pub fn build_setup_plan_v3_at(
         || installation.request.activate_transparent_launchers
     {
         bail!("deployment intent and staged installation plan disagree");
+    }
+    let automation = intent
+        .credentials
+        .iter()
+        .find(|credential| credential.slot == "automation");
+    if intent.mode == DeploymentMode::Strong && automation.is_none() {
+        bail!("strong deployment must declare the automation credential slot");
+    }
+    if intent.activation == Activation::Transparent
+        && automation.is_some_and(|credential| credential.intent == CredentialIntent::Revoke)
+    {
+        bail!("transparent activation conflicts with automation credential revocation");
     }
     if require_privileged
         && intent.mode == DeploymentMode::Strong
@@ -151,7 +838,13 @@ pub fn build_setup_plan_v3_at(
     });
     accounts.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let current_state_sha256 = current_state_digest(&installation, &intent, &accounts)?;
+    let (current_paths, current_credential_ready, current_broker_state) =
+        current_state_snapshot(&installation, &intent, &accounts)?;
+    let current_state_sha256 = stored_current_state_digest(
+        &current_paths,
+        current_credential_ready,
+        &current_broker_state,
+    )?;
     let actions = planned_actions(&intent);
     let plan = SetupPlanV3 {
         schema: "dev-auth-setup-plan-v3".into(),
@@ -160,6 +853,9 @@ pub fn build_setup_plan_v3_at(
         installation,
         source_documents: documents,
         accounts,
+        current_paths,
+        current_credential_ready,
+        current_broker_state,
         current_state_sha256,
         actions,
     };
@@ -215,6 +911,12 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
         || plan.source_documents.is_empty()
         || plan.accounts.is_empty()
         || plan.actions.is_empty()
+        || plan.current_state_sha256
+            != stored_current_state_digest(
+                &plan.current_paths,
+                plan.current_credential_ready,
+                &plan.current_broker_state,
+            )?
         || plan.actions.last().map(|action| action.kind.as_str()) != Some("verify")
         || plan
             .actions
@@ -224,11 +926,70 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
     {
         bail!("dev-auth setup plan v3 has an unsupported contract");
     }
+    if current_path_keys(&plan.current_paths)
+        != expected_current_path_keys(&plan.installation, &plan.intent, &plan.accounts)
+    {
+        bail!("setup plan v3 current-state paths do not match the deployment authority");
+    }
     render_plan(&plan.installation).context("validate nested installation plan")?;
     if plan.installation.request.activate_transparent_launchers {
         bail!("setup plan v3 must stage the release with transparent launchers inactive");
     }
     Ok(())
+}
+
+fn current_path_keys(paths: &[CurrentPathIdentity]) -> Vec<(String, String, PathBuf)> {
+    paths
+        .iter()
+        .map(|path| (path.kind.clone(), path.subject.clone(), path.path.clone()))
+        .collect()
+}
+
+fn expected_current_path_keys(
+    installation: &SetupPlan,
+    intent: &DeploymentIntent,
+    accounts: &[NativeAccountIdentity],
+) -> Vec<(String, String, PathBuf)> {
+    let mut paths = vec![
+        (
+            "installation_receipt".to_owned(),
+            "system".to_owned(),
+            installation.paths.data_root.join("install-v2.json"),
+        ),
+        (
+            "credential_actions".to_owned(),
+            "system".to_owned(),
+            installation
+                .paths
+                .data_root
+                .join("credential-actions-v1.json"),
+        ),
+    ];
+    match intent.mode {
+        DeploymentMode::Strong => paths.push((
+            "administrator_policy".into(),
+            "system".into(),
+            PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH),
+        )),
+        DeploymentMode::UserOnly => {
+            for account in accounts {
+                paths.push((
+                    "user_policy".into(),
+                    account.name.clone(),
+                    account.home.join(".config/dev-auth/policy-v2.toml"),
+                ));
+            }
+        }
+    }
+    for account in accounts {
+        paths.push((
+            "user_configuration".into(),
+            account.name.clone(),
+            account.home.join(".config/dev-auth/config-v2.toml"),
+        ));
+    }
+    paths.sort();
+    paths
 }
 
 fn planned_actions(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
@@ -263,7 +1024,9 @@ fn planned_actions(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
     for user in &intent.users {
         push("install_user_integrations", Some(user.name.clone()));
     }
-    push("start_broker", None);
+    if broker_desired(intent) {
+        push("start_broker", None);
+    }
     if intent.activation == Activation::Transparent {
         push("activate_transparent_launchers", None);
     }
@@ -271,47 +1034,68 @@ fn planned_actions(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
     actions
 }
 
-fn current_state_digest(
+fn current_state_snapshot(
     installation: &SetupPlan,
     intent: &DeploymentIntent,
     accounts: &[NativeAccountIdentity],
-) -> Result<String> {
-    #[derive(Serialize)]
-    struct StateEntry {
-        path: PathBuf,
-        identity: Option<(u64, String)>,
-    }
-    let mut paths = vec![installation.paths.data_root.join("install-v2.json")];
-    match intent.mode {
-        DeploymentMode::Strong => paths.push(PathBuf::from("/etc/dev-auth/policy.toml")),
-        DeploymentMode::UserOnly => {
-            for account in accounts {
-                paths.push(account.home.join(".config/dev-auth/policy-v2.toml"));
-            }
-        }
-    }
-    for account in accounts {
-        paths.push(account.home.join(".config/dev-auth/config-v2.toml"));
-    }
-    paths.sort();
-    paths.dedup();
+) -> Result<(Vec<CurrentPathIdentity>, bool, String)> {
+    let paths = expected_current_path_keys(installation, intent, accounts);
     let mut entries = Vec::with_capacity(paths.len());
-    for path in paths {
+    for (kind, subject, path) in paths {
         let identity = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                     bail!("setup current-state path is not a regular non-link file");
                 }
                 let document = read_bounded(&path)?;
-                Some((document.len() as u64, sha256_hex(&document)))
+                Some(CurrentFileIdentity {
+                    owner_uid: metadata.uid(),
+                    mode: metadata.mode() & 0o777,
+                    length: document.len() as u64,
+                    sha256: sha256_hex(&document),
+                })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("inspect setup current-state path"),
         };
-        entries.push(StateEntry { path, identity });
+        entries.push(CurrentPathIdentity {
+            kind,
+            subject,
+            path,
+            identity,
+        });
+    }
+    let broker = if intent.mode == DeploymentMode::UserOnly {
+        "user_only"
+    } else {
+        match crate::broker_client::probe_system_broker() {
+            crate::broker_protocol::BrokerSessionProbe::NoSession => "ready",
+            crate::broker_protocol::BrokerSessionProbe::Verified { .. } => "admitted",
+            crate::broker_protocol::BrokerSessionProbe::Invalid { .. } => "invalid",
+            crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => "unavailable",
+        }
+    };
+    Ok((entries, credential_ready(intent.mode), broker.to_owned()))
+}
+
+fn stored_current_state_digest(
+    paths: &[CurrentPathIdentity],
+    credential_ready: bool,
+    broker: &str,
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct CurrentState<'a> {
+        files: &'a [CurrentPathIdentity],
+        credential_ready: bool,
+        broker: &'a str,
     }
     Ok(sha256_hex(
-        &serde_jcs::to_vec(&entries).context("canonicalize setup current state")?,
+        &serde_jcs::to_vec(&CurrentState {
+            files: paths,
+            credential_ready,
+            broker,
+        })
+        .context("canonicalize setup current state")?,
     ))
 }
 

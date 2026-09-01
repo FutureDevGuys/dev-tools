@@ -5,7 +5,7 @@ use dev_auth::deployment::{
     Channel, CredentialIntent, DeploymentCliInput, DeploymentMode,
 };
 use dev_auth::setup::{build_plan, InstallMode, InstallRequest, SetupPaths};
-use dev_auth::setup_v3::{build_setup_plan_v3_at, render_setup_plan_v3};
+use dev_auth::setup_v3::{build_setup_plan_v3_at, credential_requirements, render_setup_plan_v3};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -236,4 +236,42 @@ config = "{}"
         "activate_transparent_launchers"
     );
     assert_eq!(document_plan.actions.last().unwrap().kind, "verify");
+}
+
+#[test]
+fn credential_requirements_are_intent_exact_and_resume_safe() {
+    let credentials = vec![
+        dev_auth::deployment::DeploymentCredential {
+            slot: "enroll".into(),
+            intent: CredentialIntent::EnrollIfAbsent,
+        },
+        dev_auth::deployment::DeploymentCredential {
+            slot: "rotate".into(),
+            intent: CredentialIntent::Rotate,
+        },
+        dev_auth::deployment::DeploymentCredential {
+            slot: "preserve".into(),
+            intent: CredentialIntent::Preserve,
+        },
+        dev_auth::deployment::DeploymentCredential {
+            slot: "revoke".into(),
+            intent: CredentialIntent::Revoke,
+        },
+    ];
+    let absent = credential_requirements(&credentials, &std::collections::BTreeSet::new());
+    assert_eq!(
+        absent.required,
+        std::collections::BTreeSet::from(["enroll".into(), "rotate".into()])
+    );
+    assert_eq!(absent.blocked, vec!["preserve".to_owned()]);
+
+    let enrolled = credential_requirements(
+        &credentials,
+        &std::collections::BTreeSet::from(["enroll".into(), "preserve".into()]),
+    );
+    assert_eq!(
+        enrolled.required,
+        std::collections::BTreeSet::from(["rotate".into()])
+    );
+    assert!(enrolled.blocked.is_empty());
 }

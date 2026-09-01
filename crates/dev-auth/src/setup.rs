@@ -2026,14 +2026,49 @@ pub fn user_service_credential_ready() -> bool {
 }
 
 pub fn install_system_policy(source: &Path, approved_sha256: &str) -> Result<PathBuf> {
-    if nix::unistd::Uid::effective().as_raw() != 0 {
-        bail!("administrator policy installation requires root");
+    reconcile_system_policy(source, approved_sha256, None)
+}
+
+pub fn reconcile_system_policy(
+    source: &Path,
+    approved_sha256: &str,
+    current_sha256: Option<&str>,
+) -> Result<PathBuf> {
+    reconcile_system_policy_at(
+        &SetupPaths::strong(),
+        source,
+        approved_sha256,
+        current_sha256,
+    )
+}
+
+pub fn reconcile_system_policy_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    current_sha256: Option<&str>,
+) -> Result<PathBuf> {
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("administrator policy installation requires root and the system layout");
     }
     let bytes = read_approved_public_document(source, approved_sha256)?;
     let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
     validate_system_policy_programs(&policy)?;
     let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
-    install_policy_document(&destination, &bytes, 0, 0o644)?;
+    match (fs::symlink_metadata(&destination), current_sha256) {
+        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+            install_policy_document(&destination, &bytes, 0, 0o644)?;
+        }
+        (Err(error), _) => return Err(error).context("inspect administrator policy"),
+        (Ok(_), _) if fs::read(&destination)? == bytes => {
+            install_policy_document(&destination, &bytes, 0, 0o644)?;
+        }
+        (Ok(_), Some(current)) => {
+            require_stopped_strong_installation_at(paths)?;
+            replace_policy_document(&destination, &bytes, 0, 0o644, current)?;
+        }
+        (Ok(_), None) => install_policy_document(&destination, &bytes, 0, 0o644)?,
+    }
     Ok(destination)
 }
 
@@ -2079,6 +2114,16 @@ pub fn install_user_policy_for_account_at(
     approved_sha256: &str,
     user_name: &str,
 ) -> Result<PathBuf> {
+    reconcile_user_policy_for_account_at(paths, source, approved_sha256, user_name, None)
+}
+
+pub fn reconcile_user_policy_for_account_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+    current_sha256: Option<&str>,
+) -> Result<PathBuf> {
     let user = nix::unistd::User::from_name(user_name)?
         .context("user-only policy names an unknown native account")?;
     let owner_uid = user.uid.as_raw();
@@ -2093,7 +2138,31 @@ pub fn install_user_policy_for_account_at(
     let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
     validate_user_policy_programs(&policy, &user, owner_uid)?;
     let destination = crate::policy_store::user_policy_path(&user);
-    install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
+    match (fs::symlink_metadata(&destination), current_sha256) {
+        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+            install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
+        }
+        (Err(error), _) => return Err(error).context("inspect user-only policy"),
+        (Ok(_), _) if fs::read(&destination)? == bytes => {
+            install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
+        }
+        (Ok(_), Some(current)) => {
+            if !matches!(
+                crate::broker_client::active_claim_and_probe()?.0,
+                crate::broker_protocol::LocalSessionClaim::Absent
+            ) {
+                bail!("user-only policy cannot change inside an admitted workload");
+            }
+            let config = crate::policy_store::load_user_config_at(
+                &crate::policy_store::user_config_path(&user),
+                owner_uid,
+            )?;
+            crate::policy_v2::resolve_policy(&policy, &config)
+                .context("updated user-only policy would invalidate the user configuration")?;
+            replace_policy_document(&destination, &bytes, owner_uid, 0o600, current)?;
+        }
+        (Ok(_), None) => install_policy_document(&destination, &bytes, owner_uid, 0o600)?,
+    }
     Ok(destination)
 }
 
@@ -2150,6 +2219,16 @@ pub fn install_user_config_for_account_at(
     approved_sha256: &str,
     user_name: &str,
 ) -> Result<PathBuf> {
+    reconcile_user_config_for_account_at(paths, source, approved_sha256, user_name, None)
+}
+
+pub fn reconcile_user_config_for_account_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+    current_sha256: Option<&str>,
+) -> Result<PathBuf> {
     let user = nix::unistd::User::from_name(user_name)?
         .context("user configuration names an unknown native account")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
@@ -2190,23 +2269,32 @@ pub fn install_user_config_for_account_at(
     preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
     preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
     let destination = crate::policy_store::user_config_path(&user);
-    reconcile_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
-    reconcile_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
-    match fs::symlink_metadata(&destination) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != owner_uid
-                || metadata.mode() & 0o777 != 0o600
-                || fs::read(&destination)? != bytes
-            {
-                bail!("user configuration already exists with unapproved drift");
+    let old_workloads = preflight_user_config_destination(
+        &destination,
+        &bytes,
+        current_sha256,
+        owner_uid,
+        &policy,
+    )?;
+    let old_aliases = old_workloads.keys().cloned().collect::<Vec<_>>();
+    let result = (|| {
+        reconcile_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
+        reconcile_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+        match current_sha256 {
+            Some(current) => {
+                replace_policy_document(&destination, &bytes, owner_uid, 0o600, current)
             }
+            None => install_policy_document(&destination, &bytes, owner_uid, 0o600),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
+    })();
+    if let Err(error) = result {
+        let alias_rollback =
+            reconcile_workload_launchers_at(&user.dir, &executable, &old_aliases, owner_uid);
+        let desktop_rollback = reconcile_desktop_entries_at(&user.dir, &old_workloads, owner_uid);
+        if alias_rollback.is_err() || desktop_rollback.is_err() {
+            bail!("user configuration apply failed and integration rollback was incomplete: {error:#}");
         }
-        Err(error) => return Err(error).context("inspect user configuration"),
+        return Err(error).context("apply user configuration transaction");
     }
     Ok(destination)
 }
@@ -2954,6 +3042,7 @@ fn preflight_user_config_destination(
             let current = crate::policy_store::load_user_config_at(destination, owner_uid)?;
             let current_bytes = fs::read(destination).context("read current user configuration")?;
             match current_sha256 {
+                Some(_) if current_bytes == new_bytes => {}
                 Some(expected) => validate_current_digest(&current_bytes, expected)?,
                 None if current_bytes == new_bytes => {}
                 None => bail!("user configuration already exists; use a digest-bound update"),
