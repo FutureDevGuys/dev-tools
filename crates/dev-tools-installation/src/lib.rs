@@ -1647,7 +1647,10 @@ fn open_directory_chain(path: &Path, create: bool) -> Result<(std::os::fd::Owned
                 rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
                     .context("open created installation directory component")?
             }
-            Err(error) => return Err(error).context("open installation directory component"),
+            Err(error) => {
+                return Err(std::io::Error::from(error))
+                    .context("open installation directory component")
+            }
         };
         if rustix::fs::FileType::from_raw_mode(
             rustix::fs::fstat(&opened)
