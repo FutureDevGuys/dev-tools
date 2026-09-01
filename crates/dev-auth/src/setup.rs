@@ -856,30 +856,37 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
         .values()
         .map(|profile| profile.credential_slot.as_str())
         .collect::<BTreeSet<_>>();
-    report.credential_ready = required_slots.iter().all(|slot| match mode {
-        InstallMode::Strong => system_service_credential_slot_ready(slot),
-        InstallMode::UserOnly => crate::runtime::user_broker_service_token_for_slot(slot).is_ok(),
-    });
-    if !report.credential_ready {
-        report.next_action = match mode {
-            InstallMode::Strong => "enroll_system_credential",
-            InstallMode::UserOnly => "enroll_user_credential",
+    match mode {
+        InstallMode::Strong => {
+            let broker_ready = matches!(
+                crate::broker_client::probe_system_broker(),
+                crate::broker_protocol::BrokerSessionProbe::NoSession
+                    | crate::broker_protocol::BrokerSessionProbe::Verified { .. }
+            );
+            let privileged = nix::unistd::Uid::effective().is_root();
+            let privileged_credential_ready = privileged
+                && required_slots
+                    .iter()
+                    .all(|slot| system_service_credential_slot_ready(slot));
+            let (credential_ready, broker_ready, next_action) =
+                strong_runtime_readiness(broker_ready, privileged, privileged_credential_ready);
+            report.credential_ready = credential_ready;
+            report.broker_ready = broker_ready;
+            if let Some(next_action) = next_action {
+                report.next_action = next_action.into();
+                return Ok(report);
+            }
         }
-        .into();
-        return Ok(report);
-    }
-
-    report.broker_ready = match mode {
-        InstallMode::Strong => matches!(
-            crate::broker_client::probe_system_broker(),
-            crate::broker_protocol::BrokerSessionProbe::NoSession
-                | crate::broker_protocol::BrokerSessionProbe::Verified { .. }
-        ),
-        InstallMode::UserOnly => true,
-    };
-    if !report.broker_ready {
-        report.next_action = "start_system_broker".into();
-        return Ok(report);
+        InstallMode::UserOnly => {
+            report.credential_ready = required_slots
+                .iter()
+                .all(|slot| crate::runtime::user_broker_service_token_for_slot(slot).is_ok());
+            if !report.credential_ready {
+                report.next_action = "enroll_user_credential".into();
+                return Ok(report);
+            }
+            report.broker_ready = true;
+        }
     }
 
     let integrations = verify_user_integrations_at(
@@ -910,6 +917,23 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
     }
     report.next_action = "ready".into();
     Ok(report)
+}
+
+fn strong_runtime_readiness(
+    broker_ready: bool,
+    privileged: bool,
+    privileged_credential_ready: bool,
+) -> (bool, bool, Option<&'static str>) {
+    if broker_ready {
+        return (true, true, None);
+    }
+    if !privileged {
+        return (false, false, Some("run_privileged_setup_plan"));
+    }
+    if !privileged_credential_ready {
+        return (false, false, Some("enroll_system_credential"));
+    }
+    (true, false, Some("start_system_broker"))
 }
 
 pub fn transparent_launchers_resolve_first_at(
@@ -4341,13 +4365,16 @@ fn write_receipt(path: &Path, receipt: &InstallReceipt) -> Result<()> {
         bail!("dev-auth installation receipt exceeds the size limit");
     }
     let temporary = path.with_extension(format!("new-{}", std::process::id()));
+    let mode = receipt_permissions(receipt.mode);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode)
         .open(&temporary)
         .with_context(|| format!("create {}", temporary.display()))?;
     file.write_all(&content).context("write install receipt")?;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .context("set install receipt permissions")?;
     file.sync_all().context("sync install receipt")?;
     match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
@@ -4364,7 +4391,8 @@ fn read_receipt(path: &Path) -> Result<InstallReceipt> {
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > RECEIPT_LIMIT
-        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || !receipt_mode_is_safe(metadata.mode())
     {
         bail!("dev-auth installation receipt is unsafe");
     }
@@ -4374,12 +4402,87 @@ fn read_receipt(path: &Path) -> Result<InstallReceipt> {
         .take(RECEIPT_LIMIT + 1)
         .read_to_end(&mut input)
         .context("read install receipt")?;
-    serde_json::from_slice(&input).context("parse install receipt")
+    let receipt: InstallReceipt =
+        serde_json::from_slice(&input).context("parse install receipt")?;
+    let expected_owner = match receipt.mode {
+        InstallMode::Strong => 0,
+        InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
+    };
+    if metadata.uid() != expected_owner
+        || !receipt_mode_matches_installation(metadata.mode(), receipt.mode)
+    {
+        bail!("dev-auth installation receipt has unsafe ownership or permissions");
+    }
+    Ok(receipt)
+}
+
+fn receipt_permissions(mode: InstallMode) -> u32 {
+    match mode {
+        InstallMode::Strong => 0o644,
+        InstallMode::UserOnly => 0o600,
+    }
+}
+
+fn receipt_mode_is_safe(mode: u32) -> bool {
+    matches!(mode & 0o777, 0o600 | 0o644)
+}
+
+fn receipt_mode_matches_installation(mode: u32, installation_mode: InstallMode) -> bool {
+    match installation_mode {
+        InstallMode::Strong => matches!(mode & 0o777, 0o600 | 0o644),
+        InstallMode::UserOnly => mode & 0o777 == 0o600,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strong_receipts_are_public_read_only_and_user_receipts_remain_private() {
+        assert_eq!(receipt_permissions(InstallMode::Strong), 0o644);
+        assert_eq!(receipt_permissions(InstallMode::UserOnly), 0o600);
+        assert!(receipt_mode_is_safe(0o644));
+        assert!(receipt_mode_is_safe(0o600));
+        assert!(!receipt_mode_is_safe(0o664));
+        assert!(!receipt_mode_is_safe(0o755));
+        assert!(receipt_mode_matches_installation(
+            0o600,
+            InstallMode::Strong
+        ));
+        assert!(receipt_mode_matches_installation(
+            0o644,
+            InstallMode::Strong
+        ));
+        assert!(receipt_mode_matches_installation(
+            0o600,
+            InstallMode::UserOnly
+        ));
+        assert!(!receipt_mode_matches_installation(
+            0o644,
+            InstallMode::UserOnly
+        ));
+    }
+
+    #[test]
+    fn unprivileged_strong_readiness_uses_the_live_broker_as_credential_proof() {
+        assert_eq!(
+            strong_runtime_readiness(false, false, false),
+            (false, false, Some("run_privileged_setup_plan"))
+        );
+        assert_eq!(
+            strong_runtime_readiness(true, false, false),
+            (true, true, None)
+        );
+        assert_eq!(
+            strong_runtime_readiness(false, true, false),
+            (false, false, Some("enroll_system_credential"))
+        );
+        assert_eq!(
+            strong_runtime_readiness(false, true, true),
+            (true, false, Some("start_system_broker"))
+        );
+    }
 
     #[test]
     fn strong_backend_availability_includes_runtime_admission_blockers() {
