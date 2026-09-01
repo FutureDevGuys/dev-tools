@@ -1,9 +1,11 @@
 #![cfg(unix)]
 
 use dev_tools_installation::{
-    publish_executable, read_atomic_document, remove_owned_file, remove_owned_installation,
-    verify_owned_installation, write_atomic_document, ArtifactIdentity, DocumentAuthority,
-    InstallationLock, InstallationReceipt, ReceiptArtifact,
+    apply_versioned_installation, publish_executable, read_atomic_document, remove_owned_file,
+    remove_owned_installation, rollback_versioned_installation, uninstall_versioned_installation,
+    verify_owned_installation, verify_versioned_installation, write_atomic_document,
+    ArtifactIdentity, DocumentAuthority, InstallationLock, InstallationReceipt, ReceiptArtifact,
+    VersionedInstallRequest, VersionedLayout,
 };
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -175,4 +177,136 @@ fn installation_lock_rejects_symlink_and_hardlink_authority() {
     let hardlinked = temp.path().join("hardlinked.lock");
     fs::hard_link(&outside, &hardlinked).unwrap();
     assert!(InstallationLock::acquire(&hardlinked).is_err());
+}
+
+fn versioned_fixture(
+    root: &std::path::Path,
+    version: &str,
+    bytes: &[u8],
+) -> VersionedInstallRequest {
+    let source = root.join(format!("candidate-{version}"));
+    fs::write(&source, bytes).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    let identity = ArtifactIdentity::from_file(&source, 4096).unwrap();
+    VersionedInstallRequest {
+        layout: VersionedLayout {
+            product: "fixture".into(),
+            data_root: root.join("data"),
+            bin_dir: root.join("bin"),
+            artifact_name: "fixture".into(),
+            owner_uid: fs::metadata(root).unwrap().uid(),
+            directory_mode: 0o700,
+        },
+        version: version.into(),
+        source,
+        identity,
+        aliases: vec!["fixture".into(), "fixture-helper".into()],
+    }
+}
+
+#[test]
+fn versioned_install_upgrade_rollback_and_uninstall_are_receipt_owned() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = versioned_fixture(temp.path(), "1.0.0", b"first");
+    let first_report = apply_versioned_installation(&first, |_| Ok(())).unwrap();
+    assert!(first_report.changed);
+    assert_eq!(first_report.receipt.active_version, "1.0.0");
+    assert_eq!(first_report.receipt.previous_version, None);
+    assert!(
+        !apply_versioned_installation(&first, |_| Ok(()))
+            .unwrap()
+            .changed
+    );
+
+    let second = versioned_fixture(temp.path(), "1.1.0", b"second");
+    let second_report = apply_versioned_installation(&second, |candidate| {
+        assert_eq!(fs::read(candidate).unwrap(), b"second");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(second_report.receipt.active_version, "1.1.0");
+    assert_eq!(
+        second_report.receipt.previous_version.as_deref(),
+        Some("1.0.0")
+    );
+    for alias in ["fixture", "fixture-helper"] {
+        assert_eq!(
+            fs::read_link(second.layout.bin_dir.join(alias)).unwrap(),
+            second.layout.data_root.join("active")
+        );
+    }
+
+    let rolled_back = rollback_versioned_installation(&second.layout, |candidate| {
+        assert_eq!(fs::read(candidate).unwrap(), b"first");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(rolled_back.receipt.active_version, "1.0.0");
+    assert_eq!(
+        rolled_back.receipt.previous_version.as_deref(),
+        Some("1.1.0")
+    );
+    verify_versioned_installation(&second.layout).unwrap();
+
+    let removed = uninstall_versioned_installation(&second.layout).unwrap();
+    assert_eq!(removed.removed_versions, 2);
+    assert!(!second.layout.data_root.join("active").exists());
+    assert!(!second.layout.bin_dir.join("fixture").exists());
+    assert!(first.source.exists());
+    assert!(second.source.exists());
+}
+
+#[test]
+fn versioned_install_rejects_unowned_alias_and_drift_without_partial_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = versioned_fixture(temp.path(), "1.0.0", b"first");
+    fs::create_dir(&first.layout.bin_dir).unwrap();
+    fs::set_permissions(
+        &first.layout.bin_dir,
+        fs::Permissions::from_mode(first.layout.directory_mode),
+    )
+    .unwrap();
+    fs::write(first.layout.bin_dir.join("fixture"), b"human tool").unwrap();
+    assert!(apply_versioned_installation(&first, |_| Ok(())).is_err());
+    assert_eq!(
+        fs::read(first.layout.bin_dir.join("fixture")).unwrap(),
+        b"human tool"
+    );
+    assert!(!first.layout.data_root.join("active").exists());
+
+    fs::remove_file(first.layout.bin_dir.join("fixture")).unwrap();
+    apply_versioned_installation(&first, |_| Ok(())).unwrap();
+    let active = first.layout.data_root.join("versions/1.0.0/fixture");
+    fs::write(&active, b"drift").unwrap();
+    let second = versioned_fixture(temp.path(), "1.1.0", b"second");
+    assert!(apply_versioned_installation(&second, |_| Ok(())).is_err());
+    assert_eq!(
+        fs::read_link(second.layout.data_root.join("active")).unwrap(),
+        active
+    );
+}
+
+#[test]
+fn versioned_install_rejects_symlinked_roots_and_hardlinked_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    let escaped = temp.path().join("escaped");
+    fs::create_dir(&escaped).unwrap();
+    let request = versioned_fixture(temp.path(), "1.0.0", b"first");
+    symlink(&escaped, &request.layout.data_root).unwrap();
+    assert!(apply_versioned_installation(&request, |_| Ok(())).is_err());
+
+    fs::remove_file(&request.layout.data_root).unwrap();
+    let hardlink = temp.path().join("candidate-hardlink");
+    fs::hard_link(&request.source, &hardlink).unwrap();
+    assert!(apply_versioned_installation(&request, |_| Ok(())).is_err());
+}
+
+#[test]
+fn versioned_receipt_rejects_writable_or_wrong_owner_artifact_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = versioned_fixture(temp.path(), "1.0.0", b"first");
+    apply_versioned_installation(&request, |_| Ok(())).unwrap();
+    let artifact = request.layout.data_root.join("versions/1.0.0/fixture");
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(verify_versioned_installation(&request.layout).is_err());
 }
