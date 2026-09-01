@@ -2355,6 +2355,51 @@ fn git_configuration_scope_snapshot(
 }
 
 #[cfg(target_os = "linux")]
+fn git_worktree_configuration_enabled(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+) -> Result<bool> {
+    let mut command = guarded_command(program, program_guard)?;
+    let output = command
+        .args([
+            "config",
+            "--local",
+            "--no-includes",
+            "--type=bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(git_probe_environment(&BTreeMap::new()))
+        .stdin(Stdio::null())
+        .output()
+        .context("resolve Git worktree configuration mode")?;
+    match output.status.code() {
+        Some(0) if output.stderr.is_empty() && output.stdout == b"true\n" => Ok(true),
+        Some(0) if output.stderr.is_empty() && output.stdout == b"false\n" => Ok(false),
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(false),
+        _ => bail!("Git worktree configuration mode cannot be bound safely"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn git_repository_configuration_scope_snapshots(
+    program: &str,
+    program_guard: &ProgramGuard,
+    cwd: &Path,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let local = git_configuration_scope_snapshot(program, program_guard, cwd, "--local")?;
+    let worktree = if git_worktree_configuration_enabled(program, program_guard, cwd)? {
+        git_configuration_scope_snapshot(program, program_guard, cwd, "--worktree")?
+    } else {
+        Vec::new()
+    };
+    Ok((local, worktree))
+}
+
+#[cfg(target_os = "linux")]
 struct IndexedGitAttributesSnapshot {
     entries: Vec<u8>,
     objects: Vec<(Vec<u8>, Vec<u8>)>,
@@ -3030,9 +3075,8 @@ fn repository_authority_binding(
         bail!("managed Git origin changed after repository selection");
     }
     validate_local_git_configuration(program, program_guard, cwd, &BTreeMap::new())?;
-    let local_config = git_configuration_scope_snapshot(program, program_guard, cwd, "--local")?;
-    let worktree_config =
-        git_configuration_scope_snapshot(program, program_guard, cwd, "--worktree")?;
+    let (local_config, worktree_config) =
+        git_repository_configuration_scope_snapshots(program, program_guard, cwd)?;
 
     let mut held_paths = held_selectors;
     for directory in [&top_level, &git_dir, &common_dir] {
@@ -6756,6 +6800,56 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             .unwrap()
             .success());
         (repository, worktree)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linked_worktree_without_worktree_config_has_no_separate_config_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let worktree = root.path().join("worktree");
+        fs::create_dir(&repository).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+
+        let (local, worktree_scope) = git_repository_configuration_scope_snapshots(
+            "/usr/bin/git",
+            &test_git_guard(),
+            &worktree,
+        )
+        .unwrap();
+        assert!(!local.is_empty());
+        assert!(worktree_scope.is_empty());
     }
 
     #[cfg(unix)]
