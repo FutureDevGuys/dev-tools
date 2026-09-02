@@ -40,7 +40,7 @@ Running help after every native result would make native authority contingent on
 
 ## Consequences and known limitations
 
-The protocol planner and validators are shell-neutral and callable for all five shells, while the existing catalog-driven managed overlay still publishes its provider payload as Zsh. Expanding provider activation and startup loading to five independent shell views belongs to the later publication and loader migration; this decision does not add that authority. Non-Zsh native misses therefore do not receive the legacy Zsh help fallback.
+The protocol planner and validators are shell-neutral and callable for all five shells. [ADR 0013](0013-five-shell-immutable-completion-activation.md) supplies the later five-shell provider activation authority and extends the already-approved conservative help fallback to each selected shell without changing native precedence or trust.
 
 Syntax validation is conditional on the corresponding shell executable being available. Registration validators are intentionally conservative and may require a catalog recipe or validator extension for unusual but valid registration styles. Process runtime obeys the shared deadline, followed by a fixed bounded cleanup grace needed to close inherited pipes and terminate descendants. Windows batch entry points continue to use the repository's existing direct batch compatibility wrapper and tree termination mechanism.
 

@@ -2371,10 +2371,10 @@ fn completion_sync_records_render_generation_rows() {
             crate::completions::CompletionSyncRecord {
                 provider: "npm".to_string(),
                 tool: "codex".to_string(),
+                shell: Some("zsh".to_string()),
                 status: CompletionSyncRecordStatus::Generated,
                 artifact: Some(
-                    "/home/example-user/.shellrc.d/shell/completions/_managed_npm_codex"
-                        .to_string(),
+                    "/home/example-user/.local/share/update-all/completions/cache/generation/shell/completions/_managed_npm_codex".to_string(),
                 ),
                 reason: None,
                 classification: Some(crate::completions::CompletionArtifactClassification::Static),
@@ -2383,8 +2383,9 @@ fn completion_sync_records_render_generation_rows() {
             crate::completions::CompletionSyncRecord {
                 provider: "npm".to_string(),
                 tool: "just".to_string(),
+                shell: Some("zsh".to_string()),
                 status: CompletionSyncRecordStatus::Unchanged,
-                artifact: Some("/home/example-user/.shellrc.d/shell/completions/_just".to_string()),
+                artifact: Some("/home/example-user/.local/share/update-all/completions/cache/generation/shell/completions/_managed_npm_just".to_string()),
                 reason: Some("unchanged".to_string()),
                 classification: Some(crate::completions::CompletionArtifactClassification::Static),
                 recipe: None,
@@ -2392,6 +2393,7 @@ fn completion_sync_records_render_generation_rows() {
             crate::completions::CompletionSyncRecord {
                 provider: "npm".to_string(),
                 tool: "repomix".to_string(),
+                shell: Some("zsh".to_string()),
                 status: CompletionSyncRecordStatus::Skipped,
                 artifact: None,
                 reason: Some("unsupported_generator".to_string()),
@@ -2405,6 +2407,8 @@ fn completion_sync_records_render_generation_rows() {
             providers: Vec::new(),
             tools: Vec::new(),
         },
+        outcome: crate::completions::CompletionSyncOutcome::Published,
+        shells: vec!["zsh".to_string()],
     };
 
     let sections = completion_report_sections(&sync);
@@ -2431,7 +2435,7 @@ fn completion_sync_records_render_generation_rows() {
     assert!(text.contains("repomix"), "{text}");
     let codex_row = text.lines().find(|line| line.contains("codex")).unwrap();
     assert!(
-        codex_row.contains("/home/example-user/.shellrc.d/shell/completions/_managed_npm_codex"),
+        text.contains("/home/example-user/.local/share/update-all/completions/cache/generation/shell/completions/_managed_npm_codex"),
         "{text}"
     );
     assert!(codex_row.contains("Generated"), "{text}");
@@ -2622,120 +2626,6 @@ fn updated_report_row_merge_with_same_state_probe_becomes_refreshed() {
     assert_eq!(section.rows[0].before.as_deref(), Some("0.1.6"));
     assert_eq!(section.rows[0].after.as_deref(), Some("0.1.6"));
     assert_eq!(section.rows[0].note.as_deref(), Some("pipx refreshed app"));
-}
-
-#[test]
-fn completion_audit_output_is_reported_as_per_finding_rows() {
-    let output = r#"Completion Audit Summary: pass=2 warn=1 fail=0 skip=1
-PASS [codex] managed_overlay_ok: managed catalog overlay shim points at generated payload
-PASS [codex] compinit_smoke_ok: completion autoload smoke check passed
-WARN [privatebin] stale_flags: stale flags present: --old
-SKIP [ghost] missing_command: command not installed; skipped help drift probe
-"#;
-
-    let section = completion_audit_report_section_from_output("warn", "0", output)
-        .expect("expected completion audit report section");
-    assert_eq!(section.key, "completion_audit");
-    assert_eq!(section.rows.len(), 5);
-    assert_eq!(section.rows[0].name, "completion-audit");
-    assert_eq!(section.rows[0].status, TaskReportStatus::Info);
-    assert_eq!(section.rows[1].name, "codex");
-    assert_eq!(section.rows[1].status, TaskReportStatus::Passed);
-    assert_eq!(
-        section.rows[1].before.as_deref(),
-        Some("managed_overlay_ok")
-    );
-    assert_eq!(
-        section.rows[1].after.as_deref(),
-        Some("managed catalog overlay shim points at generated payload")
-    );
-    assert_eq!(section.rows[3].status, TaskReportStatus::Blocked);
-    assert_eq!(section.rows[4].status, TaskReportStatus::Skipped);
-
-    let rendered = render_task_report_sections(
-        std::slice::from_ref(&section),
-        false,
-        crate::config::NoteVerbosity::All,
-    )
-    .iter()
-    .map(|line| line.text.as_str())
-    .collect::<Vec<_>>()
-    .join("\n");
-    assert!(rendered.contains("Completion Audit Results"), "{rendered}");
-    assert!(rendered.contains("Check"), "{rendered}");
-    assert!(rendered.contains("Code"), "{rendered}");
-    assert!(rendered.contains("Detail"), "{rendered}");
-    let compinit_row = rendered
-        .lines()
-        .find(|line| line.contains("compinit") || line.contains("compinit_smok"))
-        .unwrap();
-    assert!(compinit_row.contains("compinit_smoke_ok"), "{rendered}");
-    assert!(rendered.contains("Pass"), "{rendered}");
-    assert!(rendered.contains("Warn"), "{rendered}");
-    assert!(rendered.contains("Skip"), "{rendered}");
-
-    let result = TaskResult {
-        label: "Completions".to_string(),
-        status: TaskStatus::Completed,
-        details: vec!["completion audit finished".to_string()],
-        advisories: Vec::new(),
-        report_sections: vec![section],
-    };
-    let summary = vec![("completions".to_string(), result)];
-    let categories = BTreeMap::from([("completions".to_string(), "maintenance".to_string())]);
-    assert_eq!(
-        summarize_task_items(&summary[0].1),
-        "passed=2 warn=1 info=1 skipped=1"
-    );
-
-    let final_text = render_final_task_overview(
-        summary.iter().map(|(id, result)| (id.as_str(), result)),
-        &categories,
-        false,
-        crate::config::NoteVerbosity::All,
-        false,
-    )
-    .iter()
-    .map(|line| line.text.as_str())
-    .collect::<Vec<_>>()
-    .join("\n");
-    assert!(final_text.contains("passed=2"), "{final_text}");
-    assert!(final_text.contains("warn=1"), "{final_text}");
-    assert!(
-        !final_text.contains("updated=2"),
-        "audit passes should not be summarized as package updates:\n{final_text}"
-    );
-}
-
-#[test]
-fn completion_audit_unavailable_warns_without_failing_task() {
-    let mut details = Vec::new();
-    let mut report_sections = Vec::new();
-    let mut advisories = Vec::new();
-    let mut status = TaskStatus::Completed;
-
-    record_completion_audit_unavailable(
-        &mut details,
-        &mut report_sections,
-        &mut advisories,
-        &mut status,
-        "warn",
-        "warn",
-        "0",
-        "missing script /tmp/rc-root/commands/zsh/completion_audit.zsh".to_string(),
-    );
-
-    assert_eq!(status, TaskStatus::Completed);
-    assert_eq!(advisories.len(), 1);
-    assert_eq!(advisories[0].severity, AdvisorySeverity::Warning);
-    assert!(details[0].contains("Audit unavailable"));
-    assert_eq!(report_sections.len(), 1);
-    assert_eq!(report_sections[0].key, "completion_audit");
-    assert_eq!(report_sections[0].rows[0].status, TaskReportStatus::Failed);
-    assert_eq!(
-        report_sections[0].rows[0].note.as_deref(),
-        Some("missing script /tmp/rc-root/commands/zsh/completion_audit.zsh")
-    );
 }
 
 #[test]

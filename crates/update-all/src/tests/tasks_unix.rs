@@ -138,20 +138,15 @@ fn test_context(privilege_session: Arc<PrivilegeSession>) -> SyncContext {
 fn task_completion_sync_publishes_to_the_resolved_managed_root() {
     let temp = TempDir::new().unwrap();
     let managed_root = temp.path().join("resolved-managed-root");
-    let catalog_path = temp.path().join("managed-tools.json");
+    let catalog_path = managed_root.join("cache/managed-tools.json");
     let config_path = temp.path().join("config.toml");
-    fs::write(
-        &catalog_path,
-        r#"{"schema_version":1,"providers":[],"tools":[]}"#,
-    )
-    .unwrap();
     fs::write(&config_path, "").unwrap();
 
     let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
     ctx.completion_providers = String::new();
     ctx.rc_root = temp.path().join("legacy-rc-root");
     ctx.completion_managed_root = managed_root.clone();
-    ctx.completion_catalog_path = catalog_path;
+    ctx.completion_catalog_path = catalog_path.clone();
     ctx.completion_config_path = Some(config_path);
 
     let result = ctx.completion_sync_for_task(TASK_COMPLETIONS).unwrap();
@@ -162,6 +157,20 @@ fn task_completion_sync_publishes_to_the_resolved_managed_root() {
         .any(|event| event.starts_with("__UA_COMP_PUBLIC|published|")));
     assert!(managed_root.join("current").is_file());
     assert!(managed_root.join("snapshots").is_dir());
+    assert!(
+        !catalog_path.exists(),
+        "the implicit empty catalog must remain virtual and read-only"
+    );
+    let sections = completion_report_sections(&result);
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].rows.len(), 1);
+    assert_eq!(sections[0].rows[0].name, "managed-snapshot");
+    assert_eq!(sections[0].rows[0].status, TaskReportStatus::Updated);
+    assert_eq!(sections[0].rows[0].after.as_deref(), Some("published"));
+    assert!(
+        !ctx.rc_root.exists(),
+        "public task-backed sync must not create or write the legacy rc root"
+    );
 }
 
 #[test]

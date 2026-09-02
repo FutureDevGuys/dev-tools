@@ -91,7 +91,9 @@ fn completion_paths_resolve_the_managed_root_environment_override() {
     let temp = tempfile::TempDir::new().unwrap();
     let managed_root = temp.path().join("managed-root");
     let original = std::env::var_os("UPDATE_ALL_COMPLETION_ROOT");
+    let original_rc_root = std::env::var_os("RC_ROOT");
     std::env::set_var("UPDATE_ALL_COMPLETION_ROOT", &managed_root);
+    std::env::set_var("RC_ROOT", temp.path().join("legacy-checkout"));
 
     let paths = resolve_completion_paths();
 
@@ -99,7 +101,19 @@ fn completion_paths_resolve_the_managed_root_environment_override() {
         Some(value) => std::env::set_var("UPDATE_ALL_COMPLETION_ROOT", value),
         None => std::env::remove_var("UPDATE_ALL_COMPLETION_ROOT"),
     }
+    match original_rc_root {
+        Some(value) => std::env::set_var("RC_ROOT", value),
+        None => std::env::remove_var("RC_ROOT"),
+    }
     assert_eq!(paths.managed_root, managed_root);
+    assert_eq!(
+        paths.catalog_path,
+        managed_root.join("cache/managed-tools.json")
+    );
+    assert_eq!(
+        paths.registry_path,
+        managed_root.join("cache/audit-registry.json")
+    );
 }
 
 #[test]
@@ -118,4 +132,40 @@ fn completion_sync_help_leads_with_public_init_and_labels_the_legacy_bridge() {
     assert!(help.contains("update-all completions init <shell>"));
     assert!(help.contains("`bash`, `zsh`, `fish`, `elvish`, and `powershell`"));
     assert!(help.contains("explicit `--apply --shell <shell>` bridge is legacy compatibility"));
+}
+
+#[test]
+fn completion_shell_selection_normalizes_deduplicates_and_keeps_all_exclusive() {
+    let selected = crate::completions::resolve_completion_shells(
+        &["zsh".to_string(), "BASH".to_string(), "zsh".to_string()],
+        &["fish".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|shell| shell.as_event_name())
+            .collect::<Vec<_>>(),
+        ["bash", "zsh"]
+    );
+
+    let all = crate::completions::resolve_completion_shells(&["all".to_string()], &[]).unwrap();
+    assert_eq!(all.len(), 5);
+    let error =
+        crate::completions::resolve_completion_shells(&["all".to_string(), "zsh".to_string()], &[])
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("mutually exclusive"));
+}
+
+#[test]
+fn ordinary_completion_mode_is_public_refresh_and_rejects_the_implicit_legacy_audit() {
+    assert_eq!(resolve_completion_mode(None).unwrap(), "refresh");
+    assert_eq!(
+        resolve_completion_mode(Some(" OFF ".to_string())).unwrap(),
+        "off"
+    );
+    let error = resolve_completion_mode(Some("refresh+audit".to_string())).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("is retired"), "{message}");
+    assert!(message.contains("--audit-command"), "{message}");
 }

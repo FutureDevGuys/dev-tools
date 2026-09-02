@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const IDENTITY_MEMO_SCHEMA_VERSION: u64 = 1;
+const ISSUE_MEMO_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct CompletionCandidateSlot {
@@ -112,6 +113,103 @@ impl CompletionIdentityMemo {
 
 pub(super) struct CompletionIdentityStore {
     path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct CompletionIssueMemo {
+    pub shell: Option<String>,
+    pub provider: String,
+    pub command: String,
+    pub outcome: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CompletionIssueMemoFile {
+    schema_version: u64,
+    issues: Vec<CompletionIssueMemo>,
+}
+
+pub(super) struct CompletionIssueStore {
+    path: PathBuf,
+}
+
+impl CompletionIssueStore {
+    pub(super) fn new(managed_root: &Path) -> Result<Self> {
+        if !managed_root.is_absolute() {
+            anyhow::bail!(
+                "managed completion root must be absolute: {}",
+                managed_root.display()
+            );
+        }
+        Ok(Self {
+            path: managed_root.join("cache/issues.json"),
+        })
+    }
+
+    pub(super) fn load(&self) -> Result<Vec<CompletionIssueMemo>> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", self.path.display()))
+            }
+        };
+        let mut file: CompletionIssueMemoFile = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", self.path.display()))?;
+        if file.schema_version != ISSUE_MEMO_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported completion issue memo schema {} at {}",
+                file.schema_version,
+                self.path.display()
+            );
+        }
+        normalize_issues(&mut file.issues);
+        Ok(file.issues)
+    }
+
+    pub(super) fn save_if_changed(&self, issues: &[CompletionIssueMemo]) -> Result<bool> {
+        let mut issues = issues.to_vec();
+        normalize_issues(&mut issues);
+        if issues.is_empty() {
+            return match fs::remove_file(&self.path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error).with_context(|| format!("remove {}", self.path.display())),
+            };
+        }
+        let file = CompletionIssueMemoFile {
+            schema_version: ISSUE_MEMO_SCHEMA_VERSION,
+            issues,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&file).context("serialize completion issues")?;
+        bytes.push(b'\n');
+        if fs::read(&self.path).is_ok_and(|existing| existing == bytes) {
+            return Ok(false);
+        }
+        write_atomic_bytes(&self.path, &bytes)?;
+        Ok(true)
+    }
+}
+
+fn normalize_issues(issues: &mut Vec<CompletionIssueMemo>) {
+    issues.sort_by(|left, right| {
+        (
+            &left.shell,
+            &left.provider,
+            &left.command,
+            &left.outcome,
+            &left.reason,
+        )
+            .cmp(&(
+                &right.shell,
+                &right.provider,
+                &right.command,
+                &right.outcome,
+                &right.reason,
+            ))
+    });
+    issues.dedup();
 }
 
 impl CompletionIdentityStore {

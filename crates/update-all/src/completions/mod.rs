@@ -8,7 +8,8 @@ mod store;
 use crate::completions::generator::write_bytes_if_changed;
 use crate::completions::registry::Registry;
 use crate::completions::store::{
-    CompletionSnapshotPublishOutcome, ManagedCompletionRoot, ManagedCompletionRootStatus,
+    CompletionSnapshotPublishOutcome, ManagedCompletionBindingStatus, ManagedCompletionRoot,
+    ManagedCompletionRootStatus,
 };
 use anyhow::{Context, Result};
 use clap::CommandFactory;
@@ -65,8 +66,11 @@ pub struct CompletionSyncArgs {
     pub report: String,
     pub catalog_path: PathBuf,
     pub config_path: Option<PathBuf>,
-    pub rc_root: PathBuf,
+    /// Explicit one-release compatibility output root. `None` selects the
+    /// public immutable managed-root pipeline and never writes shell rc state.
+    pub rc_root: Option<PathBuf>,
     pub managed_root: PathBuf,
+    pub shells: Vec<CompletionShell>,
     pub progress_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
@@ -80,6 +84,34 @@ pub struct CompletionSyncResult {
     pub records: Vec<CompletionSyncRecord>,
     pub catalog_used: PathBuf,
     pub effective_catalog: Registry,
+    pub outcome: CompletionSyncOutcome,
+    pub shells: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionSyncOutcome {
+    Reused,
+    ProbedUnchanged,
+    Published,
+    RetainedPrevious,
+    Unsupported,
+    Removed,
+    Failed,
+}
+
+impl CompletionSyncOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::ProbedUnchanged => "probed_unchanged",
+            Self::Published => "published",
+            Self::RetainedPrevious => "retained_previous",
+            Self::Unsupported => "unsupported",
+            Self::Removed => "removed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +134,7 @@ impl CompletionArtifactClassification {
 pub struct CompletionSyncRecord {
     pub provider: String,
     pub tool: String,
+    pub shell: Option<String>,
     pub status: CompletionSyncRecordStatus,
     pub artifact: Option<String>,
     pub reason: Option<String>,
@@ -133,6 +166,7 @@ impl CompletionSyncRecord {
         Self {
             provider: provider.to_string(),
             tool: tool.to_string(),
+            shell: None,
             status,
             artifact: artifact.map(|path| path.display().to_string()),
             reason,
@@ -153,6 +187,7 @@ impl CompletionSyncRecord {
         Self {
             provider: provider.to_string(),
             tool: tool.to_string(),
+            shell: None,
             status,
             artifact: artifact.map(|path| path.display().to_string()),
             reason,
@@ -165,6 +200,7 @@ impl CompletionSyncRecord {
         Self {
             provider: provider.to_string(),
             tool: tool.to_string(),
+            shell: None,
             status: CompletionSyncRecordStatus::Skipped,
             artifact: None,
             reason: Some(reason.into()),
@@ -177,6 +213,7 @@ impl CompletionSyncRecord {
         Self {
             provider: provider.to_string(),
             tool: tool.to_string(),
+            shell: None,
             status: CompletionSyncRecordStatus::Failed,
             artifact: None,
             reason: Some(reason.into()),
@@ -207,6 +244,7 @@ pub struct CompletionApplyArgs {
     pub managed_catalog_path: Option<PathBuf>,
     pub discover: bool,
     pub audit_mode: String,
+    pub audit_command: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -297,7 +335,8 @@ fn usable_completion_payload(payload: &str) -> bool {
             || trimmed.contains("\ncompdef "))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum CompletionShell {
     Bash,
     Elvish,
@@ -340,6 +379,79 @@ impl CompletionShell {
             Self::PowerShell => "update-all.ps1",
         }
     }
+
+    pub(crate) fn all() -> [Self; 5] {
+        [
+            Self::Bash,
+            Self::Elvish,
+            Self::Fish,
+            Self::PowerShell,
+            Self::Zsh,
+        ]
+    }
+}
+
+pub(crate) fn resolve_completion_shells(
+    explicit: &[String],
+    configured: &[String],
+) -> Result<Vec<CompletionShell>> {
+    let requested = if !explicit.is_empty() {
+        explicit
+    } else if !configured.is_empty() {
+        configured
+    } else {
+        return Ok(detect_installed_completion_shells());
+    };
+    let normalized = requested
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let contains_all = normalized.iter().any(|value| value == "all");
+    if contains_all && normalized.iter().any(|value| value != "all") {
+        anyhow::bail!("completion shell 'all' is mutually exclusive with named shells");
+    }
+    let mut shells = if contains_all {
+        CompletionShell::all().into_iter().collect::<BTreeSet<_>>()
+    } else {
+        normalized
+            .iter()
+            .map(|value| CompletionShell::parse(value))
+            .collect::<Result<BTreeSet<_>>>()?
+    };
+    if shells.is_empty() {
+        anyhow::bail!("completion sync requires at least one shell");
+    }
+    Ok(shells.iter().copied().collect())
+}
+
+fn detect_installed_completion_shells() -> Vec<CompletionShell> {
+    let mut shells = BTreeSet::new();
+    if let Some(current) = std::env::var_os("SHELL")
+        .and_then(|path| PathBuf::from(path).file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(str::to_owned))
+        .and_then(|name| CompletionShell::parse(&name).ok())
+    {
+        shells.insert(current);
+    }
+    for (shell, commands) in [
+        (CompletionShell::Bash, &["bash"][..]),
+        (CompletionShell::Elvish, &["elvish"][..]),
+        (CompletionShell::Fish, &["fish"][..]),
+        (
+            CompletionShell::PowerShell,
+            &["pwsh", "powershell.exe", "powershell"][..],
+        ),
+        (CompletionShell::Zsh, &["zsh"][..]),
+    ] {
+        if commands.iter().any(|command| which(command).is_some()) {
+            shells.insert(shell);
+        }
+    }
+    if shells.is_empty() {
+        shells.insert(CompletionShell::Bash);
+    }
+    shells.into_iter().collect()
 }
 
 pub fn generate_update_all_completion(shell: &str) -> Result<String> {
@@ -668,31 +780,18 @@ pub fn completion_apply(args: CompletionApplyArgs) -> Result<CompletionApplyResu
         ),
     }
 
-    if shell == CompletionShell::PowerShell {
-        return completion_apply_powershell(args, audit_mode, events);
-    }
-
-    if which("zsh").is_none() {
-        let msg = "__UA_COMP_APPLY|zsh|audit_skipped|zsh_not_found".to_string();
-        if audit_mode == "strict" {
-            anyhow::bail!("{msg}");
-        }
-        events.push(msg);
-        return Ok(CompletionApplyResult { events });
-    }
-
-    let audit_script = args.rc_root.join("commands/zsh/completion_audit.zsh");
-    if !audit_script.is_file() {
+    let Some(audit_command) = args.audit_command.as_deref() else {
         let msg = format!(
-            "__UA_COMP_APPLY|zsh|audit_skipped|script_missing:{}",
-            audit_script.display()
+            "__UA_COMP_APPLY|{}|audit_skipped|audit_command_missing",
+            shell.as_event_name()
         );
         if audit_mode == "strict" {
             anyhow::bail!("{msg}");
         }
         events.push(msg);
         return Ok(CompletionApplyResult { events });
-    }
+    };
+    validate_exact_audit_command(audit_command)?;
 
     let strict_mode = if audit_mode == "strict" {
         "fail"
@@ -704,9 +803,8 @@ pub fn completion_apply(args: CompletionApplyArgs) -> Result<CompletionApplyResu
     } else {
         "fast"
     };
-    let mut cmd = Command::new("zsh");
+    let mut cmd = Command::new(audit_command);
     cmd.args([
-        audit_script.to_string_lossy().as_ref(),
         "--mode",
         mode,
         "--strict",
@@ -724,6 +822,17 @@ pub fn completion_apply(args: CompletionApplyArgs) -> Result<CompletionApplyResu
             managed_catalog_path.to_string_lossy().as_ref(),
         ]);
     }
+    if shell == CompletionShell::PowerShell {
+        let powershell_root = args
+            .powershell_root
+            .as_deref()
+            .context("missing PowerShell root for powershell completion audit")?;
+        cmd.args([
+            "--powershell-root",
+            powershell_root.to_string_lossy().as_ref(),
+        ]);
+    }
+    cmd.env("UPDATE_ALL_COMPLETION_AUDIT_SHELL", shell.as_event_name());
 
     let out = cmd.output().context("run completion audit")?;
     let combined = format!(
@@ -740,103 +849,39 @@ pub fn completion_apply(args: CompletionApplyArgs) -> Result<CompletionApplyResu
 
     if !out.status.success() {
         events.push(format!(
-            "__UA_COMP_APPLY|zsh|audit_failed|exit={}",
+            "__UA_COMP_APPLY|{}|audit_failed|exit={}",
+            shell.as_event_name(),
             out.status.code().unwrap_or(1)
         ));
         return Err(CompletionApplyFailure { events }.into());
     }
-    events.push("__UA_COMP_APPLY|zsh|audit_ok".to_string());
+    events.push(format!(
+        "__UA_COMP_APPLY|{}|audit_ok",
+        shell.as_event_name()
+    ));
 
     Ok(CompletionApplyResult { events })
 }
 
-fn completion_apply_powershell(
-    args: CompletionApplyArgs,
-    audit_mode: String,
-    mut events: Vec<String>,
-) -> Result<CompletionApplyResult> {
-    let powershell_root = args
-        .powershell_root
-        .context("missing PowerShell root for powershell completion audit")?;
-    let module_dir = powershell_root.join("modules");
-    let repo_generated = module_dir.join("completions.generated.ps1");
-    let self_generated = module_dir.join(POWERSHELL_SELF_COMPLETION_FILE);
-    let pwsh = find_powershell_command();
-
-    if pwsh.is_none() {
-        let msg = "__UA_COMP_APPLY|powershell|audit_skipped|powershell_not_found".to_string();
-        if audit_mode == "strict" {
-            anyhow::bail!("{msg}");
-        }
-        events.push(msg);
-        return Ok(CompletionApplyResult { events });
-    }
-
-    let mut missing = Vec::new();
-    if !repo_generated.is_file() {
-        missing.push(repo_generated.display().to_string());
-    }
-    if !self_generated.is_file() {
-        missing.push(self_generated.display().to_string());
-    }
-    if !missing.is_empty() {
-        let msg = format!(
-            "__UA_COMP_APPLY|powershell|audit_skipped|missing:{}",
-            missing.join(",")
+pub(crate) fn validate_exact_audit_command(path: &Path) -> Result<()> {
+    if !path.is_absolute() || !path.is_file() {
+        anyhow::bail!(
+            "--audit-command must name an existing absolute executable file: {}",
+            path.display()
         );
-        if audit_mode == "strict" {
-            anyhow::bail!("{msg}");
-        }
-        events.push(msg);
-        return Ok(CompletionApplyResult { events });
     }
-
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-. '{}'
-. '{}'
-[System.Management.Automation.CommandCompletion]::CompleteInput('update-all completion power', 'update-all completion power'.Length, $null) | Out-Null
-'ok'
-"#,
-        powershell_single_quote_path(&repo_generated),
-        powershell_single_quote_path(&self_generated)
-    );
-
-    let out = Command::new(pwsh.unwrap_or_else(|| "pwsh".to_string()))
-        .args(["-NoProfile", "-Command", script.as_str()])
-        .output()
-        .context("run PowerShell completion audit")?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    for line in combined.lines() {
-        if !line.trim().is_empty() && line.trim() != "ok" {
-            events.push(format!("__UA_COMP_AUDIT|{line}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .with_context(|| format!("inspect audit executable {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            anyhow::bail!("--audit-command is not executable: {}", path.display());
         }
     }
-    if !out.status.success() {
-        events.push(format!(
-            "__UA_COMP_APPLY|powershell|audit_failed|exit={}",
-            out.status.code().unwrap_or(1)
-        ));
-        return Err(CompletionApplyFailure { events }.into());
-    }
-
-    events.push("__UA_COMP_APPLY|powershell|audit_ok".to_string());
-    Ok(CompletionApplyResult { events })
-}
-
-fn find_powershell_command() -> Option<String> {
-    ["pwsh", "powershell.exe", "powershell"]
-        .iter()
-        .find(|cmd| which(cmd).is_some())
-        .map(|cmd| (*cmd).to_string())
-}
-
-fn powershell_single_quote_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\'', "''")
+    Ok(())
 }
 
 fn managed_completion_dir(rc_root: &Path) -> PathBuf {
@@ -847,26 +892,80 @@ fn managed_overlay_dir(rc_root: &Path) -> PathBuf {
     rc_root.join("shell/completions-managed")
 }
 
-fn publish_public_self_completion_snapshot(
+fn publish_public_completion_snapshot(
     managed_root: &Path,
+    shells: &[CompletionShell],
+    bindings: &[crate::completions::state::CompletionBindingMemo],
+    candidates: &BTreeMap<
+        crate::completions::state::CompletionCandidateSlot,
+        crate::completions::state::CompletionCandidateMemo,
+    >,
     events: &mut Vec<String>,
-) -> Result<()> {
+) -> Result<CompletionSnapshotPublishOutcome> {
     let root = ManagedCompletionRoot::new(managed_root.to_path_buf())?;
     let mut payloads = BTreeMap::new();
-    for shell in [
-        CompletionShell::Bash,
-        CompletionShell::Elvish,
-        CompletionShell::Fish,
-        CompletionShell::PowerShell,
-        CompletionShell::Zsh,
-    ] {
-        payloads.insert(
-            shell,
-            generate_update_all_completion(shell.as_event_name())?,
-        );
+    let mut active_bindings = Vec::new();
+    for shell in shells.iter().copied() {
+        let mut payload = generate_update_all_completion(shell.as_event_name())?;
+        for binding in bindings
+            .iter()
+            .filter(|binding| binding.binding.shell == shell.as_event_name())
+        {
+            let candidate = candidates.get(&binding.active_candidate).with_context(|| {
+                format!(
+                    "active completion candidate is missing: {:?}",
+                    binding.active_candidate
+                )
+            })?;
+            let bytes = fs::read(&candidate.artifact_path).with_context(|| {
+                format!(
+                    "read active completion artifact {}",
+                    candidate.artifact_path.display()
+                )
+            })?;
+            let text = String::from_utf8(bytes).with_context(|| {
+                format!(
+                    "active completion artifact is not UTF-8: {}",
+                    candidate.artifact_path.display()
+                )
+            })?;
+            active_bindings.push(ManagedCompletionBindingStatus {
+                shell: binding.binding.shell.clone(),
+                command: binding.binding.command.clone(),
+                provider: candidate.slot.provider.clone(),
+                executable: candidate.identity.exact_executable.clone(),
+                classification: candidate
+                    .artifact_classification
+                    .map(|classification| classification.as_str().to_string()),
+            });
+            if !payload.ends_with('\n') {
+                payload.push('\n');
+            }
+            payload.push_str(&format!(
+                "\n# update-all managed binding: {}@{}\n",
+                binding.binding.command, candidate.slot.provider
+            ));
+            payload.push_str(&text);
+            if !payload.ends_with('\n') {
+                payload.push('\n');
+            }
+            if shell == CompletionShell::Zsh {
+                payload.push_str(&format!(
+                    "if (( $+functions[compdef] )) && (( $+functions[_{}] )); then compdef _{} {}; fi\n",
+                    binding.binding.command, binding.binding.command, binding.binding.command
+                ));
+            }
+        }
+        if shell == CompletionShell::Zsh {
+            payload.push_str(
+                "if (( $+functions[compdef] )) && (( $+functions[_update-all] )); then compdef _update-all update-all; fi\n",
+            );
+        }
+        payloads.insert(shell, payload);
     }
 
-    match root.publish_shell_completions(&payloads)? {
+    let outcome = root.publish_activation_assuming_lock(&payloads, active_bindings)?;
+    match &outcome {
         CompletionSnapshotPublishOutcome::Published { snapshot } => {
             events.push(format!("__UA_COMP_PUBLIC|published|{}", snapshot.display()));
         }
@@ -878,11 +977,19 @@ fn publish_public_self_completion_snapshot(
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn managed_payload_basename(provider: &str, tool: &str) -> String {
     format!("_managed_{provider}_{tool}")
+}
+
+fn candidate_payload_basename(shell: CompletionShell, provider: &str, tool: &str) -> String {
+    if shell == CompletionShell::Zsh {
+        managed_payload_basename(provider, tool)
+    } else {
+        format!("_managed_{}_{}_{}", shell.as_event_name(), provider, tool)
+    }
 }
 
 fn managed_overlay_basename(tool: &str) -> String {
@@ -1075,6 +1182,58 @@ mod tests {
         assert_eq!(records[4].status, CompletionSyncRecordStatus::Skipped);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn legacy_audit_requires_an_exact_absolute_executable() {
+        let error = completion_apply(CompletionApplyArgs {
+            shell: "zsh".to_string(),
+            rc_root: PathBuf::from("/tmp/legacy-root"),
+            powershell_root: None,
+            registry_path: PathBuf::from("/tmp/registry.json"),
+            managed_catalog_path: None,
+            discover: false,
+            audit_mode: "strict".to_string(),
+            audit_command: Some(PathBuf::from("relative-audit")),
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("existing absolute executable file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_powershell_audit_invokes_only_the_exact_executable_with_direct_argv() {
+        let temp = TempDir::new().unwrap();
+        let audit = temp.path().join("audit");
+        crate::test_support::write_executable(
+            &audit,
+            "#!/bin/sh\nset -eu\nprintf 'shell=%s\\n' \"${UPDATE_ALL_COMPLETION_AUDIT_SHELL:-}\"\nfor arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n",
+        )
+        .unwrap();
+        let result = completion_apply(CompletionApplyArgs {
+            shell: "powershell".to_string(),
+            rc_root: temp.path().join("legacy-root"),
+            powershell_root: Some(temp.path().join("powershell-root")),
+            registry_path: temp.path().join("registry.json"),
+            managed_catalog_path: None,
+            discover: false,
+            audit_mode: "strict".to_string(),
+            audit_command: Some(audit),
+        })
+        .unwrap();
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event == "__UA_COMP_AUDIT|shell=powershell"));
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event == "__UA_COMP_AUDIT|arg=--powershell-root"));
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event == "__UA_COMP_APPLY|powershell|audit_ok"));
+    }
+
     #[test]
     fn completion_sync_reports_selected_providers_with_no_configured_tools() {
         let temp = TempDir::new().unwrap();
@@ -1105,8 +1264,9 @@ mod tests {
             report: "compact".to_string(),
             catalog_path,
             config_path: Some(config_path),
-            rc_root,
+            rc_root: Some(rc_root),
             managed_root: temp.path().join("managed-root"),
+            shells: vec![CompletionShell::Zsh],
             progress_cb: Some(Arc::new(move |line| {
                 progress_for_cb.lock().unwrap().push(line);
             })),

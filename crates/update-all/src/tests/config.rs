@@ -224,6 +224,20 @@ fn completion_dynamic_trust_survives_runtime_config_parsing() {
 }
 
 #[test]
+fn completion_default_shells_survive_runtime_config_parsing_and_reject_mixed_all() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let config = temp.path().join("config.toml");
+    std::fs::write(&config, "[completions]\nshells = [\"zsh\", \"bash\"]\n").unwrap();
+
+    let runtime = load_runtime_config(Some(config.clone())).unwrap();
+    assert_eq!(runtime.completions.shells, ["zsh", "bash"]);
+
+    std::fs::write(&config, "[completions]\nshells = [\"all\", \"zsh\"]\n").unwrap();
+    let error = load_runtime_config(Some(config)).unwrap_err();
+    assert!(format!("{error:#}").contains("mutually exclusive"));
+}
+
+#[test]
 fn path_completion_merge_marks_new_tool_as_ambient() {
     let tmp = TempDir::new().unwrap();
     let config = tmp.path().join("config.toml");

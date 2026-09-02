@@ -22,6 +22,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0010](0010-completion-inventory-and-binding-authority.md) | Completion inventory and binding authority | proposed | pending |
 | [0011](0011-native-completion-protocol-and-trust-authority.md) | Native completion protocol and trust authority | proposed | pending |
 | [0012](0012-help-derived-completion-ir-and-query-authority.md) | Help-derived completion IR and query authority | proposed | pending |
+| [0013](0013-five-shell-immutable-completion-activation.md) | Five-shell immutable completion activation | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

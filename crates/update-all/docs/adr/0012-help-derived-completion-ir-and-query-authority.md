@@ -47,7 +47,7 @@ Running help after successful native generation would subordinate authoritative 
 
 ## Consequences and known limitations
 
-The current catalog-driven managed overlay still activates provider payloads only for Zsh. The IR, query engine, and renderers support five shells, but publishing and loading five independent views is reserved for the later shell-loader migration.
+[ADR 0013](0013-five-shell-immutable-completion-activation.md) supplies the reserved five-shell provider publication boundary. This record remains authoritative for IR, query, renderer, uncertainty, and performance semantics.
 
 The evidence cache records a new exact-key reference when executable identity changes even if the resulting raw bytes are already present. That reference is outside the managed publication root; immutable snapshots, views, `current`, and pruning remain unchanged when canonical IR and adapter bytes are identical.
 

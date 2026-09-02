@@ -77,7 +77,7 @@ pub struct RunCli {
 
     #[arg(
         long = "completions",
-        help = "Control completion refresh behavior (for example: off, refresh, refresh+audit)"
+        help = "Control public completion refresh behavior: off or refresh"
     )]
     completions: Option<String>,
 
@@ -265,11 +265,11 @@ impl RunCli {
             persist_ui_choice(ui_requested);
         }
 
-        let completions_mode = self
-            .completions
-            .clone()
-            .or_else(|| env::var("UPDATE_ALL_COMPLETIONS_MODE").ok())
-            .unwrap_or_else(|| "refresh+audit".to_string());
+        let completions_mode = resolve_completion_mode(
+            self.completions
+                .clone()
+                .or_else(|| env::var("UPDATE_ALL_COMPLETIONS_MODE").ok()),
+        )?;
 
         let completion_providers = self
             .completion_provider
@@ -732,6 +732,20 @@ fn now_unix_ms_u64() -> u64 {
     u64::try_from(now_unix_ms()).unwrap_or(u64::MAX)
 }
 
+fn resolve_completion_mode(requested: Option<String>) -> Result<String> {
+    let mode = requested
+        .unwrap_or_else(|| "refresh".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "off" | "refresh" => Ok(mode),
+        "refresh+audit" => bail!(
+            "completion mode 'refresh+audit' is retired; use public 'refresh', or invoke the one-release legacy bridge explicitly with `update-all completions sync --apply --rc-root <absolute-root> --shell <shell> --audit-command <absolute-executable>`"
+        ),
+        other => bail!("invalid completion mode '{other}'; expected off or refresh"),
+    }
+}
+
 struct CompletionPaths {
     rc_root: PathBuf,
     managed_root: PathBuf,
@@ -761,25 +775,25 @@ fn resolve_completion_paths() -> CompletionPaths {
         .ok()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var("HOME")
-                .ok()
-                .filter(|p| !p.trim().is_empty())
-                .map(|h| PathBuf::from(h).join(".shellrc.d"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let managed_root = env::var("UPDATE_ALL_COMPLETION_ROOT")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_completion_managed_root);
 
     let catalog_path = env::var("UPDATE_ALL_COMPLETION_CATALOG")
         .ok()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| rc_root.join("shell/completions/managed-tools.json"));
+        .unwrap_or_else(|| managed_root.join("cache/managed-tools.json"));
 
     let registry_path = env::var("UPDATE_ALL_COMPLETION_REGISTRY")
         .ok()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| rc_root.join("shell/completions/registry.json"));
+        .unwrap_or_else(|| managed_root.join("cache/audit-registry.json"));
 
     let powershell_root = env::var("UPDATE_ALL_POWERSHELL_ROOT")
         .ok()
@@ -802,12 +816,6 @@ fn resolve_completion_paths() -> CompletionPaths {
                 .filter(|p| !p.trim().is_empty())
                 .map(|h| PathBuf::from(h).join(".config/update-all/powershell"))
         });
-
-    let managed_root = env::var("UPDATE_ALL_COMPLETION_ROOT")
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_completion_managed_root);
 
     CompletionPaths {
         rc_root,
@@ -1095,10 +1103,10 @@ struct CompletionsSyncCli {
 
     #[arg(
         long = "shell",
-        default_value = "zsh",
-        help = "Legacy Zsh or PowerShell bootstrap target used only with --apply"
+        action = clap::ArgAction::Append,
+        help = "Completion shell to publish; repeat, configure a default list, or use 'all' alone"
     )]
-    shell: String,
+    shell: Vec<String>,
 
     #[arg(
         long = "audit",
@@ -1106,6 +1114,12 @@ struct CompletionsSyncCli {
         help = "Audit mode to use after --apply"
     )]
     audit: String,
+
+    #[arg(
+        long = "audit-command",
+        help = "Exact absolute executable used by the explicit legacy audit bridge"
+    )]
+    audit_command: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1162,12 +1176,63 @@ impl CompletionsCli {
         match self.cmd {
             CompletionsCmd::Sync(cli) => {
                 let defaults = resolve_completion_paths();
-                let catalog_path = cli.catalog.unwrap_or_else(|| defaults.catalog_path.clone());
-                let registry_path = cli
-                    .registry
-                    .unwrap_or_else(|| defaults.registry_path.clone());
-                let rc_root = cli.rc_root.unwrap_or_else(|| defaults.rc_root.clone());
-                let managed_root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
+                let audit_mode = cli.audit.trim().to_ascii_lowercase();
+                if cli.rc_root.is_some() && cli.managed_root.is_some() {
+                    bail!("--rc-root and --managed-root are mutually exclusive");
+                }
+                if cli.apply && cli.rc_root.is_none() {
+                    bail!("--apply requires an explicit --rc-root compatibility target");
+                }
+                if !cli.apply
+                    && (cli.powershell_root.is_some()
+                        || cli.audit_command.is_some()
+                        || cli.registry.is_some()
+                        || audit_mode != "off")
+                {
+                    bail!(
+                        "--powershell-root, --registry, --audit, and --audit-command require --apply"
+                    );
+                }
+                if cli.apply && !matches!(audit_mode.as_str(), "off" | "fast" | "strict") {
+                    bail!("invalid --audit '{}': expected off|fast|strict", cli.audit);
+                }
+                if cli.apply && audit_mode != "off" {
+                    let audit_command = cli.audit_command.as_deref().context(
+                        "--audit fast|strict requires an exact absolute --audit-command",
+                    )?;
+                    crate::completions::validate_exact_audit_command(audit_command)?;
+                }
+                let managed_root = if let Some(rc_root) = cli.rc_root.as_deref() {
+                    if !rc_root.is_absolute() {
+                        bail!("--rc-root must be absolute: {}", rc_root.display());
+                    }
+                    rc_root.join("shell/completions/.update-all-state")
+                } else {
+                    resolve_managed_completion_root(cli.managed_root, &defaults)?
+                };
+                let catalog_path = cli.catalog.unwrap_or_else(|| {
+                    env::var("UPDATE_ALL_COMPLETION_CATALOG")
+                        .ok()
+                        .filter(|path| !path.trim().is_empty())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| managed_root.join("cache/managed-tools.json"))
+                });
+                let registry_path = cli.registry.unwrap_or_else(|| {
+                    env::var("UPDATE_ALL_COMPLETION_REGISTRY")
+                        .ok()
+                        .filter(|path| !path.trim().is_empty())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| managed_root.join("cache/audit-registry.json"))
+                });
+                let runtime_config = load_runtime_config(default_path.clone())?;
+                let shells = crate::completions::resolve_completion_shells(
+                    &cli.shell,
+                    &runtime_config.completions.shells,
+                )?;
+                if cli.apply && shells.len() != 1 {
+                    bail!("--apply requires exactly one --shell target");
+                }
+                let rc_root = cli.rc_root.clone();
                 let providers = cli.providers.clone();
                 let res = crate::completions::completion_sync(CompletionSyncArgs {
                     providers_csv: providers.clone(),
@@ -1177,21 +1242,27 @@ impl CompletionsCli {
                     config_path: default_path,
                     rc_root: rc_root.clone(),
                     managed_root,
+                    shells: shells.clone(),
                     progress_cb: None,
                 })?;
 
                 for line in res.events {
                     crate::ua_outln!("{line}");
                 }
+                crate::ua_outln!("completion_outcome={}", res.outcome.as_str());
 
                 if cli.apply {
+                    let rc_root = rc_root
+                        .clone()
+                        .context("--apply requires an explicit --rc-root")?;
+                    let shell = shells[0].as_event_name().to_string();
                     let powershell_root = cli
                         .powershell_root
                         .clone()
                         .or(defaults.powershell_root.clone());
                     let install = crate::completions::completion_install(
                         crate::completions::CompletionInstallArgs {
-                            shell: cli.shell.clone(),
+                            shell: shell.clone(),
                             rc_root: rc_root.clone(),
                             powershell_root: powershell_root.clone(),
                         },
@@ -1199,7 +1270,7 @@ impl CompletionsCli {
                     for line in install.events {
                         crate::ua_outln!("{line}");
                     }
-                    let managed_catalog = if cli.audit.trim().eq_ignore_ascii_case("off") {
+                    let managed_catalog = if audit_mode == "off" {
                         None
                     } else {
                         Some(write_completion_apply_managed_catalog(
@@ -1209,7 +1280,7 @@ impl CompletionsCli {
                     };
                     let applied = crate::completions::completion_apply(
                         crate::completions::CompletionApplyArgs {
-                            shell: cli.shell,
+                            shell,
                             rc_root,
                             powershell_root,
                             registry_path,
@@ -1217,7 +1288,8 @@ impl CompletionsCli {
                                 .as_ref()
                                 .map(|catalog| catalog.path().to_path_buf()),
                             discover: cli.discover,
-                            audit_mode: cli.audit,
+                            audit_mode,
+                            audit_command: cli.audit_command,
                         },
                     )?;
                     for line in applied.events {
@@ -1268,6 +1340,27 @@ impl CompletionsCli {
                             status.status.available_shells.join(",")
                         }
                     );
+                    crate::ua_outln!("active_bindings={}", status.status.active_bindings.len());
+                    for binding in &status.status.active_bindings {
+                        crate::ua_outln!(
+                            "binding={}:{} provider={} executable={} classification={}",
+                            binding.shell,
+                            binding.command,
+                            binding.provider,
+                            binding.executable.display(),
+                            binding.classification.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    crate::ua_outln!("issues={}", status.status.issues.len());
+                    for issue in &status.status.issues {
+                        crate::ua_outln!(
+                            "issue={}:{} outcome={} reason={}",
+                            issue.provider,
+                            issue.command,
+                            issue.outcome,
+                            issue.reason.as_deref().unwrap_or("-")
+                        );
+                    }
                 }
             }
         }

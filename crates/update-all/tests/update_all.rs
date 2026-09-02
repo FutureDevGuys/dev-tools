@@ -123,3 +123,72 @@ fn invalid_catalog_plan_uses_documented_exit_code_three() {
             "invalid updater configuration or plan",
         ));
 }
+
+#[test]
+fn public_and_legacy_completion_roots_are_mutually_exclusive_before_mutation() {
+    let home = TempDir::new().unwrap();
+    let managed = home.path().join("managed");
+    let legacy = home.path().join("legacy");
+    command(&home)
+        .args([
+            "completions",
+            "sync",
+            "--providers",
+            "path",
+            "--managed-root",
+        ])
+        .arg(&managed)
+        .arg("--rc-root")
+        .arg(&legacy)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mutually exclusive"));
+    assert!(!managed.exists());
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn legacy_audit_requires_exact_executable_before_sync_mutation() {
+    let home = TempDir::new().unwrap();
+    let legacy = home.path().join("legacy");
+    command(&home)
+        .args(["completions", "sync", "--providers", "path", "--apply"])
+        .arg("--rc-root")
+        .arg(&legacy)
+        .args(["--shell", "zsh", "--audit", "strict"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires an exact absolute --audit-command",
+        ));
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn fresh_public_completion_sync_uses_a_virtual_empty_catalog_and_then_reuses() {
+    let home = TempDir::new().unwrap();
+    let managed = home.path().join("managed");
+    let args = [
+        "completions",
+        "sync",
+        "--providers",
+        "path",
+        "--managed-root",
+    ];
+    command(&home)
+        .args(args)
+        .arg(&managed)
+        .args(["--shell", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("completion_outcome=published"));
+    assert!(!managed.join("cache/managed-tools.json").exists());
+
+    command(&home)
+        .args(args)
+        .arg(&managed)
+        .args(["--shell", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("completion_outcome=reused"));
+}

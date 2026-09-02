@@ -302,6 +302,10 @@ catalogs = []
 # category = "custom"
 
 [completions]
+# Optional default publication targets. An omitted or empty list detects the
+# installed supported shells and includes the current shell. Use `all` alone
+# to publish every supported shell.
+# shells = ["bash", "zsh", "fish", "elvish", "powershell"]
 # User-managed completion tools are merged additively with the repo catalog.
 # You can add your own entries here and you can disable a repo-managed entry
 # without editing the repo itself. Matching is by (provider, name).

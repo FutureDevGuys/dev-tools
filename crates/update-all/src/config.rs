@@ -301,6 +301,9 @@ pub struct UpdaterConfig {
 #[derive(Clone, Debug)]
 pub struct CompletionConfig {
     pub tools: Vec<CompletionToolConfig>,
+    /// Empty selects installed-shell detection. Non-empty values are
+    /// normalized by the completion CLI/task boundary.
+    pub shells: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -556,6 +559,7 @@ struct FileBootstrapConfig {
 #[serde(deny_unknown_fields)]
 struct FileCompletionConfig {
     tools: Option<Vec<FileCompletionToolConfig>>,
+    shells: Option<Vec<String>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1689,6 +1693,11 @@ pub fn load_runtime_config(config_path_cli: Option<PathBuf>) -> Result<RuntimeCo
     let default_windows_foundations = default_windows_foundation_ids()?;
 
     let custom_completion_tools = parse_completion_tool_configs(completion_cfg.tools)?;
+    let completion_shells = completion_cfg.shells.unwrap_or_default();
+    if !completion_shells.is_empty() {
+        crate::completions::resolve_completion_shells(&completion_shells, &[])
+            .context("validate completions.shells")?;
+    }
 
     Ok(RuntimeConfig {
         ui: UiConfig {
@@ -1813,6 +1822,7 @@ pub fn load_runtime_config(config_path_cli: Option<PathBuf>) -> Result<RuntimeCo
         },
         completions: CompletionConfig {
             tools: custom_completion_tools,
+            shells: completion_shells,
         },
         source_path: resolved_path,
     })
@@ -1922,6 +1932,12 @@ pub fn validate_config(path: Option<PathBuf>, strict: bool) -> Result<ConfigVali
 
     if let Some(completions) = parsed.completions {
         parse_completion_tool_configs(completions.tools)?;
+        if let Some(shells) = completions.shells {
+            if !shells.is_empty() {
+                crate::completions::resolve_completion_shells(&shells, &[])
+                    .context("validate completions.shells")?;
+            }
+        }
     }
 
     Ok(ConfigValidationReport {

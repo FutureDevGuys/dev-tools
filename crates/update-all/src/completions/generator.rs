@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use super::candidate_payload_basename;
 use super::completion_query::{QueryShell, QUERY_PROTOCOL, RESPONSE_PROTOCOL};
 use super::help_adapters::{
     render_adapter, AdapterMode, ADAPTER_RENDER_VERSION, DEFAULT_ADAPTER_MODE,
@@ -186,7 +187,7 @@ pub(super) fn generate_tool_completion_with_context(
             NativePlannerOutcome::NotFound {
                 root_help,
                 diagnostics,
-            } if request.shell == CompletionShell::Zsh => {
+            } => {
                 let authority = if diagnostics.is_empty() {
                     NativeAuthority::Unavailable
                 } else {
@@ -207,13 +208,6 @@ pub(super) fn generate_tool_completion_with_context(
                     }
                 }
             }
-            NativePlannerOutcome::NotFound { diagnostics, .. } => {
-                if diagnostics.is_empty() {
-                    None
-                } else {
-                    return Err(format!("native_output_rejected:{}", diagnostics.summary()));
-                }
-            }
         }
     };
     let Some(payload) = payload else {
@@ -221,7 +215,11 @@ pub(super) fn generate_tool_completion_with_context(
     };
 
     let managed_dir = request.rc_root.join("shell").join("completions");
-    let managed_path = managed_dir.join(format!("_managed_{}_{}", request.provider, request.tool));
+    let managed_path = managed_dir.join(candidate_payload_basename(
+        request.shell,
+        request.provider,
+        request.tool,
+    ));
     fs::create_dir_all(&managed_dir).map_err(|error| error.to_string())?;
     let changed =
         write_bytes_if_changed(&managed_path, &payload.bytes).map_err(|error| error.to_string())?;

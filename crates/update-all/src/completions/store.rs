@@ -1,3 +1,4 @@
+use super::state::CompletionIssueStore;
 use super::CompletionShell;
 use crate::util::lockfile::{try_acquire_pid_lock, PidLockOptions};
 use anyhow::{Context, Result};
@@ -18,6 +19,26 @@ pub struct ManagedCompletionRootStatus {
     pub root: PathBuf,
     pub current_snapshot: Option<String>,
     pub available_shells: Vec<String>,
+    pub active_bindings: Vec<ManagedCompletionBindingStatus>,
+    pub issues: Vec<ManagedCompletionIssueStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedCompletionBindingStatus {
+    pub shell: String,
+    pub command: String,
+    pub provider: String,
+    pub executable: PathBuf,
+    pub classification: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedCompletionIssueStatus {
+    pub shell: Option<String>,
+    pub provider: String,
+    pub command: String,
+    pub outcome: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +52,8 @@ pub enum CompletionSnapshotPublishOutcome {
 struct SnapshotManifest {
     schema_version: u64,
     views: BTreeMap<String, SnapshotView>,
+    #[serde(default)]
+    bindings: Vec<ManagedCompletionBindingStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,19 +82,54 @@ impl ManagedCompletionRoot {
         Ok(Self { root })
     }
 
+    pub(crate) fn lock_sync(&self) -> Result<crate::util::lockfile::ScopedFileLock> {
+        let parent = self.root.parent().with_context(|| {
+            format!(
+                "managed completion root has no lock parent: {}",
+                self.root.display()
+            )
+        })?;
+        let root_digest = sha256_hex(self.root.as_os_str().as_encoded_bytes());
+        let file_name = format!(".update-all-completions-{}.lock", &root_digest[..16]);
+        try_acquire_pid_lock(
+            parent,
+            PidLockOptions {
+                file_name: &file_name,
+                label: "managed completion sync",
+                active_detail: "another completion sync is already using this managed root",
+                retry_detail: "retry after the active completion sync finishes",
+                stale_after: Duration::from_secs(6 * 60 * 60),
+            },
+        )
+    }
+
     pub(crate) fn status(&self) -> Result<ManagedCompletionRootStatus> {
         let active = self.read_active_snapshot()?;
-        let (current_snapshot, available_shells) = match active {
+        let (current_snapshot, available_shells, active_bindings) = match active {
             Some(active) => (
                 Some(active.name),
                 active.manifest.views.keys().cloned().collect::<Vec<_>>(),
+                active.manifest.bindings,
             ),
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), Vec::new()),
         };
+        let issues = CompletionIssueStore::new(&self.root)?
+            .load()?
+            .into_iter()
+            .map(|issue| ManagedCompletionIssueStatus {
+                shell: issue.shell,
+                provider: issue.provider,
+                command: issue.command,
+                outcome: issue.outcome,
+                reason: issue.reason,
+            })
+            .collect();
         Ok(ManagedCompletionRootStatus {
             root: self.root.clone(),
             current_snapshot,
             available_shells,
+            active_bindings,
+            issues,
         })
     }
 
@@ -104,6 +162,29 @@ impl ManagedCompletionRoot {
         &self,
         payloads: &BTreeMap<CompletionShell, String>,
     ) -> Result<CompletionSnapshotPublishOutcome> {
+        let _lock = self.lock_sync()?;
+        self.publish_shell_completions_assuming_lock(payloads)
+    }
+
+    pub(crate) fn publish_shell_completions_assuming_lock(
+        &self,
+        payloads: &BTreeMap<CompletionShell, String>,
+    ) -> Result<CompletionSnapshotPublishOutcome> {
+        self.publish_activation_assuming_lock(payloads, Vec::new())
+    }
+
+    pub(crate) fn publish_activation_assuming_lock(
+        &self,
+        payloads: &BTreeMap<CompletionShell, String>,
+        mut bindings: Vec<ManagedCompletionBindingStatus>,
+    ) -> Result<CompletionSnapshotPublishOutcome> {
+        bindings.sort_by(|left, right| {
+            (&left.shell, &left.command, &left.provider).cmp(&(
+                &right.shell,
+                &right.command,
+                &right.provider,
+            ))
+        });
         let manifest = SnapshotManifest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             views: payloads
@@ -119,6 +200,7 @@ impl ManagedCompletionRoot {
                     )
                 })
                 .collect(),
+            bindings,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .context("serialize completion snapshot manifest")?;
@@ -127,24 +209,6 @@ impl ManagedCompletionRoot {
         let current_is_target =
             self.read_current_snapshot()?.as_deref() == Some(snapshot_name.as_str());
 
-        if current_is_target && self.validate_snapshot(&snapshot_name).is_ok() {
-            return Ok(CompletionSnapshotPublishOutcome::Unchanged {
-                snapshot: snapshot_dir,
-            });
-        }
-
-        let _lock = try_acquire_pid_lock(
-            &self.root,
-            PidLockOptions {
-                file_name: ".sync.lock",
-                label: "managed completion sync",
-                active_detail: "another completion sync is already publishing this managed root",
-                retry_detail: "retry after the active completion sync finishes",
-                stale_after: Duration::from_secs(6 * 60 * 60),
-            },
-        )?;
-        let current_is_target =
-            self.read_current_snapshot()?.as_deref() == Some(snapshot_name.as_str());
         if current_is_target && self.validate_snapshot(&snapshot_name).is_ok() {
             return Ok(CompletionSnapshotPublishOutcome::Unchanged {
                 snapshot: snapshot_dir,
@@ -614,5 +678,57 @@ mod tests {
         );
 
         assert_eq!(root.init_script(CompletionShell::Zsh).unwrap(), expected);
+    }
+
+    #[test]
+    fn status_reports_snapshot_bindings_and_current_issues_without_writing() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let mut payloads = BTreeMap::new();
+        payloads.insert(CompletionShell::Fish, "complete -c demo\n".to_string());
+        let _lock = root.lock_sync().unwrap();
+        root.publish_activation_assuming_lock(
+            &payloads,
+            vec![ManagedCompletionBindingStatus {
+                shell: "fish".to_string(),
+                command: "demo".to_string(),
+                provider: "path".to_string(),
+                executable: PathBuf::from("/usr/bin/demo"),
+                classification: Some("static".to_string()),
+            }],
+        )
+        .unwrap();
+        CompletionIssueStore::new(&root.root)
+            .unwrap()
+            .save_if_changed(&[super::super::state::CompletionIssueMemo {
+                shell: Some("zsh".to_string()),
+                provider: "uv".to_string(),
+                command: "other".to_string(),
+                outcome: "retained_previous".to_string(),
+                reason: Some("inventory_failed".to_string()),
+            }])
+            .unwrap();
+        drop(_lock);
+
+        let before = fs::read(root.current_path()).unwrap();
+        let status = root.status().unwrap();
+        let init = root.init_script(CompletionShell::Fish).unwrap();
+        assert_eq!(status.active_bindings.len(), 1);
+        assert_eq!(status.active_bindings[0].command, "demo");
+        assert_eq!(status.issues.len(), 1);
+        assert_eq!(status.issues[0].outcome, "retained_previous");
+        assert!(!init.is_empty());
+        assert_eq!(fs::read(root.current_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn managed_root_lock_covers_the_full_sync_owner() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let first = root.lock_sync().unwrap();
+        let error = root.lock_sync().unwrap_err();
+        assert!(format!("{error:#}").contains("another completion sync"));
+        drop(first);
+        assert!(root.lock_sync().is_ok());
     }
 }

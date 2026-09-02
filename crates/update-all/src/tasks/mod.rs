@@ -2,9 +2,7 @@ mod npm;
 mod package_authority;
 pub(crate) mod recovery;
 
-use crate::completions::{
-    completion_sync, filter_completion_catalog_for_providers, CompletionSyncArgs,
-};
+use crate::completions::{completion_sync, resolve_completion_shells, CompletionSyncArgs};
 use crate::completions::{CompletionSyncRecordStatus, CompletionSyncResult};
 use crate::config::{
     InteractiveExecutionMode, InteractiveRuntimeConfig, NoteVerbosity, TaskPolicy,
@@ -1617,14 +1615,17 @@ impl SyncContext {
     }
 
     pub fn completion_sync_for_task(&self, task_id: &str) -> Result<CompletionSyncResult> {
+        let runtime = crate::config::load_runtime_config(self.completion_config_path.clone())?;
+        let shells = resolve_completion_shells(&[], &runtime.completions.shells)?;
         completion_sync(CompletionSyncArgs {
             providers_csv: self.completion_providers.to_string(),
             discover: self.completion_discover == "1",
             report: self.completion_report.to_string(),
             catalog_path: self.completion_catalog_path.clone(),
             config_path: self.completion_config_path.clone(),
-            rc_root: self.rc_root.clone(),
+            rc_root: None,
             managed_root: self.completion_managed_root.clone(),
+            shells,
             progress_cb: self.completion_progress_cb(task_id),
         })
     }
@@ -2850,8 +2851,6 @@ fn task_completions(ctx: &SyncContext, spec: &TaskSpec) -> Result<TaskResult> {
         ));
     }
 
-    let completion_catalog_was_missing = !ctx.completion_catalog_path.is_file();
-    ensure_completion_catalog_for_sync(ctx)?;
     ctx.log_line(
         &spec.id,
         LogLevel::Info,
@@ -2904,12 +2903,6 @@ fn task_completions(ctx: &SyncContext, spec: &TaskSpec) -> Result<TaskResult> {
     };
 
     let mut details = Vec::new();
-    if completion_catalog_was_missing {
-        details.push(format!(
-            "[Completions] Created empty managed catalog at {}",
-            ctx.completion_catalog_path.display()
-        ));
-    }
     let sync_failed = sync
         .records
         .iter()
@@ -2931,140 +2924,8 @@ fn task_completions(ctx: &SyncContext, spec: &TaskSpec) -> Result<TaskResult> {
             sync.generated, sync.unchanged, sync.skipped
         ));
     }
-    let mut report_sections = completion_report_sections(&sync);
-    let mut advisories = Vec::new();
-    let mut status = TaskStatus::Completed;
-
-    if ctx.completions_mode == "refresh+audit" {
-        let audit_strict = completion_audit_strict_mode(&ctx.completion_strict);
-        let managed_catalog_path = write_effective_completion_catalog(ctx, &sync.effective_catalog);
-        if ctx.emit_plain {
-            crate::ua_outln!(
-                "Running completion audit (mode=fast, strict={}, discover={})...",
-                audit_strict,
-                ctx.completion_discover
-            );
-        }
-        ctx.log_line(
-            &spec.id,
-            LogLevel::Info,
-            LogStream::Meta,
-            "completion-audit: running",
-        );
-        if !ctx.rc_root.as_os_str().is_empty() {
-            let audit_script = ctx.rc_root.join("commands/zsh/completion_audit.zsh");
-            let rc_root = ctx.rc_root.to_string_lossy();
-            if which("zsh").is_none() {
-                record_completion_audit_unavailable(
-                    &mut details,
-                    &mut report_sections,
-                    &mut advisories,
-                    &mut status,
-                    &ctx.completion_strict,
-                    audit_strict,
-                    &ctx.completion_discover,
-                    "zsh not found".to_string(),
-                );
-            } else if !audit_script.is_file() {
-                record_completion_audit_unavailable(
-                    &mut details,
-                    &mut report_sections,
-                    &mut advisories,
-                    &mut status,
-                    &ctx.completion_strict,
-                    audit_strict,
-                    &ctx.completion_discover,
-                    format!("missing script {}", audit_script.display()),
-                );
-            } else {
-                match Command::new("zsh")
-                    .args([
-                        audit_script.to_string_lossy().as_ref(),
-                        "--mode",
-                        "fast",
-                        "--strict",
-                        audit_strict,
-                        "--discover",
-                        ctx.completion_discover.as_str(),
-                        "--rc-root",
-                        rc_root.as_ref(),
-                        "--registry",
-                        ctx.completion_registry_path.to_string_lossy().as_ref(),
-                        "--managed-catalog",
-                        managed_catalog_path.to_string_lossy().as_ref(),
-                    ])
-                    .env("UPDATE_ALL_HANG_PERSIST", "0")
-                    .output()
-                {
-                    Ok(output) if !output.status.success() => {
-                        let combined = format!(
-                            "{}{}",
-                            String::from_utf8_lossy(&output.stdout),
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        let audit_note = completion_audit_failure_note(&output.status, &combined);
-                        details.push(format!(
-                            "[Completions] Audit exited non-zero: {}",
-                            output.status
-                        ));
-                        if let Some(finding) = completion_audit_first_finding(&combined) {
-                            details.push(format!("[Completions] Audit finding: {finding}"));
-                        }
-                        push_completion_audit_report_from_output(
-                            &mut report_sections,
-                            audit_strict,
-                            &ctx.completion_discover,
-                            &combined,
-                            TaskReportStatus::Failed,
-                            Some(audit_note.clone()),
-                        );
-                        let strict_failure = completion_strict_fails(&ctx.completion_strict);
-                        if strict_failure {
-                            status = TaskStatus::Failed;
-                        }
-                        advisories.push(completion_audit_advisory(strict_failure, audit_note));
-                    }
-                    Ok(output) => {
-                        let combined = format!(
-                            "{}{}",
-                            String::from_utf8_lossy(&output.stdout),
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        let audit_summary = completion_audit_summary(&combined);
-                        if let Some(summary) = &audit_summary {
-                            details.push(format!("[Completions] Audit passed: {summary}"));
-                        } else {
-                            details.push("[Completions] Audit passed.".to_string());
-                        }
-                        push_completion_audit_report_from_output(
-                            &mut report_sections,
-                            audit_strict,
-                            &ctx.completion_discover,
-                            &combined,
-                            TaskReportStatus::Info,
-                            audit_summary,
-                        );
-                    }
-                    Err(e) => {
-                        let audit_note = format!("failed to start: {e}");
-                        details.push(format!("[Completions] Audit failed to start: {e}"));
-                        push_completion_audit_report(
-                            &mut report_sections,
-                            TaskReportStatus::Failed,
-                            audit_strict,
-                            &ctx.completion_discover,
-                            Some(audit_note.clone()),
-                        );
-                        let strict_failure = completion_strict_fails(&ctx.completion_strict);
-                        if strict_failure {
-                            status = TaskStatus::Failed;
-                        }
-                        advisories.push(completion_audit_advisory(strict_failure, audit_note));
-                    }
-                }
-            }
-        }
-    }
+    details.push(format!("[Completions] Outcome {}", sync.outcome.as_str()));
+    let report_sections = completion_report_sections(&sync);
 
     details.push(format!(
         "strict={}, discover={}",
@@ -3072,9 +2933,9 @@ fn task_completions(ctx: &SyncContext, spec: &TaskSpec) -> Result<TaskResult> {
     ));
     Ok(TaskResult {
         label: spec.label.clone(),
-        status,
+        status: TaskStatus::Completed,
         details,
-        advisories,
+        advisories: Vec::new(),
         report_sections,
     })
 }
@@ -3105,201 +2966,8 @@ fn completion_sync_error_result(
     }
 }
 
-fn completion_audit_strict_mode(strict: &str) -> &'static str {
-    match strict.trim().to_ascii_lowercase().as_str() {
-        "error" | "fail" => "fail",
-        "hybrid" => "hybrid",
-        _ => "warn",
-    }
-}
-
-fn completion_strict_fails(strict: &str) -> bool {
-    matches!(
-        strict.trim().to_ascii_lowercase().as_str(),
-        "error" | "fail"
-    )
-}
-
-fn record_completion_audit_unavailable(
-    details: &mut Vec<String>,
-    report_sections: &mut Vec<TaskReportSection>,
-    advisories: &mut Vec<TaskAdvisory>,
-    status: &mut TaskStatus,
-    strict: &str,
-    audit_strict: &str,
-    discover: &str,
-    note: String,
-) {
-    details.push(format!("[Completions] Audit unavailable: {note}"));
-    push_completion_audit_report(
-        report_sections,
-        TaskReportStatus::Failed,
-        audit_strict,
-        discover,
-        Some(note.clone()),
-    );
-    let strict_failure = completion_strict_fails(strict);
-    if strict_failure {
-        *status = TaskStatus::Failed;
-    }
-    advisories.push(completion_audit_advisory(strict_failure, note));
-}
-
-fn completion_audit_advisory(strict_failure: bool, note: String) -> TaskAdvisory {
-    TaskAdvisory {
-        severity: if strict_failure {
-            AdvisorySeverity::Error
-        } else {
-            AdvisorySeverity::Warning
-        },
-        code: "completion-audit-failed".to_string(),
-        summary: format!("completion audit failed: {note}"),
-        remediation: "Inspect the completion audit findings and rerun `update-all completions sync --apply --shell zsh --audit strict` after fixing the listed completion files.".to_string(),
-        blocks_dependents: false,
-    }
-}
-
-fn completion_audit_failure_note(status: &std::process::ExitStatus, output: &str) -> String {
-    let exit = status
-        .code()
-        .map(|code| format!("exit={code}"))
-        .unwrap_or_else(|| status.to_string());
-    completion_audit_first_finding(output)
-        .map(|finding| format!("{exit}; {finding}"))
-        .unwrap_or(exit)
-}
-
-fn completion_audit_summary(output: &str) -> Option<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("Completion Audit Summary:"))
-        .map(|line| truncate_completion_audit_note(line, 160))
-}
-
-fn completion_audit_first_finding(output: &str) -> Option<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("Completion Audit Summary:"))
-        .map(|line| truncate_completion_audit_note(line, 160))
-}
-
-fn truncate_completion_audit_note(input: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in input.chars().enumerate() {
-        if idx >= max_chars {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn push_completion_audit_report(
-    report_sections: &mut Vec<TaskReportSection>,
-    status: TaskReportStatus,
-    strict: &str,
-    discover: &str,
-    note: Option<String>,
-) {
-    report_sections.push(TaskReportSection {
-        key: "completion_audit".to_string(),
-        title: "Completion Audit Results".to_string(),
-        rows: vec![TaskReportRow {
-            name: "completion-audit".to_string(),
-            status,
-            before: Some("mode=fast".to_string()),
-            after: Some(format!("strict={strict}, discover={discover}")),
-            note,
-        }],
-    });
-}
-
-fn push_completion_audit_report_from_output(
-    report_sections: &mut Vec<TaskReportSection>,
-    strict: &str,
-    discover: &str,
-    output: &str,
-    fallback_status: TaskReportStatus,
-    fallback_note: Option<String>,
-) {
-    if let Some(section) = completion_audit_report_section_from_output(strict, discover, output) {
-        report_sections.push(section);
-        return;
-    }
-
-    push_completion_audit_report(
-        report_sections,
-        fallback_status,
-        strict,
-        discover,
-        fallback_note,
-    );
-}
-
-fn completion_audit_report_section_from_output(
-    strict: &str,
-    discover: &str,
-    output: &str,
-) -> Option<TaskReportSection> {
-    let summary = completion_audit_summary(output);
-    let findings = output
-        .lines()
-        .filter_map(parse_completion_audit_finding)
-        .collect::<Vec<_>>();
-    if summary.is_none() && findings.is_empty() {
-        return None;
-    }
-
-    let mut rows = Vec::new();
-    if let Some(summary) = summary {
-        rows.push(TaskReportRow {
-            name: "completion-audit".to_string(),
-            status: TaskReportStatus::Info,
-            before: Some("mode=fast".to_string()),
-            after: Some(format!("strict={strict}, discover={discover}")),
-            note: Some(summary),
-        });
-    }
-    rows.extend(findings);
-
-    Some(TaskReportSection {
-        key: "completion_audit".to_string(),
-        title: "Completion Audit Results".to_string(),
-        rows,
-    })
-}
-
-fn parse_completion_audit_finding(line: &str) -> Option<TaskReportRow> {
-    let line = line.trim();
-    let (severity, rest) = line.split_once(' ')?;
-    let status = match severity {
-        "PASS" => TaskReportStatus::Passed,
-        "WARN" => TaskReportStatus::Blocked,
-        "FAIL" => TaskReportStatus::Failed,
-        "SKIP" => TaskReportStatus::Skipped,
-        _ => return None,
-    };
-    let rest = rest.strip_prefix('[')?;
-    let (tool, rest) = rest.split_once("] ")?;
-    let (code, message) = rest.split_once(": ")?;
-    Some(TaskReportRow {
-        name: tool.to_string(),
-        status,
-        before: Some(code.to_string()),
-        after: Some(message.to_string()),
-        note: None,
-    })
-}
-
 fn completion_report_sections(sync: &CompletionSyncResult) -> Vec<TaskReportSection> {
-    if sync.records.is_empty() {
-        return Vec::new();
-    }
-
-    let rows = sync
+    let mut rows = sync
         .records
         .iter()
         .map(|record| {
@@ -3346,59 +3014,36 @@ fn completion_report_sections(sync: &CompletionSyncResult) -> Vec<TaskReportSect
         })
         .collect::<Vec<_>>();
 
+    let records_already_report_behavior_change = sync.records.iter().any(|record| {
+        matches!(
+            record.status,
+            CompletionSyncRecordStatus::Generated | CompletionSyncRecordStatus::Retired
+        )
+    });
+    if !records_already_report_behavior_change
+        && matches!(
+            sync.outcome,
+            crate::completions::CompletionSyncOutcome::Published
+                | crate::completions::CompletionSyncOutcome::Removed
+        )
+    {
+        rows.push(TaskReportRow {
+            name: "managed-snapshot".to_string(),
+            status: TaskReportStatus::Updated,
+            before: Some("completion-state".to_string()),
+            after: Some(sync.outcome.as_str().to_string()),
+            note: Some(format!("shells={}", sync.shells.join(","))),
+        });
+    }
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
     vec![TaskReportSection {
         key: "completion_generation".to_string(),
         title: "Completion Generation Results".to_string(),
         rows,
     }]
-}
-
-fn ensure_completion_catalog_for_sync(ctx: &SyncContext) -> Result<()> {
-    if ctx.completion_catalog_path.is_file() {
-        return Ok(());
-    }
-
-    if let Some(parent) = ctx.completion_catalog_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create completion catalog dir {}", parent.display()))?;
-    }
-    fs::write(
-        &ctx.completion_catalog_path,
-        r#"{"schema_version":1,"providers":[],"tools":[]}"#,
-    )
-    .with_context(|| {
-        format!(
-            "create empty completion catalog {}",
-            ctx.completion_catalog_path.display()
-        )
-    })?;
-
-    ctx.log_line(
-        TASK_COMPLETIONS,
-        LogLevel::Info,
-        LogStream::Meta,
-        format!(
-            "[Completions] Created empty managed catalog at {}",
-            ctx.completion_catalog_path.display()
-        ),
-    );
-    Ok(())
-}
-
-fn write_effective_completion_catalog(
-    ctx: &SyncContext,
-    catalog: &crate::completions::registry::Registry,
-) -> PathBuf {
-    let Some(run_log) = ctx.run_log.as_ref() else {
-        return ctx.completion_catalog_path.clone();
-    };
-    let relative_name = "completion-managed-tools.effective.json";
-    let catalog = filter_completion_catalog_for_providers(catalog, &ctx.completion_providers);
-    if let Err(err) = run_log.write_json_file(relative_name, &catalog) {
-        run_log.emit_write_warning_once(&err);
-        return ctx.completion_catalog_path.clone();
-    }
-    run_log.run_dir().join(relative_name)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
