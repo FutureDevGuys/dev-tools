@@ -23,15 +23,15 @@ Routine release construction uses one clean-checkout recipe with only the signed
 python scripts/build-release-set.py \
   --product update-all \
   --release-private-key /run/user/$(id -u)/dev-tools-signing/release.key \
-  --manifest-generation 6 \
-  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/update-all-v0.1.5"
+  --manifest-generation 7 \
+  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/update-all-v0.1.6"
 ```
 
 The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the supplied release key to be authorized and unrevoked, and produces deterministic canonical signed JSON for identical inputs. Private keys never belong in the repository, build logs, command output, or release archives.
 
 Repeat `--product` to construct more than one product from the same exact source
 revision, or omit it to construct all five. For multiple products, repeat the
-generation option as `--manifest-generation update-all=6` and
+generation option as `--manifest-generation update-all=7` and
 `--manifest-generation dev-cache=9`; every selected product must be named
 exactly once. Each product therefore keeps its own version and manifest
 generation, and independent nested release lines never need to be artificially
