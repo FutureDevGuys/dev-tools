@@ -1017,16 +1017,25 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
         launcher_resolution_ready: false,
         next_action: "verify_release_and_apply_plan".into(),
     };
-    match fs::symlink_metadata(paths.receipt_path()) {
+    let receipt_metadata = match fs::symlink_metadata(paths.receipt_path()) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         Err(error) => return Err(error).context("inspect setup readiness receipt"),
-        Ok(_) => {}
+        Ok(metadata) => metadata,
+    };
+    let privileged = nix::unistd::Uid::effective().is_root();
+    if legacy_private_strong_receipt_requires_privileged_plan(
+        mode,
+        privileged,
+        receipt_metadata.mode(),
+    ) {
+        report.installed = true;
+        report.next_action = "run_privileged_setup_plan".into();
+        return Ok(report);
     }
     let receipt = read_receipt(&paths.receipt_path())?;
     if receipt.mode != mode {
         bail!("installed dev-auth mode does not match the requested readiness mode");
     }
-    let privileged = nix::unistd::Uid::effective().is_root();
     let setup = if readiness_requires_private_installation_verification(mode, privileged) {
         verify_at(paths)?
     } else {
@@ -1171,6 +1180,14 @@ fn readiness_requires_private_installation_verification(
     privileged: bool,
 ) -> bool {
     mode == InstallMode::UserOnly || privileged
+}
+
+fn legacy_private_strong_receipt_requires_privileged_plan(
+    mode: InstallMode,
+    privileged: bool,
+    receipt_mode: u32,
+) -> bool {
+    mode == InstallMode::Strong && !privileged && receipt_mode & 0o777 == 0o600
 }
 
 pub fn transparent_launchers_resolve_first_at(
@@ -4813,6 +4830,30 @@ mod tests {
             strong_runtime_readiness(false, true, true),
             (true, false, Some("start_system_broker"))
         );
+    }
+
+    #[test]
+    fn unprivileged_readiness_reports_the_safe_upgrade_for_a_private_legacy_receipt() {
+        assert!(legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::Strong,
+            false,
+            0o100600
+        ));
+        assert!(!legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::Strong,
+            true,
+            0o100600
+        ));
+        assert!(!legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::Strong,
+            false,
+            0o100644
+        ));
+        assert!(!legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::UserOnly,
+            false,
+            0o100600
+        ));
     }
 
     #[test]
