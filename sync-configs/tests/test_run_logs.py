@@ -199,3 +199,46 @@ def test_off_style_creates_no_log_root(tmp_path: Path) -> None:
     result = run_cli(tmp_path, "--config", str(manifest), "--log-style", "off")
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "runs").exists()
+
+
+def test_valid_parent_run_id_is_recorded_without_accepting_free_form_values(
+    tmp_path: Path,
+) -> None:
+    manifest = write_manifest(tmp_path)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": str(PROJECT),
+            "SYNC_CONFIGS_LOG_ROOT": str(tmp_path / "runs"),
+            "SYNC_CONFIGS_PARENT_RUN_ID": "run-20260901T120000.000000Z-7-deadbeef",
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "syncconfigs.cli", "--config", str(manifest)],
+        cwd=PROJECT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads(
+        (only_run(tmp_path / "runs") / "run.json").read_text(encoding="utf-8")
+    )
+    assert metadata["parent_run_id"] == "run-20260901T120000.000000Z-7-deadbeef"
+
+    environment["SYNC_CONFIGS_PARENT_RUN_ID"] = "not safe\nsecret"
+    second = subprocess.run(
+        [sys.executable, "-m", "syncconfigs.cli", "--config", str(manifest)],
+        cwd=PROJECT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    latest = max((tmp_path / "runs").iterdir(), key=lambda path: path.stat().st_mtime_ns)
+    rejected_metadata = json.loads((latest / "run.json").read_text(encoding="utf-8"))
+    assert "parent_run_id" not in rejected_metadata

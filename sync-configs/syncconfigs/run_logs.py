@@ -220,6 +220,7 @@ class RunRecorder:
         level: str,
         dry_run: bool,
         started_at: datetime,
+        parent_run_id: str | None,
     ) -> None:
         self.root = root
         self.run_dir = run_dir
@@ -228,6 +229,7 @@ class RunRecorder:
         self.level = level
         self.dry_run = dry_run
         self.started_at = started_at
+        self.parent_run_id = parent_run_id
         self.event_bytes = 0
         self.events_truncated = False
         self.transcript_truncated = False
@@ -265,6 +267,10 @@ class RunRecorder:
         )
         run_dir = root / run_id
         run_dir.mkdir(mode=0o700)
+        raw_parent_run_id = os.environ.get("SYNC_CONFIGS_PARENT_RUN_ID", "")
+        parent_run_id = (
+            raw_parent_run_id if RUN_ID_PATTERN.fullmatch(raw_parent_run_id) else None
+        )
         return cls(
             root=root,
             run_dir=run_dir,
@@ -273,6 +279,7 @@ class RunRecorder:
             level=level,
             dry_run=dry_run,
             started_at=started_at,
+            parent_run_id=parent_run_id,
         )
 
     def _warn_and_disable(self, exc: BaseException) -> None:
@@ -300,6 +307,8 @@ class RunRecorder:
             payload["ended_at"] = timestamp(ended_at)
         if exit_code is not None:
             payload["exit_code"] = exit_code
+        if self.parent_run_id is not None:
+            payload["parent_run_id"] = self.parent_run_id
         if self._counts:
             payload["summary"] = self._counts
         _atomic_json(self.run_dir / "run.json", payload)
