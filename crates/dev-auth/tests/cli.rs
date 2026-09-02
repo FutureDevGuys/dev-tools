@@ -85,9 +85,12 @@ fn private_runtime() -> TempDir {
 }
 
 fn private_program_root() -> TempDir {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
     let directory = tempfile::Builder::new()
         .prefix("dev-auth-cli-programs-")
-        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .tempdir_in(user.dir)
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     directory
@@ -216,6 +219,22 @@ fn typed_reconcile_defers_when_standalone_system_is_absent() {
     assert!(!plan.exists());
 }
 
+#[test]
+fn release_manifest_signing_rejects_an_empty_payload_before_broker_access() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["sign-release-manifest", "--profile", "release"])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("release manifest must not be empty"),
+        "{error}"
+    );
+    assert!(!error.contains("unknown command"), "{error}");
+}
+
 #[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,
@@ -261,6 +280,8 @@ impl NativeUserSandbox {
 
     fn command(&self, program: &Path, cwd: &Path) -> Command {
         let uid = fs::metadata(&self.root).unwrap().uid();
+        let program_name = program.file_name().unwrap();
+        let sandbox_program = Path::new("/test-bin").join(program_name);
         let attacker_home = self.root.join("attacker-home");
         let attacker_config = self.root.join("attacker-config");
         fs::create_dir_all(&attacker_home).unwrap();
@@ -281,7 +302,11 @@ impl NativeUserSandbox {
             .args(["--dir", "/etc"])
             .args(["--dir", "/run"])
             .args(["--dir", "/run/user"])
-            .args(["--dir", "/tmp"]);
+            .args(["--dir", "/tmp"])
+            .args(["--dir", "/test-bin"])
+            .arg("--ro-bind")
+            .arg(program)
+            .arg(&sandbox_program);
         let mut ancestor = PathBuf::new();
         for component in self
             .root
@@ -316,7 +341,7 @@ impl NativeUserSandbox {
             .arg("--chdir")
             .arg(cwd)
             .arg("--")
-            .arg(program);
+            .arg(sandbox_program);
         command
     }
 

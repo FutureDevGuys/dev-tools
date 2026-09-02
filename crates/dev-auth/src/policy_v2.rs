@@ -45,6 +45,10 @@ pub struct AuthorityCap {
     #[serde(default)]
     pub signing: bool,
     #[serde(default)]
+    pub release_signing_products: Vec<String>,
+    #[serde(default)]
+    pub release_signing_keys: Vec<ReleaseSigningKeyConfig>,
+    #[serde(default)]
     pub ssh: bool,
     #[serde(default)]
     pub git_identities: Vec<GitIdentityConfig>,
@@ -220,6 +224,10 @@ pub struct AuthorityProfile {
     #[serde(default)]
     pub signing_key: Option<OperationKeyConfig>,
     #[serde(default)]
+    pub release_signing_products: Vec<String>,
+    #[serde(default)]
+    pub release_signing_key: Option<ReleaseSigningKeyConfig>,
+    #[serde(default)]
     pub ssh: bool,
     #[serde(default)]
     pub ssh_keys: Vec<OperationKeyConfig>,
@@ -228,12 +236,19 @@ pub struct AuthorityProfile {
     pub secret_references: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct OperationKeyConfig {
     pub private_key_ref: String,
     pub public_key: String,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseSigningKeyConfig {
+    pub private_key_ref: String,
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -320,6 +335,8 @@ pub struct ResolvedAuthorityProfile {
     pub github: Option<ResolvedGitHubAuthority>,
     pub signing: bool,
     pub signing_key: Option<OperationKeyConfig>,
+    pub release_signing_products: BTreeSet<String>,
+    pub release_signing_key: Option<ReleaseSigningKeyConfig>,
     pub ssh: bool,
     pub ssh_keys: Vec<OperationKeyConfig>,
     pub git_identity: Option<GitIdentityConfig>,
@@ -452,6 +469,14 @@ pub fn require_system_policy_narrows(
                 false,
             )
             || (cap.signing && !administrator_cap.signing)
+            || !is_subset(
+                &cap.release_signing_products,
+                &administrator_cap.release_signing_products,
+            )
+            || !is_subset(
+                &cap.release_signing_keys,
+                &administrator_cap.release_signing_keys,
+            )
             || (cap.ssh && !administrator_cap.ssh)
             || !is_subset(&cap.git_identities, &administrator_cap.git_identities)
             || !is_subset(&cap.secret_references, &administrator_cap.secret_references)
@@ -687,6 +712,21 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
             )?;
         }
         validate_secret_references(&cap.secret_references, "authority cap")?;
+        validate_unique(
+            &cap.release_signing_products,
+            "authority cap contains a duplicate release-signing product",
+            |product| validate_policy_identifier(product, "release-signing product"),
+            Clone::clone,
+        )?;
+        validate_unique(
+            &cap.release_signing_keys,
+            "authority cap contains a duplicate release-signing key",
+            |key| validate_release_signing_key(key, &cap.secret_references),
+            |key| key.public_key.clone(),
+        )?;
+        if cap.release_signing_products.is_empty() != cap.release_signing_keys.is_empty() {
+            bail!("authority cap release-signing products and operation keys disagree");
+        }
         let matching_slots = policy
             .credential_slots
             .iter()
@@ -783,6 +823,25 @@ fn validate_user_config(config: &UserConfigV2) -> Result<()> {
             (Some(_), false) => bail!("authority profile declares a signing key without signing"),
             (None, true) => bail!("authority profile enables signing without an operation key"),
         }
+        match (
+            &profile.release_signing_key,
+            profile.release_signing_products.is_empty(),
+        ) {
+            (Some(key), false) => validate_release_signing_key(key, &profile.secret_references)?,
+            (None, true) => {}
+            (Some(_), true) => {
+                bail!("authority profile declares a release-signing key without products")
+            }
+            (None, false) => {
+                bail!("authority profile enables release signing without an operation key")
+            }
+        }
+        validate_unique(
+            &profile.release_signing_products,
+            "authority profile contains a duplicate release-signing product",
+            |product| validate_policy_identifier(product, "release-signing product"),
+            Clone::clone,
+        )?;
         if profile.ssh != !profile.ssh_keys.is_empty() {
             bail!("authority profile SSH capability and operation keys disagree");
         }
@@ -923,6 +982,19 @@ fn resolve_policy_inner(
         if requested.signing && !cap.signing {
             bail!("authority profile {name} widens the system signing cap");
         }
+        if !is_subset(
+            &requested.release_signing_products,
+            &cap.release_signing_products,
+        ) {
+            bail!("authority profile {name} widens the system release-signing cap");
+        }
+        if requested
+            .release_signing_key
+            .as_ref()
+            .is_some_and(|key| !cap.release_signing_keys.contains(key))
+        {
+            bail!("authority profile {name} selects an unapproved release-signing key");
+        }
         if requested.ssh && !cap.ssh {
             bail!("authority profile {name} widens the system SSH cap");
         }
@@ -947,6 +1019,12 @@ fn resolve_policy_inner(
                 github,
                 signing: requested.signing,
                 signing_key: requested.signing_key.clone(),
+                release_signing_products: requested
+                    .release_signing_products
+                    .iter()
+                    .cloned()
+                    .collect(),
+                release_signing_key: requested.release_signing_key.clone(),
                 ssh: requested.ssh,
                 ssh_keys: requested.ssh_keys.clone(),
                 git_identity: requested.git_identity.clone(),
@@ -1060,6 +1138,19 @@ fn validate_operation_key(key: &OperationKeyConfig, selected_references: &[Strin
     if public_key.fingerprint(HashAlg::Sha256).to_string() != key.fingerprint {
         bail!("operation public key does not match its declared fingerprint");
     }
+    Ok(())
+}
+
+fn validate_release_signing_key(
+    key: &ReleaseSigningKeyConfig,
+    selected_references: &[String],
+) -> Result<()> {
+    super::validate_op_reference(&key.private_key_ref)?;
+    if !selected_references.contains(&key.private_key_ref) {
+        bail!("release-signing key reference is outside the authority secret references");
+    }
+    dev_tools_release::parse_release_public_key(&key.public_key)
+        .context("release-signing public key is invalid")?;
     Ok(())
 }
 

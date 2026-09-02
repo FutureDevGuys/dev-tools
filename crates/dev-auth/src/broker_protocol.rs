@@ -92,6 +92,12 @@ pub enum BrokerRequest {
         #[serde(with = "hex_bytes")]
         payload: Vec<u8>,
     },
+    SignReleaseManifest {
+        profile: String,
+        release_public_key: String,
+        #[serde(with = "hex_bytes")]
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -375,6 +381,16 @@ fn validate_request_envelope(request: &BrokerRequestEnvelope) -> Result<()> {
             if payload.is_empty() || payload.len() > 1024 * 1024 {
                 bail!("SSH signing payload size is invalid");
             }
+            Ok(())
+        }
+        BrokerRequest::SignReleaseManifest {
+            profile,
+            release_public_key,
+            payload,
+        } => {
+            validate_resource_component(profile, "release-signing profile")?;
+            dev_tools_release::parse_release_public_key(release_public_key)?;
+            dev_tools_release::validate_unsigned_product_manifest(payload)?;
             Ok(())
         }
     }

@@ -70,7 +70,17 @@ pub struct PendingSessionRegistration {
 pub struct SessionAuthorityGrant {
     pub github: Option<SessionGitHubGrant>,
     pub signing: Option<SessionOperationKeyGrant>,
+    pub release_signing: Option<SessionReleaseSigningGrant>,
     pub ssh: Vec<SessionOperationKeyGrant>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReleaseSigningGrant {
+    pub credential_slot: String,
+    pub private_key_ref: String,
+    pub public_key: String,
+    pub products: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -137,6 +147,14 @@ pub fn session_authority_from_resolved(
             .signing_key
             .as_ref()
             .map(|key| operation_key_grant(&profile.credential_slot, key)),
+        release_signing: profile.release_signing_key.as_ref().map(|key| {
+            SessionReleaseSigningGrant {
+                credential_slot: profile.credential_slot.clone(),
+                private_key_ref: key.private_key_ref.clone(),
+                public_key: key.public_key.clone(),
+                products: profile.release_signing_products.iter().cloned().collect(),
+            }
+        }),
         ssh: profile
             .ssh_keys
             .iter()
@@ -744,6 +762,7 @@ mod tests {
             authority: SessionAuthorityGrant {
                 github: None,
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: evidence.unified_cgroup.clone(),
@@ -771,6 +790,7 @@ mod tests {
             authority: SessionAuthorityGrant {
                 github: None,
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::from(CGROUP_ROOT),
@@ -847,6 +867,7 @@ mod tests {
             authority: SessionAuthorityGrant {
                 github: None,
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::from(format!(

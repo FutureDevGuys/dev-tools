@@ -17,18 +17,34 @@ python scripts/build-root-document.py \
   --output /run/user/$(id -u)/dev-tools-signing/dev-tools-root.json
 ```
 
-Routine release construction uses one clean-checkout recipe with only the signed public root document and an owner-only release key:
+Routine release construction uses one clean-checkout recipe with the signed public root document. A verified dev-auth workload can ask its broker to sign the canonical manifest with an authorized `publish` profile; only the public release-key identifier is supplied to the builder, while the private key remains behind the broker's 1Password boundary. Release signing is a distinct opt-in authority: the administrator cap lists exact `release_signing_products`, the user profile narrows that list and declares a separate raw Ed25519 `release_signing_key`, and Git signing or SSH authentication grants cannot satisfy a release request. The broker accepts only canonical stable `dev-tools-product-v1` or `dev-auth-product-v2` manifest payloads for a product in that session grant.
+
+```toml
+# administrator policy
+[authority_caps.release]
+release_signing_products = ["dev-auth", "update-all", "sync-configs"]
+release_signing_keys = [{ private_key_ref = "op://Automation/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }]
+
+# native user's config-v2.toml
+[authority_profiles.publish]
+release_signing_products = ["dev-auth", "update-all", "sync-configs"]
+release_signing_key = { private_key_ref = "op://Automation/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }
+```
 
 ```sh
 python scripts/build-release-set.py \
-  --product update-all \
+  --product dev-auth \
   --public-git-command /usr/bin/git \
-  --release-private-key /run/user/$(id -u)/dev-tools-signing/release.key \
-  --manifest-generation 7 \
-  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/update-all-v0.1.6"
+  --release-signer /usr/local/bin/dev-auth \
+  --release-signer-profile publish \
+  --release-key-id release-ca568413f0f27130 \
+  --manifest-generation 17 \
+  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.6"
 ```
 
-The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the supplied release key to be authorized and unrevoked, and produces deterministic canonical signed JSON for identical inputs. Private keys never belong in the repository, build logs, command output, or release archives.
+The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.
+
+The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before producing deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
 
 Repeat `--product` to construct more than one product from the same exact source
 revision, or omit it to construct all five. For multiple products, repeat the

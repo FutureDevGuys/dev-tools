@@ -48,9 +48,9 @@ pub use runtime::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    broker_credential_erase, broker_credential_get, enroll_user_broker_service_token,
-    exec_broker_gh, exec_broker_git, exec_broker_ssh_keygen, revoke_user_broker_service_token,
-    rotate_user_broker_service_token,
+    broker_credential_erase, broker_credential_get, broker_sign_release_manifest,
+    enroll_user_broker_service_token, exec_broker_gh, exec_broker_git, exec_broker_ssh_keygen,
+    revoke_user_broker_service_token, rotate_user_broker_service_token,
 };
 #[cfg(unix)]
 pub use runtime::{exec_native_gh, exec_native_git};

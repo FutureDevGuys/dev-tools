@@ -77,7 +77,10 @@ fn strong_file_input_requires_private_memory_backed_authority() {
         b"fixture-service-token\n"
     );
 
-    let disk = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let disk = tempfile::tempdir_in(user.dir).unwrap();
     let token = disk.path().join("credential");
     fs::write(&token, b"fixture-service-token\n").unwrap();
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();

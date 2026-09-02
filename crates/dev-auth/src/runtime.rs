@@ -2336,6 +2336,7 @@ struct ActiveBrokerProfile {
     session_id: String,
     owner_uid: u32,
     mode: crate::setup::InstallMode,
+    profile_name: String,
     profile: crate::policy_v2::ResolvedAuthorityProfile,
     policy: crate::policy_v2::ResolvedPolicy,
 }
@@ -2381,6 +2382,7 @@ fn active_broker_profile(receipt: &crate::setup::InstallReceipt) -> Result<Activ
         session_id,
         owner_uid,
         mode: receipt.mode,
+        profile_name,
         profile,
         policy,
     })
@@ -3450,6 +3452,93 @@ pub(crate) fn broker_sign_ssh(
         .try_sign(payload)
         .context("perform broker-backed SSH signature")?;
     Vec::<u8>::try_from(signature).context("encode broker-backed SSH signature")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn broker_sign_release_manifest_bytes(
+    op_program: &str,
+    service_token: &SecretString,
+    private_key_ref: &str,
+    declared_public_key: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if payload.is_empty() || payload.len() > 16 * 1024 {
+        bail!("release manifest signing payload size is invalid");
+    }
+    let source = read_declared_secret_with_token(op_program, service_token, private_key_ref)?;
+    let encoded = source.expose().trim();
+    if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("declared release private key is not raw Ed25519 hex material");
+    }
+    let mut private_bytes = zeroize::Zeroizing::new([0_u8; 32]);
+    for (index, byte) in private_bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .context("decode declared release private key")?;
+    }
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_bytes);
+    let public_key = dev_tools_release::parse_release_public_key(declared_public_key)
+        .context("declared release public key is invalid")?;
+    if signing_key.verifying_key() != public_key {
+        bail!("declared release key identity does not match private material");
+    }
+    Ok(signing_key.sign(payload).to_bytes().to_vec())
+}
+
+#[cfg(target_os = "linux")]
+pub fn broker_sign_release_manifest(profile: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        bail!("release manifest must not be empty");
+    }
+    if payload.len() > 16 * 1024 {
+        bail!("release manifest exceeds the size limit");
+    }
+    let manifest = dev_tools_release::validate_unsigned_product_manifest(payload)
+        .context("validate release manifest signing request")?;
+    let (_, receipt) = crate::setup::current_installation()?;
+    let active = active_broker_profile(&receipt)?;
+    if profile != active.profile_name {
+        bail!("requested signing profile does not match the active workload");
+    }
+    let signing_key = active
+        .profile
+        .release_signing_key
+        .as_ref()
+        .context("workload profile has no release-signing authority")?;
+    if !active
+        .profile
+        .release_signing_products
+        .contains(&manifest.product)
+    {
+        bail!("release manifest product is outside workload authority");
+    }
+    let public_key = dev_tools_release::parse_release_public_key(&signing_key.public_key)
+        .context("declared release public key is invalid")?;
+    let response = crate::broker_client::request_active(
+        crate::broker_protocol::BrokerRequest::SignReleaseManifest {
+            profile: profile.to_owned(),
+            release_public_key: signing_key.public_key.clone(),
+            payload: payload.to_vec(),
+        },
+    )?;
+    let encoded = match response {
+        crate::broker_protocol::BrokerResponse::Signature { signature } => signature,
+        crate::broker_protocol::BrokerResponse::Denied { code, message } => {
+            bail!("broker denied release-signing authority ({code}): {message}")
+        }
+        crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::Accepted
+        | crate::broker_protocol::BrokerResponse::Ready { .. }
+        | crate::broker_protocol::BrokerResponse::GitCredential { .. }
+        | crate::broker_protocol::BrokerResponse::GhExecutionToken { .. } => {
+            bail!("broker returned an invalid release-signing response")
+        }
+    };
+    let signature = ed25519_dalek::Signature::try_from(encoded.as_slice())
+        .context("decode broker release signature")?;
+    public_key
+        .verify_strict(payload, &signature)
+        .context("verify broker release signature")?;
+    Ok(signature.to_bytes().to_vec())
 }
 
 fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
@@ -5094,6 +5183,61 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn broker_release_signing_uses_only_raw_ed25519_release_keys() {
+        let directory = linux_program_test_directory();
+        let private_key = [29_u8; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key);
+        let public_key = signing_key.verifying_key();
+        let key_path = directory.path().join("release-private-key");
+        fs::write(
+            &key_path,
+            private_key
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let op = directory.path().join("op");
+        fs::write(
+            &op,
+            format!(
+                "#!/usr/bin/bash\n/usr/bin/cat -- '{}'\n",
+                key_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&op, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let payload = b"canonical release manifest payload";
+        let encoded = broker_sign_release_manifest_bytes(
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/release/private-key",
+            &public_key
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            payload,
+        )
+        .unwrap();
+        let signature = ed25519_dalek::Signature::try_from(encoded.as_slice()).unwrap();
+        public_key.verify_strict(payload, &signature).unwrap();
+        assert_eq!(encoded.len(), 64);
+
+        assert!(broker_sign_release_manifest_bytes(
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/release/private-key",
+            "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072",
+            payload,
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn transparent_broker_git_configuration_is_profile_derived_and_operation_only() {
         let key = crate::policy_v2::OperationKeyConfig {
             private_key_ref: "op://Automation/signing/private-key".into(),
@@ -5106,6 +5250,8 @@ mod tests {
             github: None,
             signing: true,
             signing_key: Some(key.clone()),
+            release_signing_products: BTreeSet::new(),
+            release_signing_key: None,
             ssh: true,
             ssh_keys: vec![key],
             git_identity: Some(crate::policy_v2::GitIdentityConfig {
