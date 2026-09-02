@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -32,12 +33,42 @@ def run(*args: str, env: dict[str, str] | None = None) -> str:
     return result.stdout.strip()
 
 
-def exact_source() -> tuple[str, str]:
-    status = run("git", "status", "--porcelain", "--untracked-files=normal")
+def resolve_public_git(explicit: Path | None) -> Path:
+    if explicit is not None:
+        if not explicit.is_absolute():
+            raise SystemExit("public Git command must be an absolute executable path")
+        candidates = (explicit,)
+    else:
+        system = platform.system().lower()
+        candidates = {
+            "linux": (Path("/usr/bin/git"), Path("/bin/git")),
+            "darwin": (Path("/usr/bin/git"), Path("/opt/homebrew/bin/git")),
+            "windows": (
+                Path("C:/Program Files/Git/cmd/git.exe"),
+                Path("C:/Program Files/Git/bin/git.exe"),
+            ),
+        }.get(system, ())
+    for candidate in candidates:
+        try:
+            canonical = candidate.resolve(strict=True)
+            metadata = canonical.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode) and os.access(canonical, os.X_OK):
+            return canonical
+    raise SystemExit(
+        "public Git command was not found at a fixed platform location; "
+        "pass --public-git-command with an absolute native Git executable"
+    )
+
+
+def exact_source(public_git: Path) -> tuple[str, str]:
+    git = str(public_git)
+    status = run(git, "status", "--porcelain", "--untracked-files=normal")
     if status:
         raise SystemExit("release construction requires a clean checkout")
-    commit = run("git", "rev-parse", "HEAD")
-    timestamp = run("git", "show", "-s", "--format=%ct", "HEAD")
+    commit = run(git, "rev-parse", "HEAD")
+    timestamp = run(git, "show", "-s", "--format=%ct", "HEAD")
     if len(commit) != 40 or not timestamp.isdigit():
         raise SystemExit("could not resolve exact source revision metadata")
     return commit, timestamp
@@ -155,6 +186,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--release-private-key", required=True, type=Path)
     parser.add_argument(
+        "--public-git-command",
+        type=Path,
+        help=(
+            "absolute native Git executable used only for public source identity; "
+            "fixed platform locations are tried when omitted"
+        ),
+    )
+    parser.add_argument(
         "--trusted-root-public-key",
         type=Path,
         default=ROOT / "crates/update-all/trust/root-public-key.txt",
@@ -182,7 +221,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    commit, timestamp = exact_source()
+    commit, timestamp = exact_source(resolve_public_git(args.public_git_command))
     versions = product_versions()
     products = tuple(dict.fromkeys(args.products or PRODUCTS))
     generations = manifest_generations(args.manifest_generation, products)

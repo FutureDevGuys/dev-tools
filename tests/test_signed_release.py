@@ -8,6 +8,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,46 @@ def test_release_builder_captures_zipapp_stdout(monkeypatch) -> None:
     assert observed["stdout"] is subprocess.PIPE
     assert observed["text"] is True
     assert observed["check"] is True
+
+
+def test_release_builder_source_identity_uses_the_declared_public_git(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_release_set_module()
+    public_git = tmp_path / "git"
+    public_git.write_text("fixture", encoding="utf-8")
+    public_git.chmod(0o755)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if "rev-parse" in args:
+            return "a" * 40
+        return "123" if "--format=%ct" in args else ""
+
+    monkeypatch.setattr(module, "run", fake_run)
+
+    assert module.exact_source(public_git) == ("a" * 40, "123")
+    assert calls
+    assert all(call[0][0] == str(public_git) for call in calls)
+
+
+def test_release_builder_public_git_is_absolute_executable_and_path_independent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_release_set_module()
+    public_git = tmp_path / "native-git"
+    public_git.write_text("fixture", encoding="utf-8")
+    public_git.chmod(0o755)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (attacker / "git").write_text("fixture", encoding="utf-8")
+    (attacker / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", str(attacker))
+
+    assert module.resolve_public_git(public_git) == public_git.resolve()
+    with pytest.raises(SystemExit, match="absolute executable"):
+        module.resolve_public_git(Path("git"))
 
 
 def test_release_builder_keeps_independent_product_versions() -> None:
