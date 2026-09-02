@@ -23,12 +23,12 @@ Routine release construction uses one clean-checkout recipe with the signed publ
 # administrator policy
 [authority_caps.release]
 release_signing_products = ["dev-auth", "update-all", "sync-configs"]
-release_signing_keys = [{ private_key_ref = "op://Automation/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }]
+release_signing_keys = [{ private_key_ref = "op://Automation/dev-tools release signing key/private key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }]
 
 # native user's config-v2.toml
 [authority_profiles.publish]
 release_signing_products = ["dev-auth", "update-all", "sync-configs"]
-release_signing_key = { private_key_ref = "op://Automation/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }
+release_signing_key = { private_key_ref = "op://Automation/dev-tools release signing key/private key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }
 ```
 
 ```sh
