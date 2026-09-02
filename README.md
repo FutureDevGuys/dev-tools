@@ -18,10 +18,10 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 
 Verified release artifacts are the supported installation path. Every product uses its own nested release tag, such as `update-all/v1.2.3`. A one-time Update All seed establishes the embedded trust root; authenticated native HTTPS then resolves and installs current stable products without Git, GitHub CLI, curl, wget, authentication, or a source checkout. The seed is not desired-version state and never needs to be refreshed.
 
-On Linux x86-64, download `update-all-0.1.5-linux-x86_64` from the [`update-all/v0.1.5` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.5), make it executable, and run:
+On Linux x86-64, download `update-all-0.1.6-linux-x86_64` from the [`update-all/v0.1.6` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.6), make it executable, and run:
 
 ```sh
-./update-all-0.1.5-linux-x86_64 self install
+./update-all-0.1.6-linux-x86_64 self install
 ~/.local/bin/update-all product install dev-cache
 ~/.local/bin/update-all product install sync-configs
 ~/.local/bin/update-all product install skills-sync
