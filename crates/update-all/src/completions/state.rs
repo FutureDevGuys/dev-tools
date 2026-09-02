@@ -24,8 +24,14 @@ pub(super) struct CompletionCandidateMemo {
     pub binding: CompletionBindingIdentity,
     pub identity: CompletionCandidateIdentity,
     pub resolution_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_resolution_fingerprint: Option<String>,
     pub artifact_path: PathBuf,
     pub artifact_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_ir_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_ir_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_classification: Option<CompletionArtifactClassification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +85,15 @@ impl CompletionIdentityMemo {
             if pair[0].slot == pair[1].slot {
                 anyhow::bail!(
                     "duplicate completion candidate slot in identity memo {}",
+                    path.display()
+                );
+            }
+        }
+        for candidate in &self.candidates {
+            if candidate.canonical_ir_path.is_some() != candidate.canonical_ir_digest.is_some() {
+                anyhow::bail!(
+                    "incomplete canonical completion IR identity for candidate {:?} in {}",
+                    candidate.slot,
                     path.display()
                 );
             }

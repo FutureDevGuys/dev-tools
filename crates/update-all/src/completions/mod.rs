@@ -1137,3 +1137,14 @@ mod tests {
         }
     }
 }
+
+// Conservative help-derived fallback. Native completion remains authoritative;
+// these modules are entered only through the generator's existing fallback seam.
+pub(crate) mod completion_query;
+pub(crate) mod help_adapters;
+pub(crate) mod help_evidence;
+pub(crate) mod help_ir;
+pub(crate) mod help_planner;
+
+#[cfg(test)]
+mod help_tests;

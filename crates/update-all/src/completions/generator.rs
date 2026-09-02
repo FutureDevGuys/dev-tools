@@ -1,14 +1,31 @@
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use super::completion_query::{QueryShell, QUERY_PROTOCOL, RESPONSE_PROTOCOL};
+use super::help_adapters::{
+    render_adapter, AdapterMode, ADAPTER_RENDER_VERSION, DEFAULT_ADAPTER_MODE,
+};
+use super::help_evidence::{
+    private_content_object_is_healthy, publish_private_content_object,
+    sha256_hex as help_sha256_hex, CapturedHelp, EVIDENCE_FORMAT_VERSION,
+};
+use super::help_ir::{
+    CompletionIr, HELP_PARSER_VERSION, IR_OBJECT_EXTENSION, IR_STORE_DIRECTORY, IR_VERSION,
+    MAX_IR_BYTES,
+};
+use super::help_planner::{
+    plan_help, BoundedHelpRunner, HelpPlanLimits, HelpPlanOutcome, HelpPlanRequest,
+    NativeAuthority, HELP_PLANNER_VERSION,
+};
 use super::native::{
-    plan_native_completion, NativeCandidateOrigin, NativeCompletionRequest, NativePlannerOutcome,
-    NativeProbeSession, NativeRecipeMemo,
+    plan_native_completion, stored_artifact_is_healthy, NativeCandidateOrigin,
+    NativeCompletionRequest, NativePlannerOutcome, NativeProbeSession, NativeRecipeMemo,
 };
 use super::registry::{
     RegistryBundledCompletion, RegistryCommandCandidate, RegistryCompletionRecipe,
@@ -42,11 +59,28 @@ pub(super) struct CompletionGenerationRequest<'a> {
     pub trust_dynamic: bool,
 }
 
+pub(super) struct CompletionGenerationContext<'a> {
+    pub managed_root: &'a Path,
+    pub candidate_identity: &'a str,
+    pub reuse_help_evidence: bool,
+    pub previous_canonical_ir: Option<(&'a Path, &'a str)>,
+}
+
 pub(super) struct GeneratedCompletion {
     pub path: PathBuf,
     pub changed: bool,
     pub classification: CompletionArtifactClassification,
     pub native_recipe: Option<NativeRecipeMemo>,
+    pub canonical_ir_path: Option<PathBuf>,
+    pub canonical_ir_digest: Option<String>,
+}
+
+struct CompletionPayload {
+    bytes: Vec<u8>,
+    classification: CompletionArtifactClassification,
+    native_recipe: Option<NativeRecipeMemo>,
+    canonical_ir_path: Option<PathBuf>,
+    canonical_ir_digest: Option<String>,
 }
 
 pub(super) fn completion_command_plans(
@@ -86,8 +120,34 @@ pub(super) fn select_completion_command_plan(
     Ok(None)
 }
 
+/// Compatibility entry point used by focused native-generator tests. Managed
+/// inventory uses the context-aware entry point so evidence keys contain the
+/// complete candidate identity and evidence stays outside publication state.
 pub(super) fn generate_tool_completion(
     request: CompletionGenerationRequest<'_>,
+    session: &mut NativeProbeSession,
+) -> std::result::Result<Option<GeneratedCompletion>, String> {
+    let identity_bytes = serde_json::to_vec(&serde_json::json!({
+        "provider": request.provider,
+        "tool": request.tool,
+        "shell": request.shell.as_event_name(),
+        "program": &request.command.program,
+        "args": &request.command.args,
+    }))
+    .map_err(|error| format!("help_identity_encode_failed:{error}"))?;
+    let candidate_identity = help_sha256_hex(&identity_bytes);
+    let context = CompletionGenerationContext {
+        managed_root: request.rc_root,
+        candidate_identity: &candidate_identity,
+        reuse_help_evidence: false,
+        previous_canonical_ir: None,
+    };
+    generate_tool_completion_with_context(request, context, session)
+}
+
+pub(super) fn generate_tool_completion_with_context(
+    request: CompletionGenerationRequest<'_>,
+    context: CompletionGenerationContext<'_>,
     session: &mut NativeProbeSession,
 ) -> std::result::Result<Option<GeneratedCompletion>, String> {
     static VALID_RE: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
@@ -99,65 +159,230 @@ pub(super) fn generate_tool_completion(
         return Err("invalid_identifier".to_string());
     }
 
-    let (bytes, classification, native_recipe) = match plan_native_completion(
-        NativeCompletionRequest {
-            shell: request.shell,
-            command_name: request.tool,
-            command: request.command,
-            provider_bin_dir: request.provider_bin_dir,
-            bundled_completions: request.bundled_completions,
-            catalog_recipes: request.catalog_recipes,
-            previous_recipe: request.previous_recipe,
-            origin: request.origin,
-            trust_dynamic: request.trust_dynamic,
-        },
-        session,
-    )? {
-        NativePlannerOutcome::Completion(completion) => (
-            completion.bytes,
-            completion.classification,
-            Some(completion.recipe),
-        ),
-        NativePlannerOutcome::NotFound {
-            root_help,
-            diagnostics,
-        } if request.shell == CompletionShell::Zsh => {
-            if let Some(fallback) = generate_help_fallback_completion(
-                request.tool,
-                request.command,
-                session,
+    let payload = if context.reuse_help_evidence {
+        generate_help_ir_payload(&request, &context, NativeAuthority::Unavailable, None)?
+    } else {
+        match plan_native_completion(
+            NativeCompletionRequest {
+                shell: request.shell,
+                command_name: request.tool,
+                command: request.command,
+                provider_bin_dir: request.provider_bin_dir,
+                bundled_completions: request.bundled_completions,
+                catalog_recipes: request.catalog_recipes,
+                previous_recipe: request.previous_recipe,
+                origin: request.origin,
+                trust_dynamic: request.trust_dynamic,
+            },
+            session,
+        )? {
+            NativePlannerOutcome::Completion(completion) => Some(CompletionPayload {
+                bytes: completion.bytes,
+                classification: completion.classification,
+                native_recipe: Some(completion.recipe),
+                canonical_ir_path: None,
+                canonical_ir_digest: None,
+            }),
+            NativePlannerOutcome::NotFound {
                 root_help,
-            )? {
-                (
-                    fallback.into_bytes(),
-                    CompletionArtifactClassification::Static,
-                    None,
-                )
-            } else if diagnostics.is_empty() {
-                return Ok(None);
-            } else {
-                return Err(format!("native_output_rejected:{}", diagnostics.summary()));
+                diagnostics,
+            } if request.shell == CompletionShell::Zsh => {
+                let authority = if diagnostics.is_empty() {
+                    NativeAuthority::Unavailable
+                } else {
+                    NativeAuthority::Invalid
+                };
+                let preloaded_root = root_help.map(|help| CapturedHelp {
+                    stdout: help.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                });
+                match generate_help_ir_payload(&request, &context, authority, preloaded_root)? {
+                    Some(payload) => Some(payload),
+                    None if diagnostics.is_empty() => None,
+                    None => {
+                        return Err(format!("native_output_rejected:{}", diagnostics.summary()));
+                    }
+                }
+            }
+            NativePlannerOutcome::NotFound { diagnostics, .. } => {
+                if diagnostics.is_empty() {
+                    None
+                } else {
+                    return Err(format!("native_output_rejected:{}", diagnostics.summary()));
+                }
             }
         }
-        NativePlannerOutcome::NotFound { diagnostics, .. } => {
-            if diagnostics.is_empty() {
-                return Ok(None);
-            }
-            return Err(format!("native_output_rejected:{}", diagnostics.summary()));
-        }
+    };
+    let Some(payload) = payload else {
+        return Ok(None);
     };
 
     let managed_dir = request.rc_root.join("shell").join("completions");
     let managed_path = managed_dir.join(format!("_managed_{}_{}", request.provider, request.tool));
     fs::create_dir_all(&managed_dir).map_err(|error| error.to_string())?;
     let changed =
-        write_bytes_if_changed(&managed_path, &bytes).map_err(|error| error.to_string())?;
+        write_bytes_if_changed(&managed_path, &payload.bytes).map_err(|error| error.to_string())?;
     Ok(Some(GeneratedCompletion {
         path: managed_path,
         changed,
-        classification,
-        native_recipe,
+        classification: payload.classification,
+        native_recipe: payload.native_recipe,
+        canonical_ir_path: payload.canonical_ir_path,
+        canonical_ir_digest: payload.canonical_ir_digest,
     }))
+}
+
+fn generate_help_ir_payload(
+    request: &CompletionGenerationRequest<'_>,
+    context: &CompletionGenerationContext<'_>,
+    native_authority: NativeAuthority,
+    preloaded_root: Option<CapturedHelp>,
+) -> std::result::Result<Option<CompletionPayload>, String> {
+    let cache_root = help_evidence_cache_root(context.managed_root);
+    let evidence_root = cache_root.join("raw");
+    let mut runner = BoundedHelpRunner;
+    let outcome = plan_help(
+        &HelpPlanRequest {
+            native_authority,
+            command_name: request.tool.to_string(),
+            candidate_identity: context.candidate_identity.to_string(),
+            executable: request.command.program.clone(),
+            launch_argv: request.command.args.iter().map(OsString::from).collect(),
+            evidence_root,
+            controlled_path: env::var_os("PATH"),
+            preloaded_root,
+        },
+        &HelpPlanLimits::default(),
+        &mut runner,
+    )
+    .map_err(|error| format!("help_planner_failed:{error}"))?;
+
+    let plan = match outcome {
+        HelpPlanOutcome::Generated(plan) => plan,
+        HelpPlanOutcome::Unavailable(_) => return Ok(None),
+        HelpPlanOutcome::NativeAuthoritative => {
+            return Err("help_planner_authority_violation".to_string());
+        }
+    };
+    let decoded = CompletionIr::decode(&plan.canonical_ir)
+        .map_err(|error| format!("canonical_help_ir_invalid:{error}"))?;
+    if decoded != plan.ir {
+        return Err("canonical_help_ir_round_trip_mismatch".to_string());
+    }
+
+    let behavior = plan
+        .ir
+        .encode_behavior_canonical()
+        .map_err(|error| format!("canonical_help_ir_behavior_failed:{error}"))?;
+    let previous_ir = context
+        .previous_canonical_ir
+        .filter(|(path, digest)| canonical_help_ir_is_healthy(context.managed_root, path, digest))
+        .and_then(|(path, digest)| {
+            let bytes = fs::read(path).ok()?;
+            let ir = CompletionIr::decode(&bytes).ok()?;
+            let previous_behavior = ir.encode_behavior_canonical().ok()?;
+            (previous_behavior == behavior).then(|| (path.to_path_buf(), digest.to_owned()))
+        });
+    let (ir_path, canonical_ir_digest) = if let Some(previous) = previous_ir {
+        previous
+    } else {
+        let ir_root = cache_root.join(IR_STORE_DIRECTORY);
+        let ir_path = publish_private_content_object(
+            &ir_root,
+            IR_OBJECT_EXTENSION,
+            &plan.canonical_digest,
+            &plan.canonical_ir,
+            MAX_IR_BYTES,
+        )
+        .map_err(|error| format!("canonical_help_ir_publish_failed:{error}"))?;
+        (ir_path, plan.canonical_digest)
+    };
+    let query_engine = env::current_exe()
+        .map_err(|error| format!("completion_query_engine_unavailable:{error}"))?;
+    if !query_engine.is_absolute()
+        || !fs::metadata(&query_engine).is_ok_and(|metadata| metadata.is_file())
+    {
+        return Err("completion_query_engine_not_exact_executable".to_string());
+    }
+    let mode = DEFAULT_ADAPTER_MODE;
+    let bytes = render_adapter(
+        query_shell(request.shell),
+        mode,
+        &query_engine,
+        &ir_path,
+        request.tool,
+        &plan.ir,
+    );
+    if !stored_artifact_is_healthy(request.shell.as_event_name(), request.tool, &bytes) {
+        return Err("help_adapter_validation_failed".to_string());
+    }
+    Ok(Some(CompletionPayload {
+        bytes,
+        classification: match mode {
+            AdapterMode::QueryEngine => CompletionArtifactClassification::Dynamic,
+            AdapterMode::Static => CompletionArtifactClassification::Static,
+        },
+        native_recipe: None,
+        canonical_ir_path: Some(ir_path),
+        canonical_ir_digest: Some(canonical_ir_digest),
+    }))
+}
+
+fn query_shell(shell: CompletionShell) -> QueryShell {
+    match shell {
+        CompletionShell::Bash => QueryShell::Bash,
+        CompletionShell::Zsh => QueryShell::Zsh,
+        CompletionShell::Fish => QueryShell::Fish,
+        CompletionShell::Elvish => QueryShell::Elvish,
+        CompletionShell::PowerShell => QueryShell::PowerShell,
+    }
+}
+
+pub(super) fn help_fallback_identity_components() -> serde_json::Value {
+    serde_json::json!({
+        "help_planner_version": HELP_PLANNER_VERSION,
+        "help_parser_version": HELP_PARSER_VERSION,
+        "evidence_format_version": EVIDENCE_FORMAT_VERSION,
+        "ir_version": IR_VERSION,
+        "query_protocol": QUERY_PROTOCOL,
+        "response_protocol": RESPONSE_PROTOCOL,
+        "adapter_render_version": ADAPTER_RENDER_VERSION,
+        "adapter_mode": match DEFAULT_ADAPTER_MODE {
+            AdapterMode::QueryEngine => "query_engine",
+            AdapterMode::Static => "static",
+        },
+    })
+}
+
+pub(super) fn canonical_help_ir_is_healthy(managed_root: &Path, path: &Path, digest: &str) -> bool {
+    let ir_root = help_evidence_cache_root(managed_root).join(IR_STORE_DIRECTORY);
+    if !private_content_object_is_healthy(&ir_root, IR_OBJECT_EXTENSION, path, digest, MAX_IR_BYTES)
+    {
+        return false;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(ir) = CompletionIr::decode(&bytes) else {
+        return false;
+    };
+    ir.encode_canonical()
+        .is_ok_and(|canonical| canonical == bytes)
+}
+
+pub(super) fn help_evidence_cache_root(managed_root: &Path) -> PathBuf {
+    let parent = managed_root.parent().unwrap_or(managed_root);
+    let mut name = OsString::from(".");
+    name.push(
+        managed_root
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("managed-completions")),
+    );
+    name.push("-help-evidence");
+    parent.join(name)
 }
 
 pub(super) fn write_bytes_if_changed(path: &Path, content: &[u8]) -> io::Result<bool> {

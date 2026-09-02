@@ -1,6 +1,7 @@
 use super::generator::{
-    completion_command_plans, generate_tool_completion, select_completion_command_plan,
-    CompletionCommandPlan, CompletionGenerationRequest, GeneratedCompletion,
+    canonical_help_ir_is_healthy, completion_command_plans, generate_tool_completion_with_context,
+    help_fallback_identity_components, select_completion_command_plan, CompletionCommandPlan,
+    CompletionGenerationContext, CompletionGenerationRequest, GeneratedCompletion,
 };
 use super::native::{
     provider_bundled_artifact_identity, stored_artifact_is_healthy, NativeCandidateOrigin,
@@ -165,6 +166,7 @@ impl CandidateOutcome {
 struct PreparedPlan {
     plan: CompletionCommandPlan,
     identity: CompletionCandidateIdentity,
+    native_resolution_fingerprint: String,
     resolution_fingerprint: String,
 }
 
@@ -281,6 +283,7 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
                 let candidate_ready = process_candidate(
                     item,
                     &args.rc_root,
+                    &args.managed_root,
                     &mut candidates,
                     &mut outcomes,
                     &mut direct_records,
@@ -381,8 +384,13 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
         inventories.push(inventory_record);
     }
 
-    let (binding_memos, mut candidate_records, activation_updates) =
-        activate_bindings(&args.rc_root, &candidates, &previous_bindings, &outcomes)?;
+    let (binding_memos, mut candidate_records, activation_updates) = activate_bindings(
+        &args.rc_root,
+        &args.managed_root,
+        &candidates,
+        &previous_bindings,
+        &outcomes,
+    )?;
     direct_records.append(&mut candidate_records);
 
     prune_retired_candidate_artifacts(&args.rc_root, &candidates, &retired)?;
@@ -1054,6 +1062,7 @@ fn mark_provider_retained(
 fn process_candidate(
     item: &InventoryCandidate,
     rc_root: &Path,
+    managed_root: &Path,
     candidates: &mut BTreeMap<CompletionCandidateSlot, CompletionCandidateMemo>,
     outcomes: &mut BTreeMap<CompletionCandidateSlot, CandidateOutcome>,
     direct_records: &mut Vec<CompletionSyncRecord>,
@@ -1077,15 +1086,23 @@ fn process_candidate(
 
     if let Some(prior) = &prior {
         if let Some(reused) = prepared.iter().find(|prepared| {
+            let resolution_matches = if prior.canonical_ir_path.is_some() {
+                prior.resolution_fingerprint == prepared.resolution_fingerprint
+            } else {
+                prior.native_resolution_fingerprint.as_deref()
+                    == Some(prepared.native_resolution_fingerprint.as_str())
+            };
             prior.identity == prepared.identity
-                && prior.resolution_fingerprint == prepared.resolution_fingerprint
+                && resolution_matches
                 && prior.artifact_path == expected_artifact_path(rc_root, item)
-                && memo_artifact_is_healthy(prior)
+                && memo_artifact_is_healthy(prior, managed_root)
         }) {
             let mut memo = prior.clone();
             memo.priority = item.metadata.priority;
             memo.managed_required = item.metadata.managed_required;
             memo.identity = reused.identity.clone();
+            memo.resolution_fingerprint = reused.resolution_fingerprint.clone();
+            memo.native_resolution_fingerprint = Some(reused.native_resolution_fingerprint.clone());
             candidates.insert(item.slot.clone(), memo);
             outcomes.insert(
                 item.slot.clone(),
@@ -1095,33 +1112,59 @@ fn process_candidate(
         }
     }
 
-    let mut session = NativeProbeSession::from_env();
-    let selectable = prepared
-        .iter()
-        .map(|prepared| prepared.plan.clone())
-        .collect::<Vec<_>>();
-    let selected_plan = match select_completion_command_plan(&selectable, &mut session) {
-        Ok(selected) => selected,
-        Err(error) => {
-            return retain_or_record_failure(
-                item,
-                prior,
-                error,
-                candidates,
-                outcomes,
-                direct_records,
-            );
-        }
-    };
-    let selected = selected_plan.and_then(|selected| {
-        prepared
-            .iter()
-            .find(|prepared| prepared.plan == selected)
-            .cloned()
+    let cached_help_reprocess = prior.as_ref().and_then(|prior| {
+        prepared.iter().find(|prepared| {
+            prior.identity == prepared.identity
+                && prior.native_resolution_fingerprint.as_deref()
+                    == Some(prepared.native_resolution_fingerprint.as_str())
+                && prior.resolution_fingerprint != prepared.resolution_fingerprint
+                && prior.artifact_path == expected_artifact_path(rc_root, item)
+                && memo_artifact_is_healthy(prior, managed_root)
+                && prior.canonical_ir_path.is_some()
+        })
     });
+
+    let mut session = NativeProbeSession::from_env();
+    let (selected, reuse_help_evidence) = if let Some(prepared) = cached_help_reprocess {
+        (Some(prepared.clone()), true)
+    } else {
+        let selectable = prepared
+            .iter()
+            .map(|prepared| prepared.plan.clone())
+            .collect::<Vec<_>>();
+        let selected_plan = match select_completion_command_plan(&selectable, &mut session) {
+            Ok(selected) => selected,
+            Err(error) => {
+                return retain_or_record_failure(
+                    item,
+                    prior,
+                    error,
+                    managed_root,
+                    candidates,
+                    outcomes,
+                    direct_records,
+                );
+            }
+        };
+        let selected = selected_plan.and_then(|selected| {
+            prepared
+                .iter()
+                .find(|prepared| prepared.plan == selected)
+                .cloned()
+        });
+        (selected, false)
+    };
     let Some(selected) = selected else {
         let reason = preparation_error.unwrap_or_else(|| "command_unavailable".to_string());
-        return retain_or_record_failure(item, prior, reason, candidates, outcomes, direct_records);
+        return retain_or_record_failure(
+            item,
+            prior,
+            reason,
+            managed_root,
+            candidates,
+            outcomes,
+            direct_records,
+        );
     };
 
     let native_origin = match item.metadata.origin {
@@ -1132,7 +1175,10 @@ fn process_candidate(
         .as_ref()
         .filter(|memo| memo.identity == selected.identity)
         .and_then(|memo| memo.successful_recipe.as_ref());
-    match generate_tool_completion(
+    let candidate_identity = serde_json::to_vec(&selected.identity)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| anyhow::anyhow!("encode completion candidate identity: {error}"))?;
+    match generate_tool_completion_with_context(
         CompletionGenerationRequest {
             provider: &item.provider,
             tool: &item.tool,
@@ -1145,6 +1191,16 @@ fn process_candidate(
             previous_recipe,
             origin: native_origin,
             trust_dynamic: item.metadata.trust_dynamic,
+        },
+        CompletionGenerationContext {
+            managed_root,
+            candidate_identity: &candidate_identity,
+            reuse_help_evidence,
+            previous_canonical_ir: prior.as_ref().and_then(|memo| {
+                memo.canonical_ir_path
+                    .as_deref()
+                    .zip(memo.canonical_ir_digest.as_deref())
+            }),
         },
         &mut session,
     ) {
@@ -1163,14 +1219,21 @@ fn process_candidate(
                 item,
                 prior,
                 "unsupported_generator".to_string(),
+                managed_root,
                 candidates,
                 outcomes,
                 direct_records,
             )
         }
-        Err(error) => {
-            retain_or_record_failure(item, prior, error, candidates, outcomes, direct_records)
-        }
+        Err(error) => retain_or_record_failure(
+            item,
+            prior,
+            error,
+            managed_root,
+            candidates,
+            outcomes,
+            direct_records,
+        ),
     }
 }
 
@@ -1208,7 +1271,7 @@ fn prepare_plan(
         &item.provider_bin_dir,
         &item.metadata.bundled_completions,
     )?;
-    let fingerprint_bytes = serde_json::to_vec(&serde_json::json!({
+    let native_fingerprint_bytes = serde_json::to_vec(&serde_json::json!({
         "native_protocol_registry_version": NATIVE_PROTOCOL_REGISTRY_VERSION,
         "native_trust_classification_version": NATIVE_TRUST_CLASSIFICATION_VERSION,
         "shell": CANDIDATE_SHELL,
@@ -1226,9 +1289,16 @@ fn prepare_plan(
         },
     }))
     .map_err(|error| error.to_string())?;
+    let native_resolution_fingerprint = sha256_hex(&native_fingerprint_bytes);
+    let fingerprint_bytes = serde_json::to_vec(&serde_json::json!({
+        "native_resolution_fingerprint": &native_resolution_fingerprint,
+        "help_fallback": help_fallback_identity_components(),
+    }))
+    .map_err(|error| error.to_string())?;
     Ok(PreparedPlan {
         plan,
         identity,
+        native_resolution_fingerprint,
         resolution_fingerprint: sha256_hex(&fingerprint_bytes),
     })
 }
@@ -1246,13 +1316,20 @@ fn finish_probed_candidate(
         prior.identity != selected.identity
             || prior.resolution_fingerprint != selected.resolution_fingerprint
     });
-    let same_artifact = prior
-        .as_ref()
-        .is_some_and(|prior| prior.artifact_digest == artifact_digest);
-    let kind = if completion.changed {
-        CandidateOutcomeKind::Generated
-    } else if identity_changed && same_artifact {
+    let same_canonical_completion = prior.as_ref().is_some_and(|prior| {
+        match (
+            prior.canonical_ir_digest.as_deref(),
+            completion.canonical_ir_digest.as_deref(),
+        ) {
+            (Some(previous), Some(current)) => previous == current,
+            (None, None) => prior.artifact_digest == artifact_digest,
+            _ => false,
+        }
+    });
+    let kind = if identity_changed && same_canonical_completion {
         CandidateOutcomeKind::ProbedUnchanged
+    } else if completion.changed {
+        CandidateOutcomeKind::Generated
     } else {
         CandidateOutcomeKind::Unchanged
     };
@@ -1261,8 +1338,11 @@ fn finish_probed_candidate(
         binding: item.binding.clone(),
         identity: selected.identity,
         resolution_fingerprint: selected.resolution_fingerprint,
+        native_resolution_fingerprint: Some(selected.native_resolution_fingerprint),
         artifact_path: completion.path,
         artifact_digest,
+        canonical_ir_path: completion.canonical_ir_path,
+        canonical_ir_digest: completion.canonical_ir_digest,
         artifact_classification: Some(completion.classification),
         successful_recipe: completion.native_recipe,
         priority: item.metadata.priority,
@@ -1277,11 +1357,12 @@ fn retain_or_record_failure(
     item: &InventoryCandidate,
     prior: Option<CompletionCandidateMemo>,
     reason: String,
+    managed_root: &Path,
     candidates: &mut BTreeMap<CompletionCandidateSlot, CompletionCandidateMemo>,
     outcomes: &mut BTreeMap<CompletionCandidateSlot, CandidateOutcome>,
     direct_records: &mut Vec<CompletionSyncRecord>,
 ) -> Result<bool> {
-    if let Some(prior) = prior.filter(memo_artifact_is_healthy) {
+    if let Some(prior) = prior.filter(|memo| memo_artifact_is_healthy(memo, managed_root)) {
         candidates.insert(item.slot.clone(), prior);
         outcomes.insert(
             item.slot.clone(),
@@ -1340,6 +1421,8 @@ fn import_static_completion(
         changed,
         classification: CompletionArtifactClassification::Static,
         native_recipe: None,
+        canonical_ir_path: None,
+        canonical_ir_digest: None,
     }))
 }
 
@@ -1347,10 +1430,20 @@ fn expected_artifact_path(rc_root: &Path, item: &InventoryCandidate) -> PathBuf 
     managed_completion_dir(rc_root).join(managed_payload_basename(&item.provider, &item.tool))
 }
 
-fn memo_artifact_is_healthy(memo: &CompletionCandidateMemo) -> bool {
-    fs::read(&memo.artifact_path).is_ok_and(|bytes| {
+fn memo_artifact_is_healthy(memo: &CompletionCandidateMemo, managed_root: &Path) -> bool {
+    let artifact_is_healthy = fs::read(&memo.artifact_path).is_ok_and(|bytes| {
         stored_artifact_is_healthy(&memo.binding.shell, &memo.binding.command, &bytes)
-    }) && sha256_file(&memo.artifact_path).is_ok_and(|digest| digest == memo.artifact_digest)
+    }) && sha256_file(&memo.artifact_path)
+        .is_ok_and(|digest| digest == memo.artifact_digest);
+    let canonical_ir_is_healthy = match (
+        memo.canonical_ir_path.as_deref(),
+        memo.canonical_ir_digest.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(path), Some(digest)) => canonical_help_ir_is_healthy(managed_root, path, digest),
+        _ => false,
+    };
+    artifact_is_healthy && canonical_ir_is_healthy
 }
 
 fn record_inventory_failure(
@@ -1396,6 +1489,7 @@ fn record_inventory_failure(
 
 fn activate_bindings(
     rc_root: &Path,
+    managed_root: &Path,
     candidates: &BTreeMap<CompletionCandidateSlot, CompletionCandidateMemo>,
     previous_bindings: &BTreeMap<CompletionBindingIdentity, CompletionBindingMemo>,
     outcomes: &BTreeMap<CompletionCandidateSlot, CandidateOutcome>,
@@ -1416,7 +1510,7 @@ fn activate_bindings(
         let healthy = binding_candidates
             .iter()
             .copied()
-            .filter(|memo| memo_artifact_is_healthy(memo))
+            .filter(|memo| memo_artifact_is_healthy(memo, managed_root))
             .collect::<Vec<_>>();
         let previous = previous_bindings.get(&binding);
         let path_winner = which(&binding.command);
@@ -1932,6 +2026,42 @@ exit 1
         write_executable(path, &script).unwrap();
     }
 
+    fn write_help_identity_runner(path: &Path, counter: &Path, fail_marker: &Path) {
+        let script = r#"#!/bin/sh
+set -eu
+counter=@COUNTER@
+fail_marker=@FAIL_MARKER@
+if [ -e "$fail_marker" ]; then
+  exit 97
+fi
+count=0
+if [ -r "$counter" ]; then
+  count=$(cat "$counter")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$counter"
+identity=${1:-}
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+if [ "$#" -eq 1 ] && [ "$1" = "--help" ]; then
+  cat <<'EOF'
+Usage: demo [OPTIONS]
+
+Options:
+  --format <FORMAT>  Output format [possible values: json, text]
+  --verbose          Increase verbosity
+EOF
+  exit 0
+fi
+printf 'unsupported identity=%s argv=%s\n' "$identity" "$*" >&2
+exit 1
+"#
+        .replace("@COUNTER@", &shell_single_quote(counter))
+        .replace("@FAIL_MARKER@", &shell_single_quote(fail_marker));
+        write_executable(path, &script).unwrap();
+    }
+
     fn write_native_command(path: &Path, command: &str, marker: &str) {
         let script = r#"#!/bin/sh
 set -eu
@@ -2145,6 +2275,75 @@ exit 1
         assert_eq!(
             root_before_third,
             tree_fingerprint(&layout.managed_root, false)
+        );
+    }
+
+    #[test]
+    fn changed_help_identity_with_identical_canonical_ir_is_probed_unchanged_then_reused() {
+        let _env = env_guard();
+        let _probe_environment = clean_probe_environment();
+        let layout = TestLayout::new();
+        let bin = layout._temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let runner = bin.join("demo");
+        let counter = layout._temp.path().join("help-probe-count");
+        let fail_marker = layout._temp.path().join("fail-if-help-probed");
+        write_help_identity_runner(&runner, &counter, &fail_marker);
+        let _path = path_with_first(&[&bin]);
+
+        write_catalog(
+            &layout.catalog,
+            &["uv"],
+            vec![configured_candidate("demo", "uv", &runner, &["A"])],
+        );
+        let first = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&first, "uv", "demo"),
+            CompletionSyncRecordStatus::Generated
+        );
+        assert!(read_counter(&counter) > 0);
+
+        let memo_before = fs::read(layout.managed_root.join("identity-memo.json")).unwrap();
+        let managed_before = tree_fingerprint(&layout.managed_root, true);
+        let rc_before = tree_fingerprint(&layout.rc_root, false);
+
+        write_catalog(
+            &layout.catalog,
+            &["uv"],
+            vec![configured_candidate("demo", "uv", &runner, &["B"])],
+        );
+        let second = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&second, "uv", "demo"),
+            CompletionSyncRecordStatus::ProbedUnchanged
+        );
+        assert_eq!(second.generated, 0);
+        assert_eq!(managed_before, tree_fingerprint(&layout.managed_root, true));
+        assert_eq!(rc_before, tree_fingerprint(&layout.rc_root, false));
+        let memo_after = fs::read(layout.managed_root.join("identity-memo.json")).unwrap();
+        assert_ne!(memo_before, memo_after);
+
+        let evidence_root = layout._temp.path().join(".managed-root-help-evidence");
+        assert!(evidence_root.is_dir());
+        fs::write(&fail_marker, "fail on probe\n").unwrap();
+        let probes_before_third = read_counter(&counter);
+        let managed_before_third = tree_fingerprint(&layout.managed_root, false);
+        let rc_before_third = tree_fingerprint(&layout.rc_root, false);
+        let evidence_before_third = tree_fingerprint(&evidence_root, false);
+        let third = layout.sync("uv", false);
+        assert_eq!(
+            record_status(&third, "uv", "demo"),
+            CompletionSyncRecordStatus::Reused
+        );
+        assert_eq!(read_counter(&counter), probes_before_third);
+        assert_eq!(
+            managed_before_third,
+            tree_fingerprint(&layout.managed_root, false)
+        );
+        assert_eq!(rc_before_third, tree_fingerprint(&layout.rc_root, false));
+        assert_eq!(
+            evidence_before_third,
+            tree_fingerprint(&evidence_root, false)
         );
     }
 
