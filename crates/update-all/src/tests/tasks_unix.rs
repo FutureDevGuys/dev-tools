@@ -107,6 +107,7 @@ fn test_context(privilege_session: Arc<PrivilegeSession>) -> SyncContext {
         event_tx: None,
         run_log: None,
         rc_root: PathBuf::new(),
+        completion_managed_root: PathBuf::from("/tmp/update-all-test-completions"),
         completion_config_path: None,
         completion_catalog_path: PathBuf::new(),
         completion_registry_path: PathBuf::new(),
@@ -131,6 +132,36 @@ fn test_context(privilege_session: Arc<PrivilegeSession>) -> SyncContext {
         runtime_control: None,
         prompt_runtime: Arc::new(PromptRuntime::default()),
     }
+}
+
+#[test]
+fn task_completion_sync_publishes_to_the_resolved_managed_root() {
+    let temp = TempDir::new().unwrap();
+    let managed_root = temp.path().join("resolved-managed-root");
+    let catalog_path = temp.path().join("managed-tools.json");
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &catalog_path,
+        r#"{"schema_version":1,"providers":[],"tools":[]}"#,
+    )
+    .unwrap();
+    fs::write(&config_path, "").unwrap();
+
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.completion_providers = String::new();
+    ctx.rc_root = temp.path().join("legacy-rc-root");
+    ctx.completion_managed_root = managed_root.clone();
+    ctx.completion_catalog_path = catalog_path;
+    ctx.completion_config_path = Some(config_path);
+
+    let result = ctx.completion_sync_for_task(TASK_COMPLETIONS).unwrap();
+
+    assert!(result
+        .events
+        .iter()
+        .any(|event| event.starts_with("__UA_COMP_PUBLIC|published|")));
+    assert!(managed_root.join("current").is_file());
+    assert!(managed_root.join("snapshots").is_dir());
 }
 
 #[test]

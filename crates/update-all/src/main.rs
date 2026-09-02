@@ -1,4 +1,8 @@
 fn main() {
+    if let Some(code) = update_all::maybe_run_completion_query() {
+        std::process::exit(code);
+    }
+
     if let Err(err) = update_all::main_entry() {
         if err.downcast_ref::<update_all::Cancelled>().is_some() {
             std::process::exit(3);

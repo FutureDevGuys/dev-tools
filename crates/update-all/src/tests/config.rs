@@ -1,4 +1,5 @@
-use super::{load_runtime_config, validate_config};
+use super::{load_runtime_config, merge_user_completion_catalog, validate_config};
+use crate::completions::registry::Registry;
 use tempfile::TempDir;
 
 #[test]
@@ -180,6 +181,69 @@ fn strict_validation_accepts_minimal_current_config() {
 
     let report = validate_config(Some(config), true).unwrap();
     assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn completion_binding_priority_survives_runtime_config_parsing() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        concat!(
+            "[[completions.tools]]\n",
+            "name = \"demo\"\n",
+            "provider = \"path\"\n",
+            "priority = 73\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = load_runtime_config(Some(config)).unwrap();
+    assert_eq!(runtime.completions.tools.len(), 1);
+    assert_eq!(runtime.completions.tools[0].priority, Some(73));
+}
+
+#[test]
+fn completion_dynamic_trust_survives_runtime_config_parsing() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        concat!(
+            "[[completions.tools]]\n",
+            "name = \"demo\"\n",
+            "provider = \"path\"\n",
+            "trust_dynamic = true\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = load_runtime_config(Some(config)).unwrap();
+    assert_eq!(runtime.completions.tools.len(), 1);
+    assert!(runtime.completions.tools[0].trust_dynamic);
+}
+
+#[test]
+fn path_completion_merge_marks_new_tool_as_ambient() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        concat!(
+            "[[completions.tools]]\n",
+            "name = \"demo\"\n",
+            "provider = \"path\"\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = load_runtime_config(Some(config)).unwrap();
+    let catalog: Registry =
+        serde_json::from_str(r#"{"schema_version":1,"providers":[],"tools":[]}"#).unwrap();
+    let merged = merge_user_completion_catalog(catalog, Some(&runtime));
+    assert_eq!(merged.tools.len(), 1);
+    assert!(merged.tools[0].ambient);
+    assert!(!merged.tools[0].trust_dynamic);
 }
 
 #[test]
