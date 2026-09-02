@@ -14,12 +14,15 @@ pub struct BrokerStatusReport {
     pub manifest_generation: Option<u64>,
     pub authenticated_release: bool,
     pub product_aliases_ready: bool,
+    /// Legacy migration state. Setup-plan v3 never activates these aliases.
     pub transparent_launchers_active: bool,
     pub policy_ready: bool,
     pub user_config_ready: bool,
     pub policy_resolution_ready: bool,
     pub workload_launchers_ready: bool,
     pub desktop_entries_ready: bool,
+    pub workload_tool_plane_ready: bool,
+    /// Compatibility alias for `workload_tool_plane_ready`.
     pub launcher_resolution_ready: bool,
     pub signing_configured: bool,
     pub ssh_authentication_configured: bool,
@@ -91,19 +94,15 @@ pub fn broker_status() -> Result<BrokerStatusReport> {
             .values()
             .any(|profile| profile.ssh && !profile.ssh_keys.is_empty())
     });
-    let launcher_resolution_ready = setup.transparent_launchers_active
-        && crate::setup::transparent_launchers_resolve_first_at(
-            &paths,
-            std::path::Path::new(&receipt.executable),
-            std::env::var_os("PATH").as_deref().unwrap_or_default(),
-        )?;
+    let (workload_tool_plane_ready, launcher_resolution_ready) =
+        crate::setup::v3_launcher_readiness(&setup, integrations.as_ref());
     let credential_ready = match receipt.mode {
         InstallMode::Strong => crate::setup::system_service_credential_ready(),
         InstallMode::UserOnly => crate::runtime::user_broker_service_token().is_ok(),
     };
     let (claim, probe) = claim_and_probe(receipt.mode)?;
     Ok(BrokerStatusReport {
-        schema: "dev-auth-broker-status-v1",
+        schema: "dev-auth-broker-status-v2",
         mode: receipt.mode,
         version: receipt.version,
         source_commit: receipt.source_commit.clone(),
@@ -123,6 +122,7 @@ pub fn broker_status() -> Result<BrokerStatusReport> {
         desktop_entries_ready: integrations
             .as_ref()
             .is_some_and(|report| report.desktop_entries_ready),
+        workload_tool_plane_ready,
         launcher_resolution_ready,
         signing_configured,
         ssh_authentication_configured,

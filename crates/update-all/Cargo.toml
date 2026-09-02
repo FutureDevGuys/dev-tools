@@ -16,7 +16,7 @@ dev-tools-installation = { path = "../dev-tools-installation" }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2.workspace = true
 toml = "1.0"
 ureq = "3.4"
 wait-timeout = "0.2"
@@ -31,8 +31,8 @@ uuid = { version = "1", default-features = false, features = ["serde", "v4"] }
 
 [dev-dependencies]
 assert_cmd = "2"
-base64 = "0.22"
-ed25519-dalek = "3"
+base64.workspace = true
+ed25519-dalek.workspace = true
 predicates = "3"
 serde_jcs = "0.2"
 tempfile = "3"

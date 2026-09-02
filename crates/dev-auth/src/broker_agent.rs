@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub const SIGNING_AGENT_ENV: &str = "DEV_AUTH_SIGNING_AGENT_SOCK";
 
 pub fn agent_socket_path(
+    mode: crate::setup::InstallMode,
     owner_uid: u32,
     session_id: &str,
     purpose: SshOperationPurpose,
@@ -22,9 +23,14 @@ pub fn agent_socket_path(
         SshOperationPurpose::GitSigning => "signing.sock",
         SshOperationPurpose::Authentication => "authentication.sock",
     };
-    PathBuf::from(format!(
-        "/run/user/{owner_uid}/dev-auth-v3/agent-sessions/{session_id}/{leaf}"
-    ))
+    match mode {
+        crate::setup::InstallMode::Strong => {
+            PathBuf::from(format!("/run/dev-auth-workload-{session_id}/{leaf}"))
+        }
+        crate::setup::InstallMode::UserOnly => PathBuf::from(format!(
+            "/run/user/{owner_uid}/dev-auth-v3/agent-sessions/{session_id}/{leaf}"
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -99,6 +105,7 @@ impl Session for BrokerAgent {
 }
 
 pub fn run_agent_proxy(
+    owner_uid: u32,
     session_id: &str,
     profile_name: &str,
     purpose: SshOperationPurpose,
@@ -107,11 +114,20 @@ pub fn run_agent_proxy(
 ) -> Result<()> {
     validate_identifier(session_id, "session identifier")?;
     validate_identifier(profile_name, "authority profile")?;
-    let owner_uid = nix::unistd::Uid::effective().as_raw();
+    let execution_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
-        bail!("broker SSH agent must run as the admitted native user");
+        bail!("broker SSH agent native owner is invalid");
     }
     let (_, receipt) = crate::setup::current_installation()?;
+    match receipt.mode {
+        crate::setup::InstallMode::Strong if execution_uid != owner_uid => {
+            bail!("strong broker SSH agent identity does not match its native owner")
+        }
+        crate::setup::InstallMode::UserOnly if execution_uid != owner_uid => {
+            bail!("user-only broker SSH agent identity does not match its native owner")
+        }
+        crate::setup::InstallMode::Strong | crate::setup::InstallMode::UserOnly => {}
+    }
     let policy = match receipt.mode {
         crate::setup::InstallMode::Strong => {
             crate::policy_store::load_resolved_policy_for_uid(owner_uid)?
@@ -146,7 +162,14 @@ pub fn run_agent_proxy(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let listener = bind_agent_socket(socket, session_id, purpose, owner_uid)?;
+    let listener = bind_agent_socket(
+        socket,
+        session_id,
+        purpose,
+        receipt.mode,
+        owner_uid,
+        execution_uid,
+    )?;
     validate_broker_socket(broker_socket, session_id, receipt.mode, owner_uid)?;
     let agent = BrokerAgent {
         broker_socket: broker_socket.to_owned(),
@@ -168,27 +191,37 @@ fn bind_agent_socket(
     socket: &Path,
     session_id: &str,
     purpose: SshOperationPurpose,
+    mode: crate::setup::InstallMode,
     owner_uid: u32,
+    execution_uid: u32,
 ) -> Result<tokio::net::UnixListener> {
-    let runtime = PathBuf::from(format!("/run/user/{owner_uid}"));
-    let product = runtime.join("dev-auth-v3");
-    let agents = product.join("agent-sessions");
-    let session = agents.join(session_id);
-    if socket != agent_socket_path(owner_uid, session_id, purpose) {
+    if socket != agent_socket_path(mode, owner_uid, session_id, purpose) {
         bail!("broker SSH agent socket is outside the private session runtime");
     }
-    validate_private_directory(&runtime, owner_uid)?;
-    for directory in [&product, &agents, &session] {
-        match fs::create_dir(directory) {
-            Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("create broker agent directory {}", directory.display())
-                })
+    match mode {
+        crate::setup::InstallMode::Strong => {
+            let runtime = PathBuf::from(format!("/run/dev-auth-workload-{session_id}"));
+            validate_private_directory(&runtime, execution_uid)?;
+        }
+        crate::setup::InstallMode::UserOnly => {
+            let runtime = PathBuf::from(format!("/run/user/{owner_uid}"));
+            let product = runtime.join("dev-auth-v3");
+            let agents = product.join("agent-sessions");
+            let session = agents.join(session_id);
+            validate_private_directory(&runtime, owner_uid)?;
+            for directory in [&product, &agents, &session] {
+                match fs::create_dir(directory) {
+                    Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("create broker agent directory {}", directory.display())
+                        })
+                    }
+                }
+                validate_private_directory(directory, execution_uid)?;
             }
         }
-        validate_private_directory(directory, owner_uid)?;
     }
     let listener =
         tokio::net::UnixListener::bind(socket).context("bind broker SSH agent socket")?;
@@ -196,7 +229,7 @@ fn bind_agent_socket(
     let metadata = fs::symlink_metadata(socket).context("inspect broker SSH agent socket")?;
     if !metadata.file_type().is_socket()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != owner_uid
+        || metadata.uid() != execution_uid
         || metadata.mode() & 0o077 != 0
     {
         bail!("broker SSH agent socket has unsafe authority");
@@ -278,6 +311,31 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::thread;
+
+    #[test]
+    fn agent_socket_paths_separate_strong_and_user_only_runtimes() {
+        let session = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            agent_socket_path(
+                crate::setup::InstallMode::Strong,
+                1000,
+                session,
+                SshOperationPurpose::GitSigning,
+            ),
+            PathBuf::from(format!("/run/dev-auth-workload-{session}/signing.sock"))
+        );
+        assert_eq!(
+            agent_socket_path(
+                crate::setup::InstallMode::UserOnly,
+                1000,
+                session,
+                SshOperationPurpose::Authentication,
+            ),
+            PathBuf::from(format!(
+                "/run/user/1000/dev-auth-v3/agent-sessions/{session}/authentication.sock"
+            ))
+        );
+    }
 
     #[test]
     fn agent_forwards_only_the_bound_identity_and_verifies_the_broker_signature() {

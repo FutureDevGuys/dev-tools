@@ -22,6 +22,7 @@ Routine release construction uses one clean-checkout recipe with only the signed
 ```sh
 python scripts/build-release-set.py \
   --product update-all \
+  --public-git-command /usr/bin/git \
   --release-private-key /run/user/$(id -u)/dev-tools-signing/release.key \
   --manifest-generation 7 \
   --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/update-all-v0.1.6"

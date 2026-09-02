@@ -84,7 +84,7 @@ fn handle_user_connection(
         bail!("user broker peer is outside the documented same-user trust boundary");
     }
     let request = decode_request_frame(&read_frame(stream)?)?;
-    let response = session_response(session, request.request, backend)?;
+    let response = session_response(session, request.request, None, backend)?;
     write_frame(
         stream,
         &encode_response_frame(&BrokerResponseEnvelope {
@@ -267,6 +267,24 @@ fn handle_public_connection(
     let request_bytes = read_frame(stream)?;
     let request = decode_request_frame(&request_bytes)?;
     let audit_request = request.request.clone();
+    if let BrokerRequest::ActivateSession { session_id } = &request.request {
+        let response = match registry.activate_pending(peer, session_id) {
+            Ok(session) => ready_response(&session)?,
+            Err(_) => BrokerResponse::Denied {
+                code: "session_invalid".into(),
+                message: "pending workload admission could not be activated".into(),
+            },
+        };
+        emit_request_audit(None, &audit_request, &response);
+        return write_frame(
+            stream,
+            &encode_response_frame(&BrokerResponseEnvelope {
+                version: BROKER_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                response,
+            })?,
+        );
+    }
     let (response, session_audited) = match registry.probe_peer(&peer) {
         Err(_) => (
             BrokerResponse::Denied {
@@ -278,7 +296,10 @@ fn handle_public_connection(
         Ok(None) => (
             match request.request {
                 BrokerRequest::Probe => BrokerResponse::NoSession,
-                BrokerRequest::GitCredential { .. }
+                BrokerRequest::ActivateSession { .. }
+                | BrokerRequest::RenewSession { .. }
+                | BrokerRequest::EndSession { .. }
+                | BrokerRequest::GitCredential { .. }
                 | BrokerRequest::InvalidateGitCredential { .. }
                 | BrokerRequest::GhExecutionToken
                 | BrokerRequest::SignSsh { .. } => BrokerResponse::Denied {
@@ -288,7 +309,10 @@ fn handle_public_connection(
             },
             false,
         ),
-        Ok(Some(session)) => (session_response(&session, request.request, backend)?, true),
+        Ok(Some(session)) => (
+            session_response(&session, request.request, Some(registry), backend)?,
+            true,
+        ),
     };
     if !session_audited {
         emit_request_audit(None, &audit_request, &response);
@@ -306,17 +330,45 @@ fn handle_public_connection(
 fn session_response(
     session: &crate::linux_admission::VerifiedLinuxSession,
     request: BrokerRequest,
+    registry: Option<&LinuxSessionRegistry>,
     backend: &dyn CapabilityBackend,
 ) -> Result<BrokerResponse> {
     let audit_request = request.clone();
     let response = match request {
-        BrokerRequest::Probe => BrokerResponse::Ready {
-            session_id: session.session_id.clone(),
-            workload: session.workload.clone(),
-            profile: session.profile.clone(),
-            expires_at: OffsetDateTime::from_unix_timestamp(session.expires_at_unix)?
-                .format(&Rfc3339)?,
+        BrokerRequest::Probe => ready_response(session)?,
+        BrokerRequest::ActivateSession { .. } => BrokerResponse::Denied {
+            code: "session_invalid".into(),
+            message: "an active workload cannot activate another admission".into(),
         },
+        BrokerRequest::RenewSession { session_id } => {
+            if session_id != session.session_id || registry.is_none() {
+                BrokerResponse::Denied {
+                    code: "session_invalid".into(),
+                    message: "session renewal does not match the admitted workload".into(),
+                }
+            } else {
+                registry
+                    .context("strong session registry is unavailable")?
+                    .renew(&session_id, lease_expiry())?;
+                BrokerResponse::Accepted
+            }
+        }
+        BrokerRequest::EndSession { session_id } => {
+            if session_id != session.session_id || registry.is_none() {
+                BrokerResponse::Denied {
+                    code: "session_invalid".into(),
+                    message: "session teardown does not match the admitted workload".into(),
+                }
+            } else {
+                let existed = registry
+                    .context("strong session registry is unavailable")?
+                    .revoke(&session_id)?;
+                if existed {
+                    backend.revoke_session(&session_id)?;
+                }
+                BrokerResponse::Accepted
+            }
+        }
         operation if !session_authorizes(session, &operation) => BrokerResponse::Denied {
             code: "resource_denied".into(),
             message: "workload profile does not authorize the requested capability".into(),
@@ -377,6 +429,24 @@ fn session_response(
     Ok(response)
 }
 
+fn ready_response(
+    session: &crate::linux_admission::VerifiedLinuxSession,
+) -> Result<BrokerResponse> {
+    Ok(BrokerResponse::Ready {
+        session_id: session.session_id.clone(),
+        owner_uid: session.owner_uid,
+        execution_uid: session.execution_uid,
+        workload: session.workload.clone(),
+        profile: session.profile.clone(),
+        expires_at: OffsetDateTime::from_unix_timestamp(session.expires_at_unix)?
+            .format(&Rfc3339)?,
+    })
+}
+
+fn lease_expiry() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp() + 15 * 60
+}
+
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct BrokerAuditRecord<'a> {
@@ -409,6 +479,9 @@ fn request_audit_record<'a>(
 ) -> BrokerAuditRecord<'a> {
     let (capability, resource_sha256) = match request {
         BrokerRequest::Probe => ("probe", None),
+        BrokerRequest::ActivateSession { .. } => ("session_activate", None),
+        BrokerRequest::RenewSession { .. } => ("session_renew", None),
+        BrokerRequest::EndSession { .. } => ("session_end", None),
         BrokerRequest::GitCredential {
             protocol,
             host,
@@ -555,7 +628,10 @@ fn session_authorizes(
     request: &BrokerRequest,
 ) -> bool {
     match request {
-        BrokerRequest::Probe => true,
+        BrokerRequest::Probe
+        | BrokerRequest::ActivateSession { .. }
+        | BrokerRequest::RenewSession { .. }
+        | BrokerRequest::EndSession { .. } => true,
         BrokerRequest::GitCredential {
             protocol,
             host,
@@ -655,11 +731,18 @@ fn handle_control_connection(
     let input = read_frame(stream)?;
     let request = decode_control_request(&input)?;
     let (audit_event, audit_session) = match &request.request {
+        ControlRequest::Prepare { session } => ("session_prepare", session.session_id.clone()),
         ControlRequest::Register { session } => ("session_register", session.session_id.clone()),
         ControlRequest::Renew { session_id, .. } => ("session_renew", session_id.clone()),
         ControlRequest::Revoke { session_id } => ("session_revoke", session_id.clone()),
     };
     let response = match request.request {
+        ControlRequest::Prepare { session } => match registry.prepare_root_owned(*session) {
+            Ok(()) => ControlResponse::Accepted,
+            Err(_) => ControlResponse::Denied {
+                message: "pending session admission was rejected".into(),
+            },
+        },
         ControlRequest::Register { session } => {
             match registry.register_root_owned(*session, peer_pidfd) {
                 Ok(()) => ControlResponse::Accepted,
@@ -844,6 +927,7 @@ mod tests {
         let session = crate::linux_admission::VerifiedLinuxSession {
             session_id: "0123456789abcdef0123456789abcdef".into(),
             owner_uid: nix::unistd::Uid::effective().as_raw(),
+            execution_uid: nix::unistd::Uid::effective().as_raw(),
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
@@ -862,6 +946,8 @@ mod tests {
             probe_at(&socket).unwrap(),
             crate::broker_protocol::BrokerSessionProbe::Verified {
                 session_id: "0123456789abcdef0123456789abcdef".into(),
+                owner_uid: nix::unistd::Uid::effective().as_raw(),
+                execution_uid: nix::unistd::Uid::effective().as_raw(),
                 workload: "codex".into(),
                 profile: "automation".into(),
             }
@@ -874,6 +960,7 @@ mod tests {
         let session = crate::linux_admission::VerifiedLinuxSession {
             session_id: "0123456789abcdef0123456789abcdef".into(),
             owner_uid: 1000,
+            execution_uid: 991,
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
@@ -921,6 +1008,7 @@ mod tests {
         let session = crate::linux_admission::VerifiedLinuxSession {
             session_id: "0123456789abcdef0123456789abcdef".into(),
             owner_uid: 1000,
+            execution_uid: 991,
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
@@ -940,6 +1028,7 @@ mod tests {
                     public_key_fingerprint: key.fingerprint.clone(),
                     payload: vec![1, 2, 3],
                 },
+                None,
                 &SigningBackend,
             )
             .unwrap(),
@@ -957,6 +1046,7 @@ mod tests {
                         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
                     payload: vec![1, 2, 3],
                 },
+                None,
                 &SigningBackend,
             )
             .unwrap(),

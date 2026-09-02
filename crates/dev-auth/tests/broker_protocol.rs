@@ -39,6 +39,8 @@ fn only_explicit_absence_can_route_to_native_tools() {
             &LocalSessionClaim::Absent,
             BrokerSessionProbe::Verified {
                 session_id: "session".into(),
+                owner_uid: 1000,
+                execution_uid: 991,
                 workload: "codex".into(),
                 profile: "automation".into(),
             },
@@ -57,6 +59,8 @@ fn verified_claim_routes_to_broker_session() {
             },
             BrokerSessionProbe::Verified {
                 session_id: "session".into(),
+                owner_uid: 1000,
+                execution_uid: 991,
                 workload: "codex".into(),
                 profile: "automation".into(),
             }
@@ -71,20 +75,43 @@ fn verified_claim_routes_to_broker_session() {
 
 #[test]
 fn request_frames_are_bounded_versioned_and_closed() {
-    let valid = br#"{"version":1,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"git_credential","protocol":"https","host":"github.com","owner":"ExampleOrg","repository":"repo"}}"#;
+    let valid = br#"{"version":2,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"git_credential","protocol":"https","host":"github.com","owner":"ExampleOrg","repository":"repo"}}"#;
     let decoded = decode_request_frame(valid).unwrap();
     assert_eq!(decoded.version, BROKER_PROTOCOL_VERSION);
 
     for invalid in [
-        br#"{"version":2,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"probe"}}"#.as_slice(),
-        br#"{"version":1,"request_id":"short","request":{"operation":"probe"}}"#.as_slice(),
-        br#"{"version":1,"request_id":"0123456789abcdef0123456789abcdef","unknown":true,"request":{"operation":"probe"}}"#.as_slice(),
-        br#"{"version":1,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"git_credential","protocol":"http","host":"github.com","owner":"ExampleOrg","repository":"repo"}}"#.as_slice(),
+        br#"{"version":1,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"probe"}}"#.as_slice(),
+        br#"{"version":2,"request_id":"short","request":{"operation":"probe"}}"#.as_slice(),
+        br#"{"version":2,"request_id":"0123456789abcdef0123456789abcdef","unknown":true,"request":{"operation":"probe"}}"#.as_slice(),
+        br#"{"version":2,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"git_credential","protocol":"http","host":"github.com","owner":"ExampleOrg","repository":"repo"}}"#.as_slice(),
     ] {
         assert!(decode_request_frame(invalid).is_err());
     }
 
     assert!(decode_request_frame(&vec![b'x'; MAX_BROKER_FRAME_BYTES + 1]).is_err());
+}
+
+#[test]
+fn session_lifecycle_requests_are_value_free_and_identifier_bounded() {
+    for request in [
+        BrokerRequest::ActivateSession {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        },
+        BrokerRequest::RenewSession {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        },
+        BrokerRequest::EndSession {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        },
+    ] {
+        let frame = BrokerRequestEnvelope {
+            version: BROKER_PROTOCOL_VERSION,
+            request_id: "abcdef0123456789abcdef0123456789".into(),
+            request: request.clone(),
+        };
+        let encoded = encode_request_frame(&frame).unwrap();
+        assert_eq!(decode_request_frame(&encoded).unwrap().request, request);
+    }
 }
 
 #[test]
@@ -155,6 +182,8 @@ fn responses_reject_malformed_secrets_lifetimes_and_public_diagnostics() {
         },
         BrokerResponse::Ready {
             session_id: request_id.clone(),
+            owner_uid: 1000,
+            execution_uid: 991,
             workload: "codex".into(),
             profile: "automation".into(),
             expires_at: "not-a-time".into(),

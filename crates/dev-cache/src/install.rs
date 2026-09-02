@@ -3,6 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use dev_tools_command::{
+    command_candidates as real_command_candidates, executable_candidates, first_executable,
+    is_executable_file as executable_file, same_path_location,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::cargo_intercept;
@@ -308,26 +312,6 @@ fn audit_entrypoint(
     }
 }
 
-fn executable_candidates(path_entries: &[PathBuf], command: &str) -> Vec<PathBuf> {
-    path_entries
-        .iter()
-        .flat_map(|directory| real_command_candidates(directory, command))
-        .filter(|candidate| executable_file(candidate))
-        .collect()
-}
-
-fn first_executable(path_entries: &[PathBuf], command: &str) -> Option<PathBuf> {
-    executable_candidates(path_entries, command)
-        .into_iter()
-        .next()
-}
-
-fn same_path_location(left: &Path, right: &Path) -> bool {
-    left.file_name() == right.file_name()
-        && left.parent().and_then(|path| fs::canonicalize(path).ok())
-            == right.parent().and_then(|path| fs::canonicalize(path).ok())
-}
-
 fn discovered_versioned_commands(intercept_dir: &Path) -> Vec<String> {
     let mut commands = Vec::new();
     let Some(path) = env::var_os("PATH") else {
@@ -592,33 +576,6 @@ fn real_command_exists(command: &str, intercept_dir: &Path) -> bool {
                 .into_iter()
                 .any(|candidate| executable_file(&candidate))
     })
-}
-
-#[cfg(not(windows))]
-fn real_command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
-    vec![directory.join(command)]
-}
-
-#[cfg(windows)]
-fn real_command_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
-    let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
-    extensions
-        .split(';')
-        .filter(|extension| !extension.is_empty())
-        .map(|extension| directory.join(format!("{command}{extension}")))
-        .collect()
-}
-
-#[cfg(unix)]
-fn executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn executable_file(path: &Path) -> bool {
-    path.is_file()
 }
 
 fn owned_intercept_targets(intercept_dir: &Path) -> Result<Vec<PathBuf>> {

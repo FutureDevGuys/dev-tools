@@ -5,7 +5,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-pub const BROKER_PROTOCOL_VERSION: u32 = 1;
+pub const BROKER_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_BROKER_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -63,6 +63,15 @@ pub struct BrokerRequestEnvelope {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum BrokerRequest {
     Probe,
+    ActivateSession {
+        session_id: String,
+    },
+    RenewSession {
+        session_id: String,
+    },
+    EndSession {
+        session_id: String,
+    },
     GitCredential {
         protocol: String,
         host: String,
@@ -107,6 +116,8 @@ pub enum BrokerResponse {
     Accepted,
     Ready {
         session_id: String,
+        owner_uid: u32,
+        execution_uid: u32,
         workload: String,
         profile: String,
         expires_at: String,
@@ -140,6 +151,8 @@ pub enum LocalSessionClaim {
 pub enum BrokerSessionProbe {
     Verified {
         session_id: String,
+        owner_uid: u32,
+        execution_uid: u32,
         workload: String,
         profile: String,
     },
@@ -176,6 +189,7 @@ pub fn decide_routing(claim: &LocalSessionClaim, probe: BrokerSessionProbe) -> R
                 session_id,
                 workload,
                 profile,
+                ..
             },
         ) => RoutingDecision::BrokerSession {
             session_id,
@@ -248,6 +262,7 @@ fn validate_response(response: &BrokerResponse) -> Result<()> {
             workload,
             profile,
             expires_at,
+            ..
         } => {
             validate_request_id(session_id)?;
             validate_public_identifier(workload, "workload")?;
@@ -322,6 +337,9 @@ fn validate_request_envelope(request: &BrokerRequestEnvelope) -> Result<()> {
     validate_request_id(&request.request_id)?;
     match &request.request {
         BrokerRequest::Probe => Ok(()),
+        BrokerRequest::ActivateSession { session_id }
+        | BrokerRequest::RenewSession { session_id }
+        | BrokerRequest::EndSession { session_id } => validate_request_id(session_id),
         BrokerRequest::GitCredential {
             protocol,
             host,

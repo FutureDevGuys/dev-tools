@@ -46,10 +46,9 @@ pub fn load_credential_inputs(
     {
         bail!("credential input does not match the declared deployment slots");
     }
-    if sources
-        .values()
-        .any(|source| matches!(source, CredentialInputSource::Stdin))
-        && required_slots.len() != 1
+    if sources.iter().any(|(slot, source)| {
+        required_slots.contains(slot) && matches!(source, CredentialInputSource::Stdin)
+    }) && required_slots.len() != 1
     {
         bail!("standard input is valid only when exactly one credential slot requires input");
     }

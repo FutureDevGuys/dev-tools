@@ -1,6 +1,6 @@
 [package]
 name = "dev-auth"
-version = "0.3.5"
+version = "0.3.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,11 +9,13 @@ description = "Transparent workload-identity broker for Git and GitHub CLI"
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64.workspace = true
 directories = "6"
+dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }
+dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 dev-tools-release = { path = "../dev-tools-release" }
-ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
+ed25519-dalek.workspace = true
 fs2 = "0.4"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 keyring = "4.1.6"
@@ -22,8 +24,8 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_jcs = "0.2"
-sha2 = "0.10"
-signature = "2"
+sha2.workspace = true
+signature.workspace = true
 ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
@@ -45,7 +47,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "socket", "user"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "user"] }
 
 [dev-dependencies]
 wait-timeout = "0.2"

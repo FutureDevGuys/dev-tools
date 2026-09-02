@@ -8,8 +8,21 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const RECEIPT_SCHEMA: &str = "dev-auth-install-v2";
+
+pub fn setup_template(name: &str) -> Result<&'static str> {
+    match name {
+        "deployment" => Ok(include_str!("../deployment-v1.example.toml")),
+        "administrator-policy" => Ok(include_str!("../policy-v2.example.toml")),
+        "user-only-policy" => Ok(include_str!("../policy-v2-user-only.example.toml")),
+        "user-config" => Ok(include_str!("../config-v2.example.toml")),
+        _ => bail!(
+            "setup template must be deployment, administrator-policy, user-only-policy, or user-config"
+        ),
+    }
+}
 const RECEIPT_LIMIT: u64 = 64 * 1024;
 const POLICY_LIMIT: u64 = 1024 * 1024;
 const BINARY_LIMIT: u64 = 256 * 1024 * 1024;
@@ -321,6 +334,17 @@ pub struct UserIntegrationReport {
     pub desktop_entries_ready: bool,
 }
 
+pub(crate) fn v3_launcher_readiness(
+    setup: &SetupReport,
+    integrations: Option<&UserIntegrationReport>,
+) -> (bool, bool) {
+    let workload_tool_plane_ready = setup.product_aliases_ready
+        && integrations
+            .is_some_and(|report| report.workload_launchers_ready && report.desktop_entries_ready);
+    let launcher_resolution_ready = setup.transparent_launchers_active;
+    (workload_tool_plane_ready, launcher_resolution_ready)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SetupReadinessReport {
@@ -335,7 +359,10 @@ pub struct SetupReadinessReport {
     pub broker_ready: bool,
     pub workload_launchers_ready: bool,
     pub desktop_entries_ready: bool,
+    pub workload_tool_plane_ready: bool,
+    /// Receipt-owned global same-name Git and GitHub CLI launchers are active.
     pub transparent_launchers_active: bool,
+    /// Normal command resolution is fully active for the requested deployment.
     pub launcher_resolution_ready: bool,
     pub next_action: String,
 }
@@ -377,6 +404,11 @@ pub struct SetupPrerequisiteBlocker {
     pub status: DiscoveryStatus,
     pub required_for: String,
     pub package_hints: BTreeMap<String, String>,
+}
+
+struct ConfiguredWorkloadDiscovery {
+    launchers: BTreeMap<String, Vec<DiscoveredPath>>,
+    desktop_entries: BTreeMap<String, Vec<DiscoveredPath>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -517,97 +549,75 @@ pub fn discover_plan(mode: InstallMode, activate_transparent_launchers: bool) ->
 }
 
 pub fn discover_setup(mode: InstallMode) -> Result<SetupDiscoveryReport> {
+    discover_setup_with_configuration(mode, None, &[])
+}
+
+pub fn discover_setup_with_configuration(
+    mode: InstallMode,
+    administrator_policy: Option<&Path>,
+    user_configurations: &[(String, PathBuf)],
+) -> Result<SetupDiscoveryReport> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective user account does not exist")?;
     let running_executable = fs::canonicalize(std::env::current_exe()?)
         .context("resolve the running dev-auth executable")?;
-    let program_candidates: [(&str, &[&str]); 12] = [
-        ("git", &["/usr/bin/git", "/bin/git"]),
-        ("gh", &["/usr/bin/gh", "/bin/gh"]),
-        ("op", &["/usr/bin/op", "/usr/local/bin/op"]),
-        ("ssh", &["/usr/bin/ssh", "/bin/ssh"]),
-        ("ssh_keygen", &["/usr/bin/ssh-keygen", "/bin/ssh-keygen"]),
-        ("pkexec", &["/usr/bin/pkexec"]),
-        ("systemd_run", &["/usr/bin/systemd-run"]),
-        ("systemd_creds", &["/usr/bin/systemd-creds"]),
-        ("systemctl", &["/usr/bin/systemctl"]),
-        ("bubblewrap", &["/usr/bin/bwrap"]),
-        ("firejail", &["/usr/bin/firejail"]),
-        ("podman", &["/usr/bin/podman"]),
-    ];
-    let programs = program_candidates
-        .into_iter()
-        .map(|(name, candidates)| {
-            (
-                name.to_owned(),
-                discover_paths(candidates, mode, user.uid.as_raw(), true),
-            )
+    let policy = administrator_policy
+        .map(|path| {
+            crate::policy_v2::parse_system_policy_v2(&read_discovery_document(
+                path,
+                "administrator policy",
+            )?)
         })
-        .collect();
-    let local_bin = user.dir.join(".local/bin");
-    let workload_launchers = BTreeMap::from([
-        (
-            "codex".into(),
-            discover_owned_paths(
-                &[
-                    PathBuf::from("/usr/local/bin/codex"),
-                    PathBuf::from("/usr/bin/codex"),
-                    local_bin.join("codex-real"),
-                ],
-                mode,
-                user.uid.as_raw(),
-                true,
-            ),
-        ),
-        (
-            "claude".into(),
-            discover_owned_paths(
-                &[
-                    PathBuf::from("/opt/claude-code/bin/claude"),
-                    PathBuf::from("/usr/local/bin/claude"),
-                    PathBuf::from("/usr/bin/claude"),
-                    local_bin.join("claude-real"),
-                ],
-                mode,
-                user.uid.as_raw(),
-                true,
-            ),
-        ),
-    ]);
-    let local_applications = user.dir.join(".local/share/applications");
-    let desktop_entries = BTreeMap::from([
-        (
-            "codex".into(),
-            discover_owned_paths(
-                &[
-                    PathBuf::from("/usr/share/applications/codex.desktop"),
-                    local_applications.join("codex.desktop"),
-                ],
-                mode,
-                user.uid.as_raw(),
-                false,
-            ),
-        ),
-        (
-            "claude".into(),
-            discover_owned_paths(
-                &[
-                    PathBuf::from("/usr/share/applications/claude.desktop"),
-                    local_applications.join("claude.desktop"),
-                ],
-                mode,
-                user.uid.as_raw(),
-                false,
-            ),
-        ),
-    ]);
+        .transpose()?;
+    if policy.is_none() && !user_configurations.is_empty() {
+        bail!("configured workload discovery requires --administrator-policy");
+    }
+    if let Some(policy) = &policy {
+        let expected_mode = match mode {
+            InstallMode::Strong => crate::policy_v2::SystemMode::Strong,
+            InstallMode::UserOnly => crate::policy_v2::SystemMode::UserOnly,
+        };
+        if policy.mode != expected_mode {
+            bail!("administrator policy mode disagrees with discovery mode");
+        }
+    }
+    let programs = discover_programs(mode, user.uid.as_raw(), policy.as_ref());
+    let configured = discover_configured_workloads(mode, policy.as_ref(), user_configurations)?;
     let strong_blockers = setup_prerequisite_blockers(InstallMode::Strong, &programs);
     let strong_backend_available = strong_backend_available_from_blockers(&strong_blockers);
-    let blockers = if mode == InstallMode::Strong {
+    let mut blockers = if mode == InstallMode::Strong {
         strong_blockers
     } else {
         setup_prerequisite_blockers(mode, &programs)
     };
+    blockers.extend(
+        configured
+            .launchers
+            .iter()
+            .filter_map(|(subject, candidates)| {
+                if candidates
+                    .iter()
+                    .any(|candidate| candidate.status == DiscoveryStatus::Usable)
+                {
+                    return None;
+                }
+                let status = if candidates
+                    .iter()
+                    .any(|candidate| candidate.status == DiscoveryStatus::Unsafe)
+                {
+                    DiscoveryStatus::Unsafe
+                } else {
+                    DiscoveryStatus::Absent
+                };
+                Some(SetupPrerequisiteBlocker {
+                    component: format!("workload_launcher:{subject}"),
+                    status,
+                    required_for: "workload_admission".into(),
+                    package_hints: BTreeMap::new(),
+                })
+            }),
+    );
+    blockers.sort_by(|left, right| left.component.cmp(&right.component));
     Ok(SetupDiscoveryReport {
         schema: "dev-auth-setup-discovery-v1".into(),
         mode,
@@ -615,10 +625,166 @@ pub fn discover_setup(mode: InstallMode) -> Result<SetupDiscoveryReport> {
         strong_backend_available,
         running_executable: running_executable.display().to_string(),
         programs,
-        workload_launchers,
-        desktop_entries,
+        workload_launchers: configured.launchers,
+        desktop_entries: configured.desktop_entries,
         blockers,
     })
+}
+
+fn discover_programs(
+    mode: InstallMode,
+    owner_uid: u32,
+    policy: Option<&crate::policy_v2::SystemPolicyV2>,
+) -> BTreeMap<String, Vec<DiscoveredPath>> {
+    let mut candidates = BTreeMap::<String, Vec<PathBuf>>::from([
+        ("git".into(), vec!["/usr/bin/git".into(), "/bin/git".into()]),
+        ("gh".into(), vec!["/usr/bin/gh".into(), "/bin/gh".into()]),
+        (
+            "op".into(),
+            vec!["/usr/bin/op".into(), "/usr/local/bin/op".into()],
+        ),
+        ("ssh".into(), vec!["/usr/bin/ssh".into(), "/bin/ssh".into()]),
+        (
+            "ssh_keygen".into(),
+            vec!["/usr/bin/ssh-keygen".into(), "/bin/ssh-keygen".into()],
+        ),
+        ("pkexec".into(), vec!["/usr/bin/pkexec".into()]),
+        ("systemd_run".into(), vec!["/usr/bin/systemd-run".into()]),
+        (
+            "systemd_creds".into(),
+            vec!["/usr/bin/systemd-creds".into()],
+        ),
+        (
+            "systemd_sysusers".into(),
+            vec!["/usr/bin/systemd-sysusers".into()],
+        ),
+        ("systemctl".into(), vec!["/usr/bin/systemctl".into()]),
+        ("bubblewrap".into(), vec!["/usr/bin/bwrap".into()]),
+        ("firejail".into(), vec!["/usr/bin/firejail".into()]),
+        ("podman".into(), vec!["/usr/bin/podman".into()]),
+    ]);
+    if let Some(policy) = policy {
+        candidates.insert("git".into(), vec![PathBuf::from(&policy.programs.git)]);
+        candidates.insert("gh".into(), vec![PathBuf::from(&policy.programs.gh)]);
+        candidates.insert("op".into(), vec![PathBuf::from(&policy.programs.op)]);
+        candidates.insert("ssh".into(), vec![PathBuf::from(&policy.programs.ssh)]);
+        candidates.insert(
+            "ssh_keygen".into(),
+            vec![PathBuf::from(&policy.programs.ssh_keygen)],
+        );
+        for (name, adapter) in &policy.sandbox_adapters {
+            candidates.insert(
+                format!("sandbox:{name}"),
+                vec![PathBuf::from(&adapter.executable)],
+            );
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|(name, candidates)| {
+            let discovered = discover_owned_paths(&candidates, mode, owner_uid, true);
+            (name, discovered)
+        })
+        .collect()
+}
+
+fn discover_configured_workloads(
+    mode: InstallMode,
+    policy: Option<&crate::policy_v2::SystemPolicyV2>,
+    user_configurations: &[(String, PathBuf)],
+) -> Result<ConfiguredWorkloadDiscovery> {
+    if policy.is_none() && user_configurations.is_empty() {
+        return Ok(ConfiguredWorkloadDiscovery {
+            launchers: BTreeMap::new(),
+            desktop_entries: BTreeMap::new(),
+        });
+    }
+    let policy = policy.context("configured workload discovery requires --administrator-policy")?;
+
+    let mut launchers = BTreeMap::new();
+    let mut desktop_entries = BTreeMap::new();
+    let mut users = BTreeSet::new();
+    for (user_name, source) in user_configurations {
+        if !users.insert(user_name.clone()) {
+            bail!("configured workload discovery contains a duplicate user");
+        }
+        let account = nix::unistd::User::from_name(user_name)?
+            .with_context(|| format!("configured discovery user {user_name} does not exist"))?;
+        let config = crate::policy_v2::parse_user_config_v2(&read_discovery_document(
+            source,
+            "user configuration",
+        )?)?;
+        for workload in config.workloads {
+            let launcher = policy
+                .trusted_launchers
+                .get(&workload.launcher)
+                .with_context(|| {
+                    format!(
+                        "configured workload {} references an unknown launcher",
+                        workload.name
+                    )
+                })?;
+            let subject = format!("{user_name}:{}", workload.name);
+            launchers.insert(
+                subject.clone(),
+                discover_owned_paths(&[PathBuf::from(launcher)], mode, account.uid.as_raw(), true),
+            );
+            if workload.desktop.is_some() {
+                let path = account
+                    .dir
+                    .join(".local/share/applications")
+                    .join(format!("dev-auth-{}.desktop", workload.name));
+                desktop_entries.insert(
+                    subject,
+                    discover_owned_paths(&[path], mode, account.uid.as_raw(), false),
+                );
+            }
+        }
+    }
+    Ok(ConfiguredWorkloadDiscovery {
+        launchers,
+        desktop_entries,
+    })
+}
+
+fn read_discovery_document(path: &Path, description: &str) -> Result<Vec<u8>> {
+    if !path.is_absolute() {
+        bail!("{description} path must be absolute");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {description} {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("inspect {description} {}", path.display()))?;
+    if !before.file_type().is_file()
+        || before.nlink() != 1
+        || before.mode() & 0o022 != 0
+        || before.len() > POLICY_LIMIT
+    {
+        bail!("{description} has unsafe discovery authority");
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    Read::by_ref(&mut file)
+        .take(POLICY_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {description}"))?;
+    let after = file
+        .metadata()
+        .with_context(|| format!("reinspect {description}"))?;
+    if bytes.len() as u64 > POLICY_LIMIT
+        || bytes.len() as u64 != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        bail!("{description} changed while being read");
+    }
+    Ok(bytes)
 }
 
 fn strong_backend_available_from_blockers(blockers: &[SetupPrerequisiteBlocker]) -> bool {
@@ -630,10 +796,12 @@ fn strong_backend_available_from_blockers(blockers: &[SetupPrerequisiteBlocker])
                     | "pkexec"
                     | "systemd_run"
                     | "systemd_creds"
+                    | "systemd_sysusers"
                     | "systemctl"
                     | "cgroup_v2"
                     | "pidfd"
                     | "systemd_runtime"
+                    | "systemd_full_identity_users"
             )
         })
 }
@@ -644,7 +812,13 @@ fn setup_prerequisite_blockers(
 ) -> Vec<SetupPrerequisiteBlocker> {
     let mut required = vec!["git", "gh", "op", "ssh", "ssh_keygen"];
     if mode == InstallMode::Strong {
-        required.extend(["pkexec", "systemd_run", "systemd_creds", "systemctl"]);
+        required.extend([
+            "pkexec",
+            "systemd_run",
+            "systemd_creds",
+            "systemd_sysusers",
+            "systemctl",
+        ]);
     }
     let mut blockers = required
         .into_iter()
@@ -709,10 +883,35 @@ fn setup_prerequisite_blockers(
                     "strong_admission",
                 ));
             }
+            if !systemd_supports_full_identity_users(Path::new("/usr/bin/systemd-run")) {
+                blockers.push(prerequisite_blocker(
+                    "systemd_full_identity_users",
+                    DiscoveryStatus::Unsupported,
+                    "strong_admission",
+                ));
+            }
         }
     }
     blockers.sort_by(|left, right| left.component.cmp(&right.component));
     blockers
+}
+
+pub(crate) fn require_setup_prerequisites(
+    mode: InstallMode,
+    owner_uid: u32,
+    policy: &crate::policy_v2::SystemPolicyV2,
+) -> Result<()> {
+    let programs = discover_programs(mode, owner_uid, Some(policy));
+    let blockers = setup_prerequisite_blockers(mode, &programs);
+    if !blockers.is_empty() {
+        let components = blockers
+            .iter()
+            .map(|blocker| blocker.component.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        bail!("dev-auth setup prerequisites are not ready: {components}");
+    }
+    Ok(())
 }
 
 fn prerequisite_blocker(
@@ -738,7 +937,12 @@ fn prerequisite_blocker(
             ("debian", "polkitd-pkla"),
             ("fedora", "polkit"),
         ],
-        "systemd_run" | "systemd_creds" | "systemctl" | "systemd_runtime" => [
+        "systemd_run"
+        | "systemd_creds"
+        | "systemd_sysusers"
+        | "systemctl"
+        | "systemd_runtime"
+        | "systemd_full_identity_users" => [
             ("arch", "systemd"),
             ("debian", "systemd"),
             ("fedora", "systemd"),
@@ -757,6 +961,32 @@ fn prerequisite_blocker(
     }
 }
 
+fn systemd_supports_full_identity_users(executable: &Path) -> bool {
+    let arguments = [std::ffi::OsString::from("--version")];
+    let environment = BTreeMap::new();
+    let Ok(output) = dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
+        executable,
+        arguments: &arguments,
+        environment: &environment,
+        cwd: None,
+        timeout: Duration::from_secs(2),
+        output_limit: 64 * 1024,
+    }) else {
+        return false;
+    };
+    output.status.success() && parse_systemd_major_version(&output.stdout).is_some_and(|v| v >= 257)
+}
+
+fn parse_systemd_major_version(output: &[u8]) -> Option<u32> {
+    let first = output.split(|byte| *byte == b'\n').next()?;
+    let first = std::str::from_utf8(first).ok()?;
+    let mut fields = first.split_ascii_whitespace();
+    if fields.next()? != "systemd" {
+        return None;
+    }
+    fields.next()?.parse().ok()
+}
+
 pub fn setup_readiness(mode: InstallMode) -> Result<SetupReadinessReport> {
     let paths = match mode {
         InstallMode::Strong => SetupPaths::strong(),
@@ -771,7 +1001,7 @@ pub fn setup_readiness(mode: InstallMode) -> Result<SetupReadinessReport> {
 
 pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<SetupReadinessReport> {
     let mut report = SetupReadinessReport {
-        schema: "dev-auth-setup-readiness-v1".into(),
+        schema: "dev-auth-setup-readiness-v2".into(),
         mode,
         installed: false,
         authenticated_release: false,
@@ -782,20 +1012,30 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
         broker_ready: false,
         workload_launchers_ready: false,
         desktop_entries_ready: false,
+        workload_tool_plane_ready: false,
         transparent_launchers_active: false,
         launcher_resolution_ready: false,
         next_action: "verify_release_and_apply_plan".into(),
     };
-    match fs::symlink_metadata(paths.receipt_path()) {
+    let receipt_metadata = match fs::symlink_metadata(paths.receipt_path()) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         Err(error) => return Err(error).context("inspect setup readiness receipt"),
-        Ok(_) => {}
+        Ok(metadata) => metadata,
+    };
+    let privileged = nix::unistd::Uid::effective().is_root();
+    if legacy_private_strong_receipt_requires_privileged_plan(
+        mode,
+        privileged,
+        receipt_metadata.mode(),
+    ) {
+        report.installed = true;
+        report.next_action = "run_privileged_setup_plan".into();
+        return Ok(report);
     }
     let receipt = read_receipt(&paths.receipt_path())?;
     if receipt.mode != mode {
         bail!("installed dev-auth mode does not match the requested readiness mode");
     }
-    let privileged = nix::unistd::Uid::effective().is_root();
     let setup = if readiness_requires_private_installation_verification(mode, privileged) {
         verify_at(paths)?
     } else {
@@ -893,30 +1133,25 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
         }
     }
 
-    let integrations = verify_user_integrations_at(
+    let integrations = match verify_user_integrations_at(
         &user.dir,
         Path::new(&receipt.executable),
         &resolved.workloads,
         user.uid.as_raw(),
-    );
-    if let Ok(integrations) = integrations {
-        report.workload_launchers_ready = integrations.workload_launchers_ready;
-        report.desktop_entries_ready = integrations.desktop_entries_ready;
-    } else {
-        report.next_action = "update_user_config".into();
-        return Ok(report);
-    }
-    if !report.transparent_launchers_active {
-        report.next_action = "activate_transparent_launchers".into();
-        return Ok(report);
-    }
-    report.launcher_resolution_ready = transparent_launchers_resolve_first_at(
-        paths,
-        Path::new(&receipt.executable),
-        std::env::var_os("PATH").as_deref().unwrap_or_default(),
-    )?;
+    ) {
+        Ok(integrations) => integrations,
+        Err(_) => {
+            report.next_action = "update_user_config".into();
+            return Ok(report);
+        }
+    };
+    report.workload_launchers_ready = integrations.workload_launchers_ready;
+    report.desktop_entries_ready = integrations.desktop_entries_ready;
+    let launcher_readiness = v3_launcher_readiness(&setup, Some(&integrations));
+    report.workload_tool_plane_ready = launcher_readiness.0;
+    report.launcher_resolution_ready = launcher_readiness.1;
     if !report.launcher_resolution_ready {
-        report.next_action = "fix_launcher_path_precedence".into();
+        report.next_action = "apply_transparent_activation_plan".into();
         return Ok(report);
     }
     report.next_action = "ready".into();
@@ -945,6 +1180,14 @@ fn readiness_requires_private_installation_verification(
     privileged: bool,
 ) -> bool {
     mode == InstallMode::UserOnly || privileged
+}
+
+fn legacy_private_strong_receipt_requires_privileged_plan(
+    mode: InstallMode,
+    privileged: bool,
+    receipt_mode: u32,
+) -> bool {
+    mode == InstallMode::Strong && !privileged && receipt_mode & 0o777 == 0o600
 }
 
 pub fn transparent_launchers_resolve_first_at(
@@ -982,20 +1225,6 @@ pub fn transparent_launchers_resolve_first_at(
         }
     }
     Ok(true)
-}
-
-fn discover_paths(
-    candidates: &[&str],
-    mode: InstallMode,
-    owner_uid: u32,
-    executable: bool,
-) -> Vec<DiscoveredPath> {
-    discover_owned_paths(
-        &candidates.iter().map(PathBuf::from).collect::<Vec<_>>(),
-        mode,
-        owner_uid,
-        executable,
-    )
 }
 
 fn discover_owned_paths(
@@ -1625,6 +1854,44 @@ fn validate_release_transition(
 }
 
 pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
+    let (paths, receipt, _) = current_installation_identity()?;
+    verify_shared_installation(&paths, &receipt)?;
+    verify_exact_alias_set(
+        &paths.bin_dir,
+        &paths.data_root.join("active"),
+        &receipt.product_aliases,
+        &PRODUCT_ALIASES,
+        false,
+    )?;
+    verify_exact_alias_set(
+        &paths.bin_dir,
+        Path::new(&receipt.executable),
+        &receipt.transparent_aliases,
+        &TRANSPARENT_ALIASES,
+        true,
+    )?;
+    Ok((paths, receipt))
+}
+
+pub(crate) fn current_frontend_installation() -> Result<(SetupPaths, InstallReceipt)> {
+    let (paths, receipt, metadata) = current_installation_identity()?;
+    let expected_owner = match receipt.mode {
+        InstallMode::Strong => 0,
+        InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.uid() != expected_owner
+        || metadata.mode() & 0o777 != 0o755
+        || metadata.len() != receipt.executable_length
+    {
+        bail!("running transparent frontend has unsafe filesystem authority");
+    }
+    Ok((paths, receipt))
+}
+
+fn current_installation_identity() -> Result<(SetupPaths, InstallReceipt, fs::Metadata)> {
     let executable = fs::canonicalize(std::env::current_exe()?)
         .context("resolve the running dev-auth executable")?;
     let version_dir = executable
@@ -1655,22 +1922,9 @@ pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
     if receipted_executable != executable || Path::new(&receipt.executable) != executable {
         bail!("running dev-auth executable is not the receipt-owned active version");
     }
-    verify_shared_installation(&paths, &receipt)?;
-    verify_exact_alias_set(
-        &paths.bin_dir,
-        &paths.data_root.join("active"),
-        &receipt.product_aliases,
-        &PRODUCT_ALIASES,
-        false,
-    )?;
-    verify_exact_alias_set(
-        &paths.bin_dir,
-        &executable,
-        &receipt.transparent_aliases,
-        &TRANSPARENT_ALIASES,
-        true,
-    )?;
-    Ok((paths, receipt))
+    let metadata = fs::symlink_metadata(&executable)
+        .context("inspect running receipt-owned dev-auth executable")?;
+    Ok((paths, receipt, metadata))
 }
 
 pub fn verify_at(paths: &SetupPaths) -> Result<SetupReport> {
@@ -2413,6 +2667,10 @@ fn validate_install_request(paths: &SetupPaths, request: &InstallRequest) -> Res
                 Path::new("/usr/bin/systemd-creds"),
                 "system credential tool",
             ),
+            (
+                Path::new("/usr/bin/systemd-sysusers"),
+                "system account manager",
+            ),
             (Path::new("/usr/bin/systemctl"), "system service manager"),
         ] {
             validate_root_owned_executable(path, description)?;
@@ -2788,6 +3046,45 @@ pub fn reconcile_user_config_for_account_at(
     user_name: &str,
     current_sha256: Option<&str>,
 ) -> Result<PathBuf> {
+    reconcile_user_config_for_account_with_integrations_at(
+        paths,
+        source,
+        approved_sha256,
+        user_name,
+        current_sha256,
+        true,
+    )
+}
+
+/// Install a validated user configuration without publishing workload entrypoints.
+///
+/// Full setup uses this while the candidate is inactive. Workload launchers and
+/// desktop entries are reconciled only after credential and broker readiness.
+pub fn reconcile_inactive_user_config_for_account_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+    current_sha256: Option<&str>,
+) -> Result<PathBuf> {
+    reconcile_user_config_for_account_with_integrations_at(
+        paths,
+        source,
+        approved_sha256,
+        user_name,
+        current_sha256,
+        false,
+    )
+}
+
+fn reconcile_user_config_for_account_with_integrations_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    user_name: &str,
+    current_sha256: Option<&str>,
+    reconcile_integrations: bool,
+) -> Result<PathBuf> {
     let user = nix::unistd::User::from_name(user_name)?
         .context("user configuration names an unknown native account")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
@@ -2825,8 +3122,10 @@ pub fn reconcile_user_config_for_account_at(
     let executable = PathBuf::from(&installation.executable);
     let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
     let owner_uid = user.uid.as_raw();
-    preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
-    preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+    if reconcile_integrations {
+        preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
+        preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+    }
     let destination = crate::policy_store::user_config_path(&user);
     let old_workloads = preflight_user_config_destination(
         &destination,
@@ -2835,11 +3134,14 @@ pub fn reconcile_user_config_for_account_at(
         owner_uid,
         &policy,
         &user.name,
+        reconcile_integrations,
     )?;
     let old_aliases = old_workloads.keys().cloned().collect::<Vec<_>>();
     let result = (|| {
-        reconcile_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
-        reconcile_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+        if reconcile_integrations {
+            reconcile_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
+            reconcile_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
+        }
         match current_sha256 {
             Some(current) => {
                 replace_policy_document(&destination, &bytes, owner_uid, 0o600, current)
@@ -2848,11 +3150,14 @@ pub fn reconcile_user_config_for_account_at(
         }
     })();
     if let Err(error) = result {
-        let alias_rollback =
-            reconcile_workload_launchers_at(&user.dir, &executable, &old_aliases, owner_uid);
-        let desktop_rollback = reconcile_desktop_entries_at(&user.dir, &old_workloads, owner_uid);
-        if alias_rollback.is_err() || desktop_rollback.is_err() {
-            bail!("user configuration apply failed and integration rollback was incomplete: {error:#}");
+        if reconcile_integrations {
+            let alias_rollback =
+                reconcile_workload_launchers_at(&user.dir, &executable, &old_aliases, owner_uid);
+            let desktop_rollback =
+                reconcile_desktop_entries_at(&user.dir, &old_workloads, owner_uid);
+            if alias_rollback.is_err() || desktop_rollback.is_err() {
+                bail!("user configuration apply failed and integration rollback was incomplete: {error:#}");
+            }
         }
         return Err(error).context("apply user configuration transaction");
     }
@@ -2910,6 +3215,7 @@ fn install_or_update_user_config(
         owner_uid,
         &system_policy,
         &user.name,
+        true,
     )?;
     let old_aliases = old_workloads.keys().cloned().collect::<Vec<_>>();
     let result = (|| {
@@ -3592,6 +3898,7 @@ fn preflight_user_config_destination(
     owner_uid: u32,
     system_policy: &crate::policy_v2::SystemPolicyV2,
     native_user: &str,
+    resolve_current_workloads: bool,
 ) -> Result<BTreeMap<String, crate::policy_v2::ResolvedWorkload>> {
     match fs::symlink_metadata(destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3610,10 +3917,18 @@ fn preflight_user_config_destination(
                 None if current_bytes == new_bytes => {}
                 None => bail!("user configuration already exists; use a digest-bound update"),
             }
-            Ok(
-                crate::policy_v2::resolve_policy_for_user(system_policy, native_user, &current)?
+            if resolve_current_workloads {
+                Ok(
+                    crate::policy_v2::resolve_policy_for_user(
+                        system_policy,
+                        native_user,
+                        &current,
+                    )?
                     .workloads,
-            )
+                )
+            } else {
+                Ok(BTreeMap::new())
+            }
         }
     }
 }
@@ -4518,14 +4833,190 @@ mod tests {
     }
 
     #[test]
+    fn unprivileged_readiness_reports_the_safe_upgrade_for_a_private_legacy_receipt() {
+        assert!(legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::Strong,
+            false,
+            0o100600
+        ));
+        assert!(!legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::Strong,
+            true,
+            0o100600
+        ));
+        assert!(!legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::Strong,
+            false,
+            0o100644
+        ));
+        assert!(!legacy_private_strong_receipt_requires_privileged_plan(
+            InstallMode::UserOnly,
+            false,
+            0o100600
+        ));
+    }
+
+    #[test]
     fn strong_backend_availability_includes_runtime_admission_blockers() {
         let runtime_blocker =
             prerequisite_blocker("cgroup_v2", DiscoveryStatus::Absent, "strong_admission");
         assert!(!strong_backend_available_from_blockers(&[runtime_blocker]));
 
+        let account_manager =
+            prerequisite_blocker("systemd_sysusers", DiscoveryStatus::Absent, "strong_setup");
+        assert!(!strong_backend_available_from_blockers(&[account_manager]));
+
         let unrelated_blocker =
             prerequisite_blocker("git", DiscoveryStatus::Absent, "strong_setup");
         assert!(strong_backend_available_from_blockers(&[unrelated_blocker]));
+    }
+
+    #[test]
+    fn workload_discovery_is_configuration_driven_and_has_no_product_names() {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+            .unwrap()
+            .unwrap();
+        let root = tempfile::tempdir_in(&user.dir).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = root.path().join("future-agent");
+        fs::write(&launcher, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let git = root.path().join("native-git");
+        let gh = root.path().join("native-gh");
+        let op = root.path().join("native-op");
+        let ssh = root.path().join("native-ssh");
+        let ssh_keygen = root.path().join("native-ssh-keygen");
+        for program in [&git, &gh, &op, &ssh, &ssh_keygen] {
+            fs::write(program, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let policy = root.path().join("policy.toml");
+        fs::write(
+            &policy,
+            format!(
+                r#"version = 2
+mode = "user_only"
+allowed_users = ["{}"]
+
+[programs]
+op = "{}"
+git = "{}"
+gh = "{}"
+ssh = "{}"
+ssh_keygen = "{}"
+
+[trusted_launchers]
+future = "{}"
+
+[github_apps]
+[credential_slots]
+[authority_caps]
+[workspace_caps]
+"#,
+                user.name,
+                op.display(),
+                git.display(),
+                gh.display(),
+                ssh.display(),
+                ssh_keygen.display(),
+                launcher.display()
+            ),
+        )
+        .unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(
+            &config,
+            r#"version = 2
+
+[[workloads]]
+name = "future-agent"
+launcher = "future"
+profile = "unused"
+secret_references = []
+workspace_roots = []
+desktop = { display_name = "Future Agent", terminal = false }
+
+[workloads.sandbox]
+mode = "none"
+adapters = []
+"#,
+        )
+        .unwrap();
+
+        let empty = discover_setup(InstallMode::UserOnly).unwrap();
+        assert!(empty.workload_launchers.is_empty());
+        assert!(empty.desktop_entries.is_empty());
+
+        let configured = discover_setup_with_configuration(
+            InstallMode::UserOnly,
+            Some(&policy),
+            &[(user.name.clone(), config)],
+        )
+        .unwrap();
+        assert_eq!(
+            configured.workload_launchers[&format!("{}:future-agent", user.name)][0].status,
+            DiscoveryStatus::Usable
+        );
+        assert_eq!(
+            configured.programs["git"][0].path,
+            git.display().to_string()
+        );
+        assert_eq!(configured.programs["op"][0].path, op.display().to_string());
+        assert_eq!(
+            configured.programs["ssh"][0].path,
+            ssh.display().to_string()
+        );
+        assert_eq!(
+            configured.desktop_entries[&format!("{}:future-agent", user.name)][0].status,
+            DiscoveryStatus::Absent
+        );
+        assert!(!configured
+            .blockers
+            .iter()
+            .any(|blocker| blocker.component.starts_with("workload_launcher:")));
+        assert!(!configured.workload_launchers.contains_key("codex"));
+        assert!(!configured.workload_launchers.contains_key("claude"));
+    }
+
+    #[test]
+    fn v3_readiness_requires_both_private_tool_plane_and_global_transparent_launchers() {
+        let mut setup = SetupReport {
+            schema: "dev-auth-setup-report-v2".into(),
+            mode: InstallMode::UserOnly,
+            version: "0.3.0-test".into(),
+            executable: "/opt/dev-auth/dev-auth".into(),
+            native_git: "/usr/bin/git".into(),
+            native_gh: "/usr/bin/gh".into(),
+            product_aliases_ready: true,
+            transparent_launchers_active: false,
+        };
+        let integrations = UserIntegrationReport {
+            schema: "dev-auth-user-integration-v1".into(),
+            workload_launchers_ready: true,
+            desktop_entries_ready: true,
+        };
+        assert_eq!(
+            v3_launcher_readiness(&setup, Some(&integrations)),
+            (true, false)
+        );
+        setup.transparent_launchers_active = true;
+        assert_eq!(
+            v3_launcher_readiness(&setup, Some(&integrations)),
+            (true, true)
+        );
+        assert_eq!(v3_launcher_readiness(&setup, None), (false, true));
+    }
+
+    #[test]
+    fn full_identity_user_namespace_requires_systemd_257_or_newer() {
+        assert_eq!(
+            parse_systemd_major_version(b"systemd 257 (257.9)\n"),
+            Some(257)
+        );
+        assert_eq!(parse_systemd_major_version(b"systemd 261\n"), Some(261));
+        assert_eq!(parse_systemd_major_version(b"systemd 256\n"), Some(256));
+        assert_eq!(parse_systemd_major_version(b"not-systemd 261\n"), None);
+        assert_eq!(parse_systemd_major_version(b"systemd future\n"), None);
     }
 
     #[test]

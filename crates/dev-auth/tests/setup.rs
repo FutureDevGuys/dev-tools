@@ -500,6 +500,7 @@ fn strong_setup_owns_hardened_socket_activated_service_assets() {
     assert!(combined.contains("SocketMode=0666"));
     assert!(combined.contains("SocketMode=0600"));
     assert!(combined.contains("User=dev-auth"));
+    assert!(!combined.contains("dev-auth-workload -"));
     assert!(combined.contains("LoadCredentialEncrypted=op-service-account-token:"));
     assert!(combined.contains("ProtectSystem=strict"));
     assert!(combined.contains("ExecStart=/usr/local/bin/dev-auth broker serve"));

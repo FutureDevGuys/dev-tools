@@ -2,7 +2,9 @@
 members = [
     "crates/dev-auth",
     "crates/dev-cache",
+    "crates/dev-tools-command",
     "crates/dev-tools-installation",
+    "crates/dev-tools-reconcile-protocol",
     "crates/dev-tools-release",
     "crates/skills-sync",
     "crates/update-all",
@@ -13,3 +15,9 @@ resolver = "2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FutureDevGuys/dev-tools"
+
+[workspace.dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
+sha2 = "0.10"
+signature = "2"

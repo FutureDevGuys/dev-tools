@@ -23,6 +23,15 @@ agent = "/opt/dev-auth/bin/agent"
 executable = "/usr/bin/bwrap"
 arguments = ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--share-net"]
 argument_separator = true
+launcher_visibility = "required"
+broker_socket_visibility = "required"
+peer_identity = "preserve"
+cgroup_identity = "retain"
+descendant_containment = "retain"
+network_namespace = "inherit"
+workspace_mounts = "requested"
+read_only_mount_arguments = ["--ro-bind", "{path}", "{path}"]
+read_write_mount_arguments = ["--bind", "{path}", "{path}"]
 
 [github_apps.automation]
 app_id = 42
@@ -220,6 +229,43 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
         WorkspaceAccess::ReadOnly
     );
     assert_eq!(workload.sandbox.adapters, ["bubblewrap"]);
+    let adapter = &resolved.sandbox_adapters["bubblewrap"];
+    assert_eq!(
+        adapter.launcher_visibility,
+        dev_auth::policy_v2::SandboxVisibility::Required
+    );
+    assert_eq!(
+        adapter.broker_socket_visibility,
+        dev_auth::policy_v2::SandboxVisibility::Required
+    );
+    assert_eq!(
+        adapter.peer_identity,
+        dev_auth::policy_v2::SandboxPeerIdentity::Preserve
+    );
+    assert_eq!(
+        adapter.cgroup_identity,
+        dev_auth::policy_v2::SandboxCgroupIdentity::Retain
+    );
+    assert_eq!(
+        adapter.descendant_containment,
+        dev_auth::policy_v2::SandboxDescendantContainment::Retain
+    );
+    assert_eq!(
+        adapter.network_namespace,
+        dev_auth::policy_v2::SandboxNetworkNamespace::Inherit
+    );
+    assert_eq!(
+        adapter.workspace_mounts,
+        dev_auth::policy_v2::SandboxWorkspaceMounts::Requested
+    );
+    assert_eq!(
+        adapter.read_only_mount_arguments,
+        ["--ro-bind", "{path}", "{path}"]
+    );
+    assert_eq!(
+        adapter.read_write_mount_arguments,
+        ["--bind", "{path}", "{path}"]
+    );
 }
 
 #[test]
@@ -287,6 +333,25 @@ fn strict_parsers_reject_unknown_duplicate_and_unsafe_inputs() {
             "unexpectedly accepted:\n{invalid}"
         );
     }
+}
+
+#[test]
+fn workload_workspace_root_count_is_bounded() {
+    let roots = (0..65)
+        .map(|index| {
+            format!(
+                "{{ cap = \"source\", path = \"/srv/source/root-{index}\", access = \"read_only\" }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let input = USER_CONFIG.replace(
+        "workspace_roots = [{ cap = \"source\", path = \"/srv/source/api\", access = \"read_only\" }]",
+        &format!("workspace_roots = [{roots}]"),
+    );
+
+    let error = parse_user_config_v2(input.as_bytes()).unwrap_err();
+    assert!(error.to_string().contains("at most 64 workspace roots"));
 }
 
 #[test]
@@ -480,6 +545,34 @@ fn sandbox_modes_have_fail_closed_adapter_contracts() {
             .as_bytes()
     )
     .is_err());
+
+    for invalid in [
+        SYSTEM_POLICY.replace("launcher_visibility = \"required\"\n", ""),
+        SYSTEM_POLICY.replace("broker_socket_visibility = \"required\"\n", ""),
+        SYSTEM_POLICY.replace(
+            "peer_identity = \"preserve\"",
+            "peer_identity = \"translate\"",
+        ),
+        SYSTEM_POLICY.replace(
+            "cgroup_identity = \"retain\"",
+            "cgroup_identity = \"escape\"",
+        ),
+        SYSTEM_POLICY.replace(
+            "descendant_containment = \"retain\"",
+            "descendant_containment = \"detach\"",
+        ),
+        SYSTEM_POLICY.replace("workspace_mounts = \"requested\"\n", ""),
+        SYSTEM_POLICY.replace(
+            "read_only_mount_arguments = [\"--ro-bind\", \"{path}\", \"{path}\"]",
+            "read_only_mount_arguments = [\"--ro-bind\", \"/tmp\", \"/tmp\"]",
+        ),
+        SYSTEM_POLICY.replace(
+            "read_write_mount_arguments = [\"--bind\", \"{path}\", \"{path}\"]",
+            "read_write_mount_arguments = [\"--bind\", \"{other}\", \"{other}\"]",
+        ),
+    ] {
+        assert!(parse_system_policy_v2(invalid.as_bytes()).is_err());
+    }
 }
 
 #[test]

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::{BTreeMap, BTreeSet};
 
+const MAX_WORKSPACE_ROOTS_PER_WORKLOAD: usize = 64;
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemMode {
@@ -85,6 +87,60 @@ pub struct WorkspaceCap {
     pub access: WorkspaceAccess,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxVisibility {
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPeerIdentity {
+    Preserve,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCgroupIdentity {
+    Retain,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxDescendantContainment {
+    Retain,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetworkNamespace {
+    Inherit,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxWorkspaceMounts {
+    Requested,
+}
+
+impl SandboxNetworkNamespace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Isolated => "isolated",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "inherit" => Ok(Self::Inherit),
+            "isolated" => Ok(Self::Isolated),
+            _ => bail!("sandbox network-namespace contract is invalid"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxAdapterCap {
@@ -93,6 +149,15 @@ pub struct SandboxAdapterCap {
     pub arguments: Vec<String>,
     #[serde(default)]
     pub argument_separator: bool,
+    pub launcher_visibility: SandboxVisibility,
+    pub broker_socket_visibility: SandboxVisibility,
+    pub peer_identity: SandboxPeerIdentity,
+    pub cgroup_identity: SandboxCgroupIdentity,
+    pub descendant_containment: SandboxDescendantContainment,
+    pub network_namespace: SandboxNetworkNamespace,
+    pub workspace_mounts: SandboxWorkspaceMounts,
+    pub read_only_mount_arguments: Vec<String>,
+    pub read_write_mount_arguments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -513,6 +578,14 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
         {
             bail!("sandbox adapter contains an invalid fixed argument");
         }
+        validate_sandbox_mount_arguments(
+            &adapter.read_only_mount_arguments,
+            "read-only workspace mount",
+        )?;
+        validate_sandbox_mount_arguments(
+            &adapter.read_write_mount_arguments,
+            "read-write workspace mount",
+        )?;
     }
 
     for (name, path) in &policy.trusted_launchers {
@@ -658,6 +731,22 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
     Ok(())
 }
 
+fn validate_sandbox_mount_arguments(arguments: &[String], description: &str) -> Result<()> {
+    if arguments.is_empty()
+        || arguments.len() > 32
+        || arguments.iter().any(|argument| {
+            argument.is_empty() || argument.len() > 4096 || argument.contains('\0') || {
+                let without_path = argument.replace("{path}", "");
+                without_path.contains('{') || without_path.contains('}')
+            }
+        })
+        || !arguments.iter().any(|argument| argument.contains("{path}"))
+    {
+        bail!("sandbox adapter contains invalid {description} arguments");
+    }
+    Ok(())
+}
+
 pub fn parse_user_config_v2(input: &[u8]) -> Result<UserConfigV2> {
     let text = std::str::from_utf8(input).context("user configuration is not UTF-8")?;
     let config: UserConfigV2 =
@@ -727,6 +816,9 @@ fn validate_user_config(config: &UserConfigV2) -> Result<()> {
         }
         validate_policy_identifier(&workload.launcher, "workload launcher reference")?;
         validate_policy_identifier(&workload.profile, "workload authority profile reference")?;
+        if workload.workspace_roots.len() > MAX_WORKSPACE_ROOTS_PER_WORKLOAD {
+            bail!("workload may declare at most 64 workspace roots");
+        }
         validate_unique(
             &workload.workspace_roots,
             "workload contains a duplicate workspace root",

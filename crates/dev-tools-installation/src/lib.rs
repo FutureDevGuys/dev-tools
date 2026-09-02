@@ -451,6 +451,8 @@ fn harden_legacy_adoption_directory(path: &Path, owner_uid: u32, mode: u32) -> R
     }
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(not(unix))]
+        let _ = (owner_uid, mode);
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("inspect legacy installation directory {}", path.display()))?;
         #[cfg(unix)]
@@ -713,7 +715,10 @@ fn ensure_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<()> 
     }
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(unix)]
         let existed = fs::symlink_metadata(path).is_ok();
+        #[cfg(not(unix))]
+        let _ = (owner_uid, mode);
         ensure_directory_chain(path)?;
         #[cfg(unix)]
         if !existed {
@@ -883,6 +888,8 @@ fn verify_versioned_artifact_authority(
     owner_uid: u32,
     identity: &ArtifactIdentity,
 ) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = owner_uid;
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect versioned artifact {}", path.display()))?;
     #[cfg(unix)]

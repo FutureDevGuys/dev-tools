@@ -645,6 +645,8 @@ fn cache_directory(cache_root: &Path, product: &str, version: &Version, target: 
 }
 
 fn ensure_release_cache_directory(path: &Path, owner_uid: u32) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = owner_uid;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_dir() {
