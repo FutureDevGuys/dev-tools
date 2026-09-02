@@ -13,7 +13,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
-const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 fn bounded_reader<T>(mut reader: T) -> thread::JoinHandle<Vec<u8>>

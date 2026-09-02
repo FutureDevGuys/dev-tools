@@ -326,6 +326,7 @@ impl RunCli {
                         completion_report,
                         filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
                         rc_root: completion_paths.rc_root,
+                        completion_managed_root: completion_paths.managed_root,
                         completion_config_path: runtime_cfg.source_path.clone(),
                         completion_catalog_path: completion_paths.catalog_path,
                         completion_registry_path: completion_paths.registry_path,
@@ -362,6 +363,7 @@ impl RunCli {
                         event_tx: None,
                         run_log: Some(run_log.clone()),
                         rc_root: completion_paths.rc_root.clone(),
+                        completion_managed_root: completion_paths.managed_root.clone(),
                         completion_config_path: runtime_cfg.source_path.clone(),
                         completion_catalog_path: completion_paths.catalog_path.clone(),
                         completion_registry_path: completion_paths.registry_path.clone(),
@@ -390,6 +392,7 @@ impl RunCli {
                 completion_report,
                 filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
                 rc_root: completion_paths.rc_root,
+                completion_managed_root: completion_paths.managed_root,
                 completion_config_path: runtime_cfg.source_path.clone(),
                 completion_catalog_path: completion_paths.catalog_path,
                 completion_registry_path: completion_paths.registry_path,
@@ -731,6 +734,7 @@ fn now_unix_ms_u64() -> u64 {
 
 struct CompletionPaths {
     rc_root: PathBuf,
+    managed_root: PathBuf,
     powershell_root: Option<PathBuf>,
     catalog_path: PathBuf,
     registry_path: PathBuf,
@@ -799,12 +803,54 @@ fn resolve_completion_paths() -> CompletionPaths {
                 .map(|h| PathBuf::from(h).join(".config/update-all/powershell"))
         });
 
+    let managed_root = env::var("UPDATE_ALL_COMPLETION_ROOT")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_completion_managed_root);
+
     CompletionPaths {
         rc_root,
+        managed_root,
         powershell_root,
         catalog_path,
         registry_path,
     }
+}
+
+pub(crate) fn default_completion_managed_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("update-all/completions");
+        }
+    }
+
+    if let Some(xdg_data_home) = env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(xdg_data_home).join("update-all/completions");
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/update-all/completions");
+    }
+
+    env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("/"))
+        .join(".local/share/update-all/completions")
+}
+
+fn resolve_managed_completion_root(
+    explicit: Option<PathBuf>,
+    defaults: &CompletionPaths,
+) -> Result<PathBuf> {
+    let root = explicit.unwrap_or_else(|| defaults.managed_root.clone());
+    if !root.is_absolute() {
+        bail!(
+            "managed completion root must be absolute: {}",
+            root.display()
+        );
+    }
+    Ok(root)
 }
 
 fn write_completion_apply_managed_catalog(
@@ -966,8 +1012,8 @@ fn resolve_mouse_row_stride(runtime_cfg: &crate::config::RuntimeConfig) -> Mouse
 
 #[derive(clap::Args, Debug)]
 #[command(
-    about = "Generate, install, and audit managed shell completions.",
-    long_about = "Generate, install, and audit managed shell completions.\n\nUse `sync` to probe enabled providers and write managed completion files. Use `install` to add the binary-owned shell bootstrap. Managed completion sync starts from the repo catalog, then additively merges user entries from your config under `[[completions.tools]]`. Matching `(provider, name)` entries can disable a repo-managed tool on your machine without editing the repository. Catalog entries can mark trusted optional tools as ambient and can declare generic command candidates for fallback launch forms such as local package runners.\n\nWhen your config is not in the default location, pass the global `--config <path>` flag before `completions` so sync uses the same file."
+    about = "Generate, publish, and inspect managed shell completions.",
+    long_about = "Generate, publish, and inspect managed shell completions.\n\nUse `sync` to probe enabled providers and publish an immutable snapshot, then `init <shell>` to print the read-only startup line for Bash, Zsh, Fish, Elvish, or PowerShell. The `install` command and sync's `--apply` flag are explicit legacy compatibility surfaces for Zsh and PowerShell only. Managed completion sync starts from the repo catalog, then additively merges user entries from your config under `[[completions.tools]]`. Matching `(provider, name)` entries can disable a repo-managed tool on your machine without editing the repository. Catalog entries can mark trusted optional tools as ambient and can declare generic command candidates for fallback launch forms such as local package runners.\n\nWhen your config is not in the default location, pass the global `--config <path>` flag before `completions` so sync uses the same file."
 )]
 pub struct CompletionsCli {
     #[command(subcommand)]
@@ -978,15 +1024,19 @@ pub struct CompletionsCli {
 enum CompletionsCmd {
     /// Probe providers and write managed completion payloads.
     Sync(CompletionsSyncCli),
-    /// Install the binary-owned shell bootstrap for managed completions.
+    /// Install the legacy binary-owned bootstrap for Zsh or PowerShell.
     Install(CompletionsInstallCli),
+    /// Emit read-only shell init code for the active managed completion snapshot.
+    Init(CompletionsInitCli),
+    /// Inspect the active managed completion snapshot.
+    Status(CompletionsStatusCli),
 }
 
 #[derive(clap::Args, Debug)]
 #[command(
     about = "Probe completion-capable tools and write managed completion files.",
     long_about = "Probe completion-capable tools and write managed completion files.",
-    after_help = "Managed completion sync starts from the repo catalog, then additively merges user config from `[[completions.tools]]` in the active update-all config file.\n\nBeginner authoring loop:\n  1. `update-all config init`\n  2. Add one `[[completions.tools]]` entry\n  3. `update-all config validate --strict`\n  4. `update-all completions sync --providers <provider> --apply --shell zsh`\n\nIf you keep your config somewhere else, use `update-all --config /path/to/config.toml completions sync ...`."
+    after_help = "Managed completion sync starts from the repo catalog, then additively merges user config from `[[completions.tools]]` in the active update-all config file.\n\nBeginner authoring loop:\n  1. `update-all config init`\n  2. Add one `[[completions.tools]]` entry\n  3. `update-all config validate --strict`\n  4. `update-all completions sync --providers <provider>`\n  5. Run `update-all completions init <shell>` and add its printed line to that shell's startup file. Supported values are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.\n\nThe explicit `--apply --shell <shell>` bridge is legacy compatibility wiring for Zsh and PowerShell only. If you keep your config somewhere else, use `update-all --config /path/to/config.toml completions sync ...`."
 )]
 struct CompletionsSyncCli {
     #[arg(
@@ -1020,9 +1070,15 @@ struct CompletionsSyncCli {
 
     #[arg(
         long = "rc-root",
-        help = "Shell rc root where managed completions and bootstrap files are written"
+        help = "Legacy shell rc root where managed completions and bootstrap files are written"
     )]
-    rc_root: PathBuf,
+    rc_root: Option<PathBuf>,
+
+    #[arg(
+        long = "managed-root",
+        help = "Absolute public root where immutable managed completion snapshots are published"
+    )]
+    managed_root: Option<PathBuf>,
 
     #[arg(
         long = "powershell-root",
@@ -1033,14 +1089,14 @@ struct CompletionsSyncCli {
     #[arg(
         long = "apply",
         default_value_t = false,
-        help = "Install the binary-owned completion bootstrap and run completion apply/audit"
+        help = "Explicitly run legacy Zsh or PowerShell bootstrap wiring and apply/audit"
     )]
     apply: bool,
 
     #[arg(
         long = "shell",
         default_value = "zsh",
-        help = "Shell bootstrap target used with --apply"
+        help = "Legacy Zsh or PowerShell bootstrap target used only with --apply"
     )]
     shell: String,
 
@@ -1053,7 +1109,7 @@ struct CompletionsSyncCli {
 }
 
 #[derive(clap::Args, Debug)]
-#[command(about = "Install the binary-owned shell bootstrap for managed completions.")]
+#[command(about = "Install the legacy binary-owned bootstrap for Zsh or PowerShell.")]
 struct CompletionsInstallCli {
     #[arg(
         long = "shell",
@@ -1075,6 +1131,32 @@ struct CompletionsInstallCli {
     powershell_root: Option<PathBuf>,
 }
 
+#[derive(clap::Args, Debug)]
+#[command(about = "Emit read-only shell init code for the active managed completion snapshot.")]
+struct CompletionsInitCli {
+    #[arg(value_name = "SHELL")]
+    shell: String,
+
+    #[arg(
+        long = "managed-root",
+        help = "Absolute public root where immutable managed completion snapshots are published"
+    )]
+    managed_root: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(about = "Inspect the active managed completion snapshot.")]
+struct CompletionsStatusCli {
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
+
+    #[arg(
+        long = "managed-root",
+        help = "Absolute public root where immutable managed completion snapshots are published"
+    )]
+    managed_root: Option<PathBuf>,
+}
+
 impl CompletionsCli {
     pub fn run(self, default_path: Option<PathBuf>) -> Result<()> {
         match self.cmd {
@@ -1084,7 +1166,8 @@ impl CompletionsCli {
                 let registry_path = cli
                     .registry
                     .unwrap_or_else(|| defaults.registry_path.clone());
-                let rc_root = cli.rc_root.clone();
+                let rc_root = cli.rc_root.unwrap_or_else(|| defaults.rc_root.clone());
+                let managed_root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
                 let providers = cli.providers.clone();
                 let res = crate::completions::completion_sync(CompletionSyncArgs {
                     providers_csv: providers.clone(),
@@ -1092,7 +1175,8 @@ impl CompletionsCli {
                     report: cli.report,
                     catalog_path,
                     config_path: default_path,
-                    rc_root,
+                    rc_root: rc_root.clone(),
+                    managed_root,
                     progress_cb: None,
                 })?;
 
@@ -1108,7 +1192,7 @@ impl CompletionsCli {
                     let install = crate::completions::completion_install(
                         crate::completions::CompletionInstallArgs {
                             shell: cli.shell.clone(),
-                            rc_root: cli.rc_root.clone(),
+                            rc_root: rc_root.clone(),
                             powershell_root: powershell_root.clone(),
                         },
                     )?;
@@ -1126,7 +1210,7 @@ impl CompletionsCli {
                     let applied = crate::completions::completion_apply(
                         crate::completions::CompletionApplyArgs {
                             shell: cli.shell,
-                            rc_root: cli.rc_root,
+                            rc_root,
                             powershell_root,
                             registry_path,
                             managed_catalog_path: managed_catalog
@@ -1152,6 +1236,38 @@ impl CompletionsCli {
                 )?;
                 for line in install.events {
                     crate::ua_outln!("{line}");
+                }
+            }
+            CompletionsCmd::Init(cli) => {
+                let defaults = resolve_completion_paths();
+                let root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
+                let init = crate::completions::completion_init(&cli.shell, root)?;
+                crate::ua_out!("{}", init.shell_code);
+            }
+            CompletionsCmd::Status(cli) => {
+                let defaults = resolve_completion_paths();
+                let root = resolve_managed_completion_root(cli.managed_root, &defaults)?;
+                let status = crate::completions::completion_status(root)?;
+                if cli.json {
+                    crate::ua_outln!("{}", serde_json::to_string_pretty(&status.status)?);
+                } else {
+                    crate::ua_outln!("managed_root={}", status.status.root.display());
+                    crate::ua_outln!(
+                        "current_snapshot={}",
+                        status
+                            .status
+                            .current_snapshot
+                            .as_deref()
+                            .unwrap_or("<none>")
+                    );
+                    crate::ua_outln!(
+                        "available_shells={}",
+                        if status.status.available_shells.is_empty() {
+                            "<none>".to_string()
+                        } else {
+                            status.status.available_shells.join(",")
+                        }
+                    );
                 }
             }
         }

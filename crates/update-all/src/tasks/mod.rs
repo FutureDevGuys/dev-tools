@@ -340,6 +340,7 @@ pub struct SyncContext {
     pub(crate) event_tx: Option<DashboardSender>,
     pub run_log: Option<Arc<RunLogSink>>,
     pub rc_root: PathBuf,
+    pub completion_managed_root: PathBuf,
     pub completion_config_path: Option<PathBuf>,
     pub completion_catalog_path: PathBuf,
     pub completion_registry_path: PathBuf,
@@ -631,6 +632,7 @@ pub struct AsyncContext {
     pub completion_report: String,
     pub filter_progress_noise: bool,
     pub rc_root: PathBuf,
+    pub completion_managed_root: PathBuf,
     pub completion_config_path: Option<PathBuf>,
     pub completion_catalog_path: PathBuf,
     pub completion_registry_path: PathBuf,
@@ -1622,6 +1624,7 @@ impl SyncContext {
             catalog_path: self.completion_catalog_path.clone(),
             config_path: self.completion_config_path.clone(),
             rc_root: self.rc_root.clone(),
+            managed_root: self.completion_managed_root.clone(),
             progress_cb: self.completion_progress_cb(task_id),
         })
     }
@@ -3301,17 +3304,44 @@ fn completion_report_sections(sync: &CompletionSyncResult) -> Vec<TaskReportSect
         .iter()
         .map(|record| {
             let status = match record.status {
-                CompletionSyncRecordStatus::Generated => TaskReportStatus::Updated,
-                CompletionSyncRecordStatus::Unchanged => TaskReportStatus::Unchanged,
+                CompletionSyncRecordStatus::Generated | CompletionSyncRecordStatus::Retired => {
+                    TaskReportStatus::Updated
+                }
+                CompletionSyncRecordStatus::Unchanged
+                | CompletionSyncRecordStatus::ProbedUnchanged
+                | CompletionSyncRecordStatus::Reused => TaskReportStatus::Unchanged,
+                CompletionSyncRecordStatus::Retained => TaskReportStatus::Blocked,
+                CompletionSyncRecordStatus::Shadowed => TaskReportStatus::Info,
                 CompletionSyncRecordStatus::Skipped => TaskReportStatus::Skipped,
                 CompletionSyncRecordStatus::Failed => TaskReportStatus::Failed,
             };
+            let mut details = Vec::new();
+            if let Some(reason) = &record.reason {
+                let duplicates_outcome = matches!(
+                    (record.status, reason.as_str()),
+                    (CompletionSyncRecordStatus::Unchanged, "unchanged")
+                        | (
+                            CompletionSyncRecordStatus::ProbedUnchanged,
+                            "probed_unchanged"
+                        )
+                        | (CompletionSyncRecordStatus::Reused, "reused")
+                );
+                if !duplicates_outcome {
+                    details.push(reason.clone());
+                }
+            }
+            if let Some(classification) = record.classification {
+                details.push(format!("classification={}", classification.as_str()));
+            }
+            if let Some(recipe) = &record.recipe {
+                details.push(format!("recipe={recipe}"));
+            }
             TaskReportRow {
                 name: record.tool.clone(),
                 status,
                 before: Some(record.provider.clone()),
                 after: Some(record.artifact.clone().unwrap_or_else(|| "-".to_string())),
-                note: record.reason.clone(),
+                note: (!details.is_empty()).then(|| details.join("; ")),
             }
         })
         .collect::<Vec<_>>();
@@ -13023,20 +13053,21 @@ fn render_per_task_row_notes(section_key: &str, row: &TaskReportRow) -> String {
 }
 
 fn render_update_details_notes(section_key: &str, row: &TaskReportRow) -> String {
-    row.note
+    let note = row
+        .note
         .as_deref()
         .map(str::trim)
-        .filter(|note| !note.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if row.status == TaskReportStatus::Unchanged {
-                "unchanged".to_string()
-            } else if section_key == "completion_generation" {
-                "generated".to_string()
-            } else {
-                report_status_note_label(section_key, row.status).to_string()
-            }
-        })
+        .filter(|note| !note.is_empty());
+    if section_key == "completion_generation" {
+        let status = report_status_note_label_for_row(section_key, row);
+        return match note {
+            Some(note) if note.eq_ignore_ascii_case(status) => status.to_string(),
+            Some(note) => format!("{status}: {note}"),
+            None => status.to_string(),
+        };
+    }
+    note.map(str::to_string)
+        .unwrap_or_else(|| report_status_note_label(section_key, row.status).to_string())
 }
 
 fn report_status_cell_for_row(key: &str, row: &TaskReportRow) -> &'static str {
@@ -13681,6 +13712,7 @@ fn ctx_clone_for_task(
         event_tx: tx,
         run_log: ctx.run_log.clone(),
         rc_root: ctx.rc_root.clone(),
+        completion_managed_root: ctx.completion_managed_root.clone(),
         completion_config_path: ctx.completion_config_path.clone(),
         completion_catalog_path: ctx.completion_catalog_path.clone(),
         completion_registry_path: ctx.completion_registry_path.clone(),

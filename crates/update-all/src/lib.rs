@@ -121,3 +121,12 @@ macro_rules! ua_out {
 pub fn main_entry() -> Result<()> {
     app::main_entry()
 }
+
+/// Internal, versioned completion-query entry point used by managed shell adapters.
+///
+/// This is hidden from the user-facing command surface. Returning `None` leaves the
+/// normal CLI path untouched.
+#[doc(hidden)]
+pub fn maybe_run_completion_query() -> Option<i32> {
+    completions::completion_query::run_from_env()
+}
