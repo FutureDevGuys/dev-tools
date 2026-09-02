@@ -5,9 +5,12 @@
 ```sh
 sync-configs --config ./manifest.yaml --profile desktop --dry-run
 sync-configs --config ./manifest.yaml --profile desktop
+sync-configs logs list
 ```
 
-Dry-run performs no writes and runs no hooks. `sync-configs` installs no packages, applications, public tools, or copies of itself. Personal manifests, host policy, generated configurations, hooks, and desired paths belong in the configuration repository that invokes it.
+Dry-run performs no desired-state writes and runs no hooks; unless logging is disabled, it still records its diagnostic run. `sync-configs` installs no packages, applications, public tools, or copies of itself. Personal manifests, host policy, generated configurations, hooks, and desired paths belong in the configuration repository that invokes it.
+
+Every normal run writes owner-only, value-free diagnostic events under `$XDG_STATE_HOME/sync-configs/runs` on Unix or `%LOCALAPPDATA%\sync-configs\runs` on Windows. Use `--log-style off|events|transcript|both`, `--log-level debug|info|warning|error|critical`, or an absolute `--log-root`; `SYNC_CONFIGS_LOG_ROOT` supplies the root when the CLI does not. Event records never contain manifest paths or values, environment values, credentials, raw hook commands, or hook output. Transcript capture is explicit because it contains the same potentially sensitive text shown on the console. Each run is capped at 8 MiB of events and 16 MiB of transcript, and completed runs are retained for at most 30 days, 100 runs, and 128 MiB. `sync-configs logs list`, `logs show RUN_ID`, and `logs prune [--dry-run]` inspect or enforce the same bounds. A diagnostic write failure warns but does not change convergence success.
 
 An entry may set `pre_script_privilege: sudo` or `post_script_privilege: sudo`. When any selected, non-dry-run entry requests that privilege, `sync-configs` authenticates the native sudo timestamp once, then invokes every declared privileged script through `sudo -n --`; selected user scripts remain unprivileged. No enabled privileged script means no sudo probe or prompt. The trusted manifest owns the command and privilege decision, while sudo remains the credential-cache and authorization authority.
 

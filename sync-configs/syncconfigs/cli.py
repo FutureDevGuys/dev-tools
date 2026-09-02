@@ -35,7 +35,7 @@ TOOLS_DIR = SCRIPT_DIR.parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from . import __version__, json_overlay, managed_path_policy, toml_overlay
+from . import __version__, json_overlay, managed_path_policy, run_logs, toml_overlay
 import yaml
 
 
@@ -1099,6 +1099,25 @@ Examples:
         "--no-color",
         action="store_true",
         help="Disable colored output (enabled by default).",
+    )
+    parser.add_argument(
+        "--log-style",
+        choices=("off", "events", "transcript", "both"),
+        default="events",
+        help="Diagnostic artifact style (default: events).",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error", "critical"),
+        default="info",
+        help="Minimum structured event level (default: info).",
+    )
+    parser.add_argument(
+        "--log-root",
+        help=(
+            "Absolute diagnostic run root. Overrides SYNC_CONFIGS_LOG_ROOT and the "
+            "platform state-directory default."
+        ),
     )
     args = parser.parse_args()
     normalized_profiles: list[str] = []
@@ -3419,6 +3438,7 @@ def run(
     args: argparse.Namespace,
     script_dir: Path,
     structured_reconciler_results: list[dict[str, object]] | None = None,
+    recorder: run_logs.RunRecorder | run_logs.NullRunRecorder | None = None,
 ) -> int:
     use_color = not args.no_color
     config_path = resolve_config_path(args.config, script_dir)
@@ -3819,32 +3839,108 @@ def run(
     print_summary(
         stats, total=total, group_stats=group_stats, use_color=use_color
     )
+    if recorder is not None:
+        recorder.record_status_records(buffer)
+        recorder.record_summary(stats, total)
     error_total = stats.get("errors", 0) + stats.get("script_error", 0)
     return 1 if error_total else 0
 
 
+def run_logs_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="sync-configs logs")
+    parser.add_argument("--log-root")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    list_parser = subparsers.add_parser("list", help="List retained diagnostic runs.")
+    list_parser.add_argument("--log-root", default=argparse.SUPPRESS)
+    list_parser.add_argument("--json", action="store_true")
+    show_parser = subparsers.add_parser("show", help="Show one run metadata record.")
+    show_parser.add_argument("--log-root", default=argparse.SUPPRESS)
+    show_parser.add_argument("run_id")
+    prune_parser = subparsers.add_parser("prune", help="Apply bounded run retention.")
+    prune_parser.add_argument("--log-root", default=argparse.SUPPRESS)
+    prune_parser.add_argument("--dry-run", action="store_true")
+    prune_parser.add_argument("--max-age-days", type=int, default=run_logs.DEFAULT_MAX_AGE_DAYS)
+    prune_parser.add_argument("--max-runs", type=int, default=run_logs.DEFAULT_MAX_RUNS)
+    prune_parser.add_argument("--max-bytes", type=int, default=run_logs.DEFAULT_MAX_BYTES)
+    args = parser.parse_args(argv)
+    try:
+        root = run_logs.resolve_log_root(args.log_root)
+        if args.command == "list":
+            records = run_logs.list_runs(root)
+            if args.json:
+                print(json.dumps(records, sort_keys=True))
+            else:
+                for record in records:
+                    print(
+                        f"{record['run_id']}\t{record.get('status', 'unknown')}\t"
+                        f"{record.get('started_at', 'unknown')}"
+                    )
+            return 0
+        if args.command == "show":
+            print(json.dumps(run_logs.show_run(root, args.run_id), sort_keys=True))
+            return 0
+        policy = run_logs.RetentionPolicy(
+            max_age_days=args.max_age_days,
+            max_runs=args.max_runs,
+            max_bytes=args.max_bytes,
+        )
+        report = run_logs.prune_runs(root, policy, dry_run=args.dry_run)
+        print(json.dumps(report.as_dict(), sort_keys=True))
+        return 0
+    except (OSError, run_logs.LogError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "logs":
+        return run_logs_command(sys.argv[2:])
     script_dir = Path(__file__).resolve().parent
     args = parse_args(script_dir)
-    if args.format == "text":
-        return run(args, script_dir)
-
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    reconciler_results: list[dict[str, object]] = []
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        exit_code = run(args, script_dir, reconciler_results)
-    payload: dict[str, object] = {
-        "schema_version": 1,
-        "outcome": "completed" if exit_code == 0 else "failed",
-        "exit_code": exit_code,
-        "dry_run": bool(args.dry_run),
-        "profiles": list(args.profile),
-    }
-    if reconciler_results:
-        payload["reconcilers"] = reconciler_results
-    print(json.dumps(payload, sort_keys=True))
-    return exit_code
+    try:
+        log_root = run_logs.resolve_log_root(args.log_root)
+    except run_logs.LogError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    recorder = run_logs.start_safely(
+        root=log_root,
+        style=args.log_style,
+        level=args.log_level,
+        dry_run=bool(args.dry_run),
+    )
+    exit_code = 1
+    interrupted = False
+    try:
+        with recorder.capture_console():
+            if args.format == "text":
+                exit_code = run(args, script_dir, recorder=recorder)
+            else:
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                reconciler_results: list[dict[str, object]] = []
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = run(
+                        args,
+                        script_dir,
+                        reconciler_results,
+                        recorder=recorder,
+                    )
+                payload: dict[str, object] = {
+                    "schema_version": 1,
+                    "outcome": "completed" if exit_code == 0 else "failed",
+                    "exit_code": exit_code,
+                    "dry_run": bool(args.dry_run),
+                    "profiles": list(args.profile),
+                }
+                if reconciler_results:
+                    payload["reconcilers"] = reconciler_results
+                print(json.dumps(payload, sort_keys=True))
+        return exit_code
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
+    finally:
+        recorder.finish(exit_code=exit_code, interrupted=interrupted)
 
 
 if __name__ == "__main__":

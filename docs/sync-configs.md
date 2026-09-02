@@ -4,7 +4,15 @@
 
 Results remain buffered into deterministic status groups. Informational records join their own group instead of appearing before the report, and captured hook output uses the same colored, aligned group/name columns as entry results. An interactive terminal receives one immediate value-free line in those same colored, aligned columns before each selected pre- or post-script so a long native or network hook cannot look frozen; the line contains only the phase and declared entry labels. Noninteractive and JSON consumers remain quiet until their normal result, and JSON stdout contains exactly one JSON document.
 
-Dry-run writes nothing and executes no hooks. The command never installs packages, applications, Dev Tools products, or itself.
+Dry-run performs no desired-state writes and executes no hooks; unless logging is disabled, it still records its diagnostic run. The command never installs packages, applications, Dev Tools products, or itself.
+
+## Bounded diagnostics
+
+Normal convergence creates one owner-only run directory beneath `$XDG_STATE_HOME/sync-configs/runs` on Unix or `%LOCALAPPDATA%\sync-configs\runs` on Windows. Root precedence is `--log-root`, `SYNC_CONFIGS_LOG_ROOT`, then the platform default; an explicit root must be absolute. `run.json` records lifecycle, selected logging policy, outcome, and value-free counts. The default `events` style also writes `events.jsonl`; `transcript` writes `console.log`; and `both` writes both payloads. `off` creates nothing.
+
+Structured events deliberately contain no manifest path or value, environment value, credential, hook command, hook output, or arbitrary exception text. Entry labels are represented only by a short SHA-256 correlation identifier. `debug`, `info`, `warning`, `error`, and `critical` select the minimum event severity, with `info` as the default. A transcript is an explicit operator choice because it preserves the console text and may therefore contain sensitive hook output.
+
+Events stop at 8 MiB and transcripts stop at 16 MiB. Finalization retains completed, failed, and interrupted runs for at most 30 days, 100 runs, and 128 MiB in aggregate; live or malformed run directories are not automatically deleted. `sync-configs logs list [--json]`, `sync-configs logs show RUN_ID`, and `sync-configs logs prune [--dry-run]` provide bounded inspection and explicit maintenance. Logging is diagnostic unmanaged state rather than a convergence postcondition: failure to create, append, finalize, or prune a run warns on stderr and does not convert a successful configuration run into failure.
 
 ## Typed external reconcilers
 

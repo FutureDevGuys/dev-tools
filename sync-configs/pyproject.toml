@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sync-configs"
-version = "0.1.12"
+version = "0.1.13"
 description = "Manifest-driven, config-only filesystem and structured-overlay convergence"
 readme = "README.md"
 requires-python = ">=3.11"
