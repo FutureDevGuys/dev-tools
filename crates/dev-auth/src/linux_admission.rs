@@ -38,7 +38,26 @@ impl LinuxPeerEvidence {
 #[serde(deny_unknown_fields)]
 pub struct SessionRegistration {
     pub session_id: String,
+    /// Native account whose policy and resources authorize the workload.
     pub owner_uid: u32,
+    /// Kernel UID that must originate broker requests for this workload.
+    pub execution_uid: u32,
+    /// Kernel primary GID that must originate broker requests for this workload.
+    pub execution_gid: u32,
+    pub workload: String,
+    pub profile: String,
+    pub authority: SessionAuthorityGrant,
+    pub cgroup: PathBuf,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingSessionRegistration {
+    pub session_id: String,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub execution_pid: u32,
     pub workload: String,
     pub profile: String,
     pub authority: SessionAuthorityGrant,
@@ -51,7 +70,17 @@ pub struct SessionRegistration {
 pub struct SessionAuthorityGrant {
     pub github: Option<SessionGitHubGrant>,
     pub signing: Option<SessionOperationKeyGrant>,
+    pub release_signing: Option<SessionReleaseSigningGrant>,
     pub ssh: Vec<SessionOperationKeyGrant>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReleaseSigningGrant {
+    pub credential_slot: String,
+    pub private_key_ref: String,
+    pub public_key: String,
+    pub products: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -87,6 +116,7 @@ struct RegisteredSession {
 pub struct VerifiedLinuxSession {
     pub session_id: String,
     pub owner_uid: u32,
+    pub execution_uid: u32,
     pub workload: String,
     pub profile: String,
     pub authority: SessionAuthorityGrant,
@@ -97,6 +127,7 @@ pub struct VerifiedLinuxSession {
 #[derive(Default)]
 pub struct LinuxSessionRegistry {
     sessions: RwLock<BTreeMap<String, RegisteredSession>>,
+    pending: RwLock<BTreeMap<String, PendingSessionRegistration>>,
 }
 
 pub fn session_authority_from_resolved(
@@ -116,6 +147,14 @@ pub fn session_authority_from_resolved(
             .signing_key
             .as_ref()
             .map(|key| operation_key_grant(&profile.credential_slot, key)),
+        release_signing: profile.release_signing_key.as_ref().map(|key| {
+            SessionReleaseSigningGrant {
+                credential_slot: profile.credential_slot.clone(),
+                private_key_ref: key.private_key_ref.clone(),
+                public_key: key.public_key.clone(),
+                products: profile.release_signing_products.iter().cloned().collect(),
+            }
+        }),
         ssh: profile
             .ssh_keys
             .iter()
@@ -147,6 +186,72 @@ impl LinuxSessionRegistry {
         supervisor_pidfd: OwnedFd,
     ) -> Result<()> {
         self.register_with_owner(registration, 0, supervisor_pidfd)
+    }
+
+    pub fn prepare_root_owned(&self, registration: PendingSessionRegistration) -> Result<()> {
+        validate_pending_session_registration(&registration)?;
+        let sessions = self
+            .sessions
+            .read()
+            .map_err(|_| anyhow::anyhow!("session registry lock is poisoned"))?;
+        if sessions.contains_key(&registration.session_id) {
+            bail!("session identifier is already active");
+        }
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|_| anyhow::anyhow!("pending session registry lock is poisoned"))?;
+        if pending.len() >= SESSION_LIMIT {
+            bail!("pending session registry is full");
+        }
+        if pending.contains_key(&registration.session_id) {
+            bail!("session identifier is already pending");
+        }
+        pending.insert(registration.session_id.clone(), registration);
+        drop(pending);
+        drop(sessions);
+        Ok(())
+    }
+
+    pub fn activate_pending(
+        &self,
+        peer: LinuxPeerEvidence,
+        session_id: &str,
+    ) -> Result<VerifiedLinuxSession> {
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|_| anyhow::anyhow!("pending session registry lock is poisoned"))?;
+        let prepared = pending
+            .remove(session_id)
+            .context("session activation references no pending admission")?;
+        drop(pending);
+        if prepared.expires_at_unix <= time::OffsetDateTime::now_utc().unix_timestamp() {
+            bail!("pending session admission has expired");
+        }
+        validate_pending_activation(&prepared, &peer)?;
+        let registration = SessionRegistration {
+            session_id: prepared.session_id,
+            owner_uid: prepared.owner_uid,
+            execution_uid: peer.uid,
+            execution_gid: peer.gid,
+            workload: prepared.workload,
+            profile: prepared.profile,
+            authority: prepared.authority,
+            cgroup: prepared.cgroup,
+            expires_at_unix: lease_expiry(),
+        };
+        self.register_with_owner(registration.clone(), 0, peer.peer_pidfd)?;
+        Ok(VerifiedLinuxSession {
+            session_id: registration.session_id,
+            owner_uid: registration.owner_uid,
+            execution_uid: registration.execution_uid,
+            workload: registration.workload,
+            profile: registration.profile,
+            authority: registration.authority,
+            cgroup: registration.cgroup,
+            expires_at_unix: registration.expires_at_unix,
+        })
     }
 
     fn register_with_owner(
@@ -225,11 +330,23 @@ impl LinuxSessionRegistry {
             .sessions
             .write()
             .map_err(|_| anyhow::anyhow!("session registry lock is poisoned"))?;
-        Ok(sessions.remove(session_id).is_some())
+        let active = sessions.remove(session_id).is_some();
+        drop(sessions);
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|_| anyhow::anyhow!("pending session registry lock is poisoned"))?;
+        Ok(active | pending.remove(session_id).is_some())
     }
 
     pub fn prune_stale(&self) -> Result<Vec<String>> {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut pending = self
+            .pending
+            .write()
+            .map_err(|_| anyhow::anyhow!("pending session registry lock is poisoned"))?;
+        pending.retain(|_, session| session.expires_at_unix > now);
+        drop(pending);
         let mut sessions = self
             .sessions
             .write()
@@ -291,7 +408,8 @@ impl LinuxSessionRegistry {
             .read()
             .map_err(|_| anyhow::anyhow!("session registry lock is poisoned"))?;
         let mut matching = sessions.values().filter(|session| {
-            session.registration.owner_uid == peer.uid
+            session.registration.execution_uid == peer.uid
+                && session.registration.execution_gid == peer.gid
                 && cgroup_contains(&session.registration.cgroup, &peer.unified_cgroup)
         });
         let Some(session) = matching.next() else {
@@ -323,6 +441,7 @@ impl LinuxSessionRegistry {
         Ok(Some(VerifiedLinuxSession {
             session_id: session.registration.session_id.clone(),
             owner_uid: session.registration.owner_uid,
+            execution_uid: session.registration.execution_uid,
             workload: session.registration.workload.clone(),
             profile: session.registration.profile.clone(),
             authority: session.registration.authority.clone(),
@@ -330,6 +449,29 @@ impl LinuxSessionRegistry {
             expires_at_unix: session.registration.expires_at_unix,
         }))
     }
+}
+
+fn validate_pending_activation(
+    prepared: &PendingSessionRegistration,
+    peer: &LinuxPeerEvidence,
+) -> Result<()> {
+    if peer.uid != prepared.owner_uid {
+        bail!("strong workload execution identity does not match its native owner");
+    }
+    if peer.gid != prepared.owner_gid {
+        bail!("strong workload primary group does not match its native owner");
+    }
+    if peer.pid != prepared.execution_pid {
+        bail!("strong workload activation does not match the retained supervisor process");
+    }
+    if peer.unified_cgroup != prepared.cgroup {
+        bail!("strong workload peer is outside the prepared cgroup");
+    }
+    Ok(())
+}
+
+fn lease_expiry() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp() + 15 * 60
 }
 
 fn pidfd_process_is_alive(pidfd: &OwnedFd) -> Result<bool> {
@@ -426,6 +568,12 @@ fn validate_session_registration(registration: &SessionRegistration) -> Result<(
     validate_public_identifier(&registration.workload, "workload")?;
     validate_public_identifier(&registration.profile, "authority profile")?;
     validate_session_authority(&registration.authority)?;
+    if registration.owner_uid == 0
+        || registration.execution_uid == 0
+        || registration.execution_gid == 0
+    {
+        bail!("session native and execution identities must be non-root");
+    }
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     if registration.expires_at_unix <= now || registration.expires_at_unix > now + 24 * 60 * 60 {
         bail!("session lease expiry is outside the admitted range");
@@ -438,6 +586,36 @@ fn validate_session_registration(registration: &SessionRegistration) -> Result<(
         .strip_prefix(CGROUP_ROOT)
         .context("registered cgroup is outside the unified cgroup root")?;
     validate_relative_cgroup(relative)?;
+    Ok(())
+}
+
+fn validate_pending_session_registration(registration: &PendingSessionRegistration) -> Result<()> {
+    validate_session_identifier(&registration.session_id)?;
+    validate_public_identifier(&registration.workload, "workload")?;
+    validate_public_identifier(&registration.profile, "authority profile")?;
+    validate_session_authority(&registration.authority)?;
+    if registration.owner_uid == 0 || registration.owner_gid == 0 || registration.execution_pid == 0
+    {
+        bail!("pending session owner must be non-root");
+    }
+    let expected = PathBuf::from(format!(
+        "{WORKLOAD_CGROUP_ROOT}/dev-auth-workload-{}.service",
+        registration.session_id
+    ));
+    if registration.cgroup != expected {
+        bail!("pending session cgroup is not the exact product transient unit");
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if registration.expires_at_unix <= now || registration.expires_at_unix > now + 60 {
+        bail!("pending admission must expire within 60 seconds");
+    }
+    Ok(())
+}
+
+fn validate_session_identifier(session_id: &str) -> Result<()> {
+    if session_id.len() != 32 || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("session identifier must contain exactly 32 hexadecimal characters");
+    }
     Ok(())
 }
 
@@ -567,16 +745,52 @@ mod tests {
     }
 
     #[test]
-    fn registration_rejects_the_root_and_user_writable_cgroups() {
-        let registry = LinuxSessionRegistry::new();
-        let root_registration = SessionRegistration {
+    fn pending_activation_is_bound_to_exact_supervisor_pid_uid_gid_and_cgroup() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = UnixStream::connect(&socket).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let evidence = peer_evidence(&server).unwrap();
+        let mut pending = PendingSessionRegistration {
             session_id: "0123456789abcdef0123456789abcdef".into(),
-            owner_uid: nix::unistd::Uid::effective().as_raw(),
+            owner_uid: evidence.uid,
+            owner_gid: evidence.gid,
+            execution_pid: evidence.pid,
             workload: "codex".into(),
             profile: "automation".into(),
             authority: SessionAuthorityGrant {
                 github: None,
                 signing: None,
+                release_signing: None,
+                ssh: Vec::new(),
+            },
+            cgroup: evidence.unified_cgroup.clone(),
+            expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 30,
+        };
+        assert!(validate_pending_activation(&pending, &evidence).is_ok());
+        pending.execution_pid = pending.execution_pid.saturating_add(1);
+        assert!(validate_pending_activation(&pending, &evidence).is_err());
+        pending.execution_pid = evidence.pid;
+        pending.owner_gid = pending.owner_gid.saturating_add(1);
+        assert!(validate_pending_activation(&pending, &evidence).is_err());
+        drop(client);
+    }
+
+    #[test]
+    fn registration_rejects_the_root_and_user_writable_cgroups() {
+        let registry = LinuxSessionRegistry::new();
+        let root_registration = SessionRegistration {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+            execution_uid: nix::unistd::Uid::effective().as_raw(),
+            execution_gid: nix::unistd::getegid().as_raw(),
+            workload: "codex".into(),
+            profile: "automation".into(),
+            authority: SessionAuthorityGrant {
+                github: None,
+                signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::from(CGROUP_ROOT),
@@ -637,5 +851,36 @@ mod tests {
     #[test]
     fn ordinary_test_process_has_no_workload_claim() {
         assert_eq!(local_session_claim().unwrap(), LocalSessionClaim::Absent);
+    }
+
+    #[test]
+    fn pending_admission_is_short_lived_and_bound_to_the_retained_execution_identity() {
+        let registry = LinuxSessionRegistry::new();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let pending = PendingSessionRegistration {
+            session_id: session_id.into(),
+            owner_uid: 1000,
+            owner_gid: 1000,
+            execution_pid: 4242,
+            workload: "codex".into(),
+            profile: "automation".into(),
+            authority: SessionAuthorityGrant {
+                github: None,
+                signing: None,
+                release_signing: None,
+                ssh: Vec::new(),
+            },
+            cgroup: PathBuf::from(format!(
+                "{WORKLOAD_CGROUP_ROOT}/dev-auth-workload-{session_id}.service"
+            )),
+            expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 30,
+        };
+        registry.prepare_root_owned(pending.clone()).unwrap();
+        assert!(registry.prepare_root_owned(pending.clone()).is_err());
+        assert!(registry.revoke(session_id).unwrap());
+
+        let mut wrong_cgroup = pending;
+        wrong_cgroup.cgroup = PathBuf::from("/sys/fs/cgroup/system.slice/other.service");
+        assert!(registry.prepare_root_owned(wrong_cgroup).is_err());
     }
 }

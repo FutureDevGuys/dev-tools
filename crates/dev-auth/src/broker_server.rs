@@ -84,7 +84,7 @@ fn handle_user_connection(
         bail!("user broker peer is outside the documented same-user trust boundary");
     }
     let request = decode_request_frame(&read_frame(stream)?)?;
-    let response = session_response(session, request.request, backend)?;
+    let response = session_response(session, request.request, None, backend)?;
     write_frame(
         stream,
         &encode_response_frame(&BrokerResponseEnvelope {
@@ -181,6 +181,15 @@ impl CapabilityBackend for UnavailableCapabilityBackend {
         bail!("capability backend is unavailable")
     }
 
+    fn sign_release_manifest(
+        &self,
+        _session_id: &str,
+        _grant: &crate::linux_admission::SessionReleaseSigningGrant,
+        _payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        bail!("capability backend is unavailable")
+    }
+
     fn revoke_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
@@ -267,6 +276,24 @@ fn handle_public_connection(
     let request_bytes = read_frame(stream)?;
     let request = decode_request_frame(&request_bytes)?;
     let audit_request = request.request.clone();
+    if let BrokerRequest::ActivateSession { session_id } = &request.request {
+        let response = match registry.activate_pending(peer, session_id) {
+            Ok(session) => ready_response(&session)?,
+            Err(_) => BrokerResponse::Denied {
+                code: "session_invalid".into(),
+                message: "pending workload admission could not be activated".into(),
+            },
+        };
+        emit_request_audit(None, &audit_request, &response);
+        return write_frame(
+            stream,
+            &encode_response_frame(&BrokerResponseEnvelope {
+                version: BROKER_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                response,
+            })?,
+        );
+    }
     let (response, session_audited) = match registry.probe_peer(&peer) {
         Err(_) => (
             BrokerResponse::Denied {
@@ -278,17 +305,24 @@ fn handle_public_connection(
         Ok(None) => (
             match request.request {
                 BrokerRequest::Probe => BrokerResponse::NoSession,
-                BrokerRequest::GitCredential { .. }
+                BrokerRequest::ActivateSession { .. }
+                | BrokerRequest::RenewSession { .. }
+                | BrokerRequest::EndSession { .. }
+                | BrokerRequest::GitCredential { .. }
                 | BrokerRequest::InvalidateGitCredential { .. }
                 | BrokerRequest::GhExecutionToken
-                | BrokerRequest::SignSsh { .. } => BrokerResponse::Denied {
+                | BrokerRequest::SignSsh { .. }
+                | BrokerRequest::SignReleaseManifest { .. } => BrokerResponse::Denied {
                     code: "no_session".into(),
                     message: "caller is outside a registered workload session".into(),
                 },
             },
             false,
         ),
-        Ok(Some(session)) => (session_response(&session, request.request, backend)?, true),
+        Ok(Some(session)) => (
+            session_response(&session, request.request, Some(registry), backend)?,
+            true,
+        ),
     };
     if !session_audited {
         emit_request_audit(None, &audit_request, &response);
@@ -306,17 +340,45 @@ fn handle_public_connection(
 fn session_response(
     session: &crate::linux_admission::VerifiedLinuxSession,
     request: BrokerRequest,
+    registry: Option<&LinuxSessionRegistry>,
     backend: &dyn CapabilityBackend,
 ) -> Result<BrokerResponse> {
     let audit_request = request.clone();
     let response = match request {
-        BrokerRequest::Probe => BrokerResponse::Ready {
-            session_id: session.session_id.clone(),
-            workload: session.workload.clone(),
-            profile: session.profile.clone(),
-            expires_at: OffsetDateTime::from_unix_timestamp(session.expires_at_unix)?
-                .format(&Rfc3339)?,
+        BrokerRequest::Probe => ready_response(session)?,
+        BrokerRequest::ActivateSession { .. } => BrokerResponse::Denied {
+            code: "session_invalid".into(),
+            message: "an active workload cannot activate another admission".into(),
         },
+        BrokerRequest::RenewSession { session_id } => {
+            if session_id != session.session_id || registry.is_none() {
+                BrokerResponse::Denied {
+                    code: "session_invalid".into(),
+                    message: "session renewal does not match the admitted workload".into(),
+                }
+            } else {
+                registry
+                    .context("strong session registry is unavailable")?
+                    .renew(&session_id, lease_expiry())?;
+                BrokerResponse::Accepted
+            }
+        }
+        BrokerRequest::EndSession { session_id } => {
+            if session_id != session.session_id || registry.is_none() {
+                BrokerResponse::Denied {
+                    code: "session_invalid".into(),
+                    message: "session teardown does not match the admitted workload".into(),
+                }
+            } else {
+                let existed = registry
+                    .context("strong session registry is unavailable")?
+                    .revoke(&session_id)?;
+                if existed {
+                    backend.revoke_session(&session_id)?;
+                }
+                BrokerResponse::Accepted
+            }
+        }
         operation if !session_authorizes(session, &operation) => BrokerResponse::Denied {
             code: "resource_denied".into(),
             message: "workload profile does not authorize the requested capability".into(),
@@ -372,9 +434,51 @@ fn session_response(
                 message: "workload profile has no signing authority".into(),
             },
         },
+        BrokerRequest::SignReleaseManifest {
+            release_public_key,
+            payload,
+            ..
+        } => match session.authority.release_signing.as_ref() {
+            Some(grant) if grant.public_key == release_public_key => {
+                match dev_tools_release::validate_unsigned_product_manifest(&payload) {
+                    Ok(manifest) if grant.products.contains(&manifest.product) => {
+                        match backend.sign_release_manifest(&session.session_id, grant, &payload) {
+                            Ok(signature) => BrokerResponse::Signature { signature },
+                            Err(_) => provider_denial(),
+                        }
+                    }
+                    Ok(_) | Err(_) => BrokerResponse::Denied {
+                        code: "resource_denied".into(),
+                        message: "release manifest is outside workload authority".into(),
+                    },
+                }
+            }
+            Some(_) | None => BrokerResponse::Denied {
+                code: "resource_denied".into(),
+                message: "workload profile has no release-signing authority".into(),
+            },
+        },
     };
     emit_request_audit(Some(session), &audit_request, &response);
     Ok(response)
+}
+
+fn ready_response(
+    session: &crate::linux_admission::VerifiedLinuxSession,
+) -> Result<BrokerResponse> {
+    Ok(BrokerResponse::Ready {
+        session_id: session.session_id.clone(),
+        owner_uid: session.owner_uid,
+        execution_uid: session.execution_uid,
+        workload: session.workload.clone(),
+        profile: session.profile.clone(),
+        expires_at: OffsetDateTime::from_unix_timestamp(session.expires_at_unix)?
+            .format(&Rfc3339)?,
+    })
+}
+
+fn lease_expiry() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp() + 15 * 60
 }
 
 #[derive(Serialize)]
@@ -409,6 +513,9 @@ fn request_audit_record<'a>(
 ) -> BrokerAuditRecord<'a> {
     let (capability, resource_sha256) = match request {
         BrokerRequest::Probe => ("probe", None),
+        BrokerRequest::ActivateSession { .. } => ("session_activate", None),
+        BrokerRequest::RenewSession { .. } => ("session_renew", None),
+        BrokerRequest::EndSession { .. } => ("session_end", None),
         BrokerRequest::GitCredential {
             protocol,
             host,
@@ -440,6 +547,23 @@ fn request_audit_record<'a>(
             },
             Some(public_resource_digest(&[profile, public_key_fingerprint])),
         ),
+        BrokerRequest::SignReleaseManifest {
+            profile,
+            release_public_key,
+            payload,
+        } => {
+            let product = dev_tools_release::validate_unsigned_product_manifest(payload)
+                .map(|manifest| manifest.product)
+                .unwrap_or_else(|_| "invalid".into());
+            (
+                "release_manifest_signing",
+                Some(public_resource_digest(&[
+                    profile,
+                    release_public_key,
+                    &product,
+                ])),
+            )
+        }
     };
     let outcome = match response {
         BrokerResponse::Denied { code, .. } => format!("denied:{code}"),
@@ -555,7 +679,10 @@ fn session_authorizes(
     request: &BrokerRequest,
 ) -> bool {
     match request {
-        BrokerRequest::Probe => true,
+        BrokerRequest::Probe
+        | BrokerRequest::ActivateSession { .. }
+        | BrokerRequest::RenewSession { .. }
+        | BrokerRequest::EndSession { .. } => true,
         BrokerRequest::GitCredential {
             protocol,
             host,
@@ -585,6 +712,22 @@ fn session_authorizes(
         } => {
             profile == &session.profile
                 && session_operation_key(session, *purpose, public_key_fingerprint).is_some()
+        }
+        BrokerRequest::SignReleaseManifest {
+            profile,
+            release_public_key,
+            payload,
+        } => {
+            profile == &session.profile
+                && session
+                    .authority
+                    .release_signing
+                    .as_ref()
+                    .is_some_and(|grant| {
+                        grant.public_key == *release_public_key
+                            && dev_tools_release::validate_unsigned_product_manifest(payload)
+                                .is_ok_and(|manifest| grant.products.contains(&manifest.product))
+                    })
         }
     }
 }
@@ -655,11 +798,18 @@ fn handle_control_connection(
     let input = read_frame(stream)?;
     let request = decode_control_request(&input)?;
     let (audit_event, audit_session) = match &request.request {
+        ControlRequest::Prepare { session } => ("session_prepare", session.session_id.clone()),
         ControlRequest::Register { session } => ("session_register", session.session_id.clone()),
         ControlRequest::Renew { session_id, .. } => ("session_renew", session_id.clone()),
         ControlRequest::Revoke { session_id } => ("session_revoke", session_id.clone()),
     };
     let response = match request.request {
+        ControlRequest::Prepare { session } => match registry.prepare_root_owned(*session) {
+            Ok(()) => ControlResponse::Accepted,
+            Err(_) => ControlResponse::Denied {
+                message: "pending session admission was rejected".into(),
+            },
+        },
         ControlRequest::Register { session } => {
             match registry.register_root_owned(*session, peer_pidfd) {
                 Ok(()) => ControlResponse::Accepted,
@@ -802,6 +952,15 @@ mod tests {
             bail!("unexpected GitHub request")
         }
 
+        fn sign_release_manifest(
+            &self,
+            _session_id: &str,
+            _grant: &crate::linux_admission::SessionReleaseSigningGrant,
+            payload: &[u8],
+        ) -> Result<Vec<u8>> {
+            Ok(payload.to_vec())
+        }
+
         fn sign_ssh(
             &self,
             _session_id: &str,
@@ -844,11 +1003,13 @@ mod tests {
         let session = crate::linux_admission::VerifiedLinuxSession {
             session_id: "0123456789abcdef0123456789abcdef".into(),
             owner_uid: nix::unistd::Uid::effective().as_raw(),
+            execution_uid: nix::unistd::Uid::effective().as_raw(),
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
                 github: None,
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::new(),
@@ -862,6 +1023,8 @@ mod tests {
             probe_at(&socket).unwrap(),
             crate::broker_protocol::BrokerSessionProbe::Verified {
                 session_id: "0123456789abcdef0123456789abcdef".into(),
+                owner_uid: nix::unistd::Uid::effective().as_raw(),
+                execution_uid: nix::unistd::Uid::effective().as_raw(),
                 workload: "codex".into(),
                 profile: "automation".into(),
             }
@@ -874,6 +1037,7 @@ mod tests {
         let session = crate::linux_admission::VerifiedLinuxSession {
             session_id: "0123456789abcdef0123456789abcdef".into(),
             owner_uid: 1000,
+            execution_uid: 991,
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
@@ -890,6 +1054,7 @@ mod tests {
                     installation_ids: vec![],
                 }),
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: "/sys/fs/cgroup/system.slice/dev-auth-workload-0123456789abcdef0123456789abcdef.service".into(),
@@ -921,11 +1086,13 @@ mod tests {
         let session = crate::linux_admission::VerifiedLinuxSession {
             session_id: "0123456789abcdef0123456789abcdef".into(),
             owner_uid: 1000,
+            execution_uid: 991,
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
                 github: None,
                 signing: Some(key.clone()),
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::new(),
@@ -940,6 +1107,7 @@ mod tests {
                     public_key_fingerprint: key.fingerprint.clone(),
                     payload: vec![1, 2, 3],
                 },
+                None,
                 &SigningBackend,
             )
             .unwrap(),
@@ -957,11 +1125,80 @@ mod tests {
                         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
                     payload: vec![1, 2, 3],
                 },
+                None,
                 &SigningBackend,
             )
             .unwrap(),
             BrokerResponse::Denied { code, .. } if code == "resource_denied"
         ));
+    }
+
+    #[test]
+    fn release_manifest_signing_rejects_git_signing_and_ungranted_products() {
+        let key = crate::linux_admission::SessionOperationKeyGrant {
+            credential_slot: "automation".into(),
+            private_key_ref: "op://Automation/release/private-key".into(),
+            public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test".into(),
+            fingerprint: "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI".into(),
+        };
+        let payload = serde_jcs::to_vec(&serde_json::json!({
+            "schema": "dev-auth-product-v2",
+            "product": "dev-auth",
+            "generation": 17,
+            "version": "0.3.6",
+            "source_commit": "a".repeat(40),
+            "engine_protocol": 1,
+            "artifacts": {"linux-x86_64": {
+                "url": "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.3.6/dev-auth-0.3.6-linux-x86_64",
+                "length": 42,
+                "sha256": "b".repeat(64),
+            }}
+        }))
+        .unwrap();
+        let mut session = crate::linux_admission::VerifiedLinuxSession {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+            owner_uid: 1000,
+            execution_uid: 991,
+            workload: "release-agent".into(),
+            profile: "release".into(),
+            authority: crate::linux_admission::SessionAuthorityGrant {
+                github: None,
+                signing: Some(key.clone()),
+                release_signing: None,
+                ssh: Vec::new(),
+            },
+            cgroup: PathBuf::new(),
+            expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 900,
+        };
+        let request = || BrokerRequest::SignReleaseManifest {
+            profile: "release".into(),
+            release_public_key: "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072"
+                .into(),
+            payload: payload.clone(),
+        };
+        assert!(matches!(
+            session_response(&session, request(), None, &SigningBackend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+
+        session.authority.signing = None;
+        session.authority.release_signing =
+            Some(crate::linux_admission::SessionReleaseSigningGrant {
+                credential_slot: key.credential_slot.clone(),
+                private_key_ref: "op://Automation/release/private-key".into(),
+                public_key: "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072"
+                    .into(),
+                products: vec!["update-all".into()],
+            });
+        assert!(matches!(
+            session_response(&session, request(), None, &SigningBackend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+        session.authority.release_signing.as_mut().unwrap().products = vec!["dev-auth".into()];
+        assert_eq!(
+            session_response(&session, request(), None, &SigningBackend).unwrap(),
+            BrokerResponse::Signature { signature: payload }
+        );
     }
 
     #[test]

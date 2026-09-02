@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from release_signing import (  # noqa: E402
+    key_id,
     load_root_document,
     read_public_key,
     verify_root_document,
@@ -58,6 +61,46 @@ def test_release_builder_captures_zipapp_stdout(monkeypatch) -> None:
     assert observed["check"] is True
 
 
+def test_release_builder_source_identity_uses_the_declared_public_git(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_release_set_module()
+    public_git = tmp_path / "git"
+    public_git.write_text("fixture", encoding="utf-8")
+    public_git.chmod(0o755)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if "rev-parse" in args:
+            return "a" * 40
+        return "123" if "--format=%ct" in args else ""
+
+    monkeypatch.setattr(module, "run", fake_run)
+
+    assert module.exact_source(public_git) == ("a" * 40, "123")
+    assert calls
+    assert all(call[0][0] == str(public_git) for call in calls)
+
+
+def test_release_builder_public_git_is_absolute_executable_and_path_independent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_release_set_module()
+    public_git = tmp_path / "native-git"
+    public_git.write_text("fixture", encoding="utf-8")
+    public_git.chmod(0o755)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (attacker / "git").write_text("fixture", encoding="utf-8")
+    (attacker / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", str(attacker))
+
+    assert module.resolve_public_git(public_git) == public_git.resolve()
+    with pytest.raises(SystemExit, match="absolute executable"):
+        module.resolve_public_git(Path("git"))
+
+
 def test_release_builder_keeps_independent_product_versions() -> None:
     module = load_release_set_module()
     versions = module.product_versions()
@@ -85,6 +128,30 @@ def test_release_builder_maps_independent_manifest_generations() -> None:
         ["update-all=6", "dev-cache=9"],
         ("update-all", "dev-cache"),
     ) == {"update-all": 6, "dev-cache": 9}
+
+
+def test_release_builder_forwards_one_external_signer_contract(tmp_path: Path) -> None:
+    module = load_release_set_module()
+    signer = tmp_path / "dev-auth"
+    release_id = "release-0123456789abcdef"
+
+    arguments = module.release_signer_arguments(
+        SimpleNamespace(
+            release_private_key=None,
+            release_signer=signer,
+            release_signer_profile="publish",
+            release_key_id=release_id,
+        )
+    )
+
+    assert arguments == [
+        "--release-signer",
+        str(signer),
+        "--release-signer-profile",
+        "publish",
+        "--release-key-id",
+        release_id,
+    ]
 
 
 def test_release_builder_names_linux_macos_and_windows_targets(monkeypatch) -> None:
@@ -305,3 +372,148 @@ def test_product_release_rejects_a_key_not_authorized_by_root_document(tmp_path:
 
     assert result.returncode != 0
     assert "not authorized" in result.stderr
+
+
+def test_product_release_accepts_an_authorized_external_ed25519_signer(
+    tmp_path: Path,
+) -> None:
+    root = Ed25519PrivateKey.from_private_bytes(bytes([3]) * 32)
+    release = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+    root_file = tmp_path / "root.key"
+    artifact = tmp_path / "dev-auth"
+    signer = tmp_path / "dev-auth-signer"
+    write_key(root_file, root)
+    artifact.write_bytes(b"fixture artifact")
+    artifact.chmod(0o755)
+    root_document, trust = build_root_document(
+        tmp_path,
+        root_files=[root_file],
+        release=release,
+    )
+    signer.write_text(
+        """#!/usr/bin/env python3
+import base64
+import sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+if sys.argv[1:] != ["sign-release-manifest", "--profile", "release"]:
+    raise SystemExit(9)
+payload = sys.stdin.buffer.read()
+key = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+sys.stdout.write(base64.b64encode(key.sign(payload)).decode("ascii") + "\\n")
+""",
+        encoding="utf-8",
+    )
+    signer.chmod(0o755)
+    output = tmp_path / "release"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--product",
+            "dev-auth",
+            "--version",
+            "1.2.3",
+            "--target",
+            "linux-x86_64",
+            "--artifact",
+            str(artifact),
+            "--root-document",
+            str(root_document),
+            "--release-signer",
+            str(signer),
+            "--release-signer-profile",
+            "release",
+            "--release-key-id",
+            key_id("release", release.public_key()),
+            "--trusted-root-public-key",
+            str(trust),
+            "--manifest-generation",
+            "2",
+            "--source-commit",
+            "a" * 40,
+            "--output",
+            str(output),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((output / "dev-auth-stable.json").read_text())
+    signature = manifest["signatures"][0]
+    assert signature["key_id"].startswith("release-")
+
+
+def test_product_release_rejects_an_external_signature_from_the_wrong_key(
+    tmp_path: Path,
+) -> None:
+    root = Ed25519PrivateKey.from_private_bytes(bytes([3]) * 32)
+    release = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+    root_file = tmp_path / "root.key"
+    artifact = tmp_path / "dev-auth"
+    signer = tmp_path / "wrong-signer"
+    write_key(root_file, root)
+    artifact.write_bytes(b"fixture artifact")
+    artifact.chmod(0o755)
+    root_document, trust = build_root_document(
+        tmp_path,
+        root_files=[root_file],
+        release=release,
+    )
+    signer.write_text(
+        """#!/usr/bin/env python3
+import base64
+import sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+payload = sys.stdin.buffer.read()
+key = Ed25519PrivateKey.from_private_bytes(bytes([11]) * 32)
+sys.stdout.write(base64.b64encode(key.sign(payload)).decode("ascii") + "\\n")
+""",
+        encoding="utf-8",
+    )
+    signer.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--product",
+            "dev-auth",
+            "--version",
+            "1.2.3",
+            "--target",
+            "linux-x86_64",
+            "--artifact",
+            str(artifact),
+            "--root-document",
+            str(root_document),
+            "--release-signer",
+            str(signer),
+            "--release-signer-profile",
+            "release",
+            "--release-key-id",
+            key_id("release", release.public_key()),
+            "--trusted-root-public-key",
+            str(trust),
+            "--manifest-generation",
+            "2",
+            "--source-commit",
+            "a" * 40,
+            "--output",
+            str(tmp_path / "release"),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode != 0
+    assert "does not match the authorized key" in result.stderr

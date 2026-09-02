@@ -13,7 +13,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
-const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 fn bounded_reader<T>(mut reader: T) -> thread::JoinHandle<Vec<u8>>
@@ -32,6 +32,18 @@ where
 }
 
 fn bounded_output(command: &mut Command) -> Output {
+    bounded_output_with_timeout(
+        command,
+        PUBLIC_SUBPROCESS_TIMEOUT,
+        "public dev-auth subprocess",
+    )
+}
+
+fn bounded_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    description: &str,
+) -> Output {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -40,16 +52,23 @@ fn bounded_output(command: &mut Command) -> Output {
         .unwrap();
     let stdout = bounded_reader(child.stdout.take().unwrap());
     let stderr = bounded_reader(child.stderr.take().unwrap());
-    let status = match child.wait_timeout(PUBLIC_SUBPROCESS_TIMEOUT).unwrap() {
-        Some(status) => status,
+    let (status, timed_out) = match child.wait_timeout(timeout).unwrap() {
+        Some(status) => (status, false),
         None => {
             child.kill().unwrap();
-            let _ = child.wait();
-            panic!("public dev-auth subprocess exceeded its 20 second bound");
+            (child.wait().unwrap(), true)
         }
     };
     let stdout = stdout.join().unwrap();
     let stderr = stderr.join().unwrap();
+    if timed_out {
+        panic!(
+            "{description} exceeded its {} second bound: stdout={} stderr={}",
+            timeout.as_secs(),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
     assert!(stdout.len() <= PUBLIC_SUBPROCESS_OUTPUT_LIMIT as usize);
     assert!(stderr.len() <= PUBLIC_SUBPROCESS_OUTPUT_LIMIT as usize);
     Output {
@@ -66,12 +85,45 @@ fn private_runtime() -> TempDir {
 }
 
 fn private_program_root() -> TempDir {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
     let directory = tempfile::Builder::new()
         .prefix("dev-auth-cli-programs-")
-        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .tempdir_in(user.dir)
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     directory
+}
+
+#[test]
+fn standalone_binary_embeds_every_setup_source_template() {
+    for name in [
+        "deployment",
+        "administrator-policy",
+        "user-only-policy",
+        "user-config",
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .args(["setup", "template", name])
+                .env_clear(),
+        );
+        assert!(output.status.success(), "{name}: {:?}", output);
+        assert!(output.stderr.is_empty(), "{name}");
+        match name {
+            "deployment" => {
+                dev_auth::deployment::parse_deployment_document(&output.stdout).unwrap();
+            }
+            "administrator-policy" | "user-only-policy" => {
+                dev_auth::policy_v2::parse_system_policy_v2(&output.stdout).unwrap();
+            }
+            "user-config" => {
+                dev_auth::policy_v2::parse_user_config_v2(&output.stdout).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]
@@ -102,6 +154,18 @@ fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("accepts only a full setup plan v3"));
+}
+
+#[test]
+fn setup_v3_does_not_expose_a_global_launcher_activation_command() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["setup", "activate", "--mode", "user-only"])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("unknown setup operation"));
 }
 
 #[test]
@@ -155,6 +219,22 @@ fn typed_reconcile_defers_when_standalone_system_is_absent() {
     assert!(!plan.exists());
 }
 
+#[test]
+fn release_manifest_signing_rejects_an_empty_payload_before_broker_access() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["sign-release-manifest", "--profile", "release"])
+            .env_clear(),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("release manifest must not be empty"),
+        "{error}"
+    );
+    assert!(!error.contains("unknown command"), "{error}");
+}
+
 #[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,
@@ -200,12 +280,15 @@ impl NativeUserSandbox {
 
     fn command(&self, program: &Path, cwd: &Path) -> Command {
         let uid = fs::metadata(&self.root).unwrap().uid();
+        let program_name = program.file_name().unwrap();
+        let sandbox_program = Path::new("/test-bin").join(program_name);
         let attacker_home = self.root.join("attacker-home");
         let attacker_config = self.root.join("attacker-config");
         fs::create_dir_all(&attacker_home).unwrap();
         fs::create_dir_all(&attacker_config).unwrap();
         let mut command = Command::new("/usr/bin/bwrap");
         command
+            .arg("--die-with-parent")
             .args(["--tmpfs", "/"])
             .args(["--dir", "/usr"])
             .args(["--ro-bind", "/usr", "/usr"])
@@ -219,7 +302,11 @@ impl NativeUserSandbox {
             .args(["--dir", "/etc"])
             .args(["--dir", "/run"])
             .args(["--dir", "/run/user"])
-            .args(["--dir", "/tmp"]);
+            .args(["--dir", "/tmp"])
+            .args(["--dir", "/test-bin"])
+            .arg("--ro-bind")
+            .arg(program)
+            .arg(&sandbox_program);
         let mut ancestor = PathBuf::new();
         for component in self
             .root
@@ -254,7 +341,7 @@ impl NativeUserSandbox {
             .arg("--chdir")
             .arg(cwd)
             .arg("--")
-            .arg(program);
+            .arg(sandbox_program);
         command
     }
 
@@ -262,6 +349,353 @@ impl NativeUserSandbox {
         fs::copy(env!("CARGO_BIN_EXE_dev-auth"), destination).unwrap();
         fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_standalone_user_only_setup_child() {
+    use dev_auth::deployment::{
+        normalize_deployment, parse_deployment_document, DeploymentCliInput,
+    };
+    use dev_auth::setup::{build_plan, rollback_at, InstallMode, InstallRequest, SetupPaths};
+    use dev_auth::setup_v3::{apply_setup_plan_v3, build_setup_plan_v3_at, render_setup_plan_v3};
+
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("dev-auth-clean-home-")
+        .tempdir_in(&user.dir)
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let candidate = user.dir.parent().unwrap().join("product");
+
+    let upstream_log = root.path().join("native-git.log");
+    let native_git = root.path().join("native-git");
+    fs::write(
+        &native_git,
+        format!(
+            "#!/bin/sh\nprintf 'editor=%s\\n' \"${{GIT_EDITOR-}}\" > '{}'\nprintf 'arg=%s\\n' \"$@\" >> '{}'\nexit 23\n",
+            upstream_log.display(),
+            upstream_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&native_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let native_gh = root.path().join("native-gh");
+    let op = root.path().join("op");
+    let ssh = root.path().join("ssh");
+    let ssh_keygen = root.path().join("ssh-keygen");
+    for path in [&native_gh, &op, &ssh, &ssh_keygen] {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let policy = root.path().join("policy.toml");
+    fs::write(
+        &policy,
+        format!(
+            r#"version = 2
+mode = "user_only"
+allowed_users = ["{}"]
+[programs]
+op = "{}"
+git = "{}"
+gh = "{}"
+ssh = "{}"
+ssh_keygen = "{}"
+[trusted_launchers]
+[github_apps]
+[credential_slots]
+[authority_caps]
+[workspace_caps]
+"#,
+            user.name,
+            op.display(),
+            native_git.display(),
+            native_gh.display(),
+            ssh.display(),
+            ssh_keygen.display()
+        ),
+    )
+    .unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(&config, b"version = 2\n").unwrap();
+    for path in [&policy, &config] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let deployment = parse_deployment_document(
+        format!(
+            r#"schema = "dev-auth-deployment-v1"
+mode = "user-only"
+channel = "stable"
+activation = "transparent"
+administrator_policy = "{}"
+
+[[users]]
+name = "{}"
+config = "{}"
+"#,
+            policy.display(),
+            user.name,
+            config.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let intent = normalize_deployment(Some(deployment), DeploymentCliInput::default()).unwrap();
+    let paths = SetupPaths::user_only(&user.dir);
+    let installation = build_plan(
+        &paths,
+        &InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.3.0-clean-device-test".into(),
+            source_executable: candidate,
+            native_git,
+            native_gh,
+            activate_transparent_launchers: false,
+        },
+    )
+    .unwrap();
+    let plan = build_setup_plan_v3_at(intent, installation, false).unwrap();
+    let (_, digest) = render_setup_plan_v3(&plan).unwrap();
+    let first = apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
+    assert!(first.changed);
+    assert!(first.verified);
+
+    let second = apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
+    assert!(!second.changed);
+    assert!(second.verified);
+
+    let output = Command::new(user.dir.join(".local/bin/git"))
+        .args(["future-command", "--new-option", "value"])
+        .env_clear()
+        .env("GIT_EDITOR", "code-insiders --wait")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    let log = fs::read_to_string(upstream_log).unwrap();
+    assert!(log.contains("editor=code-insiders --wait"));
+    assert!(log.contains("arg=future-command"));
+    assert!(log.contains("arg=--new-option"));
+    assert!(log.contains("arg=value"));
+
+    let rollback = rollback_at(&paths).unwrap();
+    assert!(!rollback.transparent_launchers_active);
+    assert!(!user.dir.join(".local/bin/git").exists());
+    assert!(!user.dir.join(".local/bin/gh").exists());
+}
+
+#[cfg(target_os = "linux")]
+fn run_missing_credential_stages_no_workload_launchers_child() {
+    use dev_auth::deployment::{
+        normalize_deployment, parse_deployment_document, DeploymentCliInput,
+    };
+    use dev_auth::setup::{build_plan, InstallMode, InstallRequest, SetupPaths};
+    use dev_auth::setup_v3::{apply_setup_plan_v3, build_setup_plan_v3_at, render_setup_plan_v3};
+
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("dev-auth-inactive-home-")
+        .tempdir_in(&user.dir)
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let candidate = user.dir.parent().unwrap().join("product");
+    let native_git = root.path().join("git");
+    let native_gh = root.path().join("gh");
+    let op = root.path().join("op");
+    let ssh = root.path().join("ssh");
+    let ssh_keygen = root.path().join("ssh-keygen");
+    let future_agent = root.path().join("future-agent");
+    for path in [
+        &native_git,
+        &native_gh,
+        &op,
+        &ssh,
+        &ssh_keygen,
+        &future_agent,
+    ] {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let policy = root.path().join("policy.toml");
+    fs::write(
+        &policy,
+        format!(
+            r#"version = 2
+mode = "user_only"
+allowed_users = ["{}"]
+[programs]
+op = "{}"
+git = "{}"
+gh = "{}"
+ssh = "{}"
+ssh_keygen = "{}"
+[trusted_launchers]
+future-agent = "{}"
+[github_apps]
+[credential_slots.automation]
+users = ["{}"]
+authority_caps = ["automation"]
+secret_references = ["op://Automation/Agent/token"]
+[authority_caps.automation]
+secret_references = ["op://Automation/Agent/token"]
+[workspace_caps]
+"#,
+            user.name,
+            op.display(),
+            native_git.display(),
+            native_gh.display(),
+            ssh.display(),
+            ssh_keygen.display(),
+            future_agent.display(),
+            user.name,
+        ),
+    )
+    .unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        br#"version = 2
+[authority_profiles.automation]
+cap = "automation"
+signing = false
+ssh = false
+secret_references = []
+
+[[workloads]]
+name = "future-agent"
+launcher = "future-agent"
+profile = "automation"
+secret_references = []
+workspace_roots = []
+[workloads.sandbox]
+mode = "none"
+"#,
+    )
+    .unwrap();
+    for path in [&policy, &config] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let deployment = parse_deployment_document(
+        format!(
+            r#"schema = "dev-auth-deployment-v1"
+mode = "user-only"
+channel = "stable"
+activation = "transparent"
+administrator_policy = "{}"
+
+[[users]]
+name = "{}"
+config = "{}"
+
+[[credentials]]
+slot = "automation"
+intent = "enroll-if-absent"
+"#,
+            policy.display(),
+            user.name,
+            config.display(),
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let intent = normalize_deployment(Some(deployment), DeploymentCliInput::default()).unwrap();
+    let paths = SetupPaths::user_only(&user.dir);
+    let installation = build_plan(
+        &paths,
+        &InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.3.0-inactive-test".into(),
+            source_executable: candidate,
+            native_git,
+            native_gh,
+            activate_transparent_launchers: false,
+        },
+    )
+    .unwrap();
+    let plan = build_setup_plan_v3_at(intent, installation, false).unwrap();
+    let (_, digest) = render_setup_plan_v3(&plan).unwrap();
+    let report = apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
+    assert_eq!(report.input_required, ["automation"]);
+    assert!(!report.verified);
+    assert!(!user.dir.join(".local/bin/future-agent").exists());
+    assert!(!user
+        .dir
+        .join(".local/share/dev-auth/workload-aliases-v1.json")
+        .exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn standalone_user_only_setup_is_idempotent_transparent_and_reversible() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_standalone_user_only_setup_child();
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .args(["--strip-debug"])
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "standalone_user_only_setup_is_idempotent_transparent_and_reversible",
+            "--nocapture",
+        ]),
+        Duration::from_secs(90),
+        "standalone setup acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_credential_stages_no_workload_launchers() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_missing_credential_stages_no_workload_launchers_child();
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "missing_credential_stages_no_workload_launchers",
+            "--nocapture",
+        ]),
+        Duration::from_secs(90),
+        "inactive setup acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn credential_helper(operation: &str, input: &str) -> std::process::Output {
@@ -928,12 +1362,16 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         .unwrap()
         .success());
 
-    let clone = bounded_output(sandbox.command(&frontend, &managed).args([
-        "clone",
-        "--no-checkout",
-        "https://github.com/ExampleOrg/cloned.git",
-        "cloned",
-    ]));
+    let clone = bounded_output_with_timeout(
+        sandbox.command(&frontend, &managed).args([
+            "clone",
+            "--no-checkout",
+            "https://github.com/ExampleOrg/cloned.git",
+            "cloned",
+        ]),
+        Duration::from_secs(60),
+        "public managed clone subprocess",
+    );
     assert!(
         clone.status.success(),
         "{}",

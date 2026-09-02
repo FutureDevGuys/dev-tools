@@ -500,6 +500,7 @@ fn strong_setup_owns_hardened_socket_activated_service_assets() {
     assert!(combined.contains("SocketMode=0666"));
     assert!(combined.contains("SocketMode=0600"));
     assert!(combined.contains("User=dev-auth"));
+    assert!(!combined.contains("dev-auth-workload -"));
     assert!(combined.contains("LoadCredentialEncrypted=op-service-account-token:"));
     assert!(combined.contains("ProtectSystem=strict"));
     assert!(combined.contains("ExecStart=/usr/local/bin/dev-auth broker serve"));
@@ -507,7 +508,8 @@ fn strong_setup_owns_hardened_socket_activated_service_assets() {
     assert!(combined.contains(
         "org.freedesktop.policykit.exec.path\">/usr/local/lib/dev-auth/dev-auth-workload-launcher"
     ));
-    assert!(combined.contains("<allow_active>yes</allow_active>"));
+    assert!(combined.contains("<allow_active>auth_self</allow_active>"));
+    assert!(!combined.contains("<allow_active>yes</allow_active>"));
     assert!(combined.contains("<allow_inactive>no</allow_inactive>"));
     assert!(combined.contains("<allow_any>no</allow_any>"));
 }

@@ -171,12 +171,74 @@ struct ProductManifest {
     artifacts: BTreeMap<String, ArtifactIdentity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedProductManifest {
+    pub schema: String,
+    pub product: String,
+    pub generation: u64,
+    pub version: Version,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactIdentity {
     url: String,
     length: u64,
     sha256: String,
+}
+
+/// Validates the exact canonical bytes that the release tooling signs.
+///
+/// This deliberately validates only the shared manifest contract. Product-specific
+/// URL, target, and source authority remains the verifier's responsibility.
+pub fn validate_unsigned_product_manifest(input: &[u8]) -> Result<UnsignedProductManifest> {
+    require_bounded(input, METADATA_LIMIT, "unsigned release manifest")?;
+    let manifest: ProductManifest =
+        serde_json::from_slice(input).context("parse unsigned release manifest")?;
+    let canonical =
+        serde_jcs::to_vec(&manifest).context("canonicalize unsigned release manifest")?;
+    if canonical != input {
+        bail!("unsigned release manifest is not canonical JSON");
+    }
+    if manifest.product.is_empty()
+        || manifest.generation == 0
+        || manifest.engine_protocol != 1
+        || manifest.artifacts.len() != 1
+    {
+        bail!("unsigned release manifest has an unsupported contract");
+    }
+    match (
+        manifest.schema.as_str(),
+        manifest.product.as_str(),
+        manifest.source_commit.as_deref(),
+    ) {
+        ("dev-tools-product-v1", product, None) if product != "dev-auth" => {}
+        ("dev-auth-product-v2", "dev-auth", Some(commit)) if valid_hex(commit, 40) => {}
+        _ => bail!("unsigned release manifest has an unsupported schema"),
+    }
+    let version = Version::parse(&manifest.version).context("parse product manifest version")?;
+    if !version.pre.is_empty() {
+        bail!("unsigned release manifest version is not stable");
+    }
+    let (target, artifact) = manifest
+        .artifacts
+        .iter()
+        .next()
+        .context("unsigned release manifest has no artifact")?;
+    if target.is_empty()
+        || !artifact.url.starts_with("https://")
+        || artifact.length == 0
+        || artifact.length as usize > ARTIFACT_LIMIT
+        || !valid_hex(&artifact.sha256, 64)
+    {
+        bail!("unsigned release manifest artifact identity is invalid");
+    }
+    Ok(UnsignedProductManifest {
+        schema: manifest.schema,
+        product: manifest.product,
+        generation: manifest.generation,
+        version,
+    })
 }
 
 pub fn verify_release_bytes(
@@ -207,8 +269,11 @@ pub fn verify_release_metadata(
     if root.signed.schema != "dev-tools-root-v1" || root.signed.generation == 0 {
         bail!("release root document has an unsupported contract");
     }
-    verify_any_signature(&root, &parse_public_key(&authority.trusted_root_key)?)
-        .context("verify release root document")?;
+    verify_any_signature(
+        &root,
+        &parse_release_public_key(&authority.trusted_root_key)?,
+    )
+    .context("verify release root document")?;
 
     let manifest: SignedEnvelope<ProductManifest> =
         serde_json::from_slice(&metadata.manifest).context("parse product release manifest")?;
@@ -645,6 +710,8 @@ fn cache_directory(cache_root: &Path, product: &str, version: &Version, target: 
 }
 
 fn ensure_release_cache_directory(path: &Path, owner_uid: u32) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = owner_uid;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_dir() {
@@ -704,7 +771,7 @@ fn validate_authority(authority: &ReleaseAuthority) -> Result<()> {
         }
         ArtifactUrlPolicy::GitHubRelease { .. } => {}
     }
-    parse_public_key(&authority.trusted_root_key)?;
+    parse_release_public_key(&authority.trusted_root_key)?;
     Ok(())
 }
 
@@ -768,7 +835,7 @@ fn verify_release_signature(
             continue;
         };
         if verify_signature(
-            &parse_public_key(&key.public_key)?,
+            &parse_release_public_key(&key.public_key)?,
             &canonical,
             &signature.signature,
         )
@@ -802,7 +869,7 @@ fn verify_signature(key: &VerifyingKey, message: &[u8], encoded: &str) -> Result
         .context("verify Ed25519 signature")
 }
 
-fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
+pub fn parse_release_public_key(encoded: &str) -> Result<VerifyingKey> {
     if !valid_hex(encoded, 64) {
         bail!("release public key is invalid");
     }

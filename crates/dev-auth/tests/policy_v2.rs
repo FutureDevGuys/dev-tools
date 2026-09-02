@@ -23,6 +23,15 @@ agent = "/opt/dev-auth/bin/agent"
 executable = "/usr/bin/bwrap"
 arguments = ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--share-net"]
 argument_separator = true
+launcher_visibility = "required"
+broker_socket_visibility = "required"
+peer_identity = "preserve"
+cgroup_identity = "retain"
+descendant_containment = "retain"
+network_namespace = "inherit"
+workspace_mounts = "requested"
+read_only_mount_arguments = ["--ro-bind", "{path}", "{path}"]
+read_write_mount_arguments = ["--bind", "{path}", "{path}"]
 
 [github_apps.automation]
 app_id = 42
@@ -31,7 +40,7 @@ private_key_references = ["op://Machine Vault/github-app/private-key"]
 [credential_slots.automation]
 users = ["automation"]
 authority_caps = ["release"]
-secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/manifest-private-key"]
 
 [authority_caps.release]
 github_apps = ["automation"]
@@ -40,9 +49,11 @@ repositories = ["api", "website"]
 permissions = { contents = "write", metadata = "read", pull_requests = "write" }
 installation_ids = [101, 102]
 signing = true
+release_signing_products = ["dev-auth", "update-all"]
+release_signing_keys = [{ private_key_ref = "op://Machine Vault/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }]
 ssh = true
 git_identities = [{ name = "Automation Agent", email = "automation@example.invalid" }]
-secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/manifest-private-key"]
 
 [workspace_caps.source]
 path = "/srv/source"
@@ -58,9 +69,11 @@ help_footer = true
 [authority_profiles.publish]
 cap = "release"
 signing = false
+release_signing_products = ["dev-auth"]
+release_signing_key = { private_key_ref = "op://Machine Vault/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }
 ssh = true
 git_identity = { name = "Automation Agent", email = "automation@example.invalid" }
-secret_references = ["op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+secret_references = ["op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/manifest-private-key"]
 ssh_keys = [{ private_key_ref = "op://Machine Vault/release/ssh-private-key", public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test", fingerprint = "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI" }]
 
 [authority_profiles.publish.github]
@@ -162,6 +175,12 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
     let resolved = resolve_policy(&system, &user).unwrap();
 
     assert_eq!(resolved.mode, SystemMode::Strong);
+    let publish = resolved.authority_profiles.get("publish").unwrap();
+    assert_eq!(
+        publish.release_signing_products,
+        BTreeSet::from(["dev-auth".to_owned()])
+    );
+    assert!(publish.release_signing_key.is_some());
     assert_eq!(
         resolved.routing.no_session,
         NoSessionRouting::NativePassthrough
@@ -220,6 +239,75 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
         WorkspaceAccess::ReadOnly
     );
     assert_eq!(workload.sandbox.adapters, ["bubblewrap"]);
+    let adapter = &resolved.sandbox_adapters["bubblewrap"];
+    assert_eq!(
+        adapter.launcher_visibility,
+        dev_auth::policy_v2::SandboxVisibility::Required
+    );
+    assert_eq!(
+        adapter.broker_socket_visibility,
+        dev_auth::policy_v2::SandboxVisibility::Required
+    );
+    assert_eq!(
+        adapter.peer_identity,
+        dev_auth::policy_v2::SandboxPeerIdentity::Preserve
+    );
+    assert_eq!(
+        adapter.cgroup_identity,
+        dev_auth::policy_v2::SandboxCgroupIdentity::Retain
+    );
+    assert_eq!(
+        adapter.descendant_containment,
+        dev_auth::policy_v2::SandboxDescendantContainment::Retain
+    );
+    assert_eq!(
+        adapter.network_namespace,
+        dev_auth::policy_v2::SandboxNetworkNamespace::Inherit
+    );
+    assert_eq!(
+        adapter.workspace_mounts,
+        dev_auth::policy_v2::SandboxWorkspaceMounts::Requested
+    );
+    assert_eq!(
+        adapter.read_only_mount_arguments,
+        ["--ro-bind", "{path}", "{path}"]
+    );
+    assert_eq!(
+        adapter.read_write_mount_arguments,
+        ["--bind", "{path}", "{path}"]
+    );
+}
+
+#[test]
+fn release_manifest_signing_is_distinct_from_git_signing_authority() {
+    let system = parse_system_policy_v2(SYSTEM_POLICY.as_bytes()).unwrap();
+    let git_key_for_release = USER_CONFIG.replace(
+        "release_signing_key = { private_key_ref = \"op://Machine Vault/release/manifest-private-key\"",
+        "release_signing_key = { private_key_ref = \"op://Machine Vault/release/ssh-private-key\"",
+    );
+    let git_key_for_release = parse_user_config_v2(git_key_for_release.as_bytes()).unwrap();
+    assert!(resolve_policy(&system, &git_key_for_release).is_err());
+
+    let without_release_key = USER_CONFIG
+        .lines()
+        .filter(|line| !line.starts_with("release_signing_key = "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(parse_user_config_v2(without_release_key.as_bytes()).is_err());
+
+    let git_only = USER_CONFIG
+        .lines()
+        .filter(|line| {
+            !line.starts_with("release_signing_products = ")
+                && !line.starts_with("release_signing_key = ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let git_only = parse_user_config_v2(git_only.as_bytes()).unwrap();
+    let resolved = resolve_policy(&system, &git_only).unwrap();
+    let publish = resolved.authority_profiles.get("publish").unwrap();
+    assert!(publish.release_signing_key.is_none());
+    assert!(publish.release_signing_products.is_empty());
 }
 
 #[test]
@@ -258,7 +346,7 @@ fn strict_parsers_reject_unknown_duplicate_and_unsafe_inputs() {
             "agent = \"relative/agent\"",
         ),
         SYSTEM_POLICY.replace(
-            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\"]",
+            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\", \"op://Machine Vault/release/manifest-private-key\"]",
             "secret_references = [\"plaintext-secret\"]",
         ),
     ];
@@ -290,6 +378,25 @@ fn strict_parsers_reject_unknown_duplicate_and_unsafe_inputs() {
 }
 
 #[test]
+fn workload_workspace_root_count_is_bounded() {
+    let roots = (0..65)
+        .map(|index| {
+            format!(
+                "{{ cap = \"source\", path = \"/srv/source/root-{index}\", access = \"read_only\" }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let input = USER_CONFIG.replace(
+        "workspace_roots = [{ cap = \"source\", path = \"/srv/source/api\", access = \"read_only\" }]",
+        &format!("workspace_roots = [{roots}]"),
+    );
+
+    let error = parse_user_config_v2(input.as_bytes()).unwrap_err();
+    assert!(error.to_string().contains("at most 64 workspace roots"));
+}
+
+#[test]
 fn user_configuration_cannot_select_an_uncapped_github_app_or_key() {
     let system = parse_system_policy_v2(SYSTEM_POLICY.as_bytes()).unwrap();
     for invalid in [
@@ -318,7 +425,7 @@ fn credential_slots_bind_users_caps_and_secret_references() {
         ),
         SYSTEM_POLICY.replace("authority_caps = [\"release\"]", "authority_caps = [\"other\"]"),
         SYSTEM_POLICY.replace(
-            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\"]\n\n[authority_caps.release]",
+            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\", \"op://Machine Vault/release/manifest-private-key\"]\n\n[authority_caps.release]",
             "secret_references = [\"op://Machine Vault/github-app/private-key\"]\n\n[authority_caps.release]",
         ),
     ] {
@@ -351,7 +458,7 @@ fn resolution_rejects_every_user_authority_expansion() {
 
     let system_without_signing = parse_system_policy_v2(
         SYSTEM_POLICY
-            .replace("signing = true\nssh = true", "signing = false\nssh = true")
+            .replace("signing = true", "signing = false")
             .as_bytes(),
     )
     .unwrap();
@@ -480,6 +587,34 @@ fn sandbox_modes_have_fail_closed_adapter_contracts() {
             .as_bytes()
     )
     .is_err());
+
+    for invalid in [
+        SYSTEM_POLICY.replace("launcher_visibility = \"required\"\n", ""),
+        SYSTEM_POLICY.replace("broker_socket_visibility = \"required\"\n", ""),
+        SYSTEM_POLICY.replace(
+            "peer_identity = \"preserve\"",
+            "peer_identity = \"translate\"",
+        ),
+        SYSTEM_POLICY.replace(
+            "cgroup_identity = \"retain\"",
+            "cgroup_identity = \"escape\"",
+        ),
+        SYSTEM_POLICY.replace(
+            "descendant_containment = \"retain\"",
+            "descendant_containment = \"detach\"",
+        ),
+        SYSTEM_POLICY.replace("workspace_mounts = \"requested\"\n", ""),
+        SYSTEM_POLICY.replace(
+            "read_only_mount_arguments = [\"--ro-bind\", \"{path}\", \"{path}\"]",
+            "read_only_mount_arguments = [\"--ro-bind\", \"/tmp\", \"/tmp\"]",
+        ),
+        SYSTEM_POLICY.replace(
+            "read_write_mount_arguments = [\"--bind\", \"{path}\", \"{path}\"]",
+            "read_write_mount_arguments = [\"--bind\", \"{other}\", \"{other}\"]",
+        ),
+    ] {
+        assert!(parse_system_policy_v2(invalid.as_bytes()).is_err());
+    }
 }
 
 #[test]

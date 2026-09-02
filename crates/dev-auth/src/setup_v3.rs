@@ -1,4 +1,6 @@
-use crate::credential_input::CredentialMaterial;
+use crate::credential_input::{
+    load_credential_inputs, CredentialInputContext, CredentialInputSource, CredentialMaterial,
+};
 use crate::deployment::{
     canonical_deployment_intent, Activation, CredentialIntent, DeploymentCredential,
     DeploymentIntent, DeploymentMode,
@@ -9,6 +11,9 @@ use crate::policy_v2::{
 };
 use crate::setup::{render_plan, SetupPlan};
 use anyhow::{bail, Context, Result};
+use dev_tools_installation::{
+    read_atomic_document, write_atomic_document, DocumentAuthority, InstallationLock,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,7 +114,7 @@ pub struct SetupApplyReportV3 {
 #[serde(deny_unknown_fields)]
 struct CredentialActionReceipt {
     schema: String,
-    plan_sha256: String,
+    action_set_sha256: String,
     completed: BTreeSet<String>,
 }
 
@@ -142,8 +147,8 @@ pub fn required_credential_slots_for_plan(plan: &SetupPlanV3) -> Result<Credenti
     validate_setup_plan_v3(plan)?;
     let ready = ready_credential_slots(plan)?;
     let mut requirements = credential_requirements(&plan.intent.credentials, &ready);
-    let (_, digest) = render_setup_plan_v3(plan)?;
-    let completed = read_credential_action_receipt(plan, &digest)?;
+    let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
+    let completed = read_credential_action_receipt(plan, &action_set_sha256)?;
     requirements.required.retain(|slot| {
         let intent = plan
             .intent
@@ -161,21 +166,49 @@ pub fn apply_setup_plan_v3(
     approved_sha256: &str,
     credentials: &BTreeMap<String, CredentialMaterial>,
 ) -> Result<SetupApplyReportV3> {
+    let declared = declared_credential_slots(plan);
+    if credentials.keys().any(|slot| !declared.contains(slot)) {
+        bail!("credential material names a slot outside the approved setup plan");
+    }
+    apply_setup_plan_v3_with_loader(plan, approved_sha256, |_, _| {
+        Ok(LoadedCredentialMaterials::Borrowed(credentials))
+    })
+}
+
+pub fn apply_setup_plan_v3_from_sources(
+    plan: &SetupPlanV3,
+    approved_sha256: &str,
+    sources: &BTreeMap<String, CredentialInputSource>,
+    context: &CredentialInputContext,
+    stdin: &mut dyn Read,
+) -> Result<SetupApplyReportV3> {
+    let declared = declared_credential_slots(plan);
+    if sources.keys().any(|slot| !declared.contains(slot)) {
+        bail!("credential input names a slot outside the approved setup plan");
+    }
+    apply_setup_plan_v3_with_loader(plan, approved_sha256, |declared, required| {
+        load_credential_inputs(declared, required, sources, context, stdin)
+            .map(LoadedCredentialMaterials::Owned)
+    })
+}
+
+fn apply_setup_plan_v3_with_loader<'a, F>(
+    plan: &SetupPlanV3,
+    approved_sha256: &str,
+    load_credentials: F,
+) -> Result<SetupApplyReportV3>
+where
+    F: FnOnce(&BTreeSet<String>, &BTreeSet<String>) -> Result<LoadedCredentialMaterials<'a>>,
+{
     let (_, digest) = render_setup_plan_v3(plan)?;
     if digest != approved_sha256.to_ascii_lowercase() {
         bail!("setup plan v3 does not match the approved digest");
     }
     require_apply_identity(plan)?;
     revalidate_public_plan_inputs(plan)?;
-    let declared = plan
-        .intent
-        .credentials
-        .iter()
-        .map(|credential| credential.slot.clone())
-        .collect::<BTreeSet<_>>();
-    if credentials.keys().any(|slot| !declared.contains(slot)) {
-        bail!("credential material names a slot outside the approved setup plan");
-    }
+    let _deployment_lock = InstallationLock::acquire(&deployment_lock_path(plan)?)
+        .context("acquire full setup transaction lock")?;
+    let declared = declared_credential_slots(plan);
     let before = deployment_state_fingerprint(plan)?;
     if postcondition_satisfied(plan, &digest) {
         return Ok(SetupApplyReportV3 {
@@ -198,34 +231,47 @@ pub fn apply_setup_plan_v3(
     install_configuration(plan, &mut actions)?;
 
     let requirements = required_credential_slots_for_plan(plan)?;
-    let mut blocked = requirements.blocked;
+    let mut blocked = requirements.blocked.clone();
     blocked.sort();
     blocked.dedup();
+    let credentials =
+        match load_credentials_if_unblocked(&requirements, &declared, load_credentials)? {
+            Some(credentials) => credentials,
+            None => {
+                let after = deployment_state_fingerprint(plan)?;
+                return Ok(SetupApplyReportV3 {
+                    schema: "dev-auth-setup-apply-v3".into(),
+                    changed: before != after,
+                    verified: false,
+                    input_required: Vec::new(),
+                    blocked,
+                    next_action: "resolve_blocked_credential_slots".into(),
+                    actions,
+                });
+            }
+        };
+    let credentials = credentials.as_ref();
     let input_required = requirements
         .required
         .iter()
         .filter(|slot| !credentials.contains_key(*slot))
         .cloned()
         .collect::<Vec<_>>();
-    if !blocked.is_empty() || !input_required.is_empty() {
+    if !input_required.is_empty() {
         let after = deployment_state_fingerprint(plan)?;
-        let next_action = if input_required.is_empty() {
-            "resolve_blocked_credential_slots"
-        } else {
-            "provide_credential_input"
-        };
         return Ok(SetupApplyReportV3 {
             schema: "dev-auth-setup-apply-v3".into(),
             changed: before != after,
             verified: false,
             input_required,
             blocked,
-            next_action: next_action.into(),
+            next_action: "provide_credential_input".into(),
             actions,
         });
     }
 
-    apply_credential_actions(plan, &digest, credentials, &mut actions)?;
+    let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
+    apply_credential_actions(plan, &action_set_sha256, credentials, &mut actions)?;
     start_and_activate_candidate(plan, &mut actions)?;
     if !postcondition_satisfied(plan, &digest) {
         bail!("setup plan v3 postcondition verification failed");
@@ -240,6 +286,42 @@ pub fn apply_setup_plan_v3(
         next_action: "none".into(),
         actions,
     })
+}
+
+fn load_credentials_if_unblocked<'a, F>(
+    requirements: &CredentialRequirements,
+    declared: &BTreeSet<String>,
+    load_credentials: F,
+) -> Result<Option<LoadedCredentialMaterials<'a>>>
+where
+    F: FnOnce(&BTreeSet<String>, &BTreeSet<String>) -> Result<LoadedCredentialMaterials<'a>>,
+{
+    if !requirements.blocked.is_empty() {
+        return Ok(None);
+    }
+    load_credentials(declared, &requirements.required).map(Some)
+}
+
+enum LoadedCredentialMaterials<'a> {
+    Borrowed(&'a BTreeMap<String, CredentialMaterial>),
+    Owned(BTreeMap<String, CredentialMaterial>),
+}
+
+impl LoadedCredentialMaterials<'_> {
+    fn as_ref(&self) -> &BTreeMap<String, CredentialMaterial> {
+        match self {
+            Self::Borrowed(materials) => materials,
+            Self::Owned(materials) => materials,
+        }
+    }
+}
+
+fn declared_credential_slots(plan: &SetupPlanV3) -> BTreeSet<String> {
+    plan.intent
+        .credentials
+        .iter()
+        .map(|credential| credential.slot.clone())
+        .collect()
 }
 
 pub fn verify_setup_plan_v3(
@@ -362,6 +444,16 @@ fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) 
         crate::setup::stop_system_broker_at(&plan.installation.paths)?;
         actions.push("stop_broker".into());
     }
+    for account in &plan.accounts {
+        crate::setup::reconcile_workload_launchers_at(
+            &account.home,
+            Path::new(&report.executable),
+            &[],
+            account.uid,
+        )?;
+        crate::setup::reconcile_desktop_entries_at(&account.home, &BTreeMap::new(), account.uid)?;
+        actions.push(format!("deactivate_user_integrations:{}", account.name));
+    }
     Ok(())
 }
 
@@ -378,7 +470,7 @@ fn install_configuration(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Resul
             actions.push("install_administrator_policy".into());
             for account in &plan.accounts {
                 let config = document_identity(plan, "user_configuration", &account.name)?;
-                crate::setup::reconcile_user_config_for_account_at(
+                crate::setup::reconcile_inactive_user_config_for_account_at(
                     &plan.installation.paths,
                     &config.path,
                     &config.sha256,
@@ -404,7 +496,7 @@ fn install_configuration(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Resul
             )?;
             actions.push(format!("install_user_policy:{}", account.name));
             let config = document_identity(plan, "user_configuration", &account.name)?;
-            crate::setup::reconcile_user_config_for_account_at(
+            crate::setup::reconcile_inactive_user_config_for_account_at(
                 &plan.installation.paths,
                 &config.path,
                 &config.sha256,
@@ -419,11 +511,11 @@ fn install_configuration(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Resul
 
 fn apply_credential_actions(
     plan: &SetupPlanV3,
-    digest: &str,
+    action_set_sha256: &str,
     credentials: &BTreeMap<String, CredentialMaterial>,
     actions: &mut Vec<String>,
 ) -> Result<()> {
-    let mut completed = read_credential_action_receipt(plan, digest)?;
+    let mut completed = read_credential_action_receipt(plan, action_set_sha256)?;
     for credential in &plan.intent.credentials {
         let ready = credential_slot_ready(plan.intent.mode, &credential.slot);
         match credential.intent {
@@ -440,21 +532,56 @@ fn apply_credential_actions(
                 let material = credentials
                     .get(&credential.slot)
                     .context("required credential input disappeared before rotation")?;
-                rotate_credential(plan, &credential.slot, material.expose())?;
-                completed.insert(credential.slot.clone());
-                actions.push(format!("rotate_credential:{}", credential.slot));
+                if complete_credential_action(
+                    &credential.slot,
+                    &mut completed,
+                    || rotate_credential(plan, &credential.slot, material.expose()),
+                    |completed| write_credential_action_receipt(plan, action_set_sha256, completed),
+                )? {
+                    actions.push(format!("rotate_credential:{}", credential.slot));
+                }
             }
             CredentialIntent::Rotate => {}
-            CredentialIntent::Revoke => {
-                if ready {
-                    revoke_credential(plan, &credential.slot)?;
+            CredentialIntent::Revoke if !completed.contains(&credential.slot) => {
+                if complete_credential_action(
+                    &credential.slot,
+                    &mut completed,
+                    || {
+                        if ready {
+                            revoke_credential(plan, &credential.slot)?;
+                        }
+                        Ok(())
+                    },
+                    |completed| write_credential_action_receipt(plan, action_set_sha256, completed),
+                )? && ready
+                {
                     actions.push(format!("revoke_credential:{}", credential.slot));
                 }
-                completed.insert(credential.slot.clone());
             }
+            CredentialIntent::Revoke => {}
         }
     }
-    write_credential_action_receipt(plan, digest, &completed)
+    write_credential_action_receipt(plan, action_set_sha256, &completed)?;
+    Ok(())
+}
+
+fn complete_credential_action<Action, Persist>(
+    slot: &str,
+    completed: &mut BTreeSet<String>,
+    action: Action,
+    persist: Persist,
+) -> Result<bool>
+where
+    Action: FnOnce() -> Result<()>,
+    Persist: FnOnce(&BTreeSet<String>) -> Result<()>,
+{
+    if completed.contains(slot) {
+        return Ok(false);
+    }
+    action()?;
+    completed.insert(slot.to_owned());
+    persist(completed)?;
+    Ok(true)
 }
 
 fn enroll_credential(plan: &SetupPlanV3, slot: &str, value: &[u8]) -> Result<()> {
@@ -494,6 +621,19 @@ fn start_and_activate_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -
         actions.push("start_broker".into());
     }
     if plan.intent.activation == Activation::Transparent {
+        let setup = crate::setup::verify_at(&plan.installation.paths)?;
+        for account in &plan.accounts {
+            let workloads = resolved_workloads_for_account(plan, account)?;
+            let aliases = workloads.keys().cloned().collect::<Vec<_>>();
+            crate::setup::reconcile_workload_launchers_at(
+                &account.home,
+                Path::new(&setup.executable),
+                &aliases,
+                account.uid,
+            )?;
+            crate::setup::reconcile_desktop_entries_at(&account.home, &workloads, account.uid)?;
+            actions.push(format!("install_user_integrations:{}", account.name));
+        }
         crate::setup::activate_transparent_launchers_at(&plan.installation.paths)?;
         actions.push("activate_transparent_launchers".into());
     }
@@ -506,8 +646,9 @@ fn postcondition_satisfied(plan: &SetupPlanV3, digest: &str) -> bool {
 
 fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
     let setup = crate::setup::verify_at(&plan.installation.paths)?;
+    let transparent_expected = plan.intent.activation == Activation::Transparent;
     if setup.version != plan.installation.request.version
-        || setup.transparent_launchers_active != (plan.intent.activation == Activation::Transparent)
+        || setup.transparent_launchers_active != transparent_expected
     {
         bail!("installed release does not match the deployment intent");
     }
@@ -540,10 +681,15 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
             }
         };
         let resolved = resolve_policy_for_user(&policy, &account.name, &user_config)?;
+        let expected_workloads = if plan.intent.activation == Activation::Transparent {
+            resolved.workloads
+        } else {
+            BTreeMap::new()
+        };
         crate::setup::verify_user_integrations_at(
             &account.home,
             Path::new(&setup.executable),
-            &resolved.workloads,
+            &expected_workloads,
             account.uid,
         )?;
     }
@@ -561,14 +707,15 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
                 crate::broker_protocol::BrokerSessionProbe::Unavailable { .. }
             )
         {
-            bail!("system broker remains active after credential revocation");
+            bail!("system broker remains active when the deployment requires it stopped");
         }
     }
     Ok(())
 }
 
-fn verify_credential_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
-    let completed = read_credential_action_receipt(plan, digest)?;
+fn verify_credential_postcondition(plan: &SetupPlanV3, _plan_digest: &str) -> Result<()> {
+    let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
+    let completed = read_credential_action_receipt(plan, &action_set_sha256)?;
     for credential in &plan.intent.credentials {
         let ready = credential_slot_ready(plan.intent.mode, &credential.slot);
         match credential.intent {
@@ -610,10 +757,26 @@ fn credential_slot_ready(mode: DeploymentMode, slot: &str) -> bool {
 }
 
 fn broker_desired(intent: &DeploymentIntent) -> bool {
-    intent
-        .credentials
-        .iter()
-        .any(|credential| credential.intent != CredentialIntent::Revoke)
+    intent.mode == DeploymentMode::Strong && intent.activation == Activation::Transparent
+}
+
+fn resolved_workloads_for_account(
+    plan: &SetupPlanV3,
+    account: &NativeAccountIdentity,
+) -> Result<BTreeMap<String, crate::policy_v2::ResolvedWorkload>> {
+    let user = nix::unistd::User::from_name(&account.name)?
+        .context("deployment account disappeared while activating integrations")?;
+    let policy = match plan.intent.mode {
+        DeploymentMode::Strong => crate::policy_store::load_system_policy()?,
+        DeploymentMode::UserOnly => {
+            let path = crate::policy_store::user_policy_path(&user);
+            parse_system_policy_v2(&read_document_bytes(&path)?)?
+        }
+    };
+    let config = parse_user_config_v2(&read_document_bytes(
+        &crate::policy_store::user_config_path(&user),
+    )?)?;
+    Ok(resolve_policy_for_user(&policy, &account.name, &config)?.workloads)
 }
 
 fn document_identity<'a>(
@@ -663,30 +826,22 @@ fn credential_action_receipt_path(plan: &SetupPlanV3) -> PathBuf {
     plan.installation
         .paths
         .data_root
-        .join("credential-actions-v1.json")
+        .join("credential-actions-v2.json")
 }
 
-fn read_credential_action_receipt(plan: &SetupPlanV3, digest: &str) -> Result<BTreeSet<String>> {
+fn read_credential_action_receipt(
+    plan: &SetupPlanV3,
+    action_set_sha256: &str,
+) -> Result<BTreeSet<String>> {
     let path = credential_action_receipt_path(plan);
-    let bytes = match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => return Err(error).context("inspect credential action receipt"),
-        Ok(metadata) => {
-            let owner = apply_owner_uid(plan)?;
-            if !metadata.file_type().is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != owner
-                || metadata.mode() & 0o777 != 0o600
-                || metadata.len() > DOCUMENT_LIMIT
-            {
-                bail!("credential action receipt has unsafe authority");
-            }
-            read_bounded(&path)?
-        }
+    let Some(document) = read_atomic_document(&path, &credential_action_authority(plan)?)? else {
+        return Ok(BTreeSet::new());
     };
     let receipt: CredentialActionReceipt =
-        serde_json::from_slice(&bytes).context("parse credential action receipt")?;
-    if receipt.schema != "dev-auth-credential-actions-v1" || receipt.plan_sha256 != digest {
+        serde_json::from_slice(&document.bytes).context("parse credential action receipt")?;
+    if receipt.schema != "dev-auth-credential-actions-v2"
+        || receipt.action_set_sha256 != action_set_sha256
+    {
         return Ok(BTreeSet::new());
     }
     Ok(receipt.completed)
@@ -694,33 +849,48 @@ fn read_credential_action_receipt(plan: &SetupPlanV3, digest: &str) -> Result<BT
 
 fn write_credential_action_receipt(
     plan: &SetupPlanV3,
-    digest: &str,
+    action_set_sha256: &str,
     completed: &BTreeSet<String>,
 ) -> Result<()> {
     let receipt = CredentialActionReceipt {
-        schema: "dev-auth-credential-actions-v1".into(),
-        plan_sha256: digest.into(),
+        schema: "dev-auth-credential-actions-v2".into(),
+        action_set_sha256: action_set_sha256.into(),
         completed: completed.clone(),
     };
     let bytes = serde_jcs::to_vec(&receipt).context("serialize credential action receipt")?;
     let path = credential_action_receipt_path(plan);
-    let parent = path
-        .parent()
-        .context("credential action receipt has no parent")?;
-    if !parent.is_dir() {
-        bail!("credential action receipt parent is absent");
+    let authority = credential_action_authority(plan)?;
+    let current = read_atomic_document(&path, &authority)?;
+    write_atomic_document(
+        &path,
+        &bytes,
+        &authority,
+        current.as_ref().map(|document| &document.identity),
+    )?;
+    Ok(())
+}
+
+fn credential_action_set_sha256(intent: &DeploymentIntent) -> Result<String> {
+    #[derive(Serialize)]
+    struct CredentialActionSet<'a> {
+        mode: DeploymentMode,
+        credentials: &'a [DeploymentCredential],
     }
-    let temporary = path.with_extension(format!("new-{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .context("create credential action receipt")?;
-    file.write_all(&bytes)
-        .context("write credential action receipt")?;
-    file.sync_all().context("sync credential action receipt")?;
-    fs::rename(&temporary, &path).context("publish credential action receipt")
+    Ok(sha256_hex(
+        &serde_jcs::to_vec(&CredentialActionSet {
+            mode: intent.mode,
+            credentials: &intent.credentials,
+        })
+        .context("canonicalize credential action set")?,
+    ))
+}
+
+fn credential_action_authority(plan: &SetupPlanV3) -> Result<DocumentAuthority> {
+    Ok(DocumentAuthority {
+        owner_uid: apply_owner_uid(plan)?,
+        mode: 0o600,
+        limit: DOCUMENT_LIMIT,
+    })
 }
 
 fn apply_owner_uid(plan: &SetupPlanV3) -> Result<u32> {
@@ -731,6 +901,32 @@ fn apply_owner_uid(plan: &SetupPlanV3) -> Result<u32> {
             .first()
             .context("user-only plan has no native account")?
             .uid),
+    }
+}
+
+fn deployment_lock_path(plan: &SetupPlanV3) -> Result<PathBuf> {
+    match plan.intent.mode {
+        DeploymentMode::Strong => deployment_lock_path_for(DeploymentMode::Strong, None),
+        DeploymentMode::UserOnly => {
+            let account = plan
+                .accounts
+                .first()
+                .context("user-only plan has no native account")?;
+            deployment_lock_path_for(DeploymentMode::UserOnly, Some(account.uid))
+        }
+    }
+}
+
+fn deployment_lock_path_for(mode: DeploymentMode, owner_uid: Option<u32>) -> Result<PathBuf> {
+    match mode {
+        DeploymentMode::Strong if owner_uid.is_none() => {
+            Ok(PathBuf::from("/run/lock/dev-auth-setup-v3.lock"))
+        }
+        DeploymentMode::UserOnly => Ok(PathBuf::from(format!(
+            "/run/user/{}/dev-auth-setup-v3.lock",
+            owner_uid.context("user-only deployment lock has no native owner")?
+        ))),
+        DeploymentMode::Strong => bail!("strong deployment lock cannot have a user owner"),
     }
 }
 
@@ -874,18 +1070,21 @@ pub fn build_setup_plan_v3_at(
         bail!("administrator policy mode does not match deployment mode");
     }
     if installation.request.native_git != Path::new(&administrator_policy.programs.git) {
-        bail!("staged transparent launcher does not target the administrator-pinned native Git");
+        bail!("staged installation does not target the administrator-pinned native Git");
     }
     if installation.request.native_gh != Path::new(&administrator_policy.programs.gh) {
-        bail!(
-            "staged transparent launcher does not target the administrator-pinned native GitHub CLI"
-        );
+        bail!("staged installation does not target the administrator-pinned native GitHub CLI");
     }
 
     validate_policy_program_authority(
         &administrator_policy,
         intent.mode,
         current_user.uid.as_raw(),
+    )?;
+    crate::setup::require_setup_prerequisites(
+        expected_install_mode,
+        current_user.uid.as_raw(),
+        &administrator_policy,
     )?;
     if intent.mode == DeploymentMode::UserOnly
         && (intent.users.len() != 1 || intent.users[0].name != current_user.name)
@@ -910,14 +1109,9 @@ pub fn build_setup_plan_v3_at(
         let user_config = parse_user_config_v2(&config.bytes).with_context(|| {
             format!("validate configuration for native account {}", account.name)
         })?;
-        let resolved = resolve_policy_for_user(&administrator_policy, &account.name, &user_config)
-            .with_context(|| format!("resolve policy for native account {}", account.name))?;
-        used_credential_slots.extend(
-            resolved
-                .authority_profiles
-                .values()
-                .map(|profile| profile.credential_slot.clone()),
-        );
+        let mut resolved =
+            resolve_policy_for_user(&administrator_policy, &account.name, &user_config)
+                .with_context(|| format!("resolve policy for native account {}", account.name))?;
         documents.push(config.identity);
         if let Some(policy_path) = &user.policy {
             let user_policy = read_document(policy_path, "user_policy", &account.name)?;
@@ -932,16 +1126,24 @@ pub fn build_setup_plan_v3_at(
                     account.name
                 )
             })?;
-            let resolved = resolve_policy_for_user(&parsed, &account.name, &user_config)
+            resolved = resolve_policy_for_user(&parsed, &account.name, &user_config)
                 .with_context(|| format!("resolve user-only policy for {}", account.name))?;
-            used_credential_slots.extend(
-                resolved
-                    .authority_profiles
-                    .values()
-                    .map(|profile| profile.credential_slot.clone()),
-            );
             documents.push(user_policy.identity);
         }
+        used_credential_slots.extend(
+            resolved
+                .authority_profiles
+                .values()
+                .map(|profile| profile.credential_slot.clone()),
+        );
+        validate_resolved_workspace_authority(&resolved, account.uid.as_raw()).with_context(
+            || {
+                format!(
+                    "validate workspace authority for native account {}",
+                    account.name
+                )
+            },
+        )?;
         accounts.push(NativeAccountIdentity {
             name: account.name,
             uid: account.uid.as_raw(),
@@ -949,6 +1151,11 @@ pub fn build_setup_plan_v3_at(
             home: account.dir,
         });
     }
+    validate_deployment_user_set(
+        intent.mode,
+        &administrator_policy.allowed_users.iter().cloned().collect(),
+        &account_names,
+    )?;
     documents.sort_by(|left, right| {
         (&left.kind, &left.subject, &left.path).cmp(&(&right.kind, &right.subject, &right.path))
     });
@@ -959,15 +1166,16 @@ pub fn build_setup_plan_v3_at(
         .iter()
         .map(|credential| credential.slot.clone())
         .collect::<BTreeSet<_>>();
-    if declared_credential_slots
-        .iter()
-        .any(|slot| !administrator_policy.credential_slots.contains_key(slot))
-    {
-        bail!("deployment intent names a credential slot outside administrator policy");
-    }
-    if !used_credential_slots.is_subset(&declared_credential_slots) {
-        bail!("deployment intent omits a credential slot required by a user authority profile");
-    }
+    let policy_credential_slots = administrator_policy
+        .credential_slots
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    validate_deployment_credential_slots(
+        &policy_credential_slots,
+        &declared_credential_slots,
+        &used_credential_slots,
+    )?;
     if intent.activation == Activation::Transparent
         && intent.credentials.iter().any(|credential| {
             used_credential_slots.contains(&credential.slot)
@@ -984,7 +1192,7 @@ pub fn build_setup_plan_v3_at(
         &current_credential_ready,
         &current_broker_state,
     )?;
-    let actions = planned_actions(&intent);
+    let actions = planned_action_contract(&intent);
     let plan = SetupPlanV3 {
         schema: "dev-auth-setup-plan-v3".into(),
         intent,
@@ -1000,6 +1208,31 @@ pub fn build_setup_plan_v3_at(
     };
     validate_setup_plan_v3(&plan)?;
     Ok(plan)
+}
+
+fn validate_deployment_user_set(
+    mode: DeploymentMode,
+    policy_users: &BTreeSet<String>,
+    deployment_users: &BTreeSet<String>,
+) -> Result<()> {
+    if mode == DeploymentMode::Strong && policy_users != deployment_users {
+        bail!("strong deployment users must exactly match administrator policy users");
+    }
+    Ok(())
+}
+
+fn validate_deployment_credential_slots(
+    policy: &BTreeSet<String>,
+    declared: &BTreeSet<String>,
+    used: &BTreeSet<String>,
+) -> Result<()> {
+    if declared != policy {
+        bail!("deployment credential slots must exactly match administrator policy");
+    }
+    if !used.is_subset(declared) {
+        bail!("deployment intent omits a credential slot required by a user authority profile");
+    }
+    Ok(())
 }
 
 fn require_canonical_installation_layout(
@@ -1054,6 +1287,38 @@ fn validate_policy_program_authority(
                 description,
             )?,
         }
+    }
+    Ok(())
+}
+
+fn validate_resolved_workspace_authority(
+    policy: &crate::policy_v2::ResolvedPolicy,
+    owner_uid: u32,
+) -> Result<()> {
+    for workload in policy.workloads.values() {
+        for root in &workload.workspace_roots {
+            validate_workspace_root_authority(Path::new(&root.path), root.access, owner_uid)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_root_authority(
+    path: &Path,
+    access: crate::policy_v2::WorkspaceAccess,
+    owner_uid: u32,
+) -> Result<()> {
+    if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
+        bail!("workspace root is absent, noncanonical, or symlinked");
+    }
+    let metadata = fs::symlink_metadata(path).context("inspect workspace root")?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.mode() & 0o022 != 0
+        || (metadata.uid() != 0 && metadata.uid() != owner_uid)
+        || (access == crate::policy_v2::WorkspaceAccess::ReadWrite && metadata.uid() != owner_uid)
+    {
+        bail!("workspace root has unsafe filesystem authority");
     }
     Ok(())
 }
@@ -1160,7 +1425,7 @@ fn expected_current_path_keys(
         installation
             .paths
             .data_root
-            .join("credential-actions-v1.json"),
+            .join("credential-actions-v2.json"),
     ));
     match intent.mode {
         DeploymentMode::Strong => paths.push((
@@ -1193,7 +1458,7 @@ fn expected_current_path_keys(
     paths
 }
 
-fn planned_actions(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
+pub fn planned_action_contract(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
     let mut actions = Vec::new();
     let mut push = |kind: &str, subject: Option<String>| {
         actions.push(SetupActionV3 {
@@ -1203,9 +1468,14 @@ fn planned_actions(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
         });
     };
     push("deactivate_transparent_launchers", None);
-    push("stop_broker", None);
+    if intent.mode == DeploymentMode::Strong {
+        push("stop_broker", None);
+    }
     push("install_release", None);
-    push("install_administrator_policy", None);
+    if intent.mode == DeploymentMode::Strong {
+        push("install_administrator_policy", None);
+        push("install_system_integrations", None);
+    }
     for user in &intent.users {
         if user.policy.is_some() {
             push("install_user_policy", Some(user.name.clone()));
@@ -1221,9 +1491,10 @@ fn planned_actions(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
         };
         push(kind, Some(credential.slot.clone()));
     }
-    push("install_system_integrations", None);
-    for user in &intent.users {
-        push("install_user_integrations", Some(user.name.clone()));
+    if intent.activation == Activation::Transparent {
+        for user in &intent.users {
+            push("install_user_integrations", Some(user.name.clone()));
+        }
     }
     if broker_desired(intent) {
         push("start_broker", None);
@@ -1393,4 +1664,214 @@ fn read_bounded_at(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn credential_actions_persist_after_each_success_and_skip_completed_retries() {
+        let mut completed = BTreeSet::new();
+        let mut action_count = 0;
+        let mut snapshots = Vec::new();
+        assert!(complete_credential_action(
+            "automation",
+            &mut completed,
+            || {
+                action_count += 1;
+                Ok(())
+            },
+            |completed| {
+                snapshots.push(completed.clone());
+                Ok(())
+            },
+        )
+        .unwrap());
+        assert!(!complete_credential_action(
+            "automation",
+            &mut completed,
+            || {
+                action_count += 1;
+                Ok(())
+            },
+            |completed| {
+                snapshots.push(completed.clone());
+                Ok(())
+            },
+        )
+        .unwrap());
+        assert_eq!(action_count, 1);
+        assert_eq!(snapshots, vec![BTreeSet::from(["automation".to_owned()])]);
+    }
+
+    #[test]
+    fn credential_action_epoch_is_independent_of_noncredential_deployment_state() {
+        let intent = DeploymentIntent {
+            schema: "dev-auth-deployment-v1".into(),
+            mode: DeploymentMode::Strong,
+            channel: crate::deployment::Channel::Stable,
+            offline: false,
+            activation: Activation::Transparent,
+            administrator_policy: PathBuf::from("/etc/dev-auth/policy.toml"),
+            users: vec![crate::deployment::DeploymentUser {
+                name: "alice".into(),
+                config: PathBuf::from("/tmp/alice.toml"),
+                policy: None,
+            }],
+            credentials: vec![DeploymentCredential {
+                slot: "automation".into(),
+                intent: CredentialIntent::Rotate,
+            }],
+        };
+        let epoch = credential_action_set_sha256(&intent).unwrap();
+        let unrelated_change = DeploymentIntent {
+            offline: true,
+            activation: Activation::Inactive,
+            administrator_policy: PathBuf::from("/tmp/replacement-policy.toml"),
+            users: Vec::new(),
+            ..intent.clone()
+        };
+        assert_eq!(
+            credential_action_set_sha256(&unrelated_change).unwrap(),
+            epoch
+        );
+
+        let next_epoch = DeploymentIntent {
+            credentials: vec![DeploymentCredential {
+                slot: "automation".into(),
+                intent: CredentialIntent::Preserve,
+            }],
+            ..intent
+        };
+        assert_ne!(credential_action_set_sha256(&next_epoch).unwrap(), epoch);
+    }
+
+    #[test]
+    fn blocked_preserved_slots_prevent_any_credential_source_read() {
+        let requirements = CredentialRequirements {
+            required: BTreeSet::from(["rotation".to_owned()]),
+            blocked: vec!["preserved".to_owned()],
+        };
+        let declared = BTreeSet::from(["preserved".to_owned(), "rotation".to_owned()]);
+        let loaded = load_credentials_if_unblocked(&requirements, &declared, |_, _| {
+            panic!("blocked setup must not read a credential source")
+        })
+        .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn deployment_credential_intents_are_the_exact_policy_slot_set() {
+        let policy = BTreeSet::from(["automation".to_owned(), "release".to_owned()]);
+        let used = BTreeSet::from(["automation".to_owned()]);
+        assert!(validate_deployment_credential_slots(&policy, &policy, &used).is_ok());
+        assert!(validate_deployment_credential_slots(
+            &policy,
+            &BTreeSet::from(["automation".to_owned()]),
+            &used,
+        )
+        .is_err());
+        assert!(validate_deployment_credential_slots(
+            &policy,
+            &BTreeSet::from([
+                "automation".to_owned(),
+                "release".to_owned(),
+                "undeclared".to_owned(),
+            ]),
+            &used,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn strong_deployment_configures_every_administrator_authorized_user() {
+        let policy = BTreeSet::from(["alice".to_owned(), "bob".to_owned()]);
+        assert!(validate_deployment_user_set(DeploymentMode::Strong, &policy, &policy,).is_ok());
+        assert!(validate_deployment_user_set(
+            DeploymentMode::Strong,
+            &policy,
+            &BTreeSet::from(["alice".to_owned()]),
+        )
+        .is_err());
+        assert!(validate_deployment_user_set(
+            DeploymentMode::UserOnly,
+            &policy,
+            &BTreeSet::from(["alice".to_owned()]),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn transparent_strong_activation_always_requires_the_broker() {
+        let intent = DeploymentIntent {
+            schema: "dev-auth-deployment-v1".into(),
+            mode: DeploymentMode::Strong,
+            channel: crate::deployment::Channel::Stable,
+            offline: false,
+            activation: Activation::Transparent,
+            administrator_policy: PathBuf::from("/etc/dev-auth/policy.toml"),
+            users: Vec::new(),
+            credentials: Vec::new(),
+        };
+        assert!(broker_desired(&intent));
+
+        let inactive = DeploymentIntent {
+            activation: Activation::Inactive,
+            ..intent
+        };
+        assert!(!broker_desired(&inactive));
+
+        let user_only = DeploymentIntent {
+            mode: DeploymentMode::UserOnly,
+            activation: Activation::Transparent,
+            ..inactive
+        };
+        assert!(!broker_desired(&user_only));
+    }
+
+    #[test]
+    fn setup_transaction_lock_is_runtime_scoped_not_installation_owned() {
+        assert_eq!(
+            deployment_lock_path_for(DeploymentMode::Strong, None).unwrap(),
+            Path::new("/run/lock/dev-auth-setup-v3.lock")
+        );
+        assert_eq!(
+            deployment_lock_path_for(DeploymentMode::UserOnly, Some(1000)).unwrap(),
+            Path::new("/run/user/1000/dev-auth-setup-v3.lock")
+        );
+    }
+
+    #[test]
+    fn setup_workspace_roots_are_existing_canonical_private_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner_uid = fs::symlink_metadata(&workspace).unwrap().uid();
+        validate_workspace_root_authority(
+            &workspace,
+            crate::policy_v2::WorkspaceAccess::ReadWrite,
+            owner_uid,
+        )
+        .unwrap();
+
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(validate_workspace_root_authority(
+            &workspace,
+            crate::policy_v2::WorkspaceAccess::ReadOnly,
+            owner_uid,
+        )
+        .is_err());
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&workspace, &alias).unwrap();
+        assert!(validate_workspace_root_authority(
+            &alias,
+            crate::policy_v2::WorkspaceAccess::ReadOnly,
+            owner_uid,
+        )
+        .is_err());
+    }
 }

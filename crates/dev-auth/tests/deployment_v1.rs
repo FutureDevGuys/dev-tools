@@ -69,6 +69,21 @@ fn toml_and_cli_normalize_to_identical_canonical_intent() {
 }
 
 #[test]
+fn published_deployment_example_is_nonsecret_and_parses_as_full_desired_state() {
+    let source = include_bytes!("../deployment-v1.example.toml");
+    let document = parse_deployment_document(source).unwrap();
+    assert_eq!(document.schema, "dev-auth-deployment-v1");
+    assert_eq!(document.mode, DeploymentMode::Strong);
+    assert_eq!(document.activation, Activation::Transparent);
+    assert_eq!(document.users.len(), 1);
+    assert_eq!(document.credentials.len(), 1);
+    let text = std::str::from_utf8(source).unwrap();
+    assert!(!text.contains("op://"));
+    assert!(!text.to_ascii_lowercase().contains("token ="));
+    assert!(!text.to_ascii_lowercase().contains("password ="));
+}
+
+#[test]
 fn conflicting_or_duplicate_definitions_fail_before_planning() {
     let document = parse_deployment_document(DEPLOYMENT.as_bytes()).unwrap();
     let mut conflict = cli_equivalent();
@@ -249,6 +264,10 @@ config = "{}"
             .request
             .activate_transparent_launchers
     );
+    assert!(document_plan
+        .actions
+        .iter()
+        .any(|action| action.kind == "activate_transparent_launchers"));
     assert_eq!(
         document_plan.actions[document_plan.actions.len() - 2].kind,
         "activate_transparent_launchers"
@@ -432,6 +451,43 @@ config = "{}"
     assert!(error
         .to_string()
         .contains("1Password CLI is group- or world-writable"));
+}
+
+#[test]
+fn inactive_setup_plans_stage_product_state_without_activating_workloads_or_broker() {
+    let document = parse_deployment_document(
+        br#"
+schema = "dev-auth-deployment-v1"
+mode = "user-only"
+channel = "stable"
+activation = "inactive"
+administrator_policy = "/srv/dev-auth/user-cap.toml"
+
+[[users]]
+name = "alice"
+config = "/srv/dev-auth/alice.toml"
+
+[[credentials]]
+slot = "automation"
+intent = "enroll-if-absent"
+"#,
+    )
+    .unwrap();
+    let intent = normalize_deployment(Some(document), DeploymentCliInput::default()).unwrap();
+    let actions = dev_auth::setup_v3::planned_action_contract(&intent);
+    assert!(actions
+        .iter()
+        .any(|action| action.kind == "install_release"));
+    assert!(actions
+        .iter()
+        .any(|action| action.kind == "install_user_configuration"));
+    assert!(!actions
+        .iter()
+        .any(|action| action.kind == "install_user_integrations"));
+    assert!(!actions.iter().any(|action| action.kind == "start_broker"));
+    assert!(!actions
+        .iter()
+        .any(|action| action.kind == "activate_transparent_launchers"));
 }
 
 #[test]

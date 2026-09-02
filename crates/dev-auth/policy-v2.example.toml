@@ -16,6 +16,15 @@ automation-agent = "/usr/local/bin/automation-agent"
 executable = "/usr/bin/bwrap"
 arguments = ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc", "--share-net"]
 argument_separator = true
+launcher_visibility = "required"
+broker_socket_visibility = "required"
+peer_identity = "preserve"
+cgroup_identity = "retain"
+descendant_containment = "retain"
+network_namespace = "inherit"
+workspace_mounts = "requested"
+read_only_mount_arguments = ["--ro-bind", "{path}", "{path}"]
+read_write_mount_arguments = ["--bind", "{path}", "{path}"]
 
 [github_apps.automation]
 app_id = 123456
