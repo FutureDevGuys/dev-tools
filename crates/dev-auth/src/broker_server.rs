@@ -181,6 +181,15 @@ impl CapabilityBackend for UnavailableCapabilityBackend {
         bail!("capability backend is unavailable")
     }
 
+    fn sign_release_manifest(
+        &self,
+        _session_id: &str,
+        _grant: &crate::linux_admission::SessionReleaseSigningGrant,
+        _payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        bail!("capability backend is unavailable")
+    }
+
     fn revoke_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
@@ -302,7 +311,8 @@ fn handle_public_connection(
                 | BrokerRequest::GitCredential { .. }
                 | BrokerRequest::InvalidateGitCredential { .. }
                 | BrokerRequest::GhExecutionToken
-                | BrokerRequest::SignSsh { .. } => BrokerResponse::Denied {
+                | BrokerRequest::SignSsh { .. }
+                | BrokerRequest::SignReleaseManifest { .. } => BrokerResponse::Denied {
                     code: "no_session".into(),
                     message: "caller is outside a registered workload session".into(),
                 },
@@ -424,6 +434,30 @@ fn session_response(
                 message: "workload profile has no signing authority".into(),
             },
         },
+        BrokerRequest::SignReleaseManifest {
+            release_public_key,
+            payload,
+            ..
+        } => match session.authority.release_signing.as_ref() {
+            Some(grant) if grant.public_key == release_public_key => {
+                match dev_tools_release::validate_unsigned_product_manifest(&payload) {
+                    Ok(manifest) if grant.products.contains(&manifest.product) => {
+                        match backend.sign_release_manifest(&session.session_id, grant, &payload) {
+                            Ok(signature) => BrokerResponse::Signature { signature },
+                            Err(_) => provider_denial(),
+                        }
+                    }
+                    Ok(_) | Err(_) => BrokerResponse::Denied {
+                        code: "resource_denied".into(),
+                        message: "release manifest is outside workload authority".into(),
+                    },
+                }
+            }
+            Some(_) | None => BrokerResponse::Denied {
+                code: "resource_denied".into(),
+                message: "workload profile has no release-signing authority".into(),
+            },
+        },
     };
     emit_request_audit(Some(session), &audit_request, &response);
     Ok(response)
@@ -513,6 +547,23 @@ fn request_audit_record<'a>(
             },
             Some(public_resource_digest(&[profile, public_key_fingerprint])),
         ),
+        BrokerRequest::SignReleaseManifest {
+            profile,
+            release_public_key,
+            payload,
+        } => {
+            let product = dev_tools_release::validate_unsigned_product_manifest(payload)
+                .map(|manifest| manifest.product)
+                .unwrap_or_else(|_| "invalid".into());
+            (
+                "release_manifest_signing",
+                Some(public_resource_digest(&[
+                    profile,
+                    release_public_key,
+                    &product,
+                ])),
+            )
+        }
     };
     let outcome = match response {
         BrokerResponse::Denied { code, .. } => format!("denied:{code}"),
@@ -661,6 +712,22 @@ fn session_authorizes(
         } => {
             profile == &session.profile
                 && session_operation_key(session, *purpose, public_key_fingerprint).is_some()
+        }
+        BrokerRequest::SignReleaseManifest {
+            profile,
+            release_public_key,
+            payload,
+        } => {
+            profile == &session.profile
+                && session
+                    .authority
+                    .release_signing
+                    .as_ref()
+                    .is_some_and(|grant| {
+                        grant.public_key == *release_public_key
+                            && dev_tools_release::validate_unsigned_product_manifest(payload)
+                                .is_ok_and(|manifest| grant.products.contains(&manifest.product))
+                    })
         }
     }
 }
@@ -885,6 +952,15 @@ mod tests {
             bail!("unexpected GitHub request")
         }
 
+        fn sign_release_manifest(
+            &self,
+            _session_id: &str,
+            _grant: &crate::linux_admission::SessionReleaseSigningGrant,
+            payload: &[u8],
+        ) -> Result<Vec<u8>> {
+            Ok(payload.to_vec())
+        }
+
         fn sign_ssh(
             &self,
             _session_id: &str,
@@ -933,6 +1009,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 github: None,
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::new(),
@@ -977,6 +1054,7 @@ mod tests {
                     installation_ids: vec![],
                 }),
                 signing: None,
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: "/sys/fs/cgroup/system.slice/dev-auth-workload-0123456789abcdef0123456789abcdef.service".into(),
@@ -1014,6 +1092,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 github: None,
                 signing: Some(key.clone()),
+                release_signing: None,
                 ssh: Vec::new(),
             },
             cgroup: PathBuf::new(),
@@ -1052,6 +1131,74 @@ mod tests {
             .unwrap(),
             BrokerResponse::Denied { code, .. } if code == "resource_denied"
         ));
+    }
+
+    #[test]
+    fn release_manifest_signing_rejects_git_signing_and_ungranted_products() {
+        let key = crate::linux_admission::SessionOperationKeyGrant {
+            credential_slot: "automation".into(),
+            private_key_ref: "op://Automation/release/private-key".into(),
+            public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test".into(),
+            fingerprint: "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI".into(),
+        };
+        let payload = serde_jcs::to_vec(&serde_json::json!({
+            "schema": "dev-auth-product-v2",
+            "product": "dev-auth",
+            "generation": 17,
+            "version": "0.3.6",
+            "source_commit": "a".repeat(40),
+            "engine_protocol": 1,
+            "artifacts": {"linux-x86_64": {
+                "url": "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.3.6/dev-auth-0.3.6-linux-x86_64",
+                "length": 42,
+                "sha256": "b".repeat(64),
+            }}
+        }))
+        .unwrap();
+        let mut session = crate::linux_admission::VerifiedLinuxSession {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+            owner_uid: 1000,
+            execution_uid: 991,
+            workload: "release-agent".into(),
+            profile: "release".into(),
+            authority: crate::linux_admission::SessionAuthorityGrant {
+                github: None,
+                signing: Some(key.clone()),
+                release_signing: None,
+                ssh: Vec::new(),
+            },
+            cgroup: PathBuf::new(),
+            expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 900,
+        };
+        let request = || BrokerRequest::SignReleaseManifest {
+            profile: "release".into(),
+            release_public_key: "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072"
+                .into(),
+            payload: payload.clone(),
+        };
+        assert!(matches!(
+            session_response(&session, request(), None, &SigningBackend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+
+        session.authority.signing = None;
+        session.authority.release_signing =
+            Some(crate::linux_admission::SessionReleaseSigningGrant {
+                credential_slot: key.credential_slot.clone(),
+                private_key_ref: "op://Automation/release/private-key".into(),
+                public_key: "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072"
+                    .into(),
+                products: vec!["update-all".into()],
+            });
+        assert!(matches!(
+            session_response(&session, request(), None, &SigningBackend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+        session.authority.release_signing.as_mut().unwrap().products = vec!["dev-auth".into()];
+        assert_eq!(
+            session_response(&session, request(), None, &SigningBackend).unwrap(),
+            BrokerResponse::Signature { signature: payload }
+        );
     }
 
     #[test]

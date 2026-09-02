@@ -21,6 +21,7 @@ fn registration() -> SessionRegistration {
         authority: SessionAuthorityGrant {
             github: None,
             signing: None,
+            release_signing: None,
             ssh: Vec::new(),
         },
         cgroup:
@@ -80,6 +81,7 @@ fn root_control_prepares_the_kernel_observed_execution_identity() {
                 authority: SessionAuthorityGrant {
                     github: None,
                     signing: None,
+                    release_signing: None,
                     ssh: Vec::new(),
                 },
                 cgroup: "/sys/fs/cgroup/system.slice/dev-auth-workload-0123456789abcdef0123456789abcdef.service".into(),

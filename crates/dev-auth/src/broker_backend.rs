@@ -1,9 +1,12 @@
 use crate::broker_protocol::SshOperationPurpose;
-use crate::linux_admission::{SessionGitHubGrant, SessionOperationKeyGrant};
+use crate::linux_admission::{
+    SessionGitHubGrant, SessionOperationKeyGrant, SessionReleaseSigningGrant,
+};
 use crate::policy_v2::{SystemMode, SystemPolicyV2};
 use crate::runtime::{
     broker_github_token_for_repositories, broker_github_token_for_repository,
-    broker_revoke_github_token, broker_sign_ssh, BrokerGitHubAuthority, BrokerGitHubToken,
+    broker_revoke_github_token, broker_sign_release_manifest_bytes, broker_sign_ssh,
+    BrokerGitHubAuthority, BrokerGitHubToken,
 };
 use crate::SecretString;
 use anyhow::{bail, Context, Result};
@@ -44,6 +47,13 @@ pub(crate) trait CapabilityBackend: Send + Sync {
         session_id: &str,
         purpose: SshOperationPurpose,
         grant: &SessionOperationKeyGrant,
+        payload: &[u8],
+    ) -> Result<Vec<u8>>;
+
+    fn sign_release_manifest(
+        &self,
+        session_id: &str,
+        grant: &SessionReleaseSigningGrant,
         payload: &[u8],
     ) -> Result<Vec<u8>>;
 
@@ -210,6 +220,39 @@ impl SystemCapabilityBackend {
         self.service_token(&grant.credential_slot)
     }
 
+    fn validate_release_signing_grant(
+        &self,
+        grant: &SessionReleaseSigningGrant,
+        product: &str,
+    ) -> Result<&SecretString> {
+        let slot = self
+            .policy
+            .credential_slots
+            .get(&grant.credential_slot)
+            .context("session credential slot is outside administrator policy")?;
+        let allowed = self.policy.authority_caps.iter().any(|(cap_name, cap)| {
+            slot.authority_caps.contains(cap_name)
+                && cap
+                    .release_signing_products
+                    .iter()
+                    .any(|item| item == product)
+                && cap
+                    .release_signing_keys
+                    .contains(&crate::policy_v2::ReleaseSigningKeyConfig {
+                        private_key_ref: grant.private_key_ref.clone(),
+                        public_key: grant.public_key.clone(),
+                    })
+                && cap
+                    .secret_references
+                    .iter()
+                    .any(|reference| reference == &grant.private_key_ref)
+        });
+        if !allowed {
+            bail!("session release-signing authority is outside administrator policy");
+        }
+        self.service_token(&grant.credential_slot)
+    }
+
     fn cached(&self, key: &str, now: i64) -> Result<Option<BrokerGitHubToken>> {
         let cache = self
             .cache
@@ -368,6 +411,26 @@ impl CapabilityBackend for SystemCapabilityBackend {
         )
     }
 
+    fn sign_release_manifest(
+        &self,
+        _session_id: &str,
+        grant: &SessionReleaseSigningGrant,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let manifest = dev_tools_release::validate_unsigned_product_manifest(payload)?;
+        if !grant.products.contains(&manifest.product) {
+            bail!("release manifest product is outside the session grant");
+        }
+        let service_token = self.validate_release_signing_grant(grant, &manifest.product)?;
+        broker_sign_release_manifest_bytes(
+            &self.policy.programs.op,
+            service_token,
+            &grant.private_key_ref,
+            &grant.public_key,
+            payload,
+        )
+    }
+
     fn revoke_session(&self, session_id: &str) -> Result<()> {
         let tokens = {
             let mut cache = self
@@ -517,6 +580,8 @@ mod tests {
             permissions: BTreeMap::from([("contents".into(), Permission::Read)]),
             installation_ids: Vec::new(),
             signing: false,
+            release_signing_products: Vec::new(),
+            release_signing_keys: Vec::new(),
             ssh: false,
             git_identities: Vec::new(),
             secret_references: vec![reference.into()],

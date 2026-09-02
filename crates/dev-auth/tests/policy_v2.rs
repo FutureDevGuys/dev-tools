@@ -40,7 +40,7 @@ private_key_references = ["op://Machine Vault/github-app/private-key"]
 [credential_slots.automation]
 users = ["automation"]
 authority_caps = ["release"]
-secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/manifest-private-key"]
 
 [authority_caps.release]
 github_apps = ["automation"]
@@ -49,9 +49,11 @@ repositories = ["api", "website"]
 permissions = { contents = "write", metadata = "read", pull_requests = "write" }
 installation_ids = [101, 102]
 signing = true
+release_signing_products = ["dev-auth", "update-all"]
+release_signing_keys = [{ private_key_ref = "op://Machine Vault/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }]
 ssh = true
 git_identities = [{ name = "Automation Agent", email = "automation@example.invalid" }]
-secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+secret_references = ["op://Machine Vault/github-app/private-key", "op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/manifest-private-key"]
 
 [workspace_caps.source]
 path = "/srv/source"
@@ -67,9 +69,11 @@ help_footer = true
 [authority_profiles.publish]
 cap = "release"
 signing = false
+release_signing_products = ["dev-auth"]
+release_signing_key = { private_key_ref = "op://Machine Vault/release/manifest-private-key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }
 ssh = true
 git_identity = { name = "Automation Agent", email = "automation@example.invalid" }
-secret_references = ["op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key"]
+secret_references = ["op://Machine Vault/release/token", "op://Machine Vault/release/ssh-private-key", "op://Machine Vault/release/manifest-private-key"]
 ssh_keys = [{ private_key_ref = "op://Machine Vault/release/ssh-private-key", public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test", fingerprint = "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI" }]
 
 [authority_profiles.publish.github]
@@ -171,6 +175,12 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
     let resolved = resolve_policy(&system, &user).unwrap();
 
     assert_eq!(resolved.mode, SystemMode::Strong);
+    let publish = resolved.authority_profiles.get("publish").unwrap();
+    assert_eq!(
+        publish.release_signing_products,
+        BTreeSet::from(["dev-auth".to_owned()])
+    );
+    assert!(publish.release_signing_key.is_some());
     assert_eq!(
         resolved.routing.no_session,
         NoSessionRouting::NativePassthrough
@@ -269,6 +279,38 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
 }
 
 #[test]
+fn release_manifest_signing_is_distinct_from_git_signing_authority() {
+    let system = parse_system_policy_v2(SYSTEM_POLICY.as_bytes()).unwrap();
+    let git_key_for_release = USER_CONFIG.replace(
+        "release_signing_key = { private_key_ref = \"op://Machine Vault/release/manifest-private-key\"",
+        "release_signing_key = { private_key_ref = \"op://Machine Vault/release/ssh-private-key\"",
+    );
+    let git_key_for_release = parse_user_config_v2(git_key_for_release.as_bytes()).unwrap();
+    assert!(resolve_policy(&system, &git_key_for_release).is_err());
+
+    let without_release_key = USER_CONFIG
+        .lines()
+        .filter(|line| !line.starts_with("release_signing_key = "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(parse_user_config_v2(without_release_key.as_bytes()).is_err());
+
+    let git_only = USER_CONFIG
+        .lines()
+        .filter(|line| {
+            !line.starts_with("release_signing_products = ")
+                && !line.starts_with("release_signing_key = ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let git_only = parse_user_config_v2(git_only.as_bytes()).unwrap();
+    let resolved = resolve_policy(&system, &git_only).unwrap();
+    let publish = resolved.authority_profiles.get("publish").unwrap();
+    assert!(publish.release_signing_key.is_none());
+    assert!(publish.release_signing_products.is_empty());
+}
+
+#[test]
 fn routing_is_native_without_a_session_and_never_allows_invalid_passthrough() {
     let default_footer = parse_user_config_v2(
         USER_CONFIG
@@ -304,7 +346,7 @@ fn strict_parsers_reject_unknown_duplicate_and_unsafe_inputs() {
             "agent = \"relative/agent\"",
         ),
         SYSTEM_POLICY.replace(
-            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\"]",
+            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\", \"op://Machine Vault/release/manifest-private-key\"]",
             "secret_references = [\"plaintext-secret\"]",
         ),
     ];
@@ -383,7 +425,7 @@ fn credential_slots_bind_users_caps_and_secret_references() {
         ),
         SYSTEM_POLICY.replace("authority_caps = [\"release\"]", "authority_caps = [\"other\"]"),
         SYSTEM_POLICY.replace(
-            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\"]\n\n[authority_caps.release]",
+            "secret_references = [\"op://Machine Vault/github-app/private-key\", \"op://Machine Vault/release/token\", \"op://Machine Vault/release/ssh-private-key\", \"op://Machine Vault/release/manifest-private-key\"]\n\n[authority_caps.release]",
             "secret_references = [\"op://Machine Vault/github-app/private-key\"]\n\n[authority_caps.release]",
         ),
     ] {
@@ -416,7 +458,7 @@ fn resolution_rejects_every_user_authority_expansion() {
 
     let system_without_signing = parse_system_policy_v2(
         SYSTEM_POLICY
-            .replace("signing = true\nssh = true", "signing = false\nssh = true")
+            .replace("signing = true", "signing = false")
             .as_bytes(),
     )
     .unwrap();

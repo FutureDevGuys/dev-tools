@@ -184,7 +184,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=ROOT / "release-trust/dev-tools-root.json",
     )
-    parser.add_argument("--release-private-key", required=True, type=Path)
+    signer = parser.add_mutually_exclusive_group(required=True)
+    signer.add_argument("--release-private-key", type=Path)
+    signer.add_argument("--release-signer", type=Path)
+    parser.add_argument("--release-signer-profile")
+    parser.add_argument("--release-key-id")
     parser.add_argument(
         "--public-git-command",
         type=Path,
@@ -219,8 +223,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def release_signer_arguments(args: argparse.Namespace) -> list[str]:
+    if args.release_private_key is not None:
+        if args.release_signer_profile is not None or args.release_key_id is not None:
+            raise SystemExit(
+                "external signer profile and key identifier require --release-signer"
+            )
+        return ["--release-private-key", str(args.release_private_key)]
+    if (
+        args.release_signer is None
+        or args.release_signer_profile is None
+        or args.release_key_id is None
+    ):
+        raise SystemExit(
+            "--release-signer requires --release-signer-profile and --release-key-id"
+        )
+    return [
+        "--release-signer",
+        str(args.release_signer),
+        "--release-signer-profile",
+        args.release_signer_profile,
+        "--release-key-id",
+        args.release_key_id,
+    ]
+
+
 def main() -> int:
     args = parse_args()
+    signer_arguments = release_signer_arguments(args)
     commit, timestamp = exact_source(resolve_public_git(args.public_git_command))
     versions = product_versions()
     products = tuple(dict.fromkeys(args.products or PRODUCTS))
@@ -279,8 +309,6 @@ def main() -> int:
             str(artifacts[product]),
             "--root-document",
             str(args.root_document),
-            "--release-private-key",
-            str(args.release_private_key),
             "--trusted-root-public-key",
             str(args.trusted_root_public_key),
             "--manifest-generation",
@@ -288,6 +316,7 @@ def main() -> int:
             "--output",
             str(destination),
         ]
+        command.extend(signer_arguments)
         if product == "dev-auth":
             command.extend(["--source-commit", commit])
         summaries.append(json.loads(run(*command, env=env)))

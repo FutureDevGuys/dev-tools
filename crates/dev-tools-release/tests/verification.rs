@@ -3,8 +3,9 @@ use base64::Engine as _;
 use dev_tools_release::{
     accept_verified_release, accept_verified_release_at, cache_verified_release, fetch_https,
     load_cached_release, load_release_state_at, select_stable_release_assets,
-    verify_artifact_bytes, verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy,
-    HttpsPolicy, ReleaseAuthority, ReleaseBundle, ReleaseMetadata, ReleaseState,
+    validate_unsigned_product_manifest, verify_artifact_bytes, verify_release_bytes,
+    verify_release_metadata, ArtifactUrlPolicy, HttpsPolicy, ReleaseAuthority, ReleaseBundle,
+    ReleaseMetadata, ReleaseState,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
@@ -16,6 +17,35 @@ use std::time::Duration;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn unsigned_manifest_validation_requires_canonical_stable_release_contract() {
+    let manifest = json!({
+        "schema": "dev-auth-product-v2",
+        "product": "dev-auth",
+        "generation": 17,
+        "version": "0.3.6",
+        "source_commit": "a".repeat(40),
+        "engine_protocol": 1,
+        "artifacts": {
+            "linux-x86_64": {
+                "url": "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.3.6/dev-auth-0.3.6-linux-x86_64",
+                "length": 42,
+                "sha256": "b".repeat(64),
+            }
+        }
+    });
+    let canonical = serde_jcs::to_vec(&manifest).unwrap();
+    let parsed = validate_unsigned_product_manifest(&canonical).unwrap();
+    assert_eq!(parsed.product, "dev-auth");
+    assert_eq!(parsed.generation, 17);
+
+    let noncanonical = serde_json::to_vec_pretty(&manifest).unwrap();
+    assert!(validate_unsigned_product_manifest(&noncanonical).is_err());
+    let mut arbitrary = manifest;
+    arbitrary["schema"] = Value::String("arbitrary-document".into());
+    assert!(validate_unsigned_product_manifest(&serde_jcs::to_vec(&arbitrary).unwrap()).is_err());
 }
 
 fn signed(value: Value, key_id: &str, key: &SigningKey) -> Vec<u8> {

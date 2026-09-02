@@ -173,12 +173,33 @@ def require_authorized_release_key(
     envelope_value: dict[str, object],
     release_key: Ed25519PrivateKey,
 ) -> str:
+    return require_authorized_release_public_key(envelope_value, release_key.public_key())
+
+
+def require_authorized_release_public_key(
+    envelope_value: dict[str, object],
+    release_key: Ed25519PublicKey,
+) -> str:
     release_id = key_id("release", release_key)
     release_public = public_hex(release_key)
     signed = envelope_value["signed"]
     for record in signed["release_keys"]:  # type: ignore[index]
         if record["key_id"] == release_id and record["public_key"] == release_public:
             if record["revoked"]:
-                raise SystemExit("release private key is revoked by the root document")
+                raise SystemExit("release key is revoked by the root document")
             return release_id
-    raise SystemExit("release private key is not authorized by the root document")
+    raise SystemExit("release key is not authorized by the root document")
+
+
+def authorized_release_public_key(
+    envelope_value: dict[str, object],
+    release_id: str,
+) -> Ed25519PublicKey:
+    signed = envelope_value["signed"]
+    for record in signed["release_keys"]:  # type: ignore[index]
+        if record["key_id"] != release_id:
+            continue
+        if record["revoked"]:
+            raise SystemExit("release key is revoked by the root document")
+        return Ed25519PublicKey.from_public_bytes(bytes.fromhex(record["public_key"]))
+    raise SystemExit("release key identifier is not authorized by the root document")
