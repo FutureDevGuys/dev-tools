@@ -25,6 +25,26 @@ fn logging_retention_defaults_and_overrides_are_explicit() {
 }
 
 #[test]
+fn completion_snapshot_retention_defaults_and_overrides_are_explicit() {
+    let tmp = TempDir::new().unwrap();
+    let default_config = tmp.path().join("default.toml");
+    std::fs::write(&default_config, "").unwrap();
+    let defaults = load_runtime_config(Some(default_config)).unwrap();
+    assert_eq!(defaults.completions.retention_prior_snapshots, 3);
+    assert_eq!(defaults.completions.retention_min_age_hours, 24);
+
+    let override_config = tmp.path().join("override.toml");
+    std::fs::write(
+        &override_config,
+        "[completions]\nretention_prior_snapshots = 7\nretention_min_age_hours = 48\n",
+    )
+    .unwrap();
+    let overridden = load_runtime_config(Some(override_config)).unwrap();
+    assert_eq!(overridden.completions.retention_prior_snapshots, 7);
+    assert_eq!(overridden.completions.retention_min_age_hours, 48);
+}
+
+#[test]
 fn external_catalog_uses_top_level_tasks() {
     let tmp = TempDir::new().unwrap();
     let config = tmp.path().join("config.toml");

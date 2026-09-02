@@ -307,6 +307,10 @@ pub struct CompletionConfig {
     /// Empty selects installed-shell detection. Non-empty values are
     /// normalized by the completion CLI/task boundary.
     pub shells: Vec<String>,
+    /// Number of prior immutable activations retained regardless of age.
+    pub retention_prior_snapshots: usize,
+    /// Minimum age before a prior snapshot may be pruned.
+    pub retention_min_age_hours: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -566,6 +570,8 @@ struct FileBootstrapConfig {
 struct FileCompletionConfig {
     tools: Option<Vec<FileCompletionToolConfig>>,
     shells: Option<Vec<String>>,
+    retention_prior_snapshots: Option<usize>,
+    retention_min_age_hours: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1844,6 +1850,8 @@ pub fn load_runtime_config(config_path_cli: Option<PathBuf>) -> Result<RuntimeCo
         completions: CompletionConfig {
             tools: custom_completion_tools,
             shells: completion_shells,
+            retention_prior_snapshots: completion_cfg.retention_prior_snapshots.unwrap_or(3),
+            retention_min_age_hours: completion_cfg.retention_min_age_hours.unwrap_or(24),
         },
         source_path: resolved_path,
     })

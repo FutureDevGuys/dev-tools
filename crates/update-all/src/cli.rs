@@ -1427,6 +1427,23 @@ impl CompletionsCli {
                             binding.classification.as_deref().unwrap_or("unknown")
                         );
                     }
+                    crate::ua_outln!(
+                        "historical_snapshots={}",
+                        status.status.historical_snapshots.len()
+                    );
+                    for snapshot in &status.status.historical_snapshots {
+                        crate::ua_outln!(
+                            "historical_snapshot={} modified_unix_ms={} bytes={} healthy={} issue={}",
+                            snapshot.snapshot,
+                            snapshot
+                                .modified_unix_ms
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            snapshot.bytes,
+                            snapshot.healthy,
+                            snapshot.issue.as_deref().unwrap_or("-")
+                        );
+                    }
                     crate::ua_outln!("issues={}", status.status.issues.len());
                     for issue in &status.status.issues {
                         crate::ua_outln!(

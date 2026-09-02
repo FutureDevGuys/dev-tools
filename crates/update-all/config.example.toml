@@ -310,6 +310,10 @@ catalogs = []
 # installed supported shells and includes the current shell. Use `all` alone
 # to publish every supported shell.
 # shells = ["bash", "zsh", "fish", "elvish", "powershell"]
+# Keep three prior immutable snapshots and never prune a snapshot less than
+# 24 hours old. Cleanup runs only after a clean behavior-changing publication.
+retention_prior_snapshots = 3
+retention_min_age_hours = 24
 # User-managed completion tools are merged additively with the repo catalog.
 # You can add your own entries here and you can disable a repo-managed entry
 # without editing the repo itself. Matching is by (provider, name).

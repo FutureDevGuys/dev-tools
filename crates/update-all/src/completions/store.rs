@@ -4,12 +4,12 @@ use crate::util::lockfile::{try_acquire_pid_lock, PidLockOptions};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 const SHA256_HEX_LENGTH: usize = 64;
@@ -20,7 +20,17 @@ pub struct ManagedCompletionRootStatus {
     pub current_snapshot: Option<String>,
     pub available_shells: Vec<String>,
     pub active_bindings: Vec<ManagedCompletionBindingStatus>,
+    pub historical_snapshots: Vec<ManagedCompletionSnapshotStatus>,
     pub issues: Vec<ManagedCompletionIssueStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedCompletionSnapshotStatus {
+    pub snapshot: String,
+    pub modified_unix_ms: Option<u64>,
+    pub bytes: u64,
+    pub healthy: bool,
+    pub issue: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +56,25 @@ pub enum CompletionSnapshotPublishOutcome {
     Published { snapshot: PathBuf },
     Repaired { snapshot: PathBuf },
     Unchanged { snapshot: PathBuf },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompletionSnapshotRetentionPolicy {
+    pub(crate) retain_prior_snapshots: usize,
+    pub(crate) minimum_age: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CompletionSnapshotPruneReport {
+    pub(crate) removed_snapshots: Vec<String>,
+    pub(crate) removed_objects: Vec<String>,
+    pub(crate) reclaimed_bytes: u64,
+    pub(crate) deferred_reason: Option<String>,
+}
+
+struct OwnedSnapshot {
+    manifest: SnapshotManifest,
+    bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +142,8 @@ impl ManagedCompletionRoot {
             ),
             None => (None, Vec::new(), Vec::new()),
         };
+        let historical_snapshots =
+            self.historical_snapshot_statuses(current_snapshot.as_deref())?;
         let issues = CompletionIssueStore::new(&self.root)?
             .load()?
             .into_iter()
@@ -129,6 +160,7 @@ impl ManagedCompletionRoot {
             current_snapshot,
             available_shells,
             active_bindings,
+            historical_snapshots,
             issues,
         })
     }
@@ -239,6 +271,148 @@ impl ManagedCompletionRoot {
         })
     }
 
+    pub(crate) fn prune_historical_snapshots_assuming_lock(
+        &self,
+        policy: CompletionSnapshotRetentionPolicy,
+    ) -> Result<CompletionSnapshotPruneReport> {
+        let Some(current) = self.read_current_snapshot()? else {
+            return Ok(CompletionSnapshotPruneReport::default());
+        };
+        if let Err(error) = self.inspect_owned_snapshot(&current) {
+            return Ok(CompletionSnapshotPruneReport {
+                deferred_reason: Some(format!(
+                    "active snapshot ownership could not be proven: {error:#}"
+                )),
+                ..CompletionSnapshotPruneReport::default()
+            });
+        }
+
+        let history = self.historical_snapshot_statuses(Some(&current))?;
+        if let Some(snapshot) = history.iter().find(|snapshot| !snapshot.healthy) {
+            return Ok(CompletionSnapshotPruneReport {
+                deferred_reason: Some(format!(
+                    "historical snapshot {} ownership could not be proven: {}",
+                    snapshot.snapshot,
+                    snapshot.issue.as_deref().unwrap_or("invalid snapshot")
+                )),
+                ..CompletionSnapshotPruneReport::default()
+            });
+        }
+
+        let now = SystemTime::now();
+        let mut removed_snapshots = Vec::new();
+        let mut reclaimed_bytes = 0_u64;
+        for (index, snapshot) in history.iter().enumerate() {
+            let modified = snapshot.modified_unix_ms.map(|value| {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_millis(value))
+                    .unwrap_or(UNIX_EPOCH)
+            });
+            let age = modified
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or(Duration::ZERO);
+            if index < policy.retain_prior_snapshots || age < policy.minimum_age {
+                continue;
+            }
+            removed_snapshots.push(snapshot.snapshot.clone());
+            reclaimed_bytes = reclaimed_bytes.saturating_add(snapshot.bytes);
+        }
+
+        let removed_set = removed_snapshots.iter().cloned().collect::<BTreeSet<_>>();
+        let survivor_names = std::iter::once(current.clone())
+            .chain(
+                history
+                    .iter()
+                    .filter(|snapshot| !removed_set.contains(&snapshot.snapshot))
+                    .map(|snapshot| snapshot.snapshot.clone()),
+            )
+            .collect::<Vec<_>>();
+        let mut referenced_objects = BTreeSet::new();
+        for snapshot in &survivor_names {
+            let owned = self.inspect_owned_snapshot(snapshot)?;
+            referenced_objects.extend(
+                owned
+                    .manifest
+                    .views
+                    .values()
+                    .map(|view| view.object_digest.clone()),
+            );
+        }
+
+        let mut removable_objects = Vec::new();
+        if self.objects_dir().exists() {
+            let metadata = fs::symlink_metadata(self.objects_dir())
+                .with_context(|| format!("inspect {}", self.objects_dir().display()))?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Ok(CompletionSnapshotPruneReport {
+                    deferred_reason: Some("object store is not a real directory".to_string()),
+                    ..CompletionSnapshotPruneReport::default()
+                });
+            }
+            for entry in fs::read_dir(self.objects_dir())
+                .with_context(|| format!("read {}", self.objects_dir().display()))?
+            {
+                let entry = entry
+                    .with_context(|| format!("read entry in {}", self.objects_dir().display()))?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if !is_owned_digest_name(&name) {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
+                    format!("inspect completion object {}", entry.path().display())
+                })?;
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    return Ok(CompletionSnapshotPruneReport {
+                        deferred_reason: Some(format!(
+                            "completion object {} is not a real regular file",
+                            name
+                        )),
+                        ..CompletionSnapshotPruneReport::default()
+                    });
+                }
+                let bytes = fs::read(entry.path()).with_context(|| {
+                    format!("read completion object {}", entry.path().display())
+                })?;
+                if sha256_hex(&bytes) != name {
+                    return Ok(CompletionSnapshotPruneReport {
+                        deferred_reason: Some(format!(
+                            "completion object {} failed content-address verification",
+                            name
+                        )),
+                        ..CompletionSnapshotPruneReport::default()
+                    });
+                }
+                if !referenced_objects.contains(&name) {
+                    removable_objects.push((name, entry.path(), metadata.len()));
+                }
+            }
+        }
+
+        for snapshot in &removed_snapshots {
+            let path = self.snapshot_dir(snapshot);
+            fs::remove_dir_all(&path).with_context(|| {
+                format!("remove retained completion snapshot {}", path.display())
+            })?;
+        }
+        let mut removed_objects = Vec::new();
+        for (name, path, bytes) in removable_objects {
+            fs::remove_file(&path).with_context(|| {
+                format!("remove unreferenced completion object {}", path.display())
+            })?;
+            reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+            removed_objects.push(name);
+        }
+
+        Ok(CompletionSnapshotPruneReport {
+            removed_snapshots,
+            removed_objects,
+            reclaimed_bytes,
+            deferred_reason: None,
+        })
+    }
+
     fn read_active_snapshot(&self) -> Result<Option<ActiveSnapshot>> {
         let Some(name) = self.read_current_snapshot()? else {
             return Ok(None);
@@ -261,6 +435,95 @@ impl ManagedCompletionRoot {
             }
         }
         Ok(manifest)
+    }
+
+    fn historical_snapshot_statuses(
+        &self,
+        current_snapshot: Option<&str>,
+    ) -> Result<Vec<ManagedCompletionSnapshotStatus>> {
+        let snapshots_dir = self.snapshots_dir();
+        if !snapshots_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(&snapshots_dir)
+            .with_context(|| format!("read {}", snapshots_dir.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("read entry in {}", snapshots_dir.display()))?;
+            let Some(snapshot) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !is_owned_digest_name(&snapshot)
+                || current_snapshot.is_some_and(|current| current == snapshot)
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
+                format!("inspect completion snapshot {}", entry.path().display())
+            })?;
+            let modified_unix_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
+            let inspected = self.inspect_owned_snapshot(&snapshot);
+            let (bytes, healthy, issue) = match inspected {
+                Ok(owned) => (owned.bytes, true, None),
+                Err(error) => (0, false, Some(format!("{error:#}"))),
+            };
+            snapshots.push(ManagedCompletionSnapshotStatus {
+                snapshot,
+                modified_unix_ms,
+                bytes,
+                healthy,
+                issue,
+            });
+        }
+        snapshots.sort_by(|left, right| {
+            right
+                .modified_unix_ms
+                .cmp(&left.modified_unix_ms)
+                .then_with(|| left.snapshot.cmp(&right.snapshot))
+        });
+        Ok(snapshots)
+    }
+
+    fn inspect_owned_snapshot(&self, snapshot: &str) -> Result<OwnedSnapshot> {
+        validate_snapshot_name(snapshot)?;
+        let manifest = self.validate_snapshot(snapshot)?;
+        let root = self.snapshot_dir(snapshot);
+        require_real_directory(&root)?;
+        let root_entries = real_directory_entry_names(&root)?;
+        let expected_root = ["manifest.json".to_string(), "views".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if root_entries != expected_root {
+            anyhow::bail!("completion snapshot contains unexpected root entries");
+        }
+
+        let manifest_path = root.join("manifest.json");
+        let mut bytes = require_real_file(&manifest_path)?;
+        let views_root = root.join("views");
+        require_real_directory(&views_root)?;
+        let view_entries = real_directory_entry_names(&views_root)?;
+        let expected_views = manifest.views.keys().cloned().collect::<BTreeSet<_>>();
+        if view_entries != expected_views {
+            anyhow::bail!("completion snapshot contains unexpected shell views");
+        }
+        for (shell, view) in &manifest.views {
+            let shell_root = views_root.join(shell);
+            require_real_directory(&shell_root)?;
+            let shell_entries = real_directory_entry_names(&shell_root)?;
+            let expected_shell = [view.file_name.clone()]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if shell_entries != expected_shell {
+                anyhow::bail!("completion snapshot contains unexpected files for shell {shell}");
+            }
+            bytes = bytes.saturating_add(require_real_file(&shell_root.join(&view.file_name))?);
+        }
+        Ok(OwnedSnapshot { manifest, bytes })
     }
 
     fn read_current_snapshot(&self) -> Result<Option<String>> {
@@ -406,11 +669,56 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn validate_snapshot_name(snapshot: &str) -> Result<()> {
-    if snapshot.len() != SHA256_HEX_LENGTH || !snapshot.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if !is_owned_digest_name(snapshot) {
         anyhow::bail!("managed completion snapshot id is invalid: {snapshot}");
     }
     Ok(())
+}
+
+fn is_owned_digest_name(value: &str) -> bool {
+    value.len() == SHA256_HEX_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn require_real_directory(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "completion snapshot path is not a real directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn require_real_file(path: &Path) -> Result<u64> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "completion snapshot path is not a real regular file: {}",
+            path.display()
+        );
+    }
+    Ok(metadata.len())
+}
+
+fn real_directory_entry_names(path: &Path) -> Result<BTreeSet<String>> {
+    fs::read_dir(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .map(|entry| {
+            let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+            entry.file_name().into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "completion snapshot contains a non-UTF-8 entry: {}",
+                    path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 fn validate_manifest(manifest: &SnapshotManifest) -> Result<()> {
@@ -710,7 +1018,7 @@ mod tests {
             .unwrap();
         drop(_lock);
 
-        let before = fs::read(root.current_path()).unwrap();
+        let before = tree_fingerprint(&root.root);
         let status = root.status().unwrap();
         let init = root.init_script(CompletionShell::Fish).unwrap();
         assert_eq!(status.active_bindings.len(), 1);
@@ -718,7 +1026,7 @@ mod tests {
         assert_eq!(status.issues.len(), 1);
         assert_eq!(status.issues[0].outcome, "retained_previous");
         assert!(!init.is_empty());
-        assert_eq!(fs::read(root.current_path()).unwrap(), before);
+        assert_eq!(tree_fingerprint(&root.root), before);
     }
 
     #[test]
@@ -730,5 +1038,168 @@ mod tests {
         assert!(format!("{error:#}").contains("another completion sync"));
         drop(first);
         assert!(root.lock_sync().is_ok());
+    }
+
+    #[test]
+    fn retention_keeps_current_and_recent_history_and_reclaims_unreferenced_objects() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let _lock = root.lock_sync().unwrap();
+
+        for generation in 0..5 {
+            let mut payloads = BTreeMap::new();
+            payloads.insert(
+                CompletionShell::Bash,
+                format!("complete -F _update_all_{generation} update-all\n"),
+            );
+            root.publish_shell_completions_assuming_lock(&payloads)
+                .unwrap();
+        }
+
+        let before = root.status().unwrap();
+        assert_eq!(before.historical_snapshots.len(), 4);
+        let report = root
+            .prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+                retain_prior_snapshots: 2,
+                minimum_age: Duration::ZERO,
+            })
+            .unwrap();
+
+        assert_eq!(report.removed_snapshots.len(), 2);
+        assert_eq!(root.status().unwrap().historical_snapshots.len(), 2);
+        assert_eq!(fs::read_dir(root.snapshots_dir()).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(root.objects_dir()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn retention_age_floor_protects_recent_snapshots_beyond_the_count_floor() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let _lock = root.lock_sync().unwrap();
+
+        for generation in 0..4 {
+            let mut payloads = BTreeMap::new();
+            payloads.insert(
+                CompletionShell::Fish,
+                format!("complete -c update-all -a generation-{generation}\n"),
+            );
+            root.publish_shell_completions_assuming_lock(&payloads)
+                .unwrap();
+        }
+        let before = tree_fingerprint(&root.root);
+        let report = root
+            .prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+                retain_prior_snapshots: 1,
+                minimum_age: Duration::from_secs(60 * 60),
+            })
+            .unwrap();
+
+        assert!(report.removed_snapshots.is_empty());
+        assert_eq!(before, tree_fingerprint(&root.root));
+    }
+
+    #[test]
+    fn malformed_historical_snapshot_defers_all_retention_mutation() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let _lock = root.lock_sync().unwrap();
+
+        for generation in 0..3 {
+            let mut payloads = BTreeMap::new();
+            payloads.insert(
+                CompletionShell::Zsh,
+                format!("#compdef update-all\n# generation {generation}\n"),
+            );
+            root.publish_shell_completions_assuming_lock(&payloads)
+                .unwrap();
+        }
+        let broken = root
+            .status()
+            .unwrap()
+            .historical_snapshots
+            .first()
+            .unwrap()
+            .snapshot
+            .clone();
+        fs::write(root.snapshot_dir(&broken).join("unexpected"), "unowned\n").unwrap();
+        let before = tree_fingerprint(&root.root);
+
+        let report = root
+            .prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+                retain_prior_snapshots: 0,
+                minimum_age: Duration::ZERO,
+            })
+            .unwrap();
+
+        assert!(report.deferred_reason.is_some());
+        assert!(report.removed_snapshots.is_empty());
+        assert_eq!(before, tree_fingerprint(&root.root));
+        assert!(root
+            .status()
+            .unwrap()
+            .historical_snapshots
+            .iter()
+            .any(|snapshot| snapshot.snapshot == broken && !snapshot.healthy));
+    }
+
+    #[test]
+    fn malformed_content_addressed_object_defers_all_retention_mutation() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let _lock = root.lock_sync().unwrap();
+
+        for generation in 0..3 {
+            let mut payloads = BTreeMap::new();
+            payloads.insert(
+                CompletionShell::Bash,
+                format!("complete -F _update_all_{generation} update-all\n"),
+            );
+            root.publish_shell_completions_assuming_lock(&payloads)
+                .unwrap();
+        }
+        let corrupt = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fs::write(root.objects_dir().join(corrupt), "not the named digest\n").unwrap();
+        let before = tree_fingerprint(&root.root);
+
+        let report = root
+            .prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+                retain_prior_snapshots: 0,
+                minimum_age: Duration::ZERO,
+            })
+            .unwrap();
+
+        assert!(report
+            .deferred_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("content-address verification")));
+        assert!(report.removed_snapshots.is_empty());
+        assert_eq!(before, tree_fingerprint(&root.root));
+    }
+
+    fn tree_fingerprint(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            if !path.exists() {
+                return;
+            }
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                let relative = entry.strip_prefix(root).unwrap().to_path_buf();
+                let metadata = fs::symlink_metadata(&entry).unwrap();
+                if metadata.is_dir() {
+                    out.push((relative.clone(), Vec::new()));
+                    walk(root, &entry, out);
+                } else if metadata.is_file() {
+                    out.push((relative, fs::read(entry).unwrap()));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
     }
 }

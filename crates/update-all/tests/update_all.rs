@@ -192,3 +192,39 @@ fn fresh_public_completion_sync_uses_a_virtual_empty_catalog_and_then_reuses() {
         .success()
         .stdout(predicate::str::contains("completion_outcome=reused"));
 }
+
+#[test]
+fn completion_status_reports_retained_snapshot_history_in_json_and_text() {
+    let home = TempDir::new().unwrap();
+    let managed = home.path().join("managed");
+    for shell in ["bash", "fish"] {
+        command(&home)
+            .args([
+                "completions",
+                "sync",
+                "--providers",
+                "path",
+                "--managed-root",
+            ])
+            .arg(&managed)
+            .args(["--shell", shell])
+            .assert()
+            .success();
+    }
+
+    command(&home)
+        .args(["completions", "status", "--managed-root"])
+        .arg(&managed)
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"historical_snapshots\""))
+        .stdout(predicate::str::contains("\"healthy\": true"));
+    command(&home)
+        .args(["completions", "status", "--managed-root"])
+        .arg(&managed)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("historical_snapshots=1"))
+        .stdout(predicate::str::contains("historical_snapshot="));
+}

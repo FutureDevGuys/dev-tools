@@ -14,6 +14,7 @@ use super::state::{
     CompletionBindingMemo, CompletionCandidateMemo, CompletionCandidateSlot,
     CompletionIdentityMemo, CompletionIdentityStore, CompletionIssueMemo, CompletionIssueStore,
 };
+use super::store::CompletionSnapshotRetentionPolicy;
 use super::{
     candidate_payload_basename, completion_provider_no_configured_tools,
     completion_provider_progress, filter_completion_catalog_for_providers, managed_completion_dir,
@@ -21,8 +22,9 @@ use super::{
     remove_managed_overlay_shim, tool_key, validate_completion_overlay_names,
     write_bytes_if_changed, write_managed_overlay_shim, CompletionArtifactClassification,
     CompletionBindingIdentity, CompletionCandidateIdentity, CompletionProviderInventoryRecord,
-    CompletionProviderInventoryStatus, CompletionShell, CompletionSyncArgs, CompletionSyncOutcome,
-    CompletionSyncRecord, CompletionSyncRecordStatus, CompletionSyncResult,
+    CompletionProviderInventoryStatus, CompletionShell, CompletionSnapshotPublishOutcome,
+    CompletionSyncArgs, CompletionSyncOutcome, CompletionSyncRecord, CompletionSyncRecordStatus,
+    CompletionSyncResult,
 };
 use crate::config::{load_runtime_config, merge_user_completion_catalog};
 use crate::util::cancel;
@@ -537,6 +539,28 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
     } else {
         None
     };
+    if completion_snapshot_retention_allowed(publication.as_ref(), &inventories, &direct_records) {
+        let retention =
+            root.prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+                retain_prior_snapshots: runtime_cfg.completions.retention_prior_snapshots,
+                minimum_age: Duration::from_secs(
+                    runtime_cfg
+                        .completions
+                        .retention_min_age_hours
+                        .saturating_mul(60 * 60),
+                ),
+            })?;
+        if let Some(reason) = retention.deferred_reason {
+            events.push(format!("__UA_COMP_RETENTION|deferred|{reason}"));
+        } else {
+            events.push(format!(
+                "__UA_COMP_RETENTION|complete|snapshots={}|objects={}|bytes={}",
+                retention.removed_snapshots.len(),
+                retention.removed_objects.len(),
+                retention.reclaimed_bytes
+            ));
+        }
+    }
     let outcome = summarize_sync_outcome(&direct_records, publication.as_ref());
 
     Ok(CompletionSyncResult {
@@ -555,6 +579,28 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
             .map(|shell| shell.as_event_name().to_string())
             .collect(),
     })
+}
+
+fn completion_snapshot_retention_allowed(
+    publication: Option<&CompletionSnapshotPublishOutcome>,
+    inventories: &[CompletionProviderInventoryRecord],
+    records: &[CompletionSyncRecord],
+) -> bool {
+    matches!(
+        publication,
+        Some(CompletionSnapshotPublishOutcome::Published { .. })
+    ) && inventories
+        .iter()
+        .all(|inventory| inventory.status == CompletionProviderInventoryStatus::Complete)
+        && !records.iter().any(|record| {
+            matches!(
+                record.status,
+                CompletionSyncRecordStatus::ProbedUnchanged
+                    | CompletionSyncRecordStatus::Retained
+                    | CompletionSyncRecordStatus::Skipped
+                    | CompletionSyncRecordStatus::Failed
+            )
+        })
 }
 
 fn summarize_sync_outcome(
@@ -2979,5 +3025,78 @@ exit 2
         assert_eq!(second.outcome, CompletionSyncOutcome::Reused);
         assert_eq!(read_counter(&counter), probes);
         assert_eq!(before, tree_fingerprint(&layout.managed_root, false));
+    }
+
+    #[test]
+    fn snapshot_retention_requires_a_clean_authoritative_behavior_change() {
+        let complete = vec![CompletionProviderInventoryRecord {
+            provider: "path".to_string(),
+            status: CompletionProviderInventoryStatus::Complete,
+            candidates: 1,
+            reason: None,
+        }];
+        let partial = vec![CompletionProviderInventoryRecord {
+            provider: "path".to_string(),
+            status: CompletionProviderInventoryStatus::Partial,
+            candidates: 1,
+            reason: Some("budget".to_string()),
+        }];
+        let clean = vec![CompletionSyncRecord::with_status(
+            "path",
+            "demo",
+            CompletionSyncRecordStatus::Generated,
+            None,
+            None,
+        )];
+
+        assert!(completion_snapshot_retention_allowed(
+            Some(&CompletionSnapshotPublishOutcome::Published {
+                snapshot: PathBuf::from("/managed/snapshots/new")
+            }),
+            &complete,
+            &clean,
+        ));
+        assert!(!completion_snapshot_retention_allowed(
+            Some(&CompletionSnapshotPublishOutcome::Unchanged {
+                snapshot: PathBuf::from("/managed/snapshots/current")
+            }),
+            &complete,
+            &clean,
+        ));
+        assert!(!completion_snapshot_retention_allowed(
+            Some(&CompletionSnapshotPublishOutcome::Repaired {
+                snapshot: PathBuf::from("/managed/snapshots/current")
+            }),
+            &complete,
+            &clean,
+        ));
+        assert!(!completion_snapshot_retention_allowed(
+            Some(&CompletionSnapshotPublishOutcome::Published {
+                snapshot: PathBuf::from("/managed/snapshots/new")
+            }),
+            &partial,
+            &clean,
+        ));
+        for degraded in [
+            CompletionSyncRecordStatus::ProbedUnchanged,
+            CompletionSyncRecordStatus::Retained,
+            CompletionSyncRecordStatus::Skipped,
+            CompletionSyncRecordStatus::Failed,
+        ] {
+            let records = vec![CompletionSyncRecord::with_status(
+                "path",
+                "demo",
+                degraded,
+                None,
+                Some("degraded".to_string()),
+            )];
+            assert!(!completion_snapshot_retention_allowed(
+                Some(&CompletionSnapshotPublishOutcome::Published {
+                    snapshot: PathBuf::from("/managed/snapshots/new")
+                }),
+                &complete,
+                &records,
+            ));
+        }
     }
 }
