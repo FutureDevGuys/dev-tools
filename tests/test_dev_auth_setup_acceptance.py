@@ -129,6 +129,35 @@ def test_acceptance_rejects_a_noninstalled_binary(tmp_path: Path) -> None:
     assert "standalone" in result.stderr
 
 
+def test_strong_acceptance_rejects_unreceipted_versions_layout_before_sudo(
+    tmp_path: Path,
+) -> None:
+    executable, calls = installed_fake(tmp_path)
+    deployment = tmp_path / "deployment.toml"
+    deployment.write_text('schema = "dev-auth-deployment-v1"\n', encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            str(HARNESS),
+            "--dev-auth",
+            str(executable),
+            "--deployment",
+            str(deployment),
+            "--mode",
+            "strong",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "DEV_AUTH_TEST_CALLS": str(calls)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "receipt-owned active strong installation" in result.stderr
+    assert not calls.exists()
+
+
 def test_strong_acceptance_never_executes_repository_code_as_root() -> None:
     source = HARNESS.read_text(encoding="utf-8")
 
@@ -137,6 +166,8 @@ def test_strong_acceptance_never_executes_repository_code_as_root() -> None:
     assert "${BASH" not in source
     assert 'sudo -- "$0"' not in source
     assert "/usr/bin/sudo -v" in source
+    assert "/usr/local/bin/dev-auth" in source
+    assert "setup verify --mode strong" in source
     assert "privileged=(/usr/bin/sudo -n --)" in source
     assert '"${privileged[@]}" "$dev_auth_bin" setup plan' in source
     assert '"${privileged[@]}" "$dev_auth_bin" setup apply' in source

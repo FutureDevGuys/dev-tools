@@ -73,6 +73,20 @@ require_standalone_installed_binary() {
   (( (8#$mode & 0022) == 0 )) || die "installed dev-auth is group- or other-writable"
 }
 
+require_strong_active_installation() {
+  local executable=$1
+  local canonical_alias=/usr/local/bin/dev-auth
+  local active
+  [[ -L $canonical_alias ]] || die \
+    "strong acceptance requires the receipt-owned active strong installation"
+  active=$(/usr/bin/readlink -f -- "$canonical_alias") || die \
+    "strong acceptance could not resolve the receipt-owned active strong installation"
+  [[ $active == "$executable" ]] || die \
+    "strong acceptance requires the receipt-owned active strong installation"
+  "$canonical_alias" setup verify --mode strong >/dev/null 2>&1 || die \
+    "strong acceptance could not verify the receipt-owned active strong installation"
+}
+
 extract_line_value() {
   local key=$1 content=$2 line found=
   while IFS= read -r line; do
@@ -166,6 +180,7 @@ main() {
   local dev_auth_bin expected_uid
   dev_auth_bin=$(resolve_executable "$requested_dev_auth")
   if [[ $mode == strong ]]; then
+    require_strong_active_installation "$dev_auth_bin"
     expected_uid=0
   else
     expected_uid=$(/usr/bin/id -u)
