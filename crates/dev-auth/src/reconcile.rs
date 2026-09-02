@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 const DOCUMENT_LIMIT: u64 = 1024 * 1024;
 const PLAN_SCHEMA: &str = "dev-auth-user-config-reconcile-plan-v1";
-const RESULT_SCHEMA: &str = "dev-tools-reconcile-result-v1";
+pub use dev_tools_reconcile_protocol::ReconcileResult;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -35,18 +35,6 @@ pub struct UserConfigReconcilePlan {
     pub current_state: Option<FileState>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ReconcileResult {
-    pub schema: String,
-    pub changed: bool,
-    pub verified: bool,
-    pub deferred: bool,
-    pub input_required: Vec<String>,
-    pub next_action: String,
-    pub diagnostics: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserConfigPlanOutcome {
     Ready {
@@ -64,7 +52,7 @@ pub fn plan_user_config_for_protocol(source: &Path) -> Result<UserConfigPlanOutc
         return Ok(UserConfigPlanOutcome::Deferred(deferred_result(
             "setup",
             "system_installation_absent",
-        )));
+        )?));
     }
     let (_, installation) = crate::setup::current_installation()?;
     let user = native_user()?;
@@ -77,7 +65,7 @@ pub fn plan_user_config_for_protocol(source: &Path) -> Result<UserConfigPlanOutc
             return Ok(UserConfigPlanOutcome::Deferred(deferred_result(
                 "install_policy",
                 "administrator_policy_absent",
-            )));
+            )?));
         }
         Err(error) => return Err(error).context("inspect reconcile policy readiness"),
         Ok(_) => {}
@@ -90,7 +78,7 @@ pub fn plan_user_config_for_protocol(source: &Path) -> Result<UserConfigPlanOutc
                 return Ok(UserConfigPlanOutcome::Deferred(deferred_result(
                     "start_broker",
                     "system_broker_unavailable",
-                )));
+                )?));
             }
             crate::broker_protocol::BrokerSessionProbe::Invalid { .. } => {
                 bail!("system broker returned an invalid session result")
@@ -140,7 +128,7 @@ pub fn plan_user_config(source: &Path) -> Result<(UserConfigReconcilePlan, Recon
     let verified = plan.current_state.as_ref() == Some(&plan.source_state);
     Ok((
         plan,
-        result(!verified, verified, if verified { "none" } else { "apply" }),
+        result(!verified, verified, if verified { "none" } else { "apply" })?,
     ))
 }
 
@@ -154,7 +142,7 @@ pub fn apply_user_config(
     }
     revalidate_plan(plan)?;
     if plan.current_state.as_ref() == Some(&plan.source_state) {
-        return Ok(result(false, true, "none"));
+        return result(false, true, "none");
     }
     crate::setup::reconcile_user_config_for_account_at(
         &plan.installation_paths,
@@ -169,17 +157,13 @@ pub fn apply_user_config(
     if installed.as_ref() != Some(&plan.source_state) {
         bail!("reconciled user configuration did not reach its approved postcondition");
     }
-    Ok(result(true, true, "none"))
+    result(true, true, "none")
 }
 
 pub fn verify_user_config(source: &Path) -> Result<ReconcileResult> {
     let (plan, _) = plan_user_config(source)?;
     let verified = plan.current_state.as_ref() == Some(&plan.source_state);
-    Ok(result(
-        false,
-        verified,
-        if verified { "none" } else { "apply" },
-    ))
+    result(false, verified, if verified { "none" } else { "apply" })
 }
 
 pub fn render_plan(plan: &UserConfigReconcilePlan) -> Result<(Vec<u8>, String)> {
@@ -351,28 +335,17 @@ fn read_public_document(path: &Path, user_uid: u32) -> Result<(Vec<u8>, FileStat
     Ok((bytes, state))
 }
 
-fn result(changed: bool, verified: bool, next_action: &str) -> ReconcileResult {
-    ReconcileResult {
-        schema: RESULT_SCHEMA.into(),
-        changed,
-        verified,
-        deferred: false,
-        input_required: Vec::new(),
-        next_action: next_action.into(),
-        diagnostics: Vec::new(),
+fn result(changed: bool, verified: bool, next_action: &str) -> Result<ReconcileResult> {
+    match (changed, verified) {
+        (true, true) => Ok(ReconcileResult::changed()),
+        (false, true) => Ok(ReconcileResult::verified()),
+        (true, false) => ReconcileResult::change_required(next_action),
+        (false, false) => ReconcileResult::pending(next_action),
     }
 }
 
-fn deferred_result(next_action: &str, diagnostic: &str) -> ReconcileResult {
-    ReconcileResult {
-        schema: RESULT_SCHEMA.into(),
-        changed: false,
-        verified: false,
-        deferred: true,
-        input_required: Vec::new(),
-        next_action: next_action.into(),
-        diagnostics: vec![diagnostic.into()],
-    }
+fn deferred_result(next_action: &str, diagnostic: &str) -> Result<ReconcileResult> {
+    ReconcileResult::deferred(next_action, [diagnostic])
 }
 
 fn current_installation_receipt() -> Result<Option<PathBuf>> {

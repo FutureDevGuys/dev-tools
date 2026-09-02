@@ -156,11 +156,15 @@ pub fn probe_at(socket: &Path) -> Result<BrokerSessionProbe> {
         BrokerResponse::NoSession => Ok(BrokerSessionProbe::NoSession),
         BrokerResponse::Ready {
             session_id,
+            owner_uid,
+            execution_uid,
             workload,
             profile,
             ..
         } => Ok(BrokerSessionProbe::Verified {
             session_id,
+            owner_uid,
+            execution_uid,
             workload,
             profile,
         }),

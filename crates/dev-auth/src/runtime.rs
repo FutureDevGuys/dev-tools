@@ -2152,7 +2152,7 @@ fn exec_native_program(program: &str, description: &str, arguments: &[OsString])
 pub fn run_native_git(arguments: &[OsString]) -> Result<ExitStatus> {
     #[cfg(unix)]
     {
-        let (_, receipt) = crate::setup::current_installation()?;
+        let (_, receipt) = crate::setup::current_frontend_installation()?;
         run_native_program(&receipt.native_git, "Git", arguments)
     }
     #[cfg(not(unix))]
@@ -2166,7 +2166,7 @@ pub fn run_native_git(arguments: &[OsString]) -> Result<ExitStatus> {
 pub fn run_native_gh(arguments: &[OsString]) -> Result<ExitStatus> {
     #[cfg(unix)]
     {
-        let (_, receipt) = crate::setup::current_installation()?;
+        let (_, receipt) = crate::setup::current_frontend_installation()?;
         run_native_program(&receipt.native_gh, "GitHub CLI", arguments)
     }
     #[cfg(not(unix))]
@@ -2179,20 +2179,22 @@ pub fn run_native_gh(arguments: &[OsString]) -> Result<ExitStatus> {
 
 #[cfg(unix)]
 pub fn exec_native_git(arguments: &[OsString]) -> Result<()> {
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_frontend_installation()?;
     exec_native_program(&receipt.native_git, "Git", arguments)
 }
 
 #[cfg(unix)]
 pub fn exec_native_gh(arguments: &[OsString]) -> Result<()> {
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_frontend_installation()?;
     exec_native_program(&receipt.native_gh, "GitHub CLI", arguments)
 }
 
 #[cfg(target_os = "linux")]
 pub fn exec_broker_git(arguments: &[OsString]) -> Result<()> {
     let (paths, receipt) = crate::setup::current_installation()?;
-    let (session_id, profile, policy) = active_broker_profile(&receipt)?;
+    let active = active_broker_profile(&receipt)?;
+    let profile = &active.profile;
+    let policy = &active.policy;
     let helper = paths.bin_dir.join("git-credential-dev-auth");
     let helper = helper
         .to_str()
@@ -2212,17 +2214,17 @@ pub fn exec_broker_git(arguments: &[OsString]) -> Result<()> {
     } else {
         &policy.programs.ssh
     };
-    let configuration = broker_git_configuration(&profile, helper, ssh_keygen, ssh_command);
+    let configuration = broker_git_configuration(profile, helper, ssh_keygen, ssh_command);
     let signing_socket = validated_agent_socket(
         crate::broker_agent::SIGNING_AGENT_ENV,
         crate::broker_protocol::SshOperationPurpose::GitSigning,
-        &session_id,
+        &active,
         profile.signing_key.is_some(),
     )?;
     let authentication_socket = validated_agent_socket(
         "SSH_AUTH_SOCK",
         crate::broker_protocol::SshOperationPurpose::Authentication,
-        &session_id,
+        &active,
         !profile.ssh_keys.is_empty(),
     )?;
     let guard = program_guard(&receipt.native_git, "Git")?;
@@ -2303,14 +2305,16 @@ fn broker_git_configuration(
 #[cfg(target_os = "linux")]
 pub fn exec_broker_ssh_keygen(arguments: &[OsString]) -> Result<()> {
     let (_, receipt) = crate::setup::current_installation()?;
-    let (session_id, profile, policy) = active_broker_profile(&receipt)?;
+    let active = active_broker_profile(&receipt)?;
+    let profile = &active.profile;
+    let policy = &active.policy;
     if profile.signing_key.is_none() {
         bail!("workload profile has no broker signing authority");
     }
     let socket = validated_agent_socket(
         crate::broker_agent::SIGNING_AGENT_ENV,
         crate::broker_protocol::SshOperationPurpose::GitSigning,
-        &session_id,
+        &active,
         true,
     )?
     .context("signing agent socket is unavailable")?;
@@ -2328,23 +2332,38 @@ pub fn exec_broker_ssh_keygen(arguments: &[OsString]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn active_broker_profile(
-    receipt: &crate::setup::InstallReceipt,
-) -> Result<(
-    String,
-    crate::policy_v2::ResolvedAuthorityProfile,
-    crate::policy_v2::ResolvedPolicy,
-)> {
+struct ActiveBrokerProfile {
+    session_id: String,
+    owner_uid: u32,
+    mode: crate::setup::InstallMode,
+    profile: crate::policy_v2::ResolvedAuthorityProfile,
+    policy: crate::policy_v2::ResolvedPolicy,
+}
+
+#[cfg(target_os = "linux")]
+fn active_broker_profile(receipt: &crate::setup::InstallReceipt) -> Result<ActiveBrokerProfile> {
     let (_, probe) = crate::broker_client::active_claim_and_probe()?;
-    let (session_id, profile_name) = match probe {
+    let (session_id, owner_uid, execution_uid, profile_name) = match probe {
         crate::broker_protocol::BrokerSessionProbe::Verified {
             session_id,
+            owner_uid,
+            execution_uid,
             profile,
             ..
-        } => (session_id, profile),
+        } => (session_id, owner_uid, execution_uid, profile),
         _ => bail!("caller is outside a verified workload session"),
     };
-    let owner_uid = nix::unistd::Uid::effective().as_raw();
+    let expected_execution_uid = match receipt.mode {
+        crate::setup::InstallMode::Strong => {
+            crate::linux_platform::IdentityUserNamespace::from_current_process()
+                .context("verified workload lacks its identity user namespace")?;
+            nix::unistd::Uid::effective().as_raw()
+        }
+        crate::setup::InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
+    };
+    if execution_uid != expected_execution_uid {
+        bail!("broker session execution identity does not match the caller");
+    }
     let policy = match receipt.mode {
         crate::setup::InstallMode::Strong => {
             crate::policy_store::load_resolved_policy_for_uid(owner_uid)?
@@ -2358,14 +2377,20 @@ fn active_broker_profile(
         .get(&profile_name)
         .context("active broker profile is no longer configured")?
         .clone();
-    Ok((session_id, profile, policy))
+    Ok(ActiveBrokerProfile {
+        session_id,
+        owner_uid,
+        mode: receipt.mode,
+        profile,
+        policy,
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn validated_agent_socket(
     variable: &str,
     purpose: crate::broker_protocol::SshOperationPurpose,
-    session_id: &str,
+    active: &ActiveBrokerProfile,
     required: bool,
 ) -> Result<Option<PathBuf>> {
     let value = std::env::var_os(variable).map(PathBuf::from);
@@ -2378,14 +2403,21 @@ fn validated_agent_socket(
     if !required {
         bail!("workload environment exposes an undeclared broker SSH agent");
     }
-    let owner_uid = nix::unistd::Uid::effective().as_raw();
-    if socket != crate::broker_agent::agent_socket_path(owner_uid, session_id, purpose) {
+    let execution_uid = nix::unistd::Uid::effective().as_raw();
+    if socket
+        != crate::broker_agent::agent_socket_path(
+            active.mode,
+            active.owner_uid,
+            &active.session_id,
+            purpose,
+        )
+    {
         bail!("broker SSH agent socket does not match the admitted session");
     }
     let metadata = fs::symlink_metadata(&socket).context("inspect broker SSH agent socket")?;
     if !metadata.file_type().is_socket()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != owner_uid
+        || metadata.uid() != execution_uid
         || metadata.mode() & 0o077 != 0
     {
         bail!("broker SSH agent socket has unsafe authority");
@@ -2413,21 +2445,32 @@ pub fn exec_broker_gh(arguments: &[OsString], session_id: &str) -> Result<()> {
             bail!("broker returned an invalid GitHub CLI response")
         }
     };
-    let runtime = PathBuf::from(format!(
-        "/run/user/{}/dev-auth-v3",
-        rustix::process::geteuid().as_raw()
-    ));
-    validate_private_directory(
-        runtime.parent().context("broker runtime has no parent")?,
-        "native-user login runtime",
-    )?;
-    ensure_private_directory(&runtime)?;
-    let session_runtime = runtime.join(session_id);
-    ensure_private_directory(&session_runtime)?;
+    let (_, receipt) = crate::setup::current_installation()?;
+    let active = active_broker_profile(&receipt)?;
+    if active.session_id != session_id {
+        bail!("GitHub CLI broker session changed during authorization");
+    }
+    let session_runtime = match receipt.mode {
+        crate::setup::InstallMode::Strong => {
+            let runtime = PathBuf::from(format!("/run/dev-auth-workload-{session_id}"));
+            validate_private_directory(&runtime, "managed workload runtime")?;
+            runtime
+        }
+        crate::setup::InstallMode::UserOnly => {
+            let runtime = PathBuf::from(format!("/run/user/{}/dev-auth-v3", active.owner_uid));
+            validate_private_directory(
+                runtime.parent().context("broker runtime has no parent")?,
+                "native-user login runtime",
+            )?;
+            ensure_private_directory(&runtime)?;
+            let session_runtime = runtime.join(session_id);
+            ensure_private_directory(&session_runtime)?;
+            session_runtime
+        }
+    };
     let gh_config = session_runtime.join("gh");
     ensure_private_directory(&gh_config)?;
 
-    let (_, receipt) = crate::setup::current_installation()?;
     let guard = program_guard(&receipt.native_gh, "GitHub CLI")?;
     let mut command = guarded_command(&receipt.native_gh, &guard)?;
     remove_automation_credential_environment(&mut command);
@@ -2469,6 +2512,12 @@ fn remove_automation_credential_environment(command: &mut Command) {
             command.env_remove(key);
         }
     }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/usr/bin/false")
+        .env("SSH_ASKPASS", "/usr/bin/false");
 }
 
 fn gh_version_is_supported(stdout: &[u8], stderr: &[u8]) -> bool {
@@ -5087,6 +5136,52 @@ mod tests {
         assert!(!configuration
             .iter()
             .any(|(_, value)| value.contains("private-key")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transparent_broker_children_isolate_human_git_config_without_parsing_editor_values() {
+        let mut command = Command::new("/usr/bin/true");
+        command
+            .env("GIT_CONFIG_GLOBAL", "/home/user/.gitconfig")
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_TERMINAL_PROMPT", "1")
+            .env("GIT_ASKPASS", "/home/user/bin/askpass")
+            .env("SSH_ASKPASS", "/home/user/bin/ssh-askpass")
+            .env("GH_TOKEN", "human-token-sentinel")
+            .env("GIT_EDITOR", "code-insiders --wait");
+
+        remove_automation_credential_environment(&mut command);
+
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&Some(OsString::from("/dev/null")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            Some(&Some(OsString::from("1")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_TERMINAL_PROMPT")),
+            Some(&Some(OsString::from("0")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_ASKPASS")),
+            Some(&Some(OsString::from("/usr/bin/false")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("SSH_ASKPASS")),
+            Some(&Some(OsString::from("/usr/bin/false")))
+        );
+        assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
+        assert_eq!(
+            environment.get(OsStr::new("GIT_EDITOR")),
+            Some(&Some(OsString::from("code-insiders --wait")))
+        );
     }
 
     #[cfg(target_os = "linux")]

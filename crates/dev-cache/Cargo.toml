@@ -12,6 +12,7 @@ anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+dev-tools-command = { path = "../dev-tools-command" }
 fs2 = "0.4"
 same-file = "1"
 serde = { version = "1", features = ["derive"] }

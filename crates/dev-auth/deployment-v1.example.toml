@@ -1,0 +1,15 @@
+# Nonsecret desired state consumed by `dev-auth setup plan --deployment`.
+# Replace the account name and source-document paths for the native machine.
+schema = "dev-auth-deployment-v1"
+mode = "strong"
+channel = "stable"
+activation = "transparent"
+administrator_policy = "/etc/dev-auth/source/policy.toml"
+
+[[users]]
+name = "account-name"
+config = "/etc/dev-auth/source/users/account-name.toml"
+
+[[credentials]]
+slot = "automation"
+intent = "enroll-if-absent"

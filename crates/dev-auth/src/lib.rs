@@ -22,6 +22,8 @@ pub mod deployment;
 pub mod diagnostics;
 #[cfg(target_os = "linux")]
 pub mod linux_admission;
+#[cfg(target_os = "linux")]
+pub mod linux_platform;
 #[cfg(unix)]
 pub mod policy_store;
 pub mod policy_v2;

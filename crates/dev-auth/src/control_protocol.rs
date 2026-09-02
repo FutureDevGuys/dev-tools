@@ -1,5 +1,5 @@
 use crate::broker_protocol::{BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES};
-use crate::linux_admission::SessionRegistration;
+use crate::linux_admission::{PendingSessionRegistration, SessionRegistration};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,9 @@ pub struct ControlEnvelope {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum ControlRequest {
+    Prepare {
+        session: Box<PendingSessionRegistration>,
+    },
     Register {
         session: Box<SessionRegistration>,
     },
@@ -76,6 +79,9 @@ fn validate_control_request(request: &ControlEnvelope) -> Result<()> {
     }
     validate_control_identifier(&request.request_id, "control request identifier")?;
     match &request.request {
+        ControlRequest::Prepare { session } => {
+            validate_control_identifier(&session.session_id, "session identifier")
+        }
         ControlRequest::Register { session } => {
             validate_control_identifier(&session.session_id, "session identifier")
         }

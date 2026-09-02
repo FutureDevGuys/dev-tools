@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn install_frontends(root: &Path, git: &Path, gh: &Path) -> dev_auth::setup::SetupPaths {
     let candidate = root.join("dev-auth-candidate");
@@ -159,4 +160,43 @@ fn same_name_frontend_is_replaced_by_native_process_for_signal_transparency() {
         .unwrap();
 
     assert_eq!(status.signal(), Some(15));
+}
+
+#[test]
+fn human_passthrough_does_not_hash_or_reverify_the_product_installation() {
+    let root = tempfile::Builder::new()
+        .prefix("dev-auth-transparent-fast-path-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let native_git = root.path().join("native-git");
+    fs::write(&native_git, "#!/bin/sh\nexit 17\n").unwrap();
+    fs::set_permissions(&native_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let native_gh = root.path().join("native-gh");
+    fs::write(&native_gh, "#!/bin/sh\nexit 19\n").unwrap();
+    fs::set_permissions(&native_gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let paths = install_frontends(root.path(), &native_git, &native_gh);
+
+    fs::write(
+        paths.data_root.join("installation-receipt-v1.json"),
+        b"deliberately unavailable to the transparent hot path",
+    )
+    .unwrap();
+    let started = Instant::now();
+    let status = Command::new(paths.bin_dir.join("git"))
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("PATH", "/usr/bin")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(17));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "native passthrough took {:?}",
+        started.elapsed()
+    );
 }

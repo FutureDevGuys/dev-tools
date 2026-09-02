@@ -18,8 +18,34 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(255)
 }
 
+#[cfg(target_os = "linux")]
+fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
+    use nix::sys::signal::{raise, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    use std::os::unix::process::ExitStatusExt;
+
+    if let Some(code) = status.code() {
+        return Ok(code);
+    }
+    let signal = status
+        .signal()
+        .context("workload termination did not contain an exit code or signal")?;
+    let signal = Signal::try_from(signal).context("workload returned an unsupported signal")?;
+    // SAFETY: this launcher has finished all cleanup and intentionally restores
+    // the workload's terminating signal to its default disposition immediately
+    // before raising it in this process. No Rust code is expected to continue.
+    unsafe {
+        sigaction(
+            signal,
+            &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+        )
+    }
+    .context("restore the workload termination signal")?;
+    raise(signal).context("re-raise the workload termination signal")?;
+    bail!("workload termination signal unexpectedly returned")
+}
+
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup discover [--mode strong|user-only]\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] [--activate] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup activate [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -38,14 +64,14 @@ fn run_workload_os() -> Result<i32> {
     }
     let arguments = arguments.collect::<Vec<_>>();
     let status = dev_auth::supervisor::run_workload_alias(&workload, &arguments)?;
-    Ok(exit_status_code(status))
+    workload_status_code(status)
 }
 
 #[cfg(target_os = "linux")]
 fn run_workload_alias_os(workload: &str) -> Result<i32> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let status = dev_auth::supervisor::run_workload_alias(workload, &arguments)?;
-    Ok(exit_status_code(status))
+    workload_status_code(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -112,24 +138,49 @@ fn run_supervisor_arguments(
     } else {
         None
     };
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--launcher-pid")) {
-        bail!("supervisor launcher PID selector is missing");
-    }
-    let launcher_pid = arguments
-        .next()
-        .context("supervisor launcher PID is missing")?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("supervisor launcher PID is not UTF-8"))?
-        .parse::<u32>()
-        .context("supervisor launcher PID is invalid")?;
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--environment-socket")) {
-        bail!("supervisor environment socket selector is missing");
-    }
-    let environment_socket = std::path::PathBuf::from(
-        arguments
+    let tool_bin = if operation == "launch" {
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--tool-bin")) {
+            bail!("supervisor workload tool-plane selector is missing");
+        }
+        Some(std::path::PathBuf::from(
+            arguments
+                .next()
+                .context("supervisor workload tool-plane is missing")?,
+        ))
+    } else {
+        None
+    };
+    let (launcher_pid, environment_socket, boundary_socket) = if operation == "dispatch" {
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--launcher-pid")) {
+            bail!("supervisor launcher PID selector is missing");
+        }
+        let launcher_pid = arguments
             .next()
-            .context("supervisor environment socket is missing")?,
-    );
+            .context("supervisor launcher PID is missing")?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("supervisor launcher PID is not UTF-8"))?
+            .parse::<u32>()
+            .context("supervisor launcher PID is invalid")?;
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--environment-socket")) {
+            bail!("supervisor environment socket selector is missing");
+        }
+        let environment_socket = std::path::PathBuf::from(
+            arguments
+                .next()
+                .context("supervisor environment socket is missing")?,
+        );
+        (Some(launcher_pid), Some(environment_socket), None)
+    } else {
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--boundary-socket")) {
+            bail!("supervisor boundary socket selector is missing");
+        }
+        let boundary_socket = std::path::PathBuf::from(
+            arguments
+                .next()
+                .context("supervisor boundary socket is missing")?,
+        );
+        (None, None, Some(boundary_socket))
+    };
     if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("supervisor requires -- before workload arguments");
     }
@@ -140,21 +191,27 @@ fn run_supervisor_arguments(
             &workload,
             &cwd,
             &session_id,
-            launcher_pid,
-            &environment_socket,
+            tool_bin
+                .as_deref()
+                .context("strong supervisor tool-plane is missing")?,
+            boundary_socket
+                .as_deref()
+                .context("strong supervisor boundary socket is missing")?,
             &arguments,
         )?;
         Ok(exit_status_code(status))
     } else {
-        dev_auth::supervisor::run_root_dispatcher(
+        let status = dev_auth::supervisor::run_root_dispatcher(
             owner_uid,
             &workload,
             &cwd,
-            launcher_pid,
-            &environment_socket,
+            launcher_pid.context("privileged dispatcher launcher PID is missing")?,
+            environment_socket
+                .as_deref()
+                .context("privileged dispatcher environment socket is missing")?,
             &arguments,
         )?;
-        bail!("privileged workload dispatcher returned unexpectedly")
+        Ok(exit_status_code(status))
     }
 }
 
@@ -197,6 +254,13 @@ fn run_supervisor_child_os() -> Result<i32> {
                 Some(value) if value == std::ffi::OsStr::new("direct") => false,
                 _ => bail!("supervisor child sandbox separator mode is invalid"),
             };
+            let network_namespace = arguments
+                .next()
+                .context("supervisor child sandbox network-namespace contract is missing")?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("sandbox network-namespace contract is not UTF-8"))?;
+            let network_namespace =
+                dev_auth::policy_v2::SandboxNetworkNamespace::parse(&network_namespace)?;
             let count = arguments
                 .next()
                 .context("supervisor child sandbox argument count is missing")?
@@ -219,6 +283,7 @@ fn run_supervisor_child_os() -> Result<i32> {
                 executable,
                 arguments: adapter_arguments,
                 argument_separator,
+                network_namespace,
             })
         }
         _ => bail!("supervisor child sandbox selector is invalid"),
@@ -276,11 +341,38 @@ fn run_sandbox_child_os() -> Result<i32> {
             .next()
             .context("sandbox child launcher is missing")?,
     );
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--network-namespace")) {
+        bail!("sandbox child network-namespace selector is missing");
+    }
+    let network_namespace = arguments
+        .next()
+        .context("sandbox child network-namespace contract is missing")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("sandbox network-namespace contract is not UTF-8"))?;
+    let network_namespace =
+        dev_auth::policy_v2::SandboxNetworkNamespace::parse(&network_namespace)?;
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--parent-network-namespace")) {
+        bail!("sandbox child parent network-namespace selector is missing");
+    }
+    let parent_network_namespace = arguments
+        .next()
+        .context("sandbox child parent network namespace is missing")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("parent network namespace is not UTF-8"))?
+        .parse::<u64>()
+        .context("sandbox child parent network namespace is invalid")?;
     if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("sandbox child requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
-    dev_auth::supervisor::run_sandbox_child(&session_id, &workload, &launcher, &arguments)?;
+    dev_auth::supervisor::run_sandbox_child(
+        &session_id,
+        &workload,
+        &launcher,
+        network_namespace,
+        parent_network_namespace,
+        &arguments,
+    )?;
     bail!("sandbox child returned unexpectedly")
 }
 
@@ -298,6 +390,11 @@ fn run_agent_proxy_os() -> Result<i32> {
     let session = selector(&mut arguments, "--session")?
         .into_string()
         .map_err(|_| anyhow::anyhow!("broker SSH agent session is not UTF-8"))?;
+    let owner_uid = selector(&mut arguments, "--owner-uid")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("broker SSH agent native owner is not UTF-8"))?
+        .parse::<u32>()
+        .context("broker SSH agent native owner is invalid")?;
     let profile = selector(&mut arguments, "--profile")?
         .into_string()
         .map_err(|_| anyhow::anyhow!("broker SSH agent profile is not UTF-8"))?;
@@ -314,7 +411,9 @@ fn run_agent_proxy_os() -> Result<i32> {
     if arguments.next().is_some() {
         bail!("broker SSH agent received trailing arguments");
     }
-    dev_auth::broker_agent::run_agent_proxy(&session, &profile, purpose, &socket, &broker)?;
+    dev_auth::broker_agent::run_agent_proxy(
+        owner_uid, &session, &profile, purpose, &socket, &broker,
+    )?;
     bail!("broker SSH agent stopped unexpectedly")
 }
 
@@ -343,17 +442,52 @@ fn setup_paths(mode: dev_auth::setup::InstallMode) -> Result<dev_auth::setup::Se
 fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
     let operation = arguments.next().context(usage())?;
     match operation.as_str() {
+        "template" => {
+            let name = arguments.next().context(
+                "setup template requires deployment, administrator-policy, user-only-policy, or user-config",
+            )?;
+            if arguments.next().is_some() {
+                bail!("setup template accepts exactly one template name");
+            }
+            print!("{}", dev_auth::setup::setup_template(&name)?);
+            Ok(0)
+        }
         "discover" => {
             let mut mode = None;
+            let mut administrator_policy = None;
+            let mut user_configurations = Vec::new();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--mode" if mode.is_none() => {
                         mode = Some(arguments.next().context("--mode requires a value")?)
                     }
+                    "--administrator-policy" if administrator_policy.is_none() => {
+                        administrator_policy = Some(std::path::PathBuf::from(
+                            arguments
+                                .next()
+                                .context("--administrator-policy requires a path")?,
+                        ));
+                    }
+                    "--user-config" => {
+                        let value = arguments
+                            .next()
+                            .context("--user-config requires USER=PATH")?;
+                        let (user, path) = value
+                            .split_once('=')
+                            .context("--user-config requires USER=PATH")?;
+                        if user.is_empty() || path.is_empty() {
+                            bail!("--user-config requires nonempty USER=PATH");
+                        }
+                        user_configurations.push((user.to_owned(), std::path::PathBuf::from(path)));
+                    }
                     _ => bail!("setup discover received an unsupported or duplicate argument"),
                 }
             }
-            let report = dev_auth::setup::discover_setup(setup_mode(mode.as_deref())?)?;
+            let report = dev_auth::setup::discover_setup_with_configuration(
+                setup_mode(mode.as_deref())?,
+                administrator_policy.as_deref(),
+                &user_configurations,
+            )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
         }
@@ -407,7 +541,6 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             let mut artifact = None;
             let mut output = None;
             let mut mode = None;
-            let mut activate = false;
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--root" if root.is_none() => {
@@ -425,7 +558,6 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     "--mode" if mode.is_none() => {
                         mode = Some(arguments.next().context("--mode requires a value")?)
                     }
-                    "--activate" if !activate => activate = true,
                     _ => bail!("release setup planning received an unsupported argument"),
                 }
             }
@@ -447,7 +579,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 dev_auth::release_manifest::verify_dev_auth_release(&root, &manifest, &artifact)?;
             let plan = dev_auth::setup::build_verified_release_plan(
                 setup_mode(mode.as_deref())?,
-                activate,
+                false,
                 verified,
             )?;
             let digest = dev_auth::setup::write_plan_at(&output, &plan)?;
@@ -682,13 +814,6 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 #[cfg(not(unix))]
                 bail!("setup candidate handoff is unavailable on this platform");
             }
-            let declared = plan
-                .intent
-                .credentials
-                .iter()
-                .map(|credential| credential.slot.clone())
-                .collect::<std::collections::BTreeSet<_>>();
-            let required = dev_auth::setup_v3::required_credential_slots_for_plan(&plan)?.required;
             let mut allowed_owner_uids = plan
                 .accounts
                 .iter()
@@ -698,9 +823,9 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 allowed_owner_uids.insert(0);
             }
             let mut stdin = std::io::stdin().lock();
-            let credentials = dev_auth::credential_input::load_credential_inputs(
-                &declared,
-                &required,
+            let report = dev_auth::setup_v3::apply_setup_plan_v3_from_sources(
+                &plan,
+                &digest,
                 &credential_sources,
                 &dev_auth::credential_input::CredentialInputContext {
                     mode: plan.intent.mode,
@@ -708,7 +833,6 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 },
                 &mut stdin,
             )?;
-            let report = dev_auth::setup_v3::apply_setup_plan_v3(&plan, &digest, &credentials)?;
             if format == "json" {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
@@ -966,7 +1090,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             println!("{}", serde_json::to_string(&report)?);
             Ok(0)
         }
-        "repair" | "rollback" | "activate" | "deactivate" | "uninstall" => {
+        "repair" | "rollback" | "deactivate" | "uninstall" => {
             let mut mode = None;
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
@@ -985,7 +1109,6 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             let report = match operation.as_str() {
                 "repair" => dev_auth::setup::repair_at(&paths)?,
                 "rollback" => dev_auth::setup::rollback_at(&paths)?,
-                "activate" => dev_auth::setup::activate_transparent_launchers_at(&paths)?,
                 "deactivate" => dev_auth::setup::deactivate_transparent_launchers_at(&paths)?,
                 _ => bail!("unknown setup operation"),
             };

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://futuredevguys.github.io/dev-tools/schemas/dev-tools-reconcile-result-v1.schema.json",
+  "title": "Dev Tools reconcile result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "changed",
+    "verified",
+    "deferred",
+    "input_required",
+    "next_action",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dev-tools-reconcile-result-v1"
+    },
+    "changed": {
+      "type": "boolean"
+    },
+    "verified": {
+      "type": "boolean"
+    },
+    "deferred": {
+      "type": "boolean"
+    },
+    "input_required": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]{1,128}$"
+      }
+    },
+    "next_action": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,128}$"
+    },
+    "diagnostics": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]{1,128}$"
+      }
+    }
+  }
+}
