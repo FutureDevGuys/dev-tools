@@ -508,7 +508,8 @@ fn strong_setup_owns_hardened_socket_activated_service_assets() {
     assert!(combined.contains(
         "org.freedesktop.policykit.exec.path\">/usr/local/lib/dev-auth/dev-auth-workload-launcher"
     ));
-    assert!(combined.contains("<allow_active>yes</allow_active>"));
+    assert!(combined.contains("<allow_active>auth_self</allow_active>"));
+    assert!(!combined.contains("<allow_active>yes</allow_active>"));
     assert!(combined.contains("<allow_inactive>no</allow_inactive>"));
     assert!(combined.contains("<allow_any>no</allow_any>"));
 }
