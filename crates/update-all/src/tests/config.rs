@@ -3,6 +3,28 @@ use crate::completions::registry::Registry;
 use tempfile::TempDir;
 
 #[test]
+fn logging_retention_defaults_and_overrides_are_explicit() {
+    let tmp = TempDir::new().unwrap();
+    let default_config = tmp.path().join("default.toml");
+    std::fs::write(&default_config, "").unwrap();
+    let defaults = load_runtime_config(Some(default_config)).unwrap();
+    assert_eq!(defaults.logging.retention_max_age_days, 30);
+    assert_eq!(defaults.logging.retention_max_runs, 100);
+    assert_eq!(defaults.logging.retention_max_bytes, 128 * 1024 * 1024);
+
+    let override_config = tmp.path().join("override.toml");
+    std::fs::write(
+        &override_config,
+        "[logging]\nretention_max_age_days = 7\nretention_max_runs = 12\nretention_max_bytes = 4096\n",
+    )
+    .unwrap();
+    let overridden = load_runtime_config(Some(override_config)).unwrap();
+    assert_eq!(overridden.logging.retention_max_age_days, 7);
+    assert_eq!(overridden.logging.retention_max_runs, 12);
+    assert_eq!(overridden.logging.retention_max_bytes, 4096);
+}
+
+#[test]
 fn external_catalog_uses_top_level_tasks() {
     let tmp = TempDir::new().unwrap();
     let config = tmp.path().join("config.toml");

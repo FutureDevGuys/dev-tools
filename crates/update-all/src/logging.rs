@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,14 +41,15 @@ struct LogFileHandle {
 impl RunLogSink {
     pub fn new(root_dir: &Path, timestamps: bool) -> Result<Self> {
         let started_unix_ms = unix_ms_now()?;
-        let run_dir = make_run_dir(root_dir)?;
-        fs::create_dir_all(&run_dir)
+        create_owner_only_dir(root_dir)?;
+        let run_id = Uuid::new_v4().to_string();
+        let run_dir = make_run_dir(root_dir, started_unix_ms, &run_id);
+        create_owner_only_dir(&run_dir)
             .with_context(|| format!("create run log directory {}", run_dir.display()))?;
         let run_file_path = run_dir.join("run.log");
         let run_file = open_append(&run_file_path)?;
         let event_file_path = run_dir.join("events.jsonl");
         let event_file = open_append(&event_file_path)?;
-        let run_id = Uuid::new_v4().to_string();
         let sink = Self {
             run_dir,
             run_id: run_id.clone(),
@@ -287,7 +290,7 @@ impl RunLogSink {
         let path = self.run_dir.join(relative_name);
         let json = serde_json::to_vec_pretty(value)
             .with_context(|| format!("serialize {}", path.display()))?;
-        fs::write(&path, json).with_context(|| format!("write {}", path.display()))
+        write_owner_only(&path, &json)
     }
 
     pub fn emit_write_warning_once(&self, err: &anyhow::Error) {
@@ -418,21 +421,49 @@ fn render_ts(unix_ms: u64) -> String {
     format!("{h:02}:{m:02}:{s:02}Z")
 }
 
-fn make_run_dir(root: &Path) -> Result<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs();
+fn make_run_dir(root: &Path, started_unix_ms: u64, run_id: &str) -> PathBuf {
     let pid = std::process::id();
-    Ok(root.join(format!("run-{now}-{pid}")))
+    root.join(format!("run-{started_unix_ms}-{pid}-{run_id}"))
 }
 
 fn open_append(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
         .open(path)
-        .with_context(|| format!("open {}", path.display()))
+        .with_context(|| format!("open {}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set owner-only permissions on {}", path.display()))?;
+    Ok(file)
+}
+
+fn create_owner_only_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set owner-only permissions on {}", path.display()))?;
+    Ok(())
+}
+
+fn write_owner_only(path: &Path, payload: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(payload)
+        .with_context(|| format!("write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set owner-only permissions on {}", path.display()))?;
+    Ok(())
 }
 
 fn write_warning_target(err: &anyhow::Error) -> String {
@@ -455,6 +486,42 @@ mod tests {
     use super::{render_human_record, RunLogSink};
     use crate::ui::{LogLevel, LogRecord, LogStream};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_artifacts_are_owner_only_even_with_a_permissive_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TempDir::new().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sink = RunLogSink::new(root.path(), false).unwrap();
+        sink.write_json_file("fixture.json", &serde_json::json!({"ok": true}))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(sink.run_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for name in ["run.log", "events.jsonl", "run-meta.json", "fixture.json"] {
+            assert_eq!(
+                std::fs::metadata(sink.run_dir().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn run_log_sink_writes_run_and_task_logs() {

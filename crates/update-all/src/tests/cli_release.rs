@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn runs_prune_is_a_public_dry_run_capable_command() {
+    use clap::CommandFactory;
+
+    let command = RunCli::command();
+    let runs = command
+        .find_subcommand("runs")
+        .expect("runs command must exist");
+    let prune = runs
+        .find_subcommand("prune")
+        .expect("runs prune command must exist");
+    assert!(prune
+        .get_arguments()
+        .any(|argument| argument.get_long() == Some("dry-run")));
+}
+
+#[test]
+fn logging_initialization_failure_is_non_fatal() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let occupied = temp.path().join("occupied");
+    std::fs::write(&occupied, "not a directory").unwrap();
+
+    assert!(open_run_log(&occupied, true).is_none());
+}
+
+#[test]
 fn self_subcommands_are_current_release_operations() {
     use clap::CommandFactory;
 

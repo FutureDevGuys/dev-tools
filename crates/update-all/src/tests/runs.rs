@@ -1,8 +1,111 @@
-use super::{resolve_run_query, scan_runs, write_metadata_atomic, RunArtifactStatus, RunMetadata};
+use super::{
+    prune_runs, resolve_run_query, scan_runs, write_metadata_atomic, RunArtifactStatus,
+    RunMetadata, RunRetentionPolicy,
+};
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
+
+fn completed_run(root: &Path, name: &str, updated_unix_ms: u64, payload_bytes: usize) {
+    let run_dir = root.join(name);
+    write_metadata_atomic(
+        &run_dir,
+        &RunMetadata {
+            schema_version: 1,
+            run_id: format!("id-{name}"),
+            display_name: name.to_string(),
+            created_unix_ms: updated_unix_ms.saturating_sub(1),
+            updated_unix_ms,
+            status: "completed".to_string(),
+            run_dir: run_dir.display().to_string(),
+            pid: 1,
+            host_os: Some("linux".to_string()),
+            ui_mode: Some("plain".to_string()),
+            engine_mode: Some("sync".to_string()),
+            selected_tasks: Vec::new(),
+        },
+    )
+    .unwrap();
+    fs::write(run_dir.join("payload.log"), vec![b'x'; payload_bytes]).unwrap();
+}
+
+#[test]
+fn run_retention_prunes_age_count_and_bytes_without_touching_active_or_unowned() {
+    let temp = TempDir::new().unwrap();
+    let now = 2_000_000_000_000_u64;
+    completed_run(temp.path(), "run-old", now - 40 * 24 * 60 * 60 * 1000, 10);
+    completed_run(temp.path(), "run-first", now - 2_000, 700);
+    completed_run(temp.path(), "run-second", now - 1_000, 700);
+    let active = temp.path().join("run-active");
+    write_metadata_atomic(
+        &active,
+        &RunMetadata {
+            schema_version: 1,
+            run_id: "active".to_string(),
+            display_name: "active".to_string(),
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+            status: "running".to_string(),
+            run_dir: active.display().to_string(),
+            pid: 1,
+            host_os: None,
+            ui_mode: None,
+            engine_mode: None,
+            selected_tasks: Vec::new(),
+        },
+    )
+    .unwrap();
+    let unowned = temp.path().join("unowned");
+    fs::create_dir(&unowned).unwrap();
+    fs::write(unowned.join("notes"), "keep").unwrap();
+
+    let report = prune_runs(
+        temp.path(),
+        RunRetentionPolicy {
+            max_age_days: 30,
+            max_runs: 2,
+            max_bytes: 1_100,
+        },
+        now,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert!(report.removed.contains(&"run-old".to_string()));
+    assert!(report.removed.contains(&"run-first".to_string()));
+    assert!(temp.path().join("run-second").exists());
+    assert!(active.exists());
+    assert!(unowned.exists());
+}
+
+#[test]
+fn run_retention_dry_run_reports_without_mutation_and_protects_current_run() {
+    let temp = TempDir::new().unwrap();
+    completed_run(temp.path(), "run-first", 10, 100);
+    completed_run(temp.path(), "run-current", 20, 100);
+    let current = temp.path().join("run-current");
+
+    let report = prune_runs(
+        temp.path(),
+        RunRetentionPolicy {
+            max_age_days: 0,
+            max_runs: 0,
+            max_bytes: 0,
+        },
+        100,
+        Some(&current),
+        true,
+    )
+    .unwrap();
+
+    assert!(report.dry_run);
+    assert_eq!(report.removed, ["run-first"]);
+    assert!(temp.path().join("run-first").exists());
+    assert!(current.exists());
+}
 
 #[test]
 fn scan_reads_new_metadata_and_sorts_by_updated_time() {

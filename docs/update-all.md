@@ -8,6 +8,8 @@ Prompt request, answer, and cancellation events are explicit journal records key
 
 Every task-scoped `log_line` record carries the task's exact qualified ID. Run-wide records have a null `task_id`, remain in the global pane and `run.log`, and never create a task-log artifact. The selected task pane replays all retained journal-delivered records for that ID, including records received before task registration.
 
+Run artifacts are owner-only diagnostic state. After every terminal run, Update All retains completed runs for at most 30 days, 100 runs, and 128 MiB by default; `[logging]` keys `retention_max_age_days`, `retention_max_runs`, and `retention_max_bytes` override those limits. The current run, active runs, malformed directories, symlinks, and directories without Update All metadata are never automatically removed. `update-all runs prune --dry-run` reports the exact bounded deletion set as JSON, and `update-all runs prune` applies it. Retention failures warn and leave the updater outcome unchanged. This maintenance changes only diagnostics and is not a package, catalog, completion, or task-state mutation.
+
 Catalog relationships distinguish capability health from ordering. `depends_on`
 and `depends_on_selected` require healthy predecessors. `after` and
 `after_selected` wait only for terminal outcomes, so a final reconciliation task

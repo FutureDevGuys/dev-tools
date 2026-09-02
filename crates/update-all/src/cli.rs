@@ -109,6 +109,8 @@ enum RunSubcommand {
     Config(ConfigCli),
     /// Browse prior run artifacts.
     Restore(RestoreCli),
+    /// Inspect and prune persisted run artifacts.
+    Runs(RunsCli),
     /// Open a prior run by UUID, display name, or run directory name.
     Resume(ResumeCli),
     /// Rename a prior run by UUID, display name, or run directory name.
@@ -151,6 +153,26 @@ struct RestoreCli {
 
     #[arg(long = "json", default_value_t = false)]
     json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(about = "Inspect and prune persisted update-all runs.")]
+struct RunsCli {
+    #[command(subcommand)]
+    command: RunsCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum RunsCommand {
+    /// Enforce configured run retention without affecting updater state.
+    Prune(RunsPruneCli),
+}
+
+#[derive(clap::Args, Debug)]
+struct RunsPruneCli {
+    /// Report the runs that would be removed without deleting them.
+    #[arg(long = "dry-run", default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -203,6 +225,7 @@ impl RunCli {
             Some(RunSubcommand::Product(cli)) => return cli.run(),
             Some(RunSubcommand::Config(cli)) => return cli.run_with_default_path(self.config),
             Some(RunSubcommand::Restore(cli)) => return cli.run(self.config),
+            Some(RunSubcommand::Runs(cli)) => return cli.run(self.config),
             Some(RunSubcommand::Resume(cli)) => return cli.run(self.config),
             Some(RunSubcommand::Rename(cli)) => return cli.run(self.config),
             Some(RunSubcommand::List(cli)) => return cli.run(),
@@ -290,10 +313,7 @@ impl RunCli {
             .unwrap_or_else(|| "compact".to_string());
 
         let completion_paths = resolve_completion_paths();
-        let run_log = Arc::new(RunLogSink::new(
-            &runtime_cfg.logging.run_dir,
-            runtime_cfg.logging.timestamps,
-        )?);
+        let run_log = open_run_log(&runtime_cfg.logging.run_dir, runtime_cfg.logging.timestamps);
         let task_policies = resolve_task_policies(&runtime_cfg);
         let mouse_row_stride = resolve_mouse_row_stride(&runtime_cfg);
 
@@ -305,10 +325,12 @@ impl RunCli {
         if let Some(src) = runtime_cfg.source_path.as_ref() {
             crate::ua_outln!("Using config: {}", src.display());
         }
-        crate::ua_outln!("Run logs: {}", run_log.run_dir().display());
-        crate::ua_outln!("Run ID: {}", run_log.run_id());
+        if let Some(log) = run_log.as_ref() {
+            crate::ua_outln!("Run logs: {}", log.run_dir().display());
+            crate::ua_outln!("Run ID: {}", log.run_id());
+        }
 
-        match engine_mode {
+        let run_result = match engine_mode {
             EngineMode::Sync => {
                 if ui == UiModeResolved::Dashboard {
                     run_async(crate::tasks::AsyncContext {
@@ -330,7 +352,7 @@ impl RunCli {
                         completion_config_path: runtime_cfg.source_path.clone(),
                         completion_catalog_path: completion_paths.catalog_path,
                         completion_registry_path: completion_paths.registry_path,
-                        run_log: Some(run_log.clone()),
+                        run_log: run_log.clone(),
                         task_policies: task_policies.clone(),
                         interactive_runtime: runtime_cfg.interactive.clone(),
                         privilege_session: Arc::new(PrivilegeSession::default()),
@@ -347,7 +369,7 @@ impl RunCli {
                         task_colors: runtime_cfg.logging.task_colors,
                         note_verbosity: runtime_cfg.ui.note_verbosity,
                         debug_report: self.debug_report,
-                    })?
+                    })
                 } else {
                     run_sync(crate::tasks::SyncContext {
                         flags,
@@ -361,7 +383,7 @@ impl RunCli {
                         filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
                         emit_plain: true,
                         event_tx: None,
-                        run_log: Some(run_log.clone()),
+                        run_log: run_log.clone(),
                         rc_root: completion_paths.rc_root.clone(),
                         completion_managed_root: completion_paths.managed_root.clone(),
                         completion_config_path: runtime_cfg.source_path.clone(),
@@ -374,7 +396,7 @@ impl RunCli {
                         privilege_session: Arc::new(PrivilegeSession::default()),
                         runtime_control: None,
                         prompt_runtime: Arc::new(crate::tasks::PromptRuntime::default()),
-                    })?
+                    })
                 }
             }
             EngineMode::Async => run_async(crate::tasks::AsyncContext {
@@ -396,7 +418,7 @@ impl RunCli {
                 completion_config_path: runtime_cfg.source_path.clone(),
                 completion_catalog_path: completion_paths.catalog_path,
                 completion_registry_path: completion_paths.registry_path,
-                run_log: Some(run_log),
+                run_log: run_log.clone(),
                 task_policies,
                 interactive_runtime: runtime_cfg.interactive.clone(),
                 privilege_session: Arc::new(PrivilegeSession::default()),
@@ -413,8 +435,26 @@ impl RunCli {
                 task_colors: runtime_cfg.logging.task_colors,
                 note_verbosity: runtime_cfg.ui.note_verbosity,
                 debug_report: self.debug_report,
-            })?,
+            }),
+        };
+
+        let retention = crate::runs::RunRetentionPolicy {
+            max_age_days: runtime_cfg.logging.retention_max_age_days,
+            max_runs: runtime_cfg.logging.retention_max_runs,
+            max_bytes: runtime_cfg.logging.retention_max_bytes,
+        };
+        if let Err(error) = crate::runs::prune_runs(
+            &runtime_cfg.logging.run_dir,
+            retention,
+            now_unix_ms_u64(),
+            run_log.as_ref().map(|log| log.run_dir()),
+            false,
+        ) {
+            crate::ua_errln!(
+                "update-all: run retention failed; continuing without pruning diagnostics: {error:#}"
+            );
         }
+        run_result?;
 
         Ok(())
     }
@@ -464,6 +504,30 @@ impl RestoreCli {
             }
         }
         Ok(())
+    }
+}
+
+impl RunsCli {
+    fn run(self, default_config_path: Option<PathBuf>) -> Result<()> {
+        let runtime = load_runtime_config(default_config_path)
+            .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
+        match self.command {
+            RunsCommand::Prune(cli) => {
+                let report = crate::runs::prune_runs(
+                    &runtime.logging.run_dir,
+                    crate::runs::RunRetentionPolicy {
+                        max_age_days: runtime.logging.retention_max_age_days,
+                        max_runs: runtime.logging.retention_max_runs,
+                        max_bytes: runtime.logging.retention_max_bytes,
+                    },
+                    now_unix_ms_u64(),
+                    None,
+                    cli.dry_run,
+                )?;
+                crate::ua_outln!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -533,6 +597,18 @@ fn run_history_root(default_config_path: Option<PathBuf>) -> Result<PathBuf> {
         .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?
         .logging
         .run_dir)
+}
+
+fn open_run_log(root: &Path, timestamps: bool) -> Option<Arc<RunLogSink>> {
+    match RunLogSink::new(root, timestamps) {
+        Ok(log) => Some(Arc::new(log)),
+        Err(error) => {
+            crate::ua_errln!(
+                "update-all: run logging unavailable; continuing without persisted diagnostics: {error:#}"
+            );
+            None
+        }
+    }
 }
 
 fn select_run_match(

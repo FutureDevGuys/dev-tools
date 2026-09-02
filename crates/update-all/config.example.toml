@@ -36,6 +36,10 @@ retry_once = true
 # Windows default: %APPDATA%/update-all/runs
 # Uncomment to override the OS default.
 # run_dir = "/absolute/path/to/update-all/runs"
+# Completed-run retention is enforced after each run and by `update-all runs prune`.
+retention_max_age_days = 30
+retention_max_runs = 100
+retention_max_bytes = 134217728
 max_in_memory_lines = 20000
 filter_progress_noise = false
 timestamps = true

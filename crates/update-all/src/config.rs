@@ -37,6 +37,9 @@ impl TaskPolicy {
 #[derive(Clone, Debug)]
 pub struct LoggingConfig {
     pub run_dir: PathBuf,
+    pub retention_max_age_days: u64,
+    pub retention_max_runs: usize,
+    pub retention_max_bytes: u64,
     pub max_in_memory_lines: usize,
     pub filter_progress_noise: bool,
     pub timestamps: bool,
@@ -407,6 +410,9 @@ struct FileInteractiveConfig {
 #[serde(deny_unknown_fields)]
 struct FileLoggingConfig {
     run_dir: Option<PathBuf>,
+    retention_max_age_days: Option<u64>,
+    retention_max_runs: Option<usize>,
+    retention_max_bytes: Option<u64>,
     max_in_memory_lines: Option<usize>,
     filter_progress_noise: Option<bool>,
     timestamps: Option<bool>,
@@ -1777,6 +1783,21 @@ pub fn load_runtime_config(config_path_cli: Option<PathBuf>) -> Result<RuntimeCo
                 .as_ref()
                 .and_then(|l| l.run_dir.clone().map(|p| expand_tilde_path(&p)))
                 .unwrap_or_else(default_run_root),
+            retention_max_age_days: parsed
+                .logging
+                .as_ref()
+                .and_then(|l| l.retention_max_age_days)
+                .unwrap_or(30),
+            retention_max_runs: parsed
+                .logging
+                .as_ref()
+                .and_then(|l| l.retention_max_runs)
+                .unwrap_or(100),
+            retention_max_bytes: parsed
+                .logging
+                .as_ref()
+                .and_then(|l| l.retention_max_bytes)
+                .unwrap_or(128 * 1024 * 1024),
             max_in_memory_lines: parsed
                 .logging
                 .as_ref()
