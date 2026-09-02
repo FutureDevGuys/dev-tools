@@ -266,6 +266,7 @@ impl ManagedCompletionRoot {
         }
 
         self.write_current(&snapshot_name)?;
+        self.write_activation_recency(&snapshot_name)?;
         Ok(CompletionSnapshotPublishOutcome::Published {
             snapshot: snapshot_dir,
         })
@@ -298,6 +299,18 @@ impl ManagedCompletionRoot {
                 ..CompletionSnapshotPruneReport::default()
             });
         }
+
+        let recency = match self.read_activation_recency_store() {
+            Ok(recency) => recency,
+            Err(error) => {
+                return Ok(CompletionSnapshotPruneReport {
+                    deferred_reason: Some(format!(
+                        "activation recency ownership could not be proven: {error:#}"
+                    )),
+                    ..CompletionSnapshotPruneReport::default()
+                });
+            }
+        };
 
         let now = SystemTime::now();
         let mut removed_snapshots = Vec::new();
@@ -396,6 +409,22 @@ impl ManagedCompletionRoot {
                 format!("remove retained completion snapshot {}", path.display())
             })?;
         }
+        let survivor_set = survivor_names.into_iter().collect::<BTreeSet<_>>();
+        for snapshot in recency
+            .keys()
+            .filter(|snapshot| !survivor_set.contains(*snapshot))
+        {
+            let path = self.activation_recency_path(snapshot);
+            let bytes = fs::metadata(&path)
+                .with_context(|| {
+                    format!("inspect completion activation recency {}", path.display())
+                })?
+                .len();
+            fs::remove_file(&path).with_context(|| {
+                format!("remove completion activation recency {}", path.display())
+            })?;
+            reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+        }
         let mut removed_objects = Vec::new();
         for (name, path, bytes) in removable_objects {
             fs::remove_file(&path).with_context(|| {
@@ -462,15 +491,32 @@ impl ManagedCompletionRoot {
             let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
                 format!("inspect completion snapshot {}", entry.path().display())
             })?;
-            let modified_unix_ms = metadata
+            let fallback_modified_unix_ms = metadata
                 .modified()
                 .ok()
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
                 .map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX));
             let inspected = self.inspect_owned_snapshot(&snapshot);
-            let (bytes, healthy, issue) = match inspected {
-                Ok(owned) => (owned.bytes, true, None),
-                Err(error) => (0, false, Some(format!("{error:#}"))),
+            let activation_recency = self.read_activation_recency(&snapshot);
+            let (modified_unix_ms, bytes, healthy, issue) = match (activation_recency, inspected) {
+                (Ok(recency), Ok(owned)) => (
+                    recency.or(fallback_modified_unix_ms),
+                    owned.bytes,
+                    true,
+                    None,
+                ),
+                (Err(error), _) => (
+                    fallback_modified_unix_ms,
+                    0,
+                    false,
+                    Some(format!("activation recency is malformed: {error:#}")),
+                ),
+                (_, Err(error)) => (
+                    fallback_modified_unix_ms,
+                    0,
+                    false,
+                    Some(format!("{error:#}")),
+                ),
             };
             snapshots.push(ManagedCompletionSnapshotStatus {
                 snapshot,
@@ -539,6 +585,70 @@ impl ManagedCompletionRoot {
         }
         validate_snapshot_name(trimmed)?;
         Ok(Some(trimmed.to_string()))
+    }
+
+    fn write_activation_recency(&self, snapshot: &str) -> Result<()> {
+        validate_snapshot_name(snapshot)?;
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time predates the Unix epoch")?
+            .as_millis();
+        write_atomic_bytes(
+            &self.activation_recency_path(snapshot),
+            format!("{now_unix_ms}\n").as_bytes(),
+        )
+    }
+
+    fn read_activation_recency(&self, snapshot: &str) -> Result<Option<u64>> {
+        validate_snapshot_name(snapshot)?;
+        let path = self.activation_recency_path(snapshot);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "activation recency is not a real regular file: {}",
+                path.display()
+            );
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+            anyhow::bail!(
+                "activation recency is not an unsigned Unix timestamp: {}",
+                path.display()
+            );
+        }
+        let timestamp = trimmed
+            .parse::<u64>()
+            .with_context(|| format!("parse activation recency {}", path.display()))?;
+        Ok(Some(timestamp))
+    }
+
+    fn read_activation_recency_store(&self) -> Result<BTreeMap<String, u64>> {
+        let root = self.activation_recency_dir();
+        if !root.exists() {
+            return Ok(BTreeMap::new());
+        }
+        require_real_directory(&root)?;
+        let mut recency = BTreeMap::new();
+        for entry in fs::read_dir(&root).with_context(|| format!("read {}", root.display()))? {
+            let entry = entry.with_context(|| format!("read entry in {}", root.display()))?;
+            let snapshot = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("activation recency contains a non-UTF-8 entry"))?;
+            if !is_owned_digest_name(&snapshot) {
+                anyhow::bail!("activation recency contains an unexpected entry: {snapshot}");
+            }
+            let timestamp = self
+                .read_activation_recency(&snapshot)?
+                .context("activation recency entry disappeared during inspection")?;
+            recency.insert(snapshot, timestamp);
+        }
+        Ok(recency)
     }
 
     fn read_manifest(&self, snapshot: &str) -> Result<SnapshotManifest> {
@@ -615,6 +725,14 @@ impl ManagedCompletionRoot {
 
     fn objects_dir(&self) -> PathBuf {
         self.root.join("objects")
+    }
+
+    fn activation_recency_dir(&self) -> PathBuf {
+        self.root.join("activation-recency")
+    }
+
+    fn activation_recency_path(&self, snapshot: &str) -> PathBuf {
+        self.activation_recency_dir().join(snapshot)
     }
 
     fn snapshots_dir(&self) -> PathBuf {
@@ -1173,6 +1291,96 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.contains("content-address verification")));
         assert!(report.removed_snapshots.is_empty());
+        assert_eq!(before, tree_fingerprint(&root.root));
+    }
+
+    #[test]
+    fn reactivated_snapshot_renews_recency_without_mutating_on_no_op() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let _lock = root.lock_sync().unwrap();
+
+        let mut first = BTreeMap::new();
+        first.insert(CompletionShell::Bash, "# completion A\n".to_string());
+        root.publish_shell_completions_assuming_lock(&first)
+            .unwrap();
+        let first_snapshot = root.read_current_snapshot().unwrap().unwrap();
+        fs::write(root.activation_recency_path(&first_snapshot), "1\n").unwrap();
+
+        let mut second = BTreeMap::new();
+        second.insert(CompletionShell::Bash, "# completion B\n".to_string());
+        root.publish_shell_completions_assuming_lock(&second)
+            .unwrap();
+        let second_snapshot = root.read_current_snapshot().unwrap().unwrap();
+        fs::write(root.activation_recency_path(&second_snapshot), "2\n").unwrap();
+
+        let reactivated = root
+            .publish_shell_completions_assuming_lock(&first)
+            .unwrap();
+        assert!(matches!(
+            reactivated,
+            CompletionSnapshotPublishOutcome::Published { .. }
+        ));
+        let renewed = fs::read(root.activation_recency_path(&first_snapshot)).unwrap();
+        assert_ne!(renewed, b"1\n");
+
+        let before_no_op = tree_fingerprint(&root.root);
+        let no_op = root
+            .publish_shell_completions_assuming_lock(&first)
+            .unwrap();
+        assert!(matches!(
+            no_op,
+            CompletionSnapshotPublishOutcome::Unchanged { .. }
+        ));
+        assert_eq!(before_no_op, tree_fingerprint(&root.root));
+
+        let mut third = BTreeMap::new();
+        third.insert(CompletionShell::Bash, "# completion C\n".to_string());
+        root.publish_shell_completions_assuming_lock(&third)
+            .unwrap();
+        root.prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+            retain_prior_snapshots: 1,
+            minimum_age: Duration::ZERO,
+        })
+        .unwrap();
+
+        assert!(root.snapshot_dir(&first_snapshot).exists());
+        assert!(!root.snapshot_dir(&second_snapshot).exists());
+    }
+
+    #[test]
+    fn malformed_activation_recency_defers_all_retention_mutation() {
+        let temp = TempDir::new().unwrap();
+        let root = ManagedCompletionRoot::new(temp.path().join("managed-root")).unwrap();
+        let _lock = root.lock_sync().unwrap();
+
+        let mut first = BTreeMap::new();
+        first.insert(CompletionShell::Fish, "# completion A\n".to_string());
+        root.publish_shell_completions_assuming_lock(&first)
+            .unwrap();
+        let first_snapshot = root.read_current_snapshot().unwrap().unwrap();
+        let mut second = BTreeMap::new();
+        second.insert(CompletionShell::Fish, "# completion B\n".to_string());
+        root.publish_shell_completions_assuming_lock(&second)
+            .unwrap();
+        fs::write(
+            root.activation_recency_path(&first_snapshot),
+            "not-a-timestamp\n",
+        )
+        .unwrap();
+        let before = tree_fingerprint(&root.root);
+
+        let report = root
+            .prune_historical_snapshots_assuming_lock(CompletionSnapshotRetentionPolicy {
+                retain_prior_snapshots: 0,
+                minimum_age: Duration::ZERO,
+            })
+            .unwrap();
+
+        assert!(report
+            .deferred_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("activation recency")));
         assert_eq!(before, tree_fingerprint(&root.root));
     }
 
