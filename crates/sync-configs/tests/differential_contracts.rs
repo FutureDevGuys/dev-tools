@@ -5,6 +5,11 @@
 //! interface. Tests named `native_*` document intentional correctness changes instead of forcing
 //! the Rust implementation to reproduce known Python defects.
 
+// The retained 0.1.13 fixture and hook protocol use POSIX interpreter/shell paths. Native
+// cross-platform contracts live in the module-level suites; this black-box bridge is the accepted
+// Linux/Unix migration gate and must not pretend to execute the Python reference on Windows.
+#![cfg(unix)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -546,8 +551,13 @@ fn successful_hooks_and_aborting_pre_hook_match() {
             snapshot(&python.path().join("output")),
             snapshot(&native.path().join("output"))
         );
-        assert_eq!(python.path().join("post.marker").exists(), !fail);
-        assert_eq!(native.path().join("post.marker").exists(), !fail);
+        if fail {
+            assert!(!python.path().join("post.marker").exists());
+            assert!(!native.path().join("post.marker").exists());
+        } else {
+            assert!(python.path().join("post.marker").exists());
+            assert!(native.path().join("post.marker").exists());
+        }
     }
 }
 
