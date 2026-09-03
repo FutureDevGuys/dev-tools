@@ -8,6 +8,7 @@ use ssh_key::{PublicKey, Signature};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -162,14 +163,6 @@ pub fn run_agent_proxy(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let listener = bind_agent_socket(
-        socket,
-        session_id,
-        purpose,
-        receipt.mode,
-        owner_uid,
-        execution_uid,
-    )?;
     validate_broker_socket(broker_socket, session_id, receipt.mode, owner_uid)?;
     let agent = BrokerAgent {
         broker_socket: broker_socket.to_owned(),
@@ -181,10 +174,20 @@ pub fn run_agent_proxy(
         .enable_all()
         .build()
         .context("create broker SSH agent runtime")?;
-    runtime
-        .block_on(listen(listener, agent))
-        .map_err(anyhow::Error::from)
-        .context("serve broker SSH agent")
+    let listener = bind_agent_socket(
+        socket,
+        session_id,
+        purpose,
+        receipt.mode,
+        owner_uid,
+        execution_uid,
+    )?;
+    let result = runtime.block_on(async move {
+        let listener = into_tokio_listener(listener)?;
+        listen(listener, agent).await.map_err(anyhow::Error::from)
+    });
+    let _ = fs::remove_file(socket);
+    result.context("serve broker SSH agent")
 }
 
 fn bind_agent_socket(
@@ -194,7 +197,7 @@ fn bind_agent_socket(
     mode: crate::setup::InstallMode,
     owner_uid: u32,
     execution_uid: u32,
-) -> Result<tokio::net::UnixListener> {
+) -> Result<StdUnixListener> {
     if socket != agent_socket_path(mode, owner_uid, session_id, purpose) {
         bail!("broker SSH agent socket is outside the private session runtime");
     }
@@ -223,8 +226,10 @@ fn bind_agent_socket(
             }
         }
     }
-    let listener =
-        tokio::net::UnixListener::bind(socket).context("bind broker SSH agent socket")?;
+    let listener = StdUnixListener::bind(socket).context("bind broker SSH agent socket")?;
+    listener
+        .set_nonblocking(true)
+        .context("configure broker SSH agent socket")?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     let metadata = fs::symlink_metadata(socket).context("inspect broker SSH agent socket")?;
     if !metadata.file_type().is_socket()
@@ -235,6 +240,10 @@ fn bind_agent_socket(
         bail!("broker SSH agent socket has unsafe authority");
     }
     Ok(listener)
+}
+
+fn into_tokio_listener(listener: StdUnixListener) -> Result<tokio::net::UnixListener> {
+    tokio::net::UnixListener::from_std(listener).context("adopt broker SSH agent socket")
 }
 
 fn validate_broker_socket(
@@ -335,6 +344,21 @@ mod tests {
                 "/run/user/1000/dev-auth-v3/agent-sessions/{session}/authentication.sock"
             ))
         );
+    }
+
+    #[test]
+    fn broker_agent_listener_is_adopted_only_inside_its_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = StdUnixListener::bind(root.path().join("agent.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = into_tokio_listener(listener).unwrap();
+            assert!(listener.local_addr().unwrap().as_pathname().is_some());
+        });
     }
 
     #[test]
