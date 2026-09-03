@@ -354,8 +354,23 @@ pub fn setup_apply_candidate_path(
     if digest != approved_sha256.to_ascii_lowercase() {
         bail!("setup plan v3 does not match the approved digest");
     }
-    let source = &plan.installation.request.source_executable;
-    let (source_length, source_sha256) = crate::setup::setup_executable_identity(source)?;
+    require_apply_identity(plan)?;
+    revalidate_public_plan_inputs(plan)?;
+    let source = if let Some(release) = &plan.installation.verified_release {
+        let storage =
+            crate::stable_release::native_release_storage(plan.installation.request.mode)?;
+        let accepted = crate::stable_release::load_exact_accepted_release(&storage, release)?;
+        canonical_plan_release_source(
+            &plan.installation.request.source_executable,
+            release,
+            &accepted,
+        )?
+    } else if plan.intent.mode == DeploymentMode::Strong {
+        bail!("strong setup apply requires an authenticated accepted release")
+    } else {
+        plan.installation.request.source_executable.clone()
+    };
+    let (source_length, source_sha256) = crate::setup::setup_executable_identity(&source)?;
     if source_length != plan.installation.source_length
         || source_sha256 != plan.installation.source_sha256
     {
@@ -367,8 +382,19 @@ pub fn setup_apply_candidate_path(
     if current_length == source_length && current_sha256 == source_sha256 {
         Ok(None)
     } else {
-        Ok(Some(source.clone()))
+        Ok(Some(source))
     }
+}
+
+fn canonical_plan_release_source(
+    requested_source: &Path,
+    planned: &crate::release_manifest::VerifiedDevAuthRelease,
+    accepted: &crate::stable_release::StagedStableRelease,
+) -> Result<PathBuf> {
+    if accepted.verified != *planned || requested_source != accepted.verified.artifact_path {
+        bail!("setup plan release paths do not match the canonical accepted release cache");
+    }
+    Ok(accepted.verified.artifact_path.clone())
 }
 
 fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
@@ -1670,6 +1696,52 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn verified_release(artifact_path: &Path) -> crate::release_manifest::VerifiedDevAuthRelease {
+        crate::release_manifest::VerifiedDevAuthRelease {
+            schema: "dev-auth-verified-release-v1".into(),
+            root_path: PathBuf::from("/var/lib/dev-auth/releases/cache/release/root.json"),
+            manifest_path: PathBuf::from(
+                "/var/lib/dev-auth/releases/cache/release/manifest.json",
+            ),
+            root_generation: 1,
+            manifest_generation: 19,
+            version: "0.3.8".into(),
+            source_commit: "a".repeat(40),
+            target: "x86_64-unknown-linux-gnu".into(),
+            artifact_path: artifact_path.to_path_buf(),
+            artifact_url: "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.3.8/dev-auth-0.3.8-linux-x86_64".into(),
+            artifact_length: 123,
+            artifact_sha256: "b".repeat(64),
+            root_sha256: "c".repeat(64),
+            manifest_sha256: "d".repeat(64),
+        }
+    }
+
+    #[test]
+    fn setup_candidate_requires_the_exact_canonical_accepted_cache_paths() {
+        let artifact = PathBuf::from("/var/lib/dev-auth/releases/cache/release/artifact");
+        let planned = verified_release(&artifact);
+        let accepted = crate::stable_release::StagedStableRelease {
+            verified: planned.clone(),
+            directory: artifact.parent().unwrap().to_path_buf(),
+        };
+        assert_eq!(
+            canonical_plan_release_source(&artifact, &planned, &accepted).unwrap(),
+            artifact
+        );
+
+        assert!(canonical_plan_release_source(
+            Path::new("/tmp/equally-signed-copy"),
+            &planned,
+            &accepted,
+        )
+        .is_err());
+
+        let mut caller_paths = planned.clone();
+        caller_paths.root_path = PathBuf::from("/tmp/root.json");
+        assert!(canonical_plan_release_source(&artifact, &caller_paths, &accepted).is_err());
+    }
 
     #[test]
     fn credential_actions_persist_after_each_success_and_skip_completed_retries() {

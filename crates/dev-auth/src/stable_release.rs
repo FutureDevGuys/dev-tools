@@ -106,18 +106,18 @@ pub fn require_accepted_release(
     storage: &StableReleaseStorage,
     release: &VerifiedDevAuthRelease,
 ) -> Result<()> {
-    validate_storage(storage)?;
-    let state = load_release_state_at(&storage.state_path, storage.owner_uid)?;
-    if state.accepted_root_generation != release.root_generation
-        || state.accepted_root_sha256.as_deref() != Some(release.root_sha256.as_str())
-        || state.accepted_generation != release.manifest_generation
-        || state.accepted_manifest_sha256.as_deref() != Some(release.manifest_sha256.as_str())
-        || state.accepted_version.as_deref() != Some(release.version.as_str())
-        || state.accepted_binary_sha256.as_deref() != Some(release.artifact_sha256.as_str())
-    {
-        bail!("setup plan release is no longer the exact accepted stable release");
-    }
-    Ok(())
+    load_exact_accepted_release(storage, release).map(|_| ())
+}
+
+/// Reload the expected accepted release from the authenticated canonical cache.
+///
+/// The paths in `expected` are not trusted as cache authority. The returned
+/// paths always identify the receipt-checked entry beneath `storage.cache_root`.
+pub fn load_exact_accepted_release(
+    storage: &StableReleaseStorage,
+    expected: &VerifiedDevAuthRelease,
+) -> Result<StagedStableRelease> {
+    load_exact_accepted_release_with_authority(storage, expected, &release_authority()?)
 }
 
 fn stage_latest_stable_release_inner(
@@ -230,20 +230,59 @@ fn preflight_accepted_state(
 }
 
 fn load_offline_release(storage: &StableReleaseStorage) -> Result<StagedStableRelease> {
+    let authority = release_authority()?;
+    load_accepted_release_with_authority(storage, &authority)
+}
+
+fn load_accepted_release_with_authority(
+    storage: &StableReleaseStorage,
+    authority: &ReleaseAuthority,
+) -> Result<StagedStableRelease> {
+    validate_storage(storage)?;
     let state = load_release_state_at(&storage.state_path, storage.owner_uid)?;
     let version = state
         .accepted_version
         .as_deref()
         .context("offline release resolution has no previously accepted version")?;
     let version = Version::parse(version).context("parse accepted offline release version")?;
-    let cached = load_cached_release(
-        &storage.cache_root,
-        &release_authority()?,
-        &version,
-        storage.owner_uid,
-    )?;
+    let cached = load_cached_release(&storage.cache_root, authority, &version, storage.owner_uid)?;
     require_cached_state_match(&state, &cached.verified)?;
     cached_release_result(cached)
+}
+
+fn load_exact_accepted_release_with_authority(
+    storage: &StableReleaseStorage,
+    expected: &VerifiedDevAuthRelease,
+    authority: &ReleaseAuthority,
+) -> Result<StagedStableRelease> {
+    validate_storage(storage)?;
+    let state = load_release_state_at(&storage.state_path, storage.owner_uid)?;
+    require_expected_state_match(&state, expected)?;
+    let version =
+        Version::parse(&expected.version).context("parse expected accepted release version")?;
+    let cached = load_cached_release(&storage.cache_root, authority, &version, storage.owner_uid)?;
+    require_cached_state_match(&state, &cached.verified)?;
+    let accepted = cached_release_result(cached)?;
+    if accepted.verified != *expected {
+        bail!("canonical cached release does not match the expected release identity");
+    }
+    Ok(accepted)
+}
+
+fn require_expected_state_match(
+    state: &ReleaseState,
+    expected: &VerifiedDevAuthRelease,
+) -> Result<()> {
+    if state.accepted_root_generation != expected.root_generation
+        || state.accepted_root_sha256.as_deref() != Some(expected.root_sha256.as_str())
+        || state.accepted_generation != expected.manifest_generation
+        || state.accepted_manifest_sha256.as_deref() != Some(expected.manifest_sha256.as_str())
+        || state.accepted_version.as_deref() != Some(expected.version.as_str())
+        || state.accepted_binary_sha256.as_deref() != Some(expected.artifact_sha256.as_str())
+    {
+        bail!("setup plan release is no longer the exact accepted stable release");
+    }
+    Ok(())
 }
 
 fn require_cached_state_match(state: &ReleaseState, verified: &VerifiedRelease) -> Result<()> {
@@ -505,6 +544,32 @@ mod tests {
         .unwrap();
         require_cached_state_match(&state, &cached.verified).unwrap();
         assert_eq!(cached_release_result(cached).unwrap(), staged);
+
+        let copied_artifact = root.path().join("copied-artifact");
+        std::fs::write(&copied_artifact, &artifact).unwrap();
+        let mut expected = staged.verified.clone();
+        expected.artifact_path = copied_artifact;
+        assert!(
+            load_exact_accepted_release_with_authority(&storage, &expected, &authority).is_err()
+        );
+
+        let mut mismatched = staged.verified.clone();
+        mismatched.source_commit = "b".repeat(40);
+        assert!(
+            load_exact_accepted_release_with_authority(&storage, &mismatched, &authority,).is_err()
+        );
+
+        let mut tampered_state = state;
+        tampered_state.accepted_binary_sha256 = Some("0".repeat(64));
+        std::fs::write(
+            &storage.state_path,
+            serde_jcs::to_vec(&tampered_state).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_exact_accepted_release_with_authority(&storage, &staged.verified, &authority)
+                .is_err()
+        );
 
         let mut changed = artifact.clone();
         changed.push(0);
