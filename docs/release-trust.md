@@ -17,7 +17,7 @@ python scripts/build-root-document.py \
   --output /run/user/$(id -u)/dev-tools-signing/dev-tools-root.json
 ```
 
-Routine release construction uses one clean-checkout recipe with the signed public root document. A verified dev-auth workload can ask its broker to sign the canonical manifest with an authorized `publish` profile; only the public release-key identifier is supplied to the builder, while the private key remains behind the broker's 1Password boundary. Release signing is a distinct opt-in authority: the administrator cap lists exact `release_signing_products`, the user profile narrows that list and declares a separate raw Ed25519 `release_signing_key`, and Git signing or SSH authentication grants cannot satisfy a release request. The broker accepts only canonical stable `dev-tools-product-v1` or `dev-auth-product-v2` manifest payloads for a product in that session grant.
+Routine release construction uses one clean-checkout recipe with the signed public root document. A verified dev-auth workload can ask its broker to sign the canonical manifest with an authorized profile; the profile name is deployment-defined (`publish` is illustrative below, while this repository's workstation deployment uses `source-maintenance`). Only the public release-key identifier is supplied to the builder, while the private key remains behind the broker's 1Password boundary. Release signing is a distinct opt-in authority: the administrator cap lists exact `release_signing_products`, the user profile narrows that list and declares a separate raw Ed25519 `release_signing_key`, and Git signing or SSH authentication grants cannot satisfy a release request. The broker accepts only canonical stable `dev-tools-product-v1` or `dev-auth-product-v2` manifest payloads for a product in that session grant.
 
 ```toml
 # administrator policy
@@ -32,11 +32,12 @@ release_signing_key = { private_key_ref = "op://Automation/dev-tools release sig
 ```
 
 ```sh
+release_signer_profile=source-maintenance # exact name from the installed config-v2.toml
 python scripts/build-release-set.py \
   --product dev-auth \
   --public-git-command /usr/bin/git \
   --release-signer /usr/local/bin/dev-auth \
-  --release-signer-profile publish \
+  --release-signer-profile "$release_signer_profile" \
   --release-key-id release-ca568413f0f27130 \
   --manifest-generation 18 \
   --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.7"

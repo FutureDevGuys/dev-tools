@@ -467,6 +467,73 @@ config = "{}"
     assert!(!second.changed);
     assert!(second.verified);
 
+    let installation_lock = paths.data_root.join("installation.lock");
+    fs::set_permissions(&installation_lock, fs::Permissions::from_mode(0o000)).unwrap();
+    for arguments in [&["status", "--broker"][..], &["explain", "git"][..]] {
+        let output = Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(arguments)
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let reconcile_plan = root.path().join("reconcile-plan.json");
+    let reconcile = Command::new(user.dir.join(".local/bin/dev-auth"))
+        .args([
+            "reconcile",
+            "plan",
+            "--source",
+            config.to_str().unwrap(),
+            "--output",
+            reconcile_plan.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .env_clear()
+        .env("HOME", &user.dir)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        reconcile.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&reconcile.stdout),
+        String::from_utf8_lossy(&reconcile.stderr)
+    );
+    fs::remove_file(reconcile_plan).unwrap();
+
+    let unresolved_workload = user.dir.join(".local/bin/future-agent");
+    symlink(
+        paths
+            .data_root
+            .join("versions/0.3.0-clean-device-test/dev-auth"),
+        &unresolved_workload,
+    )
+    .unwrap();
+    let workload = Command::new(&unresolved_workload)
+        .arg("--version")
+        .env_clear()
+        .env("HOME", &user.dir)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(!workload.status.success());
+    let workload_error = String::from_utf8(workload.stderr).unwrap();
+    assert!(
+        workload_error.contains("workload launcher is outside the installed alias set"),
+        "{workload_error}"
+    );
+    assert!(!workload_error.contains("installation lock"));
+    fs::remove_file(unresolved_workload).unwrap();
+    fs::set_permissions(&installation_lock, fs::Permissions::from_mode(0o600)).unwrap();
+
     let output = Command::new(user.dir.join(".local/bin/git"))
         .args(["future-command", "--new-option", "value"])
         .env_clear()

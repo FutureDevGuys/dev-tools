@@ -1,5 +1,5 @@
 use crate::broker_protocol::{BrokerSessionProbe, LocalSessionClaim, RoutingDecision};
-use crate::setup::{current_installation, verify_at, InstallMode};
+use crate::setup::{current_runtime_installation, verify_runtime_installation_at, InstallMode};
 use anyhow::{bail, Result};
 use serde::Serialize;
 
@@ -44,8 +44,8 @@ pub struct ExplainReport {
 }
 
 pub fn broker_status() -> Result<BrokerStatusReport> {
-    let (paths, receipt) = current_installation()?;
-    let setup = verify_at(&paths)?;
+    let (paths, receipt) = current_runtime_installation()?;
+    let setup = verify_runtime_installation_at(&paths, &receipt)?;
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?;
     let policy_ready = match (receipt.mode, user.as_ref()) {
         (InstallMode::Strong, _) => crate::policy_store::load_system_policy().is_ok(),
@@ -137,7 +137,7 @@ pub fn explain(command: &str) -> Result<ExplainReport> {
     if !matches!(command, "git" | "gh") {
         bail!("explain supports only git or gh");
     }
-    let (_, receipt) = current_installation()?;
+    let (_, receipt) = current_runtime_installation()?;
     let (claim, probe) = claim_and_probe(receipt.mode)?;
     let decision = crate::broker_protocol::decide_routing(&claim, probe.clone());
     let (decision_name, reason) = match decision {

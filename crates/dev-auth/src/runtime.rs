@@ -2152,7 +2152,7 @@ fn exec_native_program(program: &str, description: &str, arguments: &[OsString])
 pub fn run_native_git(arguments: &[OsString]) -> Result<ExitStatus> {
     #[cfg(unix)]
     {
-        let (_, receipt) = crate::setup::current_frontend_installation()?;
+        let (_, receipt) = crate::setup::current_runtime_installation()?;
         run_native_program(&receipt.native_git, "Git", arguments)
     }
     #[cfg(not(unix))]
@@ -2166,7 +2166,7 @@ pub fn run_native_git(arguments: &[OsString]) -> Result<ExitStatus> {
 pub fn run_native_gh(arguments: &[OsString]) -> Result<ExitStatus> {
     #[cfg(unix)]
     {
-        let (_, receipt) = crate::setup::current_frontend_installation()?;
+        let (_, receipt) = crate::setup::current_runtime_installation()?;
         run_native_program(&receipt.native_gh, "GitHub CLI", arguments)
     }
     #[cfg(not(unix))]
@@ -2179,19 +2179,19 @@ pub fn run_native_gh(arguments: &[OsString]) -> Result<ExitStatus> {
 
 #[cfg(unix)]
 pub fn exec_native_git(arguments: &[OsString]) -> Result<()> {
-    let (_, receipt) = crate::setup::current_frontend_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     exec_native_program(&receipt.native_git, "Git", arguments)
 }
 
 #[cfg(unix)]
 pub fn exec_native_gh(arguments: &[OsString]) -> Result<()> {
-    let (_, receipt) = crate::setup::current_frontend_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     exec_native_program(&receipt.native_gh, "GitHub CLI", arguments)
 }
 
 #[cfg(target_os = "linux")]
 pub fn exec_broker_git(arguments: &[OsString]) -> Result<()> {
-    let (paths, receipt) = crate::setup::current_installation()?;
+    let (paths, receipt) = crate::setup::current_runtime_installation()?;
     let active = active_broker_profile(&receipt)?;
     let profile = &active.profile;
     let policy = &active.policy;
@@ -2304,7 +2304,7 @@ fn broker_git_configuration(
 
 #[cfg(target_os = "linux")]
 pub fn exec_broker_ssh_keygen(arguments: &[OsString]) -> Result<()> {
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     let active = active_broker_profile(&receipt)?;
     let profile = &active.profile;
     let policy = &active.policy;
@@ -2447,7 +2447,7 @@ pub fn exec_broker_gh(arguments: &[OsString], session_id: &str) -> Result<()> {
             bail!("broker returned an invalid GitHub CLI response")
         }
     };
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     let active = active_broker_profile(&receipt)?;
     if active.session_id != session_id {
         bail!("GitHub CLI broker session changed during authorization");
@@ -3494,7 +3494,7 @@ pub fn broker_sign_release_manifest(profile: &str, payload: &[u8]) -> Result<Vec
     }
     let manifest = dev_tools_release::validate_unsigned_product_manifest(payload)
         .context("validate release manifest signing request")?;
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     let active = active_broker_profile(&receipt)?;
     if profile != active.profile_name {
         bail!("requested signing profile does not match the active workload");

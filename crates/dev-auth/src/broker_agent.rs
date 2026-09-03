@@ -118,7 +118,7 @@ pub fn run_agent_proxy(
     if owner_uid == 0 {
         bail!("broker SSH agent native owner is invalid");
     }
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     match receipt.mode {
         crate::setup::InstallMode::Strong if execution_uid != owner_uid => {
             bail!("strong broker SSH agent identity does not match its native owner")

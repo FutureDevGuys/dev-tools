@@ -885,7 +885,7 @@ pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitS
     if nix::unistd::Uid::effective().is_root() {
         bail!("workload launcher must be invoked by the native user");
     }
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     if receipt.mode != crate::setup::InstallMode::Strong {
         bail!("privileged workload launch requires a strong installation");
     }
@@ -934,7 +934,7 @@ pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitS
 
 pub fn run_workload_alias(workload: &str, arguments: &[OsString]) -> Result<ExitStatus> {
     let resolved = crate::setup::resolve_current_workload_alias(workload)?;
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     let (claim, probe) = crate::broker_client::active_claim_and_probe()?;
     match claim {
         crate::broker_protocol::LocalSessionClaim::Absent => match receipt.mode {
@@ -1419,7 +1419,7 @@ pub fn run_sandbox_child(
         parent_network_namespace,
     )?;
     let owner_uid = identity.owner_uid;
-    let (_, receipt) = crate::setup::current_installation()?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
     let policy = match receipt.mode {
         crate::setup::InstallMode::Strong => {
             crate::policy_store::load_resolved_policy_for_uid(owner_uid)?
