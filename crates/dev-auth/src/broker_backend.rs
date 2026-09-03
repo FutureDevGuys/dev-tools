@@ -330,9 +330,6 @@ impl CapabilityBackend for SystemCapabilityBackend {
         let [owner] = grant.owners.as_slice() else {
             bail!("GitHub CLI authority requires exactly one owner");
         };
-        if grant.repositories.is_empty() {
-            bail!("GitHub CLI authority requires an exact finite repository set");
-        }
         let public_scope = serde_json::to_vec(&(
             "gh",
             session_id,

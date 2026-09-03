@@ -973,7 +973,8 @@ struct AppJwtClaims {
 
 #[derive(Debug, Serialize)]
 struct InstallationTokenRequest<'a> {
-    repositories: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repositories: Option<&'a [String]>,
     permissions: &'a BTreeMap<String, String>,
 }
 
@@ -1077,6 +1078,66 @@ fn discover_repository_installation_with_jwt(
     validate_repository_installation_response(profile, owner, repository, &bytes)
 }
 
+#[cfg(target_os = "linux")]
+fn discover_owner_installation_with_jwt(
+    profile: &crate::GitHubProfile,
+    owner: &str,
+    jwt: &str,
+) -> Result<u64> {
+    let agent = github_api_agent();
+    let mut installation_id = None;
+    for account_kind in ["orgs", "users"] {
+        let url = format!("https://api.github.com/{account_kind}/{owner}/installation");
+        let mut response = agent
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {jwt}"))
+            .header("X-GitHub-Api-Version", "2026-03-10")
+            .call()
+            .context("discover owner GitHub App installation")?;
+        if response.status().as_u16() == 404 {
+            continue;
+        }
+        if !response.status().is_success() {
+            bail!(
+                "GitHub App owner installation lookup returned HTTP {}",
+                response.status()
+            );
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(RESPONSE_LIMIT)
+            .read_to_vec()
+            .context("read bounded GitHub App owner installation response")?;
+        let selected = validate_owner_installation_response(profile, owner, &bytes)?;
+        if installation_id.replace(selected).is_some() {
+            bail!("GitHub App owner installation lookup is ambiguous");
+        }
+    }
+    installation_id.context("GitHub App has no installation for the authorized owner")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_owner_installation_response(
+    profile: &crate::GitHubProfile,
+    owner: &str,
+    bytes: &[u8],
+) -> Result<u64> {
+    let installation: RepositoryInstallationResponse =
+        serde_json::from_slice(bytes).context("parse GitHub App owner installation response")?;
+    if installation.id == 0
+        || installation.app_id != profile.app_id
+        || !installation.account.login.eq_ignore_ascii_case(owner)
+        || installation.permissions != profile.permissions
+        || installation.repository_selection != profile.repository_selection
+        || installation.suspended_at.is_some()
+    {
+        bail!("GitHub App owner installation does not match the declared authority");
+    }
+    Ok(installation.id)
+}
+
 fn validate_repository_installation_response(
     profile: &crate::GitHubProfile,
     owner: &str,
@@ -1155,21 +1216,26 @@ fn mint_scoped_installation_token_with_jwt(
     repositories: &[String],
     now: i64,
 ) -> Result<BrokerGitHubToken> {
-    if repositories.is_empty() || repositories.len() > 500 {
-        bail!("GitHub token scope must contain between one and 500 repositories");
+    if repositories.len() > 500 {
+        bail!("GitHub token scope must not exceed 500 repositories");
     }
-    let expected_repositories = repositories
-        .iter()
-        .map(|repository| {
-            if !crate::is_github_component(repository) {
-                bail!("GitHub token scope contains an invalid repository name");
-            }
-            Ok(format!("{owner}/{repository}").to_ascii_lowercase())
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
-    if expected_repositories.len() != repositories.len() {
-        bail!("GitHub token scope contains a duplicate repository");
-    }
+    let expected_repositories = if repositories.is_empty() {
+        None
+    } else {
+        let expected = repositories
+            .iter()
+            .map(|repository| {
+                if !crate::is_github_component(repository) {
+                    bail!("GitHub token scope contains an invalid repository name");
+                }
+                Ok(format!("{owner}/{repository}").to_ascii_lowercase())
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if expected.len() != repositories.len() {
+            bail!("GitHub token scope contains a duplicate repository");
+        }
+        Some(expected)
+    };
     let agent = github_api_agent();
     let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
     let mut response = agent
@@ -1178,7 +1244,7 @@ fn mint_scoped_installation_token_with_jwt(
         .header("Authorization", format!("Bearer {jwt}"))
         .header("X-GitHub-Api-Version", "2026-03-10")
         .send_json(&InstallationTokenRequest {
-            repositories,
+            repositories: (!repositories.is_empty()).then_some(repositories),
             permissions: &profile.permissions,
         })
         .context("request narrowed GitHub App installation token")?;
@@ -1194,8 +1260,24 @@ fn mint_scoped_installation_token_with_jwt(
         .limit(RESPONSE_LIMIT)
         .read_to_vec()
         .context("read bounded GitHub App response")?;
+    validate_installation_token_response(
+        profile,
+        owner,
+        expected_repositories.as_ref(),
+        &bytes,
+        now,
+    )
+}
+
+fn validate_installation_token_response(
+    profile: &crate::GitHubProfile,
+    owner: &str,
+    expected_repositories: Option<&BTreeSet<String>>,
+    bytes: &[u8],
+    now: i64,
+) -> Result<BrokerGitHubToken> {
     let response: InstallationTokenResponse =
-        serde_json::from_slice(&bytes).context("parse GitHub App token response")?;
+        serde_json::from_slice(bytes).context("parse GitHub App token response")?;
     let expires_at = OffsetDateTime::parse(&response.expires_at, &Rfc3339)
         .context("parse GitHub App token expiry")?
         .unix_timestamp();
@@ -1218,8 +1300,22 @@ fn mint_scoped_installation_token_with_jwt(
             Ok(repository.full_name.to_ascii_lowercase())
         })
         .collect::<Result<BTreeSet<_>>>()?;
-    if returned_repositories.len() != response.repositories.len()
-        || returned_repositories != expected_repositories
+    if returned_repositories.len() != response.repositories.len() {
+        bail!("GitHub token scope contains duplicate repository identities");
+    }
+    if let Some(expected_repositories) = expected_repositories {
+        if &returned_repositories != expected_repositories {
+            bail!("GitHub token scope does not exactly match the requested repositories");
+        }
+    } else if returned_repositories.is_empty()
+        || returned_repositories.iter().any(|repository| {
+            repository
+                .split_once('/')
+                .is_none_or(|(returned_owner, repository)| {
+                    !returned_owner.eq_ignore_ascii_case(owner)
+                        || !crate::is_github_component(repository)
+                })
+        })
     {
         bail!("GitHub token scope does not exactly match the requested repositories");
     }
@@ -1275,8 +1371,8 @@ pub(crate) fn broker_github_token_for_repositories(
     owner: &str,
     repositories: &[String],
 ) -> Result<BrokerGitHubToken> {
-    if repositories.is_empty() || repositories.len() > 500 {
-        bail!("GitHub CLI authority requires a finite repository set");
+    if repositories.len() > 500 {
+        bail!("GitHub CLI authority exceeds the repository limit");
     }
     let private_key = read_declared_secret_with_token(
         authority.op_program,
@@ -1293,17 +1389,21 @@ pub(crate) fn broker_github_token_for_repositories(
         installations: Vec::new(),
         permissions: authority.permissions,
     };
-    let mut installation_id = None;
-    for repository in repositories {
-        let selected =
-            discover_repository_installation_with_jwt(&profile, owner, repository, &jwt)?;
-        match installation_id {
-            None => installation_id = Some(selected.installation_id),
-            Some(expected) if expected == selected.installation_id => {}
-            Some(_) => bail!("GitHub CLI repository scope crosses App installations"),
+    let installation_id = if repositories.is_empty() {
+        discover_owner_installation_with_jwt(&profile, owner, &jwt)?
+    } else {
+        let mut installation_id = None;
+        for repository in repositories {
+            let selected =
+                discover_repository_installation_with_jwt(&profile, owner, repository, &jwt)?;
+            match installation_id {
+                None => installation_id = Some(selected.installation_id),
+                Some(expected) if expected == selected.installation_id => {}
+                Some(_) => bail!("GitHub CLI repository scope crosses App installations"),
+            }
         }
-    }
-    let installation_id = installation_id.context("GitHub CLI authority has no repository")?;
+        installation_id.context("GitHub CLI authority has no repository")?
+    };
     if !authority.installation_ids.is_empty()
         && authority
             .installation_ids
@@ -3971,7 +4071,7 @@ mod tests {
         let permissions = BTreeMap::from([("contents".into(), "write".into())]);
         let repositories = vec!["brand-new-repository".to_owned()];
         let request = InstallationTokenRequest {
-            repositories: &repositories,
+            repositories: Some(&repositories),
             permissions: &permissions,
         };
         assert_eq!(
@@ -3981,6 +4081,103 @@ mod tests {
                 "permissions": {"contents": "write"}
             })
         );
+    }
+
+    #[test]
+    fn installation_token_request_omits_repositories_for_owner_scope() {
+        let permissions = BTreeMap::from([("contents".into(), "write".into())]);
+        let request = InstallationTokenRequest {
+            repositories: None,
+            permissions: &permissions,
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"permissions": {"contents": "write"}})
+        );
+    }
+
+    #[test]
+    fn owner_scoped_token_accepts_only_provider_selected_repositories_for_that_owner() {
+        let profile = crate::GitHubProfile {
+            app_id: 42,
+            private_key_ref: "op://Automation/app/private-key".into(),
+            repository_selection: crate::RepositorySelection::Selected,
+            discover_installations: true,
+            installations: Vec::new(),
+            permissions: BTreeMap::from([
+                ("contents".into(), "write".into()),
+                ("metadata".into(), "read".into()),
+            ]),
+        };
+        let response = serde_json::json!({
+            "token": "installation-token",
+            "expires_at": "2026-09-03T12:30:00Z",
+            "permissions": {"contents": "write", "metadata": "read"},
+            "repository_selection": "selected",
+            "repositories": [
+                {"id": 1, "full_name": "ExampleOrg/alpha"},
+                {"id": 2, "full_name": "exampleorg/beta"}
+            ]
+        });
+        let token = validate_installation_token_response(
+            &profile,
+            "ExampleOrg",
+            None,
+            &serde_json::to_vec(&response).unwrap(),
+            1_788_436_800,
+        )
+        .unwrap();
+        assert_eq!(token.token.expose(), "installation-token");
+
+        let mut wrong_owner = response;
+        wrong_owner["repositories"][1]["full_name"] =
+            serde_json::Value::String("AnotherOrg/beta".into());
+        assert!(validate_installation_token_response(
+            &profile,
+            "ExampleOrg",
+            None,
+            &serde_json::to_vec(&wrong_owner).unwrap(),
+            1_788_436_800,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn owner_installation_lookup_requires_the_exact_app_account_and_permissions() {
+        let profile = crate::GitHubProfile {
+            app_id: 42,
+            private_key_ref: "op://Automation/app/private-key".into(),
+            repository_selection: crate::RepositorySelection::Selected,
+            discover_installations: true,
+            installations: Vec::new(),
+            permissions: BTreeMap::from([("contents".into(), "write".into())]),
+        };
+        let response = serde_json::json!({
+            "id": 101,
+            "app_id": 42,
+            "account": {"login": "ExampleOrg"},
+            "permissions": {"contents": "write"},
+            "repository_selection": "selected",
+            "suspended_at": null
+        });
+        assert_eq!(
+            validate_owner_installation_response(
+                &profile,
+                "exampleorg",
+                &serde_json::to_vec(&response).unwrap(),
+            )
+            .unwrap(),
+            101
+        );
+
+        let mut wrong_app = response;
+        wrong_app["app_id"] = serde_json::Value::from(7);
+        assert!(validate_owner_installation_response(
+            &profile,
+            "exampleorg",
+            &serde_json::to_vec(&wrong_app).unwrap(),
+        )
+        .is_err());
     }
 
     #[test]
