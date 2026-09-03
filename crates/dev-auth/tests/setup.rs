@@ -502,6 +502,9 @@ fn strong_setup_owns_hardened_socket_activated_service_assets() {
     assert!(combined.contains("User=dev-auth"));
     assert!(!combined.contains("dev-auth-workload -"));
     assert!(combined.contains("LoadCredentialEncrypted=op-service-account-token:"));
+    assert!(combined.contains("RuntimeDirectory=dev-auth-provider"));
+    assert!(combined.contains("RuntimeDirectoryMode=0700"));
+    assert!(combined.contains("Environment=HOME=/run/dev-auth-provider"));
     assert!(combined.contains("ProtectSystem=strict"));
     assert!(combined.contains("ExecStart=/usr/local/bin/dev-auth broker serve"));
     assert!(combined.contains("com.futuredevguys.dev-auth.launch-workload"));
