@@ -167,8 +167,12 @@ def test_strong_acceptance_never_executes_repository_code_as_root() -> None:
     assert 'sudo -- "$0"' not in source
     assert "/usr/bin/sudo -v" in source
     assert "/usr/local/bin/dev-auth" in source
-    assert "setup verify --mode strong" in source
+    assert '"$canonical_alias" setup verify --mode strong' not in source
     assert "privileged=(/usr/bin/sudo -n --)" in source
+    assert (
+        '"${privileged[@]}" "$dev_auth_bin" setup verify --mode strong'
+        in source
+    )
     assert '"${privileged[@]}" "$dev_auth_bin" setup plan' in source
     assert '"${privileged[@]}" "$dev_auth_bin" setup apply' in source
     assert '"${privileged[@]}" "$dev_auth_bin" setup verify' in source

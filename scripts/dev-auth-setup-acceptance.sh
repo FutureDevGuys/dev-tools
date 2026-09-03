@@ -83,8 +83,6 @@ require_strong_active_installation() {
     "strong acceptance could not resolve the receipt-owned active strong installation"
   [[ $active == "$executable" ]] || die \
     "strong acceptance requires the receipt-owned active strong installation"
-  "$canonical_alias" setup verify --mode strong >/dev/null 2>&1 || die \
-    "strong acceptance could not verify the receipt-owned active strong installation"
 }
 
 extract_line_value() {
@@ -217,6 +215,8 @@ main() {
     [[ -x /usr/bin/sudo ]] || die "strong acceptance requires /usr/bin/sudo"
     /usr/bin/sudo -v
     privileged=(/usr/bin/sudo -n --)
+    capture_step "$log_path" "$step_path" strong-installation-verify \
+      "${privileged[@]}" "$dev_auth_bin" setup verify --mode strong
   fi
   ((offline == 0)) || plan_args+=(--offline)
 
