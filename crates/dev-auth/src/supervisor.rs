@@ -265,15 +265,23 @@ impl Drop for StrongBoundaryListener {
 }
 
 fn ensure_root_runtime_directory(path: &Path, mode: u32) -> Result<()> {
+    ensure_runtime_directory(path, mode, 0)
+}
+
+fn ensure_runtime_directory(path: &Path, mode: u32, owner_uid: u32) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(_) => validate_root_runtime_directory(path, mode),
+        Ok(_) => validate_runtime_directory(path, mode, owner_uid),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
             builder.mode(mode);
             match builder.create(path) {
-                Ok(()) => validate_root_runtime_directory(path, mode),
+                Ok(()) => {
+                    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                        .context("publish strong workload runtime directory permissions")?;
+                    validate_runtime_directory(path, mode, owner_uid)
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    validate_root_runtime_directory(path, mode)
+                    validate_runtime_directory(path, mode, owner_uid)
                 }
                 Err(error) => Err(error).context("create strong workload runtime directory"),
             }
@@ -283,11 +291,15 @@ fn ensure_root_runtime_directory(path: &Path, mode: u32) -> Result<()> {
 }
 
 fn validate_root_runtime_directory(path: &Path, mode: u32) -> Result<()> {
+    validate_runtime_directory(path, mode, 0)
+}
+
+fn validate_runtime_directory(path: &Path, mode: u32, owner_uid: u32) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect strong workload directory {}", path.display()))?;
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
+        || metadata.uid() != owner_uid
         || metadata.mode() & 0o777 != mode
     {
         bail!("strong workload runtime directory has unsafe authority");
@@ -2359,6 +2371,35 @@ fn validate_identifier(value: &str, description: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_directory_publishes_exact_mode_under_restrictive_umask() {
+        const CHILD: &str = "DEV_AUTH_RUNTIME_MODE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = std::env::var_os("DEV_AUTH_RUNTIME_MODE_ROOT").unwrap();
+            let path = PathBuf::from(root).join("workloads");
+            let previous = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+            let result =
+                ensure_runtime_directory(&path, 0o755, nix::unistd::Uid::effective().as_raw());
+            nix::sys::stat::umask(previous);
+            result.unwrap();
+            assert_eq!(fs::symlink_metadata(path).unwrap().mode() & 0o777, 0o755);
+            return;
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "supervisor::tests::runtime_directory_publishes_exact_mode_under_restrictive_umask",
+            )
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("DEV_AUTH_RUNTIME_MODE_ROOT", temporary.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn workload_environment_removes_auth_and_loader_injection_but_keeps_ui_settings() {
