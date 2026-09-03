@@ -509,7 +509,7 @@ pub fn local_session_claim() -> Result<LocalSessionClaim> {
 }
 
 pub fn current_workload_cgroup(session_id: &str) -> Result<PathBuf> {
-    validate_public_identifier(session_id, "session identifier")?;
+    validate_current_workload_session(session_id)?;
     let cgroup = read_unified_cgroup(std::process::id())?;
     let observed = workload_session_id(&cgroup)
         .context("supervisor is outside a product-owned transient workload service")?;
@@ -517,6 +517,10 @@ pub fn current_workload_cgroup(session_id: &str) -> Result<PathBuf> {
         bail!("supervisor transient service does not match its session identifier");
     }
     Ok(cgroup)
+}
+
+fn validate_current_workload_session(session_id: &str) -> Result<()> {
+    validate_session_identifier(session_id)
 }
 
 fn workload_session_id(cgroup: &Path) -> Option<&str> {
@@ -833,6 +837,12 @@ mod tests {
         ] {
             assert_eq!(workload_session_id(Path::new(rejected)), None);
         }
+    }
+
+    #[test]
+    fn current_workload_accepts_numeric_prefix_session_identifiers() {
+        validate_current_workload_session("4c5461c2953de137653360f284ee797d").unwrap();
+        assert!(validate_current_workload_session("g0000000000000000000000000000000").is_err());
     }
 
     #[test]
