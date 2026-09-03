@@ -1,4 +1,16 @@
 pub mod cli;
+pub mod engine;
+pub mod filesystem;
+pub mod hooks;
+pub mod manifest;
+pub mod overlay;
+pub mod paths;
+pub mod privilege;
+pub mod privileged_target;
+pub mod reconciler;
+pub mod report;
+pub mod run_logs;
+pub mod scaffold;
 
 use std::ffi::OsString;
 

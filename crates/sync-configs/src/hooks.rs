@@ -1,0 +1,697 @@
+//! Execution boundary for manifest-authorized per-entry hooks.
+//!
+//! Hooks are deliberately an explicit trusted shell-string interface. The
+//! manifest, rather than this module, owns the command text. This module fixes
+//! the shell executable and argv grammar, validates every selected hook before
+//! authentication, and keeps command/output bytes out of its structured status.
+
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::Duration;
+
+use dev_tools_command::is_executable_file;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::manifest::{Entry, Privilege, ScriptFailurePolicy};
+use crate::privilege::{PrivilegeError, PrivilegeSession};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookRunMode {
+    Apply,
+    DryRun,
+    Validate,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum HookPhase {
+    #[serde(rename = "pre_script")]
+    Pre,
+    #[serde(rename = "post_script")]
+    Post,
+}
+
+impl HookPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pre => "pre_script",
+            Self::Post => "post_script",
+        }
+    }
+}
+
+impl fmt::Display for HookPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookState {
+    Planned,
+    Succeeded,
+    FailedAbort,
+    FailedSkip,
+    FailedContinue,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookStatus {
+    pub phase: HookPhase,
+    pub state: HookState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookProgressState {
+    Running,
+    Planned,
+}
+
+/// A fixed-token progress record. Entry identity remains available from the
+/// surrounding [`PreHookRecord`] or [`PostHookRecord`] and can be hashed by the
+/// diagnostic recorder; command text and hook output are intentionally absent.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookProgress {
+    pub phase: HookPhase,
+    pub state: HookProgressState,
+}
+
+pub struct HookExecution {
+    status: HookStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl HookExecution {
+    pub fn status(&self) -> &HookStatus {
+        &self.status
+    }
+
+    /// Captured bytes are returned only to the immediate caller. This module
+    /// never writes them to a transcript, structured log, or filesystem.
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    /// Captured bytes are returned only to the immediate caller. This module
+    /// never writes them to a transcript, structured log, or filesystem.
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+
+    pub fn into_output(self) -> (Vec<u8>, Vec<u8>) {
+        (self.stdout, self.stderr)
+    }
+}
+
+impl fmt::Debug for HookExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HookExecution")
+            .field("status", &self.status)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookDecision {
+    Proceed,
+    Skip,
+    Abort,
+}
+
+pub struct PreHookRecord<'a> {
+    pub entry: &'a Entry,
+    pub decision: HookDecision,
+    pub progress: Option<HookProgress>,
+    pub execution: Option<HookExecution>,
+}
+
+impl fmt::Debug for PreHookRecord<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreHookRecord")
+            .field("decision", &self.decision)
+            .field("progress", &self.progress)
+            .field("execution", &self.execution)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostHookDecision {
+    Complete,
+    Abort,
+}
+
+pub struct PostHookRecord<'a> {
+    pub entry: &'a Entry,
+    pub decision: PostHookDecision,
+    pub progress: HookProgress,
+    pub execution: HookExecution,
+}
+
+impl fmt::Debug for PostHookRecord<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PostHookRecord")
+            .field("decision", &self.decision)
+            .field("progress", &self.progress)
+            .field("execution", &self.execution)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryConvergence {
+    Changed,
+    UpToDate,
+    Failed,
+    MissingSource,
+    Skipped,
+}
+
+impl EntryConvergence {
+    const fn permits_post_hook(self) -> bool {
+        matches!(self, Self::Changed | Self::UpToDate)
+    }
+}
+
+/// Safe, prevalidated platform-shell authority and its fixed argument prefix.
+#[derive(Clone)]
+pub struct HookShell {
+    executable: PathBuf,
+    arguments_before_script: Vec<OsString>,
+}
+
+impl HookShell {
+    pub fn posix(executable: PathBuf) -> Result<Self, HookError> {
+        Self::new(executable, vec![OsString::from("-c")])
+    }
+
+    pub fn windows_cmd(executable: PathBuf) -> Result<Self, HookError> {
+        Self::new(
+            executable,
+            vec![
+                OsString::from("/D"),
+                OsString::from("/S"),
+                OsString::from("/C"),
+            ],
+        )
+    }
+
+    pub fn current() -> Result<Self, HookError> {
+        #[cfg(unix)]
+        {
+            Self::posix(PathBuf::from("/bin/sh"))
+        }
+        #[cfg(windows)]
+        {
+            let system_root = std::env::var_os("SystemRoot").ok_or(HookError::UnsafeShell)?;
+            Self::windows_cmd(PathBuf::from(system_root).join("System32/cmd.exe"))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(HookError::UnsupportedPlatform)
+        }
+    }
+
+    fn new(executable: PathBuf, arguments_before_script: Vec<OsString>) -> Result<Self, HookError> {
+        let executable = validated_executable(&executable)?;
+        Ok(Self {
+            executable,
+            arguments_before_script,
+        })
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+}
+
+impl fmt::Debug for HookShell {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HookShell")
+            .field("executable", &self.executable)
+            .field("fixed_argument_count", &self.arguments_before_script.len())
+            .finish()
+    }
+}
+
+pub struct HookSpec<'a> {
+    entry: &'a Entry,
+    phase: HookPhase,
+    command: &'a str,
+    privilege: Privilege,
+    on_failure: ScriptFailurePolicy,
+}
+
+impl<'a> HookSpec<'a> {
+    fn pre(entry: &'a Entry) -> Option<Self> {
+        entry.pre_script.as_deref().map(|command| Self {
+            entry,
+            phase: HookPhase::Pre,
+            command,
+            privilege: entry.pre_script_privilege,
+            on_failure: entry.pre_script_on_fail,
+        })
+    }
+
+    fn post(entry: &'a Entry) -> Option<Self> {
+        entry.post_script.as_deref().map(|command| Self {
+            entry,
+            phase: HookPhase::Post,
+            command,
+            privilege: entry.post_script_privilege,
+            on_failure: entry.post_script_on_fail,
+        })
+    }
+
+    pub fn entry(&self) -> &'a Entry {
+        self.entry
+    }
+
+    pub const fn phase(&self) -> HookPhase {
+        self.phase
+    }
+
+    pub const fn privilege(&self) -> Privilege {
+        self.privilege
+    }
+
+    pub const fn on_failure(&self) -> ScriptFailurePolicy {
+        self.on_failure
+    }
+
+    pub const fn progress(&self, state: HookProgressState) -> HookProgress {
+        HookProgress {
+            phase: self.phase,
+            state,
+        }
+    }
+}
+
+impl fmt::Debug for HookSpec<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HookSpec")
+            .field("phase", &self.phase)
+            .field("privilege", &self.privilege)
+            .field("on_failure", &self.on_failure)
+            .field("command", &"<redacted>")
+            .finish()
+    }
+}
+
+struct EntryHooks<'a> {
+    entry: &'a Entry,
+    pre: Option<HookSpec<'a>>,
+    post: Option<HookSpec<'a>>,
+}
+
+pub struct HookPlan<'a> {
+    entries: Vec<EntryHooks<'a>>,
+    config_dir: PathBuf,
+    shell: HookShell,
+    mode: HookRunMode,
+    requires_privilege: bool,
+}
+
+impl fmt::Debug for HookPlan<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HookPlan")
+            .field("entry_count", &self.entries.len())
+            .field("config_dir", &self.config_dir)
+            .field("shell", &self.shell)
+            .field("mode", &self.mode)
+            .field("requires_privilege", &self.requires_privilege)
+            .finish()
+    }
+}
+
+impl<'a> HookPlan<'a> {
+    /// Prepare every selected entry before authentication or hook execution.
+    /// Callers pass the already profile-selected, base/override-merged entries.
+    pub fn prepare<I>(
+        entries: I,
+        config_dir: &Path,
+        shell: HookShell,
+        mode: HookRunMode,
+    ) -> Result<Self, HookError>
+    where
+        I: IntoIterator<Item = &'a Entry>,
+    {
+        validate_working_directory(config_dir)?;
+        let mut prepared = Vec::new();
+        let mut requires_privilege = false;
+        for entry in entries {
+            let pre = HookSpec::pre(entry);
+            let post = HookSpec::post(entry);
+            for hook in pre.iter().chain(post.iter()) {
+                validate_command(hook)?;
+                if hook.privilege == Privilege::Sudo {
+                    validate_privileged_hook_platform()?;
+                    requires_privilege = true;
+                }
+            }
+            prepared.push(EntryHooks { entry, pre, post });
+        }
+        if mode != HookRunMode::Apply {
+            requires_privilege = false;
+        }
+        Ok(Self {
+            entries: prepared,
+            config_dir: config_dir.to_path_buf(),
+            shell,
+            mode,
+            requires_privilege,
+        })
+    }
+
+    pub const fn mode(&self) -> HookRunMode {
+        self.mode
+    }
+
+    pub const fn requires_privilege(&self) -> bool {
+        self.requires_privilege
+    }
+
+    /// Authenticate at most once through the caller-owned shared session.
+    /// Dry-run, validation, and hook-free plans are strict no-ops.
+    pub fn authenticate(&self, session: &mut PrivilegeSession) -> Result<(), HookError> {
+        if self.requires_privilege {
+            session.ensure_authenticated()?;
+        }
+        Ok(())
+    }
+
+    /// Run selected pre-hooks in manifest order. A failed `abort` hook marks
+    /// that entry erroneous and ineligible, but—matching the established CLI
+    /// contract—does not prevent later independent pre-hooks from running.
+    pub fn run_pre_hooks(
+        &self,
+        session: Option<&PrivilegeSession>,
+    ) -> Result<Vec<PreHookRecord<'a>>, HookError> {
+        let mut records = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let Some(hook) = entry.pre.as_ref() else {
+                records.push(PreHookRecord {
+                    entry: entry.entry,
+                    decision: HookDecision::Proceed,
+                    progress: None,
+                    execution: None,
+                });
+                continue;
+            };
+            let progress = hook.progress(match self.mode {
+                HookRunMode::DryRun => HookProgressState::Planned,
+                HookRunMode::Apply | HookRunMode::Validate => HookProgressState::Running,
+            });
+            match self.mode {
+                HookRunMode::Validate => records.push(PreHookRecord {
+                    entry: entry.entry,
+                    decision: HookDecision::Proceed,
+                    progress: None,
+                    execution: None,
+                }),
+                HookRunMode::DryRun => records.push(PreHookRecord {
+                    entry: entry.entry,
+                    decision: HookDecision::Proceed,
+                    progress: Some(progress),
+                    execution: Some(planned_execution(hook.phase)),
+                }),
+                HookRunMode::Apply => {
+                    let execution = self.execute(hook, session)?;
+                    records.push(PreHookRecord {
+                        entry: entry.entry,
+                        decision: pre_decision(execution.status.state),
+                        progress: Some(progress),
+                        execution: Some(execution),
+                    });
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    /// Run post-hooks in original manifest order only for entries whose actual
+    /// convergence succeeded. Dry-run records a value-free plan without
+    /// executing anything; validation records nothing.
+    pub fn run_post_hooks<F>(
+        &self,
+        session: Option<&PrivilegeSession>,
+        mut convergence: F,
+    ) -> Result<Vec<PostHookRecord<'a>>, HookError>
+    where
+        F: FnMut(&Entry) -> EntryConvergence,
+    {
+        let mut records = Vec::new();
+        if self.mode == HookRunMode::Validate {
+            return Ok(records);
+        }
+        for entry in &self.entries {
+            let Some(hook) = entry.post.as_ref() else {
+                continue;
+            };
+            if self.mode == HookRunMode::Apply && !convergence(entry.entry).permits_post_hook() {
+                continue;
+            }
+            let progress = hook.progress(if self.mode == HookRunMode::DryRun {
+                HookProgressState::Planned
+            } else {
+                HookProgressState::Running
+            });
+            let execution = if self.mode == HookRunMode::DryRun {
+                planned_execution(hook.phase)
+            } else {
+                self.execute(hook, session)?
+            };
+            let decision = if execution.status.state == HookState::FailedAbort {
+                PostHookDecision::Abort
+            } else {
+                PostHookDecision::Complete
+            };
+            records.push(PostHookRecord {
+                entry: entry.entry,
+                decision,
+                progress,
+                execution,
+            });
+        }
+        Ok(records)
+    }
+
+    fn execute(
+        &self,
+        hook: &HookSpec<'_>,
+        session: Option<&PrivilegeSession>,
+    ) -> Result<HookExecution, HookError> {
+        // Linux can briefly return ETXTBSY for a newly replaced executable
+        // while an older mapping is being released. Rebuild the exact command
+        // and retry only that transient kernel condition; every other spawn
+        // failure remains immediate and value-conscious.
+        let mut attempt = 0_u32;
+        loop {
+            let output = match hook.privilege {
+                Privilege::User => self.user_command(hook.command).output(),
+                Privilege::Sudo => self.privileged_command(hook.command, session)?.output(),
+            };
+            match output {
+                Ok(output) => return Ok(completed_execution(hook, output)),
+                Err(source) if attempt < 4 && executable_temporarily_busy(&source) => {
+                    std::thread::sleep(Duration::from_millis(2_u64 << attempt));
+                    attempt += 1;
+                }
+                Err(source) => {
+                    return Err(HookError::Start {
+                        phase: hook.phase,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    fn user_command(&self, script: &str) -> Command {
+        let mut command = Command::new(&self.shell.executable);
+        command
+            .args(&self.shell.arguments_before_script)
+            .arg(script)
+            .current_dir(&self.config_dir);
+        command
+    }
+
+    fn privileged_command(
+        &self,
+        script: &str,
+        session: Option<&PrivilegeSession>,
+    ) -> Result<Command, HookError> {
+        let session = session.ok_or(HookError::MissingPrivilegeSession)?;
+        if !session.is_authenticated() {
+            return Err(HookError::MissingPrivilegeSession);
+        }
+        let mut command = Command::new(session.sudo_path());
+        command
+            .args([OsStr::new("-n"), OsStr::new("--")])
+            .arg(&self.shell.executable)
+            .args(&self.shell.arguments_before_script)
+            .arg(script)
+            .current_dir(&self.config_dir);
+        Ok(command)
+    }
+}
+
+#[cfg(unix)]
+fn executable_temporarily_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn executable_temporarily_busy(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn planned_execution(phase: HookPhase) -> HookExecution {
+    HookExecution {
+        status: HookStatus {
+            phase,
+            state: HookState::Planned,
+            exit_code: None,
+        },
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+fn completed_execution(hook: &HookSpec<'_>, output: Output) -> HookExecution {
+    let state = if output.status.success() {
+        HookState::Succeeded
+    } else {
+        match hook.on_failure {
+            ScriptFailurePolicy::Abort => HookState::FailedAbort,
+            ScriptFailurePolicy::Skip => HookState::FailedSkip,
+            ScriptFailurePolicy::Continue => HookState::FailedContinue,
+        }
+    };
+    HookExecution {
+        status: HookStatus {
+            phase: hook.phase,
+            state,
+            exit_code: output.status.code(),
+        },
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
+fn pre_decision(state: HookState) -> HookDecision {
+    match state {
+        HookState::FailedAbort => HookDecision::Abort,
+        HookState::FailedSkip => HookDecision::Skip,
+        HookState::Planned | HookState::Succeeded | HookState::FailedContinue => {
+            HookDecision::Proceed
+        }
+    }
+}
+
+fn validate_command(hook: &HookSpec<'_>) -> Result<(), HookError> {
+    if hook.command.is_empty() || hook.command.as_bytes().contains(&0) {
+        return Err(HookError::InvalidCommand { phase: hook.phase });
+    }
+    Ok(())
+}
+
+fn validate_working_directory(path: &Path) -> Result<(), HookError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(HookError::InvalidWorkingDirectory);
+    }
+    let metadata = fs::metadata(path).map_err(|_| HookError::InvalidWorkingDirectory)?;
+    if !metadata.is_dir() {
+        return Err(HookError::InvalidWorkingDirectory);
+    }
+    Ok(())
+}
+
+fn validated_executable(path: &Path) -> Result<PathBuf, HookError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(HookError::UnsafeShell);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| HookError::UnsafeShell)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| HookError::UnsafeShell)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(HookError::UnsafeShell);
+    }
+    if !is_executable_file(path) {
+        return Err(HookError::UnsafeShell);
+    }
+    // Preserve the explicitly selected executable spelling. In particular,
+    // invoking `/bin/sh` by that name can select POSIX behavior that would be
+    // lost if a symlink were replaced with its canonical Bash target.
+    Ok(path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn validate_privileged_hook_platform() -> Result<(), HookError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_privileged_hook_platform() -> Result<(), HookError> {
+    Err(HookError::PrivilegedHooksUnsupported)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[derive(Debug, Error)]
+pub enum HookError {
+    #[error("trusted hook shell has unsafe authority")]
+    UnsafeShell,
+    #[error("hook working directory is invalid")]
+    InvalidWorkingDirectory,
+    #[error("selected {phase} has an invalid hook command")]
+    InvalidCommand { phase: HookPhase },
+    #[error("selected privileged hooks are unsupported on this platform")]
+    PrivilegedHooksUnsupported,
+    #[error("privileged hook requires one authenticated shared sudo session")]
+    MissingPrivilegeSession,
+    #[error("{phase} hook failed to start")]
+    Start {
+        phase: HookPhase,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Privilege(#[from] PrivilegeError),
+    #[error("trusted hooks are unsupported on this platform")]
+    UnsupportedPlatform,
+}
