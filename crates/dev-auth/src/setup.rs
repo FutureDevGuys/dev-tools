@@ -1445,7 +1445,7 @@ pub fn migrate_v1_configuration(
     let user_config_bytes =
         read_approved_public_document(user_config_source, approved_user_config_sha256)?;
     let user_config = crate::policy_v2::parse_user_config_v2(&user_config_bytes)?;
-    let (_, receipt) = current_installation()?;
+    let (_, receipt) = current_runtime_installation()?;
     let system_policy = match receipt.mode {
         InstallMode::Strong => crate::policy_store::load_system_policy()?,
         InstallMode::UserOnly => crate::policy_store::load_user_policy_at(
@@ -1876,7 +1876,9 @@ pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
     Ok((paths, receipt))
 }
 
-pub(crate) fn current_frontend_installation() -> Result<(SetupPaths, InstallReceipt)> {
+/// Resolves the receipt-owned running executable without entering the installation mutation lane.
+/// Strong-mode runtime artifacts are root-owned and immutable to the native workload user.
+pub(crate) fn current_runtime_installation() -> Result<(SetupPaths, InstallReceipt)> {
     let (paths, receipt, metadata) = current_installation_identity()?;
     let expected_owner = match receipt.mode {
         InstallMode::Strong => 0,
@@ -1889,7 +1891,7 @@ pub(crate) fn current_frontend_installation() -> Result<(SetupPaths, InstallRece
         || metadata.mode() & 0o777 != 0o755
         || metadata.len() != receipt.executable_length
     {
-        bail!("running transparent frontend has unsafe filesystem authority");
+        bail!("running dev-auth executable has unsafe filesystem authority");
     }
     Ok((paths, receipt))
 }
@@ -1989,6 +1991,14 @@ fn verify_receipted_installation_at(
         native_git: receipt.native_git.clone(),
         native_gh: receipt.native_gh.clone(),
     })
+}
+
+/// Verifies public runtime state without opening or recovering the private installation receipt.
+pub(crate) fn verify_runtime_installation_at(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+) -> Result<SetupReport> {
+    verify_receipted_installation_at(paths, receipt, false)
 }
 
 pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
@@ -2951,7 +2961,7 @@ pub fn install_user_policy(source: &Path, approved_sha256: &str) -> Result<PathB
     if owner_uid == 0 {
         bail!("user-only policy must be installed by its native user");
     }
-    let (_, receipt) = current_installation()?;
+    let (_, receipt) = current_runtime_installation()?;
     if receipt.mode != InstallMode::UserOnly {
         bail!("user-only policy cannot configure a strong installation");
     }
@@ -3032,7 +3042,7 @@ pub fn update_user_policy(
     if owner_uid == 0 {
         bail!("user-only policy update requires a native non-root user");
     }
-    let (_, receipt) = current_installation()?;
+    let (_, receipt) = current_runtime_installation()?;
     if receipt.mode != InstallMode::UserOnly {
         bail!("user-only policy cannot update a strong installation");
     }
@@ -3228,7 +3238,7 @@ fn install_or_update_user_config(
         .context("effective user account does not exist")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
     let user_config = crate::policy_v2::parse_user_config_v2(&bytes)?;
-    let (_, receipt) = current_installation()?;
+    let (_, receipt) = current_runtime_installation()?;
     let system_policy = match receipt.mode {
         InstallMode::Strong => crate::policy_store::load_system_policy()?,
         InstallMode::UserOnly => crate::policy_store::load_user_policy_at(
@@ -3245,7 +3255,7 @@ fn install_or_update_user_config(
     }
     let resolved =
         crate::policy_v2::resolve_policy_for_user(&system_policy, &user.name, &user_config)?;
-    let (installation_paths, installation) = current_installation()?;
+    let (installation_paths, installation) = current_runtime_installation()?;
     let executable = PathBuf::from(&installation.executable);
     let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
     preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
@@ -3817,7 +3827,7 @@ pub fn resolve_current_workload_alias(alias: &str) -> Result<crate::policy_v2::R
     validate_workload_alias_names(&[alias.to_owned()])?;
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("native user account does not exist")?;
-    let (_, installation) = current_installation()?;
+    let (_, installation) = current_runtime_installation()?;
     let executable = PathBuf::from(&installation.executable);
     let receipt = read_workload_alias_receipt(&user.dir, owner_uid)?
         .context("workload launcher receipt is not installed")?;

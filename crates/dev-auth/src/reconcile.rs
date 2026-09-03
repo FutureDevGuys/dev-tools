@@ -54,7 +54,7 @@ pub fn plan_user_config_for_protocol(source: &Path) -> Result<UserConfigPlanOutc
             "system_installation_absent",
         )?));
     }
-    let (_, installation) = crate::setup::current_installation()?;
+    let (_, installation) = crate::setup::current_runtime_installation()?;
     let user = native_user()?;
     let policy = match installation.mode {
         crate::setup::InstallMode::Strong => PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH),
@@ -96,7 +96,7 @@ pub fn plan_user_config(source: &Path) -> Result<(UserConfigReconcilePlan, Recon
     if !source.is_absolute() {
         bail!("reconcile source path must be absolute");
     }
-    let (installation_paths, installation) = crate::setup::current_installation()?;
+    let (installation_paths, installation) = crate::setup::current_runtime_installation()?;
     let user = native_user()?;
     let (source_bytes, source_state) = read_public_document(source, user.uid.as_raw())?;
     let user_config = crate::policy_v2::parse_user_config_v2(&source_bytes)?;
@@ -213,7 +213,7 @@ pub fn read_plan(path: &Path) -> Result<UserConfigReconcilePlan> {
 
 fn revalidate_plan(plan: &UserConfigReconcilePlan) -> Result<()> {
     validate_plan(plan)?;
-    let (paths, installation) = crate::setup::current_installation()?;
+    let (paths, installation) = crate::setup::current_runtime_installation()?;
     let user = native_user()?;
     if paths != plan.installation_paths
         || installation.version != plan.installation_version
