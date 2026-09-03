@@ -1714,6 +1714,10 @@ fn spawn_agent_proxy(
     let mut child = command.spawn().context("start broker SSH agent process")?;
     let started = Instant::now();
     loop {
+        if let Some(status) = child.try_wait().context("poll broker SSH agent startup")? {
+            let _ = fs::remove_file(&socket);
+            bail!("broker SSH agent exited before readiness: {status}");
+        }
         match fs::symlink_metadata(&socket) {
             Ok(metadata)
                 if metadata.file_type().is_socket()
@@ -1721,34 +1725,55 @@ fn spawn_agent_proxy(
                     && metadata.uid() == execution_uid
                     && metadata.mode() & 0o077 == 0 =>
             {
-                return Ok(AgentProxyProcess {
-                    child,
-                    socket,
-                    cleanup_parent: mode == crate::setup::InstallMode::UserOnly,
-                })
+                match UnixStream::connect(&socket) {
+                    Ok(stream) => {
+                        drop(stream);
+                        if let Some(status) = child
+                            .try_wait()
+                            .context("confirm broker SSH agent liveness")?
+                        {
+                            let _ = fs::remove_file(&socket);
+                            bail!("broker SSH agent exited during readiness: {status}");
+                        }
+                        return Ok(AgentProxyProcess {
+                            child,
+                            socket,
+                            cleanup_parent: mode == crate::setup::InstallMode::UserOnly,
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(error) => {
+                        stop_failed_agent_proxy(&mut child, &socket);
+                        return Err(error).context("connect to broker SSH agent during readiness");
+                    }
+                }
             }
             Ok(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_failed_agent_proxy(&mut child, &socket);
                 bail!("broker SSH agent created an unsafe socket");
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_failed_agent_proxy(&mut child, &socket);
                 return Err(error).context("inspect broker SSH agent socket");
             }
         }
-        if let Some(status) = child.try_wait().context("poll broker SSH agent startup")? {
-            bail!("broker SSH agent exited before readiness: {status}");
-        }
         if started.elapsed() >= Duration::from_secs(5) {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_failed_agent_proxy(&mut child, &socket);
             bail!("broker SSH agent readiness timed out");
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn stop_failed_agent_proxy(child: &mut Child, socket: &Path) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(socket);
 }
 
 fn stop_agent_proxies(proxies: &mut Vec<AgentProxyProcess>) {
@@ -2399,6 +2424,19 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn failed_agent_startup_reaps_the_child_and_removes_its_socket() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let mut child = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+
+        stop_failed_agent_proxy(&mut child, &socket);
+
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!socket.exists());
     }
 
     #[test]
