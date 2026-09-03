@@ -40,8 +40,8 @@ release_signer_profile=source-maintenance # exact name from the installed config
   --release-signer /usr/local/bin/dev-auth \
   --release-signer-profile "$release_signer_profile" \
   --release-key-id release-ca568413f0f27130 \
-  --manifest-generation 19 \
-  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.8"
+  --manifest-generation 20 \
+  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.9"
 ```
 
 The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.

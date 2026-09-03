@@ -4914,7 +4914,6 @@ fn interrupted_setup_helper_release(
     if committed.mode != InstallMode::Strong || release_supports_setup_helper(committed) {
         return Ok(None);
     }
-    let active = setup_helper_release_from_shared_active(paths, shared)?;
     if shared.product != "dev-auth"
         || shared.data_root != paths.data_root
         || shared.bin_dir != paths.bin_dir
@@ -4923,6 +4922,15 @@ fn interrupted_setup_helper_release(
     {
         bail!("shared installation receipt cannot prove a setup helper transition");
     }
+    if shared.active_version == committed.version {
+        if shared.active_identity.length == committed.executable_length
+            && shared.active_identity.sha256 == committed.executable_sha256
+        {
+            return Ok(None);
+        }
+        bail!("shared active release disagrees with the committed pre-helper receipt");
+    }
+    let active = setup_helper_release_from_shared_active(paths, shared)?;
     if shared.previous_version.as_deref() != Some(committed.version.as_str())
         || shared.previous_identity.as_ref().is_none_or(|identity| {
             identity.length != committed.executable_length
@@ -6283,6 +6291,64 @@ mod tests {
     #[test]
     fn stale_pre_helper_receipt_recovers_full_pair_for_removal_and_exact_retry() {
         assert_stale_pre_helper_transition_recovery(SetupHelperArtifactState::Pair);
+    }
+
+    #[test]
+    fn aligned_pre_helper_shared_receipt_does_not_enter_upgrade_recovery() {
+        let fixture = SetupHelperTransitionFixture::new();
+        fs::remove_file(&fixture.next.executable).unwrap();
+        fs::remove_dir(Path::new(&fixture.next.executable).parent().unwrap()).unwrap();
+        let previous_executable = fixture.paths.versioned_binary("0.3.6");
+        fs::create_dir_all(previous_executable.parent().unwrap()).unwrap();
+        fs::write(&previous_executable, b"retained pre-helper executable").unwrap();
+        fs::set_permissions(&previous_executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let (previous_length, previous_sha256) = file_identity(&previous_executable).unwrap();
+        let mut shared = fixture.shared.clone();
+        shared.active_version = fixture.committed.version.clone();
+        shared.active_identity = dev_tools_installation::ArtifactIdentity {
+            length: fixture.committed.executable_length,
+            sha256: fixture.committed.executable_sha256.clone(),
+        };
+        shared.previous_version = Some("0.3.6".into());
+        shared.previous_identity = Some(dev_tools_installation::ArtifactIdentity {
+            length: previous_length,
+            sha256: previous_sha256,
+        });
+
+        assert_eq!(fixture.next.version, "0.3.8");
+        assert!(!fixture.helper.exists());
+        assert!(!fixture.sidecar.exists());
+        assert!(
+            interrupted_setup_helper_release(&fixture.paths, &fixture.committed, &shared)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!fixture.helper.exists());
+        assert!(!fixture.sidecar.exists());
+        assert!(!Path::new(&fixture.next.executable).exists());
+    }
+
+    #[test]
+    fn aligned_pre_helper_version_with_mismatched_identity_fails_closed() {
+        let fixture = SetupHelperTransitionFixture::new();
+        fs::remove_file(&fixture.next.executable).unwrap();
+        fs::remove_dir(Path::new(&fixture.next.executable).parent().unwrap()).unwrap();
+        let mut shared = fixture.shared.clone();
+        shared.active_version = fixture.committed.version.clone();
+        shared.active_identity = dev_tools_installation::ArtifactIdentity {
+            length: fixture.committed.executable_length + 1,
+            sha256: fixture.committed.executable_sha256.clone(),
+        };
+
+        let error = interrupted_setup_helper_release(&fixture.paths, &fixture.committed, &shared)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "shared active release disagrees with the committed pre-helper receipt"
+        );
+        assert!(!fixture.helper.exists());
+        assert!(!fixture.sidecar.exists());
+        assert!(!Path::new(&fixture.next.executable).exists());
     }
 
     #[test]
