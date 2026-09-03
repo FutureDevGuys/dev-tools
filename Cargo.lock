@@ -983,6 +983,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-tools-privilege"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "dev-tools-reconcile-protocol"
 version = "0.1.0"
 dependencies = [
