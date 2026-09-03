@@ -40,7 +40,9 @@ def read_private_key(path: Path) -> Ed25519PrivateKey:
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
         raise SystemExit(f"private key file must be owner-only: {path}")
-    return Ed25519PrivateKey.from_private_bytes(_read_hex(path, label="private key file"))
+    return Ed25519PrivateKey.from_private_bytes(
+        _read_hex(path, label="private key file")
+    )
 
 
 def read_public_key(path: Path) -> Ed25519PublicKey:
@@ -115,7 +117,11 @@ def load_root_document(path: Path) -> dict[str, object]:
     if signed["schema"] != "dev-tools-root-v1":
         raise SystemExit("root document schema is unsupported")
     generation = signed["generation"]
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
         raise SystemExit("root document generation must be positive")
     release_keys = signed["release_keys"]
     if not isinstance(release_keys, list) or not release_keys:
@@ -140,7 +146,9 @@ def load_root_document(path: Path) -> dict[str, object]:
         public_key = Ed25519PublicKey.from_public_bytes(public_bytes_value)
         expected_id = key_id("release", public_key)
         if record["key_id"] != expected_id or expected_id in seen:
-            raise SystemExit("root document release key identity is invalid or duplicated")
+            raise SystemExit(
+                "root document release key identity is invalid or duplicated"
+            )
         if not isinstance(record["revoked"], bool):
             raise SystemExit("root document release revocation state is invalid")
         seen.add(expected_id)
@@ -149,7 +157,9 @@ def load_root_document(path: Path) -> dict[str, object]:
     for signature in signatures:
         if not isinstance(signature, dict) or set(signature) != {"key_id", "signature"}:
             raise SystemExit("root document signature has unsupported fields")
-        if not all(isinstance(signature[field], str) for field in ("key_id", "signature")):
+        if not all(
+            isinstance(signature[field], str) for field in ("key_id", "signature")
+        ):
             raise SystemExit("root document signature is invalid")
     return envelope_value
 
@@ -173,7 +183,9 @@ def require_authorized_release_key(
     envelope_value: dict[str, object],
     release_key: Ed25519PrivateKey,
 ) -> str:
-    return require_authorized_release_public_key(envelope_value, release_key.public_key())
+    return require_authorized_release_public_key(
+        envelope_value, release_key.public_key()
+    )
 
 
 def require_authorized_release_public_key(
@@ -203,3 +215,51 @@ def authorized_release_public_key(
             raise SystemExit("release key is revoked by the root document")
         return Ed25519PublicKey.from_public_bytes(bytes.fromhex(record["public_key"]))
     raise SystemExit("release key identifier is not authorized by the root document")
+
+
+def load_signed_product_manifest(path: Path) -> dict[str, object]:
+    try:
+        envelope_value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"product manifest is not valid JSON: {path}") from exc
+    if not isinstance(envelope_value, dict) or set(envelope_value) != {
+        "signed",
+        "signatures",
+    }:
+        raise SystemExit("product manifest envelope has unsupported fields")
+    signed = envelope_value["signed"]
+    signatures = envelope_value["signatures"]
+    if not isinstance(signed, dict):
+        raise SystemExit("product manifest signed payload is invalid")
+    if not isinstance(signatures, list) or not signatures or len(signatures) > 8:
+        raise SystemExit("product manifest signatures are invalid")
+    for signature in signatures:
+        if not isinstance(signature, dict) or set(signature) != {"key_id", "signature"}:
+            raise SystemExit("product manifest signature has unsupported fields")
+        if not all(
+            isinstance(signature[field], str) for field in ("key_id", "signature")
+        ):
+            raise SystemExit("product manifest signature is invalid")
+    return envelope_value
+
+
+def verify_product_manifest(
+    envelope_value: dict[str, object],
+    root_document: dict[str, object],
+) -> dict[str, object]:
+    signed = envelope_value["signed"]
+    if not isinstance(signed, dict):
+        raise SystemExit("product manifest signed payload is invalid")
+    payload = canonical_json(signed)
+    for signature in envelope_value["signatures"]:  # type: ignore[union-attr]
+        try:
+            release_key = authorized_release_public_key(
+                root_document,
+                signature["key_id"],
+            )
+            raw = base64.b64decode(signature["signature"], validate=True)
+            release_key.verify(raw, payload)
+            return signed
+        except (InvalidSignature, ValueError, TypeError, SystemExit):
+            continue
+    raise SystemExit("product manifest signature is invalid or unauthorized")

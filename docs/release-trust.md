@@ -45,6 +45,23 @@ python scripts/build-release-set.py \
 
 The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.
 
+Release publication is a separate operation from construction and signing. Run the checked-in bounded publisher from a clean canonical checkout inside the configured `release-builder` workload so its exact same-name `git` and `gh` children receive the short-lived `source-maintenance` authority. Outside that admitted workload, `git` and `gh` intentionally remain native human passthrough and SHALL NOT be used for unattended publication.
+
+```sh
+/usr/bin/env -u ARGV0 "$HOME/.local/bin/release-builder" \
+  "$PWD/scripts/publish-release-set.py" \
+  --release-root "$HOME/.cache/dev-tools-release/RELEASE-SET/signed/releases" \
+  --source-commit "$(/usr/bin/git rev-parse HEAD)" \
+  --repository FutureDevGuys/dev-tools \
+  --git-command /usr/local/bin/git \
+  --gh-command /usr/local/bin/gh \
+  --format json
+```
+
+The publisher authenticates every signed manifest and artifact before provider mutation, creates and verifies signed source tags, creates only matching non-draft stable GitHub releases, anonymously re-downloads every published asset through the admitted `gh` child, and verifies exact length and SHA-256. Its admitted `git` and `gh` launchers and resolved executables must be root-owned and reachable only through root-owned non-writable path components; execution pins the validated executable while preserving the same-name launcher as `argv[0]`. A second invocation is an idempotent verification pass. It refuses dirty source, conflicting tags or releases, unexpected files, ambiguous provider responses, and artifacts that change before upload.
+
+Only `dev-auth-product-v2` currently cryptographically binds the artifact manifest to `source_commit`. A `dev-tools-product-v1` release still receives a signed source tag and an independently authenticated artifact manifest, but the publisher explicitly reports `source_bound=false` and does not claim that the v1 signature proves artifact-to-source provenance. A future shared manifest revision must add that binding before these older products may report `source_bound=true`.
+
 The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before producing deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
 
 Repeat `--product` to construct more than one product from the same exact source
