@@ -26,6 +26,9 @@ pub fn setup_template(name: &str) -> Result<&'static str> {
 const RECEIPT_LIMIT: u64 = 64 * 1024;
 const POLICY_LIMIT: u64 = 1024 * 1024;
 const BINARY_LIMIT: u64 = 256 * 1024 * 1024;
+const SYSTEM_ASSET_LIMIT: u64 = 64 * 1024;
+const BROKER_READY_ATTEMPTS: usize = 10;
+const BROKER_READY_DELAY: Duration = Duration::from_millis(250);
 const WORKLOAD_ALIAS_RECEIPT_SCHEMA: &str = "dev-auth-workload-aliases-v1";
 const DESKTOP_ENTRY_RECEIPT_SCHEMA: &str = "dev-auth-desktop-entries-v1";
 const PRODUCT_ALIASES: [&str; 5] = [
@@ -1972,11 +1975,8 @@ fn verify_receipted_installation_at(
     validate_native_program(Path::new(&receipt.native_git), "native Git")?;
     validate_native_program(Path::new(&receipt.native_gh), "native GitHub CLI")?;
     if receipt.mode == InstallMode::Strong {
-        if receipt.system_assets != system_asset_digests() {
-            bail!("dev-auth system asset receipt does not match this product version");
-        }
+        verify_linux_system_assets_against(&receipt.system_assets)?;
         verify_privileged_launcher(&executable, receipt)?;
-        verify_linux_system_assets()?;
     }
 
     Ok(SetupReport {
@@ -2570,16 +2570,56 @@ pub fn start_system_broker_at(paths: &SetupPaths) -> Result<SetupReport> {
         ],
         "activate broker sockets",
     )?;
-    match crate::broker_client::probe_system_broker() {
-        crate::broker_protocol::BrokerSessionProbe::NoSession => verify_at(paths),
-        crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {
-            bail!("system broker activation ran inside an admitted workload")
+    let readiness = wait_for_system_broker_with(crate::broker_client::probe_system_broker, || {
+        std::thread::sleep(BROKER_READY_DELAY)
+    });
+    if let Err(error) = readiness {
+        let cleanup = run_system_command(
+            Path::new("/usr/bin/systemctl"),
+            &[
+                OsStr::new("disable"),
+                OsStr::new("--now"),
+                OsStr::new("dev-auth-broker.socket"),
+                OsStr::new("dev-auth-broker-control.socket"),
+                OsStr::new("dev-auth-broker.service"),
+            ],
+            "contain broker after failed startup",
+        );
+        if let Err(cleanup_error) = cleanup {
+            bail!("{error:#}; broker containment also failed: {cleanup_error:#}");
         }
-        crate::broker_protocol::BrokerSessionProbe::Invalid { reason }
-        | crate::broker_protocol::BrokerSessionProbe::Unavailable { reason } => {
-            bail!("system broker did not become ready: {reason}")
+        return Err(error);
+    }
+    verify_at(paths)
+}
+
+fn wait_for_system_broker_with<Probe, Pause>(mut probe: Probe, mut pause: Pause) -> Result<()>
+where
+    Probe: FnMut() -> crate::broker_protocol::BrokerSessionProbe,
+    Pause: FnMut(),
+{
+    let mut last_unavailable = None;
+    for attempt in 0..BROKER_READY_ATTEMPTS {
+        match probe() {
+            crate::broker_protocol::BrokerSessionProbe::NoSession => return Ok(()),
+            crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {
+                bail!("system broker activation ran inside an admitted workload")
+            }
+            crate::broker_protocol::BrokerSessionProbe::Invalid { reason } => {
+                bail!("system broker did not become ready: {reason}")
+            }
+            crate::broker_protocol::BrokerSessionProbe::Unavailable { reason } => {
+                last_unavailable = Some(reason);
+                if attempt + 1 < BROKER_READY_ATTEMPTS {
+                    pause();
+                }
+            }
         }
     }
+    bail!(
+        "system broker did not become ready: {}",
+        last_unavailable.context("broker readiness retry ended without an observation")?
+    )
 }
 
 pub fn stop_system_broker() -> Result<SetupReport> {
@@ -3127,6 +3167,9 @@ fn reconcile_user_config_for_account_with_integrations_at(
         preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
     }
     let destination = crate::policy_store::user_config_path(&user);
+    if installation.mode == InstallMode::Strong {
+        repair_exact_root_owned_user_document(&destination, &bytes, &user)?;
+    }
     let old_workloads = preflight_user_config_destination(
         &destination,
         &bytes,
@@ -3933,6 +3976,80 @@ fn preflight_user_config_destination(
     }
 }
 
+fn repair_exact_root_owned_user_document(
+    destination: &Path,
+    expected: &[u8],
+    user: &nix::unistd::User,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.uid() == user.uid.as_raw() => return Ok(()),
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect interrupted user configuration"),
+    };
+    if !nix::unistd::Uid::effective().is_root()
+        || metadata.uid() != 0
+        || !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() > POLICY_LIMIT
+    {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(destination)
+        .context("open interrupted user configuration")?;
+    let before = file
+        .metadata()
+        .context("inspect held interrupted user configuration")?;
+    if !before.file_type().is_file()
+        || before.uid() != 0
+        || before.nlink() != 1
+        || before.mode() & 0o777 != 0o600
+        || before.len() > POLICY_LIMIT
+        || metadata.dev() != before.dev()
+        || metadata.ino() != before.ino()
+    {
+        bail!("root-owned user configuration changed before ownership repair");
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    Read::by_ref(&mut file)
+        .take(POLICY_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .context("read interrupted user configuration")?;
+    let after = file
+        .metadata()
+        .context("reinspect held interrupted user configuration")?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || bytes != expected
+    {
+        bail!("root-owned user configuration is not an exact interrupted setup artifact");
+    }
+    nix::unistd::fchown(&file, Some(user.uid), Some(user.gid))
+        .context("restore interrupted user configuration ownership")?;
+    let repaired = file
+        .metadata()
+        .context("verify repaired user configuration ownership")?;
+    let published =
+        fs::symlink_metadata(destination).context("reinspect published user configuration")?;
+    if repaired.uid() != user.uid.as_raw()
+        || repaired.gid() != user.gid.as_raw()
+        || published.dev() != repaired.dev()
+        || published.ino() != repaired.ino()
+        || published.uid() != user.uid.as_raw()
+    {
+        bail!("interrupted user configuration ownership repair did not persist");
+    }
+    Ok(())
+}
+
 fn validate_current_digest(bytes: &[u8], expected: &str) -> Result<()> {
     if expected.len() != 64
         || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -3975,12 +4092,14 @@ fn replace_policy_document(
         .mode(0o600)
         .open(&temporary)
         .context("create replacement configuration document")?;
-    if let Err(error) = (|| {
+    if let Err(error) = (|| -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        set_owner_if_root(&temporary, owner_uid)?;
         fs::rename(&temporary, destination)?;
-        File::open(parent)?.sync_all()
+        File::open(parent)?.sync_all()?;
+        Ok(())
     })() {
         let _ = fs::remove_file(&temporary);
         return Err(error).context("publish replacement configuration document");
@@ -4183,7 +4302,9 @@ fn set_owner_if_root(path: &Path, owner_uid: u32) -> Result<()> {
     if !nix::unistd::Uid::effective().is_root() {
         bail!("created path does not belong to the native user");
     }
-    nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(owner_uid)), None)
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
+        .context("created path owner is not a native account")?;
+    nix::unistd::chown(path, Some(user.uid), Some(user.gid))
         .with_context(|| format!("assign native ownership to {}", path.display()))
 }
 
@@ -4197,6 +4318,24 @@ fn system_asset_digests() -> BTreeMap<String, String> {
             )
         })
         .collect()
+}
+
+fn validate_system_asset_receipt_shape(receipt: &BTreeMap<String, String>) -> Result<()> {
+    let expected_paths = linux_system_assets()
+        .into_iter()
+        .map(|(path, _, _)| path.display().to_string())
+        .collect::<BTreeSet<_>>();
+    if receipt.keys().cloned().collect::<BTreeSet<_>>() != expected_paths
+        || receipt.values().any(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+    {
+        bail!("dev-auth system asset receipt has an unsupported ownership shape");
+    }
+    Ok(())
 }
 
 fn install_linux_system_assets(prior_receipt: Option<&InstallReceipt>) -> Result<()> {
@@ -4251,16 +4390,50 @@ fn install_linux_system_assets(prior_receipt: Option<&InstallReceipt>) -> Result
 }
 
 fn verify_linux_system_assets() -> Result<()> {
-    for (path, content, mode) in linux_system_assets() {
-        let metadata = fs::symlink_metadata(path)
+    verify_linux_system_assets_against(&system_asset_digests())
+}
+
+fn verify_linux_system_assets_against(receipt: &BTreeMap<String, String>) -> Result<()> {
+    validate_system_asset_receipt_shape(receipt)?;
+    for (path, _content, mode) in linux_system_assets() {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("open dev-auth system asset {}", path.display()))?;
+        let metadata = file
+            .metadata()
             .with_context(|| format!("inspect dev-auth system asset {}", path.display()))?;
         if !metadata.file_type().is_file()
-            || metadata.file_type().is_symlink()
             || metadata.uid() != 0
             || metadata.mode() & 0o777 != mode
-            || fs::read(path)? != content.as_bytes()
+            || metadata.len() > SYSTEM_ASSET_LIMIT
         {
             bail!("dev-auth system asset does not match product policy");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(SYSTEM_ASSET_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        let after = file
+            .metadata()
+            .with_context(|| format!("reinspect dev-auth system asset {}", path.display()))?;
+        let published = fs::symlink_metadata(path)
+            .with_context(|| format!("reinspect published system asset {}", path.display()))?;
+        if bytes.len() as u64 > SYSTEM_ASSET_LIMIT
+            || metadata.dev() != after.dev()
+            || metadata.ino() != after.ino()
+            || metadata.len() != after.len()
+            || metadata.mtime() != after.mtime()
+            || metadata.mtime_nsec() != after.mtime_nsec()
+            || !published.file_type().is_file()
+            || published.file_type().is_symlink()
+            || published.dev() != after.dev()
+            || published.ino() != after.ino()
+            || receipt.get(&path.display().to_string())
+                != Some(&format!("{:x}", Sha256::digest(&bytes)))
+        {
+            bail!("dev-auth system asset does not match its receipt");
         }
     }
     Ok(())
@@ -5106,6 +5279,44 @@ adapters = []
         assert!(
             validate_release_transition(&prior, &request, &prior.executable_sha256, None,).is_ok()
         );
+    }
+
+    #[test]
+    fn system_asset_receipt_accepts_prior_content_only_for_the_exact_owned_path_set() {
+        let mut prior = system_asset_digests();
+        let first = prior.values_mut().next().unwrap();
+        *first = "0".repeat(64);
+        validate_system_asset_receipt_shape(&prior).unwrap();
+
+        let mut missing = prior.clone();
+        missing.pop_first();
+        assert!(validate_system_asset_receipt_shape(&missing).is_err());
+
+        *prior.values_mut().next().unwrap() = "A".repeat(64);
+        assert!(validate_system_asset_receipt_shape(&prior).is_err());
+    }
+
+    #[test]
+    fn broker_startup_retries_transient_unavailability_before_activation() {
+        let probes = std::cell::RefCell::new(std::collections::VecDeque::from([
+            crate::broker_protocol::BrokerSessionProbe::Unavailable {
+                reason: "broker is loading its protected credential".into(),
+            },
+            crate::broker_protocol::BrokerSessionProbe::Unavailable {
+                reason: "broker is loading policy".into(),
+            },
+            crate::broker_protocol::BrokerSessionProbe::NoSession,
+        ]));
+        let pauses = std::cell::Cell::new(0);
+
+        wait_for_system_broker_with(
+            || probes.borrow_mut().pop_front().unwrap(),
+            || pauses.set(pauses.get() + 1),
+        )
+        .unwrap();
+
+        assert_eq!(pauses.get(), 2);
+        assert!(probes.borrow().is_empty());
     }
 
     #[test]
