@@ -40,7 +40,10 @@ use crate::privileged_target::{
     apply_privileged_plans, plan_selected_privileged_entries, PrivilegedCommands,
     PrivilegedCopyPlan, PrivilegedTargetError, PrivilegedTargetOutcome, SystemIdentityResolver,
 };
-use crate::reconciler::{ReconcilerError, ReconcilerPrivilege, ReconcilerRunner, ReconcilerSpec};
+use crate::reconciler::{
+    resolve_executable as resolve_reconciler_executable, ReconcilerError, ReconcilerPrivilege,
+    ReconcilerRunner, ReconcilerSpec,
+};
 use crate::report::{ReconcilerSummary, Record, Report, Status};
 use crate::scaffold::{initialize, render_examples, ScaffoldError, ScaffoldPaths};
 
@@ -241,7 +244,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         .map(|manifest| {
             let spec = ReconcilerSpec {
                 name: manifest.name.clone(),
-                executable: manifest.executable.clone(),
+                executable: resolve_reconciler_executable(&manifest.executable)?,
                 source: manifest.source.clone(),
                 privilege: match manifest.privilege {
                     Privilege::User => ReconcilerPrivilege::User,
@@ -354,15 +357,15 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         }
     }
 
-    let origin_by_target = expanded_with_origin
-        .iter()
-        .map(|(entry, origin)| {
-            (
-                canonical_target_key(&entry.target, &loaded.path_context),
-                *origin,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut origin_by_target: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (entry, origin) in &expanded_with_origin {
+        let origins = origin_by_target
+            .entry(canonical_target_key(&entry.target, &loaded.path_context))
+            .or_default();
+        if !origins.contains(origin) {
+            origins.push(*origin);
+        }
+    }
     let expanded = deduplicate_and_validate_targets(
         expanded_with_origin
             .into_iter()
@@ -416,15 +419,20 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
     let backup_root = backup_root(&loaded.path_context)?;
     for entry in &expanded {
         let key = canonical_target_key(&entry.target, &loaded.path_context);
-        let origin = origin_by_target.get(&key).copied();
+        let origins = origin_by_target.get(&key);
         let outcome = if let Some(plan) = privileged_by_target.get(&key) {
             let Some(identities) = identities.as_ref() else {
                 report.records.push(error_record(
                     entry,
                     &"privileged target identity resolver is unavailable",
                 ));
-                if let Some(origin) = origin {
-                    merge_convergence(&mut origin_convergence[origin], EntryConvergence::Failed);
+                if let Some(origins) = origins {
+                    for origin in origins {
+                        merge_convergence(
+                            &mut origin_convergence[*origin],
+                            EntryConvergence::Failed,
+                        );
+                    }
                 }
                 continue;
             };
@@ -451,8 +459,10 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         } else {
             converge_unprivileged(cli, entry, &backup_root, &loaded.path_context, &mut report)
         };
-        if let Some(origin) = origin {
-            merge_convergence(&mut origin_convergence[origin], outcome);
+        if let Some(origins) = origins {
+            for origin in origins {
+                merge_convergence(&mut origin_convergence[*origin], outcome);
+            }
         }
     }
 

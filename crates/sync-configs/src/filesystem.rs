@@ -862,6 +862,23 @@ fn validate_existing_target_ancestors(target: &Path) -> Result<(), FilesystemErr
     Ok(())
 }
 
+fn target_resolves_exactly_to_source(
+    source: &Path,
+    target: &Path,
+) -> Result<bool, FilesystemError> {
+    let Some(_) = symlink_metadata(target, "inspect resolved target alias")? else {
+        return Ok(false);
+    };
+    let canonical_source = fs::canonicalize(source)
+        .map_err(|error| io_error("resolve source identity", source, error))?;
+    let canonical_target = match fs::canonicalize(target) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("resolve target identity", target, error)),
+    };
+    Ok(canonical_target == canonical_source)
+}
+
 fn create_parent_directories(target: &Path) -> Result<(), FilesystemError> {
     validate_existing_target_ancestors(target)?;
     let absolute = absolute_lexical(target)?;
@@ -1578,8 +1595,8 @@ pub fn converge_entry(
             mode: entry.mode,
         });
     }
-    validate_existing_target_ancestors(&entry.target)?;
     let Some(source_metadata) = symlink_metadata(&entry.source, "inspect source")? else {
+        validate_existing_target_ancestors(&entry.target)?;
         return Ok(EntryOutcome {
             name: entry.name.clone(),
             source: entry.source.clone(),
@@ -1597,6 +1614,50 @@ pub fn converge_entry(
         return Err(FilesystemError::UnsupportedSource(entry.source.clone()));
     }
     validate_source_tree(&entry.source)?;
+    if entry.mode == Mode::Symlink
+        && target_resolves_exactly_to_source(&entry.source, &entry.target)?
+    {
+        let source_permissions_match =
+            permissions_match(&entry.source, entry.source_permissions.as_ref())?;
+        if source_permissions_match {
+            return Ok(EntryOutcome {
+                name: entry.name.clone(),
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+                status: EntryStatus::UpToDate,
+                action: EntryAction::None,
+                existing_state: ExistingState::ManagedLink,
+                backup: None,
+            });
+        }
+        if options.dry_run {
+            return Ok(EntryOutcome {
+                name: entry.name.clone(),
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+                status: EntryStatus::WouldChange,
+                action: EntryAction::UpdatePermissions,
+                existing_state: ExistingState::ManagedLink,
+                backup: None,
+            });
+        }
+        apply_permissions(&entry.source, entry.source_permissions.as_ref())?;
+        if !permissions_match(&entry.source, entry.source_permissions.as_ref())?
+            || !target_resolves_exactly_to_source(&entry.source, &entry.target)?
+        {
+            return Err(FilesystemError::Postcondition(entry.target.clone()));
+        }
+        return Ok(EntryOutcome {
+            name: entry.name.clone(),
+            source: entry.source.clone(),
+            target: entry.target.clone(),
+            status: EntryStatus::Changed,
+            action: EntryAction::UpdatePermissions,
+            existing_state: ExistingState::ManagedLink,
+            backup: None,
+        });
+    }
+    validate_existing_target_ancestors(&entry.target)?;
     let target_metadata = symlink_metadata(&entry.target, "inspect target")?;
     let state = match entry.mode {
         Mode::Symlink => classify_symlink_target(entry, options, target_metadata.as_ref())?,

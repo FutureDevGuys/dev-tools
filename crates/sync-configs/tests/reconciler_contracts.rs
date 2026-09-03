@@ -6,7 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
-use sync_configs::reconciler::{ReconcilerPrivilege, ReconcilerRunner, ReconcilerSpec};
+use sync_configs::reconciler::{
+    resolve_executable, ReconcilerPrivilege, ReconcilerRunner, ReconcilerSpec,
+};
 use tempfile::TempDir;
 
 fn fake_reconciler(root: &Path, unsafe_plan: bool) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -69,6 +71,23 @@ fn runner() -> ReconcilerRunner {
         timeout: Duration::from_secs(5),
         output_limit: 1 << 20,
     }
+}
+
+#[test]
+fn stable_alias_is_resolved_before_protocol_execution() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().expect("temp root");
+    let (executable, _) = fake_reconciler(root.path(), false);
+    let alias = root.path().join("owner-tool");
+    symlink(&executable, &alias).expect("stable alias");
+
+    let resolved = resolve_executable(&alias).expect("resolve alias");
+    assert_eq!(
+        resolved,
+        executable.canonicalize().expect("canonical executable")
+    );
+    assert!(!resolved.is_symlink());
 }
 
 #[test]

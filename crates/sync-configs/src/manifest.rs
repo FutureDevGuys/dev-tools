@@ -1274,21 +1274,8 @@ fn entries_equivalent(left: &Entry, right: &Entry) -> bool {
     left.source == right.source
         && left.target == right.target
         && left.mode == right.mode
-        && left.directory_strategy == right.directory_strategy
-        && left.profiles == right.profiles
-        && left.include == right.include
-        && left.exclude == right.exclude
-        && left.ignore_files == right.ignore_files
-        && left.discover_ignore_files == right.discover_ignore_files
-        && left.use_default_filters == right.use_default_filters
         && left.permissions == right.permissions
         && left.source_permissions == right.source_permissions
-        && left.pre_script == right.pre_script
-        && left.pre_script_on_fail == right.pre_script_on_fail
-        && left.pre_script_privilege == right.pre_script_privilege
-        && left.post_script == right.post_script
-        && left.post_script_on_fail == right.post_script_on_fail
-        && left.post_script_privilege == right.post_script_privilege
         && left.target_privilege == right.target_privilege
         && left.target_owner == right.target_owner
         && left.target_group == right.target_group

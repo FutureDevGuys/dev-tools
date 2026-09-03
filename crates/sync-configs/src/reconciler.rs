@@ -58,6 +58,23 @@ pub enum ReconcilerError {
     UnsupportedProtocol,
 }
 
+/// Resolve a declarative executable alias exactly once, then validate and
+/// return the immutable command entry point used for every protocol phase.
+/// This permits system-owned stable aliases without invoking through a
+/// replaceable symlink spelling.
+pub fn resolve_executable(path: &Path) -> Result<PathBuf, ReconcilerError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(ReconcilerError::UnsafeExecutable);
+    }
+    let resolved = fs::canonicalize(path).map_err(|_| ReconcilerError::UnsafeExecutable)?;
+    validate_executable(&resolved)?;
+    Ok(resolved)
+}
+
 impl ReconcilerRunner {
     /// Validate every static authority and resource bound without invoking the
     /// provider. Callers use this during the global preflight before any sudo

@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use sync_configs::filesystem::apply_source_permissions;
 use sync_configs::filesystem::{
-    apply_source_permissions, converge_entry, expand_entries, ConvergeOptions, EntryAction,
-    EntryStatus, ExpansionOptions, ManagedPathPolicy,
+    converge_entry, expand_entries, ConvergeOptions, EntryAction, EntryStatus, ExpansionOptions,
+    ManagedPathPolicy,
 };
 use sync_configs::manifest::{
     CommentedTargetPolicy, DirectoryStrategy, Entry, FileMode, Mode, PermissionPolicy, Privilege,
@@ -473,6 +475,60 @@ fn target_parent_symlinks_are_rejected_instead_of_written_through() {
 
     assert!(error.to_string().contains("target ancestor"));
     assert!(!outside.join("target").exists());
+}
+
+#[test]
+fn an_exact_managed_directory_alias_makes_its_symlink_children_current() {
+    let temp = TempDir::new().expect("temporary directory");
+    let source_root = temp.path().join("source");
+    let target_root = temp.path().join("target-root");
+    let source = source_root.join("nested.conf");
+    let target = target_root.join("nested.conf");
+    fs::create_dir(&source_root).expect("create source directory");
+    fs::write(&source, b"managed\n").expect("write managed source");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source_root, &target_root).expect("link managed directory");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&source_root, &target_root)
+        .expect("link managed directory");
+    let fixture = entry(source.clone(), target, Mode::Symlink);
+
+    let outcome = converge_entry(&fixture, &options(&temp.path().join("backups")))
+        .expect("accept exact managed directory alias");
+
+    assert_eq!(outcome.status, EntryStatus::UpToDate);
+    assert_eq!(outcome.action, EntryAction::None);
+    assert!(fs::symlink_metadata(&target_root)
+        .expect("target root metadata")
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(source).expect("source remains present"), b"managed\n");
+}
+
+#[test]
+fn a_mismatched_directory_alias_remains_blocked_for_symlink_entries() {
+    let temp = TempDir::new().expect("temporary directory");
+    let source = temp.path().join("source.conf");
+    let outside = temp.path().join("outside");
+    let target_root = temp.path().join("target-root");
+    fs::write(&source, b"managed\n").expect("write managed source");
+    fs::create_dir(&outside).expect("create outside directory");
+    fs::write(outside.join("nested.conf"), b"managed\n").expect("write unrelated target");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &target_root).expect("link unrelated directory");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&outside, &target_root)
+        .expect("link unrelated directory");
+    let fixture = entry(source, target_root.join("nested.conf"), Mode::Symlink);
+
+    let error = converge_entry(&fixture, &options(&temp.path().join("backups")))
+        .expect_err("reject mismatched directory alias");
+
+    assert!(error.to_string().contains("target ancestor"));
+    assert_eq!(
+        fs::read(outside.join("nested.conf")).expect("unrelated target remains present"),
+        b"managed\n"
+    );
 }
 
 #[cfg(unix)]

@@ -277,9 +277,13 @@ entries:
   - name: first
     source: ./source
     target: ./target
+    profiles: [one]
+    post_script: 'printf first'
   - name: second
     source: ./source
     target: ./target
+    profiles: [two]
+    post_script: 'printf second'
 "#,
     )
     .expect("equivalent manifest");
