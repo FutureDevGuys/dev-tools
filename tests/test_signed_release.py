@@ -47,18 +47,37 @@ def test_release_builder_remaps_checkout_output_and_home_paths(tmp_path: Path) -
     assert environment["DEV_AUTH_SOURCE_COMMIT"] == "a" * 40
 
 
-def test_release_builder_captures_zipapp_stdout(monkeypatch) -> None:
+def test_release_builder_routes_sync_configs_to_the_native_cargo_artifact(
+    tmp_path: Path,
+) -> None:
     module = load_release_set_module()
-    observed = {}
+    artifacts = module.release_artifacts(tmp_path, "linux-x86_64")
 
-    def fake_run(*args, **kwargs):
-        observed.update(kwargs)
+    assert artifacts["sync-configs"] == tmp_path / "release" / "sync-configs"
+    assert set(artifacts) == set(module.PRODUCTS)
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
-    module.build_sync_configs({"TEST": "1"})
-    assert observed["stdout"] is subprocess.PIPE
-    assert observed["text"] is True
-    assert observed["check"] is True
+
+def test_release_builder_builds_sync_configs_as_a_selected_cargo_binary() -> None:
+    module = load_release_set_module()
+
+    assert module.cargo_build_command(("sync-configs",)) == [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--bin",
+        "sync-configs",
+    ]
+
+
+def test_release_builder_uses_exe_names_for_every_windows_product(
+    tmp_path: Path,
+) -> None:
+    module = load_release_set_module()
+    artifacts = module.release_artifacts(tmp_path, "windows-x86_64")
+
+    assert all(path.suffix == ".exe" for path in artifacts.values())
+    assert artifacts["sync-configs"].name == "sync-configs.exe"
 
 
 def test_release_builder_source_identity_uses_the_declared_public_git(
@@ -109,21 +128,41 @@ def test_release_builder_keeps_independent_product_versions() -> None:
         product: tomllib.loads(
             (ROOT / "crates" / product / "Cargo.toml").read_text(encoding="utf-8")
         )["package"]["version"]
-        for product in ("update-all", "dev-auth", "dev-cache", "skills-sync")
+        for product in (
+            "update-all",
+            "dev-auth",
+            "dev-cache",
+            "sync-configs",
+            "skills-sync",
+        )
     }
-    expected["sync-configs"] = tomllib.loads(
-        (ROOT / "sync-configs" / "pyproject.toml").read_text(encoding="utf-8")
-    )["project"]["version"]
 
     assert versions == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("linux-x86_64", "sync-configs-1.2.3-linux-x86_64"),
+        ("windows-x86_64", "sync-configs-1.2.3-windows-x86_64.exe"),
+    ],
+)
+def test_signed_release_names_native_sync_configs_for_target(
+    target: str, expected: str
+) -> None:
+    module_path = ROOT / "scripts" / "build-signed-release.py"
+    spec = importlib.util.spec_from_file_location("build_signed_release", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.artifact_name("sync-configs", "1.2.3", target) == expected
 
 
 def test_release_builder_maps_independent_manifest_generations() -> None:
     module = load_release_set_module()
 
-    assert module.manifest_generations(["6"], ("update-all",)) == {
-        "update-all": 6
-    }
+    assert module.manifest_generations(["6"], ("update-all",)) == {"update-all": 6}
     assert module.manifest_generations(
         ["update-all=6", "dev-cache=9"],
         ("update-all", "dev-cache"),
@@ -177,9 +216,7 @@ def write_public_key(path: Path, key: Ed25519PrivateKey) -> None:
 
 def test_tracked_root_document_matches_compiled_trust_root() -> None:
     root_document = load_root_document(ROOT / "release-trust/dev-tools-root.json")
-    trusted_root = read_public_key(
-        ROOT / "crates/update-all/trust/root-public-key.txt"
-    )
+    trusted_root = read_public_key(ROOT / "crates/update-all/trust/root-public-key.txt")
     verify_root_document(root_document, trusted_root)
     active = [
         record
@@ -215,7 +252,9 @@ def build_root_document(
     ]
     for root_file in root_files:
         command.extend(["--root-private-key", str(root_file)])
-    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        command, cwd=ROOT, text=True, capture_output=True, check=False
+    )
     assert result.returncode == 0, result.stderr
     return document, trust
 
@@ -272,7 +311,9 @@ def test_release_recipe_is_deterministic_and_binds_artifact(tmp_path: Path) -> N
         assert result.returncode == 0, result.stderr
         outputs.append(output)
     for filename in ("dev-tools-root.json", "dev-auth-stable.json"):
-        assert (outputs[0] / filename).read_bytes() == (outputs[1] / filename).read_bytes()
+        assert (outputs[0] / filename).read_bytes() == (
+            outputs[1] / filename
+        ).read_bytes()
     manifest = json.loads((outputs[0] / "dev-auth-stable.json").read_text())
     signed = manifest["signed"]
     assert signed["product"] == "dev-auth"
@@ -292,7 +333,9 @@ def test_release_recipe_emits_dual_root_signatures_for_rotation(tmp_path: Path) 
     trust = tmp_path / "root.pub"
     write_key(current_file, current)
     write_key(next_file, next_key)
-    trust.write_text(current.public_key().public_bytes_raw().hex() + "\n", encoding="ascii")
+    trust.write_text(
+        current.public_key().public_bytes_raw().hex() + "\n", encoding="ascii"
+    )
     release_public = tmp_path / "release.pub"
     write_public_key(release_public, release)
     output = tmp_path / "dev-tools-root.json"
@@ -325,7 +368,9 @@ def test_release_recipe_emits_dual_root_signatures_for_rotation(tmp_path: Path) 
     assert all(row["key_id"].startswith("root-") for row in envelope["signatures"])
 
 
-def test_product_release_rejects_a_key_not_authorized_by_root_document(tmp_path: Path) -> None:
+def test_product_release_rejects_a_key_not_authorized_by_root_document(
+    tmp_path: Path,
+) -> None:
     root = Ed25519PrivateKey.from_private_bytes(bytes([3]) * 32)
     authorized = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
     unauthorized = Ed25519PrivateKey.from_private_bytes(bytes([19]) * 32)

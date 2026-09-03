@@ -29,7 +29,7 @@ On Linux x86-64, download `update-all-0.1.6-linux-x86_64` from the [`update-all/
 
 The current stable `dev-auth` is distributed through the same signed release format but remains provisioned by the workstation configuration authority during the reversible v0.3 transition. The v0.3 successor owns its installer, broker services, same-name launchers, migration, diagnostics, and credential lifecycle; Syscfg becomes only an optional policy and deployment client after standalone clean-device acceptance. `dev-auth` remains deliberately outside unattended `update-all` product installation because setup includes administrator policy and explicit credential enrollment.
 
-After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer.
+After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. `sync-configs` is distributed as a target-specific native executable, so target hosts do not need Python to install or run it.
 
 | Platform | Status | Notes |
 |---|---|---|
@@ -45,8 +45,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny check
-python -m pytest tests sync-configs/tests
-python sync-configs/scripts/build_zipapp.py
+python -m pytest tests/test_signed_release.py
 ```
 
 See the [documentation index](docs/README.md), [security policy](SECURITY.md), [contribution guide](CONTRIBUTING.md), and [license terms](LICENSE-MIT) ([Apache-2.0](LICENSE-APACHE)).

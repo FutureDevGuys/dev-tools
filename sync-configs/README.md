@@ -23,3 +23,5 @@ Grouped results remain buffered so summaries are deterministic. Informational re
 TOML overlays preserve intentional commented target keys by default, report their dotted paths without values, and support explicit `activate` or `error` policies. Generic mutually exclusive sibling groups prevent stale alternatives from surviving beside the selected source key. Root manifests may declare read-only JSON state preconditions so an owning configuration system can require its current layout generation before local overlays run.
 
 See the workspace [sync-configs documentation](../docs/sync-configs.md) for the supported interface and trust boundary.
+
+The maintained executable is the Rust workspace crate at `crates/sync-configs`. Authenticated releases contain its target-specific native Cargo binary rather than a Python zip application; see the workspace documentation for the exact release contract.

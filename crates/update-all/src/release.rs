@@ -65,7 +65,11 @@ impl Product {
     }
 
     fn executable_name(self) -> String {
-        if cfg!(windows) && self != Self::SyncConfigs {
+        self.executable_name_for(cfg!(windows))
+    }
+
+    fn executable_name_for(self, windows: bool) -> String {
+        if windows {
             format!("{}.exe", self.id())
         } else {
             self.id().to_string()
@@ -1293,6 +1297,17 @@ impl Paths {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn every_windows_product_uses_a_native_executable_name() {
+        for product in Product::ALL {
+            assert_eq!(
+                product.executable_name_for(true),
+                format!("{}.exe", product.id())
+            );
+            assert_eq!(product.executable_name_for(false), product.id());
+        }
+    }
 
     fn envelope<T: Clone + Serialize>(
         signed: T,

@@ -36,7 +36,7 @@ For each selected entry, `sync-configs` runs only `reconcile plan --source PATH 
 
 The owner tool remains solely responsible for domain validation, action planning, mutation, receipts, and verification. In particular, the dev-auth reconciler manages only the current user configuration; it cannot install dev-auth, alter administrator policy, manage services, activate same-name launchers, or enroll credentials.
 
-The release artifact is a platform-neutral Python zip application containing its hash-locked Python dependency and third-party license. It requires Python 3.11 or newer, but does not resolve or install packages on the target host. Release builds normalize archive metadata and validate the artifact under `python -S` so globally installed packages cannot satisfy its imports.
+The release artifact is the native `sync-configs` executable built from the workspace crate with `cargo build --release --locked --bin sync-configs`; target hosts do not need Python or a package resolver. Release-set construction reads the product version from Cargo metadata and signs one exact target-specific artifact under the independent `sync-configs/vX.Y.Z` tag. Windows artifacts use the `sync-configs.exe` executable name. The current release manifest intentionally contains one target, with Linux x86-64 as the first accepted production target; additional native targets require their own build and acceptance evidence before publication.
 
 ## Comment-aware TOML overlays
 
