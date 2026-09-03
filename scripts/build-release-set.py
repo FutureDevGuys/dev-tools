@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from release_targets import require_accepted_release_target
+
 ROOT = Path(__file__).resolve().parents[1]
 SIGNER = ROOT / "scripts" / "build-signed-release.py"
 PRODUCTS = ("update-all", "dev-auth", "dev-cache", "sync-configs", "skills-sync")
@@ -248,12 +250,14 @@ def release_signer_arguments(args: argparse.Namespace) -> list[str]:
 
 def main() -> int:
     args = parse_args()
+    products = tuple(dict.fromkeys(args.products or PRODUCTS))
+    target = target_id()
+    for product in products:
+        require_accepted_release_target(product, target)
     signer_arguments = release_signer_arguments(args)
     commit, timestamp = exact_source(resolve_public_git(args.public_git_command))
     versions = product_versions()
-    products = tuple(dict.fromkeys(args.products or PRODUCTS))
     generations = manifest_generations(args.manifest_generation, products)
-    target = target_id()
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         raise SystemExit(f"release output directory is not empty: {output}")

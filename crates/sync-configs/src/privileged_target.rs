@@ -4,7 +4,9 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
@@ -14,7 +16,7 @@ use uuid::Uuid;
 #[cfg(unix)]
 use crate::manifest::{DirectoryStrategy, Mode};
 use crate::manifest::{Entry, Privilege};
-use crate::privilege::{PrivilegeError, PrivilegeSession};
+use crate::privilege::{validate_trusted_executable, PrivilegeError, PrivilegeSession};
 
 #[derive(Debug, Error)]
 pub enum PrivilegedTargetError {
@@ -167,10 +169,10 @@ impl PrivilegedCommands {
         move_file: PathBuf,
         remove: PathBuf,
     ) -> Result<Self, PrivilegedTargetError> {
-        validate_command("chmod", &chmod)?;
-        validate_command("install", &install)?;
-        validate_command("mv", &move_file)?;
-        validate_command("rm", &remove)?;
+        let chmod = validate_command("chmod", &chmod)?;
+        let install = validate_command("install", &install)?;
+        let move_file = validate_command("mv", &move_file)?;
+        let remove = validate_command("rm", &remove)?;
         Ok(Self {
             chmod,
             install,
@@ -188,36 +190,13 @@ fn resolve_system_command(name: &str) -> Option<PathBuf> {
     ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
         .into_iter()
         .map(|directory| Path::new(directory).join(name))
-        .find(|candidate| validate_command_path(candidate))
+        .find(|candidate| validate_trusted_executable(candidate).is_ok())
 }
 
-fn validate_command(name: &'static str, path: &Path) -> Result<(), PrivilegedTargetError> {
-    if validate_command_path(path) {
-        Ok(())
-    } else {
-        Err(PrivilegedTargetError::UnsafeCommand { name })
-    }
-}
-
-fn validate_command_path(path: &Path) -> bool {
-    if !path.is_absolute() || contains_parent(path) {
-        return false;
-    }
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+fn validate_command(name: &'static str, path: &Path) -> Result<PathBuf, PrivilegedTargetError> {
+    validate_trusted_executable(path)
+        .map(|()| path.to_path_buf())
+        .map_err(|_| PrivilegedTargetError::UnsafeCommand { name })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,7 +311,7 @@ pub fn plan_privileged_copy(
     #[cfg(not(unix))]
     {
         let _ = (entry, force, identities);
-        return Err(PrivilegedTargetError::Unsupported);
+        Err(PrivilegedTargetError::Unsupported)
     }
     #[cfg(unix)]
     {
@@ -424,14 +403,7 @@ pub fn apply_privileged_plans(
     session: Option<&mut PrivilegeSession>,
     commands: Option<&PrivilegedCommands>,
 ) -> Result<Vec<PrivilegedTargetOutcome>, PrivilegedTargetError> {
-    let mut current = Vec::with_capacity(plans.len());
-    for plan in plans {
-        let replanned = plan_privileged_copy(&plan.entry, plan.force, identities)?;
-        if !snapshots_match_exactly(plan, &replanned) {
-            return Err(drift(plan, "between plan and apply"));
-        }
-        current.push(replanned);
-    }
+    let current = revalidate_privileged_plans(plans, identities)?;
 
     if dry_run {
         return Ok(current.iter().map(dry_run_outcome).collect());
@@ -461,6 +433,25 @@ pub fn apply_privileged_plans(
         }
     }
     Ok(outcomes)
+}
+
+/// Revalidate a complete planned batch without authenticating or mutating.
+/// The engine uses this boundary after trusted pre-hooks and expansion so a
+/// late drift in any active privileged target stops every target before sudo.
+#[doc(hidden)]
+pub fn revalidate_privileged_plans(
+    plans: &[PrivilegedCopyPlan],
+    identities: &dyn IdentityResolver,
+) -> Result<Vec<PrivilegedCopyPlan>, PrivilegedTargetError> {
+    let mut current = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let replanned = plan_privileged_copy(&plan.entry, plan.force, identities)?;
+        if !snapshots_match_exactly(plan, &replanned) {
+            return Err(drift(plan, "between plan and apply"));
+        }
+        current.push(replanned);
+    }
+    Ok(current)
 }
 
 fn dry_run_outcome(plan: &PrivilegedCopyPlan) -> PrivilegedTargetOutcome {
@@ -629,7 +620,7 @@ fn stage_and_replace(
     if let Err(primary_error) = &result {
         let cleanup_needed = path_exists_nofollow(&temporary).unwrap_or(true);
         if cleanup_needed
-            && run_privileged(
+            && run_privileged_cleanup(
                 session,
                 vec![
                     commands.remove.as_os_str().to_owned(),
@@ -665,6 +656,21 @@ fn run_privileged(
             target: target.to_path_buf(),
             source,
         })
+}
+
+fn run_privileged_cleanup(
+    session: &PrivilegeSession,
+    argv: Vec<OsString>,
+    operation: &'static str,
+    target: &Path,
+) -> Result<(), PrivilegedTargetError> {
+    session.run_cleanup(&argv).map(|_| ()).map_err(|source| {
+        PrivilegedTargetError::PrivilegedCommand {
+            operation,
+            target: target.to_path_buf(),
+            source,
+        }
+    })
 }
 
 fn temporary_target(target: &Path) -> Result<PathBuf, PrivilegedTargetError> {
@@ -754,6 +760,7 @@ fn invalid_entry(entry: &Entry, detail: &'static str) -> PrivilegedTargetError {
     }
 }
 
+#[cfg(unix)]
 fn contains_parent(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::ParentDir))
@@ -808,7 +815,7 @@ fn snapshot_regular_file(
     #[cfg(not(unix))]
     {
         let _ = (path, label, missing_ok);
-        return Err(PrivilegedTargetError::Unsupported);
+        Err(PrivilegedTargetError::Unsupported)
     }
     #[cfg(unix)]
     {

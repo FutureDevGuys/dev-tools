@@ -137,7 +137,7 @@ pub fn overlay_json_file(
         let managed_id = options
             .managed_overlay_id
             .as_deref()
-            .expect("validated managed overlay id");
+            .ok_or_else(|| anyhow!("managed_overlay_id is required for an ownership receipt"))?;
         if let Err(error) = ownership::write_paths_atomic(&path, managed_id, &current_paths) {
             if write_target {
                 ownership::restore_file(target_path, &target_snapshot).with_context(|| {
@@ -198,7 +198,9 @@ fn set_pointer_value(data: &mut Value, pointer: &str, value: Value) -> Result<()
         };
     }
 
-    let final_component = path.last().expect("non-empty pointer path");
+    let final_component = path
+        .last()
+        .ok_or_else(|| anyhow!("JSON pointer unexpectedly resolved to an empty path: {pointer}"))?;
     match current {
         Value::Object(object) => {
             if !object.contains_key(final_component) {
@@ -355,8 +357,10 @@ fn remove_object_path_inner(data: &mut Map<String, Value>, path: &[String]) -> (
 }
 
 fn read_optional_target(path: &Path) -> Result<(String, bool)> {
+    ownership::validate_real_parent_chain(path, "JSON overlay target")?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
+            ownership::validate_real_parent_chain(path, "JSON overlay target")?;
             let text = match fs::read_to_string(path) {
                 Ok(text) => text,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -368,11 +372,15 @@ fn read_optional_target(path: &Path) -> Result<(String, bool)> {
             };
             Ok((text, true))
         }
-        Ok(metadata) if metadata.is_file() => Ok((
-            fs::read_to_string(path)
-                .with_context(|| format!("cannot read JSON overlay target {}", path.display()))?,
-            false,
-        )),
+        Ok(metadata) if metadata.is_file() => {
+            ownership::validate_real_parent_chain(path, "JSON overlay target")?;
+            Ok((
+                fs::read_to_string(path).with_context(|| {
+                    format!("cannot read JSON overlay target {}", path.display())
+                })?,
+                false,
+            ))
+        }
         Ok(_) => bail!(
             "JSON overlay target must be a file path: {}",
             path.display()

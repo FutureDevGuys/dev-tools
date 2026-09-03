@@ -1,13 +1,16 @@
-#![cfg(unix)]
+#![cfg(all(unix, any(debug_assertions, feature = "test-support")))]
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(any(debug_assertions, feature = "test-support"))]
+use std::time::{Duration, Instant};
 
 use sync_configs::hooks::{
-    EntryConvergence, HookDecision, HookPhase, HookPlan, HookRunMode, HookShell, HookState,
-    PostHookDecision,
+    EntryConvergence, HookDecision, HookError, HookOutputStream, HookPhase, HookPlan, HookRunMode,
+    HookShell, HookState, PostHookDecision,
 };
 use sync_configs::manifest::{load_manifest, select_entries_for_profiles, LoadOptions, Manifest};
 use sync_configs::paths::{PathContext, PathPlatform};
@@ -101,6 +104,64 @@ fn read_argv_log(path: &Path) -> Vec<Vec<String>> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("argv JSON"))
         .collect()
+}
+
+#[test]
+fn privileged_hook_rejects_a_user_owned_shell_before_execution() {
+    let root = TempDir::new().expect("temp root");
+    let manifest = load(
+        root.path(),
+        "entries:\n  - name: privileged\n    source: ./source\n    target: ./target\n    pre_script: printf bad\n    pre_script_privilege: sudo\n",
+    );
+    let (shell, shell_log) = forwarding_shell(root.path());
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook");
+    let (sudo, sudo_log) = forwarding_sudo(root.path());
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .expect("strict command authority with injected sudo");
+
+    let error = plan
+        .authenticate(&mut session)
+        .expect_err("user-owned shell must be rejected");
+
+    assert!(matches!(error, HookError::Privilege(_)));
+    assert!(!sudo_log.exists());
+    assert!(!shell_log.exists());
+}
+
+#[test]
+fn privileged_hook_preserves_the_trusted_posix_shell_spelling() {
+    let root = TempDir::new().expect("temp root");
+    let marker = root.path().join("ran");
+    let manifest = load(
+        root.path(),
+        &format!(
+            "entries:\n  - name: privileged\n    source: ./source\n    target: ./target\n    pre_script: printf ok > '{}'\n    pre_script_privilege: sudo\n",
+            marker.display()
+        ),
+    );
+    let shell = HookShell::posix(PathBuf::from("/bin/sh")).expect("POSIX shell");
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook");
+    let (sudo, sudo_log) = forwarding_sudo(root.path());
+    let session = PrivilegeSession::new_authenticated_injected_sudo_for_test(sudo)
+        .expect("strict command authority with injected sudo");
+
+    plan.run_pre_hooks(Some(&session)).expect("run hook");
+
+    assert_eq!(fs::read_to_string(marker).expect("marker"), "ok");
+    let calls = read_argv_log(&sudo_log);
+    assert_eq!(calls[0][2], "/bin/sh");
 }
 
 #[test]
@@ -320,7 +381,7 @@ entries:
     let (shell, _) = forwarding_shell(root.path());
     let shell_path = shell.executable().to_path_buf();
     let (sudo, sudo_log) = forwarding_sudo(root.path());
-    let mut session = PrivilegeSession::new(sudo).expect("sudo session");
+    let mut session = PrivilegeSession::new_fully_injected_for_test(sudo).expect("sudo session");
     let plan = HookPlan::prepare(
         manifest.entries.iter(),
         root.path(),
@@ -361,6 +422,63 @@ entries:
 }
 
 #[test]
+fn privileged_hook_requirements_are_phase_and_eligibility_aware() {
+    let root = TempDir::new().expect("temp root");
+    let manifest = load(
+        root.path(),
+        r#"
+entries:
+  - name: pre
+    source: ./pre
+    target: ./out-pre
+    pre_script: "printf pre"
+    pre_script_privilege: sudo
+  - name: post-current
+    source: ./post-current
+    target: ./out-current
+    post_script: "printf current"
+    post_script_privilege: sudo
+  - name: post-missing
+    source: ./post-missing
+    target: ./out-missing
+    post_script: "printf missing"
+    post_script_privilege: sudo
+"#,
+    );
+    let (shell, _) = forwarding_shell(root.path());
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hooks");
+
+    assert!(plan.requires_privilege());
+    assert!(plan.requires_pre_privilege());
+    assert!(plan.requires_post_privilege());
+    assert!(plan.requires_eligible_post_privilege(|entry| {
+        if entry.name == "post-current" {
+            EntryConvergence::UpToDate
+        } else {
+            EntryConvergence::MissingSource
+        }
+    }));
+    assert!(!plan.requires_eligible_post_privilege(|_| { EntryConvergence::MissingSource }));
+
+    let post_only = HookPlan::prepare(
+        manifest.entries[1..].iter(),
+        root.path(),
+        HookShell::posix(PathBuf::from("/bin/sh")).expect("shell"),
+        HookRunMode::Apply,
+    )
+    .expect("prepare post-only hooks");
+    assert!(post_only.requires_privilege());
+    assert!(!post_only.requires_pre_privilege());
+    assert!(post_only.requires_post_privilege());
+}
+
+#[test]
 fn dry_run_validation_disabled_profiles_and_no_hook_plans_execute_nothing() {
     let root = TempDir::new().expect("temp root");
     let marker = root.path().join("must-not-run");
@@ -388,7 +506,7 @@ entries:
     let enabled = select_entries_for_profiles(&manifest.entries, &["enabled".to_owned()]);
     assert_eq!(enabled.len(), 1);
     let (sudo, sudo_log) = forwarding_sudo(root.path());
-    let mut session = PrivilegeSession::new(sudo).expect("sudo session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("sudo session");
 
     for mode in [HookRunMode::DryRun, HookRunMode::Validate] {
         let (shell, shell_log) = forwarding_shell(root.path());
@@ -452,7 +570,7 @@ entries:
     manifest.entries[1].post_script = Some("invalid\0script".to_owned());
     let (shell, _) = forwarding_shell(root.path());
     let (sudo, sudo_log) = forwarding_sudo(root.path());
-    let _session = PrivilegeSession::new(sudo).expect("sudo session");
+    let _session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("sudo session");
 
     let error = HookPlan::prepare(
         manifest.entries.iter(),
@@ -501,6 +619,227 @@ fn captured_values_are_explicit_and_structured_status_is_value_free() {
         assert!(!structured.contains(&command));
         assert!(!structured.contains("secret-output"));
     }
+    assert_eq!(
+        read_argv_log(&argv_log),
+        vec![vec!["-c".to_owned(), command]]
+    );
+}
+
+#[test]
+fn hook_stdin_is_closed_and_the_captured_environment_is_inherited_explicitly() {
+    let root = TempDir::new().expect("temp root");
+    let manifest = load(
+        root.path(),
+        r#"
+entries:
+  - name: closed-stdin
+    source: ./source
+    target: ./target
+    pre_script: 'if IFS= read -r value; then exit 91; fi; printf "%s" "$PATH"'
+"#,
+    );
+    let (shell, _) = forwarding_shell(root.path());
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook");
+
+    let records = plan.run_pre_hooks(None).expect("run hook");
+
+    assert_eq!(
+        records[0].execution.as_ref().unwrap().status().state,
+        HookState::Succeeded
+    );
+    assert_eq!(
+        records[0].execution.as_ref().unwrap().stdout(),
+        std::env::var_os("PATH").unwrap_or_default().as_bytes()
+    );
+}
+
+#[test]
+fn hook_stdout_is_rejected_when_it_exceeds_the_capture_limit() {
+    let root = TempDir::new().expect("temp root");
+    let manifest = load(
+        root.path(),
+        r#"
+entries:
+  - name: oversized-output
+    source: ./source
+    target: ./target
+    pre_script: /usr/bin/head -c 16777217 /dev/zero
+"#,
+    );
+    let (shell, _) = forwarding_shell(root.path());
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook");
+
+    let error = plan
+        .run_pre_hooks(None)
+        .expect_err("oversized hook output must fail closed");
+
+    assert!(matches!(
+        error,
+        HookError::OutputLimit {
+            phase: HookPhase::Pre,
+            stream: HookOutputStream::Stdout,
+        }
+    ));
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn hook_stderr_limit_has_a_distinct_value_free_classification() {
+    let root = TempDir::new().expect("temp root");
+    let private_output = "PRIVATE_HOOK_STDERR_VALUE";
+    let command = format!("printf '%s' '{private_output}' >&2");
+    let manifest = load(
+        root.path(),
+        &format!(
+            "entries:\n  - name: oversized-stderr\n    source: ./source\n    target: ./target\n    pre_script: {command:?}\n"
+        ),
+    );
+    let (shell, _) = forwarding_shell(root.path());
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook")
+    .with_execution_limits_for_test(Duration::from_secs(1), 8);
+
+    let error = plan
+        .run_pre_hooks(None)
+        .expect_err("oversized stderr must fail closed");
+
+    assert!(matches!(
+        &error,
+        HookError::OutputLimit {
+            phase: HookPhase::Pre,
+            stream: HookOutputStream::Stderr,
+        }
+    ));
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains(private_output));
+    assert!(!rendered.contains(&command));
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[test]
+fn hook_timeout_is_fast_distinct_and_value_free() {
+    let root = TempDir::new().expect("temp root");
+    let private_command = "while :; do :; done # PRIVATE_TIMEOUT_COMMAND";
+    let manifest = load(
+        root.path(),
+        &format!(
+            "entries:\n  - name: timeout\n    source: ./source\n    target: ./target\n    pre_script: {private_command:?}\n"
+        ),
+    );
+    let shell = HookShell::posix(PathBuf::from("/bin/sh")).expect("POSIX shell");
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook")
+    .with_execution_limits_for_test(Duration::from_millis(20), 1024);
+
+    let started = Instant::now();
+    let error = plan
+        .run_pre_hooks(None)
+        .expect_err("nonterminating hook must time out");
+
+    assert!(matches!(
+        &error,
+        HookError::TimedOut {
+            phase: HookPhase::Pre,
+        }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains(private_command));
+    assert!(!rendered.contains("PRIVATE_TIMEOUT_COMMAND"));
+}
+
+#[test]
+fn hook_start_failure_is_distinct_and_does_not_disclose_the_command() {
+    let root = TempDir::new().expect("temp root");
+    let shell_path = root.path().join("broken-shell");
+    write_executable(&shell_path, "#!/missing-hook-interpreter\n");
+    let private_command = "printf PRIVATE_START_COMMAND";
+    let manifest = load(
+        root.path(),
+        &format!(
+            "entries:\n  - name: broken\n    source: ./source\n    target: ./target\n    pre_script: {private_command:?}\n"
+        ),
+    );
+    let shell = HookShell::posix(shell_path).expect("executable shell file");
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook");
+
+    let error = plan
+        .run_pre_hooks(None)
+        .expect_err("invalid interpreter must fail at start");
+
+    assert!(matches!(
+        &error,
+        HookError::Start {
+            phase: HookPhase::Pre,
+            ..
+        }
+    ));
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains(private_command));
+    assert!(!rendered.contains("PRIVATE_START_COMMAND"));
+}
+
+#[test]
+fn simple_python_hooks_remain_raw_shell_commands() {
+    let root = TempDir::new().expect("temp root");
+    let script = root.path().join("generate_mcp_surfaces.py");
+    let marker = root.path().join("generated");
+    fs::write(
+        &script,
+        format!(
+            "from pathlib import Path\nPath({marker:?}).write_text('ok\\n', encoding='utf-8')\n",
+            marker = marker.display().to_string(),
+        ),
+    )
+    .expect("write script");
+    let command = format!("python3 {}", script.display());
+    let manifest = load(
+        root.path(),
+        &format!(
+            "entries:\n  - name: generate\n    source: ./source\n    target: ./target\n    pre_script: {command:?}\n"
+        ),
+    );
+    let (shell, argv_log) = forwarding_shell(root.path());
+    let plan = HookPlan::prepare(
+        manifest.entries.iter(),
+        root.path(),
+        shell,
+        HookRunMode::Apply,
+    )
+    .expect("prepare hook");
+
+    let result = plan.run_pre_hooks(None).expect("run hook");
+
+    assert_eq!(result[0].decision, HookDecision::Proceed);
+    assert!(marker.is_file());
     assert_eq!(
         read_argv_log(&argv_log),
         vec![vec!["-c".to_owned(), command]]

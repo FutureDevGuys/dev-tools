@@ -2,7 +2,8 @@
 //!
 //! Structured events deliberately expose only fixed, value-free fields. Console
 //! transcripts are a separate, explicit channel because they can contain any
-//! text that the command showed to its operator.
+//! text that the command showed to its operator. Windows storage stays disabled
+//! until owner-only DACL creation and verification have an audited implementation.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -29,6 +30,8 @@ pub const DEFAULT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 const METADATA_SCHEMA_VERSION: u64 = 1;
 const PRODUCT: &str = "sync-configs";
+const LOGGING_UNAVAILABLE_WARNING: &str = "warning: sync-configs logging unavailable";
+const WINDOWS_STORAGE_UNAVAILABLE: &str = "owner-only diagnostic storage is unavailable on Windows";
 const TRANSCRIPT_TRUNCATION_MARKER: &[u8] = b"\n[transcript truncated at configured byte limit]\n";
 
 #[derive(Debug)]
@@ -205,7 +208,9 @@ where
             _ => home_dir(platform, &mut variable)?.join("AppData/Local"),
         },
     };
-    Ok(base.join("sync-configs/runs"))
+    let resolved = base.join("sync-configs/runs");
+    reject_parent_traversal(&resolved)?;
+    Ok(resolved)
 }
 
 fn absolute_override<F>(
@@ -220,7 +225,8 @@ where
     if !expanded.is_absolute() {
         return Err(LogError::invalid("log root must be an absolute path"));
     }
-    Ok(normalize_absolute(&expanded))
+    reject_parent_traversal(&expanded)?;
+    Ok(expanded)
 }
 
 fn home_dir<F>(platform: Platform, variable: &mut F) -> Result<PathBuf, LogError>
@@ -243,7 +249,8 @@ where
             "current user's home directory must be absolute",
         ));
     }
-    Ok(normalize_absolute(&candidate))
+    reject_parent_traversal(&candidate)?;
+    Ok(candidate)
 }
 
 fn expand_tilde<F>(path: &Path, platform: Platform, variable: &mut F) -> Result<PathBuf, LogError>
@@ -259,18 +266,16 @@ where
     Ok(expanded)
 }
 
-fn normalize_absolute(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
+fn reject_parent_traversal(path: &Path) -> Result<(), LogError> {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(LogError::invalid(
+            "log root must not contain parent-directory traversal",
+        ));
     }
-    normalized
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,6 +360,7 @@ pub struct RunMetadata {
 
 struct ActiveRecorder {
     root: PathBuf,
+    root_custody: RootCustody,
     run_dir: PathBuf,
     metadata: RunMetadata,
     events: Option<File>,
@@ -364,6 +370,8 @@ struct ActiveRecorder {
     limits: LogLimits,
     warned: bool,
     disabled: bool,
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    fail_event_writes_for_test: bool,
 }
 
 pub struct RunRecorder {
@@ -372,27 +380,35 @@ pub struct RunRecorder {
 
 impl RunRecorder {
     pub fn start(options: RecorderOptions) -> Result<Self, LogError> {
+        Self::start_on_platform(options, Platform::current())
+    }
+
+    fn start_on_platform(options: RecorderOptions, platform: Platform) -> Result<Self, LogError> {
         if !options.root.is_absolute() {
             return Err(LogError::invalid("log root must be an absolute path"));
         }
         if options.style == LogStyle::Off {
             return Ok(Self { active: None });
         }
-        create_owner_only_directory(&options.root)?;
+        ensure_owner_only_storage_supported(platform)?;
+        let root_custody = create_owner_only_directory(&options.root)?;
         let started = SystemTime::now();
-        let (run_id, run_dir) = create_run_directory(&options.root, started)?;
+        let (run_id, run_dir) = create_run_directory(&options.root, root_custody, started)?;
+        let root = options.root.clone();
         let cleanup_path = run_dir.clone();
-        let result = Self::start_in_created_directory(options, run_id, run_dir, started);
+        let result =
+            Self::start_in_created_directory(options, root_custody, run_id, run_dir, started);
         if result.is_err() {
-            // This directory was just created under an owner-only root and has
-            // not been exposed as a successful run, so cleanup is bounded.
-            let _ = fs::remove_dir_all(cleanup_path);
+            // Never clean up through a root whose identity or custody can no
+            // longer be proven, even when that means retaining a partial run.
+            let _ = remove_created_run_directory(&root, root_custody, &cleanup_path);
         }
         result
     }
 
     fn start_in_created_directory(
         options: RecorderOptions,
+        root_custody: RootCustody,
         run_id: String,
         run_dir: PathBuf,
         started: SystemTime,
@@ -426,10 +442,12 @@ impl RunRecorder {
             parent_run_id,
             summary: BTreeMap::new(),
         };
+        ensure_root_custody(&options.root, root_custody)?;
         atomic_write_json(&run_dir.join("run.json"), &metadata)?;
         let mut recorder = Self {
             active: Some(ActiveRecorder {
                 root: options.root,
+                root_custody,
                 run_dir,
                 metadata,
                 events,
@@ -439,6 +457,8 @@ impl RunRecorder {
                 limits: options.limits,
                 warned: false,
                 disabled: false,
+                #[cfg(any(debug_assertions, feature = "test-support"))]
+                fail_event_writes_for_test: false,
             }),
         };
         recorder.fixed_event(LogLevel::Info, "run_started", |payload| {
@@ -450,10 +470,27 @@ impl RunRecorder {
     /// Start logging without allowing a diagnostic failure to change the
     /// convergence outcome.
     pub fn start_safely(options: RecorderOptions) -> Self {
-        match Self::start(options) {
+        Self::start_safely_on_platform(options, Platform::current())
+    }
+
+    fn start_safely_on_platform(options: RecorderOptions, platform: Platform) -> Self {
+        Self::start_safely_on_platform_with_warning(options, platform, |warning| {
+            eprintln!("{warning}");
+        })
+    }
+
+    fn start_safely_on_platform_with_warning<F>(
+        options: RecorderOptions,
+        platform: Platform,
+        warn: F,
+    ) -> Self
+    where
+        F: FnOnce(&'static str),
+    {
+        match Self::start_on_platform(options, platform) {
             Ok(recorder) => recorder,
             Err(_) => {
-                eprintln!("warning: sync-configs logging unavailable: io error");
+                warn(LOGGING_UNAVAILABLE_WARNING);
                 Self { active: None }
             }
         }
@@ -461,6 +498,16 @@ impl RunRecorder {
 
     pub fn enabled(&self) -> bool {
         self.active.as_ref().is_some_and(|active| !active.disabled)
+    }
+
+    /// Inject an event-channel write failure for contract tests without
+    /// relying on platform-specific file-descriptor manipulation.
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_event_writes_for_test(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.fail_event_writes_for_test = true;
+        }
     }
 
     pub fn run_id(&self) -> Option<&str> {
@@ -571,7 +618,7 @@ impl RunRecorder {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if active.disabled || active.metadata.status.is_terminal() {
+        if active.metadata.status.is_terminal() {
             return;
         }
         let status = if interrupted {
@@ -586,6 +633,19 @@ impl RunRecorder {
         } else {
             LogLevel::Error
         };
+
+        // Terminal metadata is the durable run lifecycle authority. Publish it
+        // before touching either optional output channel, and do not let a
+        // previously disabled channel prevent this independent best effort.
+        active.metadata.status = status;
+        active.metadata.exit_code = Some(exit_code);
+        active.metadata.ended_at = Some(format_timestamp(SystemTime::now()));
+        let metadata_result = ensure_root_custody(&active.root, active.root_custody)
+            .and_then(|()| atomic_write_json(&active.run_dir.join("run.json"), &active.metadata));
+        if let Err(error) = metadata_result {
+            warn_and_disable(active, &error);
+        }
+
         self.fixed_event(level, "run_finished", |payload| {
             payload.insert("status".to_owned(), json!(status));
             payload.insert("exit_code".to_owned(), json!(exit_code));
@@ -594,32 +654,25 @@ impl RunRecorder {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if active.disabled {
-            return;
-        }
-        active.metadata.status = status;
-        active.metadata.exit_code = Some(exit_code);
-        active.metadata.ended_at = Some(format_timestamp(SystemTime::now()));
-        if let Err(error) = atomic_write_json(&active.run_dir.join("run.json"), &active.metadata) {
-            warn_and_disable(active, &error);
-            return;
-        }
-        let flush_error = active
+        let event_flush_error = active
             .events
             .as_mut()
-            .and_then(|events| events.flush().err())
-            .or_else(|| {
-                active
-                    .transcript
-                    .as_mut()
-                    .and_then(|transcript| transcript.flush().err())
-            });
-        if let Some(error) = flush_error {
+            .and_then(|events| events.flush().err());
+        if let Some(error) = event_flush_error {
             warn_and_disable(
                 active,
-                &LogError::io("cannot flush diagnostic output", error),
+                &LogError::io("cannot flush diagnostic events", error),
             );
-            return;
+        }
+        let transcript_flush_error = active
+            .transcript
+            .as_mut()
+            .and_then(|transcript| transcript.flush().err());
+        if let Some(error) = transcript_flush_error {
+            warn_and_disable(
+                active,
+                &LogError::io("cannot flush diagnostic transcript", error),
+            );
         }
         if let Err(error) = prune_runs(&active.root, RetentionPolicy::default(), false) {
             warn_and_disable(active, &error);
@@ -661,20 +714,31 @@ impl RunRecorder {
             active.metadata.events_truncated = true;
             return;
         }
-        let result = active
-            .events
-            .as_mut()
-            .ok_or_else(|| LogError::invalid("event file is unavailable"))
-            .and_then(|events| {
-                events
-                    .write_all(&encoded)
-                    .map_err(|error| LogError::io("cannot write diagnostic event", error))
-            });
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        let result = if active.fail_event_writes_for_test {
+            Err(LogError::io(
+                "cannot write diagnostic event",
+                io::Error::other("injected event-channel failure"),
+            ))
+        } else {
+            write_event_bytes(active, &encoded)
+        };
+        #[cfg(not(any(debug_assertions, feature = "test-support")))]
+        let result = write_event_bytes(active, &encoded);
         match result {
             Ok(()) => active.event_bytes += encoded.len() as u64,
             Err(error) => warn_and_disable(active, &error),
         }
     }
+}
+
+fn write_event_bytes(active: &mut ActiveRecorder, value: &[u8]) -> Result<(), LogError> {
+    active
+        .events
+        .as_mut()
+        .ok_or_else(|| LogError::invalid("event file is unavailable"))?
+        .write_all(value)
+        .map_err(|error| LogError::io("cannot write diagnostic event", error))
 }
 
 fn write_transcript_bytes(active: &mut ActiveRecorder, value: &[u8]) -> Result<(), LogError> {
@@ -700,7 +764,7 @@ fn utf8_prefix_len(value: &str, maximum: usize) -> usize {
 fn warn_and_disable(active: &mut ActiveRecorder, _error: &LogError) {
     active.disabled = true;
     if !active.warned {
-        eprintln!("warning: sync-configs logging unavailable: io error");
+        eprintln!("{LOGGING_UNAVAILABLE_WARNING}");
         active.warned = true;
     }
 }
@@ -755,27 +819,30 @@ fn entry_id(scope_label: &str, entry_name: &str) -> String {
         .collect()
 }
 
-fn create_owner_only_directory(path: &Path) -> Result<(), LogError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(LogError::invalid("log root is not a real directory"));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .map_err(|error| LogError::io("cannot create diagnostic root", error))?;
-        }
-        Err(error) => return Err(LogError::io("cannot inspect diagnostic root", error)),
-    }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| LogError::io("cannot inspect diagnostic root", error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(LogError::invalid("log root is not a real directory"));
-    }
-    set_owner_only_directory(path)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootCustody {
+    device: u64,
+    inode: u64,
 }
 
-fn create_run_directory(root: &Path, started: SystemTime) -> Result<(String, PathBuf), LogError> {
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct DirectoryAuthority {
+    uid: u32,
+    mode: u32,
+}
+
+fn create_owner_only_directory(path: &Path) -> Result<RootCustody, LogError> {
+    ensure_owner_only_storage_supported(Platform::current())?;
+    inspect_log_root(path, true)?
+        .ok_or_else(|| LogError::invalid("cannot establish custody of the diagnostic root"))
+}
+
+fn create_run_directory(
+    root: &Path,
+    root_custody: RootCustody,
+    started: SystemTime,
+) -> Result<(String, PathBuf), LogError> {
     for _ in 0..8 {
         let uuid = Uuid::new_v4().simple().to_string();
         let run_id = format!(
@@ -785,9 +852,22 @@ fn create_run_directory(root: &Path, started: SystemTime) -> Result<(String, Pat
             &uuid[..8]
         );
         let run_dir = root.join(&run_id);
-        match fs::create_dir(&run_dir) {
+        #[cfg(unix)]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&run_dir) {
             Ok(()) => {
-                set_owner_only_directory(&run_dir)?;
+                ensure_root_custody(root, root_custody)?;
+                let metadata = fs::symlink_metadata(&run_dir).map_err(|error| {
+                    LogError::io("cannot inspect diagnostic run directory", error)
+                })?;
+                validate_owner_only_directory(&metadata, "diagnostic run directory")?;
                 return Ok((run_id, run_dir));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -804,7 +884,30 @@ fn create_run_directory(root: &Path, started: SystemTime) -> Result<(String, Pat
     ))
 }
 
+fn remove_created_run_directory(
+    root: &Path,
+    root_custody: RootCustody,
+    run_dir: &Path,
+) -> Result<(), LogError> {
+    if run_dir.parent() != Some(root) {
+        return Err(LogError::invalid(
+            "diagnostic run is outside the proven root",
+        ));
+    }
+    ensure_root_custody(root, root_custody)?;
+    let metadata = fs::symlink_metadata(run_dir)
+        .map_err(|error| LogError::io("cannot revalidate diagnostic run", error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LogError::invalid("diagnostic run changed before cleanup"));
+    }
+    ensure_root_custody(root, root_custody)?;
+    fs::remove_dir_all(run_dir)
+        .map_err(|error| LogError::io("cannot remove partial diagnostic run", error))?;
+    ensure_root_custody(root, root_custody)
+}
+
 fn create_owner_only_file(path: &Path) -> Result<File, LogError> {
+    ensure_owner_only_storage_supported(Platform::current())?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -820,18 +923,6 @@ fn create_owner_only_file(path: &Path) -> Result<File, LogError> {
 }
 
 #[cfg(unix)]
-fn set_owner_only_directory(path: &Path) -> Result<(), LogError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| LogError::io("cannot restrict diagnostic directory", error))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_directory(_path: &Path) -> Result<(), LogError> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn set_owner_only_file(path: &Path) -> Result<(), LogError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
@@ -840,10 +931,13 @@ fn set_owner_only_file(path: &Path) -> Result<(), LogError> {
 
 #[cfg(not(unix))]
 fn set_owner_only_file(_path: &Path) -> Result<(), LogError> {
-    Ok(())
+    Err(LogError::invalid(
+        "owner-only diagnostic storage is unavailable on this platform",
+    ))
 }
 
 fn atomic_write_json(path: &Path, payload: &RunMetadata) -> Result<(), LogError> {
+    ensure_owner_only_storage_supported(Platform::current())?;
     let parent = path
         .parent()
         .ok_or_else(|| LogError::invalid("diagnostic metadata has no parent"))?;
@@ -868,14 +962,210 @@ fn atomic_write_json(path: &Path, payload: &RunMetadata) -> Result<(), LogError>
     Ok(())
 }
 
-fn root_is_real_directory(root: &Path) -> Result<bool, LogError> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(LogError::invalid("log root is not a real directory"))
+/// Validate every existing path component without following links. An accepted
+/// Unix root is a real directory owned by the effective user whose group and
+/// other rwx bits are all clear and no special permission bits are set. Owner
+/// bits may be any subset of `0700`; an overly restrictive existing root
+/// remains private and ordinary I/O reports whether it is usable. Root-
+/// or effective-user-owned ancestors must not be shared-writable unless sticky;
+/// a sticky shared ancestor is accepted only around an effective-user-owned
+/// immediate child that is not group/world-writable. Other owners are not a
+/// stable path authority because they can change their directory's mode.
+#[cfg(unix)]
+fn inspect_log_root(root: &Path, create_missing: bool) -> Result<Option<RootCustody>, LogError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    if !root.is_absolute() {
+        return Err(LogError::invalid("log root must be an absolute path"));
+    }
+
+    let mut current = PathBuf::new();
+    let mut components = root.components().peekable();
+    let mut parent_authority = None;
+    while let Some(component) = components.next() {
+        match component {
+            Component::RootDir => current.push(Path::new("/")),
+            Component::Normal(value) => current.push(value),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(LogError::invalid(
+                    "log root must be a normalized absolute path",
+                ));
+            }
         }
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(LogError::io("cannot inspect diagnostic root", error)),
+        let is_root = components.peek().is_none();
+        let mut created = false;
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create_missing => {
+                if let Some(parent) = parent_authority {
+                    validate_missing_child_boundary(parent)?;
+                }
+                return Ok(None);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = parent_authority {
+                    validate_ancestor_before_creation(parent)?;
+                }
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&current) {
+                    Ok(()) => created = true,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(LogError::io("cannot create diagnostic root", error));
+                    }
+                }
+                fs::symlink_metadata(&current)
+                    .map_err(|error| LogError::io("cannot inspect diagnostic root", error))?
+            }
+            Err(error) => return Err(LogError::io("cannot inspect diagnostic root", error)),
+        };
+
+        if metadata.file_type().is_symlink() {
+            return Err(LogError::invalid(
+                "diagnostic root path crosses a symbolic link",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(LogError::invalid(
+                "diagnostic root path contains a non-directory component",
+            ));
+        }
+        let authority = directory_authority(&metadata);
+        if let Some(parent) = parent_authority {
+            validate_existing_child_boundary(parent, authority)?;
+        }
+        if created {
+            validate_owner_only_directory(&metadata, "new diagnostic root component")?;
+        }
+        if is_root {
+            return validate_owner_only_directory(&metadata, "diagnostic root").map(Some);
+        }
+        parent_authority = Some(authority);
+    }
+
+    Err(LogError::invalid("log root must be an absolute path"))
+}
+
+#[cfg(unix)]
+fn directory_authority(metadata: &fs::Metadata) -> DirectoryAuthority {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    DirectoryAuthority {
+        uid: metadata.uid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    }
+}
+
+#[cfg(unix)]
+fn validate_ancestor_before_creation(parent: DirectoryAuthority) -> Result<(), LogError> {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if parent.uid != 0 && parent.uid != effective_uid {
+        return Err(LogError::invalid(
+            "diagnostic root path has an untrusted mutable ancestor",
+        ));
+    }
+    if parent.mode & 0o022 != 0 && parent.mode & 0o1000 == 0 {
+        return Err(LogError::invalid(
+            "diagnostic root path has a non-sticky shared-writable ancestor",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_existing_child_boundary(
+    parent: DirectoryAuthority,
+    child: DirectoryAuthority,
+) -> Result<(), LogError> {
+    validate_ancestor_before_creation(parent)?;
+    if parent.mode & 0o022 != 0 {
+        let effective_uid = rustix::process::geteuid().as_raw();
+        if child.uid != effective_uid || child.mode & 0o022 != 0 {
+            return Err(LogError::invalid(
+                "diagnostic root path crosses a sticky shared ancestor without a private effective-user-owned child",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_missing_child_boundary(parent: DirectoryAuthority) -> Result<(), LogError> {
+    validate_ancestor_before_creation(parent)?;
+    if parent.mode & 0o022 != 0 {
+        return Err(LogError::invalid(
+            "diagnostic root path crosses a sticky shared ancestor without an existing private effective-user-owned child",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn inspect_log_root(_root: &Path, _create_missing: bool) -> Result<Option<RootCustody>, LogError> {
+    Err(LogError::invalid(
+        "owner-only diagnostic storage is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn validate_owner_only_directory(
+    metadata: &fs::Metadata,
+    subject: &str,
+) -> Result<RootCustody, LogError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LogError::invalid(format!(
+            "{subject} is not a real directory"
+        )));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(LogError::invalid(format!(
+            "{subject} is not owned by the effective user"
+        )));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & !0o700 != 0 {
+        return Err(LogError::invalid(format!(
+            "{subject} permissions are broader than 0700"
+        )));
+    }
+    Ok(RootCustody {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn validate_owner_only_directory(
+    _metadata: &fs::Metadata,
+    _subject: &str,
+) -> Result<RootCustody, LogError> {
+    Err(LogError::invalid(
+        "owner-only diagnostic storage is unavailable on this platform",
+    ))
+}
+
+fn ensure_root_custody(root: &Path, expected: RootCustody) -> Result<(), LogError> {
+    let current = inspect_log_root(root, false)?.ok_or_else(|| {
+        LogError::invalid("diagnostic root changed while logging was in progress")
+    })?;
+    if current != expected {
+        return Err(LogError::invalid(
+            "diagnostic root changed while logging was in progress",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_owner_only_storage_supported(platform: Platform) -> Result<(), LogError> {
+    match platform {
+        Platform::Unix => Ok(()),
+        // Do not accept inherited/default Windows ACLs as an owner-only
+        // guarantee. This may be enabled only alongside audited DACL creation
+        // and verification for both new and caller-supplied roots.
+        Platform::Windows => Err(LogError::invalid(WINDOWS_STORAGE_UNAVAILABLE)),
     }
 }
 
@@ -1001,9 +1291,14 @@ fn read_metadata(path: &Path, expected_run_id: &str) -> Result<(RunMetadata, Vec
 }
 
 pub fn list_runs(root: &Path) -> Result<Vec<RunMetadata>, LogError> {
-    if !root_is_real_directory(root)? {
+    list_runs_on_platform(root, Platform::current())
+}
+
+fn list_runs_on_platform(root: &Path, platform: Platform) -> Result<Vec<RunMetadata>, LogError> {
+    ensure_owner_only_storage_supported(platform)?;
+    let Some(root_custody) = inspect_log_root(root, false)? else {
         return Ok(Vec::new());
-    }
+    };
     let mut results = Vec::new();
     let entries =
         fs::read_dir(root).map_err(|error| LogError::io("cannot read diagnostic root", error))?;
@@ -1031,15 +1326,27 @@ pub fn list_runs(root: &Path) -> Result<Vec<RunMetadata>, LogError> {
             .cmp(&left.started_at)
             .then_with(|| right.run_id.cmp(&left.run_id))
     });
+    ensure_root_custody(root, root_custody)?;
     Ok(results)
 }
 
 pub fn show_run(root: &Path, run_id: &str) -> Result<RunMetadata, LogError> {
-    if !root_is_real_directory(root)? {
+    show_run_on_platform(root, run_id, Platform::current())
+}
+
+fn show_run_on_platform(
+    root: &Path,
+    run_id: &str,
+    platform: Platform,
+) -> Result<RunMetadata, LogError> {
+    ensure_owner_only_storage_supported(platform)?;
+    let Some(root_custody) = inspect_log_root(root, false)? else {
         return Err(LogError::invalid(format!("run not found: {run_id}")));
-    }
+    };
     let run_dir = safe_run_dir(root, run_id)?;
-    read_metadata(&run_dir.join("run.json"), run_id).map(|(metadata, _)| metadata)
+    let (metadata, _) = read_metadata(&run_dir.join("run.json"), run_id)?;
+    ensure_root_custody(root, root_custody)?;
+    Ok(metadata)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1089,14 +1396,25 @@ pub fn prune_runs_at(
     now: SystemTime,
     dry_run: bool,
 ) -> Result<PruneReport, LogError> {
-    if !root_is_real_directory(root)? {
+    prune_runs_at_on_platform(root, policy, now, dry_run, Platform::current())
+}
+
+fn prune_runs_at_on_platform(
+    root: &Path,
+    policy: RetentionPolicy,
+    now: SystemTime,
+    dry_run: bool,
+    platform: Platform,
+) -> Result<PruneReport, LogError> {
+    ensure_owner_only_storage_supported(platform)?;
+    let Some(root_custody) = inspect_log_root(root, false)? else {
         return Ok(PruneReport {
             dry_run,
             reclaimed_bytes: 0,
             removed: Vec::new(),
             retained: Vec::new(),
         });
-    }
+    };
     let mut completed = Vec::new();
     let mut retained_other = Vec::new();
     let entries =
@@ -1188,7 +1506,7 @@ pub fn prune_runs_at(
         removed.push(run.run_id.clone());
         reclaimed_bytes = reclaimed_bytes.saturating_add(run.size);
         if !dry_run {
-            remove_run_if_unchanged(run)?;
+            remove_run_if_unchanged(root, root_custody, run)?;
         }
     }
     let mut retained: Vec<String> = completed
@@ -1199,6 +1517,7 @@ pub fn prune_runs_at(
         .chain(retained_other)
         .collect();
     retained.sort();
+    ensure_root_custody(root, root_custody)?;
     Ok(PruneReport {
         dry_run,
         reclaimed_bytes,
@@ -1207,7 +1526,17 @@ pub fn prune_runs_at(
     })
 }
 
-fn remove_run_if_unchanged(run: &CompletedRun) -> Result<(), LogError> {
+fn remove_run_if_unchanged(
+    root: &Path,
+    root_custody: RootCustody,
+    run: &CompletedRun,
+) -> Result<(), LogError> {
+    if run.path.parent() != Some(root) {
+        return Err(LogError::invalid(
+            "diagnostic run is outside the proven root",
+        ));
+    }
+    ensure_root_custody(root, root_custody)?;
     let metadata = match fs::symlink_metadata(&run.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1225,8 +1554,10 @@ fn remove_run_if_unchanged(run: &CompletedRun) -> Result<(), LogError> {
             "diagnostic run changed while retention was in progress",
         ));
     }
+    ensure_root_custody(root, root_custody)?;
     fs::remove_dir_all(&run.path)
-        .map_err(|error| LogError::io("cannot remove retained diagnostic run", error))
+        .map_err(|error| LogError::io("cannot remove retained diagnostic run", error))?;
+    ensure_root_custody(root, root_custody)
 }
 
 fn directory_size(path: &Path) -> u64 {
@@ -1367,6 +1698,17 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 mod tests {
     use super::*;
 
+    fn recorder_options(root: &Path, style: LogStyle) -> RecorderOptions {
+        RecorderOptions {
+            root: root.to_owned(),
+            style,
+            level: LogLevel::Info,
+            dry_run: false,
+            parent_run_id: None,
+            limits: LogLimits::default(),
+        }
+    }
+
     #[test]
     fn generated_timestamp_round_trips() {
         let value = UNIX_EPOCH + Duration::new(1_788_220_800, 123_456_000);
@@ -1384,5 +1726,84 @@ mod tests {
         assert!(!is_valid_run_id(
             "run-20260901T120000.000000Z-nope-deadbeef"
         ));
+    }
+
+    #[test]
+    fn windows_recording_fails_closed_before_storage_access() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path().join("sensitive-runs");
+
+        let error = match RunRecorder::start_on_platform(
+            recorder_options(&root, LogStyle::Transcript),
+            Platform::Windows,
+        ) {
+            Ok(_) => panic!("Windows recording must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "owner-only diagnostic storage is unavailable on Windows"
+        );
+        assert!(!root.exists(), "rejection must precede root creation");
+
+        let mut warnings = Vec::new();
+        let recorder = RunRecorder::start_safely_on_platform_with_warning(
+            recorder_options(&root, LogStyle::Both),
+            Platform::Windows,
+            |warning| warnings.push(warning.to_owned()),
+        );
+        assert!(!recorder.enabled(), "safe startup must degrade to disabled");
+        assert!(!root.exists(), "safe degradation must not create storage");
+        assert_eq!(
+            warnings,
+            ["warning: sync-configs logging unavailable"],
+            "the warning must be fixed and value-free"
+        );
+
+        let off_root = temp.path().join("off-runs");
+        let recorder = RunRecorder::start_on_platform(
+            recorder_options(&off_root, LogStyle::Off),
+            Platform::Windows,
+        )
+        .expect("off remains a platform-independent no-op");
+        assert!(!recorder.enabled());
+        assert!(!off_root.exists());
+    }
+
+    #[test]
+    fn windows_management_rejects_the_root_before_read_or_prune() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path().join("untrusted-runs");
+        fs::create_dir(&root).expect("fixture root");
+        let sentinel = root.join("DO_NOT_TOUCH");
+        fs::write(&sentinel, b"retained").expect("fixture sentinel");
+        let expected = "owner-only diagnostic storage is unavailable on Windows";
+
+        let list_error = list_runs_on_platform(&root, Platform::Windows)
+            .expect_err("Windows list must reject unverified storage");
+        assert_eq!(list_error.to_string(), expected);
+
+        let show_error = show_run_on_platform(
+            &root,
+            "run-20260901T120000.000000Z-7-deadbeef",
+            Platform::Windows,
+        )
+        .expect_err("Windows show must reject unverified storage");
+        assert_eq!(show_error.to_string(), expected);
+
+        let prune_error = prune_runs_at_on_platform(
+            &root,
+            RetentionPolicy {
+                max_age_days: 0,
+                max_runs: 0,
+                max_bytes: 0,
+            },
+            SystemTime::now(),
+            false,
+            Platform::Windows,
+        )
+        .expect_err("Windows prune must reject unverified storage");
+        assert_eq!(prune_error.to_string(), expected);
+        assert_eq!(fs::read(&sentinel).expect("sentinel retained"), b"retained");
     }
 }

@@ -277,7 +277,7 @@ fn is_link_or_reparse(metadata: &Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
@@ -540,6 +540,13 @@ fn entry_uses_filters(entry: &Entry) -> bool {
         || !entry.use_default_filters
 }
 
+fn missing_source_may_expand_later(entry: &Entry) -> bool {
+    matches!(
+        entry.directory_strategy,
+        DirectoryStrategy::Children | DirectoryStrategy::Recursive
+    )
+}
+
 fn expanded_entry(entry: &Entry, source: PathBuf, target: PathBuf, relative: &Path) -> Entry {
     let mut expanded = entry.clone();
     expanded.name = if !entry.name.is_empty() && entry.name != entry.target.to_string_lossy() {
@@ -684,20 +691,27 @@ fn glob_literal_root(pattern: &Path) -> PathBuf {
     }
 }
 
+fn source_glob_matcher(
+    pattern: &str,
+    platform: PathPlatform,
+) -> Result<GlobMatcher, FilesystemError> {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(platform != PathPlatform::Windows)
+        .build()
+        .map_err(|error| FilesystemError::InvalidPattern {
+            pattern: pattern.to_owned(),
+            message: error.to_string(),
+        })
+        .map(|glob| glob.compile_matcher())
+}
+
 fn expand_glob(entry: &Entry, options: &ExpansionOptions) -> Result<Vec<Entry>, FilesystemError> {
     let pattern = entry
         .source
         .to_str()
         .ok_or_else(|| FilesystemError::NonUtf8Pattern(entry.source.clone()))?;
-    let matcher = GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .backslash_escape(true)
-        .build()
-        .map_err(|error| FilesystemError::InvalidPattern {
-            pattern: pattern.to_owned(),
-            message: error.to_string(),
-        })?
-        .compile_matcher();
+    let matcher = source_glob_matcher(pattern, PathPlatform::current())?;
     let root = glob_literal_root(&entry.source);
     let Some(metadata) = symlink_metadata(&root, "inspect glob root")? else {
         return Ok(Vec::new());
@@ -754,6 +768,9 @@ fn expand_glob(entry: &Entry, options: &ExpansionOptions) -> Result<Vec<Entry>, 
 fn apply_source_overrides(entries: &mut [Entry]) {
     let selected: BTreeSet<PathBuf> = entries.iter().map(|entry| entry.source.clone()).collect();
     for entry in entries {
+        if entry.target_privilege != Privilege::User {
+            continue;
+        }
         let candidate = candidate_source_override(&entry.source);
         if candidate != entry.source && candidate.exists() && !selected.contains(&candidate) {
             entry.source = candidate;
@@ -789,7 +806,7 @@ pub fn expand_entries(
             }
             Some(_) => return Err(FilesystemError::UnsupportedSource(entry.source.clone())),
             None => {
-                if entry_uses_filters(entry) {
+                if entry_uses_filters(entry) && !missing_source_may_expand_later(entry) {
                     return Err(FilesystemError::FiltersOnLiteralSource {
                         entry: entry.name.clone(),
                         path: entry.source.clone(),
@@ -1753,4 +1770,18 @@ pub fn converge_entry(
         existing_state: state,
         backup,
     })
+}
+
+#[cfg(test)]
+mod platform_glob_tests {
+    use super::*;
+
+    #[test]
+    fn windows_source_glob_keeps_backslash_separators_literal() {
+        let matcher = source_glob_matcher(r"C:\repo\*.toml", PathPlatform::Windows)
+            .expect("valid Windows source glob");
+
+        assert!(matcher.is_match(Path::new(r"C:\repo\settings.toml")));
+        assert!(!matcher.is_match(Path::new(r"C:\repo\settings.json")));
+    }
 }

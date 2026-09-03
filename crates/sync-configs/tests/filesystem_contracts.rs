@@ -328,6 +328,23 @@ fn glob_and_children_strategies_keep_their_target_relative_paths() {
 }
 
 #[test]
+fn missing_recursive_directory_with_filters_is_deferred_for_hook_time_expansion() {
+    let temp = TempDir::new().expect("temporary directory");
+    let mut fixture = entry(
+        temp.path().join("generated"),
+        temp.path().join("target"),
+        Mode::Copy,
+    );
+    fixture.directory_strategy = DirectoryStrategy::Recursive;
+    fixture.include = vec!["*.txt".to_owned()];
+
+    let expanded =
+        expand_entries(&[fixture.clone()], &ExpansionOptions::default()).expect("defer expansion");
+
+    assert_eq!(expanded, vec![fixture]);
+}
+
+#[test]
 fn a_selected_override_file_does_not_replace_the_base_source_twice() {
     let temp = TempDir::new().expect("temporary directory");
     let source = temp.path().join("source");
@@ -370,6 +387,42 @@ fn an_unselected_sibling_override_is_preferred_and_can_be_disabled() {
 
     assert_eq!(preferred[0].source, override_source);
     assert_eq!(disabled[0].source, source);
+}
+
+#[test]
+fn source_expansion_keeps_privileged_sources_literal_and_overrides_user_sources() {
+    let temp = TempDir::new().expect("temporary directory");
+    let user_source = temp.path().join("user.conf");
+    let user_override = temp.path().join("user.override.conf");
+    let privileged_source = temp.path().join("system.conf");
+    let privileged_override = temp.path().join("system.override.conf");
+    for source in [
+        &user_source,
+        &user_override,
+        &privileged_source,
+        &privileged_override,
+    ] {
+        fs::write(source, b"managed\n").expect("write source fixture");
+    }
+    let mut user = entry(
+        user_source,
+        temp.path().join("user-target.conf"),
+        Mode::Copy,
+    );
+    user.name = "user-policy".to_owned();
+    let mut privileged = entry(
+        privileged_source.clone(),
+        PathBuf::from("/etc/example/system.conf"),
+        Mode::Copy,
+    );
+    privileged.name = "system-policy".to_owned();
+    privileged.target_privilege = Privilege::Sudo;
+
+    let expanded = expand_entries(&[user, privileged], &ExpansionOptions::default())
+        .expect("expand literal sources");
+
+    assert_eq!(expanded[0].source, user_override);
+    assert_eq!(expanded[1].source, privileged_source);
 }
 
 #[test]
@@ -489,8 +542,7 @@ fn an_exact_managed_directory_alias_makes_its_symlink_children_current() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&source_root, &target_root).expect("link managed directory");
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&source_root, &target_root)
-        .expect("link managed directory");
+    std::os::windows::fs::symlink_dir(&source_root, &target_root).expect("link managed directory");
     let fixture = entry(source.clone(), target, Mode::Symlink);
 
     let outcome = converge_entry(&fixture, &options(&temp.path().join("backups")))
@@ -502,7 +554,10 @@ fn an_exact_managed_directory_alias_makes_its_symlink_children_current() {
         .expect("target root metadata")
         .file_type()
         .is_symlink());
-    assert_eq!(fs::read(source).expect("source remains present"), b"managed\n");
+    assert_eq!(
+        fs::read(source).expect("source remains present"),
+        b"managed\n"
+    );
 }
 
 #[test]
@@ -517,8 +572,7 @@ fn a_mismatched_directory_alias_remains_blocked_for_symlink_entries() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, &target_root).expect("link unrelated directory");
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&outside, &target_root)
-        .expect("link unrelated directory");
+    std::os::windows::fs::symlink_dir(&outside, &target_root).expect("link unrelated directory");
     let fixture = entry(source, target_root.join("nested.conf"), Mode::Symlink);
 
     let error = converge_entry(&fixture, &options(&temp.path().join("backups")))

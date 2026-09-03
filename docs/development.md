@@ -15,7 +15,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny check
-python -m pytest tests/test_signed_release.py
+python -m pytest tests
 ```
 
 Run the authenticated release-set recipe only from the exact clean revision intended for publication. The recipe embeds the full source commit and a clean-tree marker in every Rust artifact, remaps checkout and user paths out of compiler metadata, and produces no private-key material; release acceptance compares the metadata and installed digest with the signed artifact before support is claimed.

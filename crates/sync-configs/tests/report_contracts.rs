@@ -1,4 +1,4 @@
-use sync_configs::report::{Record, Report, Status};
+use sync_configs::report::{ReconcilerSummary, Record, Report, Status};
 
 #[test]
 fn json_is_one_value_free_summary_document() {
@@ -12,7 +12,19 @@ fn json_is_one_value_free_summary_document() {
             message: "DO_NOT_SERIALIZE_VALUE".to_owned(),
             output: None,
         }],
-        reconcilers: Vec::new(),
+        reconcilers: vec![ReconcilerSummary {
+            schema: "dev-tools-reconcile-result-v1",
+            name: "owner-tool".to_owned(),
+            group: Some("Identity".to_owned()),
+            subgroup: Some("Dev Auth".to_owned()),
+            scope: "user".to_owned(),
+            changed: true,
+            verified: true,
+            deferred: false,
+            input_required: Vec::new(),
+            next_action: "none".to_owned(),
+            diagnostics: Vec::new(),
+        }],
     };
     let encoded = serde_json::to_string(&report.json()).expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&encoded).expect("one JSON document");
@@ -21,6 +33,10 @@ fn json_is_one_value_free_summary_document() {
     assert_eq!(parsed["exit_code"], 0);
     assert_eq!(parsed["dry_run"], true);
     assert_eq!(parsed["profiles"], serde_json::json!(["linux", "desktop"]));
+    assert_eq!(
+        parsed["reconcilers"][0]["schema"],
+        serde_json::json!("dev-tools-reconcile-result-v1")
+    );
     assert!(!encoded.contains("DO_NOT_SERIALIZE"));
 }
 

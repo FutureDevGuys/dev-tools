@@ -70,6 +70,55 @@ def test_release_builder_builds_sync_configs_as_a_selected_cargo_binary() -> Non
     ]
 
 
+def test_release_builder_rejects_unaccepted_sync_configs_target_before_work(
+    monkeypatch,
+) -> None:
+    module = load_release_set_module()
+    monkeypatch.setattr(
+        module,
+        "parse_args",
+        lambda: SimpleNamespace(products=["sync-configs"]),
+    )
+    monkeypatch.setattr(module, "target_id", lambda: "windows-x86_64")
+
+    with pytest.raises(SystemExit, match="sync-configs release target is not accepted"):
+        module.main()
+
+
+def test_release_signer_rejects_unaccepted_sync_configs_target_before_io(
+    monkeypatch,
+) -> None:
+    module_path = ROOT / "scripts" / "build-signed-release.py"
+    spec = importlib.util.spec_from_file_location("build_signed_release", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(
+        module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            product="sync-configs",
+            target="macos-aarch64",
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="sync-configs release target is not accepted"):
+        module.main()
+
+
+def test_release_target_policy_leaves_other_products_platform_generic() -> None:
+    module = load_release_set_module()
+
+    module.require_accepted_release_target("sync-configs", "linux-x86_64")
+    for target in ("linux-aarch64", "macos-aarch64", "windows-x86_64"):
+        with pytest.raises(
+            SystemExit,
+            match="sync-configs release target is not accepted",
+        ):
+            module.require_accepted_release_target("sync-configs", target)
+    module.require_accepted_release_target("update-all", "windows-x86_64")
+
+
 def test_release_builder_uses_exe_names_for_every_windows_product(
     tmp_path: Path,
 ) -> None:

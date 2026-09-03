@@ -47,14 +47,7 @@ The owner-only `--release-private-key` mode remains available for initial bootst
 
 The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before producing deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
 
-Repeat `--product` to construct more than one product from the same exact source
-revision, or omit it to construct all five. For multiple products, repeat the
-generation option as `--manifest-generation update-all=7` and
-`--manifest-generation dev-cache=9`; every selected product must be named
-exactly once. Each product therefore keeps its own version and manifest
-generation, and independent nested release lines never need to be artificially
-synchronized. The output path should live on persistent owner-controlled
-storage rather than a memory-backed temporary filesystem.
+Repeat `--product` to construct more than one product from the same exact source revision. Omit it to select all five only on `linux-x86_64`: `sync-configs` is presently accepted solely for that release target, so an all-products build on any other target fails closed before compilation and must instead name only the accepted products explicitly. For multiple products, repeat the generation option as `--manifest-generation update-all=7` and `--manifest-generation dev-cache=9`; every selected product must be named exactly once. Each product therefore keeps its own version and manifest generation, and independent nested release lines never need to be artificially synchronized. The output path should live on persistent owner-controlled storage rather than a memory-backed temporary filesystem.
 
 Each product uses independent nested tags: `update-all/vX.Y.Z`, `dev-auth/vX.Y.Z`, `dev-cache/vX.Y.Z`, `sync-configs/vX.Y.Z`, and `skills-sync/vX.Y.Z`.
 

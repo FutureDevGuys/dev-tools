@@ -141,6 +141,13 @@ pub struct VersionedAdoption {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct VersionedTwoLevelAdoption {
+    pub adoption: VersionedAdoption,
+    pub version_pointer: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VersionedReceipt {
     pub schema: String,
     pub product: String,
@@ -174,6 +181,16 @@ struct VersionedTransitionJournal {
     schema: String,
     prior: Option<VersionedReceipt>,
     next: VersionedReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy: Option<VersionedLegacyTransition>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct VersionedLegacyTransition {
+    version_pointer: Option<PathBuf>,
+    version_pointer_present: bool,
+    present_aliases: Vec<String>,
 }
 
 const VERSIONED_RECEIPT_SCHEMA: &str = "dev-tools-versioned-installation-v1";
@@ -321,12 +338,52 @@ pub fn adopt_versioned_installation<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    adopt_versioned_installation_inner(adoption, None, post_install_verify, |_| Ok(()))
+}
+
+pub fn adopt_two_level_versioned_installation<F>(
+    request: &VersionedTwoLevelAdoption,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    adopt_versioned_installation_inner(
+        &request.adoption,
+        Some(&request.version_pointer),
+        post_install_verify,
+        |_| Ok(()),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyAdoptionPhase {
+    JournalWritten,
+    ActivePublished,
+    AliasPublished(usize),
+    VersionPointerRetired,
+    ReceiptWritten,
+}
+
+fn adopt_versioned_installation_inner<F, Observe>(
+    adoption: &VersionedAdoption,
+    version_pointer: Option<&Path>,
+    post_install_verify: F,
+    mut observe: Observe,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+    Observe: FnMut(LegacyAdoptionPhase) -> Result<()>,
+{
     validate_version_and_aliases(
         &adoption.layout,
         &adoption.version,
         &adoption.identity,
         &adoption.aliases,
     )?;
+    if let Some(version_pointer) = version_pointer {
+        validate_legacy_version_pointer(&adoption.layout, version_pointer)?;
+    }
     harden_legacy_adoption_layout(&adoption.layout, &adoption.version)?;
     prepare_layout(&adoption.layout, Some(&adoption.version))?;
     let _lock = InstallationLock::acquire(&adoption.layout.lock_path())?;
@@ -350,16 +407,7 @@ where
     let artifact = adoption.layout.version_artifact(&adoption.version);
     verify_versioned_artifact_authority(&artifact, adoption.layout.owner_uid, &adoption.identity)?;
     post_install_verify(&artifact).context("adopted product verification failed")?;
-    for alias in &adoption.aliases {
-        let path = adoption.layout.bin_dir.join(alias);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata)
-                if metadata.file_type().is_symlink() && fs::read_link(&path)? == artifact => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => bail!("legacy installation alias is not owned by the adopted artifact"),
-            Err(error) => return Err(error).context("inspect legacy installation alias"),
-        }
-    }
+    let legacy = inspect_legacy_transition(adoption, version_pointer, &artifact)?;
     require_path_absent(&adoption.layout.active_pointer())?;
     require_path_absent(&adoption.layout.previous_pointer())?;
     let next = VersionedReceipt {
@@ -378,26 +426,38 @@ where
         schema: VERSIONED_JOURNAL_SCHEMA.into(),
         prior: None,
         next: next.clone(),
+        legacy: Some(legacy.clone()),
     };
     write_transition_journal(&adoption.layout, &journal)?;
     let transition = (|| -> Result<()> {
-        for alias in &adoption.aliases {
-            let path = adoption.layout.bin_dir.join(alias);
-            match fs::symlink_metadata(&path) {
-                Ok(_) => remove_exact_symlink(&path, &artifact)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("inspect adopted installation alias"),
-            }
-        }
+        observe(LegacyAdoptionPhase::JournalWritten)?;
         replace_owned_symlink(&adoption.layout.active_pointer(), Some(&artifact), None)?;
-        for alias in &adoption.aliases {
+        observe(LegacyAdoptionPhase::ActivePublished)?;
+        let prior_alias_target = legacy_alias_target(&adoption.layout, &artifact, &legacy);
+        for (index, alias) in adoption.aliases.iter().enumerate() {
             replace_owned_symlink(
                 &adoption.layout.bin_dir.join(alias),
                 Some(&adoption.layout.active_pointer()),
-                None,
+                legacy
+                    .present_aliases
+                    .contains(alias)
+                    .then_some(prior_alias_target.as_path()),
             )?;
+            observe(LegacyAdoptionPhase::AliasPublished(index))?;
+        }
+        if let Some(version_pointer) = legacy.version_pointer.as_deref() {
+            if legacy.version_pointer_present {
+                remove_exact_symlink(
+                    version_pointer,
+                    &adoption.layout.versions_dir().join(&adoption.version),
+                )?;
+            } else {
+                require_path_absent(version_pointer)?;
+            }
+            observe(LegacyAdoptionPhase::VersionPointerRetired)?;
         }
         write_versioned_receipt(&adoption.layout, &next)?;
+        observe(LegacyAdoptionPhase::ReceiptWritten)?;
         verify_versioned_receipt(&adoption.layout, &next)
     })();
     if let Err(error) = transition {
@@ -410,6 +470,74 @@ where
         changed: true,
         receipt: next,
     })
+}
+
+fn validate_legacy_version_pointer(layout: &VersionedLayout, path: &Path) -> Result<()> {
+    if path != layout.data_root.join("current") {
+        bail!("two-level legacy installation has an invalid version pointer");
+    }
+    Ok(())
+}
+
+fn inspect_legacy_transition(
+    adoption: &VersionedAdoption,
+    version_pointer: Option<&Path>,
+    artifact: &Path,
+) -> Result<VersionedLegacyTransition> {
+    let version_pointer_present = if let Some(version_pointer) = version_pointer {
+        inspect_optional_exact_symlink(
+            version_pointer,
+            &adoption.layout.versions_dir().join(&adoption.version),
+            "legacy version pointer does not match authenticated state",
+        )?
+    } else {
+        false
+    };
+    let expected_alias_target = version_pointer
+        .map(|path| path.join(&adoption.layout.artifact_name))
+        .unwrap_or_else(|| artifact.to_path_buf());
+    let mut present_aliases = Vec::new();
+    for alias in &adoption.aliases {
+        if inspect_optional_exact_symlink(
+            &adoption.layout.bin_dir.join(alias),
+            &expected_alias_target,
+            "legacy installation alias is not owned by the adopted artifact",
+        )? {
+            present_aliases.push(alias.clone());
+        }
+    }
+    Ok(VersionedLegacyTransition {
+        version_pointer: version_pointer.map(Path::to_path_buf),
+        version_pointer_present,
+        present_aliases,
+    })
+}
+
+fn inspect_optional_exact_symlink(
+    path: &Path,
+    expected: &Path,
+    mismatch: &'static str,
+) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() && fs::read_link(path)? == expected => {
+            Ok(true)
+        }
+        Ok(_) => bail!(mismatch),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect legacy installation pointer"),
+    }
+}
+
+fn legacy_alias_target(
+    layout: &VersionedLayout,
+    artifact: &Path,
+    legacy: &VersionedLegacyTransition,
+) -> PathBuf {
+    legacy
+        .version_pointer
+        .as_ref()
+        .map(|path| path.join(&layout.artifact_name))
+        .unwrap_or_else(|| artifact.to_path_buf())
 }
 
 fn harden_legacy_adoption_layout(layout: &VersionedLayout, version: &str) -> Result<()> {
@@ -484,6 +612,32 @@ pub fn verify_versioned_installation(layout: &VersionedLayout) -> Result<Version
     Ok(receipt)
 }
 
+pub fn repair_versioned_installation<F>(
+    layout: &VersionedLayout,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    validate_layout(layout)?;
+    let _lock = InstallationLock::acquire(&layout.lock_path())?;
+    recover_versioned_installation_locked(layout)?;
+    let receipt = read_versioned_receipt(layout)?.context("installation receipt is absent")?;
+    let active = layout.version_artifact(&receipt.active_version);
+    verify_versioned_artifact_authority(&active, layout.owner_uid, &receipt.active_identity)?;
+    post_install_verify(&active).context("installed product verification failed")?;
+    let changed = repair_missing_receipt_links(layout, &receipt)?;
+    verify_versioned_receipt(layout, &receipt)?;
+    Ok(VersionedApplyReport { changed, receipt })
+}
+
+pub fn read_versioned_installation_receipt(
+    layout: &VersionedLayout,
+) -> Result<Option<VersionedReceipt>> {
+    validate_layout(layout)?;
+    read_versioned_receipt(layout)
+}
+
 pub fn inspect_versioned_installation(
     layout: &VersionedLayout,
 ) -> Result<Option<VersionedReceipt>> {
@@ -538,6 +692,51 @@ where
         .context("installation has no retained previous identity")?;
     let candidate = layout.version_artifact(&previous_version);
     post_install_verify(&candidate).context("product rollback verification failed")?;
+    let next = VersionedReceipt {
+        active_version: previous_version,
+        active_identity: previous_identity,
+        previous_version: Some(prior.active_version.clone()),
+        previous_identity: Some(prior.active_identity.clone()),
+        ..prior.clone()
+    };
+    commit_versioned_transition(layout, Some(&prior), &next)?;
+    Ok(VersionedApplyReport {
+        changed: true,
+        receipt: next,
+    })
+}
+
+pub fn rollback_versioned_installation_with_link_repair<F>(
+    layout: &VersionedLayout,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    validate_layout(layout)?;
+    let _lock = InstallationLock::acquire(&layout.lock_path())?;
+    if read_transition_journal(layout)?.is_some() {
+        bail!("installation rollback cannot preflight a pending transition");
+    }
+    let prior = read_versioned_receipt(layout)?.context("installation receipt is absent")?;
+    let active = layout.version_artifact(&prior.active_version);
+    verify_versioned_artifact_authority(&active, layout.owner_uid, &prior.active_identity)
+        .context("active version does not match its receipt")?;
+    let previous_version = prior
+        .previous_version
+        .clone()
+        .context("installation has no retained previous version")?;
+    let previous_identity = prior
+        .previous_identity
+        .clone()
+        .context("installation has no retained previous identity")?;
+    let candidate = layout.version_artifact(&previous_version);
+    verify_versioned_artifact_authority(&candidate, layout.owner_uid, &previous_identity)
+        .context("previous version does not match its receipt")?;
+    post_install_verify(&candidate).context("product rollback verification failed")?;
+
+    repair_missing_receipt_links(layout, &prior)?;
+    verify_versioned_receipt(layout, &prior)?;
     let next = VersionedReceipt {
         active_version: previous_version,
         active_identity: previous_identity,
@@ -958,6 +1157,7 @@ fn commit_versioned_transition(
         schema: VERSIONED_JOURNAL_SCHEMA.into(),
         prior: prior.cloned(),
         next: next.clone(),
+        legacy: None,
     };
     write_transition_journal(layout, &journal)?;
 
@@ -1018,9 +1218,7 @@ fn write_transition_journal(
     layout: &VersionedLayout,
     journal: &VersionedTransitionJournal,
 ) -> Result<()> {
-    if journal.schema != VERSIONED_JOURNAL_SCHEMA {
-        bail!("versioned installation transition journal is unsupported");
-    }
+    validate_transition_journal(layout, journal)?;
     let bytes = serde_jcs::to_vec(journal).context("serialize installation transition journal")?;
     write_atomic_document(
         &layout.journal_path(),
@@ -1038,6 +1236,14 @@ fn read_transition_journal(layout: &VersionedLayout) -> Result<Option<VersionedT
     };
     let journal: VersionedTransitionJournal =
         serde_json::from_slice(&document.bytes).context("parse installation transition journal")?;
+    validate_transition_journal(layout, &journal)?;
+    Ok(Some(journal))
+}
+
+fn validate_transition_journal(
+    layout: &VersionedLayout,
+    journal: &VersionedTransitionJournal,
+) -> Result<()> {
     if journal.schema != VERSIONED_JOURNAL_SCHEMA {
         bail!("versioned installation transition journal is unsupported");
     }
@@ -1045,7 +1251,38 @@ fn read_transition_journal(layout: &VersionedLayout) -> Result<Option<VersionedT
         validate_versioned_receipt(layout, prior)?;
     }
     validate_versioned_receipt(layout, &journal.next)?;
-    Ok(Some(journal))
+    if let Some(legacy) = &journal.legacy {
+        if journal.prior.is_some() {
+            bail!("legacy adoption journal cannot replace a published receipt");
+        }
+        validate_legacy_transition(layout, &journal.next, legacy)?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_transition(
+    layout: &VersionedLayout,
+    next: &VersionedReceipt,
+    legacy: &VersionedLegacyTransition,
+) -> Result<()> {
+    if next.previous_version.is_some() || next.previous_identity.is_some() {
+        bail!("legacy adoption journal cannot declare a previous version");
+    }
+    match legacy.version_pointer.as_deref() {
+        Some(path) => validate_legacy_version_pointer(layout, path)?,
+        None if legacy.version_pointer_present => {
+            bail!("legacy adoption journal has an invalid version pointer state");
+        }
+        None => {}
+    }
+    let mut prior: Option<&String> = None;
+    for alias in &legacy.present_aliases {
+        if !next.aliases.contains(alias) || prior.is_some_and(|prior| prior >= alias) {
+            bail!("legacy adoption journal aliases are invalid");
+        }
+        prior = Some(alias);
+    }
+    Ok(())
 }
 
 fn remove_transition_journal(layout: &VersionedLayout) -> Result<()> {
@@ -1118,18 +1355,52 @@ fn restore_transition_prior(
             verify_versioned_receipt(layout, prior)
         }
         None => {
-            remove_symlink_if_target(&layout.active_pointer(), &next_active)?;
-            if let Some(next_previous) = next_previous.as_deref() {
-                remove_symlink_if_target(&layout.previous_pointer(), next_previous)?;
+            if let Some(legacy) = &journal.legacy {
+                restore_legacy_transition(layout, &journal.next, legacy, &next_active)?;
             } else {
-                require_path_absent(&layout.previous_pointer())?;
-            }
-            for alias in &journal.next.aliases {
-                remove_symlink_if_target(&layout.bin_dir.join(alias), &layout.active_pointer())?;
+                remove_symlink_if_target(&layout.active_pointer(), &next_active)?;
+                if let Some(next_previous) = next_previous.as_deref() {
+                    remove_symlink_if_target(&layout.previous_pointer(), next_previous)?;
+                } else {
+                    require_path_absent(&layout.previous_pointer())?;
+                }
+                for alias in &journal.next.aliases {
+                    remove_symlink_if_target(
+                        &layout.bin_dir.join(alias),
+                        &layout.active_pointer(),
+                    )?;
+                }
             }
             Ok(())
         }
     }
+}
+
+fn restore_legacy_transition(
+    layout: &VersionedLayout,
+    next: &VersionedReceipt,
+    legacy: &VersionedLegacyTransition,
+    next_active: &Path,
+) -> Result<()> {
+    if let Some(version_pointer) = legacy.version_pointer.as_deref() {
+        let expected = layout.versions_dir().join(&next.active_version);
+        if legacy.version_pointer_present {
+            restore_owned_symlink(version_pointer, &expected, None)?;
+        } else {
+            require_path_absent(version_pointer)?;
+        }
+    }
+    let prior_alias_target = legacy_alias_target(layout, next_active, legacy);
+    for alias in &next.aliases {
+        let path = layout.bin_dir.join(alias);
+        if legacy.present_aliases.contains(alias) {
+            restore_owned_symlink(&path, &prior_alias_target, Some(&layout.active_pointer()))?;
+        } else {
+            remove_symlink_if_target(&path, &layout.active_pointer())?;
+        }
+    }
+    require_path_absent(&layout.previous_pointer())?;
+    remove_symlink_if_target(&layout.active_pointer(), next_active)
 }
 
 fn restore_optional_symlink(
@@ -1770,6 +2041,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(all(test, unix))]
 mod versioned_tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     fn request(root: &Path, version: &str, bytes: &[u8]) -> VersionedInstallRequest {
         let source = root.join(format!("source-{version}"));
@@ -1788,6 +2060,56 @@ mod versioned_tests {
             identity: ArtifactIdentity::from_file(&source, 4096).unwrap(),
             source,
             aliases: vec!["fixture".into()],
+        }
+    }
+
+    fn two_level_adoption(root: &Path) -> VersionedTwoLevelAdoption {
+        let mut fixture = request(root, "1.0.0", b"legacy");
+        fixture.aliases.push("fixture-helper".into());
+        let artifact = fixture.layout.version_artifact(&fixture.version);
+        let versions_dir = fixture.layout.versions_dir();
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::create_dir_all(&fixture.layout.bin_dir).unwrap();
+        for directory in [
+            fixture.layout.data_root.as_path(),
+            versions_dir.as_path(),
+            artifact.parent().unwrap(),
+            fixture.layout.bin_dir.as_path(),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::copy(&fixture.source, &artifact).unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+        let version_pointer = fixture.layout.data_root.join("current");
+        symlink(versions_dir.join(&fixture.version), &version_pointer).unwrap();
+        for alias in &fixture.aliases {
+            symlink(
+                version_pointer.join(&fixture.layout.artifact_name),
+                fixture.layout.bin_dir.join(alias),
+            )
+            .unwrap();
+        }
+        VersionedTwoLevelAdoption {
+            adoption: VersionedAdoption {
+                layout: fixture.layout,
+                version: fixture.version,
+                identity: fixture.identity,
+                aliases: fixture.aliases,
+            },
+            version_pointer,
+        }
+    }
+
+    fn assert_aliases_resolve(adoption: &VersionedTwoLevelAdoption) {
+        let artifact = adoption
+            .adoption
+            .layout
+            .version_artifact(&adoption.adoption.version);
+        for alias in &adoption.adoption.aliases {
+            assert_eq!(
+                fs::canonicalize(adoption.adoption.layout.bin_dir.join(alias)).unwrap(),
+                artifact
+            );
         }
     }
 
@@ -1821,6 +2143,7 @@ mod versioned_tests {
                 schema: VERSIONED_JOURNAL_SCHEMA.into(),
                 prior: Some(prior.clone()),
                 next: next.clone(),
+                legacy: None,
             },
         )
         .unwrap();
@@ -1840,5 +2163,121 @@ mod versioned_tests {
         recover_versioned_installation_locked(&second.layout).unwrap();
         verify_versioned_receipt(&second.layout, &prior).unwrap();
         assert!(!second.layout.journal_path().exists());
+    }
+
+    #[test]
+    fn two_level_adoption_is_recoverable_without_stranding_commands_at_each_pointer_phase() {
+        for interrupted_after in [
+            LegacyAdoptionPhase::JournalWritten,
+            LegacyAdoptionPhase::ActivePublished,
+            LegacyAdoptionPhase::AliasPublished(0),
+            LegacyAdoptionPhase::AliasPublished(1),
+            LegacyAdoptionPhase::VersionPointerRetired,
+            LegacyAdoptionPhase::ReceiptWritten,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let request = two_level_adoption(temp.path());
+            let result = adopt_versioned_installation_inner(
+                &request.adoption,
+                Some(&request.version_pointer),
+                |_| Ok(()),
+                |phase| {
+                    if phase == interrupted_after {
+                        bail!("injected adoption interruption");
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_aliases_resolve(&request);
+            assert!(request.adoption.layout.journal_path().is_file());
+
+            {
+                let _lock =
+                    InstallationLock::acquire(&request.adoption.layout.lock_path()).unwrap();
+                recover_versioned_installation_locked(&request.adoption.layout).unwrap();
+            }
+            assert!(!request.adoption.layout.journal_path().exists());
+
+            if interrupted_after == LegacyAdoptionPhase::ReceiptWritten {
+                let receipt = verify_versioned_installation(&request.adoption.layout).unwrap();
+                assert_eq!(receipt.active_version, request.adoption.version);
+                assert!(!request.version_pointer.exists());
+                for alias in &request.adoption.aliases {
+                    assert_eq!(
+                        fs::read_link(request.adoption.layout.bin_dir.join(alias)).unwrap(),
+                        request.adoption.layout.active_pointer()
+                    );
+                }
+            } else {
+                assert!(read_versioned_receipt(&request.adoption.layout)
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    fs::read_link(&request.version_pointer).unwrap(),
+                    request
+                        .adoption
+                        .layout
+                        .versions_dir()
+                        .join(&request.adoption.version)
+                );
+                for alias in &request.adoption.aliases {
+                    assert_eq!(
+                        fs::read_link(request.adoption.layout.bin_dir.join(alias)).unwrap(),
+                        request
+                            .version_pointer
+                            .join(&request.adoption.layout.artifact_name)
+                    );
+                }
+                assert!(!request.adoption.layout.active_pointer().exists());
+                assert_aliases_resolve(&request);
+
+                let adopted = adopt_two_level_versioned_installation(&request, |_| Ok(())).unwrap();
+                assert!(adopted.changed);
+                assert_aliases_resolve(&request);
+            }
+        }
+    }
+
+    #[test]
+    fn two_level_adoption_recovery_preserves_an_originally_absent_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = two_level_adoption(temp.path());
+        let absent_alias = request.adoption.layout.bin_dir.join("fixture-helper");
+        fs::remove_file(&absent_alias).unwrap();
+
+        let result = adopt_versioned_installation_inner(
+            &request.adoption,
+            Some(&request.version_pointer),
+            |_| Ok(()),
+            |phase| {
+                if phase == LegacyAdoptionPhase::AliasPublished(1) {
+                    bail!("injected adoption interruption");
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(fs::symlink_metadata(&absent_alias).is_ok());
+
+        {
+            let _lock = InstallationLock::acquire(&request.adoption.layout.lock_path()).unwrap();
+            recover_versioned_installation_locked(&request.adoption.layout).unwrap();
+        }
+        assert!(fs::symlink_metadata(&absent_alias).is_err());
+        assert_eq!(
+            fs::read_link(request.adoption.layout.bin_dir.join("fixture")).unwrap(),
+            request
+                .version_pointer
+                .join(&request.adoption.layout.artifact_name)
+        );
+        assert_eq!(
+            fs::read_link(&request.version_pointer).unwrap(),
+            request
+                .adoption
+                .layout
+                .versions_dir()
+                .join(&request.adoption.version)
+        );
     }
 }

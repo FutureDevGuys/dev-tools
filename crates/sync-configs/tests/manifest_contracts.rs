@@ -453,6 +453,45 @@ fn source_and_manifest_overrides_are_resolved_without_double_selecting_sources()
 }
 
 #[test]
+fn source_overrides_skip_privileged_targets_but_still_apply_to_user_targets() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path();
+    for source in [
+        "user.conf",
+        "user.override.conf",
+        "system.conf",
+        "system.override.conf",
+    ] {
+        fs::write(root.join(source), "managed\n").expect("source fixture");
+    }
+    fs::write(
+        root.join("manifest.yaml"),
+        r#"
+entries:
+  - name: user-policy
+    source: ./user.conf
+    target: ./user-target.conf
+    mode: copy
+  - name: system-policy
+    source: ./system.conf
+    target: /etc/example/system.conf
+    mode: copy
+    target_privilege: sudo
+    target_owner: root
+    target_group: root
+    target_parent_mode: "0755"
+    permissions: {file: "0644"}
+"#,
+    )
+    .expect("manifest");
+
+    let loaded = load(root, &root.join("manifest.yaml"));
+
+    assert_eq!(loaded.entries[0].source, root.join("user.override.conf"));
+    assert_eq!(loaded.entries[1].source, root.join("system.conf"));
+}
+
+#[test]
 fn profile_map_is_strict_at_root_and_preserves_first_seen_order() {
     let temp = TempDir::new().expect("temporary directory");
     let map = temp.path().join("profiles.yaml");

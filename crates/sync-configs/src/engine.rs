@@ -21,11 +21,12 @@ use crate::filesystem::{
 use crate::hooks::{
     EntryConvergence, HookDecision, HookPlan, HookRunMode, HookShell, HookState, PostHookDecision,
 };
+use crate::interrupt::Interrupted;
 use crate::manifest::{
     check_state_preconditions, collect_profile_names, deduplicate_and_validate_targets,
     load_manifest, load_profile_map, select_entries_for_profiles, select_reconcilers_for_profiles,
     CommentedTargetPolicy, Entry, LoadOptions, Manifest, ManifestError, Mode, Privilege,
-    Reconciler, ReconcilerScope,
+    Reconciler, ReconcilerScope, ScriptFailurePolicy,
 };
 use crate::overlay::json::{overlay_json_file, JsonOverlayOptions};
 use crate::overlay::toml::{
@@ -33,12 +34,14 @@ use crate::overlay::toml::{
     ExclusiveSiblingGroup as OverlayExclusiveSiblingGroup, TomlConflictPolicy, TomlOverlayOptions,
 };
 use crate::paths::{
-    canonical_target_key, resolve_config_path, PathContext, PathError, PathPlatform,
+    canonical_target_key, is_absolute_for, resolve_config_path, PathContext, PathError,
+    PathPlatform,
 };
-use crate::privilege::{PrivilegeError, PrivilegeSession};
+use crate::privilege::{discover_trusted_sudo, PrivilegeError, PrivilegeSession};
 use crate::privileged_target::{
-    apply_privileged_plans, plan_selected_privileged_entries, PrivilegedCommands,
-    PrivilegedCopyPlan, PrivilegedTargetError, PrivilegedTargetOutcome, SystemIdentityResolver,
+    apply_privileged_plans, plan_selected_privileged_entries, revalidate_privileged_plans,
+    PrivilegedCommands, PrivilegedCopyPlan, PrivilegedTargetError, PrivilegedTargetOutcome,
+    SystemIdentityResolver,
 };
 use crate::reconciler::{
     resolve_executable as resolve_reconciler_executable, ReconcilerError, ReconcilerPrivilege,
@@ -47,8 +50,16 @@ use crate::reconciler::{
 use crate::report::{ReconcilerSummary, Record, Report, Status};
 use crate::scaffold::{initialize, render_examples, ScaffoldError, ScaffoldPaths};
 
-const RECONCILER_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONCILER_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONCILER_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Expose the fixed production timeout to contract tests without making it
+/// caller-configurable.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[doc(hidden)]
+pub const fn reconciler_timeout_for_test() -> Duration {
+    RECONCILER_TIMEOUT
+}
 
 #[derive(Debug)]
 pub enum RunOutput {
@@ -70,6 +81,8 @@ impl RunOutput {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    #[error(transparent)]
+    Interrupted(#[from] Interrupted),
     #[error(transparent)]
     Path(#[from] PathError),
     #[error(transparent)]
@@ -102,6 +115,25 @@ pub enum EngineError {
     Lock(#[source] AnyError),
 }
 
+impl EngineError {
+    pub const fn is_interrupted(&self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted(_)
+                | Self::Hook(crate::hooks::HookError::Interrupted)
+                | Self::Hook(crate::hooks::HookError::Privilege(
+                    PrivilegeError::Interrupted,
+                ))
+                | Self::Privilege(PrivilegeError::Interrupted)
+                | Self::PrivilegedTarget(PrivilegedTargetError::PrivilegedCommand {
+                    source: PrivilegeError::Interrupted,
+                    ..
+                })
+                | Self::Reconciler(ReconcilerError::Interrupted)
+        )
+    }
+}
+
 struct LoadedRequest {
     manifest: Manifest,
     profiles: Vec<String>,
@@ -114,32 +146,129 @@ struct SelectedReconciler {
 }
 
 pub fn execute(cli: &Cli) -> Result<RunOutput, EngineError> {
+    let mut profiles = normalized_profiles(&cli.profile);
+    execute_observed(cli, &mut profiles)
+}
+
+/// Execute one request while returning the exact profile selection observed by
+/// the engine. The CLI uses this to keep machine output bound to the same
+/// profile-map read that governed convergence.
+pub fn execute_observed(
+    cli: &Cli,
+    observed_profiles: &mut Vec<String>,
+) -> Result<RunOutput, EngineError> {
     if cli.print_example {
+        if let Ok(path_context) = PathContext::from_current_environment() {
+            if let Ok(profiles) = resolve_profiles(cli, &path_context) {
+                *observed_profiles = profiles;
+            }
+        }
         return Ok(RunOutput::Examples(render_examples()));
     }
 
     let path_context = PathContext::from_current_environment()?;
     let config = config_path(cli, &path_context)?;
     if cli.init {
+        if let Ok(profiles) = resolve_profiles(cli, &path_context) {
+            *observed_profiles = profiles;
+        }
         return Ok(RunOutput::Initialized(initialize(&config, cli.force_init)?));
     }
 
     let loaded = load_request(cli, path_context, config)?;
+    *observed_profiles = loaded.profiles.clone();
     if cli.list_profiles {
         return Ok(RunOutput::Profiles(collect_profile_names(&loaded.manifest)));
     }
     if cli.validate {
-        // Selection is intentionally evaluated during validation so bad host
-        // maps and profile combinations fail without hooks or writes.
-        let _ = select_entries_for_profiles(&loaded.manifest.entries, &loaded.profiles);
-        let _ = select_reconcilers_for_profiles(&loaded.manifest.reconcilers, &loaded.profiles);
-        return Ok(RunOutput::Validation(Report {
-            profiles: loaded.profiles,
-            ..Report::default()
-        }));
+        return validate_request(cli, &loaded).map(RunOutput::Validation);
     }
 
     converge(cli, loaded).map(RunOutput::Convergence)
+}
+
+fn validate_request(cli: &Cli, loaded: &LoadedRequest) -> Result<Report, EngineError> {
+    crate::interrupt::check()?;
+    check_state_preconditions(&loaded.manifest)?;
+    let selected_entries = select_entries_for_profiles(&loaded.manifest.entries, &loaded.profiles)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_reconcilers =
+        select_reconcilers_for_profiles(&loaded.manifest.reconcilers, &loaded.profiles);
+    let config_dir = loaded
+        .manifest
+        .path
+        .parent()
+        .unwrap_or_else(|| Path::new("/"));
+
+    // Validation exercises every selected authority boundary, but HookRunMode::Validate
+    // guarantees that no hook is executed and no sudo session is requested.
+    let hooks = HookPlan::prepare(
+        selected_entries.iter(),
+        config_dir,
+        HookShell::current()?,
+        HookRunMode::Validate,
+    )?;
+    hooks.validate_privileged_authority()?;
+    let privileged_targets_selected = selected_entries
+        .iter()
+        .any(|entry| entry.target_privilege == Privilege::Sudo);
+    if privileged_targets_selected {
+        let identities = SystemIdentityResolver::resolve()?;
+        let _plans = plan_selected_privileged_entries(
+            &selected_entries,
+            cli.managed_path_policy == CliManagedPathPolicy::Takeover,
+            &identities,
+        )?;
+        let _commands = PrivilegedCommands::resolve()?;
+    }
+    let runner = ReconcilerRunner {
+        environment: reconciler_environment(&loaded.profiles),
+        sudo_path: None,
+        timeout: RECONCILER_TIMEOUT,
+        output_limit: RECONCILER_OUTPUT_LIMIT,
+    };
+    let privileged_reconciler_selected = selected_reconcilers
+        .iter()
+        .any(|reconciler| reconciler.privilege == Privilege::Sudo);
+    for reconciler in selected_reconcilers {
+        let spec = ReconcilerSpec {
+            name: reconciler.name.clone(),
+            executable: resolve_reconciler_executable(&reconciler.executable)?,
+            source: reconciler.source.clone(),
+            privilege: match reconciler.privilege {
+                Privilege::User => ReconcilerPrivilege::User,
+                Privilege::Sudo => ReconcilerPrivilege::Sudo,
+            },
+            protocol: reconciler.protocol.clone(),
+        };
+        runner.validate(&spec)?;
+    }
+    if hooks.declares_privilege() || privileged_targets_selected || privileged_reconciler_selected {
+        let _session = PrivilegeSession::new(resolve_sudo().ok_or(EngineError::MissingSudo)?)?;
+    }
+
+    let expansion_options = ExpansionOptions {
+        prefer_source_overrides: !cli.no_source_overrides,
+        environment: loaded.path_context.environment.clone(),
+        home: loaded.path_context.home.clone(),
+    };
+    let mut expanded = Vec::new();
+    for entry in &selected_entries {
+        expanded.extend(expand_entries(
+            std::slice::from_ref(entry),
+            &expansion_options,
+        )?);
+    }
+    let _deduplicated =
+        deduplicate_and_validate_targets(expanded, &loaded.path_context, &loaded.manifest.path)?;
+    crate::interrupt::check()?;
+
+    Ok(Report {
+        profiles: loaded.profiles.clone(),
+        ..Report::default()
+    })
 }
 
 fn load_request(
@@ -147,34 +276,11 @@ fn load_request(
     path_context: PathContext,
     config: PathBuf,
 ) -> Result<LoadedRequest, EngineError> {
-    if cli.profile_map.is_some() != cli.host_profile.is_some() {
-        return Err(EngineError::IncompleteProfileMap);
-    }
     let mut options = LoadOptions::default().with_path_context(path_context.clone());
     options.mode_override = cli.mode.map(mode_from_cli);
     options.prefer_source_overrides = !cli.no_source_overrides;
     let manifest = load_manifest(&config, &options)?;
-
-    let mut profiles = Vec::new();
-    let mut seen = BTreeSet::new();
-    if let (Some(profile_map), Some(host_profile)) = (&cli.profile_map, &cli.host_profile) {
-        for profile in load_profile_map(
-            profile_map,
-            host_profile,
-            cli.profile_map_field.as_deref(),
-            &path_context,
-        )? {
-            if seen.insert(profile.clone()) {
-                profiles.push(profile);
-            }
-        }
-    }
-    for profile in &cli.profile {
-        let profile = profile.trim();
-        if !profile.is_empty() && seen.insert(profile.to_owned()) {
-            profiles.push(profile.to_owned());
-        }
-    }
+    let profiles = resolve_profiles(cli, &path_context)?;
 
     Ok(LoadedRequest {
         manifest,
@@ -184,6 +290,7 @@ fn load_request(
 }
 
 fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
+    crate::interrupt::check()?;
     check_state_preconditions(&loaded.manifest)?;
 
     let selected_entries = select_entries_for_profiles(&loaded.manifest.entries, &loaded.profiles)
@@ -212,6 +319,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         HookShell::current()?,
         hook_mode,
     )?;
+    hooks.validate_privileged_authority()?;
 
     // Privileged entry planning resolves identities and snapshots every target
     // before either authentication or hook execution.
@@ -257,6 +365,31 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         })
         .collect::<Result<Vec<_>, ReconcilerError>>()?;
 
+    // Validate every currently observable source boundary before any lock,
+    // authentication, or trusted hook side effect. Duplicate targets can be
+    // rejected here only when every involved entry is guaranteed to remain
+    // eligible: a failed pre-hook with `abort` or `skip` intentionally removes
+    // its entry before Python 0.1.13's target-deduplication boundary. The full
+    // active graph is expanded and validated again after pre-hooks.
+    let preflight_expansion_options = ExpansionOptions {
+        prefer_source_overrides: !cli.no_source_overrides,
+        environment: loaded.path_context.environment.clone(),
+        home: loaded.path_context.home.clone(),
+    };
+    let mut preflight_expanded = Vec::new();
+    for entry in &selected_entries {
+        let expanded = expand_entries(std::slice::from_ref(entry), &preflight_expansion_options)?;
+        if entry.pre_script.is_none() || entry.pre_script_on_fail == ScriptFailurePolicy::Continue {
+            preflight_expanded.extend(expanded);
+        }
+    }
+    let _preflight_targets = deduplicate_and_validate_targets(
+        preflight_expanded,
+        &loaded.path_context,
+        &loaded.manifest.path,
+    )?;
+    crate::interrupt::check()?;
+
     // Serialize the complete mutating phase, including trusted hooks and
     // reconcilers. Validation and dry-run remain strictly read-only and never
     // create lock metadata.
@@ -271,24 +404,22 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
             None => return Err(EngineError::Busy),
         }
     };
+    crate::interrupt::check()?;
 
     let privileged_reconciler = reconciler_specs
         .iter()
         .any(|reconciler| reconciler.manifest.privilege == Privilege::Sudo);
-    // Hooks and privileged reconcilers are selected before expansion and need
-    // the shared session at their protocol boundary. Privileged file targets
-    // deliberately do not authenticate yet: pre-hooks, expansion, and target
-    // deduplication can still prove that no target mutation is eligible.
-    let needs_early_authentication =
-        !cli.dry_run && (hooks.requires_privilege() || privileged_reconciler);
-    let mut session = if needs_early_authentication {
+    // Only a privileged pre-hook needs authentication before pre-hook
+    // execution. Privileged targets, reconcilers, and post-hooks authenticate
+    // at their later protocol boundaries after all available preflight.
+    let mut session = if !cli.dry_run && hooks.requires_pre_privilege() {
         let mut session = PrivilegeSession::new(resolve_sudo().ok_or(EngineError::MissingSudo)?)?;
-        session.ensure_authenticated()?;
-        runner.sudo_path = Some(session.sudo_path().to_path_buf());
+        hooks.authenticate(&mut session)?;
         Some(session)
     } else {
         None
     };
+    crate::interrupt::check()?;
 
     let mut report = Report {
         dry_run: cli.dry_run,
@@ -297,6 +428,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
     };
     let mut eligible = vec![true; selected_entries.len()];
     let pre_records = hooks.run_pre_hooks(session.as_ref())?;
+    crate::interrupt::check()?;
     for pre in pre_records {
         let Some(index) = selected_entries
             .iter()
@@ -339,6 +471,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
     let mut expanded_with_origin = Vec::new();
     let mut origin_convergence = vec![None; selected_entries.len()];
     for (index, entry) in selected_entries.iter().enumerate() {
+        crate::interrupt::check()?;
         if !eligible[index] {
             origin_convergence[index] = Some(EntryConvergence::Failed);
             continue;
@@ -374,38 +507,61 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         &loaded.path_context,
         &loaded.manifest.path,
     )?;
+    crate::interrupt::check()?;
 
     let active_targets = expanded
         .iter()
         .map(|entry| canonical_target_key(&entry.target, &loaded.path_context))
         .collect::<BTreeSet<_>>();
-    let active_privileged_plans = privileged_plans
-        .into_iter()
-        .filter(|plan| {
-            active_targets.contains(&canonical_target_key(
-                &plan.entry.target,
-                &loaded.path_context,
-            ))
-        })
+    let mut active_privileged_by_target = BTreeMap::new();
+    let privileged_origins = selected_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.target_privilege == Privilege::Sudo)
+        .map(|(index, _)| index);
+    for (plan, origin) in privileged_plans.into_iter().zip(privileged_origins) {
+        let key = canonical_target_key(&plan.entry.target, &loaded.path_context);
+        if eligible[origin] && active_targets.contains(&key) {
+            active_privileged_by_target.entry(key).or_insert(plan);
+        }
+    }
+    let active_privileged_plans = active_privileged_by_target
+        .into_values()
         .collect::<Vec<_>>();
-    let privileged_commands = if !cli.dry_run
-        && active_privileged_plans
-            .iter()
-            .any(PrivilegedCopyPlan::needs_mutation)
-    {
+    let active_privileged_plans = if active_privileged_plans.is_empty() {
+        Vec::new()
+    } else {
+        let identities = identities
+            .as_ref()
+            .ok_or(PrivilegedTargetError::Unsupported)?;
+        // Revalidate the complete active batch after pre-hooks and expansion.
+        // No target, helper, or sudo mutation may precede this all-target gate.
+        revalidate_privileged_plans(&active_privileged_plans, identities)?
+    };
+    let privileged_target_mutation = active_privileged_plans
+        .iter()
+        .any(PrivilegedCopyPlan::needs_mutation);
+    let privileged_commands = if !cli.dry_run && privileged_target_mutation {
         // Resolve every fixed privileged helper before asking the user to
         // authenticate. A missing/unsafe command must remain mutation-free.
-        let commands = PrivilegedCommands::resolve()?;
-        if session.is_none() {
-            let mut target_session =
-                PrivilegeSession::new(resolve_sudo().ok_or(EngineError::MissingSudo)?)?;
-            target_session.ensure_authenticated()?;
-            session = Some(target_session);
-        }
-        Some(commands)
+        Some(PrivilegedCommands::resolve()?)
     } else {
         None
     };
+    crate::interrupt::check()?;
+    if !cli.dry_run && (privileged_target_mutation || privileged_reconciler) {
+        if session.is_none() {
+            session = Some(PrivilegeSession::new(
+                resolve_sudo().ok_or(EngineError::MissingSudo)?,
+            )?);
+        }
+        let active_session = session.as_mut().ok_or(EngineError::MissingSudo)?;
+        active_session.ensure_authenticated()?;
+        if privileged_reconciler {
+            runner.sudo_path = Some(active_session.sudo_path().to_path_buf());
+        }
+    }
+    crate::interrupt::check()?;
     let privileged_by_target = active_privileged_plans
         .into_iter()
         .map(|plan| {
@@ -418,6 +574,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
 
     let backup_root = backup_root(&loaded.path_context)?;
     for entry in &expanded {
+        crate::interrupt::check()?;
         let key = canonical_target_key(&entry.target, &loaded.path_context);
         let origins = origin_by_target.get(&key);
         let outcome = if let Some(plan) = privileged_by_target.get(&key) {
@@ -452,6 +609,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
                     convergence_from_privileged(outcome)
                 }
                 Err(error) => {
+                    crate::interrupt::check()?;
                     report.records.push(error_record(entry, &error));
                     EntryConvergence::Failed
                 }
@@ -464,9 +622,11 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
                 merge_convergence(&mut origin_convergence[*origin], outcome);
             }
         }
+        crate::interrupt::check()?;
     }
 
     for reconciler in &reconciler_specs {
+        crate::interrupt::check()?;
         if cli.dry_run && reconciler.manifest.privilege == Privilege::Sudo {
             let summary = reconciler_summary(
                 &reconciler.manifest,
@@ -517,6 +677,7 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
                     result.diagnostics,
                 ));
             }
+            Err(ReconcilerError::Interrupted) => return Err(Interrupted.into()),
             Err(error) => report.records.push(Record {
                 status: Status::Errors,
                 scope: reconciler.manifest.scope_label(),
@@ -525,15 +686,27 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
                 output: None,
             }),
         }
+        crate::interrupt::check()?;
     }
 
-    let post_records = hooks.run_post_hooks(session.as_ref(), |entry| {
+    let post_convergence = |entry: &Entry| {
         selected_entries
             .iter()
             .position(|candidate| std::ptr::eq(candidate, entry))
             .and_then(|index| origin_convergence[index])
             .unwrap_or(EntryConvergence::Skipped)
-    })?;
+    };
+    if !cli.dry_run && hooks.requires_eligible_post_privilege(post_convergence) {
+        if session.is_none() {
+            session = Some(PrivilegeSession::new(
+                resolve_sudo().ok_or(EngineError::MissingSudo)?,
+            )?);
+        }
+        hooks.authenticate(session.as_mut().ok_or(EngineError::MissingSudo)?)?;
+    }
+    crate::interrupt::check()?;
+    let post_records = hooks.run_post_hooks(session.as_ref(), post_convergence)?;
+    crate::interrupt::check()?;
     for post in post_records {
         let state = post.execution.status().state;
         let record_status = match (post.decision, state) {
@@ -800,6 +973,7 @@ fn reconciler_summary(
     diagnostics: Vec<String>,
 ) -> ReconcilerSummary {
     ReconcilerSummary {
+        schema: crate::report::RECONCILER_RESULT_SCHEMA,
         name: reconciler.name.clone(),
         group: reconciler.group.clone(),
         subgroup: reconciler.subgroup.clone(),
@@ -815,6 +989,48 @@ fn reconciler_summary(
         next_action,
         diagnostics,
     }
+}
+
+pub fn fallback_profiles_for_output(cli: &Cli) -> Vec<String> {
+    normalized_profiles(&cli.profile)
+}
+
+fn resolve_profiles(cli: &Cli, path_context: &PathContext) -> Result<Vec<String>, EngineError> {
+    if cli.profile_map.is_some() != cli.host_profile.is_some() {
+        return Err(EngineError::IncompleteProfileMap);
+    }
+
+    let mut profiles = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let (Some(profile_map), Some(host_profile)) = (&cli.profile_map, &cli.host_profile) {
+        for profile in load_profile_map(
+            profile_map,
+            host_profile,
+            cli.profile_map_field.as_deref(),
+            path_context,
+        )? {
+            if seen.insert(profile.clone()) {
+                profiles.push(profile);
+            }
+        }
+    }
+    for profile in normalized_profiles(&cli.profile) {
+        if seen.insert(profile.clone()) {
+            profiles.push(profile);
+        }
+    }
+    Ok(profiles)
+}
+
+fn normalized_profiles(profiles: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for profile in profiles {
+        let profile = profile.trim();
+        if !profile.is_empty() && !result.iter().any(|existing| existing == profile) {
+            result.push(profile.to_owned());
+        }
+    }
+    result
 }
 
 fn filesystem_message(status: EntryStatus, dry_run: bool) -> String {
@@ -898,12 +1114,11 @@ fn config_path(cli: &Cli, context: &PathContext) -> Result<PathBuf, EngineError>
         });
     }
     let base = match context.platform {
-        PathPlatform::Windows => environment_value(context, "APPDATA")
-            .map(PathBuf::from)
+        PathPlatform::Windows => absolute_environment_path(context, "APPDATA")
+            .or_else(|| absolute_home(context).map(|home| home.join("AppData/Roaming")))
             .ok_or(EngineError::MissingConfigHome)?,
-        PathPlatform::Posix => environment_value(context, "XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| context.home.as_ref().map(|home| home.join(".config")))
+        PathPlatform::Posix => absolute_environment_path(context, "XDG_CONFIG_HOME")
+            .or_else(|| absolute_home(context).map(|home| home.join(".config")))
             .ok_or(EngineError::MissingConfigHome)?,
     };
     Ok(base.join("sync-configs/manifest.yaml"))
@@ -915,15 +1130,27 @@ fn backup_root(context: &PathContext) -> Result<PathBuf, EngineError> {
 
 fn state_root(context: &PathContext) -> Result<PathBuf, EngineError> {
     let base = match context.platform {
-        PathPlatform::Windows => environment_value(context, "LOCALAPPDATA")
-            .map(PathBuf::from)
+        PathPlatform::Windows => absolute_environment_path(context, "LOCALAPPDATA")
+            .or_else(|| absolute_home(context).map(|home| home.join("AppData/Local")))
             .ok_or(EngineError::MissingStateHome)?,
-        PathPlatform::Posix => environment_value(context, "XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| context.home.as_ref().map(|home| home.join(".local/state")))
+        PathPlatform::Posix => absolute_environment_path(context, "XDG_STATE_HOME")
+            .or_else(|| absolute_home(context).map(|home| home.join(".local/state")))
             .ok_or(EngineError::MissingStateHome)?,
     };
     Ok(base.join("sync-configs"))
+}
+
+fn absolute_environment_path(context: &PathContext, name: &str) -> Option<PathBuf> {
+    environment_value(context, name)
+        .map(PathBuf::from)
+        .filter(|path| is_absolute_for(path, context.platform))
+}
+
+fn absolute_home(context: &PathContext) -> Option<&Path> {
+    context
+        .home
+        .as_deref()
+        .filter(|path| is_absolute_for(path, context.platform))
 }
 
 fn environment_value<'a>(context: &'a PathContext, name: &str) -> Option<&'a OsString> {
@@ -957,19 +1184,5 @@ fn reconciler_environment(profiles: &[String]) -> BTreeMap<OsString, OsString> {
 }
 
 fn resolve_sudo() -> Option<PathBuf> {
-    let mut candidates = ["/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    if let Some(path) = env::var_os("PATH") {
-        candidates.extend(
-            env::split_paths(&path)
-                .filter(|directory| directory.is_absolute())
-                .map(|directory| directory.join("sudo")),
-        );
-    }
-    let mut seen = BTreeSet::new();
-    candidates.into_iter().find(|candidate| {
-        seen.insert(candidate.clone()) && PrivilegeSession::new(candidate.clone()).is_ok()
-    })
+    discover_trusted_sudo(env::var_os("PATH").as_deref())
 }

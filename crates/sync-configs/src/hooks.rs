@@ -4,20 +4,54 @@
 //! manifest, rather than this module, owns the command text. This module fixes
 //! the shell executable and argv grammar, validates every selected hook before
 //! authentication, and keeps command/output bytes out of its structured status.
+//!
+//! Hook execution is bounded through `dev-tools-command`: production hooks get
+//! five minutes and independent 16 MiB stdout/stderr capture ceilings. On Unix,
+//! output limits are enforced while the hook runs and timeout or overflow
+//! terminalizes its owned process group. A process that deliberately creates a
+//! new session leaves that domain, but inherited output handles cannot keep the
+//! runner blocked. On non-Unix platforms the shared runner currently owns only
+//! the direct child, so detached hook descendants remain unsupported.
 
-use std::ffi::{OsStr, OsString};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
 use std::time::Duration;
 
-use dev_tools_command::is_executable_file;
+use dev_tools_command::{
+    is_executable_file, run_bounded_command_with_cancellation, BoundedCommand, BoundedCommandError,
+    BoundedCommandErrorKind, BoundedCommandOutput, BoundedCommandStream,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::manifest::{Entry, Privilege, ScriptFailurePolicy};
 use crate::privilege::{PrivilegeError, PrivilegeSession};
+
+const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_HOOK_OUTPUT_LIMIT: usize = 16 << 20;
+
+#[derive(Clone, Copy, Debug)]
+struct HookExecutionLimits {
+    timeout: Duration,
+    output_limit: usize,
+}
+
+impl Default for HookExecutionLimits {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_HOOK_TIMEOUT,
+            output_limit: DEFAULT_HOOK_OUTPUT_LIMIT,
+        }
+    }
+}
+
+struct PreparedHookCommand {
+    executable: PathBuf,
+    arguments: Vec<OsString>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HookRunMode {
@@ -323,8 +357,11 @@ pub struct HookPlan<'a> {
     entries: Vec<EntryHooks<'a>>,
     config_dir: PathBuf,
     shell: HookShell,
+    environment: BTreeMap<OsString, OsString>,
+    limits: HookExecutionLimits,
     mode: HookRunMode,
-    requires_privilege: bool,
+    requires_pre_privilege: bool,
+    requires_post_privilege: bool,
 }
 
 impl fmt::Debug for HookPlan<'_> {
@@ -334,8 +371,11 @@ impl fmt::Debug for HookPlan<'_> {
             .field("entry_count", &self.entries.len())
             .field("config_dir", &self.config_dir)
             .field("shell", &self.shell)
+            .field("environment_variable_count", &self.environment.len())
+            .field("limits", &self.limits)
             .field("mode", &self.mode)
-            .field("requires_privilege", &self.requires_privilege)
+            .field("requires_pre_privilege", &self.requires_pre_privilege)
+            .field("requires_post_privilege", &self.requires_post_privilege)
             .finish()
     }
 }
@@ -354,29 +394,57 @@ impl<'a> HookPlan<'a> {
     {
         validate_working_directory(config_dir)?;
         let mut prepared = Vec::new();
-        let mut requires_privilege = false;
+        let mut requires_pre_privilege = false;
+        let mut requires_post_privilege = false;
         for entry in entries {
             let pre = HookSpec::pre(entry);
             let post = HookSpec::post(entry);
-            for hook in pre.iter().chain(post.iter()) {
+            for hook in pre.iter() {
                 validate_command(hook)?;
                 if hook.privilege == Privilege::Sudo {
                     validate_privileged_hook_platform()?;
-                    requires_privilege = true;
+                    requires_pre_privilege = true;
+                }
+            }
+            for hook in post.iter() {
+                validate_command(hook)?;
+                if hook.privilege == Privilege::Sudo {
+                    validate_privileged_hook_platform()?;
+                    requires_post_privilege = true;
                 }
             }
             prepared.push(EntryHooks { entry, pre, post });
         }
         if mode != HookRunMode::Apply {
-            requires_privilege = false;
+            requires_pre_privilege = false;
+            requires_post_privilege = false;
         }
         Ok(Self {
             entries: prepared,
             config_dir: config_dir.to_path_buf(),
             shell,
+            environment: std::env::vars_os().collect(),
+            limits: HookExecutionLimits::default(),
             mode,
-            requires_privilege,
+            requires_pre_privilege,
+            requires_post_privilege,
         })
+    }
+
+    /// Replace production resource bounds for fast deterministic integration
+    /// tests. Release builds contain no caller-selectable limits surface.
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_execution_limits_for_test(
+        mut self,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Self {
+        self.limits = HookExecutionLimits {
+            timeout,
+            output_limit,
+        };
+        self
     }
 
     pub const fn mode(&self) -> HookRunMode {
@@ -384,13 +452,63 @@ impl<'a> HookPlan<'a> {
     }
 
     pub const fn requires_privilege(&self) -> bool {
-        self.requires_privilege
+        self.requires_pre_privilege || self.requires_post_privilege
+    }
+
+    pub const fn requires_pre_privilege(&self) -> bool {
+        self.requires_pre_privilege
+    }
+
+    pub const fn requires_post_privilege(&self) -> bool {
+        self.requires_post_privilege
+    }
+
+    pub(crate) fn declares_privilege(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            entry
+                .pre
+                .as_ref()
+                .is_some_and(|hook| hook.privilege == Privilege::Sudo)
+                || entry
+                    .post
+                    .as_ref()
+                    .is_some_and(|hook| hook.privilege == Privilege::Sudo)
+        })
+    }
+
+    pub fn requires_eligible_post_privilege<F>(&self, mut convergence: F) -> bool
+    where
+        F: FnMut(&Entry) -> EntryConvergence,
+    {
+        self.mode == HookRunMode::Apply
+            && self.entries.iter().any(|entry| {
+                entry
+                    .post
+                    .as_ref()
+                    .is_some_and(|hook| hook.privilege == Privilege::Sudo)
+                    && matches!(
+                        convergence(entry.entry),
+                        EntryConvergence::Changed | EntryConvergence::UpToDate
+                    )
+            })
+    }
+
+    /// Validate the fixed elevated shell authority without acquiring a sudo
+    /// timestamp. Engines call this during global preflight so a post-only
+    /// privileged hook cannot reveal an unsafe shell after target mutation.
+    pub(crate) fn validate_privileged_authority(&self) -> Result<(), HookError> {
+        if self.declares_privilege() {
+            crate::privilege::validate_trusted_executable(&self.shell.executable)
+                .map_err(|_| HookError::UnsafeShell)?;
+        }
+        Ok(())
     }
 
     /// Authenticate at most once through the caller-owned shared session.
     /// Dry-run, validation, and hook-free plans are strict no-ops.
     pub fn authenticate(&self, session: &mut PrivilegeSession) -> Result<(), HookError> {
-        if self.requires_privilege {
+        if self.requires_privilege() {
+            session.elevated_executable(&self.shell.executable)?;
             session.ensure_authenticated()?;
         }
         Ok(())
@@ -503,63 +621,96 @@ impl<'a> HookPlan<'a> {
         // failure remains immediate and value-conscious.
         let mut attempt = 0_u32;
         loop {
-            let output = match hook.privilege {
-                Privilege::User => self.user_command(hook.command).output(),
-                Privilege::Sudo => self.privileged_command(hook.command, session)?.output(),
+            let command = match hook.privilege {
+                Privilege::User => self.user_command(hook.command),
+                Privilege::Sudo => self.privileged_command(hook.command, session)?,
             };
+            let output = run_bounded_command_with_cancellation(
+                &BoundedCommand {
+                    executable: &command.executable,
+                    arguments: &command.arguments,
+                    environment: &self.environment,
+                    cwd: Some(&self.config_dir),
+                    timeout: self.limits.timeout,
+                    output_limit: self.limits.output_limit,
+                },
+                crate::interrupt::cancellation_flag(),
+            );
             match output {
                 Ok(output) => return Ok(completed_execution(hook, output)),
                 Err(source) if attempt < 4 && executable_temporarily_busy(&source) => {
                     std::thread::sleep(Duration::from_millis(2_u64 << attempt));
                     attempt += 1;
                 }
-                Err(source) => {
-                    return Err(HookError::Start {
-                        phase: hook.phase,
-                        source,
-                    });
-                }
+                Err(source) => return Err(classify_bounded_error(hook.phase, source)),
             }
         }
     }
 
-    fn user_command(&self, script: &str) -> Command {
-        let mut command = Command::new(&self.shell.executable);
-        command
-            .args(&self.shell.arguments_before_script)
-            .arg(script)
-            .current_dir(&self.config_dir);
-        command
+    fn user_command(&self, script: &str) -> PreparedHookCommand {
+        let mut arguments = self.shell.arguments_before_script.clone();
+        arguments.push(OsString::from(script));
+        PreparedHookCommand {
+            executable: self.shell.executable.clone(),
+            arguments,
+        }
     }
 
     fn privileged_command(
         &self,
         script: &str,
         session: Option<&PrivilegeSession>,
-    ) -> Result<Command, HookError> {
+    ) -> Result<PreparedHookCommand, HookError> {
         let session = session.ok_or(HookError::MissingPrivilegeSession)?;
         if !session.is_authenticated() {
             return Err(HookError::MissingPrivilegeSession);
         }
-        let mut command = Command::new(session.sudo_path());
-        command
-            .args([OsStr::new("-n"), OsStr::new("--")])
-            .arg(&self.shell.executable)
-            .args(&self.shell.arguments_before_script)
-            .arg(script)
-            .current_dir(&self.config_dir);
-        Ok(command)
+        let shell = session.elevated_executable(&self.shell.executable)?;
+        let mut arguments = vec![OsString::from("-n"), OsString::from("--")];
+        arguments.push(shell.into_os_string());
+        arguments.extend(self.shell.arguments_before_script.iter().cloned());
+        arguments.push(OsString::from(script));
+        Ok(PreparedHookCommand {
+            executable: session.sudo_path().to_path_buf(),
+            arguments,
+        })
     }
 }
 
 #[cfg(unix)]
-fn executable_temporarily_busy(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ETXTBSY)
+fn executable_temporarily_busy(error: &BoundedCommandError) -> bool {
+    error.kind() == BoundedCommandErrorKind::Start
+        && error
+            .io_error()
+            .is_some_and(|source| source.raw_os_error() == Some(libc::ETXTBSY))
 }
 
 #[cfg(not(unix))]
-fn executable_temporarily_busy(_error: &std::io::Error) -> bool {
+fn executable_temporarily_busy(_error: &BoundedCommandError) -> bool {
     false
+}
+
+fn classify_bounded_error(phase: HookPhase, source: BoundedCommandError) -> HookError {
+    match source.kind() {
+        BoundedCommandErrorKind::Cancelled => HookError::Interrupted,
+        BoundedCommandErrorKind::TimedOut => HookError::TimedOut { phase },
+        BoundedCommandErrorKind::OutputLimit(BoundedCommandStream::Stdout) => {
+            HookError::OutputLimit {
+                phase,
+                stream: HookOutputStream::Stdout,
+            }
+        }
+        BoundedCommandErrorKind::OutputLimit(BoundedCommandStream::Stderr) => {
+            HookError::OutputLimit {
+                phase,
+                stream: HookOutputStream::Stderr,
+            }
+        }
+        BoundedCommandErrorKind::Start | BoundedCommandErrorKind::InvalidExecutable => {
+            HookError::Start { phase }
+        }
+        _ => HookError::Runner { phase },
+    }
 }
 
 fn planned_execution(phase: HookPhase) -> HookExecution {
@@ -574,7 +725,7 @@ fn planned_execution(phase: HookPhase) -> HookExecution {
     }
 }
 
-fn completed_execution(hook: &HookSpec<'_>, output: Output) -> HookExecution {
+fn completed_execution(hook: &HookSpec<'_>, output: BoundedCommandOutput) -> HookExecution {
     let state = if output.status.success() {
         HookState::Succeeded
     } else {
@@ -592,6 +743,21 @@ fn completed_execution(hook: &HookSpec<'_>, output: Output) -> HookExecution {
         },
         stdout: output.stdout,
         stderr: output.stderr,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl fmt::Display for HookOutputStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
     }
 }
 
@@ -674,6 +840,8 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 
 #[derive(Debug, Error)]
 pub enum HookError {
+    #[error("hook execution interrupted")]
+    Interrupted,
     #[error("trusted hook shell has unsafe authority")]
     UnsafeShell,
     #[error("hook working directory is invalid")]
@@ -685,11 +853,16 @@ pub enum HookError {
     #[error("privileged hook requires one authenticated shared sudo session")]
     MissingPrivilegeSession,
     #[error("{phase} hook failed to start")]
-    Start {
+    Start { phase: HookPhase },
+    #[error("{phase} hook exceeded the configured execution limit")]
+    TimedOut { phase: HookPhase },
+    #[error("{phase} hook {stream} exceeded the configured capture limit")]
+    OutputLimit {
         phase: HookPhase,
-        #[source]
-        source: std::io::Error,
+        stream: HookOutputStream,
     },
+    #[error("{phase} hook could not complete bounded execution")]
+    Runner { phase: HookPhase },
     #[error(transparent)]
     Privilege(#[from] PrivilegeError),
     #[error("trusted hooks are unsupported on this platform")]

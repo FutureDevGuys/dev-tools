@@ -1,0 +1,180 @@
+{
+  "schema": "sync-configs-frozen-reference-v1",
+  "reference": {
+    "product": "sync-configs",
+    "version": "0.1.13",
+    "source_tree_git_oid": "598986f7bf0c1b9bdd4a66270c6c15ee3eabee90",
+    "observed_gate_commit": "697d97fb20912cb63968e1cef354153b3f6a081e",
+    "differential_test_sha256": "ec9bff5ba66f7d8876b98339dadcb6e2dc842a4021d3dda8506036ad3f941d03",
+    "observed_result": "17 passed",
+    "supplemental_observation_ids": ["pre_hook_skip_removes_duplicate_target"]
+  },
+  "equivalent_cases": [
+    {
+      "id": "copy_two_pass",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []},
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []}
+        ],
+        "files": {"output/target.txt": "desired\n"},
+        "absent": []
+      }
+    },
+    {
+      "id": "symlink_two_pass",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []},
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []}
+        ],
+        "links": {"output/linked.txt": "source.txt"},
+        "absent": []
+      }
+    },
+    {
+      "id": "directory_filters_and_override",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []}
+        ],
+        "files": {
+          "output/overridden.txt": "override\n",
+          "output/tree/keep.txt": "keep\n",
+          "output/tree/nested/also.txt": "nested\n"
+        },
+        "absent": ["output/tree/drop.tmp"]
+      }
+    },
+    {
+      "id": "structured_overlays_two_pass",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []},
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []}
+        ],
+        "semantics": {
+          "json": {"managed": {"enabled": true, "keep": 7}, "shape": "new", "user": "stay"},
+          "toml": {"user": "stay", "managed": {"enabled": true, "name": "native", "keep": 7}}
+        }
+      }
+    },
+    {
+      "id": "failed_state_precondition",
+      "expected": {
+        "runs": [
+          {"exit_code": 1, "schema_version": 1, "outcome": "failed", "dry_run": false, "profiles": []}
+        ],
+        "files": {},
+        "absent": ["output/target.txt"]
+      }
+    },
+    {
+      "id": "hooks_success_and_abort",
+      "expected": {
+        "success": {
+          "runs": [
+            {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []}
+          ],
+          "files": {
+            "generated.txt": "generated\n",
+            "output/target.txt": "generated\n",
+            "post.marker": "post\n"
+          },
+          "absent": []
+        },
+        "abort": {
+          "runs": [
+            {"exit_code": 1, "schema_version": 1, "outcome": "failed", "dry_run": false, "profiles": []}
+          ],
+          "files": {},
+          "absent": ["generated.txt", "output/target.txt", "post.marker"]
+        }
+      }
+    },
+    {
+      "id": "pre_hook_skip_removes_duplicate_target",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": []}
+        ],
+        "files": {"output/target.txt": "second\n"},
+        "absent": []
+      }
+    },
+    {
+      "id": "dry_run_hooks",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": true, "profiles": []}
+        ],
+        "files": {},
+        "absent": ["generated.txt", "post.marker", "output/target.txt"]
+      }
+    },
+    {
+      "id": "profile_map_order",
+      "expected": {
+        "runs": [
+          {"exit_code": 0, "schema_version": 1, "outcome": "completed", "dry_run": false, "profiles": ["linux", "desktop"]}
+        ],
+        "files": {"output/desktop.txt": "desktop\n", "output/linux.txt": "linux\n"},
+        "absent": ["output/windows.txt"]
+      }
+    },
+    {
+      "id": "cli_dependency_error",
+      "expected": {
+        "runs": [
+          {"exit_code": 2, "schema_version": null, "outcome": null, "dry_run": null, "profiles": null}
+        ],
+        "files": {},
+        "absent": ["logs"]
+      }
+    }
+  ],
+  "intentional_corrections": [
+    {
+      "id": "missing_is_not_null",
+      "reference_behavior": "missing JSON field satisfied expected null",
+      "native_behavior": "precondition fails read-only",
+      "native_test": "missing_json_field_does_not_satisfy_expected_null_end_to_end"
+    },
+    {
+      "id": "override_hooks_execute",
+      "reference_behavior": "override hooks were omitted from execution",
+      "native_behavior": "merged override hooks execute",
+      "native_test": "override_manifest_hooks_execute_end_to_end"
+    },
+    {
+      "id": "post_hook_requires_success",
+      "reference_behavior": "post hook ran after missing source",
+      "native_behavior": "post hook is ineligible after missing source",
+      "native_test": "post_hooks_do_not_run_after_missing_source"
+    },
+    {
+      "id": "comment_policy_forwarded",
+      "reference_behavior": "configured activate policy was ignored",
+      "native_behavior": "configured activate policy is applied",
+      "native_test": "commented_target_policy_activate_applies_end_to_end"
+    },
+    {
+      "id": "unknown_fields_fail_closed",
+      "reference_behavior": "unknown entry fields were ignored",
+      "native_behavior": "unknown entry fields reject the manifest",
+      "native_test": "unknown_manifest_fields_fail_closed_end_to_end"
+    },
+    {
+      "id": "directory_content_is_compared",
+      "reference_behavior": "existing directories were assumed equal",
+      "native_behavior": "directory content drift is reconciled",
+      "native_test": "directory_copy_detects_content_drift_end_to_end"
+    },
+    {
+      "id": "strict_never_adopts_regular_file",
+      "reference_behavior": "strict policy adopted an identical regular file as a symlink",
+      "native_behavior": "strict policy leaves the regular file untouched",
+      "native_test": "strict_policy_never_adopts_an_identical_regular_file_as_symlink"
+    }
+  ]
+}

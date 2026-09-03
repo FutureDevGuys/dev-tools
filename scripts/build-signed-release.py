@@ -30,6 +30,7 @@ from release_signing import (
     verify_root_document,
     write_json,
 )
+from release_targets import require_accepted_release_target
 
 PRODUCTS = {"update-all", "dev-auth", "dev-cache", "sync-configs", "skills-sync"}
 OWNER = "FutureDevGuys"
@@ -120,6 +121,7 @@ def artifact_name(product: str, version: str, target: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    require_accepted_release_target(args.product, args.target)
     if not args.artifact.is_file():
         raise SystemExit(f"artifact does not exist: {args.artifact}")
     if args.manifest_generation < 1:

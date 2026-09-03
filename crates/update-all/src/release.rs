@@ -6,9 +6,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 #[cfg(unix)]
 use dev_tools_installation::{
-    adopt_versioned_installation, apply_versioned_installation, rollback_versioned_installation,
+    adopt_two_level_versioned_installation, adopt_versioned_installation,
+    apply_versioned_installation, inspect_versioned_installation,
+    read_versioned_installation_receipt, repair_versioned_installation,
+    rollback_versioned_installation, rollback_versioned_installation_with_link_repair,
     verify_versioned_installation, ArtifactIdentity, VersionedAdoption, VersionedInstallRequest,
-    VersionedLayout, VersionedReceipt,
+    VersionedLayout, VersionedReceipt, VersionedTwoLevelAdoption,
 };
 use dev_tools_release::{
     accept_verified_release, select_stable_release_assets, verify_release_metadata,
@@ -37,6 +40,36 @@ const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const MAX_JITTER_SECS: u64 = 30 * 60;
+const SYNC_CONFIGS_UNSUPPORTED_RUNTIME: &str =
+    "sync-configs native releases are unsupported on this runtime";
+#[cfg(unix)]
+const MANAGED_LEGACY_MISSING_AUTHORITY: &str =
+    "managed legacy installation lacks authenticated release state";
+
+#[derive(Debug)]
+struct UnsupportedSyncConfigsRuntime;
+
+impl std::fmt::Display for UnsupportedSyncConfigsRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(SYNC_CONFIGS_UNSUPPORTED_RUNTIME)
+    }
+}
+
+impl std::error::Error for UnsupportedSyncConfigsRuntime {}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ManagedLegacyMissingAuthority;
+
+#[cfg(unix)]
+impl std::fmt::Display for ManagedLegacyMissingAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(MANAGED_LEGACY_MISSING_AUTHORITY)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ManagedLegacyMissingAuthority {}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -200,6 +233,13 @@ struct FetchResult {
     etag: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstallClassification {
+    Absent,
+    Managed,
+    External,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -222,12 +262,23 @@ pub(crate) fn status(product: Product) -> Result<Status> {
         installed_version: state.active_version.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         previous_version: state.previous_version,
-        managed: is_managed_install(&paths),
+        managed: classify_install(product, &paths)? == InstallClassification::Managed,
         last_successful_check_unix: state.last_successful_check_unix,
     })
 }
 
 pub(crate) fn check(product: Product) -> Result<Check> {
+    require_current_runtime(product)?;
+    check_after_runtime_gate(product)
+}
+
+#[cfg(test)]
+fn check_for_runtime(product: Product, runtime: &RuntimeObservation) -> Result<Check> {
+    require_accepted_runtime(product, runtime)?;
+    check_after_runtime_gate(product)
+}
+
+fn check_after_runtime_gate(product: Product) -> Result<Check> {
     let paths = Paths::resolve(product)?;
     let mut state = load_state(&paths)?;
     let verified = fetch_verified_manifest(product, &paths, &state)?;
@@ -239,43 +290,80 @@ pub(crate) fn check(product: Product) -> Result<Check> {
 
 pub(crate) fn update(product: Product) -> Result<Activation> {
     let paths = Paths::resolve(product)?;
-    if paths.public_binary.exists() && !is_managed_install(&paths) {
+    if classify_install(product, &paths)? == InstallClassification::External {
         return Ok(externally_managed(product, &paths));
     }
-    let mut state = load_state(&paths)?;
+    require_current_runtime(product)?;
+    update_managed(product, &paths)
+}
+
+#[cfg(test)]
+fn update_for_runtime(product: Product, runtime: &RuntimeObservation) -> Result<Activation> {
+    let paths = Paths::resolve(product)?;
+    if classify_install(product, &paths)? == InstallClassification::External {
+        return Ok(externally_managed(product, &paths));
+    }
+    require_accepted_runtime(product, runtime)?;
+    update_managed(product, &paths)
+}
+
+fn update_managed(product: Product, paths: &Paths) -> Result<Activation> {
+    update_managed_with_sources(product, paths, fetch_verified_manifest, fetch_artifact)
+}
+
+fn update_managed_with_sources<FetchManifest, FetchArtifact>(
+    product: Product,
+    paths: &Paths,
+    fetch_manifest: FetchManifest,
+    fetch_release_artifact: FetchArtifact,
+) -> Result<Activation>
+where
+    FetchManifest: FnOnce(Product, &Paths, &ReleaseState) -> Result<VerifiedManifest>,
+    FetchArtifact: FnOnce(&Artifact) -> Result<Vec<u8>>,
+{
+    let mut state = match load_state(paths) {
+        Ok(state) => state,
+        Err(error) => {
+            #[cfg(unix)]
+            if observe_legacy_topology(product, paths)?.present {
+                return managed_legacy_missing_authority();
+            }
+            return Err(error);
+        }
+    };
     #[cfg(unix)]
-    adopt_legacy_installation(product, &paths, &mut state)?;
-    let verified = fetch_verified_manifest(product, &paths, &state)?;
+    adopt_legacy_installation(product, paths, &mut state)?;
+    let verified = fetch_manifest(product, paths, &state)?;
     accept_manifest_metadata(&mut state, &verified)?;
-    if activation_is_current(&paths, &state, &verified)? {
+    if activation_is_current(paths, &state, &verified)? {
         state.last_successful_check_unix = Some(now_unix());
-        save_state(&paths, &state)?;
+        save_state(paths, &state)?;
         return Ok(Activation {
             product,
             version: Some(verified.manifest.version.clone()),
             changed: false,
             managed: true,
             outcome: "no_op".into(),
-            path: Some(version_binary(&paths, &verified.manifest.version)),
+            path: Some(version_binary(paths, &verified.manifest.version)),
         });
     }
-    if activate_retained_verified(product, &paths, &mut state, &verified)? {
+    if activate_retained_verified(product, paths, &mut state, &verified)? {
         state.last_successful_check_unix = Some(now_unix());
-        save_state(&paths, &state)?;
+        save_state(paths, &state)?;
         return Ok(Activation {
             product,
             version: Some(verified.manifest.version.clone()),
             changed: true,
             managed: true,
             outcome: "updated".into(),
-            path: Some(version_binary(&paths, &verified.manifest.version)),
+            path: Some(version_binary(paths, &verified.manifest.version)),
         });
     }
-    let bytes = fetch_artifact(&verified.artifact)?;
+    let bytes = fetch_release_artifact(&verified.artifact)?;
     verify_artifact(&bytes, &verified.artifact)?;
-    let activation = activate(product, &paths, &mut state, &verified, &bytes)?;
+    let activation = activate(product, paths, &mut state, &verified, &bytes)?;
     state.last_successful_check_unix = Some(now_unix());
-    save_state(&paths, &state)?;
+    save_state(paths, &state)?;
     Ok(activation)
 }
 
@@ -285,7 +373,10 @@ fn activation_is_current(
     verified: &VerifiedManifest,
 ) -> Result<bool> {
     let version = &verified.manifest.version;
-    if state.active_version.as_ref() != Some(version) || !is_managed_install(paths) {
+    if state.active_version.as_ref() != Some(version)
+        || classify_install(Product::from_id(&verified.manifest.product)?, paths)?
+            != InstallClassification::Managed
+    {
         return Ok(false);
     }
     #[cfg(unix)]
@@ -346,36 +437,86 @@ pub(crate) fn install(product: Product) -> Result<Activation> {
 
 pub(crate) fn update_if_installed(product: Product) -> Result<Activation> {
     let paths = Paths::resolve(product)?;
-    if !paths.public_binary.exists() {
-        return Ok(Activation {
+    match classify_install(product, &paths)? {
+        InstallClassification::Absent => Ok(Activation {
             product,
             version: None,
             changed: false,
             managed: false,
             outcome: "not_applicable".into(),
             path: None,
-        });
+        }),
+        InstallClassification::External => Ok(externally_managed(product, &paths)),
+        InstallClassification::Managed => {
+            require_current_runtime(product)?;
+            update_managed(product, &paths)
+        }
     }
-    update(product)
 }
 
 pub(crate) fn rollback(product: Product) -> Result<Activation> {
+    if product == Product::SyncConfigs {
+        let runtime = RuntimeObservation::current();
+        return rollback_with_runtime_policy(product, Some(&runtime));
+    }
+    rollback_with_runtime_policy(product, None)
+}
+
+#[cfg(test)]
+fn rollback_for_runtime(product: Product, runtime: &RuntimeObservation) -> Result<Activation> {
+    rollback_with_runtime_policy(product, Some(runtime))
+}
+
+fn rollback_with_runtime_policy(
+    product: Product,
+    runtime: Option<&RuntimeObservation>,
+) -> Result<Activation> {
     let paths = Paths::resolve(product)?;
     let mut state = load_state(&paths)?;
     #[cfg(unix)]
     {
-        adopt_legacy_installation(product, &paths, &mut state)?;
-        let report = rollback_versioned_installation(
-            &shared_installation_layout(product, &paths)?,
-            |candidate| {
-                let version = candidate
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|value| value.to_str())
-                    .context("rollback candidate has no version directory")?;
-                verify_candidate_health(product, candidate, version)
-            },
-        )?;
+        let layout = shared_installation_layout(product, &paths)?;
+        let unsupported_runtime = product == Product::SyncConfigs
+            && runtime.is_some_and(|runtime| require_accepted_runtime(product, runtime).is_err());
+        let verify_candidate = |candidate: &Path| {
+            let version = candidate
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                .context("rollback candidate has no version directory")?;
+            require_rollback_runtime(product, version, runtime)?;
+            verify_candidate_health(product, candidate, version)
+        };
+        let report = if unsupported_runtime {
+            if path_entry_present(
+                &paths.product_root.join("installation-transition-v1.json"),
+                "inspect installation transition path",
+            )? {
+                return unsupported_sync_configs_runtime();
+            }
+            let receipt = read_versioned_installation_receipt(&layout)?
+                .ok_or(UnsupportedSyncConfigsRuntime)?;
+            let candidate = receipt
+                .previous_version
+                .as_deref()
+                .ok_or(UnsupportedSyncConfigsRuntime)?;
+            require_rollback_runtime(product, candidate, runtime)?;
+            rollback_versioned_installation_with_link_repair(&layout, verify_candidate)
+        } else {
+            adopt_legacy_installation(product, &paths, &mut state)?;
+            rollback_versioned_installation(&layout, verify_candidate)
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error)
+                if error
+                    .downcast_ref::<UnsupportedSyncConfigsRuntime>()
+                    .is_some() =>
+            {
+                return unsupported_sync_configs_runtime();
+            }
+            Err(error) => return Err(error),
+        };
         synchronize_installation_state(&mut state, &report.receipt);
         save_state(&paths, &state)?;
         return Ok(Activation {
@@ -395,6 +536,7 @@ pub(crate) fn rollback(product: Product) -> Result<Activation> {
                 product.id()
             )
         })?;
+        require_rollback_runtime(product, &previous, runtime)?;
         let binary = version_binary(&paths, &previous);
         if !binary.is_file() {
             bail!("retained rollback binary is missing: {}", binary.display());
@@ -417,7 +559,7 @@ pub(crate) fn rollback(product: Product) -> Result<Activation> {
 pub(crate) fn maybe_auto_update() -> Result<Option<Activation>> {
     let product = Product::UpdateAll;
     let paths = Paths::resolve(product)?;
-    if !is_managed_install(&paths) {
+    if classify_install(product, &paths)? != InstallClassification::Managed {
         return Ok(None);
     }
     let state = load_state(&paths)?;
@@ -972,8 +1114,86 @@ fn select_release_urls(releases: &[GitHubRelease], product: Product) -> Result<(
     ))
 }
 
+#[cfg(not(unix))]
 fn is_managed_install(paths: &Paths) -> bool {
     fs::canonicalize(&paths.public_binary).is_ok_and(|path| path.starts_with(&paths.product_root))
+}
+
+fn classify_install(product: Product, paths: &Paths) -> Result<InstallClassification> {
+    #[cfg(unix)]
+    {
+        return classify_unix_install(product, paths);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = product;
+        match fs::symlink_metadata(&paths.public_binary) {
+            Ok(_) if is_managed_install(paths) => Ok(InstallClassification::Managed),
+            Ok(_) => Ok(InstallClassification::External),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(InstallClassification::Absent)
+            }
+            Err(error) => Err(error).context("inspect public command path"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn classify_unix_install(product: Product, paths: &Paths) -> Result<InstallClassification> {
+    let receipt_present = path_entry_present(
+        &paths.product_root.join("installation-receipt-v1.json"),
+        "inspect installation receipt path",
+    )?;
+    let journal_present = path_entry_present(
+        &paths.product_root.join("installation-transition-v1.json"),
+        "inspect installation transition path",
+    )?;
+    let metadata = match fs::symlink_metadata(&paths.public_binary) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(if receipt_present || journal_present {
+                InstallClassification::Managed
+            } else {
+                InstallClassification::Absent
+            });
+        }
+        Err(error) => return Err(error).context("inspect public command path"),
+    };
+    if journal_present {
+        return Ok(InstallClassification::Managed);
+    }
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(&paths.public_binary).context("inspect public command link")?;
+        if receipt_present {
+            if target == paths.product_root.join("active") {
+                return Ok(InstallClassification::Managed);
+            }
+            bail!("receipt-owned public command has unowned drift");
+        }
+        if target == paths.current.join(product.id()) || target == paths.product_root.join("active")
+        {
+            return Ok(InstallClassification::Managed);
+        }
+    }
+    if receipt_present {
+        bail!("receipt-owned public command has unowned drift");
+    }
+    if fs::canonicalize(&paths.public_binary)
+        .is_ok_and(|path| path.starts_with(&paths.product_root))
+    {
+        Ok(InstallClassification::Managed)
+    } else {
+        Ok(InstallClassification::External)
+    }
+}
+
+#[cfg(unix)]
+fn path_entry_present(path: &Path, context: &'static str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context(context),
+    }
 }
 
 fn externally_managed(product: Product, paths: &Paths) -> Activation {
@@ -985,6 +1205,101 @@ fn externally_managed(product: Product, paths: &Paths) -> Activation {
         outcome: "externally_managed".into(),
         path: Some(paths.public_binary.clone()),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeObservation {
+    os: String,
+    arch: String,
+    kernel_os_release: Option<String>,
+    kernel_version: Option<String>,
+    kernel_wsl_interop: bool,
+}
+
+impl RuntimeObservation {
+    fn current() -> Self {
+        Self {
+            os: env::consts::OS.into(),
+            arch: env::consts::ARCH.into(),
+            kernel_os_release: read_kernel_identity("/proc/sys/kernel/osrelease"),
+            kernel_version: read_kernel_identity("/proc/version"),
+            kernel_wsl_interop: fs::symlink_metadata("/proc/sys/fs/binfmt_misc/WSLInterop").is_ok(),
+        }
+    }
+}
+
+fn read_kernel_identity(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn require_current_runtime(product: Product) -> Result<()> {
+    if product != Product::SyncConfigs {
+        return Ok(());
+    }
+    require_accepted_runtime(product, &RuntimeObservation::current())
+}
+
+fn require_accepted_runtime(product: Product, runtime: &RuntimeObservation) -> Result<()> {
+    if product != Product::SyncConfigs {
+        return Ok(());
+    }
+
+    // WSL_* variables are deliberately not authoritative: process environment can be spoofed or
+    // removed. Kernel-owned release/version markers and the registered WSLInterop handler are the
+    // positive WSL signals. If both identity files are unavailable, reject the release as a
+    // conservative false-positive; accepting an unobserved runtime would violate the native-only
+    // boundary. A future WSL kernel that removes every known kernel marker could cause a false
+    // negative; avoiding that without stronger platform attestation would also reject ordinary
+    // native Linux, so this detector must be extended when WSL's kernel contract changes.
+    let kernel_identity = [
+        runtime.kernel_os_release.as_deref(),
+        runtime.kernel_version.as_deref(),
+    ];
+    let has_kernel_identity = kernel_identity
+        .iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty());
+    let is_wsl = runtime.kernel_wsl_interop
+        || kernel_identity
+            .iter()
+            .flatten()
+            .any(|value| contains_wsl_kernel_marker(value));
+    if runtime.os == "linux" && runtime.arch == "x86_64" && has_kernel_identity && !is_wsl {
+        return Ok(());
+    }
+    unsupported_sync_configs_runtime()
+}
+
+fn require_rollback_runtime(
+    product: Product,
+    candidate_version: &str,
+    runtime: Option<&RuntimeObservation>,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    if require_accepted_runtime(product, runtime).is_ok()
+        || (product == Product::SyncConfigs
+            && is_reviewed_sync_configs_recovery_version(candidate_version))
+    {
+        return Ok(());
+    }
+    unsupported_sync_configs_runtime()
+}
+
+fn unsupported_sync_configs_runtime<T>() -> Result<T> {
+    Err(UnsupportedSyncConfigsRuntime.into())
+}
+
+fn is_reviewed_sync_configs_recovery_version(value: &str) -> bool {
+    Version::parse(value).is_ok_and(|version| version == Version::new(0, 1, 13))
+}
+
+fn contains_wsl_kernel_marker(value: &str) -> bool {
+    let lowercase = value.to_ascii_lowercase();
+    lowercase.contains("microsoft") || lowercase.contains("wsl")
 }
 
 fn target_id() -> String {
@@ -1002,6 +1317,75 @@ fn target_id() -> String {
 
 fn version_binary(paths: &Paths, version: &str) -> PathBuf {
     paths.versions.join(version).join(&paths.executable_name)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyTopologyObservation {
+    present: bool,
+    version: Option<String>,
+}
+
+#[cfg(unix)]
+fn observe_legacy_topology(product: Product, paths: &Paths) -> Result<LegacyTopologyObservation> {
+    let public_present = match fs::symlink_metadata(&paths.public_binary) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::read_link(&paths.public_binary).context("inspect legacy public command pointer")?
+                == paths.current.join(product.id())
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("inspect legacy public command pointer"),
+    };
+    let version = match fs::symlink_metadata(&paths.current) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target =
+                fs::read_link(&paths.current).context("inspect legacy current-version pointer")?;
+            target
+                .parent()
+                .filter(|parent| *parent == paths.versions.as_path())
+                .and_then(|_| target.file_name())
+                .and_then(|value| value.to_str())
+                .filter(|value| Version::parse(value).is_ok())
+                .map(str::to_string)
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspect legacy current-version pointer"),
+    };
+    Ok(LegacyTopologyObservation {
+        present: public_present || version.is_some(),
+        version,
+    })
+}
+
+#[cfg(unix)]
+fn authenticated_legacy_state(state: &ReleaseState) -> Option<(&str, &str)> {
+    let active_version = state.active_version.as_deref()?;
+    let accepted_version = state.accepted_version.as_deref()?;
+    let root_sha256 = state.accepted_root_sha256.as_deref()?;
+    let manifest_sha256 = state.accepted_manifest_sha256.as_deref()?;
+    let binary_sha256 = state.accepted_binary_sha256.as_deref()?;
+    if state.accepted_root_generation == 0
+        || state.accepted_generation == 0
+        || accepted_version != active_version
+        || !is_sha256(root_sha256)
+        || !is_sha256(manifest_sha256)
+        || !is_sha256(binary_sha256)
+    {
+        return None;
+    }
+    Some((active_version, binary_sha256))
+}
+
+#[cfg(unix)]
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(unix)]
+fn managed_legacy_missing_authority<T>() -> Result<T> {
+    Err(ManagedLegacyMissingAuthority.into())
 }
 
 #[cfg(unix)]
@@ -1044,55 +1428,67 @@ fn adopt_legacy_installation(
     state: &mut ReleaseState,
 ) -> Result<()> {
     let layout = shared_installation_layout(product, paths)?;
-    if fs::symlink_metadata(paths.product_root.join("installation-receipt-v1.json")).is_ok() {
-        verify_versioned_installation(&layout)?;
+    let receipt_present = path_entry_present(
+        &paths.product_root.join("installation-receipt-v1.json"),
+        "inspect installation receipt path",
+    )?;
+    if receipt_present {
+        repair_versioned_installation(&layout, |candidate| {
+            let version = candidate
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                .context("installed candidate has no version directory")?;
+            verify_candidate_health(product, candidate, version)
+        })?;
         return Ok(());
     }
-    let Some(version) = state.active_version.as_deref() else {
+    if path_entry_present(
+        &paths.product_root.join("installation-transition-v1.json"),
+        "inspect installation transition path",
+    )? {
+        if let Some(receipt) = inspect_versioned_installation(&layout)? {
+            verify_candidate_health(
+                product,
+                &version_binary(paths, &receipt.active_version),
+                &receipt.active_version,
+            )?;
+            return Ok(());
+        }
+    }
+    let topology = observe_legacy_topology(product, paths)?;
+    let Some((version, approved_sha256)) = authenticated_legacy_state(state) else {
+        if topology.present {
+            return managed_legacy_missing_authority();
+        }
         return Ok(());
     };
+    if topology
+        .version
+        .as_deref()
+        .is_some_and(|observed| observed != version)
+    {
+        bail!("legacy installation topology conflicts with authenticated release state");
+    }
     let artifact = version_binary(paths, version);
     let identity = ArtifactIdentity::from_file(&artifact, ARTIFACT_LIMIT)?;
-    if state
-        .accepted_binary_sha256
-        .as_deref()
-        .is_some_and(|approved| approved != identity.sha256)
-    {
+    if approved_sha256 != identity.sha256 {
         bail!("legacy managed artifact does not match authenticated release state");
     }
-    let expected_current = paths.versions.join(version);
-    let expected_public = paths.current.join(product.id());
-    let current_present = verify_optional_legacy_symlink(&paths.current, &expected_current)?;
-    let public_present = verify_optional_legacy_symlink(&paths.public_binary, &expected_public)?;
     verify_candidate_health(product, &artifact, version)?;
-    if public_present {
-        fs::remove_file(&paths.public_binary).context("detach legacy public command pointer")?;
-    }
-    if current_present {
-        fs::remove_file(&paths.current).context("detach legacy current-version pointer")?;
-    }
-    adopt_versioned_installation(
-        &VersionedAdoption {
+    let adoption = VersionedTwoLevelAdoption {
+        adoption: VersionedAdoption {
             layout,
             version: version.into(),
             identity,
             aliases: vec![paths.executable_name.clone()],
         },
-        |candidate| verify_candidate_health(product, candidate, version),
-    )?;
+        version_pointer: paths.current.clone(),
+    };
+    adopt_two_level_versioned_installation(&adoption, |candidate| {
+        verify_candidate_health(product, candidate, version)
+    })?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn verify_optional_legacy_symlink(path: &Path, expected: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() && fs::read_link(path)? == expected => {
-            Ok(true)
-        }
-        Ok(_) => bail!("legacy managed installation pointer does not match authenticated state"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).context("inspect legacy managed installation pointer"),
-    }
 }
 
 #[cfg(unix)]
@@ -1297,6 +1693,408 @@ impl Paths {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    struct EnvRestore {
+        name: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = env::var_os(name);
+            env::set_var(name, value);
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.as_ref() {
+                Some(value) => env::set_var(self.name, value),
+                None => env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn observed_runtime(
+        os: &str,
+        arch: &str,
+        kernel_os_release: Option<&str>,
+        kernel_version: Option<&str>,
+    ) -> RuntimeObservation {
+        RuntimeObservation {
+            os: os.into(),
+            arch: arch.into(),
+            kernel_os_release: kernel_os_release.map(str::to_string),
+            kernel_version: kernel_version.map(str::to_string),
+            kernel_wsl_interop: false,
+        }
+    }
+
+    fn native_linux_x86_64() -> RuntimeObservation {
+        observed_runtime(
+            "linux",
+            "x86_64",
+            Some("6.16.4-arch1-1"),
+            Some("Linux version 6.16.4-arch1-1"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn authenticated_release_state(version: &str, binary_sha256: &str) -> ReleaseState {
+        ReleaseState {
+            accepted_root_generation: 1,
+            accepted_root_sha256: Some("11".repeat(32)),
+            accepted_generation: 1,
+            accepted_version: Some(version.into()),
+            accepted_manifest_sha256: Some("22".repeat(32)),
+            accepted_binary_sha256: Some(binary_sha256.into()),
+            active_version: Some(version.into()),
+            ..ReleaseState::default()
+        }
+    }
+
+    #[test]
+    fn sync_configs_runtime_policy_accepts_only_the_admitted_linux_x86_64_contract() {
+        require_accepted_runtime(Product::SyncConfigs, &native_linux_x86_64()).unwrap();
+
+        for unsupported in [
+            observed_runtime("linux", "aarch64", Some("6.16.4"), Some("Linux 6.16.4")),
+            observed_runtime("windows", "x86_64", None, None),
+            observed_runtime("macos", "x86_64", None, None),
+            observed_runtime("linux", "x86_64", None, None),
+        ] {
+            let error = require_accepted_runtime(Product::SyncConfigs, &unsupported).unwrap_err();
+            assert_eq!(error.to_string(), SYNC_CONFIGS_UNSUPPORTED_RUNTIME);
+        }
+    }
+
+    #[test]
+    fn sync_configs_runtime_policy_rejects_wsl_from_kernel_evidence_without_env_help() {
+        for wsl in [
+            observed_runtime(
+                "linux",
+                "x86_64",
+                Some("5.15.153.1-microsoft-standard-WSL2"),
+                None,
+            ),
+            observed_runtime(
+                "linux",
+                "x86_64",
+                Some("4.4.0-19041-Microsoft"),
+                Some("Linux version 4.4.0-19041-Microsoft"),
+            ),
+            RuntimeObservation {
+                kernel_wsl_interop: true,
+                ..native_linux_x86_64()
+            },
+        ] {
+            let error = require_accepted_runtime(Product::SyncConfigs, &wsl).unwrap_err();
+            assert_eq!(error.to_string(), SYNC_CONFIGS_UNSUPPORTED_RUNTIME);
+        }
+    }
+
+    #[test]
+    fn runtime_restriction_does_not_change_other_product_behavior() {
+        let unsupported = observed_runtime(
+            "plan9",
+            "mips",
+            Some("microsoft-standard-WSL2"),
+            Some("untrusted"),
+        );
+        for product in Product::ALL
+            .into_iter()
+            .filter(|product| *product != Product::SyncConfigs)
+        {
+            require_accepted_runtime(product, &unsupported).unwrap();
+        }
+    }
+
+    #[test]
+    fn unsupported_sync_configs_check_fails_before_network_or_state_mutation() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let _releases = EnvRestore::set("DEV_TOOLS_RELEASES_URL", "http://127.0.0.1:9/releases");
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+
+        let error = check_for_runtime(Product::SyncConfigs, &wsl).unwrap_err();
+
+        assert_eq!(error.to_string(), SYNC_CONFIGS_UNSUPPORTED_RUNTIME);
+        assert!(!temp.path().join("state/dev-tools").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_sync_configs_update_preserves_an_external_install() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        crate::test_support::write_executable(
+            &paths.public_binary,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs external'\n",
+        )
+        .unwrap();
+        let before = fs::read(&paths.public_binary).unwrap();
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+
+        let activation = update_for_runtime(Product::SyncConfigs, &wsl).unwrap();
+
+        assert_eq!(activation.outcome, "externally_managed");
+        assert!(!activation.managed);
+        assert_eq!(fs::read(&paths.public_binary).unwrap(), before);
+        assert!(!paths.product_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_external_install_is_not_treated_as_absent() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing-external"), &paths.public_binary)
+            .unwrap();
+
+        let activation = update_if_installed(Product::SyncConfigs).unwrap();
+
+        assert_eq!(activation.outcome, "externally_managed");
+        assert!(!activation.managed);
+        assert_eq!(
+            activation.path.as_deref(),
+            Some(paths.public_binary.as_path())
+        );
+        assert_eq!(
+            fs::read_link(&paths.public_binary).unwrap(),
+            temp.path().join("missing-external")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_shared_alias_shape_is_still_classified_as_managed() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        std::os::unix::fs::symlink(paths.product_root.join("active"), &paths.public_binary)
+            .unwrap();
+
+        assert_eq!(
+            classify_install(Product::SyncConfigs, &paths).unwrap(),
+            InstallClassification::Managed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_journal_presence_routes_even_a_dangling_alias_to_managed_recovery() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        fs::create_dir_all(&paths.bin_dir).unwrap();
+        fs::create_dir_all(&paths.product_root).unwrap();
+        fs::write(
+            paths.product_root.join("installation-transition-v1.json"),
+            b"journal authority marker",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), &paths.public_binary).unwrap();
+
+        assert_eq!(
+            classify_install(Product::SyncConfigs, &paths).unwrap(),
+            InstallClassification::Managed
+        );
+        assert_eq!(
+            fs::read_link(&paths.public_binary).unwrap(),
+            temp.path().join("missing")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_receipt_owned_alias_is_classified_as_managed_and_repaired() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let source = temp.path().join("sync-configs-0.2.0");
+        crate::test_support::write_executable(
+            &source,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.2.0 profile=release'\n",
+        )
+        .unwrap();
+        let identity = ArtifactIdentity::from_file(&source, ARTIFACT_LIMIT).unwrap();
+        apply_versioned_installation(
+            &VersionedInstallRequest {
+                layout: shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+                version: "0.2.0".into(),
+                source,
+                identity,
+                aliases: vec!["sync-configs".into()],
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        fs::remove_file(&paths.public_binary).unwrap();
+
+        assert_eq!(
+            classify_install(Product::SyncConfigs, &paths).unwrap(),
+            InstallClassification::Managed
+        );
+        let mut state = ReleaseState::default();
+        adopt_legacy_installation(Product::SyncConfigs, &paths, &mut state).unwrap();
+
+        assert_eq!(
+            fs::read_link(&paths.public_binary).unwrap(),
+            paths.product_root.join("active")
+        );
+        assert_eq!(
+            fs::canonicalize(&paths.public_binary).unwrap(),
+            version_binary(&paths, "0.2.0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_owned_dangling_alias_drift_fails_closed_and_is_preserved() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let source = temp.path().join("sync-configs-0.2.0");
+        crate::test_support::write_executable(
+            &source,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.2.0 profile=release'\n",
+        )
+        .unwrap();
+        let identity = ArtifactIdentity::from_file(&source, ARTIFACT_LIMIT).unwrap();
+        apply_versioned_installation(
+            &VersionedInstallRequest {
+                layout: shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+                version: "0.2.0".into(),
+                source,
+                identity,
+                aliases: vec!["sync-configs".into()],
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        fs::remove_file(&paths.public_binary).unwrap();
+        let drift_target = temp.path().join("missing-external");
+        std::os::unix::fs::symlink(&drift_target, &paths.public_binary).unwrap();
+
+        let error = update_if_installed(Product::SyncConfigs).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "receipt-owned public command has unowned drift"
+        );
+        assert_eq!(fs::read_link(&paths.public_binary).unwrap(), drift_target);
+        assert!(!paths.root_cache.exists());
+        assert!(!paths.manifest_cache.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_sync_configs_update_does_not_adopt_or_mutate_a_managed_legacy_install() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state_home = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let _releases = EnvRestore::set("DEV_TOOLS_RELEASES_URL", "http://127.0.0.1:9/releases");
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let version = "0.1.13";
+        let target = version_binary(&paths, version);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &target,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.1.13'\n",
+        )
+        .unwrap();
+        activate_link(Product::SyncConfigs, &paths, version).unwrap();
+        let identity = ArtifactIdentity::from_file(&target, ARTIFACT_LIMIT).unwrap();
+        save_state(
+            &paths,
+            &ReleaseState {
+                active_version: Some(version.into()),
+                accepted_binary_sha256: Some(identity.sha256),
+                ..ReleaseState::default()
+            },
+        )
+        .unwrap();
+        let state_before = fs::read(&paths.state).unwrap();
+        let public_before = fs::read_link(&paths.public_binary).unwrap();
+        let current_before = fs::read_link(&paths.current).unwrap();
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+
+        let error = update_for_runtime(Product::SyncConfigs, &wsl).unwrap_err();
+
+        assert_eq!(error.to_string(), SYNC_CONFIGS_UNSUPPORTED_RUNTIME);
+        assert!(!paths
+            .product_root
+            .join("installation-receipt-v1.json")
+            .exists());
+        assert_eq!(fs::read_link(&paths.public_binary).unwrap(), public_before);
+        assert_eq!(fs::read_link(&paths.current).unwrap(), current_before);
+        assert_eq!(fs::read(&paths.state).unwrap(), state_before);
+        assert!(!paths.root_cache.exists());
+        assert!(!paths.manifest_cache.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_sync_configs_rollback_rejects_unreviewed_python_legacy_versions() {
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+
+        assert_eq!(
+            require_rollback_runtime(Product::SyncConfigs, "0.1.13", Some(&wsl))
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Ok(())
+        );
+        for version in ["0.1.12", "0.1.99", "0.2.0", "1.0.0"] {
+            assert_eq!(
+                require_rollback_runtime(Product::SyncConfigs, version, Some(&wsl))
+                    .unwrap_err()
+                    .to_string(),
+                SYNC_CONFIGS_UNSUPPORTED_RUNTIME,
+                "unexpected rollback admission for {version}"
+            );
+        }
+    }
 
     #[test]
     fn every_windows_product_uses_a_native_executable_name() {
@@ -1575,11 +2373,7 @@ mod tests {
         activate_link(Product::UpdateAll, &paths, version).unwrap();
         let identity =
             dev_tools_installation::ArtifactIdentity::from_file(&target, ARTIFACT_LIMIT).unwrap();
-        let mut state = ReleaseState {
-            active_version: Some(version.into()),
-            accepted_binary_sha256: Some(identity.sha256.clone()),
-            ..ReleaseState::default()
-        };
+        let mut state = authenticated_release_state(version, &identity.sha256);
 
         adopt_legacy_installation(Product::UpdateAll, &paths, &mut state).unwrap();
 
@@ -1592,6 +2386,426 @@ mod tests {
         assert_eq!(receipt.aliases, vec!["update-all"]);
         assert_eq!(fs::canonicalize(paths.public_binary).unwrap(), target);
         assert!(!paths.current.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_legacy_layout_without_complete_release_authority_fails_closed() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let version = "0.1.11";
+        let target = version_binary(&paths, version);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &target,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.1.11'\n",
+        )
+        .unwrap();
+        activate_link(Product::SyncConfigs, &paths, version).unwrap();
+        let target_before = fs::read(&target).unwrap();
+        let current_before = fs::read_link(&paths.current).unwrap();
+        let public_before = fs::read_link(&paths.public_binary).unwrap();
+
+        assert_eq!(
+            classify_install(Product::SyncConfigs, &paths).unwrap(),
+            InstallClassification::Managed
+        );
+        let assert_rejected_without_mutation = || {
+            let error = update_managed_with_sources(
+                Product::SyncConfigs,
+                &paths,
+                |_, _, _| panic!("release metadata must not be fetched without authority"),
+                |_| panic!("release artifact must not be fetched without authority"),
+            )
+            .unwrap_err();
+
+            assert!(error
+                .downcast_ref::<ManagedLegacyMissingAuthority>()
+                .is_some());
+            assert_eq!(error.to_string(), MANAGED_LEGACY_MISSING_AUTHORITY);
+            assert_eq!(fs::read(&target).unwrap(), target_before);
+            assert_eq!(fs::read_link(&paths.current).unwrap(), current_before);
+            assert_eq!(fs::read_link(&paths.public_binary).unwrap(), public_before);
+            assert!(!paths
+                .product_root
+                .join("installation-receipt-v1.json")
+                .exists());
+            assert!(!paths
+                .product_root
+                .join("installation-transition-v1.json")
+                .exists());
+            assert!(!paths.root_cache.exists());
+            assert!(!paths.manifest_cache.exists());
+        };
+
+        assert!(!paths.state.exists());
+        assert_rejected_without_mutation();
+        assert!(!paths.state.exists());
+
+        fs::write(&paths.state, b"{").unwrap();
+        let corrupt_state_before = fs::read(&paths.state).unwrap();
+        assert_rejected_without_mutation();
+        assert_eq!(fs::read(&paths.state).unwrap(), corrupt_state_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_legacy_topology_must_agree_with_authenticated_release_state() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let target = version_binary(&paths, "0.1.11");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &target,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.1.11'\n",
+        )
+        .unwrap();
+        activate_link(Product::SyncConfigs, &paths, "0.1.11").unwrap();
+        let identity = ArtifactIdentity::from_file(&target, ARTIFACT_LIMIT).unwrap();
+        let stale_state = authenticated_release_state("0.1.12", &identity.sha256);
+        save_state(&paths, &stale_state).unwrap();
+        let target_before = fs::read(&target).unwrap();
+        let state_before = fs::read(&paths.state).unwrap();
+        let current_before = fs::read_link(&paths.current).unwrap();
+        let public_before = fs::read_link(&paths.public_binary).unwrap();
+
+        let error = update_managed_with_sources(
+            Product::SyncConfigs,
+            &paths,
+            |_, _, _| panic!("release metadata must not be fetched after topology conflict"),
+            |_| panic!("release artifact must not be fetched after topology conflict"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "legacy installation topology conflicts with authenticated release state"
+        );
+        assert_eq!(fs::read(&target).unwrap(), target_before);
+        assert_eq!(fs::read(&paths.state).unwrap(), state_before);
+        assert_eq!(fs::read_link(&paths.current).unwrap(), current_before);
+        assert_eq!(fs::read_link(&paths.public_binary).unwrap(), public_before);
+        assert!(!paths
+            .product_root
+            .join("installation-receipt-v1.json")
+            .exists());
+        assert!(!paths
+            .product_root
+            .join("installation-transition-v1.json")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_authenticated_sync_configs_0_1_x_migrates_and_rolls_back_on_native_linux() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let legacy_version = "0.1.11";
+        let native_version = "0.2.0";
+        let rollback_failure_marker = temp.path().join("reject-legacy-health");
+        let legacy_target = version_binary(&paths, legacy_version);
+        fs::create_dir_all(legacy_target.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &legacy_target,
+            &format!(
+                "#!/bin/sh\nif [ -e '{}' ]; then\n  printf '%s\\n' 'sync-configs 9.9.9'\nelse\n  printf '%s\\n' 'sync-configs {legacy_version}'\nfi\n",
+                rollback_failure_marker.display()
+            ),
+        )
+        .unwrap();
+        activate_link(Product::SyncConfigs, &paths, legacy_version).unwrap();
+        let legacy_identity = ArtifactIdentity::from_file(&legacy_target, ARTIFACT_LIMIT).unwrap();
+        let state = authenticated_release_state(legacy_version, &legacy_identity.sha256);
+        save_state(&paths, &state).unwrap();
+
+        let native_bytes =
+            format!("#!/bin/sh\nprintf '%s\\n' 'sync-configs {native_version} profile=release'\n")
+                .into_bytes();
+        let verified = VerifiedManifest {
+            root_generation: 2,
+            root_sha256: "root".into(),
+            manifest: ProductManifest {
+                schema: "dev-tools-product-v1".into(),
+                product: Product::SyncConfigs.id().into(),
+                generation: 2,
+                version: native_version.into(),
+                engine_protocol: ENGINE_PROTOCOL,
+                artifacts: BTreeMap::new(),
+            },
+            artifact: Artifact {
+                url: "https://github.com/FutureDevGuys/dev-tools/releases/download/test/sync-configs-linux-x86_64".into(),
+                length: native_bytes.len() as u64,
+                sha256: sha256_hex(&native_bytes),
+            },
+            manifest_sha256: "manifest".into(),
+        };
+
+        let adoption_checked = std::cell::Cell::new(false);
+        let activation = update_managed_with_sources(
+            Product::SyncConfigs,
+            &paths,
+            |_, paths, _| {
+                let adopted = verify_versioned_installation(
+                    &shared_installation_layout(Product::SyncConfigs, paths).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(adopted.active_version, legacy_version);
+                assert_eq!(adopted.active_identity, legacy_identity);
+                assert_eq!(adopted.aliases, vec!["sync-configs"]);
+                assert_eq!(
+                    fs::canonicalize(&paths.public_binary).unwrap(),
+                    legacy_target
+                );
+                adoption_checked.set(true);
+                Ok(verified.clone())
+            },
+            |_| Ok(native_bytes.clone()),
+        )
+        .unwrap();
+        let state = load_state(&paths).unwrap();
+
+        assert!(adoption_checked.get());
+        assert!(activation.changed);
+        assert_eq!(activation.version.as_deref(), Some(native_version));
+        assert!(activation_is_current(&paths, &state, &verified).unwrap());
+        assert_eq!(state.accepted_version.as_deref(), Some(native_version));
+        assert_eq!(
+            state.accepted_binary_sha256.as_deref(),
+            Some(verified.artifact.sha256.as_str())
+        );
+        let migrated = verify_versioned_installation(
+            &shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(migrated.active_version, native_version);
+        assert_eq!(migrated.previous_version.as_deref(), Some(legacy_version));
+
+        fs::write(&rollback_failure_marker, b"reject").unwrap();
+        let error = rollback_for_runtime(Product::SyncConfigs, &native_linux_x86_64()).unwrap_err();
+        assert!(error.downcast_ref::<IntegrityFailure>().is_some());
+        let after_rejected_rollback = verify_versioned_installation(
+            &shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after_rejected_rollback.active_version, native_version);
+        fs::remove_file(&rollback_failure_marker).unwrap();
+
+        let rollback = rollback_for_runtime(Product::SyncConfigs, &native_linux_x86_64()).unwrap();
+
+        assert!(rollback.changed);
+        assert_eq!(rollback.version.as_deref(), Some(legacy_version));
+        let rolled_back = verify_versioned_installation(
+            &shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rolled_back.active_version, legacy_version);
+        assert_eq!(
+            rolled_back.previous_version.as_deref(),
+            Some(native_version)
+        );
+        assert_eq!(
+            fs::canonicalize(&paths.public_binary).unwrap(),
+            legacy_target
+        );
+        let output = Command::new(&paths.public_binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("sync-configs 0.1.11"));
+
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+        let error = rollback_for_runtime(Product::SyncConfigs, &wsl).unwrap_err();
+        assert_eq!(error.to_string(), SYNC_CONFIGS_UNSUPPORTED_RUNTIME);
+        let after_native_rollback_rejection = verify_versioned_installation(
+            &shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after_native_rollback_rejection.active_version,
+            legacy_version
+        );
+        assert_eq!(
+            after_native_rollback_rejection.previous_version.as_deref(),
+            Some(native_version)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_runtime_can_recover_the_exact_reviewed_sync_configs_0_1_13() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let legacy_version = "0.1.13";
+        let legacy = version_binary(&paths, legacy_version);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &legacy,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.1.13'\n",
+        )
+        .unwrap();
+        activate_link(Product::SyncConfigs, &paths, legacy_version).unwrap();
+        let legacy_identity = ArtifactIdentity::from_file(&legacy, ARTIFACT_LIMIT).unwrap();
+        let mut state = authenticated_release_state(legacy_version, &legacy_identity.sha256);
+        adopt_legacy_installation(Product::SyncConfigs, &paths, &mut state).unwrap();
+
+        let native_version = "0.2.0";
+        let native_source = temp.path().join("sync-configs-native");
+        crate::test_support::write_executable(
+            &native_source,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.2.0 profile=release'\n",
+        )
+        .unwrap();
+        let native_identity = ArtifactIdentity::from_file(&native_source, ARTIFACT_LIMIT).unwrap();
+        let installed = apply_versioned_installation(
+            &VersionedInstallRequest {
+                layout: shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+                version: native_version.into(),
+                source: native_source,
+                identity: native_identity,
+                aliases: vec!["sync-configs".into()],
+            },
+            |candidate| verify_candidate_health(Product::SyncConfigs, candidate, native_version),
+        )
+        .unwrap();
+        synchronize_installation_state(&mut state, &installed.receipt);
+        save_state(&paths, &state).unwrap();
+        fs::remove_file(&paths.public_binary).unwrap();
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+
+        let rollback = rollback_for_runtime(Product::SyncConfigs, &wsl).unwrap();
+
+        assert_eq!(rollback.version.as_deref(), Some(legacy_version));
+        assert_eq!(fs::canonicalize(&paths.public_binary).unwrap(), legacy);
+        let receipt = verify_versioned_installation(
+            &shared_installation_layout(Product::SyncConfigs, &paths).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt.active_version, legacy_version);
+        assert_eq!(receipt.previous_version.as_deref(), Some(native_version));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_runtime_rollback_does_not_repair_links_before_candidate_preflight() {
+        let _env_lock = crate::test_support::env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvRestore::set("HOME", temp.path());
+        let _state = EnvRestore::set("XDG_STATE_HOME", temp.path().join("state"));
+        let paths = Paths::resolve(Product::SyncConfigs).unwrap();
+        let legacy_version = "0.1.13";
+        let rollback_failure_marker = temp.path().join("reject-legacy-health");
+        let legacy = version_binary(&paths, legacy_version);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &legacy,
+            &format!(
+                "#!/bin/sh\nif [ -e '{}' ]; then\n  printf '%s\\n' 'sync-configs 9.9.9'\nelse\n  printf '%s\\n' 'sync-configs {legacy_version}'\nfi\n",
+                rollback_failure_marker.display()
+            ),
+        )
+        .unwrap();
+        activate_link(Product::SyncConfigs, &paths, legacy_version).unwrap();
+        let legacy_identity = ArtifactIdentity::from_file(&legacy, ARTIFACT_LIMIT).unwrap();
+        let mut state = authenticated_release_state(legacy_version, &legacy_identity.sha256);
+        adopt_legacy_installation(Product::SyncConfigs, &paths, &mut state).unwrap();
+
+        let native_version = "0.2.0";
+        let native_source = temp.path().join("sync-configs-native");
+        crate::test_support::write_executable(
+            &native_source,
+            "#!/bin/sh\nprintf '%s\\n' 'sync-configs 0.2.0 profile=release'\n",
+        )
+        .unwrap();
+        let native_identity = ArtifactIdentity::from_file(&native_source, ARTIFACT_LIMIT).unwrap();
+        let layout = shared_installation_layout(Product::SyncConfigs, &paths).unwrap();
+        let installed = apply_versioned_installation(
+            &VersionedInstallRequest {
+                layout: layout.clone(),
+                version: native_version.into(),
+                source: native_source,
+                identity: native_identity,
+                aliases: vec!["sync-configs".into()],
+            },
+            |candidate| verify_candidate_health(Product::SyncConfigs, candidate, native_version),
+        )
+        .unwrap();
+        synchronize_installation_state(&mut state, &installed.receipt);
+        save_state(&paths, &state).unwrap();
+
+        fs::remove_file(&paths.public_binary).unwrap();
+        fs::write(&rollback_failure_marker, b"reject").unwrap();
+        let active = paths.product_root.join("active");
+        let previous = paths.product_root.join("previous");
+        let receipt_path = paths.product_root.join("installation-receipt-v1.json");
+        let active_before = fs::read_link(&active).unwrap();
+        let previous_before = fs::read_link(&previous).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let state_before = fs::read(&paths.state).unwrap();
+        let legacy_before = fs::read(&legacy).unwrap();
+        let native_before = fs::read(version_binary(&paths, native_version)).unwrap();
+        let wsl = observed_runtime(
+            "linux",
+            "x86_64",
+            Some("5.15.153.1-microsoft-standard-WSL2"),
+            None,
+        );
+
+        let error = rollback_for_runtime(Product::SyncConfigs, &wsl).unwrap_err();
+
+        assert!(error.downcast_ref::<IntegrityFailure>().is_some());
+        assert_eq!(error.to_string(), "product rollback verification failed");
+        assert_eq!(
+            fs::symlink_metadata(&paths.public_binary)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::symlink_metadata(&paths.current).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read_link(&active).unwrap(), active_before);
+        assert_eq!(fs::read_link(&previous).unwrap(), previous_before);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert_eq!(fs::read(&paths.state).unwrap(), state_before);
+        assert!(!paths
+            .product_root
+            .join("installation-transition-v1.json")
+            .exists());
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_before);
+        assert_eq!(
+            fs::read(version_binary(&paths, native_version)).unwrap(),
+            native_before
+        );
+        assert_eq!(
+            read_versioned_installation_receipt(&layout)
+                .unwrap()
+                .unwrap(),
+            installed.receipt
+        );
     }
 
     #[cfg(unix)]

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod engine;
 pub mod filesystem;
 pub mod hooks;
+pub mod interrupt;
 pub mod manifest;
 pub mod overlay;
 pub mod paths;
@@ -11,6 +12,7 @@ pub mod reconciler;
 pub mod report;
 pub mod run_logs;
 pub mod scaffold;
+pub mod standalone;
 
 use std::ffi::OsString;
 

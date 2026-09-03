@@ -1068,12 +1068,20 @@ fn parse_reconciler(
             format!("'{name}' has unsupported protocol '{}'", raw.protocol),
         ));
     }
+    let privilege = raw.privilege.unwrap_or(Privilege::User);
+    if privilege == Privilege::Sudo && context.platform == PathPlatform::Windows {
+        return Err(invalid(
+            manifest_path,
+            "reconciler",
+            "reconciler privilege: sudo is unavailable on Windows",
+        ));
+    }
     Ok(Reconciler {
         name,
         executable,
         source,
         scope: raw.scope.unwrap_or(ReconcilerScope::User),
-        privilege: raw.privilege.unwrap_or(Privilege::User),
+        privilege,
         protocol: raw.protocol,
         profiles: normalized_strings(manifest_path, "reconciler", "profiles", raw.profiles)?,
         group: optional_nonempty(manifest_path, "reconciler", "group", raw.group)?,
@@ -1357,6 +1365,9 @@ fn merge_manifest_entries(
 fn apply_source_overrides(entries: &mut [Entry]) {
     let selected: BTreeSet<PathBuf> = entries.iter().map(|entry| entry.source.clone()).collect();
     for entry in entries {
+        if entry.target_privilege != Privilege::User {
+            continue;
+        }
         let candidate = candidate_source_override(&entry.source);
         if candidate != entry.source && candidate.exists() && !selected.contains(&candidate) {
             entry.source = candidate;
@@ -1628,4 +1639,46 @@ pub fn check_state_preconditions(manifest: &Manifest) -> Result<(), ManifestErro
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn windows_manifest_rejects_a_sudo_reconciler() {
+        let raw: RawReconciler = serde_yaml_ng::from_str(
+            r#"
+name: system-owner
+executable: 'C:\Program Files\owner\owner.exe'
+source: 'C:\desired\owner.toml'
+privilege: sudo
+protocol: dev-tools-reconcile-v1
+"#,
+        )
+        .expect("reconciler fixture");
+        let context = PathContext::new(
+            PathPlatform::Windows,
+            PathBuf::from(r"C:\workspace"),
+            Some(PathBuf::from(r"C:\Users\operator")),
+            PathBuf::from(r"D:\Temp"),
+            BTreeMap::new(),
+        );
+
+        let error = parse_reconciler(
+            raw,
+            Path::new(r"C:\workspace\manifest.yaml"),
+            Path::new(r"C:\workspace"),
+            &context,
+        )
+        .expect_err("sudo reconciler must be rejected on Windows");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reconciler privilege: sudo is unavailable on Windows"),
+            "{error}"
+        );
+    }
 }

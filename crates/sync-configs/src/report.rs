@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use serde::Serialize;
 
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
+pub const RECONCILER_RESULT_SCHEMA: &str = "dev-tools-reconcile-result-v1";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,8 +97,9 @@ pub struct Record {
     pub output: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReconcilerSummary {
+    pub schema: &'static str,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,

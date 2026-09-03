@@ -1,18 +1,22 @@
-#![cfg(unix)]
+#![cfg(all(unix, any(debug_assertions, feature = "test-support")))]
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sync_configs::manifest::{
     CommentedTargetPolicy, DirectoryStrategy, Entry, FileMode, Mode, PermissionPolicy, Privilege,
     ScriptFailurePolicy,
 };
-use sync_configs::privilege::PrivilegeSession;
+use sync_configs::privilege::{PrivilegeError, PrivilegeSession};
 use sync_configs::privileged_target::{
     apply_privileged_plans, plan_selected_privileged_entries, IdentityResolver, PrivilegedCommands,
-    PrivilegedTargetOutcome,
+    PrivilegedTargetError, PrivilegedTargetOutcome,
 };
 use tempfile::TempDir;
 
@@ -46,6 +50,7 @@ impl IdentityResolver for FixedIdentities {
 struct FakeBehavior<'a> {
     drift_source_on_auth: Option<&'a Path>,
     drift_target_after_stage: Option<&'a Path>,
+    block_after_stage: Option<&'a Path>,
     corrupt_target_after_move: Option<&'a Path>,
     fail_stage_install: bool,
 }
@@ -65,6 +70,15 @@ fn fake_sudo(root: &Path, behavior: FakeBehavior<'_>) -> PathBuf {
     let stage_drift = behavior.drift_target_after_stage.map_or_else(
         || ":".to_owned(),
         |path| format!("printf 'drifted-before-move\\n' > {}", shell_literal(path)),
+    );
+    let stage_block = behavior.block_after_stage.map_or_else(
+        || ":".to_owned(),
+        |ready| {
+            format!(
+                "trap '' HUP TERM; : > {}; /bin/sleep 30",
+                shell_literal(ready)
+            )
+        },
     );
     let move_corruption = behavior.corrupt_target_after_move.map_or_else(
         || ":".to_owned(),
@@ -96,6 +110,7 @@ if [ "${{1:-}} ${{2:-}}" = '-n --' ]; then
   status=$?
   if [ "$status" = 0 ] && [ "$command_name" = install ] && [ "${{2:-}}" != -d ]; then
     {stage_drift}
+    {stage_block}
   fi
   if [ "$status" = 0 ] && [ "$command_name" = mv ]; then
     {move_corruption}
@@ -128,6 +143,19 @@ fn commands() -> PrivilegedCommands {
         system_command("rm"),
     )
     .expect("validated system commands")
+}
+
+#[test]
+fn privileged_commands_reject_user_owned_executables() {
+    let root = TempDir::new().expect("temp root");
+    let command = root.path().join("command");
+    fs::write(&command, "#!/bin/sh\nexit 0\n").expect("write command");
+    fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).expect("chmod command");
+
+    let error = PrivilegedCommands::new(command.clone(), command.clone(), command.clone(), command)
+        .expect_err("user-owned privileged commands must be rejected");
+
+    assert!(error.to_string().contains("unavailable or unsafe"));
 }
 
 fn entry(source: &Path, target: &Path) -> Entry {
@@ -240,7 +268,7 @@ fn plans_every_selected_entry_before_authentication() {
         entry(&unsafe_source, &root.path().join("second-target.conf")),
     ];
     let sudo = fake_sudo(root.path(), FakeBehavior::default());
-    let _session = PrivilegeSession::new(sudo).expect("unused session");
+    let _session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("unused session");
 
     let error = plan_selected_privileged_entries(&entries, false, &identities)
         .expect_err("unsafe late source must reject the whole batch");
@@ -248,6 +276,44 @@ fn plans_every_selected_entry_before_authentication() {
     assert!(error.to_string().contains("must not be a symbolic link"));
     assert!(history(root.path()).is_empty());
     assert!(!entries[0].target.exists());
+}
+
+#[test]
+fn late_drift_in_one_plan_stops_the_entire_batch_before_authentication() {
+    let root = TempDir::new().expect("temp root");
+    let identities = FixedIdentities::current(root.path());
+    let first_source = root.path().join("first.conf");
+    let second_source = root.path().join("second.conf");
+    let first_target = root.path().join("first-target.conf");
+    let second_target = root.path().join("second-target.conf");
+    fs::write(&first_source, "first\n").expect("first source");
+    fs::write(&second_source, "second\n").expect("second source");
+    let plans = plan_selected_privileged_entries(
+        &[
+            entry(&first_source, &first_target),
+            entry(&second_source, &second_target),
+        ],
+        false,
+        &identities,
+    )
+    .expect("plans");
+    fs::write(&second_source, "drifted\n").expect("drift second source");
+    let sudo = fake_sudo(root.path(), FakeBehavior::default());
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("unused session");
+
+    let error = apply_privileged_plans(
+        &plans,
+        false,
+        &identities,
+        Some(&mut session),
+        Some(&commands()),
+    )
+    .expect_err("late drift must reject the full batch");
+
+    assert!(error.to_string().contains("drifted between plan and apply"));
+    assert!(history(root.path()).is_empty());
+    assert!(!first_target.exists());
+    assert!(!second_target.exists());
 }
 
 #[test]
@@ -259,7 +325,7 @@ fn first_pass_is_atomic_and_second_pass_invokes_no_sudo() {
     fs::write(&source, "managed\n").expect("source");
     let selected = vec![entry(&source, &target)];
     let sudo = fake_sudo(root.path(), FakeBehavior::default());
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
     let plans = plan_selected_privileged_entries(&selected, false, &identities).expect("plan");
 
     let outcomes = apply_privileged_plans(
@@ -365,7 +431,7 @@ fn authentication_drift_is_detected_before_any_privileged_mutation() {
             ..FakeBehavior::default()
         },
     );
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
     let error = apply_privileged_plans(
         &plans,
@@ -406,7 +472,7 @@ fn existing_parent_mode_is_reconciled_without_reowning_or_replacing_current_file
     let selected = vec![selected_entry];
     let plans = plan_selected_privileged_entries(&selected, false, &identities).expect("plan");
     let sudo = fake_sudo(root.path(), FakeBehavior::default());
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
     apply_privileged_plans(
         &plans,
@@ -453,7 +519,8 @@ fn missing_parent_is_materialized_with_declared_identity_and_mode() {
     let selected = vec![entry(&source, &target)];
     let plans = plan_selected_privileged_entries(&selected, false, &identities).expect("plan");
     let sudo = fake_sudo(root.path(), FakeBehavior::default());
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session =
+        PrivilegeSession::new_authenticated_injected_sudo_for_test(sudo).expect("session");
 
     apply_privileged_plans(
         &plans,
@@ -475,7 +542,7 @@ fn missing_parent_is_materialized_with_declared_identity_and_mode() {
     let calls = history(root.path());
     assert_eq!(invoked_commands(&calls), ["install", "install", "mv"]);
     assert_eq!(
-        calls[2],
+        calls[0],
         vec![
             "-n".to_owned(),
             "--".to_owned(),
@@ -511,7 +578,7 @@ fn staging_drift_preserves_target_and_removes_adjacent_temporary() {
             ..FakeBehavior::default()
         },
     );
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
     let error = apply_privileged_plans(
         &plans,
@@ -534,6 +601,76 @@ fn staging_drift_preserves_target_and_removes_adjacent_temporary() {
 }
 
 #[test]
+fn cancellation_during_staging_preserves_target_and_settles_temporary_cleanup() {
+    let root = TempDir::new().expect("temp root");
+    let identities = FixedIdentities::current(root.path());
+    let source = root.path().join("source.conf");
+    let target = root.path().join("target.conf");
+    let stage_ready = root.path().join("stage-ready");
+    fs::write(&source, "new\n").expect("source");
+    fs::write(&target, "old\n").expect("target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+    let plans = plan_selected_privileged_entries(&[entry(&source, &target)], false, &identities)
+        .expect("plan");
+    let sudo = fake_sudo(
+        root.path(),
+        FakeBehavior {
+            block_after_stage: Some(&stage_ready),
+            ..FakeBehavior::default()
+        },
+    );
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut session = PrivilegeSession::new_authenticated_injected_sudo_for_test(sudo)
+        .expect("session")
+        .with_execution_limits_for_test(Duration::from_secs(3), 1 << 20)
+        .with_cancellation_for_test(Arc::clone(&cancelled));
+    let test_commands = commands();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let runner = thread::spawn(move || {
+        let result = apply_privileged_plans(
+            &plans,
+            false,
+            &identities,
+            Some(&mut session),
+            Some(&test_commands),
+        );
+        let _ = sender.send(result);
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    while !stage_ready.exists() && Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stage_started = stage_ready.exists();
+    let adjacent_temporary_was_staged = !temporary_candidates(&target).is_empty();
+    cancelled.store(true, Ordering::Release);
+    let result = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancelled stage or its temporary cleanup exceeded the bounded return window");
+    runner.join().expect("join privileged target runner");
+
+    assert!(
+        stage_started,
+        "staged install did not reach its blocking point"
+    );
+    assert!(
+        adjacent_temporary_was_staged,
+        "blocked staged install did not leave an adjacent candidate to settle"
+    );
+    assert!(matches!(
+        result,
+        Err(PrivilegedTargetError::PrivilegedCommand {
+            operation: "file install",
+            source: PrivilegeError::Interrupted,
+            ..
+        })
+    ));
+    assert_eq!(fs::read_to_string(&target).expect("target"), "old\n");
+    assert_eq!(invoked_commands(&history(root.path())), ["install", "rm"]);
+    assert!(temporary_candidates(&target).is_empty());
+}
+
+#[test]
 fn failed_stage_install_preserves_the_existing_target() {
     let root = TempDir::new().expect("temp root");
     let identities = FixedIdentities::current(root.path());
@@ -551,7 +688,7 @@ fn failed_stage_install_preserves_the_existing_target() {
             ..FakeBehavior::default()
         },
     );
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
     let error = apply_privileged_plans(
         &plans,
@@ -587,7 +724,7 @@ fn exact_postcondition_detects_corruption_after_atomic_replace() {
             ..FakeBehavior::default()
         },
     );
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
     let error = apply_privileged_plans(
         &plans,
@@ -645,7 +782,7 @@ fn multiple_targets_share_exactly_one_authentication_session() {
     )
     .expect("plans");
     let sudo = fake_sudo(root.path(), FakeBehavior::default());
-    let mut session = PrivilegeSession::new(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
     let outcomes = apply_privileged_plans(
         &plans,

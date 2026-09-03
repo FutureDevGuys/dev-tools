@@ -7,16 +7,19 @@ repository.workspace = true
 publish = false
 description = "Manifest-driven, config-only filesystem and structured-overlay convergence"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+ctrlc = "3"
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
-fs2 = "0.4"
 globset = "0.4"
-ignore = "0.4"
 libc = "0.2"
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }

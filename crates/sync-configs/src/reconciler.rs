@@ -5,10 +5,15 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use dev_tools_command::{is_executable_file, run_bounded_command, BoundedCommand};
+use dev_tools_command::{
+    is_executable_file, run_bounded_command_with_cancellation, BoundedCommand,
+    BoundedCommandErrorKind,
+};
 use dev_tools_reconcile_protocol::ReconcileResult;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::privilege::{resolve_trusted_sudo, validate_trusted_executable};
 
 const PROTOCOL: &str = "dev-tools-reconcile-v1";
 const MAX_OUTPUT: usize = 16 << 20;
@@ -38,8 +43,12 @@ pub struct ReconcilerRunner {
 
 #[derive(Debug, Error)]
 pub enum ReconcilerError {
+    #[error("external reconciler was interrupted")]
+    Interrupted,
     #[error("external reconciler executable has unsafe authority")]
     UnsafeExecutable,
+    #[error("external reconciler sudo executable has unsafe authority")]
+    UnsafeSudo,
     #[error("external reconciler source has unsafe authority")]
     UnsafeSource,
     #[error("external reconciler requires one shared sudo session")]
@@ -56,6 +65,8 @@ pub enum ReconcilerError {
     InvalidLimits,
     #[error("external reconciler protocol is unsupported")]
     UnsupportedProtocol,
+    #[error("external reconciler privilege is unsupported on this platform")]
+    UnsupportedPrivilege,
 }
 
 /// Resolve a declarative executable alias exactly once, then validate and
@@ -82,7 +93,17 @@ impl ReconcilerRunner {
     pub fn validate(&self, spec: &ReconcilerSpec) -> Result<(), ReconcilerError> {
         self.validate_limits()?;
         Self::validate_protocol(&spec.protocol)?;
-        validate_executable(&spec.executable)?;
+        #[cfg(not(unix))]
+        if spec.privilege == ReconcilerPrivilege::Sudo {
+            return Err(ReconcilerError::UnsupportedPrivilege);
+        }
+        match spec.privilege {
+            ReconcilerPrivilege::User => validate_executable(&spec.executable)?,
+            ReconcilerPrivilege::Sudo => {
+                validate_trusted_executable(&spec.executable)
+                    .map_err(|_| ReconcilerError::UnsafeExecutable)?;
+            }
+        }
         validate_source(&spec.source, self.output_limit)
     }
 
@@ -184,12 +205,15 @@ impl ReconcilerRunner {
         arguments: Vec<OsString>,
     ) -> Result<ReconcileResult, ReconcilerError> {
         let (executable, arguments) = match spec.privilege {
-            ReconcilerPrivilege::User => (spec.executable.as_path(), arguments),
+            ReconcilerPrivilege::User => (spec.executable.clone(), arguments),
             ReconcilerPrivilege::Sudo => {
                 let sudo = self
                     .sudo_path
                     .as_deref()
                     .ok_or(ReconcilerError::MissingSudo)?;
+                let sudo = resolve_trusted_sudo(sudo).map_err(|_| ReconcilerError::UnsafeSudo)?;
+                validate_trusted_executable(&spec.executable)
+                    .map_err(|_| ReconcilerError::UnsafeExecutable)?;
                 let mut elevated = Vec::with_capacity(arguments.len() + 3);
                 elevated.push("-n".into());
                 elevated.push("--".into());
@@ -198,15 +222,24 @@ impl ReconcilerRunner {
                 (sudo, elevated)
             }
         };
-        let output = run_bounded_command(&BoundedCommand {
-            executable,
-            arguments: &arguments,
-            environment: &self.environment,
-            cwd: None,
-            timeout: self.timeout,
-            output_limit: self.output_limit,
-        })
-        .map_err(|_| ReconcilerError::Invocation { operation })?;
+        let output = run_bounded_command_with_cancellation(
+            &BoundedCommand {
+                executable: &executable,
+                arguments: &arguments,
+                environment: &self.environment,
+                cwd: None,
+                timeout: self.timeout,
+                output_limit: self.output_limit,
+            },
+            crate::interrupt::cancellation_flag(),
+        )
+        .map_err(|error| {
+            if error.kind() == BoundedCommandErrorKind::Cancelled {
+                ReconcilerError::Interrupted
+            } else {
+                ReconcilerError::Invocation { operation }
+            }
+        })?;
         if !output.status.success() {
             return Err(ReconcilerError::Invocation { operation });
         }
@@ -361,4 +394,31 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+
+    #[test]
+    fn sudo_reconciler_is_rejected_before_filesystem_validation() {
+        let runner = ReconcilerRunner {
+            environment: BTreeMap::new(),
+            sudo_path: None,
+            timeout: Duration::from_secs(1),
+            output_limit: 1024,
+        };
+        let spec = ReconcilerSpec {
+            name: "system-owner".to_owned(),
+            executable: PathBuf::from(r"C:\missing\owner.exe"),
+            source: PathBuf::from(r"C:\missing\desired.toml"),
+            privilege: ReconcilerPrivilege::Sudo,
+            protocol: PROTOCOL.to_owned(),
+        };
+
+        assert!(matches!(
+            runner.validate(&spec),
+            Err(ReconcilerError::UnsupportedPrivilege)
+        ));
+    }
 }

@@ -203,7 +203,7 @@ pub fn overlay_toml_file(
         let managed_id = options
             .managed_overlay_id
             .as_deref()
-            .expect("validated managed overlay id");
+            .ok_or_else(|| anyhow!("managed_overlay_id is required for an ownership receipt"))?;
         if let Err(error) = ownership::write_paths_atomic(&path, managed_id, &current_paths) {
             if write_target {
                 ownership::restore_file(target_path, &target_snapshot).with_context(|| {
@@ -235,7 +235,10 @@ pub fn parse_toml_key_path(raw: &str) -> Result<PathKey> {
         if paths.len() != 1 {
             bail!("TOML key path must identify exactly one key");
         }
-        let path = paths.into_iter().next().expect("one parsed key component");
+        let path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("TOML key path did not contain a parsed component"))?;
         if path.len() != 1 {
             bail!("TOML key path contains an invalid component");
         }
@@ -257,11 +260,37 @@ pub fn render_toml_key_path(path: &[String]) -> String {
             {
                 component.clone()
             } else {
-                serde_json::to_string(component).expect("a Rust string always serializes to JSON")
+                quote_toml_basic_string(component)
             }
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn quote_toml_basic_string(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{08}' => quoted.push_str("\\b"),
+            '\u{09}' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\u{0c}' => quoted.push_str("\\f"),
+            '\r' => quoted.push_str("\\r"),
+            character if character <= '\u{1f}' => {
+                let value = character as usize;
+                quoted.push_str("\\u00");
+                quoted.push(HEX[value >> 4] as char);
+                quoted.push(HEX[value & 0x0f] as char);
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn parse_document(text: &str, label: &str) -> Result<DocumentMut> {
@@ -463,13 +492,9 @@ fn merge_source_wins(target: &mut dyn TableLike, source: &dyn TableLike) {
             target.insert(&key, source_item);
             continue;
         };
-        if target_item.is_table_like() && source_item.is_table_like() {
-            let target_table = target_item
-                .as_table_like_mut()
-                .expect("checked target table-like item");
-            let source_table = source_item
-                .as_table_like()
-                .expect("checked source table-like item");
+        if let (Some(target_table), Some(source_table)) =
+            (target_item.as_table_like_mut(), source_item.as_table_like())
+        {
             merge_source_wins(target_table, source_table);
         } else {
             *target_item = source_item;
@@ -697,8 +722,10 @@ fn semantic_target_wins(source: &SemanticValue, target: &SemanticValue) -> Seman
 }
 
 fn read_optional_target(path: &Path) -> Result<(String, bool)> {
+    ownership::validate_real_parent_chain(path, "TOML overlay target")?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
+            ownership::validate_real_parent_chain(path, "TOML overlay target")?;
             let text = match fs::read_to_string(path) {
                 Ok(text) => text,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -710,11 +737,15 @@ fn read_optional_target(path: &Path) -> Result<(String, bool)> {
             };
             Ok((text, true))
         }
-        Ok(metadata) if metadata.is_file() => Ok((
-            fs::read_to_string(path)
-                .with_context(|| format!("cannot read TOML overlay target {}", path.display()))?,
-            false,
-        )),
+        Ok(metadata) if metadata.is_file() => {
+            ownership::validate_real_parent_chain(path, "TOML overlay target")?;
+            Ok((
+                fs::read_to_string(path).with_context(|| {
+                    format!("cannot read TOML overlay target {}", path.display())
+                })?,
+                false,
+            ))
+        }
         Ok(_) => bail!(
             "TOML overlay target must be a file path: {}",
             path.display()

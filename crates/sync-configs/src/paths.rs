@@ -21,6 +21,22 @@ impl PathPlatform {
     }
 }
 
+fn environment_value_for<'a>(
+    environment: &'a BTreeMap<OsString, OsString>,
+    platform: PathPlatform,
+    name: &str,
+) -> Option<&'a OsString> {
+    if platform == PathPlatform::Windows {
+        environment.iter().find_map(|(key, value)| {
+            key.to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case(name))
+                .then_some(value)
+        })
+    } else {
+        environment.get(OsStr::new(name))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PathContext {
     pub platform: PathPlatform,
@@ -50,40 +66,47 @@ impl PathContext {
     pub fn from_current_environment() -> Result<Self, PathError> {
         let environment: BTreeMap<OsString, OsString> = env::vars_os().collect();
         let platform = PathPlatform::current();
-        let home =
-            match platform {
-                PathPlatform::Posix => environment.get(OsStr::new("HOME")).cloned(),
-                PathPlatform::Windows => environment
-                    .get(OsStr::new("USERPROFILE"))
-                    .cloned()
-                    .or_else(|| {
-                        let drive = environment.get(OsStr::new("HOMEDRIVE"))?;
-                        let path = environment.get(OsStr::new("HOMEPATH"))?;
-                        let mut joined = drive.clone();
-                        joined.push(path);
-                        Some(joined)
-                    }),
-            }
-            .map(PathBuf::from);
-        Ok(Self {
+        Ok(Self::from_environment(
             platform,
-            cwd: env::current_dir().map_err(PathError::CurrentDirectory)?,
-            home,
-            temp_dir: env::temp_dir(),
+            env::current_dir().map_err(PathError::CurrentDirectory)?,
+            env::temp_dir(),
             environment,
-        })
+        ))
+    }
+
+    /// Build a context from a captured environment while deriving the native
+    /// home convention for `platform`.
+    pub fn from_environment(
+        platform: PathPlatform,
+        cwd: PathBuf,
+        temp_dir: PathBuf,
+        environment: BTreeMap<OsString, OsString>,
+    ) -> Self {
+        let home = match platform {
+            PathPlatform::Posix => environment_value_for(&environment, platform, "HOME").cloned(),
+            PathPlatform::Windows => environment_value_for(&environment, platform, "USERPROFILE")
+                .cloned()
+                .or_else(|| {
+                    let drive = environment_value_for(&environment, platform, "HOMEDRIVE")?;
+                    let path = environment_value_for(&environment, platform, "HOMEPATH")?;
+                    let mut joined = drive.clone();
+                    joined.push(path);
+                    Some(joined)
+                }),
+        }
+        .map(PathBuf::from)
+        .filter(|home| is_absolute_for(home, platform));
+        Self {
+            platform,
+            cwd,
+            home,
+            temp_dir,
+            environment,
+        }
     }
 
     fn environment_value(&self, name: &str) -> Option<&OsString> {
-        if self.platform == PathPlatform::Windows {
-            self.environment.iter().find_map(|(key, value)| {
-                key.to_str()
-                    .is_some_and(|key| key.eq_ignore_ascii_case(name))
-                    .then_some(value)
-            })
-        } else {
-            self.environment.get(OsStr::new(name))
-        }
+        environment_value_for(&self.environment, self.platform, name)
     }
 }
 
@@ -204,7 +227,7 @@ fn windows_separators(path: OsString) -> OsString {
     OsString::from(path.replace('/', "\\"))
 }
 
-fn platform_join(base: &Path, child: &Path, platform: PathPlatform) -> PathBuf {
+pub(crate) fn platform_join(base: &Path, child: &Path, platform: PathPlatform) -> PathBuf {
     if platform != PathPlatform::Windows || cfg!(windows) {
         return base.join(child);
     }
@@ -269,19 +292,86 @@ pub fn normalize_user_path(raw: &str, context: &PathContext) -> Result<PathBuf, 
     }
 }
 
+fn is_windows_separator(byte: u8) -> bool {
+    matches!(byte, b'/' | b'\\')
+}
+
+fn windows_text_is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_windows_separator(bytes[2])
+    {
+        return true;
+    }
+
+    if bytes.len() < 2 || !is_windows_separator(bytes[0]) || !is_windows_separator(bytes[1]) {
+        return false;
+    }
+
+    // Windows treats verbatim and device namespace prefixes as rooted even
+    // when no component follows the namespace marker. Keep these cases
+    // aligned with `std::path` before applying ordinary UNC validation.
+    if bytes.starts_with(br"\\?\")
+        || (bytes.len() >= 4 && bytes[2] == b'.' && is_windows_separator(bytes[3]))
+    {
+        return true;
+    }
+
+    let mut components = path[2..].split(['/', '\\']);
+    let server = components.next().unwrap_or_default();
+    let share = components.next().unwrap_or_default();
+    !server.is_empty() && !share.is_empty()
+}
+
+/// Reports whether `path` is absolute according to the selected platform.
+///
+/// On a non-Windows host, Windows paths are classified textually using the
+/// rooted-drive and UNC prefix forms recognized by `std::path` on Windows.
+/// Non-Unicode paths cannot be simulated and are rejected conservatively.
 pub fn is_absolute_for(path: &Path, platform: PathPlatform) -> bool {
     if platform != PathPlatform::Windows || cfg!(windows) {
         return path.is_absolute();
     }
-    let Some(path) = path.to_str() else {
-        return false;
-    };
-    let bytes = path.as_bytes();
-    path.starts_with(['/', '\\'])
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'/' | b'\\'))
+    path.to_str().is_some_and(windows_text_is_absolute)
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::windows_text_is_absolute;
+    use std::path::Path;
+
+    #[test]
+    fn synthetic_windows_absolute_classifier_matches_native_path_grammar() {
+        for raw in [
+            r"C:\config",
+            "C:/config",
+            r"\\server\share",
+            r"\\server\share\config",
+            "//server/share/config",
+            r"\\?\C:\config",
+            r"\\?\",
+            r"\\?\UNC\server",
+            r"\\.\COM1",
+            r"\\.\",
+            r"C:config",
+            r"1:\config",
+            r"\config",
+            "/config",
+            r"\\server",
+            r"\\server\",
+            r"\\\share",
+            r"\\server\\share",
+            "config",
+        ] {
+            assert_eq!(
+                windows_text_is_absolute(raw),
+                Path::new(raw).is_absolute(),
+                "Windows absolute-path parity for {raw:?}"
+            );
+        }
+    }
 }
 
 fn lexical_normalize_posix(path: &Path) -> PathBuf {

@@ -4,12 +4,21 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use sync_configs::reconciler::{
-    resolve_executable, ReconcilerPrivilege, ReconcilerRunner, ReconcilerSpec,
+    resolve_executable, ReconcilerError, ReconcilerPrivilege, ReconcilerRunner, ReconcilerSpec,
 };
 use tempfile::TempDir;
+
+static RECONCILER_PROCESS_TEST: Mutex<()> = Mutex::new(());
+
+fn process_test_guard() -> MutexGuard<'static, ()> {
+    RECONCILER_PROCESS_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn fake_reconciler(root: &Path, unsafe_plan: bool) -> (std::path::PathBuf, std::path::PathBuf) {
     let executable = root.join("fake-reconciler");
@@ -73,8 +82,76 @@ fn runner() -> ReconcilerRunner {
     }
 }
 
+fn canonical_system_executable(name: &str) -> std::path::PathBuf {
+    ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("missing system executable {name}"))
+        .canonicalize()
+        .expect("canonical system executable")
+}
+
+#[test]
+fn sudo_reconciler_rejects_a_user_owned_sudo_executable_before_invocation() {
+    let _guard = process_test_guard();
+    let root = TempDir::new().expect("temp root");
+    let source = root.path().join("desired.toml");
+    fs::write(&source, "desired = true\n").expect("write source");
+    let marker = root.path().join("must-not-run");
+    let sudo = root.path().join("sudo");
+    fs::write(
+        &sudo,
+        format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+    )
+    .expect("write fake sudo");
+    fs::set_permissions(&sudo, fs::Permissions::from_mode(0o700)).expect("chmod fake sudo");
+    let spec = ReconcilerSpec {
+        name: "owner-tool".into(),
+        executable: canonical_system_executable("true"),
+        source,
+        privilege: ReconcilerPrivilege::Sudo,
+        protocol: "dev-tools-reconcile-v1".into(),
+    };
+    let mut runner = runner();
+    runner.sudo_path = Some(sudo);
+
+    let error = runner
+        .run(&spec, false)
+        .expect_err("user-owned sudo must be rejected");
+
+    assert!(matches!(error, ReconcilerError::UnsafeSudo));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn sudo_reconciler_rejects_a_user_owned_reconciler_before_invocation() {
+    let _guard = process_test_guard();
+    let root = TempDir::new().expect("temp root");
+    let source = root.path().join("desired.toml");
+    fs::write(&source, "desired = true\n").expect("write source");
+    let (executable, argv_log) = fake_reconciler(root.path(), false);
+    let spec = ReconcilerSpec {
+        name: "owner-tool".into(),
+        executable,
+        source,
+        privilege: ReconcilerPrivilege::Sudo,
+        protocol: "dev-tools-reconcile-v1".into(),
+    };
+    let mut runner = runner();
+    runner.sudo_path = Some(canonical_system_executable("true"));
+
+    let error = runner
+        .run(&spec, false)
+        .expect_err("user-owned reconciler must be rejected");
+
+    assert!(matches!(error, ReconcilerError::UnsafeExecutable));
+    assert!(!argv_log.exists());
+}
+
 #[test]
 fn stable_alias_is_resolved_before_protocol_execution() {
+    let _guard = process_test_guard();
     use std::os::unix::fs::symlink;
 
     let root = TempDir::new().expect("temp root");
@@ -92,6 +169,7 @@ fn stable_alias_is_resolved_before_protocol_execution() {
 
 #[test]
 fn exact_plan_apply_verify_grammar_and_digest_are_enforced() {
+    let _guard = process_test_guard();
     let root = TempDir::new().expect("temp root");
     let source = root.path().join("desired.toml");
     fs::write(&source, "desired = true\n").expect("write source");
@@ -147,6 +225,7 @@ fn exact_plan_apply_verify_grammar_and_digest_are_enforced() {
 
 #[test]
 fn dry_run_plans_only_and_never_applies() {
+    let _guard = process_test_guard();
     let root = TempDir::new().expect("temp root");
     let source = root.path().join("desired.toml");
     fs::write(&source, "desired = true\n").expect("write source");
@@ -167,6 +246,7 @@ fn dry_run_plans_only_and_never_applies() {
 
 #[test]
 fn unsafe_plan_custody_fails_before_apply() {
+    let _guard = process_test_guard();
     let root = TempDir::new().expect("temp root");
     let source = root.path().join("desired.toml");
     fs::write(&source, "desired = true\n").expect("write source");
@@ -180,7 +260,10 @@ fn unsafe_plan_custody_fails_before_apply() {
     };
 
     let error = runner().run(&spec, false).expect_err("unsafe plan");
-    assert!(error.to_string().contains("unsafe plan"));
+    assert!(
+        error.to_string().contains("unsafe plan"),
+        "unexpected error: {error:?}"
+    );
     assert!(!root.path().join("applied").exists());
     assert_eq!(fs::read_to_string(argv_log).unwrap().lines().count(), 1);
 }
