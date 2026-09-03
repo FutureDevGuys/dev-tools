@@ -66,6 +66,7 @@ pub struct GitIdentityConfig {
 #[serde(deny_unknown_fields)]
 pub struct GitHubAppCap {
     pub app_id: u64,
+    pub repository_selection: crate::RepositorySelection,
     pub private_key_references: Vec<String>,
 }
 
@@ -321,6 +322,7 @@ pub struct ResolvedRouting {
 pub struct ResolvedGitHubAuthority {
     pub app_cap: String,
     pub app_id: u64,
+    pub repository_selection: crate::RepositorySelection,
     pub private_key_ref: String,
     pub owners: BTreeSet<String>,
     pub repositories: BTreeSet<String>,
@@ -430,6 +432,7 @@ pub fn require_system_policy_narrows(
             .get(name)
             .with_context(|| format!("narrowing policy introduces GitHub App cap {name}"))?;
         if app.app_id != administrator_app.app_id
+            || app.repository_selection != administrator_app.repository_selection
             || !is_subset(
                 &app.private_key_references,
                 &administrator_app.private_key_references,
@@ -1196,6 +1199,7 @@ fn resolve_github_authority(
     Ok(ResolvedGitHubAuthority {
         app_cap: requested.app_cap.clone(),
         app_id: app.app_id,
+        repository_selection: app.repository_selection,
         private_key_ref: requested.private_key_ref.clone(),
         owners,
         repositories,

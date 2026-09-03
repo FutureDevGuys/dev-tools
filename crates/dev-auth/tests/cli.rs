@@ -16,6 +16,83 @@ use wait_timeout::ChildExt;
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn signed_release_asset_name_enters_the_setup_cli_without_renaming() {
+    let directory = tempfile::tempdir().unwrap();
+    let asset = directory.path().join(format!(
+        "dev-auth-{}-linux-{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    ));
+    fs::copy(env!("CARGO_BIN_EXE_dev-auth"), &asset).unwrap();
+    fs::set_permissions(&asset, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = bounded_output(
+        Command::new(&asset)
+            .arg("build-info")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin"),
+    );
+    assert!(
+        output.status.success(),
+        "downloaded release asset did not enter the core CLI: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["product"], "dev-auth");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let output = bounded_output(
+        Command::new(&asset)
+            .args([
+                "setup",
+                "plan",
+                "--mode",
+                "strong",
+                "--channel",
+                "stable",
+                "--offline",
+                "--activation",
+                "inactive",
+                "--administrator-policy",
+                directory.path().join("policy.toml").to_str().unwrap(),
+                "--user-config",
+                &format!(
+                    "{}={}",
+                    user.name,
+                    directory.path().join("config.toml").display()
+                ),
+                "--release-root",
+                directory.path().join("missing-root.json").to_str().unwrap(),
+                "--release-manifest",
+                directory
+                    .path()
+                    .join("missing-manifest.json")
+                    .to_str()
+                    .unwrap(),
+                "--release-artifact",
+                directory.path().join("missing-artifact").to_str().unwrap(),
+                "--output",
+                directory.path().join("plan.json").to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin"),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("open root document"),
+        "downloaded release asset did not parse the local setup plan: {error}"
+    );
+}
+
 fn bounded_reader<T>(mut reader: T) -> thread::JoinHandle<Vec<u8>>
 where
     T: Read + Send + 'static,
@@ -154,6 +231,60 @@ fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("accepts only a full setup plan v3"));
+}
+
+#[test]
+fn setup_plan_requires_one_complete_offline_release_bundle() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let user_config = format!("{}=/tmp/dev-auth-config.toml", user.name);
+    let common = [
+        "setup",
+        "plan",
+        "--mode",
+        "user-only",
+        "--channel",
+        "stable",
+        "--activation",
+        "inactive",
+        "--administrator-policy",
+        "/tmp/dev-auth-policy.toml",
+        "--user-config",
+        &user_config,
+        "--output",
+        "/tmp/dev-auth-plan.json",
+        "--format",
+        "json",
+    ];
+    let incomplete = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(common)
+            .args(["--offline", "--release-root", "/tmp/root.json"])
+            .env_clear(),
+    );
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8(incomplete.stderr)
+        .unwrap()
+        .contains("must be provided together"));
+
+    let online = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(common)
+            .args([
+                "--release-root",
+                "/tmp/root.json",
+                "--release-manifest",
+                "/tmp/manifest.json",
+                "--release-artifact",
+                "/tmp/artifact",
+            ])
+            .env_clear(),
+    );
+    assert!(!online.status.success());
+    assert!(String::from_utf8(online.stderr)
+        .unwrap()
+        .contains("requires --offline"));
 }
 
 #[test]
@@ -357,7 +488,8 @@ fn run_standalone_user_only_setup_child() {
         normalize_deployment, parse_deployment_document, DeploymentCliInput,
     };
     use dev_auth::setup::{build_plan, rollback_at, InstallMode, InstallRequest, SetupPaths};
-    use dev_auth::setup_v3::{apply_setup_plan_v3, build_setup_plan_v3_at, render_setup_plan_v3};
+    use dev_auth::setup_v3::{build_setup_plan_v3_at, write_setup_plan_v3_at};
+    use std::os::unix::process::CommandExt;
 
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .unwrap()
@@ -367,7 +499,8 @@ fn run_standalone_user_only_setup_child() {
         .tempdir_in(&user.dir)
         .unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let candidate = user.dir.parent().unwrap().join("product");
+    let candidate = user.dir.parent().unwrap().join("artifact");
+    let bootstrap = user.dir.parent().unwrap().join("dev-auth-bootstrap");
 
     let upstream_log = root.path().join("native-git.log");
     let native_git = root.path().join("native-git");
@@ -458,14 +591,55 @@ config = "{}"
     )
     .unwrap();
     let plan = build_setup_plan_v3_at(intent, installation, false).unwrap();
-    let (_, digest) = render_setup_plan_v3(&plan).unwrap();
-    let first = apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
-    assert!(first.changed);
-    assert!(first.verified);
+    let plan_path = root.path().join("setup-plan.json");
+    let digest = write_setup_plan_v3_at(&plan_path, &plan).unwrap();
+    let first = Command::new(&bootstrap)
+        .arg0("dev-auth")
+        .args([
+            "setup",
+            "apply",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--sha256",
+            &digest,
+            "--format",
+            "json",
+        ])
+        .env_clear()
+        .env("HOME", &user.dir)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "candidate setup handoff failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["changed"], true);
+    assert_eq!(first["verified"], true);
 
-    let second = apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
-    assert!(!second.changed);
-    assert!(second.verified);
+    let second = Command::new(user.dir.join(".local/bin/dev-auth"))
+        .args([
+            "setup",
+            "apply",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--sha256",
+            &digest,
+            "--format",
+            "json",
+        ])
+        .env_clear()
+        .env("HOME", &user.dir)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["changed"], false);
+    assert_eq!(second["verified"], true);
 
     let installation_lock = paths.data_root.join("installation.lock");
     fs::set_permissions(&installation_lock, fs::Permissions::from_mode(0o000)).unwrap();
@@ -708,8 +882,10 @@ fn standalone_user_only_setup_is_idempotent_transparent_and_reversible() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
-    let product = sandbox.root.join("product");
+    let product = sandbox.root.join("artifact");
+    let bootstrap = sandbox.root.join("dev-auth-bootstrap");
     sandbox.install_binary(&product);
+    sandbox.install_binary(&bootstrap);
     assert!(Command::new("/usr/bin/strip")
         .args(["--strip-debug"])
         .arg(&product)

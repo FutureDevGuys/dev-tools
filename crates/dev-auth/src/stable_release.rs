@@ -17,7 +17,7 @@ const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const TRUSTED_ROOT: &str = include_str!("../trust/root-public-key.txt");
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedStableRelease {
     pub verified: VerifiedDevAuthRelease,
     pub directory: PathBuf,
@@ -58,6 +58,48 @@ pub fn stage_latest_stable_release(
         return load_offline_release(storage);
     }
     stage_latest_stable_release_inner(storage)
+}
+
+pub fn stage_verified_release_from_paths(
+    storage: &StableReleaseStorage,
+    root_path: &Path,
+    manifest_path: &Path,
+    artifact_path: &Path,
+) -> Result<StagedStableRelease> {
+    stage_verified_release_from_paths_with_authority(
+        storage,
+        &release_authority()?,
+        root_path,
+        manifest_path,
+        artifact_path,
+    )
+}
+
+fn stage_verified_release_from_paths_with_authority(
+    storage: &StableReleaseStorage,
+    authority: &ReleaseAuthority,
+    root_path: &Path,
+    manifest_path: &Path,
+    artifact_path: &Path,
+) -> Result<StagedStableRelease> {
+    let metadata = ReleaseMetadata {
+        root: crate::release_manifest::read_public_file(
+            root_path,
+            METADATA_LIMIT,
+            "root document",
+        )?,
+        manifest: crate::release_manifest::read_public_file(
+            manifest_path,
+            METADATA_LIMIT,
+            "release manifest",
+        )?,
+    };
+    let artifact = crate::release_manifest::read_public_file(
+        artifact_path,
+        ARTIFACT_LIMIT,
+        "release artifact",
+    )?;
+    stage_verified_release_bundle(storage, authority, &metadata, &artifact)
 }
 
 pub fn require_accepted_release(
@@ -109,13 +151,27 @@ fn stage_latest_stable_release_inner(
         verified.artifact_length,
         None,
     )?;
-    verify_artifact_bytes(&verified, &artifact.bytes)?;
+    stage_verified_release_bundle(storage, &authority, &metadata, &artifact.bytes)
+}
+
+fn stage_verified_release_bundle(
+    storage: &StableReleaseStorage,
+    authority: &ReleaseAuthority,
+    metadata: &ReleaseMetadata,
+    artifact: &[u8],
+) -> Result<StagedStableRelease> {
+    validate_storage(storage)?;
+    let verified = verify_release_metadata(metadata, authority)?;
+    if !verified.version.pre.is_empty() {
+        bail!("explicit release bundle is not a stable release");
+    }
+    verify_artifact_bytes(&verified, artifact)?;
     preflight_accepted_state(storage, &verified)?;
     let cached = cache_verified_release(
         &storage.cache_root,
-        &authority,
-        &metadata,
-        &artifact.bytes,
+        authority,
+        metadata,
+        artifact,
         storage.owner_uid,
     )?;
     accept_verified_release_at(&storage.state_path, storage.owner_uid, &verified)?;
@@ -238,6 +294,129 @@ fn cached_release_result(cached: CachedRelease) -> Result<StagedStableRelease> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde::Serialize;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    #[derive(Serialize)]
+    struct TestEnvelope<T> {
+        signed: T,
+        signatures: Vec<TestSignature>,
+    }
+
+    #[derive(Serialize)]
+    struct TestSignature {
+        key_id: String,
+        signature: String,
+    }
+
+    #[derive(Serialize)]
+    struct TestRoot {
+        schema: String,
+        generation: u64,
+        release_keys: Vec<TestReleaseKey>,
+    }
+
+    #[derive(Serialize)]
+    struct TestReleaseKey {
+        key_id: String,
+        public_key: String,
+        revoked: bool,
+    }
+
+    #[derive(Serialize)]
+    struct TestManifest {
+        schema: String,
+        product: String,
+        generation: u64,
+        version: String,
+        source_commit: String,
+        engine_protocol: u32,
+        artifacts: BTreeMap<String, TestArtifact>,
+    }
+
+    #[derive(Serialize)]
+    struct TestArtifact {
+        url: String,
+        length: u64,
+        sha256: String,
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn envelope<T: Serialize>(signed: T, key_id: &str, key: &SigningKey) -> Vec<u8> {
+        let signature = BASE64.encode(key.sign(&serde_jcs::to_vec(&signed).unwrap()).to_bytes());
+        serde_json::to_vec(&TestEnvelope {
+            signed,
+            signatures: vec![TestSignature {
+                key_id: key_id.into(),
+                signature,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn release_fixture() -> (ReleaseAuthority, ReleaseMetadata, Vec<u8>) {
+        let root_key = SigningKey::from_bytes(&[7; 32]);
+        let release_key = SigningKey::from_bytes(&[9; 32]);
+        let target = "linux-x86_64";
+        let version = "0.3.8";
+        let artifact = b"authenticated local release fixture".to_vec();
+        let root = envelope(
+            TestRoot {
+                schema: "dev-tools-root-v1".into(),
+                generation: 7,
+                release_keys: vec![TestReleaseKey {
+                    key_id: "release-test".into(),
+                    public_key: hex(&release_key.verifying_key().to_bytes()),
+                    revoked: false,
+                }],
+            },
+            "root-test",
+            &root_key,
+        );
+        let manifest = envelope(
+            TestManifest {
+                schema: "dev-auth-product-v2".into(),
+                product: "dev-auth".into(),
+                generation: 19,
+                version: version.into(),
+                source_commit: "a".repeat(40),
+                engine_protocol: 1,
+                artifacts: BTreeMap::from([(
+                    target.into(),
+                    TestArtifact {
+                        url: format!("https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv{version}/dev-auth-{version}-{target}"),
+                        length: artifact.len() as u64,
+                        sha256: format!("{:x}", Sha256::digest(&artifact)),
+                    },
+                )]),
+            },
+            "release-test",
+            &release_key,
+        );
+        (
+            ReleaseAuthority {
+                trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
+                product: "dev-auth".into(),
+                accepted_manifest_schemas: vec!["dev-auth-product-v2".into()],
+                target: target.into(),
+                artifact_url: ArtifactUrlPolicy::GitHubRelease {
+                    owner: "FutureDevGuys".into(),
+                    repository: "dev-tools".into(),
+                },
+                require_source_commit: true,
+                engine_protocol: 1,
+            },
+            ReleaseMetadata { root, manifest },
+            artifact,
+        )
+    }
 
     #[test]
     fn release_storage_is_absolute_bounded_and_nonoverlapping() {
@@ -253,5 +432,90 @@ mod tests {
             ..storage
         };
         assert!(validate_storage(&overlapping).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_local_release_is_cached_accepted_and_reloadable() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = StableReleaseStorage {
+            state_path: root.path().join("state.json"),
+            cache_root: root.path().join("cache"),
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+        };
+        let (authority, metadata, artifact) = release_fixture();
+        let root_real = root.path().join("root-real.json");
+        let root_path = root.path().join("root.json");
+        let manifest_path = root.path().join("manifest.json");
+        let artifact_path = root.path().join("artifact");
+        std::fs::write(&root_real, &metadata.root).unwrap();
+        std::fs::write(&manifest_path, &metadata.manifest).unwrap();
+        std::fs::write(&artifact_path, &artifact).unwrap();
+        symlink(&root_real, &root_path).unwrap();
+        assert!(stage_verified_release_from_paths_with_authority(
+            &storage,
+            &authority,
+            &root_path,
+            &manifest_path,
+            &artifact_path,
+        )
+        .is_err());
+        std::fs::remove_file(&root_path).unwrap();
+        std::fs::write(&root_path, &metadata.root).unwrap();
+
+        let staged = stage_verified_release_from_paths_with_authority(
+            &storage,
+            &authority,
+            &root_path,
+            &manifest_path,
+            &artifact_path,
+        )
+        .unwrap();
+        assert_eq!(staged.verified.version, "0.3.8");
+        assert_eq!(staged.verified.manifest_generation, 19);
+        assert!(staged.verified.root_path.starts_with(&storage.cache_root));
+        assert!(staged
+            .verified
+            .manifest_path
+            .starts_with(&storage.cache_root));
+        assert!(staged
+            .verified
+            .artifact_path
+            .starts_with(&storage.cache_root));
+        assert_eq!(
+            stage_verified_release_from_paths_with_authority(
+                &storage,
+                &authority,
+                &root_path,
+                &manifest_path,
+                &artifact_path,
+            )
+            .unwrap(),
+            staged
+        );
+        let state = load_release_state_at(&storage.state_path, storage.owner_uid).unwrap();
+        let cached = load_cached_release(
+            &storage.cache_root,
+            &authority,
+            &Version::parse("0.3.8").unwrap(),
+            storage.owner_uid,
+        )
+        .unwrap();
+        require_cached_state_match(&state, &cached.verified).unwrap();
+        assert_eq!(cached_release_result(cached).unwrap(), staged);
+
+        let mut changed = artifact.clone();
+        changed.push(0);
+        std::fs::write(&artifact_path, changed).unwrap();
+        assert!(stage_verified_release_from_paths_with_authority(
+            &storage,
+            &authority,
+            &root_path,
+            &manifest_path,
+            &artifact_path,
+        )
+        .is_err());
     }
 }

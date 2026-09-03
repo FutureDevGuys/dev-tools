@@ -97,6 +97,7 @@ pub struct SessionOperationKeyGrant {
 pub struct SessionGitHubGrant {
     pub credential_slot: String,
     pub app_id: u64,
+    pub repository_selection: crate::RepositorySelection,
     pub private_key_ref: String,
     pub owners: Vec<String>,
     pub repositories: Vec<String>,
@@ -137,6 +138,7 @@ pub fn session_authority_from_resolved(
         github: profile.github.as_ref().map(|github| SessionGitHubGrant {
             credential_slot: profile.credential_slot.clone(),
             app_id: github.app_id,
+            repository_selection: github.repository_selection,
             private_key_ref: github.private_key_ref.clone(),
             owners: github.owners.iter().cloned().collect(),
             repositories: github.repositories.iter().cloned().collect(),

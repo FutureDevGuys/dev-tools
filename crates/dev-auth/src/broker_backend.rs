@@ -23,6 +23,25 @@ const CREDENTIAL_LIMIT: u64 = 64 * 1024;
 const TOKEN_REFRESH_MARGIN_SECONDS: i64 = 300;
 const SERVICE_CREDENTIAL_PREFIX: &str = "op-service-account-token_";
 
+fn repository_cache_key(
+    session_id: &str,
+    grant: &SessionGitHubGrant,
+    owner: &str,
+    repository: &str,
+) -> Result<String> {
+    let public_scope = serde_json::to_vec(&(
+        session_id,
+        &grant.credential_slot,
+        grant.app_id,
+        grant.repository_selection,
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase(),
+        &grant.permissions,
+        &grant.installation_ids,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(public_scope)))
+}
+
 pub(crate) trait CapabilityBackend: Send + Sync {
     fn github_token(
         &self,
@@ -127,6 +146,9 @@ impl SystemCapabilityBackend {
             .context("session GitHub App is outside administrator policy")?;
         if !app.private_key_references.contains(&grant.private_key_ref) {
             bail!("session GitHub private-key reference is outside administrator policy");
+        }
+        if app.repository_selection != grant.repository_selection {
+            bail!("session GitHub repository selection is outside administrator policy");
         }
         let owners = grant
             .owners
@@ -284,6 +306,13 @@ impl SystemCapabilityBackend {
         }
         Ok(())
     }
+
+    fn take_cached(&self, key: &str) -> Result<Option<CachedToken>> {
+        self.cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))
+            .map(|mut cache| cache.remove(key))
+    }
 }
 
 impl CapabilityBackend for SystemCapabilityBackend {
@@ -295,16 +324,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
         repository: &str,
     ) -> Result<BrokerGitHubToken> {
         let service_token = self.validate_grant(grant)?;
-        let public_scope = serde_json::to_vec(&(
-            session_id,
-            &grant.credential_slot,
-            grant.app_id,
-            owner.to_ascii_lowercase(),
-            repository.to_ascii_lowercase(),
-            &grant.permissions,
-            &grant.installation_ids,
-        ))?;
-        let key = format!("{:x}", Sha256::digest(public_scope));
+        let key = repository_cache_key(session_id, grant, owner, repository)?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         if let Some(token) = self.cached(&key, now)? {
             return Ok(token);
@@ -314,6 +334,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
                 op_program: &self.policy.programs.op,
                 service_token,
                 app_id: grant.app_id,
+                repository_selection: grant.repository_selection,
                 private_key_ref: &grant.private_key_ref,
                 permissions: Self::permissions(grant),
                 installation_ids: &grant.installation_ids,
@@ -335,6 +356,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
             session_id,
             &grant.credential_slot,
             grant.app_id,
+            grant.repository_selection,
             owner.to_ascii_lowercase(),
             &grant.repositories,
             &grant.permissions,
@@ -350,6 +372,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
                 op_program: &self.policy.programs.op,
                 service_token,
                 app_id: grant.app_id,
+                repository_selection: grant.repository_selection,
                 private_key_ref: &grant.private_key_ref,
                 permissions: Self::permissions(grant),
                 installation_ids: &grant.installation_ids,
@@ -369,21 +392,8 @@ impl CapabilityBackend for SystemCapabilityBackend {
         repository: &str,
     ) -> Result<()> {
         self.validate_grant(grant)?;
-        let public_scope = serde_json::to_vec(&(
-            session_id,
-            &grant.credential_slot,
-            grant.app_id,
-            owner.to_ascii_lowercase(),
-            repository.to_ascii_lowercase(),
-            &grant.permissions,
-            &grant.installation_ids,
-        ))?;
-        let key = format!("{:x}", Sha256::digest(public_scope));
-        let removed = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
-            .remove(&key);
+        let key = repository_cache_key(session_id, grant, owner, repository)?;
+        let removed = self.take_cached(&key)?;
         if let Some(removed) = removed {
             broker_revoke_github_token(&removed.token)?;
         }
@@ -600,6 +610,7 @@ mod tests {
                     "alpha".into(),
                     GitHubAppCap {
                         app_id: 1,
+                        repository_selection: crate::RepositorySelection::Selected,
                         private_key_references: vec!["op://Vault/alpha/private-key".into()],
                     },
                 ),
@@ -607,6 +618,7 @@ mod tests {
                     "beta".into(),
                     GitHubAppCap {
                         app_id: 2,
+                        repository_selection: crate::RepositorySelection::Selected,
                         private_key_references: vec!["op://Vault/beta/private-key".into()],
                     },
                 ),
@@ -657,6 +669,7 @@ mod tests {
         let mut grant = SessionGitHubGrant {
             credential_slot: "beta".into(),
             app_id: 2,
+            repository_selection: crate::RepositorySelection::Selected,
             private_key_ref: "op://Vault/beta/private-key".into(),
             owners: vec!["exampleorg".into()],
             repositories: vec!["repository".into()],
@@ -670,6 +683,46 @@ mod tests {
 
         grant.credential_slot = "alpha".into();
         assert!(backend.validate_grant(&grant).is_err());
+    }
+
+    #[test]
+    fn repository_cache_invalidation_uses_the_selection_bound_insertion_key() {
+        let backend = SystemCapabilityBackend {
+            policy: policy_with_two_slots(),
+            service_tokens: BTreeMap::new(),
+            cache: Mutex::new(BTreeMap::new()),
+        };
+        let mut grant = SessionGitHubGrant {
+            credential_slot: "beta".into(),
+            app_id: 2,
+            repository_selection: crate::RepositorySelection::Selected,
+            private_key_ref: "op://Vault/beta/private-key".into(),
+            owners: vec!["exampleorg".into()],
+            repositories: vec!["repository".into()],
+            permissions: BTreeMap::from([("contents".into(), Permission::Read)]),
+            installation_ids: Vec::new(),
+        };
+
+        let selected_key =
+            repository_cache_key("session", &grant, "ExampleOrg", "Repository").unwrap();
+        grant.repository_selection = crate::RepositorySelection::All;
+        let all_key = repository_cache_key("session", &grant, "ExampleOrg", "Repository").unwrap();
+        assert_ne!(selected_key, all_key);
+
+        for key in [selected_key, all_key] {
+            backend
+                .cache(
+                    "session",
+                    key.clone(),
+                    &BrokerGitHubToken {
+                        token: SecretString::new("installation-token".into()),
+                        expires_at: i64::MAX,
+                    },
+                )
+                .unwrap();
+            assert!(backend.take_cached(&key).unwrap().is_some());
+            assert!(backend.take_cached(&key).unwrap().is_none());
+        }
     }
 
     #[test]

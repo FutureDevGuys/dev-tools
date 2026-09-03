@@ -28,6 +28,7 @@ read_write_mount_arguments = ["--bind", "{path}", "{path}"]
 
 [github_apps.automation]
 app_id = 123456
+repository_selection = "selected"
 private_key_references = ["op://Automation/GitHub App/private-key"]
 
 [credential_slots.automation]

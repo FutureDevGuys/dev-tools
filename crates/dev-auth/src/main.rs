@@ -49,7 +49,7 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -595,6 +595,9 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             let mut deployment = None;
             let mut output = None;
             let mut format = None;
+            let mut release_root = None;
+            let mut release_manifest = None;
+            let mut release_artifact = None;
             let mut cli = dev_auth::deployment::DeploymentCliInput::default();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
@@ -618,6 +621,24 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                         )
                     }
                     "--offline" if cli.offline.is_none() => cli.offline = Some(true),
+                    "--release-root" if release_root.is_none() => {
+                        release_root =
+                            Some(arguments.next().context("--release-root requires a path")?)
+                    }
+                    "--release-manifest" if release_manifest.is_none() => {
+                        release_manifest = Some(
+                            arguments
+                                .next()
+                                .context("--release-manifest requires a path")?,
+                        )
+                    }
+                    "--release-artifact" if release_artifact.is_none() => {
+                        release_artifact = Some(
+                            arguments
+                                .next()
+                                .context("--release-artifact requires a path")?,
+                        )
+                    }
                     "--activation" if cli.activation.is_none() => {
                         cli.activation = Some(
                             arguments
@@ -695,10 +716,39 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 }
             };
             let release_storage = dev_auth::stable_release::native_release_storage(install_mode)?;
-            let staged = dev_auth::stable_release::stage_latest_stable_release(
-                &release_storage,
-                intent.offline,
-            )?;
+            let local_release = match (release_root, release_manifest, release_artifact) {
+                (None, None, None) => None,
+                (Some(root), Some(manifest), Some(artifact)) => {
+                    if !intent.offline {
+                        bail!("an explicit release bundle requires --offline");
+                    }
+                    let paths = [
+                        std::path::PathBuf::from(root),
+                        std::path::PathBuf::from(manifest),
+                        std::path::PathBuf::from(artifact),
+                    ];
+                    if paths.iter().any(|path| !path.is_absolute()) {
+                        bail!("explicit release bundle paths must be absolute");
+                    }
+                    Some(paths)
+                }
+                _ => bail!(
+                    "--release-root, --release-manifest, and --release-artifact must be provided together"
+                ),
+            };
+            let staged = if let Some([root, manifest, artifact]) = local_release {
+                dev_auth::stable_release::stage_verified_release_from_paths(
+                    &release_storage,
+                    &root,
+                    &manifest,
+                    &artifact,
+                )?
+            } else {
+                dev_auth::stable_release::stage_latest_stable_release(
+                    &release_storage,
+                    intent.offline,
+                )?
+            };
             let plan = dev_auth::setup_v3::build_setup_plan_v3_for_verified_release(
                 intent,
                 staged.verified,
@@ -809,6 +859,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 {
                     use std::os::unix::process::CommandExt;
                     let error = std::process::Command::new(&candidate)
+                        .arg0("dev-auth")
                         .args(std::env::args_os().skip(1))
                         .exec();
                     return Err(error).with_context(|| {
@@ -1636,6 +1687,13 @@ fn run_gh_pager_frontend() -> Result<i32> {
     Ok(0)
 }
 
+fn is_core_frontend(frontend: &str) -> bool {
+    frontend == "dev-auth"
+        || dev_auth::release_manifest::target_id().is_ok_and(|target| {
+            frontend == format!("dev-auth-{}-{target}", env!("CARGO_PKG_VERSION"))
+        })
+}
+
 fn main() {
     let program = std::env::args_os()
         .next()
@@ -1703,7 +1761,7 @@ fn main() {
         {
             run_agent_proxy_os()
         }
-        ("dev-auth", _, _) => run(),
+        (frontend, _, _) if is_core_frontend(frontend) => run(),
         #[cfg(target_os = "linux")]
         (workload, false, false) => run_workload_alias_os(workload),
         #[cfg(not(target_os = "linux"))]

@@ -33,13 +33,14 @@ release_signing_key = { private_key_ref = "op://Automation/dev-tools release sig
 
 ```sh
 release_signer_profile=source-maintenance # exact name from the installed config-v2.toml
-python scripts/build-release-set.py \
+/usr/bin/env -u ARGV0 "$HOME/.local/bin/release-builder" \
+  "$PWD/scripts/build-release-set.py" \
   --product dev-auth \
   --public-git-command /usr/bin/git \
   --release-signer /usr/local/bin/dev-auth \
   --release-signer-profile "$release_signer_profile" \
   --release-key-id release-ca568413f0f27130 \
-  --manifest-generation 18 \
+  --manifest-generation 19 \
   --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.8"
 ```
 

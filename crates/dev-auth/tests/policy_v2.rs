@@ -2,6 +2,7 @@ use dev_auth::policy_v2::{
     parse_system_policy_v2, parse_user_config_v2, require_system_policy_narrows, resolve_policy,
     InvalidSessionRouting, NoSessionRouting, Permission, SandboxMode, SystemMode, WorkspaceAccess,
 };
+use dev_auth::RepositorySelection;
 use std::collections::{BTreeMap, BTreeSet};
 
 const SYSTEM_POLICY: &str = r#"
@@ -35,6 +36,7 @@ read_write_mount_arguments = ["--bind", "{path}", "{path}"]
 
 [github_apps.automation]
 app_id = 42
+repository_selection = "selected"
 private_key_references = ["op://Machine Vault/github-app/private-key"]
 
 [credential_slots.automation]
@@ -196,6 +198,7 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
         .unwrap();
     assert_eq!(github.app_id, 42);
     assert_eq!(github.app_cap, "automation");
+    assert_eq!(github.repository_selection, RepositorySelection::Selected);
     assert_eq!(
         github.private_key_ref,
         "op://Machine Vault/github-app/private-key"
@@ -356,6 +359,13 @@ fn strict_parsers_reject_unknown_duplicate_and_unsafe_inputs() {
             "unexpectedly accepted:\n{invalid}"
         );
     }
+
+    let missing_repository_selection = SYSTEM_POLICY
+        .lines()
+        .filter(|line| !line.starts_with("repository_selection = "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(parse_system_policy_v2(missing_repository_selection.as_bytes()).is_err());
 
     let user_cases = [
         USER_CONFIG.replace(

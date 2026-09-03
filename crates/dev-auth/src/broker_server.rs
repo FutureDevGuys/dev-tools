@@ -1069,6 +1069,7 @@ mod tests {
                 github: Some(crate::linux_admission::SessionGitHubGrant {
                     credential_slot: "automation".into(),
                     app_id: 42,
+                    repository_selection: crate::RepositorySelection::Selected,
                     private_key_ref: "op://Automation/app/private-key".into(),
                     owners: vec!["ExampleOrg".into()],
                     repositories: vec!["api".into()],

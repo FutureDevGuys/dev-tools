@@ -984,6 +984,7 @@ struct InstallationTokenResponse {
     expires_at: String,
     permissions: BTreeMap<String, String>,
     repository_selection: String,
+    #[serde(default)]
     repositories: Vec<RepositoryResponse>,
 }
 
@@ -1281,12 +1282,21 @@ fn validate_installation_token_response(
     let expires_at = OffsetDateTime::parse(&response.expires_at, &Rfc3339)
         .context("parse GitHub App token expiry")?
         .unix_timestamp();
+    let expected_selection = if expected_repositories.is_some() {
+        crate::RepositorySelection::Selected
+    } else {
+        profile.repository_selection
+    };
     if response.token.is_empty()
         || response.token.contains(['\n', '\r', '\0'])
         || expires_at <= now + 300
         || expires_at > now + 3700
         || response.permissions != profile.permissions
-        || response.repository_selection != "selected"
+        || response.repository_selection
+            != match expected_selection {
+                crate::RepositorySelection::All => "all",
+                crate::RepositorySelection::Selected => "selected",
+            }
     {
         bail!("GitHub returned an invalid installation token contract");
     }
@@ -1307,7 +1317,8 @@ fn validate_installation_token_response(
         if &returned_repositories != expected_repositories {
             bail!("GitHub token scope does not exactly match the requested repositories");
         }
-    } else if returned_repositories.is_empty()
+    } else if (matches!(expected_selection, crate::RepositorySelection::Selected)
+        && returned_repositories.is_empty())
         || returned_repositories.iter().any(|repository| {
             repository
                 .split_once('/')
@@ -1330,6 +1341,7 @@ pub(crate) struct BrokerGitHubAuthority<'a> {
     pub op_program: &'a str,
     pub service_token: &'a SecretString,
     pub app_id: u64,
+    pub repository_selection: crate::RepositorySelection,
     pub private_key_ref: &'a str,
     pub permissions: BTreeMap<String, String>,
     pub installation_ids: &'a [u64],
@@ -1384,7 +1396,7 @@ pub(crate) fn broker_github_token_for_repositories(
     let profile = crate::GitHubProfile {
         app_id: authority.app_id,
         private_key_ref: authority.private_key_ref.to_owned(),
-        repository_selection: crate::RepositorySelection::Selected,
+        repository_selection: authority.repository_selection,
         discover_installations: true,
         installations: Vec::new(),
         permissions: authority.permissions,
@@ -4143,6 +4155,69 @@ mod tests {
     }
 
     #[test]
+    fn owner_scoped_all_installation_accepts_an_omitted_repository_list_only_for_all() {
+        let mut profile = crate::GitHubProfile {
+            app_id: 42,
+            private_key_ref: "op://Automation/app/private-key".into(),
+            repository_selection: crate::RepositorySelection::All,
+            discover_installations: true,
+            installations: Vec::new(),
+            permissions: BTreeMap::from([("contents".into(), "write".into())]),
+        };
+        let response = serde_json::json!({
+            "token": "installation-token",
+            "expires_at": "2026-09-03T12:30:00Z",
+            "permissions": {"contents": "write"},
+            "repository_selection": "all"
+        });
+        assert!(validate_installation_token_response(
+            &profile,
+            "ExampleOrg",
+            None,
+            &serde_json::to_vec(&response).unwrap(),
+            1_788_436_800,
+        )
+        .is_ok());
+
+        profile.repository_selection = crate::RepositorySelection::Selected;
+        assert!(validate_installation_token_response(
+            &profile,
+            "ExampleOrg",
+            None,
+            &serde_json::to_vec(&response).unwrap(),
+            1_788_436_800,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn exact_repository_token_from_an_all_installation_remains_one_repository_selected() {
+        let profile = crate::GitHubProfile {
+            app_id: 42,
+            private_key_ref: "op://Automation/app/private-key".into(),
+            repository_selection: crate::RepositorySelection::All,
+            discover_installations: true,
+            installations: Vec::new(),
+            permissions: BTreeMap::from([("contents".into(), "write".into())]),
+        };
+        let response = serde_json::json!({
+            "token": "installation-token",
+            "expires_at": "2026-09-03T12:30:00Z",
+            "permissions": {"contents": "write"},
+            "repository_selection": "selected",
+            "repositories": [{"id": 1, "full_name": "ExampleOrg/api"}]
+        });
+        assert!(validate_installation_token_response(
+            &profile,
+            "ExampleOrg",
+            Some(&BTreeSet::from(["exampleorg/api".into()])),
+            &serde_json::to_vec(&response).unwrap(),
+            1_788_436_800,
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn owner_installation_lookup_requires_the_exact_app_account_and_permissions() {
         let profile = crate::GitHubProfile {
             app_id: 42,
@@ -4170,7 +4245,7 @@ mod tests {
             101
         );
 
-        let mut wrong_app = response;
+        let mut wrong_app = response.clone();
         wrong_app["app_id"] = serde_json::Value::from(7);
         assert!(validate_owner_installation_response(
             &profile,
@@ -4178,6 +4253,17 @@ mod tests {
             &serde_json::to_vec(&wrong_app).unwrap(),
         )
         .is_err());
+
+        let mut all_profile = profile;
+        all_profile.repository_selection = crate::RepositorySelection::All;
+        let mut all_installation = response;
+        all_installation["repository_selection"] = serde_json::Value::String("all".into());
+        assert!(validate_owner_installation_response(
+            &all_profile,
+            "exampleorg",
+            &serde_json::to_vec(&all_installation).unwrap(),
+        )
+        .is_ok());
     }
 
     #[test]

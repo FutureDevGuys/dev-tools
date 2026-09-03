@@ -172,7 +172,7 @@ fn verify_release_documents(
     })
 }
 
-fn read_public_file(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_public_file(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
     if !path.is_absolute() {
         bail!("{description} path must be absolute");
     }

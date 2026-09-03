@@ -5499,6 +5499,7 @@ agent = "/opt/dev-auth/agent"
 
 [github_apps.automation]
 app_id = 42
+repository_selection = "selected"
 private_key_references = ["op://Machine Vault/github-app/private-key"]
 
 [credential_slots.automation]
