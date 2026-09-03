@@ -203,32 +203,41 @@ fn inherited_systemd_listeners() -> Result<(UnixListener, UnixListener)> {
     if listen_pid != std::process::id() {
         bail!("systemd socket activation belongs to another process");
     }
-    if std::env::var("LISTEN_FDS").as_deref() != Ok("2")
-        || std::env::var("LISTEN_FDNAMES").as_deref() != Ok("public:control")
-    {
+    if std::env::var("LISTEN_FDS").as_deref() != Ok("2") {
         bail!("system broker requires the exact public and control socket units");
     }
+    let names = std::env::var("LISTEN_FDNAMES")
+        .context("systemd did not provide the broker listener names")?;
+    let (public_fd, control_fd) = listener_fds_for_names(&names)?;
     validate_inherited_listener(
-        3,
+        public_fd,
         Path::new(crate::broker_client::SYSTEM_BROKER_SOCKET),
         0o666,
     )?;
-    validate_inherited_listener(4, Path::new(SYSTEM_CONTROL_SOCKET), 0o600)?;
+    validate_inherited_listener(control_fd, Path::new(SYSTEM_CONTROL_SOCKET), 0o600)?;
     std::env::remove_var("LISTEN_PID");
     std::env::remove_var("LISTEN_FDS");
     std::env::remove_var("LISTEN_FDNAMES");
 
     // SAFETY: systemd's socket-activation contract gives this process ownership
-    // of exactly descriptors 3 and 4. The exact PID/count/names were checked,
-    // both descriptors were successfully queried as Unix listeners at the
-    // required root-owned filesystem paths, and no safe owner exists in this
-    // process. Converting each descriptor once transfers that ownership into
-    // `UnixListener`, whose destructor closes it.
-    let public = unsafe { UnixListener::from_raw_fd(3) };
-    // SAFETY: the same validated socket-activation contract applies to fd 4,
-    // which is distinct from fd 3 and converted exactly once.
-    let control = unsafe { UnixListener::from_raw_fd(4) };
+    // of exactly descriptors 3 and 4. The exact PID/count/name set was checked,
+    // each distinct descriptor was successfully queried at its required
+    // root-owned Unix socket path, and no safe owner exists in this process.
+    // Converting each descriptor once transfers ownership to `UnixListener`,
+    // whose destructor closes it.
+    let public = unsafe { UnixListener::from_raw_fd(public_fd) };
+    // SAFETY: the same validated contract applies to the distinct control
+    // descriptor selected from the exact two-name set and converted once.
+    let control = unsafe { UnixListener::from_raw_fd(control_fd) };
     Ok((public, control))
+}
+
+fn listener_fds_for_names(names: &str) -> Result<(i32, i32)> {
+    match names {
+        "public:control" => Ok((3, 4)),
+        "control:public" => Ok((4, 3)),
+        _ => bail!("system broker requires the exact public and control socket units"),
+    }
 }
 
 fn validate_inherited_listener(fd: i32, expected_path: &Path, expected_mode: u32) -> Result<()> {
@@ -922,6 +931,22 @@ mod tests {
     use std::path::PathBuf;
 
     struct SigningBackend;
+
+    #[test]
+    fn systemd_listener_names_map_each_descriptor_by_role_regardless_of_order() {
+        assert_eq!(listener_fds_for_names("public:control").unwrap(), (3, 4));
+        assert_eq!(listener_fds_for_names("control:public").unwrap(), (4, 3));
+
+        for names in [
+            "public",
+            "control",
+            "public:public",
+            "control:control",
+            "public:other",
+        ] {
+            assert!(listener_fds_for_names(names).is_err(), "accepted {names}");
+        }
+    }
 
     impl CapabilityBackend for SigningBackend {
         fn github_token(

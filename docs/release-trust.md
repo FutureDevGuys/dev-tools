@@ -38,8 +38,8 @@ python scripts/build-release-set.py \
   --release-signer /usr/local/bin/dev-auth \
   --release-signer-profile publish \
   --release-key-id release-ca568413f0f27130 \
-  --manifest-generation 17 \
-  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.6"
+  --manifest-generation 18 \
+  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.7"
 ```
 
 The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.
