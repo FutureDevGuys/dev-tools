@@ -42,6 +42,11 @@ const TRANSPARENT_ALIASES: [&str; 2] = ["git", "gh"];
 const SYSTEM_CREDENTIAL_PATH: &str = "/etc/credstore.encrypted/dev-auth.op-service-account-token";
 const SYSTEM_CREDENTIAL_DIRECTORY: &str = "/etc/credstore.encrypted/dev-auth-slots";
 const PRIVILEGED_LAUNCHER_PATH: &str = "/usr/local/lib/dev-auth/dev-auth-workload-launcher";
+const SETUP_HELPER_PATH: &str = "/usr/local/lib/dev-auth/dev-auth-setup-helper";
+const SETUP_HELPER_RECEIPT_SCHEMA: &str = "dev-auth-setup-helper-v1";
+const SETUP_HELPER_PROTOCOL: &str = "dev-auth-setup-helper-v1";
+const SETUP_HELPER_RECEIPT_NAME: &str = "setup-helper-v1.json";
+const SETUP_HELPER_INTRODUCED_VERSION: &str = "0.3.8";
 const SYSTEM_ASSETS: [(&str, &str, u32); 5] = [
     (
         "/etc/sysusers.d/dev-auth.conf",
@@ -115,6 +120,16 @@ pub(crate) fn installation_current_state_paths(
             "privileged_workload_launcher".into(),
             "system".into(),
             PathBuf::from(PRIVILEGED_LAUNCHER_PATH),
+        ));
+        current.push((
+            "privileged_setup_helper".into(),
+            "system".into(),
+            PathBuf::from(SETUP_HELPER_PATH),
+        ));
+        current.push((
+            "setup_helper_receipt".into(),
+            "system".into(),
+            setup_helper_receipt_path(paths),
         ));
         current.extend(linux_system_assets().into_iter().map(|(path, _, _)| {
             (
@@ -294,6 +309,29 @@ pub struct RetainedRelease {
     pub manifest_generation: Option<u64>,
     #[serde(default)]
     pub system_assets: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHelperReceipt {
+    pub schema: String,
+    pub protocol: String,
+    pub helper_path: String,
+    pub helper_length: u64,
+    pub helper_sha256: String,
+    pub source_version: String,
+    pub source_target: String,
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    #[serde(default)]
+    pub root_generation: Option<u64>,
+    #[serde(default)]
+    pub manifest_generation: Option<u64>,
+    pub active_executable: String,
+    pub active_executable_length: u64,
+    pub active_executable_sha256: String,
+    pub install_receipt_path: String,
+    pub install_receipt_schema: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1699,7 +1737,8 @@ fn install_at_with_release(
             InstallMode::UserOnly => require_user_sessions_absent()?,
         }
     }
-    let (_, requested_source_sha256) = file_identity(&request.source_executable)?;
+    let (requested_source_length, requested_source_sha256) =
+        file_identity(&request.source_executable)?;
     if let Some(prior) = prior_receipt.as_ref() {
         validate_release_transition(prior, request, &requested_source_sha256, verified_release)?;
     }
@@ -1727,13 +1766,24 @@ fn install_at_with_release(
             )?;
         }
     }
+    let setup_helper_existing_current_owned = if request.mode == InstallMode::Strong {
+        prepare_setup_helper_install_recovery(
+            paths,
+            prior_receipt.as_ref(),
+            &request.version,
+            requested_source_length,
+            &requested_source_sha256,
+        )?
+    } else {
+        false
+    };
     let shared_report = dev_tools_installation::apply_versioned_installation(
         &dev_tools_installation::VersionedInstallRequest {
             layout: shared_layout,
             version: request.version.clone(),
             source: request.source_executable.clone(),
             identity: dev_tools_installation::ArtifactIdentity {
-                length: fs::symlink_metadata(&request.source_executable)?.len(),
+                length: requested_source_length,
                 sha256: requested_source_sha256.clone(),
             },
             aliases: shared_aliases,
@@ -1804,6 +1854,27 @@ fn install_at_with_release(
         },
         previous_release,
     };
+    if request.mode == InstallMode::Strong {
+        if release_supports_setup_helper(&receipt) {
+            let source_target = verified_release
+                .map(|release| release.target.clone())
+                .unwrap_or(crate::release_manifest::target_id()?);
+            reconcile_setup_helper(
+                paths,
+                &receipt,
+                &source_target,
+                SetupHelperReconcileOptions {
+                    prior_receipt: prior_receipt.as_ref(),
+                    allow_current_without_sidecar: setup_helper_existing_current_owned,
+                },
+            )?;
+        } else if let Some(prior) = prior_receipt
+            .as_ref()
+            .filter(|prior| release_supports_setup_helper(prior))
+        {
+            remove_setup_helper(paths, prior)?;
+        }
+    }
     write_receipt(&paths.receipt_path(), &receipt)?;
     verify_at(paths)
 }
@@ -1979,6 +2050,11 @@ fn verify_receipted_installation_at(
     if receipt.mode == InstallMode::Strong {
         verify_linux_system_assets_against(&receipt.system_assets)?;
         verify_privileged_launcher(&executable, receipt)?;
+        if release_supports_setup_helper(receipt) {
+            verify_setup_helper(paths, receipt)?;
+        } else {
+            verify_setup_helper_absent(paths)?;
+        }
     }
 
     Ok(SetupReport {
@@ -2003,6 +2079,9 @@ pub(crate) fn verify_runtime_installation_at(
 
 pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
     let receipt = read_receipt(&paths.receipt_path())?;
+    if let Some(report) = resume_interrupted_setup_helper_rollback(paths, &receipt)? {
+        return Ok(report);
+    }
     let request = InstallRequest {
         mode: receipt.mode,
         version: receipt.version,
@@ -2016,6 +2095,23 @@ pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
 
 pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
     let mut receipt = read_receipt(&paths.receipt_path())?;
+    if let Some(report) = resume_interrupted_setup_helper_rollback(paths, &receipt)? {
+        return Ok(report);
+    }
+    if restore_interrupted_setup_helper_installation(paths, &receipt)? {
+        return repair_at(paths);
+    }
+    if release_supports_setup_helper(&receipt) {
+        reconcile_setup_helper(
+            paths,
+            &receipt,
+            &crate::release_manifest::target_id()?,
+            SetupHelperReconcileOptions {
+                prior_receipt: None,
+                allow_current_without_sidecar: true,
+            },
+        )?;
+    }
     verify_at(paths)?;
     if !receipt.transparent_aliases.is_empty() {
         deactivate_transparent_launchers_at(paths)?;
@@ -2056,6 +2152,7 @@ pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
         bail!("shared installation state cannot resume the product rollback");
     }
 
+    let installed_receipt = receipt.clone();
     let current = retained_release(&receipt);
     receipt.version = previous.version;
     receipt.executable = paths
@@ -2079,6 +2176,19 @@ pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
             Path::new(PRIVILEGED_LAUNCHER_PATH),
             paths,
         )?;
+        if release_supports_setup_helper(&receipt) {
+            reconcile_setup_helper(
+                paths,
+                &receipt,
+                &crate::release_manifest::target_id()?,
+                SetupHelperReconcileOptions {
+                    prior_receipt: Some(&installed_receipt),
+                    allow_current_without_sidecar: false,
+                },
+            )?;
+        } else if release_supports_setup_helper(&installed_receipt) {
+            remove_setup_helper(paths, &installed_receipt)?;
+        }
     }
     write_receipt(&paths.receipt_path(), &receipt)?;
     verify_at(paths)
@@ -2098,6 +2208,24 @@ fn retained_release(receipt: &InstallReceipt) -> RetainedRelease {
 
 pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
     let mut receipt = read_receipt(&paths.receipt_path())?;
+    if resume_interrupted_setup_helper_rollback(paths, &receipt)?.is_some() {
+        receipt = read_receipt(&paths.receipt_path())?;
+    }
+    if restore_interrupted_setup_helper_installation(paths, &receipt)? {
+        repair_at(paths)?;
+        receipt = read_receipt(&paths.receipt_path())?;
+    }
+    if release_supports_setup_helper(&receipt) {
+        reconcile_setup_helper(
+            paths,
+            &receipt,
+            &crate::release_manifest::target_id()?,
+            SetupHelperReconcileOptions {
+                prior_receipt: None,
+                allow_current_without_sidecar: true,
+            },
+        )?;
+    }
     verify_at(paths)?;
     if !receipt.transparent_aliases.is_empty() {
         deactivate_transparent_launchers_at(paths)?;
@@ -2126,6 +2254,9 @@ pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
 
     let executable = PathBuf::from(&receipt.executable);
     if receipt.mode == InstallMode::Strong {
+        if release_supports_setup_helper(&receipt) {
+            remove_setup_helper(paths, &receipt)?;
+        }
         remove_privileged_launcher(&executable, &receipt)?;
         remove_linux_system_assets(&receipt)?;
     }
@@ -4613,6 +4744,913 @@ pub(crate) fn validate_user_or_root_executable(
     Ok(())
 }
 
+pub fn setup_helper_path() -> &'static Path {
+    Path::new(SETUP_HELPER_PATH)
+}
+
+fn setup_helper_receipt_path(paths: &SetupPaths) -> PathBuf {
+    paths.data_root.join(SETUP_HELPER_RECEIPT_NAME)
+}
+
+fn release_supports_setup_helper(receipt: &InstallReceipt) -> bool {
+    receipt.mode == InstallMode::Strong && version_supports_setup_helper(&receipt.version)
+}
+
+fn version_supports_setup_helper(version: &str) -> bool {
+    semver::Version::parse(version)
+        .ok()
+        .zip(semver::Version::parse(SETUP_HELPER_INTRODUCED_VERSION).ok())
+        .is_some_and(|(version, introduced)| version >= introduced)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupHelperReleaseIdentity {
+    version: String,
+    executable: PathBuf,
+    length: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SetupHelperReconcileOptions<'a> {
+    prior_receipt: Option<&'a InstallReceipt>,
+    allow_current_without_sidecar: bool,
+}
+
+fn expected_setup_helper_receipt(
+    helper: &Path,
+    receipt: &InstallReceipt,
+    source_target: &str,
+) -> SetupHelperReceipt {
+    SetupHelperReceipt {
+        schema: SETUP_HELPER_RECEIPT_SCHEMA.into(),
+        protocol: SETUP_HELPER_PROTOCOL.into(),
+        helper_path: helper.display().to_string(),
+        helper_length: receipt.executable_length,
+        helper_sha256: receipt.executable_sha256.clone(),
+        source_version: receipt.version.clone(),
+        source_target: source_target.into(),
+        source_commit: receipt.source_commit.clone(),
+        root_generation: receipt.root_generation,
+        manifest_generation: receipt.manifest_generation,
+        active_executable: receipt.executable.clone(),
+        active_executable_length: receipt.executable_length,
+        active_executable_sha256: receipt.executable_sha256.clone(),
+        install_receipt_path: helper
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join("install-v2.json")
+            .display()
+            .to_string(),
+        install_receipt_schema: RECEIPT_SCHEMA.into(),
+    }
+}
+
+fn read_setup_helper_receipt_at(path: &Path, owner_uid: u32) -> Result<SetupHelperReceipt> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect setup helper receipt {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != owner_uid
+        || metadata.mode() & 0o777 != 0o644
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > RECEIPT_LIMIT
+    {
+        bail!("setup helper receipt has unsafe filesystem authority");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .context("open setup helper receipt")?;
+    let held = file
+        .metadata()
+        .context("inspect held setup helper receipt")?;
+    if metadata.dev() != held.dev()
+        || metadata.ino() != held.ino()
+        || metadata.len() != held.len()
+        || held.uid() != owner_uid
+        || held.nlink() != 1
+        || held.mode() & 0o777 != 0o644
+    {
+        bail!("setup helper receipt changed before it was opened");
+    }
+    let mut bytes = Vec::with_capacity(held.len() as usize);
+    Read::by_ref(&mut file)
+        .take(RECEIPT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .context("read setup helper receipt")?;
+    let after = file
+        .metadata()
+        .context("reinspect held setup helper receipt")?;
+    if bytes.len() as u64 != held.len()
+        || held.dev() != after.dev()
+        || held.ino() != after.ino()
+        || held.len() != after.len()
+        || held.mtime() != after.mtime()
+        || held.mtime_nsec() != after.mtime_nsec()
+    {
+        bail!("setup helper receipt changed while it was read");
+    }
+    serde_json::from_slice(&bytes).context("parse setup helper receipt")
+}
+
+fn setup_helper_receipt_matches(
+    sidecar: &SetupHelperReceipt,
+    helper: &Path,
+    receipt: &InstallReceipt,
+) -> Result<()> {
+    let target = crate::release_manifest::target_id()?;
+    let expected = expected_setup_helper_receipt(helper, receipt, &target);
+    if sidecar != &expected {
+        bail!("setup helper receipt does not match the active installation");
+    }
+    Ok(())
+}
+
+fn setup_helper_receipt_matches_release_identity(
+    sidecar: &SetupHelperReceipt,
+    helper: &Path,
+    install_receipt_path: &Path,
+    release: &SetupHelperReleaseIdentity,
+) -> Result<()> {
+    match (
+        sidecar.source_commit.as_deref(),
+        sidecar.root_generation,
+        sidecar.manifest_generation,
+    ) {
+        (None, None, None) => {}
+        (Some(commit), Some(root_generation), Some(manifest_generation))
+            if commit.len() == 40
+                && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && root_generation > 0
+                && manifest_generation > 0 => {}
+        _ => bail!("setup helper receipt has incomplete release provenance"),
+    }
+    if sidecar.schema != SETUP_HELPER_RECEIPT_SCHEMA
+        || sidecar.protocol != SETUP_HELPER_PROTOCOL
+        || Path::new(&sidecar.helper_path) != helper
+        || sidecar.helper_length != release.length
+        || sidecar.helper_sha256 != release.sha256
+        || sidecar.source_version != release.version
+        || sidecar.source_target != crate::release_manifest::target_id()?
+        || Path::new(&sidecar.active_executable) != release.executable
+        || sidecar.active_executable_length != release.length
+        || sidecar.active_executable_sha256 != release.sha256
+        || Path::new(&sidecar.install_receipt_path) != install_receipt_path
+        || sidecar.install_receipt_schema != RECEIPT_SCHEMA
+    {
+        bail!("setup helper receipt does not match the interrupted installation transition");
+    }
+    Ok(())
+}
+
+fn interrupted_setup_helper_release(
+    paths: &SetupPaths,
+    committed: &InstallReceipt,
+    shared: &dev_tools_installation::VersionedReceipt,
+) -> Result<Option<SetupHelperReleaseIdentity>> {
+    if committed.mode != InstallMode::Strong || release_supports_setup_helper(committed) {
+        return Ok(None);
+    }
+    let active = setup_helper_release_from_shared_active(paths, shared)?;
+    if shared.product != "dev-auth"
+        || shared.data_root != paths.data_root
+        || shared.bin_dir != paths.bin_dir
+        || shared.artifact_name != "dev-auth"
+        || shared.aliases != shared_product_aliases()
+    {
+        bail!("shared installation receipt cannot prove a setup helper transition");
+    }
+    if shared.previous_version.as_deref() != Some(committed.version.as_str())
+        || shared.previous_identity.as_ref().is_none_or(|identity| {
+            identity.length != committed.executable_length
+                || identity.sha256 != committed.executable_sha256
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(active))
+}
+
+fn setup_helper_release_from_shared_active(
+    paths: &SetupPaths,
+    shared: &dev_tools_installation::VersionedReceipt,
+) -> Result<SetupHelperReleaseIdentity> {
+    if shared.product != "dev-auth"
+        || shared.data_root != paths.data_root
+        || shared.bin_dir != paths.bin_dir
+        || shared.artifact_name != "dev-auth"
+        || shared.aliases != shared_product_aliases()
+        || !version_supports_setup_helper(&shared.active_version)
+    {
+        bail!("shared installation receipt cannot prove a setup helper release");
+    }
+    Ok(SetupHelperReleaseIdentity {
+        version: shared.active_version.clone(),
+        executable: paths.versioned_binary(&shared.active_version),
+        length: shared.active_identity.length,
+        sha256: shared.active_identity.sha256.clone(),
+    })
+}
+
+fn interrupted_first_install_setup_helper_release(
+    paths: &SetupPaths,
+    shared: &dev_tools_installation::VersionedReceipt,
+    requested_version: &str,
+    requested_length: u64,
+    requested_sha256: &str,
+) -> Result<SetupHelperReleaseIdentity> {
+    let active = setup_helper_release_from_shared_active(paths, shared)?;
+    if shared.previous_version.is_some()
+        || shared.previous_identity.is_some()
+        || active.version != requested_version
+        || active.length != requested_length
+        || active.sha256 != requested_sha256
+    {
+        bail!("setup helper artifacts do not match the interrupted first installation");
+    }
+    Ok(active)
+}
+
+fn setup_helper_artifacts_present_at(helper: &Path, sidecar_path: &Path) -> Result<bool> {
+    for (path, description) in [
+        (helper, "setup helper"),
+        (sidecar_path, "setup helper receipt"),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {description}")),
+        }
+    }
+    Ok(false)
+}
+
+fn validate_interrupted_setup_helper_artifacts_at(
+    helper: &Path,
+    sidecar_path: &Path,
+    install_receipt_path: &Path,
+    release: &SetupHelperReleaseIdentity,
+    owner_uid: u32,
+) -> Result<()> {
+    if helper.parent() != sidecar_path.parent()
+        || helper.parent() != install_receipt_path.parent()
+        || helper.file_name() != Some(OsStr::new("dev-auth-setup-helper"))
+        || sidecar_path.file_name() != Some(OsStr::new(SETUP_HELPER_RECEIPT_NAME))
+        || install_receipt_path.file_name() != Some(OsStr::new("install-v2.json"))
+    {
+        bail!("interrupted setup helper artifacts are outside their fixed product layout");
+    }
+    let source_metadata = fs::symlink_metadata(&release.executable)
+        .context("inspect interrupted setup helper source")?;
+    if !source_metadata.file_type().is_file()
+        || source_metadata.file_type().is_symlink()
+        || source_metadata.uid() != owner_uid
+        || source_metadata.nlink() != 1
+        || source_metadata.mode() & 0o777 != 0o755
+        || file_identity(&release.executable)? != (release.length, release.sha256.clone())
+    {
+        bail!("interrupted setup helper source has unsafe filesystem authority");
+    }
+    let helper_present = validate_setup_helper_slot(helper, owner_uid, 0o755, "setup helper")?;
+    let sidecar_present =
+        validate_setup_helper_slot(sidecar_path, owner_uid, 0o644, "setup helper receipt")?;
+    if helper_present && file_identity(helper)? != (release.length, release.sha256.clone()) {
+        bail!("interrupted setup helper executable is not owned by the active release");
+    }
+    if sidecar_present {
+        let sidecar = read_setup_helper_receipt_at(sidecar_path, owner_uid)?;
+        setup_helper_receipt_matches_release_identity(
+            &sidecar,
+            helper,
+            install_receipt_path,
+            release,
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_interrupted_privileged_launcher_at(
+    launcher: &Path,
+    committed: &InstallReceipt,
+    interrupted: &SetupHelperReleaseIdentity,
+    owner_uid: u32,
+) -> Result<()> {
+    let committed_executable = Path::new(&committed.executable);
+    let committed_identity = (
+        committed.executable_length,
+        committed.executable_sha256.clone(),
+    );
+    let committed_metadata = fs::symlink_metadata(committed_executable)
+        .context("inspect committed executable during setup helper recovery")?;
+    if !committed_metadata.file_type().is_file()
+        || committed_metadata.file_type().is_symlink()
+        || committed_metadata.uid() != owner_uid
+        || committed_metadata.nlink() != 1
+        || committed_metadata.mode() & 0o777 != 0o755
+        || file_identity(committed_executable)? != committed_identity
+    {
+        bail!("committed executable has unsafe filesystem authority during setup helper recovery");
+    }
+    let metadata = match fs::symlink_metadata(launcher) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect interrupted privileged launcher"),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != owner_uid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o755
+    {
+        bail!("interrupted privileged launcher has unsafe filesystem authority");
+    }
+    let launcher_identity = file_identity(launcher)?;
+    if launcher_identity == committed_identity {
+        return Ok(());
+    }
+    if launcher_identity != (interrupted.length, interrupted.sha256.clone()) {
+        bail!("refusing to replace a privileged launcher not owned by the interrupted transition");
+    }
+    publish_executable_copy(
+        committed_executable,
+        launcher,
+        owner_uid,
+        "interrupted privileged workload launcher",
+    )
+}
+
+fn inspect_interrupted_setup_helper_release(
+    paths: &SetupPaths,
+    committed: &InstallReceipt,
+) -> Result<Option<SetupHelperReleaseIdentity>> {
+    if committed.mode != InstallMode::Strong || release_supports_setup_helper(committed) {
+        return Ok(None);
+    }
+    let Some(shared) = dev_tools_installation::inspect_versioned_installation(
+        &shared_installation_layout(paths, committed.mode),
+    )?
+    else {
+        return Ok(None);
+    };
+    interrupted_setup_helper_release(paths, committed, &shared)
+}
+
+fn prepare_setup_helper_install_recovery(
+    paths: &SetupPaths,
+    committed: Option<&InstallReceipt>,
+    requested_version: &str,
+    requested_length: u64,
+    requested_sha256: &str,
+) -> Result<bool> {
+    let helper = Path::new(SETUP_HELPER_PATH);
+    let sidecar = setup_helper_receipt_path(paths);
+    let artifacts_present = setup_helper_artifacts_present_at(helper, &sidecar)?;
+    let Some(committed) = committed else {
+        if !artifacts_present {
+            return Ok(false);
+        }
+        let Some(shared) = dev_tools_installation::inspect_versioned_installation(
+            &shared_installation_layout(paths, InstallMode::Strong),
+        )?
+        else {
+            bail!("refusing to adopt setup helper artifacts without an installation receipt");
+        };
+        let active = interrupted_first_install_setup_helper_release(
+            paths,
+            &shared,
+            requested_version,
+            requested_length,
+            requested_sha256,
+        )?;
+        validate_interrupted_setup_helper_artifacts_at(
+            helper,
+            &sidecar,
+            &paths.receipt_path(),
+            &active,
+            0,
+        )?;
+        return Ok(true);
+    };
+    if release_supports_setup_helper(committed) {
+        return Ok(committed.version == requested_version
+            && committed.executable_length == requested_length
+            && committed.executable_sha256 == requested_sha256);
+    }
+    let Some(interrupted) = inspect_interrupted_setup_helper_release(paths, committed)? else {
+        if artifacts_present {
+            bail!("pre-helper installation contains setup helper artifacts without an interrupted-transition receipt");
+        }
+        return Ok(false);
+    };
+    validate_interrupted_setup_helper_artifacts_at(
+        helper,
+        &sidecar,
+        &paths.receipt_path(),
+        &interrupted,
+        0,
+    )?;
+    if interrupted.version == requested_version
+        && interrupted.length == requested_length
+        && interrupted.sha256 == requested_sha256
+    {
+        return Ok(true);
+    }
+    if committed.version != requested_version
+        || committed.executable_length != requested_length
+        || committed.executable_sha256 != requested_sha256
+    {
+        bail!("a different release cannot replace an interrupted setup helper transition");
+    }
+    restore_interrupted_privileged_launcher_at(
+        Path::new(PRIVILEGED_LAUNCHER_PATH),
+        committed,
+        &interrupted,
+        0,
+    )?;
+    remove_interrupted_setup_helper_artifacts_at(
+        helper,
+        &sidecar,
+        &paths.receipt_path(),
+        &interrupted,
+        0,
+    )?;
+    Ok(false)
+}
+
+fn restore_interrupted_setup_helper_installation(
+    paths: &SetupPaths,
+    committed: &InstallReceipt,
+) -> Result<bool> {
+    let Some(interrupted) = inspect_interrupted_setup_helper_release(paths, committed)? else {
+        return Ok(false);
+    };
+    let helper = Path::new(SETUP_HELPER_PATH);
+    let sidecar = setup_helper_receipt_path(paths);
+    validate_interrupted_setup_helper_artifacts_at(
+        helper,
+        &sidecar,
+        &paths.receipt_path(),
+        &interrupted,
+        0,
+    )?;
+    restore_interrupted_privileged_launcher_at(
+        Path::new(PRIVILEGED_LAUNCHER_PATH),
+        committed,
+        &interrupted,
+        0,
+    )?;
+    remove_interrupted_setup_helper_artifacts_at(
+        helper,
+        &sidecar,
+        &paths.receipt_path(),
+        &interrupted,
+        0,
+    )?;
+    Ok(true)
+}
+
+fn resume_interrupted_setup_helper_rollback(
+    paths: &SetupPaths,
+    installed: &InstallReceipt,
+) -> Result<Option<SetupReport>> {
+    if installed.mode != InstallMode::Strong
+        || !release_supports_setup_helper(installed)
+        || installed.previous_release.is_none()
+    {
+        return Ok(None);
+    }
+    let active_pointer = paths.data_root.join("active");
+    match fs::symlink_metadata(&active_pointer) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect active release during rollback recovery"),
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                && fs::read_link(&active_pointer)? == Path::new(&installed.executable) =>
+        {
+            return Ok(None);
+        }
+        Ok(_) => {}
+    }
+    let shared = dev_tools_installation::verify_versioned_installation(
+        &shared_installation_layout(paths, installed.mode),
+    )?;
+    let Some(resumed) = interrupted_setup_helper_rollback_receipt(paths, installed, &shared)?
+    else {
+        return Ok(None);
+    };
+
+    let helper = Path::new(SETUP_HELPER_PATH);
+    let sidecar_path = setup_helper_receipt_path(paths);
+    let installed_release = SetupHelperReleaseIdentity {
+        version: installed.version.clone(),
+        executable: PathBuf::from(&installed.executable),
+        length: installed.executable_length,
+        sha256: installed.executable_sha256.clone(),
+    };
+    validate_interrupted_setup_helper_artifacts_at(
+        helper,
+        &sidecar_path,
+        &paths.receipt_path(),
+        &installed_release,
+        0,
+    )?;
+    if validate_setup_helper_slot(&sidecar_path, 0, 0o644, "setup helper receipt")? {
+        let sidecar = read_setup_helper_receipt_at(&sidecar_path, 0)?;
+        setup_helper_receipt_matches(&sidecar, helper, installed)?;
+    }
+
+    restore_interrupted_privileged_launcher_at(
+        Path::new(PRIVILEGED_LAUNCHER_PATH),
+        &resumed,
+        &installed_release,
+        0,
+    )?;
+    remove_interrupted_setup_helper_artifacts_at(
+        helper,
+        &sidecar_path,
+        &paths.receipt_path(),
+        &installed_release,
+        0,
+    )?;
+    write_receipt(&paths.receipt_path(), &resumed)?;
+    verify_at(paths).map(Some)
+}
+
+fn interrupted_setup_helper_rollback_receipt(
+    paths: &SetupPaths,
+    installed: &InstallReceipt,
+    shared: &dev_tools_installation::VersionedReceipt,
+) -> Result<Option<InstallReceipt>> {
+    if installed.mode != InstallMode::Strong || !release_supports_setup_helper(installed) {
+        return Ok(None);
+    }
+    let Some(previous) = installed.previous_release.as_ref() else {
+        return Ok(None);
+    };
+    if shared.active_version == installed.version {
+        return Ok(None);
+    }
+    if shared.product != "dev-auth"
+        || shared.data_root != paths.data_root
+        || shared.bin_dir != paths.bin_dir
+        || shared.artifact_name != "dev-auth"
+        || shared.active_version != previous.version
+        || shared.active_identity.length != previous.executable_length
+        || shared.active_identity.sha256 != previous.executable_sha256
+        || shared.previous_version.as_deref() != Some(installed.version.as_str())
+        || shared.previous_identity.as_ref().is_none_or(|identity| {
+            identity.length != installed.executable_length
+                || identity.sha256 != installed.executable_sha256
+        })
+        || shared.aliases != shared_product_aliases()
+    {
+        return Ok(None);
+    }
+    if !installed.transparent_aliases.is_empty() {
+        bail!("interrupted setup helper rollback retained same-name launchers");
+    }
+    let mut resumed = installed.clone();
+    let current = retained_release(installed);
+    resumed.version = previous.version.clone();
+    resumed.executable = paths
+        .versioned_binary(&resumed.version)
+        .display()
+        .to_string();
+    resumed.executable_length = previous.executable_length;
+    resumed.executable_sha256 = previous.executable_sha256.clone();
+    resumed.source_commit = previous.source_commit.clone();
+    resumed.root_generation = previous.root_generation;
+    resumed.manifest_generation = previous.manifest_generation;
+    resumed.system_assets = previous.system_assets.clone();
+    resumed.previous_release = Some(current);
+    resumed.transparent_aliases.clear();
+    if resumed.system_assets != system_asset_digests() {
+        bail!("retained release requires incompatible system service assets");
+    }
+    Ok(Some(resumed))
+}
+
+fn remove_interrupted_setup_helper_artifacts_at(
+    helper: &Path,
+    sidecar_path: &Path,
+    install_receipt_path: &Path,
+    release: &SetupHelperReleaseIdentity,
+    owner_uid: u32,
+) -> Result<()> {
+    validate_interrupted_setup_helper_artifacts_at(
+        helper,
+        sidecar_path,
+        install_receipt_path,
+        release,
+        owner_uid,
+    )?;
+    if validate_setup_helper_slot(helper, owner_uid, 0o755, "setup helper")? {
+        if file_identity(helper)? != (release.length, release.sha256.clone()) {
+            bail!("setup helper changed before interrupted-transition removal");
+        }
+        fs::remove_file(helper).context("remove interrupted setup helper")?;
+    }
+    if validate_setup_helper_slot(sidecar_path, owner_uid, 0o644, "setup helper receipt")? {
+        let sidecar = read_setup_helper_receipt_at(sidecar_path, owner_uid)?;
+        setup_helper_receipt_matches_release_identity(
+            &sidecar,
+            helper,
+            install_receipt_path,
+            release,
+        )?;
+        fs::remove_file(sidecar_path).context("remove interrupted setup helper receipt")?;
+    }
+    if let Some(parent) = helper.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .context("sync interrupted setup helper removal")?;
+    }
+    Ok(())
+}
+
+fn validate_setup_helper_slot(
+    path: &Path,
+    owner_uid: u32,
+    expected_mode: u32,
+    description: &str,
+) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {description}")),
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == owner_uid
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o777 == expected_mode =>
+        {
+            Ok(true)
+        }
+        Ok(_) => bail!("{description} has unsafe filesystem authority"),
+    }
+}
+
+fn write_setup_helper_receipt_at(
+    path: &Path,
+    receipt: &SetupHelperReceipt,
+    owner_uid: u32,
+) -> Result<()> {
+    let content = serde_json::to_vec_pretty(receipt).context("serialize setup helper receipt")?;
+    if content.len() as u64 > RECEIPT_LIMIT {
+        bail!("setup helper receipt exceeds the size limit");
+    }
+    let parent = path
+        .parent()
+        .context("setup helper receipt has no parent")?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).context("create setup helper receipt temporary")?;
+    temporary
+        .as_file_mut()
+        .write_all(&content)
+        .context("write setup helper receipt")?;
+    temporary
+        .as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o644))
+        .context("protect setup helper receipt")?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .context("sync setup helper receipt")?;
+    let metadata = temporary
+        .as_file()
+        .metadata()
+        .context("inspect staged setup helper receipt")?;
+    if metadata.uid() != owner_uid || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o644 {
+        bail!("staged setup helper receipt has unsafe filesystem authority");
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("publish setup helper receipt")?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("sync setup helper receipt directory")
+}
+
+fn reconcile_setup_helper_at(
+    source: &Path,
+    helper: &Path,
+    sidecar_path: &Path,
+    receipt: &InstallReceipt,
+    source_target: &str,
+    owner_uid: u32,
+    options: SetupHelperReconcileOptions<'_>,
+) -> Result<()> {
+    if !release_supports_setup_helper(receipt) {
+        bail!("the selected dev-auth release does not provide the receipt-owned setup helper");
+    }
+    if Path::new(&receipt.executable) != source
+        || file_identity(source)? != (receipt.executable_length, receipt.executable_sha256.clone())
+    {
+        bail!("setup helper source does not match the active installation receipt");
+    }
+    let source_metadata = fs::symlink_metadata(source).context("inspect setup helper source")?;
+    if !source_metadata.file_type().is_file()
+        || source_metadata.file_type().is_symlink()
+        || source_metadata.uid() != owner_uid
+        || source_metadata.nlink() != 1
+        || source_metadata.mode() & 0o777 != 0o755
+    {
+        bail!("setup helper source has unsafe filesystem authority");
+    }
+    if source_target != crate::release_manifest::target_id()? {
+        bail!("setup helper source target does not match this platform");
+    }
+    if helper.parent() != sidecar_path.parent()
+        || sidecar_path.file_name() != Some(OsStr::new(SETUP_HELPER_RECEIPT_NAME))
+    {
+        bail!("setup helper artifacts are outside their fixed product layout");
+    }
+
+    let helper_present = validate_setup_helper_slot(helper, owner_uid, 0o755, "setup helper")?;
+    let sidecar_present =
+        validate_setup_helper_slot(sidecar_path, owner_uid, 0o644, "setup helper receipt")?;
+    let sidecar = sidecar_present
+        .then(|| read_setup_helper_receipt_at(sidecar_path, owner_uid))
+        .transpose()?;
+    let sidecar_owns_current = sidecar
+        .as_ref()
+        .is_some_and(|value| setup_helper_receipt_matches(value, helper, receipt).is_ok());
+    let sidecar_owns_prior = sidecar.as_ref().is_some_and(|value| {
+        options.prior_receipt.is_some_and(|prior| {
+            release_supports_setup_helper(prior)
+                && setup_helper_receipt_matches(value, helper, prior).is_ok()
+        })
+    });
+    let helper_is_current = helper_present
+        && file_identity(helper)? == (receipt.executable_length, receipt.executable_sha256.clone());
+    if sidecar_present && !sidecar_owns_current && !sidecar_owns_prior {
+        bail!("refusing to replace an unowned setup helper receipt");
+    }
+    if helper_present && !helper_is_current && !sidecar_owns_current && !sidecar_owns_prior {
+        bail!("refusing to replace an unowned setup helper executable");
+    }
+    if helper_present
+        && helper_is_current
+        && sidecar.is_none()
+        && !options.allow_current_without_sidecar
+    {
+        bail!("refusing to adopt a setup helper executable without receipt ownership");
+    }
+
+    if !helper_is_current {
+        publish_executable_copy(source, helper, owner_uid, "setup helper")?;
+    }
+    let expected = expected_setup_helper_receipt(helper, receipt, source_target);
+    if sidecar.as_ref() != Some(&expected) {
+        write_setup_helper_receipt_at(sidecar_path, &expected, owner_uid)?;
+    }
+    verify_setup_helper_at(helper, sidecar_path, receipt, owner_uid)
+}
+
+fn verify_setup_helper_at(
+    helper: &Path,
+    sidecar_path: &Path,
+    receipt: &InstallReceipt,
+    owner_uid: u32,
+) -> Result<()> {
+    if !release_supports_setup_helper(receipt) {
+        bail!("installed dev-auth release predates the receipt-owned setup helper");
+    }
+    if !validate_setup_helper_slot(helper, owner_uid, 0o755, "setup helper")?
+        || !validate_setup_helper_slot(sidecar_path, owner_uid, 0o644, "setup helper receipt")?
+    {
+        bail!("receipt-owned setup helper is incomplete");
+    }
+    if file_identity(helper)? != (receipt.executable_length, receipt.executable_sha256.clone()) {
+        bail!("setup helper executable does not match the active installation");
+    }
+    let sidecar = read_setup_helper_receipt_at(sidecar_path, owner_uid)?;
+    setup_helper_receipt_matches(&sidecar, helper, receipt)
+}
+
+fn remove_setup_helper_at(
+    helper: &Path,
+    sidecar_path: &Path,
+    receipt: &InstallReceipt,
+    owner_uid: u32,
+) -> Result<()> {
+    let helper_present = validate_setup_helper_slot(helper, owner_uid, 0o755, "setup helper")?;
+    let sidecar_present =
+        validate_setup_helper_slot(sidecar_path, owner_uid, 0o644, "setup helper receipt")?;
+    if !helper_present && !sidecar_present {
+        return Ok(());
+    }
+    if !sidecar_present {
+        bail!("setup helper cannot be removed without its ownership receipt");
+    }
+    let sidecar = read_setup_helper_receipt_at(sidecar_path, owner_uid)?;
+    setup_helper_receipt_matches(&sidecar, helper, receipt)?;
+    if helper_present {
+        if file_identity(helper)? != (sidecar.helper_length, sidecar.helper_sha256.clone()) {
+            bail!("setup helper changed before receipt-owned removal");
+        }
+        fs::remove_file(helper).context("remove receipt-owned setup helper")?;
+    }
+    fs::remove_file(sidecar_path).context("remove setup helper receipt")?;
+    if let Some(parent) = helper.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .context("sync setup helper removal")?;
+    }
+    Ok(())
+}
+
+fn reconcile_setup_helper(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+    source_target: &str,
+    options: SetupHelperReconcileOptions<'_>,
+) -> Result<()> {
+    if *paths != SetupPaths::strong() || receipt.mode != InstallMode::Strong {
+        bail!("setup helper installation requires the strong system layout");
+    }
+    reconcile_setup_helper_at(
+        Path::new(&receipt.executable),
+        Path::new(SETUP_HELPER_PATH),
+        &setup_helper_receipt_path(paths),
+        receipt,
+        source_target,
+        0,
+        options,
+    )
+}
+
+fn verify_setup_helper(paths: &SetupPaths, receipt: &InstallReceipt) -> Result<()> {
+    verify_setup_helper_at(
+        Path::new(SETUP_HELPER_PATH),
+        &setup_helper_receipt_path(paths),
+        receipt,
+        0,
+    )
+}
+
+fn verify_setup_helper_absent(paths: &SetupPaths) -> Result<()> {
+    let sidecar = setup_helper_receipt_path(paths);
+    for (path, description) in [
+        (Path::new(SETUP_HELPER_PATH), "setup helper"),
+        (sidecar.as_path(), "setup helper receipt"),
+    ] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {description}")),
+            Ok(_) => bail!("pre-helper dev-auth release retains an unexpected {description}"),
+        }
+    }
+    Ok(())
+}
+
+fn remove_setup_helper(paths: &SetupPaths, receipt: &InstallReceipt) -> Result<()> {
+    remove_setup_helper_at(
+        Path::new(SETUP_HELPER_PATH),
+        &setup_helper_receipt_path(paths),
+        receipt,
+        0,
+    )
+}
+
+pub(crate) fn validated_setup_helper_path(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+) -> Result<PathBuf> {
+    if *paths != SetupPaths::strong() || receipt.mode != InstallMode::Strong {
+        bail!("setup helper is available only for the strong system installation");
+    }
+    if !release_supports_setup_helper(receipt) {
+        bail!("this pre-helper dev-auth release requires one authenticated package or deployment-client bootstrap before privileged setup can be self-hosted");
+    }
+    verify_setup_helper(paths, receipt)?;
+    Ok(PathBuf::from(SETUP_HELPER_PATH))
+}
+
+pub fn validate_installed_setup_helper() -> Result<PathBuf> {
+    validate_root_owned_executable(Path::new(SETUP_HELPER_PATH), "receipt-owned setup helper")?;
+    let paths = SetupPaths::strong();
+    let receipt = read_receipt(&paths.receipt_path())?;
+    validated_setup_helper_path(&paths, &receipt)
+}
+
+pub fn validate_running_setup_helper() -> Result<PathBuf> {
+    let current = fs::canonicalize(std::env::current_exe()?)
+        .context("resolve running setup helper executable")?;
+    if current != Path::new(SETUP_HELPER_PATH) {
+        bail!("privileged setup requires the dedicated receipt-owned setup helper identity");
+    }
+    validate_root_owned_executable(Path::new(SETUP_HELPER_PATH), "receipt-owned setup helper")?;
+    let paths = SetupPaths::strong();
+    let receipt = read_receipt(&paths.receipt_path())?;
+    validated_setup_helper_path(&paths, &receipt)?;
+    Ok(PathBuf::from(receipt.executable))
+}
+
 fn install_privileged_launcher(
     executable: &Path,
     launcher: &Path,
@@ -4657,12 +5695,7 @@ fn install_privileged_launcher(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("inspect privileged workload launcher"),
     }
-    let temporary = launcher.with_extension(format!("new-{}", std::process::id()));
-    stage_executable_copy(executable, &temporary, &executable_identity)?;
-    if let Err(error) = fs::rename(&temporary, launcher) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).context("publish privileged workload launcher");
-    }
+    publish_executable_copy(executable, launcher, 0, "privileged workload launcher")?;
     verify_privileged_launcher_copy(executable, launcher)
 }
 
@@ -4730,6 +5763,51 @@ fn stage_executable_copy(source: &Path, temporary: &Path, expected: &(u64, Strin
     if &file_identity(temporary)? != expected {
         let _ = fs::remove_file(temporary);
         bail!("executable copy changed before publication");
+    }
+    Ok(())
+}
+
+fn publish_executable_copy(
+    source: &Path,
+    destination: &Path,
+    owner_uid: u32,
+    description: &str,
+) -> Result<()> {
+    let expected = file_identity(source)?;
+    let temporary = destination.with_extension(format!("new-{}", std::process::id()));
+    match fs::symlink_metadata(&temporary) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == owner_uid
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o777 == 0o755
+                && file_identity(&temporary)? == expected =>
+        {
+            fs::remove_file(&temporary)
+                .with_context(|| format!("remove interrupted {description} temporary"))?;
+        }
+        Ok(_) => bail!("interrupted {description} temporary has unsafe authority"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {description} temporary"))
+        }
+    }
+    stage_executable_copy(source, &temporary, &expected)?;
+    let metadata = fs::symlink_metadata(&temporary)
+        .with_context(|| format!("inspect staged {description}"))?;
+    if metadata.uid() != owner_uid || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o755 {
+        let _ = fs::remove_file(&temporary);
+        bail!("staged {description} has unsafe filesystem authority");
+    }
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("publish {description}"));
+    }
+    if let Some(parent) = destination.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync {description} directory"))?;
     }
     Ok(())
 }
@@ -4956,6 +6034,555 @@ fn receipt_mode_matches_installation(mode: u32, installation_mode: InstallMode) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup_helper_test_receipt(
+        source: &Path,
+        version: &str,
+        manifest_generation: Option<u64>,
+    ) -> InstallReceipt {
+        let (executable_length, executable_sha256) = file_identity(source).unwrap();
+        InstallReceipt {
+            schema: RECEIPT_SCHEMA.into(),
+            mode: InstallMode::Strong,
+            version: version.into(),
+            executable: source.display().to_string(),
+            bin_dir: "/usr/local/bin".into(),
+            executable_length,
+            executable_sha256,
+            source_commit: manifest_generation.map(|_| "a".repeat(40)),
+            root_generation: manifest_generation.map(|_| 7),
+            manifest_generation,
+            native_git: "/usr/bin/git".into(),
+            native_gh: "/usr/bin/gh".into(),
+            product_aliases: PRODUCT_ALIASES.iter().map(ToString::to_string).collect(),
+            transparent_aliases: Vec::new(),
+            privileged_launcher: Some(PRIVILEGED_LAUNCHER_PATH.into()),
+            system_assets: system_asset_digests(),
+            previous_release: None,
+        }
+    }
+
+    fn setup_helper_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, InstallReceipt) {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = root.path().join("dev-auth");
+        fs::write(&source, b"dev-auth setup helper test executable").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let helper = root.path().join("dev-auth-setup-helper");
+        let sidecar = root.path().join("setup-helper-v1.json");
+        let receipt = setup_helper_test_receipt(&source, "0.3.8", Some(19));
+        (root, source, helper, sidecar, receipt)
+    }
+
+    struct SetupHelperTransitionFixture {
+        _root: tempfile::TempDir,
+        paths: SetupPaths,
+        committed: InstallReceipt,
+        next: InstallReceipt,
+        shared: dev_tools_installation::VersionedReceipt,
+        helper: PathBuf,
+        sidecar: PathBuf,
+        owner_uid: u32,
+        target: String,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SetupHelperArtifactState {
+        HelperOnly,
+        SidecarOnly,
+        Pair,
+    }
+
+    impl SetupHelperTransitionFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let paths = SetupPaths {
+                data_root: root.path().to_path_buf(),
+                bin_dir: root.path().join("bin"),
+            };
+            fs::create_dir(&paths.bin_dir).unwrap();
+            let committed_executable = paths.versioned_binary("0.3.7");
+            let next_executable = paths.versioned_binary("0.3.8");
+            fs::create_dir_all(committed_executable.parent().unwrap()).unwrap();
+            fs::create_dir_all(next_executable.parent().unwrap()).unwrap();
+            fs::write(&committed_executable, b"committed pre-helper executable").unwrap();
+            fs::write(&next_executable, b"interrupted helper-capable executable").unwrap();
+            fs::set_permissions(&committed_executable, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&next_executable, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut committed = setup_helper_test_receipt(&committed_executable, "0.3.7", Some(18));
+            committed.bin_dir = paths.bin_dir.display().to_string();
+            let mut next = setup_helper_test_receipt(&next_executable, "0.3.8", Some(19));
+            next.bin_dir = paths.bin_dir.display().to_string();
+            let shared = dev_tools_installation::VersionedReceipt {
+                schema: "dev-tools-versioned-installation-v1".into(),
+                product: "dev-auth".into(),
+                data_root: paths.data_root.clone(),
+                bin_dir: paths.bin_dir.clone(),
+                artifact_name: "dev-auth".into(),
+                active_version: next.version.clone(),
+                active_identity: dev_tools_installation::ArtifactIdentity {
+                    length: next.executable_length,
+                    sha256: next.executable_sha256.clone(),
+                },
+                previous_version: Some(committed.version.clone()),
+                previous_identity: Some(dev_tools_installation::ArtifactIdentity {
+                    length: committed.executable_length,
+                    sha256: committed.executable_sha256.clone(),
+                }),
+                aliases: shared_product_aliases(),
+            };
+            let helper = paths.data_root.join("dev-auth-setup-helper");
+            let sidecar = setup_helper_receipt_path(&paths);
+            Self {
+                _root: root,
+                paths,
+                committed,
+                next,
+                shared,
+                helper,
+                sidecar,
+                owner_uid: nix::unistd::Uid::effective().as_raw(),
+                target: crate::release_manifest::target_id().unwrap(),
+            }
+        }
+
+        fn publish(&self, state: SetupHelperArtifactState) {
+            if matches!(
+                state,
+                SetupHelperArtifactState::HelperOnly | SetupHelperArtifactState::Pair
+            ) {
+                publish_executable_copy(
+                    Path::new(&self.next.executable),
+                    &self.helper,
+                    self.owner_uid,
+                    "test setup helper",
+                )
+                .unwrap();
+            }
+            if matches!(
+                state,
+                SetupHelperArtifactState::SidecarOnly | SetupHelperArtifactState::Pair
+            ) {
+                write_setup_helper_receipt_at(
+                    &self.sidecar,
+                    &expected_setup_helper_receipt(&self.helper, &self.next, &self.target),
+                    self.owner_uid,
+                )
+                .unwrap();
+            }
+        }
+
+        fn interrupted_release(&self) -> SetupHelperReleaseIdentity {
+            interrupted_setup_helper_release(&self.paths, &self.committed, &self.shared)
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    fn assert_stale_pre_helper_transition_recovery(state: SetupHelperArtifactState) {
+        let fixture = SetupHelperTransitionFixture::new();
+        let interrupted = fixture.interrupted_release();
+        fixture.publish(state);
+        validate_interrupted_setup_helper_artifacts_at(
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.paths.receipt_path(),
+            &interrupted,
+            fixture.owner_uid,
+        )
+        .unwrap();
+        remove_interrupted_setup_helper_artifacts_at(
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.paths.receipt_path(),
+            &interrupted,
+            fixture.owner_uid,
+        )
+        .unwrap();
+        assert!(!fixture.helper.exists());
+        assert!(!fixture.sidecar.exists());
+
+        fixture.publish(state);
+        reconcile_setup_helper_at(
+            Path::new(&fixture.next.executable),
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.next,
+            &fixture.target,
+            fixture.owner_uid,
+            SetupHelperReconcileOptions {
+                prior_receipt: Some(&fixture.committed),
+                allow_current_without_sidecar: true,
+            },
+        )
+        .unwrap();
+        verify_setup_helper_at(
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.next,
+            fixture.owner_uid,
+        )
+        .unwrap();
+    }
+
+    fn assert_first_install_transition_retry(state: SetupHelperArtifactState) {
+        let fixture = SetupHelperTransitionFixture::new();
+        let mut shared = fixture.shared.clone();
+        shared.previous_version = None;
+        shared.previous_identity = None;
+        fixture.publish(state);
+        let interrupted = interrupted_first_install_setup_helper_release(
+            &fixture.paths,
+            &shared,
+            &fixture.next.version,
+            fixture.next.executable_length,
+            &fixture.next.executable_sha256,
+        )
+        .unwrap();
+        validate_interrupted_setup_helper_artifacts_at(
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.paths.receipt_path(),
+            &interrupted,
+            fixture.owner_uid,
+        )
+        .unwrap();
+        reconcile_setup_helper_at(
+            Path::new(&fixture.next.executable),
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.next,
+            &fixture.target,
+            fixture.owner_uid,
+            SetupHelperReconcileOptions {
+                prior_receipt: None,
+                allow_current_without_sidecar: true,
+            },
+        )
+        .unwrap();
+        verify_setup_helper_at(
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.next,
+            fixture.owner_uid,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_pre_helper_receipt_recovers_helper_only_for_removal_and_exact_retry() {
+        assert_stale_pre_helper_transition_recovery(SetupHelperArtifactState::HelperOnly);
+    }
+
+    #[test]
+    fn stale_pre_helper_receipt_recovers_sidecar_only_for_removal_and_exact_retry() {
+        assert_stale_pre_helper_transition_recovery(SetupHelperArtifactState::SidecarOnly);
+    }
+
+    #[test]
+    fn stale_pre_helper_receipt_recovers_full_pair_for_removal_and_exact_retry() {
+        assert_stale_pre_helper_transition_recovery(SetupHelperArtifactState::Pair);
+    }
+
+    #[test]
+    fn first_helper_install_retries_helper_only_publication() {
+        assert_first_install_transition_retry(SetupHelperArtifactState::HelperOnly);
+    }
+
+    #[test]
+    fn first_helper_install_retries_sidecar_only_publication() {
+        assert_first_install_transition_retry(SetupHelperArtifactState::SidecarOnly);
+    }
+
+    #[test]
+    fn first_helper_install_retries_full_pair_publication() {
+        assert_first_install_transition_retry(SetupHelperArtifactState::Pair);
+    }
+
+    #[test]
+    fn interrupted_helper_removal_preserves_pre_helper_rollback_target() {
+        let fixture = SetupHelperTransitionFixture::new();
+        fixture.publish(SetupHelperArtifactState::Pair);
+        fs::remove_file(&fixture.helper).unwrap();
+
+        let mut installed = fixture.next.clone();
+        installed.previous_release = Some(retained_release(&fixture.committed));
+        let mut shared = fixture.shared.clone();
+        shared.active_version = fixture.committed.version.clone();
+        shared.active_identity = dev_tools_installation::ArtifactIdentity {
+            length: fixture.committed.executable_length,
+            sha256: fixture.committed.executable_sha256.clone(),
+        };
+        shared.previous_version = Some(installed.version.clone());
+        shared.previous_identity = Some(dev_tools_installation::ArtifactIdentity {
+            length: installed.executable_length,
+            sha256: installed.executable_sha256.clone(),
+        });
+
+        let resumed =
+            interrupted_setup_helper_rollback_receipt(&fixture.paths, &installed, &shared)
+                .unwrap()
+                .unwrap();
+        assert_eq!(resumed.version, fixture.committed.version);
+        assert_eq!(
+            resumed.executable_sha256,
+            fixture.committed.executable_sha256
+        );
+        assert_eq!(
+            resumed
+                .previous_release
+                .as_ref()
+                .map(|release| &release.version),
+            Some(&installed.version)
+        );
+
+        let installed_release = SetupHelperReleaseIdentity {
+            version: installed.version.clone(),
+            executable: PathBuf::from(&installed.executable),
+            length: installed.executable_length,
+            sha256: installed.executable_sha256.clone(),
+        };
+        remove_interrupted_setup_helper_artifacts_at(
+            &fixture.helper,
+            &fixture.sidecar,
+            &fixture.paths.receipt_path(),
+            &installed_release,
+            fixture.owner_uid,
+        )
+        .unwrap();
+        assert!(!fixture.helper.exists());
+        assert!(!fixture.sidecar.exists());
+    }
+
+    #[test]
+    fn current_helper_release_skips_rollback_recovery_before_shared_link_verification() {
+        let fixture = SetupHelperTransitionFixture::new();
+        let mut installed = fixture.next.clone();
+        installed.previous_release = Some(retained_release(&fixture.committed));
+        symlink(
+            Path::new(&installed.executable),
+            fixture.paths.data_root.join("active"),
+        )
+        .unwrap();
+
+        assert!(
+            resume_interrupted_setup_helper_rollback(&fixture.paths, &installed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn setup_helper_install_verify_repair_and_remove_are_receipt_owned() {
+        let (_root, source, helper, sidecar, receipt) = setup_helper_fixture();
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let target = crate::release_manifest::target_id().unwrap();
+
+        reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .unwrap();
+        verify_setup_helper_at(&helper, &sidecar, &receipt, owner_uid).unwrap();
+        assert_eq!(fs::read(&helper).unwrap(), fs::read(&source).unwrap());
+        let helper_metadata = fs::symlink_metadata(&helper).unwrap();
+        assert!(helper_metadata.file_type().is_file());
+        assert_eq!(helper_metadata.mode() & 0o777, 0o755);
+        assert_eq!(helper_metadata.nlink(), 1);
+        assert_eq!(helper_metadata.uid(), owner_uid);
+        let sidecar_metadata = fs::symlink_metadata(&sidecar).unwrap();
+        assert_eq!(sidecar_metadata.mode() & 0o777, 0o644);
+        assert_eq!(sidecar_metadata.nlink(), 1);
+        assert_eq!(sidecar_metadata.uid(), owner_uid);
+        let sidecar_receipt = read_setup_helper_receipt_at(&sidecar, owner_uid).unwrap();
+        assert_eq!(sidecar_receipt.schema, SETUP_HELPER_RECEIPT_SCHEMA);
+        assert_eq!(sidecar_receipt.protocol, SETUP_HELPER_PROTOCOL);
+        assert_eq!(sidecar_receipt.source_version, receipt.version);
+        assert_eq!(sidecar_receipt.source_target, target);
+        assert_eq!(sidecar_receipt.source_commit, receipt.source_commit);
+        assert_eq!(sidecar_receipt.root_generation, receipt.root_generation);
+        assert_eq!(
+            sidecar_receipt.manifest_generation,
+            receipt.manifest_generation
+        );
+        assert_eq!(sidecar_receipt.active_executable, receipt.executable);
+        assert_eq!(
+            sidecar_receipt.active_executable_sha256,
+            receipt.executable_sha256
+        );
+
+        fs::remove_file(&helper).unwrap();
+        reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .unwrap();
+        verify_setup_helper_at(&helper, &sidecar, &receipt, owner_uid).unwrap();
+
+        fs::write(&helper, b"tampered helper").unwrap();
+        reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .unwrap();
+        verify_setup_helper_at(&helper, &sidecar, &receipt, owner_uid).unwrap();
+
+        fs::write(&sidecar, b"tampered sidecar").unwrap();
+        assert!(reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .is_err());
+        assert_eq!(fs::read(&sidecar).unwrap(), b"tampered sidecar");
+
+        fs::remove_file(&sidecar).unwrap();
+        write_setup_helper_receipt_at(
+            &sidecar,
+            &expected_setup_helper_receipt(&helper, &receipt, &target),
+            owner_uid,
+        )
+        .unwrap();
+
+        remove_setup_helper_at(&helper, &sidecar, &receipt, owner_uid).unwrap();
+        assert!(!helper.exists());
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn setup_helper_refuses_symlinks_and_unprovable_double_tamper() {
+        let (root, source, helper, sidecar, receipt) = setup_helper_fixture();
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let target = crate::release_manifest::target_id().unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &helper).unwrap();
+        assert!(reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+
+        fs::remove_file(&helper).unwrap();
+        reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .unwrap();
+        fs::write(&helper, b"tampered helper").unwrap();
+        fs::write(&sidecar, b"tampered sidecar").unwrap();
+        assert!(reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn setup_helper_sidecar_mismatch_is_detected_and_not_overwritten() {
+        let (_root, source, helper, sidecar, receipt) = setup_helper_fixture();
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let target = crate::release_manifest::target_id().unwrap();
+        reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        value["source_version"] = serde_json::Value::String("9.9.9".into());
+        fs::write(&sidecar, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(verify_setup_helper_at(&helper, &sidecar, &receipt, owner_uid).is_err());
+
+        assert!(reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rollback_to_a_pre_helper_release_removes_only_validated_setup_helper_artifacts() {
+        let (_root, source, helper, sidecar, receipt) = setup_helper_fixture();
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let target = crate::release_manifest::target_id().unwrap();
+        reconcile_setup_helper_at(
+            &source,
+            &helper,
+            &sidecar,
+            &receipt,
+            &target,
+            owner_uid,
+            SetupHelperReconcileOptions::default(),
+        )
+        .unwrap();
+
+        assert!(release_supports_setup_helper(&receipt));
+        let previous = setup_helper_test_receipt(&source, "0.3.7", Some(18));
+        assert!(!release_supports_setup_helper(&previous));
+        remove_setup_helper_at(&helper, &sidecar, &receipt, owner_uid).unwrap();
+        assert!(!helper.exists());
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn setup_helper_execution_path_rejects_a_writable_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let writable = root.path().join("writable");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        let helper = writable.join("dev-auth-setup-helper");
+        fs::write(&helper, b"dev-auth setup helper test executable").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(validate_root_owned_executable(&helper, "receipt-owned setup helper").is_err());
+    }
 
     #[test]
     fn strong_receipts_are_public_read_only_and_user_receipts_remain_private() {

@@ -13,6 +13,7 @@ base64.workspace = true
 directories = "6"
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }
+dev-tools-privilege = { path = "../dev-tools-privilege" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 dev-tools-release = { path = "../dev-tools-release" }
 ed25519-dalek.workspace = true

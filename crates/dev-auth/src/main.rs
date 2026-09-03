@@ -49,7 +49,7 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 #[cfg(target_os = "linux")]
@@ -443,6 +443,233 @@ fn setup_paths(mode: dev_auth::setup::InstallMode) -> Result<dev_auth::setup::Se
 }
 
 #[cfg(unix)]
+fn apply_setup_plan_v3_with_sources(
+    plan: &dev_auth::setup_v3::SetupPlanV3,
+    digest: &str,
+    credential_sources: &std::collections::BTreeMap<
+        String,
+        dev_auth::credential_input::CredentialInputSource,
+    >,
+    format: &str,
+) -> Result<i32> {
+    let mut allowed_owner_uids = plan
+        .accounts
+        .iter()
+        .map(|account| account.uid)
+        .collect::<std::collections::BTreeSet<_>>();
+    if plan.intent.mode == dev_auth::deployment::DeploymentMode::Strong {
+        allowed_owner_uids.insert(0);
+    }
+    let mut stdin = std::io::stdin().lock();
+    let report = dev_auth::setup_v3::apply_setup_plan_v3_from_sources(
+        plan,
+        digest,
+        credential_sources,
+        &dev_auth::credential_input::CredentialInputContext {
+            mode: plan.intent.mode,
+            allowed_owner_uids,
+        },
+        &mut stdin,
+    )?;
+    if format == "json" {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("changed={}", report.changed);
+        println!("verified={}", report.verified);
+        println!("next_action={}", report.next_action);
+        for slot in &report.input_required {
+            println!("input_required={slot}");
+        }
+        for slot in &report.blocked {
+            println!("blocked={slot}");
+        }
+    }
+    Ok(if !report.input_required.is_empty() {
+        3
+    } else if !report.blocked.is_empty() {
+        2
+    } else {
+        0
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn authorized_setup_exit_code(
+    outcome: dev_auth::setup_authorization::StrongSetupApplyAuthorizationOutcome,
+) -> Result<i32> {
+    use dev_auth::setup_authorization::StrongSetupApplyAuthorizationOutcome;
+
+    match outcome {
+        StrongSetupApplyAuthorizationOutcome::HelperExited(termination) => Ok(termination
+            .code
+            .or_else(|| termination.signal.map(|signal| 128 + signal))
+            .unwrap_or(255)),
+        StrongSetupApplyAuthorizationOutcome::AuthorizationNotCompleted => {
+            bail!("strong setup authorization did not complete")
+        }
+        StrongSetupApplyAuthorizationOutcome::Unavailable(_) => {
+            bail!("the configured strong setup authorization backend is unavailable")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ParsedSetupHelperApply {
+    plan: std::path::PathBuf,
+    digest: String,
+    format: String,
+    credential_sources:
+        std::collections::BTreeMap<String, dev_auth::credential_input::CredentialInputSource>,
+    canonical_arguments: Vec<std::ffi::OsString>,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_setup_helper_apply(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<ParsedSetupHelperApply> {
+    use dev_auth::setup_authorization::{SetupApplyCredentialInput, StrongSetupApplyAuthorization};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let supplied_arguments = arguments.into_iter().collect::<Vec<_>>();
+    let mut arguments = supplied_arguments.iter().cloned();
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("apply-v3")) {
+        bail!("setup helper accepts only the apply-v3 protocol")
+    }
+    let mut plan = None;
+    let mut digest = None;
+    let mut format = None;
+    let mut credential_sources = std::collections::BTreeMap::new();
+    let mut authorization_credentials = Vec::new();
+    while let Some(argument) = arguments.next() {
+        match argument.to_str() {
+            Some("--plan") if plan.is_none() => {
+                plan = Some(std::path::PathBuf::from(
+                    arguments.next().context("--plan requires a path")?,
+                ));
+            }
+            Some("--sha256") if digest.is_none() => {
+                digest = Some(
+                    arguments
+                        .next()
+                        .context("--sha256 requires a digest")?
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("setup plan digest is not UTF-8"))?,
+                );
+            }
+            Some("--credential-stdin") => {
+                let slot = arguments
+                    .next()
+                    .context("--credential-stdin requires SLOT")?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("credential slot is not UTF-8"))?;
+                if credential_sources
+                    .insert(
+                        slot.clone(),
+                        dev_auth::credential_input::CredentialInputSource::Stdin,
+                    )
+                    .is_some()
+                {
+                    bail!("credential input slot was defined more than once");
+                }
+                authorization_credentials.push(SetupApplyCredentialInput::stdin(slot));
+            }
+            Some("--credential-file") => {
+                let value = arguments
+                    .next()
+                    .context("--credential-file requires SLOT=PATH")?;
+                let bytes = value.as_bytes();
+                let separator = bytes
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .context("--credential-file requires SLOT=PATH")?;
+                let slot = std::str::from_utf8(&bytes[..separator])
+                    .context("credential slot is not UTF-8")?
+                    .to_owned();
+                let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                    bytes[separator + 1..].to_vec(),
+                ));
+                if credential_sources
+                    .insert(
+                        slot.clone(),
+                        dev_auth::credential_input::CredentialInputSource::File(path.clone()),
+                    )
+                    .is_some()
+                {
+                    bail!("credential input slot was defined more than once");
+                }
+                authorization_credentials.push(SetupApplyCredentialInput::file(slot, path));
+            }
+            Some("--credential-fd") => {
+                bail!("setup helper does not accept credential file descriptors")
+            }
+            Some("--format") if format.is_none() => {
+                format = Some(
+                    arguments
+                        .next()
+                        .context("--format requires a value")?
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("setup apply format is not UTF-8"))?,
+                );
+            }
+            _ => bail!("setup helper received an unsupported or duplicate argument"),
+        }
+    }
+    let plan = plan.context("setup helper requires --plan PATH")?;
+    let digest = digest.context("setup helper requires --sha256 HEX")?;
+    let format = format.context("setup helper requires --format human|json")?;
+    let authorization =
+        StrongSetupApplyAuthorization::new(&plan, &digest, &format, authorization_credentials)?;
+    let canonical_arguments = authorization.native_arguments();
+    if supplied_arguments != canonical_arguments {
+        bail!("setup helper arguments are not in the canonical protocol form");
+    }
+    Ok(ParsedSetupHelperApply {
+        plan,
+        digest,
+        format,
+        credential_sources,
+        canonical_arguments,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run_setup_helper_os() -> Result<i32> {
+    use std::os::unix::process::CommandExt;
+
+    let request = parse_setup_helper_apply(std::env::args_os().skip(1))?;
+    let plan = dev_auth::setup_v3::read_root_setup_plan_v3_at(&request.plan)
+        .context("setup helper accepts only a root-custodied full setup plan v3")?;
+    if plan.intent.mode != dev_auth::deployment::DeploymentMode::Strong {
+        bail!("setup helper accepts only strong setup plans")
+    }
+    if let Some(candidate) = dev_auth::setup_v3::setup_apply_candidate_path(&plan, &request.digest)?
+    {
+        let error = std::process::Command::new(&candidate)
+            .arg0("dev-auth-setup-helper")
+            .args(&request.canonical_arguments)
+            .env_clear()
+            .current_dir("/")
+            .exec();
+        return Err(error)
+            .with_context(|| format!("execute verified setup candidate {}", candidate.display()));
+    }
+
+    let current = std::fs::canonicalize(std::env::current_exe()?)
+        .context("resolve running setup helper executable")?;
+    let accepted_candidate = std::fs::canonicalize(&plan.installation.request.source_executable)
+        .context("resolve accepted setup candidate executable")?;
+    if current != accepted_candidate {
+        dev_auth::setup::validate_running_setup_helper()?;
+    }
+    apply_setup_plan_v3_with_sources(
+        &plan,
+        &request.digest,
+        &request.credential_sources,
+        &request.format,
+    )
+}
+
+#[cfg(unix)]
 fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
     let operation = arguments.next().context(usage())?;
     match operation.as_str() {
@@ -781,7 +1008,10 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             let mut plan_path = None;
             let mut digest = None;
             let mut format = None;
+            let mut authorize = None;
             let mut credential_sources = std::collections::BTreeMap::new();
+            #[cfg(target_os = "linux")]
+            let mut authorization_credentials = Vec::new();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--plan" if plan_path.is_none() => {
@@ -790,19 +1020,26 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     "--sha256" if digest.is_none() => {
                         digest = Some(arguments.next().context("--sha256 requires a digest")?)
                     }
+                    "--authorize" if authorize.is_none() => {
+                        authorize = Some(arguments.next().context("--authorize requires a value")?)
+                    }
                     "--credential-stdin" => {
                         let slot = arguments
                             .next()
                             .context("--credential-stdin requires SLOT")?;
                         if credential_sources
                             .insert(
-                                slot,
+                                slot.clone(),
                                 dev_auth::credential_input::CredentialInputSource::Stdin,
                             )
                             .is_some()
                         {
                             bail!("credential input slot was defined more than once");
                         }
+                        #[cfg(target_os = "linux")]
+                        authorization_credentials.push(
+                            dev_auth::setup_authorization::SetupApplyCredentialInput::stdin(slot),
+                        );
                     }
                     "--credential-fd" => {
                         let value = arguments
@@ -811,13 +1048,20 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                         let (slot, fd) = value
                             .split_once('=')
                             .context("--credential-fd requires SLOT=FD")?;
-                        let source = dev_auth::credential_input::CredentialInputSource::Fd(
-                            fd.parse()
-                                .context("credential file descriptor is invalid")?,
-                        );
-                        if credential_sources.insert(slot.into(), source).is_some() {
+                        let fd = fd
+                            .parse()
+                            .context("credential file descriptor is invalid")?;
+                        let source = dev_auth::credential_input::CredentialInputSource::Fd(fd);
+                        if credential_sources.insert(slot.to_owned(), source).is_some() {
                             bail!("credential input slot was defined more than once");
                         }
+                        #[cfg(target_os = "linux")]
+                        authorization_credentials.push(
+                            dev_auth::setup_authorization::SetupApplyCredentialInput::file_descriptor(
+                                slot,
+                                fd,
+                            ),
+                        );
                     }
                     "--credential-file" => {
                         let value = arguments
@@ -830,10 +1074,17 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                         if !path.is_absolute() {
                             bail!("credential file path must be absolute");
                         }
-                        let source = dev_auth::credential_input::CredentialInputSource::File(path);
-                        if credential_sources.insert(slot.into(), source).is_some() {
+                        let source =
+                            dev_auth::credential_input::CredentialInputSource::File(path.clone());
+                        if credential_sources.insert(slot.to_owned(), source).is_some() {
                             bail!("credential input slot was defined more than once");
                         }
+                        #[cfg(target_os = "linux")]
+                        authorization_credentials.push(
+                            dev_auth::setup_authorization::SetupApplyCredentialInput::file(
+                                slot, path,
+                            ),
+                        );
                     }
                     "--format" if format.is_none() => {
                         format = Some(arguments.next().context("--format requires a value")?)
@@ -851,6 +1102,36 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if !matches!(format, "human" | "json") {
                 bail!("setup apply format must be human or json");
             }
+            if let Some(authorize) = authorize {
+                #[cfg(target_os = "linux")]
+                {
+                    if authorize != "sudo" {
+                        bail!("setup apply authorization must be sudo");
+                    }
+                    let request =
+                        dev_auth::setup_authorization::StrongSetupApplyAuthorization::new(
+                            &plan_path,
+                            &digest,
+                            format,
+                            authorization_credentials,
+                        )?;
+                    dev_auth::setup::validate_installed_setup_helper().context(
+                        "validate the receipt-owned setup helper before requesting privilege; bootstrap strong setup as root when the helper is not installed",
+                    )?;
+                    let authorizer = dev_tools_privilege::SudoAuthorizer::new("/usr/bin/sudo")
+                        .context(
+                            "prepare strong setup authorization; bootstrap the receipt-owned setup helper as root when it is not installed",
+                        )?;
+                    return authorized_setup_exit_code(
+                        dev_auth::setup_authorization::authorize_strong_apply_with(
+                            &authorizer,
+                            &request,
+                        )?,
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
+                bail!("setup apply authorization is unavailable on this platform");
+            }
             let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan_path)
                 .context("setup apply accepts only a full setup plan v3")?;
             if let Some(candidate) = dev_auth::setup_v3::setup_apply_candidate_path(&plan, &digest)?
@@ -861,6 +1142,8 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     let error = std::process::Command::new(&candidate)
                         .arg0("dev-auth")
                         .args(std::env::args_os().skip(1))
+                        .env_clear()
+                        .current_dir("/")
                         .exec();
                     return Err(error).with_context(|| {
                         format!("execute verified setup candidate {}", candidate.display())
@@ -869,45 +1152,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 #[cfg(not(unix))]
                 bail!("setup candidate handoff is unavailable on this platform");
             }
-            let mut allowed_owner_uids = plan
-                .accounts
-                .iter()
-                .map(|account| account.uid)
-                .collect::<std::collections::BTreeSet<_>>();
-            if plan.intent.mode == dev_auth::deployment::DeploymentMode::Strong {
-                allowed_owner_uids.insert(0);
-            }
-            let mut stdin = std::io::stdin().lock();
-            let report = dev_auth::setup_v3::apply_setup_plan_v3_from_sources(
-                &plan,
-                &digest,
-                &credential_sources,
-                &dev_auth::credential_input::CredentialInputContext {
-                    mode: plan.intent.mode,
-                    allowed_owner_uids,
-                },
-                &mut stdin,
-            )?;
-            if format == "json" {
-                println!("{}", serde_json::to_string(&report)?);
-            } else {
-                println!("changed={}", report.changed);
-                println!("verified={}", report.verified);
-                println!("next_action={}", report.next_action);
-                for slot in &report.input_required {
-                    println!("input_required={slot}");
-                }
-                for slot in &report.blocked {
-                    println!("blocked={slot}");
-                }
-            }
-            Ok(if !report.input_required.is_empty() {
-                3
-            } else if !report.blocked.is_empty() {
-                2
-            } else {
-                0
-            })
+            apply_setup_plan_v3_with_sources(&plan, &digest, &credential_sources, format)
         }
         "migrate-v1-preview" => {
             if arguments.next().as_deref() != Some("--output") {
@@ -1729,6 +1974,8 @@ fn main() {
         ("git-credential-dev-auth", _, _) => run_credential_frontend(),
         ("gh-dev-auth", _, _) => run_gh_frontend(),
         ("ssh-keygen-dev-auth", _, _) => run_ssh_keygen_frontend(),
+        #[cfg(target_os = "linux")]
+        ("dev-auth-setup-helper", false, false) => run_setup_helper_os(),
         #[cfg(target_os = "linux")]
         ("dev-auth-workload-launcher", false, false) => run_privileged_launcher_os(),
         #[cfg(target_os = "linux")]

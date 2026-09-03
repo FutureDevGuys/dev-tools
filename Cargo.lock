@@ -910,6 +910,7 @@ dependencies = [
  "base64 0.22.1",
  "dev-tools-command",
  "dev-tools-installation",
+ "dev-tools-privilege",
  "dev-tools-reconcile-protocol",
  "dev-tools-release",
  "directories",

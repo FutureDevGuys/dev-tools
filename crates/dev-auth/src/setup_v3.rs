@@ -1386,9 +1386,74 @@ pub fn write_setup_plan_v3_at(path: &Path, plan: &SetupPlanV3) -> Result<String>
 
 pub fn read_setup_plan_v3_at(path: &Path) -> Result<SetupPlanV3> {
     let bytes = read_bounded(path)?;
-    let plan: SetupPlanV3 = serde_json::from_slice(&bytes).context("parse setup plan v3")?;
+    parse_setup_plan_v3(&bytes)
+}
+
+/// Read a privileged setup transaction only from root-owned private custody.
+///
+/// The setup helper uses this stricter entry point before it interprets any
+/// plan content. World- or user-writable ancestors are not acceptable plan
+/// authority even when the leaf itself is a root-owned regular file.
+pub fn read_root_setup_plan_v3_at(path: &Path) -> Result<SetupPlanV3> {
+    validate_root_plan_path(path)?;
+    let document = read_atomic_document(
+        path,
+        &DocumentAuthority {
+            owner_uid: 0,
+            mode: 0o600,
+            limit: DOCUMENT_LIMIT,
+        },
+    )?
+    .context("root-owned setup plan v3 is absent")?;
+    parse_setup_plan_v3(&document.bytes)
+}
+
+fn parse_setup_plan_v3(bytes: &[u8]) -> Result<SetupPlanV3> {
+    let plan: SetupPlanV3 = serde_json::from_slice(bytes).context("parse setup plan v3")?;
     validate_setup_plan_v3(&plan)?;
     Ok(plan)
+}
+
+fn validate_root_plan_path(path: &Path) -> Result<()> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        bail!("root-owned setup plan path must be absolute and normalized");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        if !matches!(
+            component,
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_)
+        ) {
+            bail!("root-owned setup plan path must be absolute and normalized");
+        }
+        normalized.push(component.as_os_str());
+    }
+    if normalized.as_os_str() != path.as_os_str() {
+        bail!("root-owned setup plan path must be absolute and normalized");
+    }
+    let parent = path
+        .parent()
+        .context("root-owned setup plan has no parent")?;
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).with_context(|| {
+            format!(
+                "inspect root-owned setup plan ancestor {}",
+                current.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            bail!("root-owned setup plan has unsafe ancestor authority");
+        }
+    }
+    Ok(())
 }
 
 fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
@@ -1741,6 +1806,24 @@ mod tests {
         let mut caller_paths = planned.clone();
         caller_paths.root_path = PathBuf::from("/tmp/root.json");
         assert!(canonical_plan_release_source(&artifact, &caller_paths, &accepted).is_err());
+    }
+
+    #[test]
+    fn privileged_setup_plan_rejects_relative_and_writable_ancestor_custody() {
+        assert!(validate_root_plan_path(Path::new("relative-plan.json")).is_err());
+        assert!(validate_root_plan_path(Path::new("/run//dev-auth/plan.json")).is_err());
+        assert!(validate_root_plan_path(Path::new("/run/dev-auth/../plan.json")).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let plan = root.path().join("plan.json");
+        fs::write(&plan, b"not parsed because custody fails first").unwrap();
+        fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = read_root_setup_plan_v3_at(&plan).unwrap_err().to_string();
+        assert!(
+            error.contains("unsafe ancestor authority")
+                || error.contains("unsafe filesystem authority")
+        );
+        assert!(!error.contains("parse setup plan"));
     }
 
     #[test]

@@ -34,6 +34,8 @@ mod runtime;
 #[cfg(unix)]
 pub mod setup;
 #[cfg(unix)]
+pub mod setup_authorization;
+#[cfg(unix)]
 pub mod setup_v3;
 #[cfg(unix)]
 pub mod stable_release;

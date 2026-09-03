@@ -233,6 +233,87 @@ fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
     assert!(error.contains("accepts only a full setup plan v3"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_helper_identity_accepts_only_its_narrow_apply_protocol() {
+    use std::os::unix::process::CommandExt;
+
+    for arguments in [
+        vec!["build-info"],
+        vec!["setup", "readiness"],
+        vec!["apply-v3", "--help"],
+        vec!["apply-v3", "--plan", "/tmp/plan", "--sha256"],
+        vec![
+            "apply-v3",
+            "--plan",
+            "/tmp/plan",
+            "--sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--format",
+            "json",
+        ],
+        vec![
+            "apply-v3",
+            "--plan",
+            "/tmp/plan",
+            "--sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--credential-fd",
+            "automation=7",
+        ],
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
+        command
+            .arg0("dev-auth-setup-helper")
+            .args(arguments)
+            .env_clear();
+        let output = bounded_output(&mut command);
+        assert!(
+            !output.status.success(),
+            "helper grammar unexpectedly succeeded"
+        );
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.starts_with("dev-auth-setup-helper:"),
+            "helper identity fell through to another frontend: {error}"
+        );
+        assert!(!error.contains("workload alias"), "{error}");
+    }
+
+    for arguments in [
+        vec![
+            "apply-v3",
+            "--plan",
+            "/tmp/plan",
+            "--sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+        vec![
+            "apply-v3",
+            "--sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--plan",
+            "/tmp/plan",
+            "--format",
+            "json",
+        ],
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
+        command
+            .arg0("dev-auth-setup-helper")
+            .args(arguments)
+            .env_clear();
+        let output = bounded_output(&mut command);
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("requires --format") || error.contains("canonical protocol form"),
+            "noncanonical helper grammar reached plan processing: {error}"
+        );
+        assert!(!error.contains("inspect root-owned setup plan"), "{error}");
+    }
+}
+
 #[test]
 fn setup_plan_requires_one_complete_offline_release_bundle() {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
