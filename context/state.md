@@ -1,6 +1,5 @@
 # Active work
 
-- Publish and install dev-auth v0.3.10/generation 21 only after owner-installation aliasing, bounded provider and teardown work, retryable token cleanup, and session-lifecycle races pass the standard two-pass strong setup harness and live Git/gh probes; preserve v0.3.9 and the known v0.3.7 rollback line until acceptance. Unpublished v0.3.8/generation 19 and installed v0.3.9/generation 20 are already bound in local anti-equivocation state and must never be reused for different bytes.
 - Use the admitted operation-only release path to rebuild, publish, install, and accept Update All 0.1.6 generation 7 and native sync-configs 0.2.0 generation 14 from the final merged source; the earlier `acd45e4` artifacts are superseded and must not be published.
 - Run the current Syscfg manifest through installed native sync-configs twice and require the second pass to perform no configuration mutations or unnecessary authentication.
 - Prove Linux strong-mode admission and transparent human passthrough across CLI, desktop, subagents, fresh shells, editors, signals, sandbox adapters, cache expiry, revocation, and no-human-fallback before making the full support claim.
