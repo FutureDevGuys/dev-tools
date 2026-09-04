@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -317,7 +318,37 @@ def verify_local_tag(
         raise SystemExit(
             f"local release tag points at a different source: {release.tag}"
         )
-    run(git, "verify-tag", release.tag)
+    configured_key = run(git, "config", "--get", "user.signingKey").stdout.splitlines()
+    if len(configured_key) != 1 or not configured_key[0].startswith("key::"):
+        raise SystemExit("Git signing identity is not one inline SSH public key")
+    fields = configured_key[0].removeprefix("key::").split()
+    if (
+        len(fields) < 2
+        or not re.fullmatch(r"[A-Za-z0-9@._+-]{1,128}", fields[0])
+        or not re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", fields[1])
+    ):
+        raise SystemExit("Git signing identity is not one inline SSH public key")
+    try:
+        key_bytes = base64.b64decode(fields[1], validate=True)
+    except ValueError as exc:
+        raise SystemExit(
+            "Git signing identity is not one inline SSH public key"
+        ) from exc
+    if not 32 <= len(key_bytes) <= 16 * 1024:
+        raise SystemExit("Git signing identity is not one inline SSH public key")
+    with tempfile.TemporaryDirectory(prefix="dev-tools-allowed-signers-") as directory:
+        allowed_signers = Path(directory) / "allowed-signers"
+        allowed_signers.write_text(
+            f'* namespaces="git" {fields[0]} {fields[1]}\n', encoding="ascii"
+        )
+        allowed_signers.chmod(0o600)
+        run(
+            git,
+            "-c",
+            f"gpg.ssh.allowedSignersFile={allowed_signers}",
+            "verify-tag",
+            release.tag,
+        )
 
 
 def ensure_signed_tag(

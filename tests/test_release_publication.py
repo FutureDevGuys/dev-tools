@@ -153,8 +153,19 @@ if Path(sys.argv[0]).name == "git":
         tag = args[2]
         (state / ("tag-" + tag.replace("/", "_"))).write_text(source)
         raise SystemExit(0)
-    if args and args[0] == "verify-tag":
+    if args[:3] == ["config", "--get", "user.signingKey"]:
+        print("key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGFx1w/enBxQRy/DEl59qE3az25LG9DbYUue2Bj5IghY fixture")
         raise SystemExit(0)
+    if len(args) == 4 and args[0] == "-c" and args[2] == "verify-tag":
+        key, separator, allowed_signers = args[1].partition("=")
+        if key != "gpg.ssh.allowedSignersFile" or not separator:
+            raise SystemExit(93)
+        (state / "allowed-signers.txt").write_text(
+            Path(allowed_signers).read_text(encoding="ascii"), encoding="ascii"
+        )
+        raise SystemExit(0)
+    if args and args[0] == "verify-tag":
+        raise SystemExit(93)
     if args[:3] == ["rev-list", "-n", "1"]:
         print(source)
         raise SystemExit(0)
@@ -299,6 +310,10 @@ def test_publisher_verifies_signatures_tags_and_assets_then_resumes(
     ]
     assert any(
         call["argv0"] == "git" and call["args"][:2] == ["tag", "-s"] for call in calls
+    )
+    assert (state / "allowed-signers.txt").read_text(encoding="ascii") == (
+        '* namespaces="git" ssh-ed25519 '
+        "AAAAC3NzaC1lZDI1NTE5AAAAIGFx1w/enBxQRy/DEl59qE3az25LG9DbYUue2Bj5IghY\n"
     )
     assert any(
         call["argv0"] == "gh" and call["args"][:2] == ["release", "create"]
