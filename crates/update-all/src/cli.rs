@@ -11,6 +11,7 @@ use crate::ui::{MouseRowStride, UiModeResolved};
 use crate::updaters::{detected_builtin_tasks, HostOs};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
+use dev_tools_product::{BuildInfo, ProductId};
 use is_terminal::IsTerminal;
 use std::env;
 use std::fs;
@@ -96,6 +97,8 @@ pub struct RunCli {
 
 #[derive(clap::Subcommand, Debug)]
 enum RunSubcommand {
+    /// Show checkout-independent product build information.
+    BuildInfo(BuildInfoCli),
     /// Emit shell completion for update-all itself.
     Completion(CompletionCli),
     /// Manage binary-owned completion generation and installation.
@@ -140,6 +143,13 @@ struct CompletionCli {
 
     #[arg(long = "shell")]
     shell_flag: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct BuildInfoCli {
+    /// Emit the common machine-readable schema.
+    #[arg(long = "json", default_value_t = false)]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -219,6 +229,7 @@ impl RunCli {
         }
 
         match self.subcommand.take() {
+            Some(RunSubcommand::BuildInfo(cli)) => return cli.run(),
             Some(RunSubcommand::Completion(cli)) => return cli.run(),
             Some(RunSubcommand::Completions(cli)) => return cli.run(self.config),
             Some(RunSubcommand::SelfCommand(cli)) => return cli.run_with_default_path(self.config),
@@ -456,6 +467,31 @@ impl RunCli {
         }
         run_result?;
 
+        Ok(())
+    }
+}
+
+impl BuildInfoCli {
+    fn run(self) -> Result<()> {
+        let info = BuildInfo::from_build_values(
+            ProductId::parse("update-all")?,
+            env!("CARGO_PKG_VERSION"),
+            option_env!("UPDATE_ALL_GIT_COMMIT"),
+            option_env!("UPDATE_ALL_GIT_DIRTY"),
+            option_env!("UPDATE_ALL_BUILD_TARGET"),
+            option_env!("UPDATE_ALL_BUILD_PROFILE"),
+            option_env!("UPDATE_ALL_BUILD_UNIX"),
+        )?;
+        if self.json {
+            crate::ua_outln!("{}", serde_json::to_string_pretty(&info)?);
+        } else {
+            crate::ua_outln!("{} {}", info.product, info.version);
+            crate::ua_outln!("source_commit={}", info.source_commit);
+            crate::ua_outln!("source_state={:?}", info.source_state);
+            crate::ua_outln!("target={}", info.target);
+            crate::ua_outln!("profile={:?}", info.profile);
+            crate::ua_outln!("built_unix={}", info.built_unix);
+        }
         Ok(())
     }
 }

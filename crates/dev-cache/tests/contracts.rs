@@ -95,6 +95,30 @@ fn build_info_exposes_checkout_independent_build_metadata() {
 }
 
 #[test]
+fn standard_build_info_subcommand_uses_the_common_product_schema() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-cache"))
+        .args(["build-info", "--json"])
+        .output()
+        .expect("run standard build-info command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("build-info JSON");
+    assert_eq!(payload["schema"], "dev-tools-build-info-v1");
+    assert_eq!(payload["product"], "dev-cache");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+    assert!(payload["source_commit"].as_str().is_some());
+    assert!(payload["source_state"].as_str().is_some());
+    assert!(payload["target"].as_str().is_some());
+    assert!(payload["profile"].as_str().is_some());
+    assert!(payload["built_unix"].as_u64().is_some());
+}
+
+#[test]
 fn dev_cache_has_one_canonical_binary_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_dev-cache"))
         .arg("--version")

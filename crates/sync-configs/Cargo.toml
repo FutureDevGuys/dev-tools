@@ -18,6 +18,7 @@ clap_complete = "4"
 ctrlc = "3"
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }
+dev-tools-product = { path = "../dev-tools-product" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 globset = "0.4"
 libc = "0.2"

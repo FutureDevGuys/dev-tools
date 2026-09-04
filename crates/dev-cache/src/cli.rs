@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use dev_tools_product::{BuildInfo, ProductId};
 use serde::Serialize;
 
 use crate::adapter::{Adapter, AdapterContext};
@@ -60,6 +61,8 @@ enum CompletionShell {
 
 #[derive(Subcommand, Debug)]
 enum CommandKind {
+    /// Show checkout-independent product build information.
+    BuildInfo,
     /// Generate a completion script from the live command definition.
     Completion {
         #[arg(value_enum)]
@@ -318,6 +321,10 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
     };
     let command = cli.command.take().unwrap_or(CommandKind::Status);
     match command {
+        CommandKind::BuildInfo => {
+            print_standard_build_info(cli.json)?;
+            return Ok(0);
+        }
         CommandKind::Completion { shell, output } => {
             if let Some(changed) = generate_completion(shell, output.as_deref())? {
                 print_value(
@@ -428,8 +435,23 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
         | CommandKind::Activate { .. }
         | CommandKind::Deactivate { .. }
         | CommandKind::Uninstall { .. } => bail!("internal command dispatch error"),
-        CommandKind::Completion { .. } => bail!("internal command dispatch error"),
+        CommandKind::Completion { .. } | CommandKind::BuildInfo => {
+            bail!("internal command dispatch error")
+        }
     }
+}
+
+fn print_standard_build_info(json: bool) -> Result<()> {
+    let info = BuildInfo::from_build_values(
+        ProductId::parse("dev-cache")?,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("DEV_TOOLS_GIT_COMMIT"),
+        option_env!("DEV_TOOLS_GIT_DIRTY"),
+        option_env!("DEV_TOOLS_BUILD_TARGET"),
+        option_env!("DEV_TOOLS_BUILD_PROFILE"),
+        option_env!("DEV_TOOLS_BUILD_UNIX"),
+    )?;
+    print_value(json, &info)
 }
 
 fn generate_completion(shell: CompletionShell, output: Option<&Path>) -> Result<Option<bool>> {

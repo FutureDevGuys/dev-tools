@@ -5,6 +5,7 @@ mod build_info {
 }
 
 use anyhow::{anyhow, Context, Result};
+use dev_tools_product::{BuildInfo, ProductId};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -473,6 +474,9 @@ pub fn main_entry(args: Vec<String>) -> i32 {
         build_info::print_build_info();
         return 0;
     }
+    if args.first().is_some_and(|arg| arg == "build-info") {
+        return print_standard_build_info(&args[1..]);
+    }
     match Options::parse(args) {
         Ok(options) if options.mode == CommandMode::Help => {
             print_help();
@@ -488,6 +492,45 @@ pub fn main_entry(args: Vec<String>) -> i32 {
         Err(err) => {
             eprintln!("skills-sync: {err:#}");
             EXIT_USAGE
+        }
+    }
+}
+
+fn print_standard_build_info(args: &[String]) -> i32 {
+    if args != ["--json"] {
+        eprintln!("skills-sync: build-info requires --json");
+        return EXIT_SCHEMA;
+    }
+    let product = match ProductId::parse("skills-sync") {
+        Ok(product) => product,
+        Err(error) => {
+            eprintln!("skills-sync: {error}");
+            return EXIT_SCHEMA;
+        }
+    };
+    let info = match BuildInfo::from_build_values(
+        product,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("DEV_TOOLS_GIT_COMMIT"),
+        option_env!("DEV_TOOLS_GIT_DIRTY"),
+        option_env!("DEV_TOOLS_BUILD_TARGET"),
+        option_env!("DEV_TOOLS_BUILD_PROFILE"),
+        option_env!("DEV_TOOLS_BUILD_UNIX"),
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            eprintln!("skills-sync: {error}");
+            return EXIT_SCHEMA;
+        }
+    };
+    match serde_json::to_writer_pretty(std::io::stdout().lock(), &info) {
+        Ok(()) => {
+            println!();
+            0
+        }
+        Err(_) => {
+            eprintln!("skills-sync: build information could not be written");
+            1
         }
     }
 }
@@ -4056,6 +4099,7 @@ START HERE
 WHAT CHANGES FILES?
     Read-only:
       skills-sync help
+      skills-sync build-info --json
       skills-sync status
       skills-sync lock status
       any command with --dry-run
@@ -4127,6 +4171,9 @@ AGENT LINK RECONCILIATION
         differs from the canonical global skill.
 
 COMMANDS
+    build-info --json
+        Emit checkout-independent common product build information.
+
     sync
         Restore skills from the selected lock files and repair installed skills
         that have no agent links. This is the default command.

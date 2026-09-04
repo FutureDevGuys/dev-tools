@@ -187,19 +187,20 @@ fn validate_exact_executable(path: &Path, description: &str) -> Result<()> {
     {
         bail!("{description} path must be absolute and normalized");
     }
-    let components = path.components().collect::<Vec<_>>();
+    let mut components = path.components().peekable();
     let mut current = PathBuf::new();
-    for (index, component) in components.iter().enumerate() {
+    while let Some(component) = components.next() {
         current.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&current)
             .with_context(|| format!("inspect {description} at {}", current.display()))?;
         if metadata.file_type().is_symlink() {
             bail!("{description} path must not contain symlinks");
         }
-        if index + 1 < components.len() && !metadata.file_type().is_dir() {
+        let is_last = components.peek().is_none();
+        if !is_last && !metadata.file_type().is_dir() {
             bail!("{description} ancestor must be a directory");
         }
-        if index + 1 == components.len() && !metadata.file_type().is_file() {
+        if is_last && !metadata.file_type().is_file() {
             bail!("{description} must be a regular file");
         }
     }

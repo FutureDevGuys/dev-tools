@@ -947,6 +947,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dev-tools-command",
+ "dev-tools-product",
  "fs2",
  "same-file",
  "serde",
@@ -972,6 +973,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-tools-conformance"
+version = "0.1.0"
+dependencies = [
+ "dev-tools-command",
+ "dev-tools-product",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dev-tools-installation"
 version = "0.1.0"
 dependencies = [
@@ -992,6 +1005,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "tempfile",
+]
+
+[[package]]
+name = "dev-tools-product"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3200,6 +3221,7 @@ name = "skills-sync"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "dev-tools-product",
  "serde",
  "serde_json",
 ]
@@ -3403,6 +3425,7 @@ dependencies = [
  "ctrlc",
  "dev-tools-command",
  "dev-tools-installation",
+ "dev-tools-product",
  "dev-tools-reconcile-protocol",
  "globset",
  "libc",
@@ -3831,6 +3854,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "dev-tools-installation",
+ "dev-tools-product",
  "dev-tools-release",
  "ed25519-dalek",
  "is-terminal",

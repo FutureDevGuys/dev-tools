@@ -26,6 +26,10 @@ fn main() {
         &env::var("PROFILE").unwrap_or_else(|_| "unknown".into()),
     );
     set_env(
+        "UPDATE_ALL_BUILD_TARGET",
+        &env::var("TARGET").unwrap_or_else(|_| "unknown".into()),
+    );
+    set_env(
         "UPDATE_ALL_GIT_COMMIT",
         &env::var("DEV_TOOLS_GIT_COMMIT")
             .ok()

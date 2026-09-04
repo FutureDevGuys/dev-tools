@@ -81,10 +81,10 @@ fn external_catalog_rejects_config_file_shape() {
 }
 
 #[test]
-fn managed_and_local_catalogs_require_owned_namespaces() {
+fn discovered_catalog_directories_define_their_owned_namespaces() {
     let tmp = TempDir::new().unwrap();
     let config_root = tmp.path().join("update-all");
-    let managed = config_root.join("catalog.d/syscfg");
+    let managed = config_root.join("catalog.d/workstation");
     let local = config_root.join("catalog.d/local");
     std::fs::create_dir_all(&managed).unwrap();
     std::fs::create_dir_all(&local).unwrap();
@@ -92,7 +92,7 @@ fn managed_and_local_catalogs_require_owned_namespaces() {
     std::fs::write(&config, "[updaters]\nrun_all_detected = false\n").unwrap();
     std::fs::write(
         managed.join("desktop.toml"),
-        "[tasks.\"syscfg/desktop\"]\ncommand = \"desktop-refresh\"\n",
+        "[tasks.\"workstation/desktop\"]\ncommand = \"desktop-refresh\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -102,7 +102,10 @@ fn managed_and_local_catalogs_require_owned_namespaces() {
     .unwrap();
 
     let runtime = load_runtime_config(Some(config)).unwrap();
-    assert!(runtime.updaters.custom_tasks.contains_key("syscfg/desktop"));
+    assert!(runtime
+        .updaters
+        .custom_tasks
+        .contains_key("workstation/desktop"));
     assert!(runtime.updaters.custom_tasks.contains_key("local/notes"));
 }
 
@@ -110,7 +113,7 @@ fn managed_and_local_catalogs_require_owned_namespaces() {
 fn discovered_catalog_rejects_foreign_namespace() {
     let tmp = TempDir::new().unwrap();
     let config_root = tmp.path().join("update-all");
-    let managed = config_root.join("catalog.d/syscfg");
+    let managed = config_root.join("catalog.d/workstation");
     std::fs::create_dir_all(&managed).unwrap();
     let config = config_root.join("config.toml");
     std::fs::write(&config, "[updaters]\nrun_all_detected = false\n").unwrap();
@@ -122,9 +125,41 @@ fn discovered_catalog_rejects_foreign_namespace() {
 
     let error = load_runtime_config(Some(config)).unwrap_err().to_string();
     assert!(
-        error.contains("must use the 'syscfg/' namespace"),
+        error.contains("must use the 'workstation/' namespace"),
         "{error}"
     );
+}
+
+#[test]
+fn discovered_catalog_rejects_an_invalid_namespace_directory() {
+    let tmp = TempDir::new().unwrap();
+    let config_root = tmp.path().join("update-all");
+    let invalid = config_root.join("catalog.d/Not Managed");
+    std::fs::create_dir_all(&invalid).unwrap();
+    let config = config_root.join("config.toml");
+    std::fs::write(&config, "[updaters]\nrun_all_detected = false\n").unwrap();
+
+    let error = load_runtime_config(Some(config)).unwrap_err().to_string();
+    assert_eq!(error, "invalid updater catalog namespace directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn discovered_catalog_rejects_a_linked_namespace_boundary() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let config_root = tmp.path().join("update-all");
+    let catalog_root = config_root.join("catalog.d");
+    let external = tmp.path().join("external");
+    std::fs::create_dir_all(&catalog_root).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+    symlink(&external, catalog_root.join("workstation")).unwrap();
+    let config = config_root.join("config.toml");
+    std::fs::write(&config, "[updaters]\nrun_all_detected = false\n").unwrap();
+
+    let error = load_runtime_config(Some(config)).unwrap_err().to_string();
+    assert_eq!(error, "updater catalog namespace must be a real directory");
 }
 
 #[test]

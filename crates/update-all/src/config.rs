@@ -1399,27 +1399,79 @@ fn discovered_updater_catalogs(config_path: Option<&Path>) -> Result<Vec<(String
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("catalog.d");
-    let mut catalogs = Vec::new();
-    for namespace in ["syscfg", "local"] {
-        let directory = root.join(namespace);
-        if !directory.is_dir() {
+    let root_metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("inspect updater catalog root"),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("updater catalog root must be a real directory");
+    }
+
+    let mut namespace_directories = Vec::new();
+    for entry in std::fs::read_dir(&root).context("read updater catalog root")? {
+        let entry = entry.context("read updater catalog namespace entry")?;
+        let file_type = entry
+            .file_type()
+            .context("inspect updater catalog namespace entry")?;
+        if file_type.is_symlink() {
+            bail!("updater catalog namespace must be a real directory");
+        }
+        if !file_type.is_dir() {
             continue;
         }
+        let namespace = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("invalid updater catalog namespace directory"))?;
+        if !valid_catalog_namespace(&namespace) {
+            bail!("invalid updater catalog namespace directory");
+        }
+        namespace_directories.push((namespace, entry.path()));
+    }
+    namespace_directories.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut catalogs = Vec::new();
+    for (namespace, directory) in namespace_directories {
         let mut paths = std::fs::read_dir(&directory)
             .with_context(|| format!("read updater catalog directory {}", directory.display()))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.is_file()
+            .map(|entry| {
+                let entry = entry.context("read updater catalog entry")?;
+                let file_type = entry.file_type().context("inspect updater catalog entry")?;
+                if file_type.is_symlink() {
+                    bail!("updater catalog entries must not be symbolic links");
+                }
+                let path = entry.path();
+                Ok((file_type.is_file(), path))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(is_file, path)| {
+                (is_file
                     && path
                         .extension()
                         .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml")))
+                .then_some(path)
             })
             .collect::<Vec<_>>();
         paths.sort();
-        catalogs.extend(paths.into_iter().map(|path| (namespace.to_string(), path)));
+        catalogs.extend(paths.into_iter().map(|path| (namespace.clone(), path)));
     }
     Ok(catalogs)
+}
+
+fn valid_catalog_namespace(namespace: &str) -> bool {
+    let valid_start = namespace
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    !namespace.is_empty()
+        && namespace.len() <= 64
+        && valid_start
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn validate_discovered_catalog_namespace(namespace: &str, id: &str, path: &Path) -> Result<()> {

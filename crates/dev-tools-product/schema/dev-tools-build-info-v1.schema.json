@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FutureDevGuys/dev-tools/schema/dev-tools-build-info-v1.schema.json",
+  "title": "Dev Tools build information v1",
+  "type": "object",
+  "required": ["schema", "product", "version", "source_commit", "source_state", "target", "profile", "built_unix"],
+  "properties": {
+    "schema": { "const": "dev-tools-build-info-v1" },
+    "product": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source_commit": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source_state": { "enum": ["clean", "dirty", "unknown"] },
+    "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "profile": { "enum": ["debug", "release", "unknown"] },
+    "built_unix": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": true
+}

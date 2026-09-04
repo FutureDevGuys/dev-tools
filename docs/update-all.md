@@ -10,6 +10,8 @@ Every task-scoped `log_line` record carries the task's exact qualified ID. Run-w
 
 Run artifacts are owner-only diagnostic state. After every terminal run, Update All retains completed runs for at most 30 days, 100 runs, and 128 MiB by default; `[logging]` keys `retention_max_age_days`, `retention_max_runs`, and `retention_max_bytes` override those limits. The current run, active runs, malformed directories, symlinks, and directories without Update All metadata are never automatically removed. `update-all runs prune --dry-run` reports the exact bounded deletion set as JSON, and `update-all runs prune` applies it. Retention failures warn and leave the updater outcome unchanged. This maintenance changes only diagnostics and is not a package, catalog, completion, or task-state mutation.
 
+`update-all build-info --json` emits the common checkout-independent `dev-tools-build-info-v1` document without loading configuration, release state, task catalogs, or network machinery. The hidden `--build-info` form remains for rollback to the pre-standard 0.1 line and is removed in the next minor release after one accepted release has shipped the standard subcommand.
+
 Catalog relationships distinguish capability health from ordering. `depends_on`
 and `depends_on_selected` require healthy predecessors. `after` and
 `after_selected` wait only for terminal outcomes, so a final reconciliation task

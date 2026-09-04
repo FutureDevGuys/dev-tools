@@ -1,0 +1,24 @@
+[package]
+name = "dev-tools-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Executable conformance harness for standalone Dev Tools products"
+
+[dependencies]
+dev-tools-command = { path = "../dev-tools-command" }
+dev-tools-product = { path = "../dev-tools-product" }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "conformance-fixture"
+path = "src/bin/conformance_fixture.rs"
+test = false
+bench = false

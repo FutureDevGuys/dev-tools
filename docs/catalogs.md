@@ -35,6 +35,6 @@ requires_elevation = false
 interactive = false
 ```
 
-Catalog protocol fields default to version 1 when omitted; explicitly unsupported schema, engine, adapter, or result protocol versions fail before planning. Managed files discovered below `catalog.d/syscfg/` must use `syscfg/` task IDs, and files below `catalog.d/local/` must use `local/` task IDs. Explicit catalog paths may use another owner namespace, but duplicate fully qualified IDs and duplicate non-empty authority claims are always invalid.
+Catalog protocol fields default to version 1 when omitted; explicitly unsupported schema, engine, adapter, or result protocol versions fail before planning. Every immediate `catalog.d/<owner>/` directory defines its own lowercase ASCII owner namespace, and tasks discovered below it must use `<owner>/` task IDs. Explicit catalog paths may use another owner namespace, but duplicate fully qualified IDs and duplicate non-empty authority claims are always invalid.
 
 `resource_locks` names mutable authorities that must not run concurrently. Locks affect scheduling without changing dashboard grouping. A task that declares `result_protocol = 1` must finish with one line of the form `UPDATE_ALL_RESULT {"outcome":"updated","detail":"...","current":"...","latest":"..."}`. The supported outcomes are `updated`, `no_op`, `not_applicable`, `deferred`, `failed`, `blocked`, and `cancelled`; answer values and secrets must not appear in the payload.

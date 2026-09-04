@@ -2,6 +2,8 @@
 
 Rust validation uses formatting, Clippy with warnings denied, workspace tests, and the product integration tests. Python validation remains for release tooling and support scripts. Release validation additionally audits source and Git objects, dependencies and licenses, fixtures, metadata, documentation, archives, signatures, links, and platform claims.
 
+Cross-product work follows the [Dev Tools product standard](product-standard.md) and the applicable [repository architecture decisions](adr/README.md). The complete public gate must succeed from an isolated source tree with private downstream repositories unavailable; public fixtures are synthetic and public product code never discovers a neighboring checkout.
+
 No release or platform support claim is made from compilation or unit tests alone when a native runtime acceptance gate is documented.
 
 The bounded v0.2 `gh-dev-auth` compatibility frontend remains release-frozen while the v0.3 workload broker is under acceptance. Its child grammar is reviewed against one exact upstream GitHub CLI source revision and build output. The v0.3 same-name workload frontend does not parse GitHub CLI grammar: an admitted session passes argv to the administrator-pinned native executable and supplies only the broker-derived child environment.

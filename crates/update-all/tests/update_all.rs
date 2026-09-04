@@ -38,6 +38,25 @@ fn help_exposes_current_general_interfaces() {
 }
 
 #[test]
+fn standard_build_info_is_local_and_uses_the_common_schema() {
+    let home = TempDir::new().unwrap();
+    let output = command(&home)
+        .args(["build-info", "--json"])
+        .output()
+        .expect("run standard build-info");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("build-info JSON");
+    assert_eq!(payload["schema"], "dev-tools-build-info-v1");
+    assert_eq!(payload["product"], "update-all");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+    assert!(payload["source_commit"].as_str().is_some());
+    assert!(payload["source_state"].as_str().is_some());
+    assert!(payload["target"].as_str().is_some());
+}
+
+#[test]
 fn self_status_is_offline_and_machine_readable() {
     let home = TempDir::new().unwrap();
     command(&home)

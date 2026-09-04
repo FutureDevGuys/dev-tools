@@ -48,6 +48,8 @@ The same native executable exposes focused operations for trusted callers that d
 
 `sync-configs completion bash|zsh|fish|elvish|powershell` emits a first-party completion definition for the complete native CLI.
 
+`sync-configs build-info --json` emits the common checkout-independent `dev-tools-build-info-v1` document. The hidden `--build-info` form remains for rollback to the pre-standard 0.1 line and is removed in the next minor release after one accepted release has shipped the standard subcommand.
+
 ## Comment-aware TOML overlays
 
 TOML overlays default to `commented_target_policy: respect`. When the target already contains a recognizable commented assignment, or a commented table header covering a source assignment, that source path stays inactive. The final plain report lists only dotted paths under `Suppressed by comments`; it never includes their values. Leading whitespace before `#` is supported. Use `activate` only when comments are documentation rather than an intentional disabled state, or `error` when any suppression must block the run.

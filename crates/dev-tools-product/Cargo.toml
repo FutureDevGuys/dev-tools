@@ -1,14 +1,14 @@
 [package]
-name = "skills-sync"
-version = "0.1.4"
+name = "dev-tools-product"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Reconcile agent skills from explicit sources and locks"
+description = "Common product identity and operation-result contracts for Dev Tools"
 
 [dependencies]
-anyhow = "1"
-dev-tools-product = { path = "../dev-tools-product" }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
 serde_json = "1"

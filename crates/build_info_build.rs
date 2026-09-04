@@ -26,9 +26,10 @@ fn main() {
         env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
     );
     println!(
-        "cargo:rustc-env=DEV_TOOLS_BUILD_UNIX={}",
-        build_unix()
+        "cargo:rustc-env=DEV_TOOLS_BUILD_TARGET={}",
+        env::var("TARGET").unwrap_or_else(|_| "unknown".into())
     );
+    println!("cargo:rustc-env=DEV_TOOLS_BUILD_UNIX={}", build_unix());
     println!(
         "cargo:rustc-env=DEV_TOOLS_GIT_COMMIT={}",
         env::var("DEV_TOOLS_GIT_COMMIT").unwrap_or_else(|_| "unknown".into())

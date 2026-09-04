@@ -41,6 +41,19 @@ fn self_subcommands_are_current_release_operations() {
 }
 
 #[test]
+fn standard_build_info_subcommand_is_exposed() {
+    use clap::CommandFactory;
+
+    let mut command = RunCli::command();
+    let build_info = command
+        .find_subcommand_mut("build-info")
+        .expect("build-info command must exist");
+    assert!(build_info
+        .get_arguments()
+        .any(|argument| argument.get_long() == Some("json")));
+}
+
+#[test]
 fn product_subcommands_share_the_release_engine() {
     use clap::CommandFactory;
 

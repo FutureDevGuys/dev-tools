@@ -13,6 +13,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 | [`dev-cache`](docs/dev-cache.md) | Route and automatically maintain known disposable build caches on storage you select without moving source or deliverables. |
 | [`sync-configs`](docs/sync-configs.md) | Converge explicitly selected files, directories, and structured overlays from a trusted manifest. |
 | [`skills-sync`](docs/skills-sync.md) | Reconcile installed agent skills and their links from an explicit lock and provider selection. |
+| `release-admin` (planned) | Build, verify, sign, publish, and audit releases while preserving separate authority boundaries. |
 
 ## Installation
 
@@ -27,7 +28,7 @@ After `update-all` 0.1.6 and native `sync-configs` 0.2.0 complete publication an
 ~/.local/bin/update-all product install skills-sync
 ```
 
-The current stable `dev-auth` is distributed through the same signed release format but remains provisioned by the workstation configuration authority during the reversible v0.3 transition. The v0.3 successor owns its installer, broker services, same-name launchers, migration, diagnostics, and credential lifecycle; Syscfg becomes only an optional policy and deployment client after standalone clean-device acceptance. `dev-auth` remains deliberately outside unattended `update-all` product installation because setup includes administrator policy and explicit credential enrollment.
+The current stable `dev-auth` is distributed through the same signed release format and provisioned through its product-owned setup workflow. It remains deliberately outside unattended `update-all` product installation because setup includes administrator policy and explicit credential enrollment.
 
 After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. Fresh and steady-state `sync-configs` installations use a target-specific native executable and need no Python runtime. A managed upgrade from the retained Python `sync-configs 0.1.13` artifact keeps that interpreter available only through adoption and the rollback window, as described in the [sync-configs guide](docs/sync-configs.md).
 
@@ -48,7 +49,7 @@ cargo deny check
 python -m pytest tests
 ```
 
-See the [documentation index](docs/README.md), [security policy](SECURITY.md), [contribution guide](CONTRIBUTING.md), and [license terms](LICENSE-MIT) ([Apache-2.0](LICENSE-APACHE)).
+See the [product standard](docs/product-standard.md), [architecture decisions](docs/adr/README.md), [documentation index](docs/README.md), [security policy](SECURITY.md), [contribution guide](CONTRIBUTING.md), and [license terms](LICENSE-MIT) ([Apache-2.0](LICENSE-APACHE)).
 
 ## Non-goals
 

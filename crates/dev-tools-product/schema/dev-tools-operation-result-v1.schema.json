@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FutureDevGuys/dev-tools/schema/dev-tools-operation-result-v1.schema.json",
+  "title": "Dev Tools operation result v1",
+  "type": "object",
+  "required": ["schema", "product", "operation", "outcome", "changed", "exit_code"],
+  "properties": {
+    "schema": { "const": "dev-tools-operation-result-v1" },
+    "product": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "operation": {
+      "enum": ["doctor", "update_status", "update_check", "update_install", "update_apply", "update_rollback"]
+    },
+    "outcome": {
+      "enum": ["completed", "no_op", "current", "stale", "unknown", "external", "installed", "updated", "rolled_back", "blocked", "deferred", "unsupported", "requires_setup", "failed", "authenticity_violation", "integrity_violation", "authority_violation", "interrupted"]
+    },
+    "changed": { "type": "boolean" },
+    "installed_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "available_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "cache_freshness": { "enum": ["fresh", "expired", "absent", "not_applicable"] },
+    "installation_state": { "enum": ["managed", "external", "absent", "unknown", "not_applicable"] },
+    "exit_code": { "enum": [0, 1, 2, 3, 4, 130] },
+    "error_kind": {
+      "enum": ["operational", "invalid_invocation", "invalid_configuration", "blocked", "deferred", "unsupported", "requires_setup", "network", "authenticity", "integrity", "authority", "interrupted"]
+    }
+  },
+  "additionalProperties": true
+}

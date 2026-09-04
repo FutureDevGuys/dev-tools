@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use dev_tools_product::{BuildInfo, ProductId};
 
 use crate::paths::{normalize_user_path, PathContext};
 pub use crate::run_logs::{LogLevel, LogStyle};
@@ -206,6 +207,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Show checkout-independent product build information.
+    BuildInfo {
+        /// Emit the common machine-readable schema.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and prune bounded diagnostic runs.
     Logs(LogsArgs),
     /// Emit this command's native completion to stdout.
@@ -325,6 +332,10 @@ pub fn main_entry(argv0: OsString, args: Vec<OsString>) -> i32 {
     argv.extend(args);
     match Cli::try_parse_from(argv) {
         Ok(Cli {
+            command: Some(Commands::BuildInfo { json }),
+            ..
+        }) => run_build_info_command(json),
+        Ok(Cli {
             command: Some(Commands::Completion { shell }),
             ..
         }) => {
@@ -375,6 +386,47 @@ pub fn main_entry(argv0: OsString, args: Vec<OsString>) -> i32 {
             code
         }
     }
+}
+
+fn run_build_info_command(json: bool) -> i32 {
+    let info = match BuildInfo::from_build_values(
+        match ProductId::parse("sync-configs") {
+            Ok(product) => product,
+            Err(error) => {
+                eprintln!("sync-configs: {error}");
+                return 1;
+            }
+        },
+        env!("CARGO_PKG_VERSION"),
+        option_env!("DEV_TOOLS_GIT_COMMIT"),
+        option_env!("DEV_TOOLS_GIT_DIRTY"),
+        option_env!("DEV_TOOLS_BUILD_TARGET"),
+        option_env!("DEV_TOOLS_BUILD_PROFILE"),
+        option_env!("DEV_TOOLS_BUILD_UNIX"),
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            eprintln!("sync-configs: {error}");
+            return 1;
+        }
+    };
+    if json {
+        match serde_json::to_writer_pretty(std::io::stdout().lock(), &info) {
+            Ok(()) => println!(),
+            Err(_) => {
+                eprintln!("sync-configs: build information could not be written");
+                return 1;
+            }
+        }
+    } else {
+        println!("{} {}", info.product, info.version);
+        println!("source_commit={}", info.source_commit);
+        println!("source_state={:?}", info.source_state);
+        println!("target={}", info.target);
+        println!("profile={:?}", info.profile);
+        println!("built_unix={}", info.built_unix);
+    }
+    0
 }
 
 fn run_json_overlay_command(arguments: JsonOverlayArgs) -> i32 {

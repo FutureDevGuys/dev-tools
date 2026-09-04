@@ -1,5 +1,7 @@
 # Documentation
 
+- [Dev Tools product standard](product-standard.md)
+- [Repository-wide architecture decision records](adr/README.md)
 - [Update All architecture decision records](../crates/update-all/docs/adr/README.md)
 - [update-all](update-all.md)
 - [dev-auth](dev-auth.md)
