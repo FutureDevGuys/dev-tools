@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
 
@@ -228,7 +228,7 @@ fn set_build_constructs_one_exact_source_bound_release_without_python() {
     let fake_cargo = root.path().join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nset -eu\nmkdir -p \"$CARGO_TARGET_DIR/release\"\nprintf 'native release\\n' >\"$CARGO_TARGET_DIR/release/update-all\"\n",
+        "#!/bin/sh\nset -eu\nmkdir -p \"$CARGO_TARGET_DIR/release/deps\"\nprintf 'native release\\n' >\"$CARGO_TARGET_DIR/release/deps/update-all-build\"\nln \"$CARGO_TARGET_DIR/release/deps/update-all-build\" \"$CARGO_TARGET_DIR/release/update-all\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -350,6 +350,7 @@ fn set_build_constructs_one_exact_source_bound_release_without_python() {
         Some(source_commit.as_str())
     );
     assert_eq!(fs::read(&artifact).unwrap(), b"native release\n");
+    assert_eq!(fs::metadata(&artifact).unwrap().nlink(), 1);
     assert!(!output.join("build").exists());
     assert!(git_output(&source, &["status", "--porcelain"]).is_empty());
 

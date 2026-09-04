@@ -153,8 +153,12 @@ pub(crate) fn build_release_set(arguments: SetBuildArgs) -> Result<()> {
         let artifact_source = cargo_target
             .join("release")
             .join(native_binary_name(product, &arguments.target));
-        let artifact_bytes = read_bounded_file(&artifact_source, ARTIFACT_LIMIT)
-            .context("read constructed release artifact")?;
+        let artifact_bytes = super::read_bounded_file_with_origin(
+            &artifact_source,
+            ARTIFACT_LIMIT,
+            super::InputOrigin::ControlledBuild,
+        )
+        .context("read constructed release artifact")?;
         let artifact_name = public_artifact_name(product, version, &arguments.target);
         let artifact_output = product_dir.join(&artifact_name);
         write_new_private_file_with_limit(&artifact_output, &artifact_bytes, ARTIFACT_LIMIT)?;

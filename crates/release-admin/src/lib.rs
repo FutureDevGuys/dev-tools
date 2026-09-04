@@ -2096,6 +2096,21 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_bounded_file_with_origin(path, limit, InputOrigin::External)
+}
+
+#[derive(Clone, Copy)]
+enum InputOrigin {
+    External,
+    ControlledBuild,
+}
+
+// Only the constructor's private Cargo target tree uses ControlledBuild. Cargo
+// normally hard-links final executables to release/deps; those bytes are copied
+// into new single-link release files before signing or publication.
+fn read_bounded_file_with_origin(path: &Path, limit: u64, origin: InputOrigin) -> Result<Vec<u8>> {
+    #[cfg(not(unix))]
+    let _ = origin;
     if !path.is_absolute() || limit == 0 {
         bail!("release input path or bound is invalid");
     }
@@ -2113,7 +2128,7 @@ fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
         bail!("release input has unsafe filesystem authority");
     }
     #[cfg(unix)]
-    if metadata.nlink() != 1 {
+    if matches!(origin, InputOrigin::External) && metadata.nlink() != 1 {
         bail!("release input must have exactly one filesystem link");
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -2125,6 +2140,28 @@ fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
         bail!("release input changed while being read");
     }
     Ok(bytes)
+}
+
+#[cfg(all(test, unix))]
+mod input_link_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_build_links_do_not_relax_external_input_or_symlink_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("artifact");
+        fs::write(&artifact, b"built bytes").unwrap();
+        fs::hard_link(&artifact, root.path().join("cargo-alias")).unwrap();
+        assert!(read_bounded_file(&artifact, 100).is_err());
+        assert_eq!(
+            read_bounded_file_with_origin(&artifact, 100, InputOrigin::ControlledBuild).unwrap(),
+            b"built bytes"
+        );
+        assert!(read_bounded_file_with_origin(&artifact, 1, InputOrigin::ControlledBuild).is_err());
+        let link = root.path().join("symlink");
+        std::os::unix::fs::symlink(&artifact, &link).unwrap();
+        assert!(read_bounded_file_with_origin(&link, 100, InputOrigin::ControlledBuild).is_err());
+    }
 }
 
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
