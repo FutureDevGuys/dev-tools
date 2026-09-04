@@ -70,7 +70,24 @@ fn help_exposes_only_native_typed_release_operations() {
         .args(["crate-set", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("verify-registry"));
+        .stdout(predicate::str::contains("verify-registry"))
+        .stdout(predicate::str::contains("bootstrap-publish"));
+}
+
+#[test]
+fn cargo_credential_plugin_fails_closed_without_echoing_input() {
+    Command::cargo_bin("release-admin")
+        .expect("release-admin binary")
+        .arg("--cargo-plugin")
+        .write_stdin("do-not-echo-this\n")
+        .assert()
+        .failure()
+        .stdout(predicate::str::starts_with("{\"v\":[1]}\n"))
+        .stdout(predicate::str::contains(
+            "registry publication authority denied",
+        ))
+        .stdout(predicate::str::contains("do-not-echo-this").not())
+        .stderr("");
 }
 
 #[cfg(target_os = "linux")]

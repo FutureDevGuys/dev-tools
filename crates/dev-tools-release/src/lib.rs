@@ -276,6 +276,12 @@ pub struct VerifiedRegistryCrate {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryCrateStatus {
+    Absent,
+    Verified(VerifiedRegistryCrate),
+}
+
 #[derive(Debug, Deserialize)]
 struct CratesIoConfig {
     dl: String,
@@ -643,6 +649,31 @@ pub fn verify_crate_package_bytes(
 /// Anonymously authenticates every package in a signed crate set against the
 /// crates.io sparse index and the exact downloaded registry bytes.
 pub fn verify_crates_io_package_set(set: &VerifiedCrateSet) -> Result<Vec<VerifiedRegistryCrate>> {
+    let (index_policy, artifact_policy) = crates_io_https_policies();
+    verify_crates_io_package_set_with_fetch(set, |url, limit| {
+        let policy = crates_io_policy_for_url(url, &index_policy, &artifact_policy)?;
+        Ok(fetch_https(url, policy, limit, None)?.bytes)
+    })
+}
+
+/// Inspects one package version without credentials and distinguishes a truly
+/// absent sparse-index entry from an authenticated published package.
+pub fn inspect_crates_io_package(
+    set: &VerifiedCrateSet,
+    name: &str,
+) -> Result<RegistryCrateStatus> {
+    let (index_policy, artifact_policy) = crates_io_https_policies();
+    inspect_crates_io_package_with_fetch(set, name, |url, limit| {
+        let policy = crates_io_policy_for_url(url, &index_policy, &artifact_policy)?;
+        if url.starts_with("https://index.crates.io/") {
+            Ok(fetch_optional_https(url, policy, limit)?.map(|response| response.bytes))
+        } else {
+            Ok(Some(fetch_https(url, policy, limit, None)?.bytes))
+        }
+    })
+}
+
+fn crates_io_https_policies() -> (HttpsPolicy, HttpsPolicy) {
     let index_policy = HttpsPolicy {
         allowed_hosts: BTreeSet::from(["index.crates.io".into()]),
         max_redirects: 3,
@@ -653,16 +684,21 @@ pub fn verify_crates_io_package_set(set: &VerifiedCrateSet) -> Result<Vec<Verifi
         allowed_hosts: BTreeSet::from(["static.crates.io".into()]),
         ..index_policy.clone()
     };
-    verify_crates_io_package_set_with_fetch(set, |url, limit| {
-        let policy = if url.starts_with("https://index.crates.io/") {
-            &index_policy
-        } else if url.starts_with("https://static.crates.io/") {
-            &artifact_policy
-        } else {
-            bail!("crates.io verification URL is outside the fixed registry authority");
-        };
-        Ok(fetch_https(url, policy, limit, None)?.bytes)
-    })
+    (index_policy, artifact_policy)
+}
+
+fn crates_io_policy_for_url<'a>(
+    url: &str,
+    index: &'a HttpsPolicy,
+    artifact: &'a HttpsPolicy,
+) -> Result<&'a HttpsPolicy> {
+    if url.starts_with("https://index.crates.io/") {
+        Ok(index)
+    } else if url.starts_with("https://static.crates.io/") {
+        Ok(artifact)
+    } else {
+        bail!("crates.io verification URL is outside the fixed registry authority");
+    }
 }
 
 fn verify_crates_io_package_set_with_fetch<F>(
@@ -672,44 +708,77 @@ fn verify_crates_io_package_set_with_fetch<F>(
 where
     F: FnMut(&str, u64) -> Result<Vec<u8>>,
 {
+    let mut verified = Vec::with_capacity(set.packages.len());
+    for name in set.packages.keys() {
+        let status = inspect_crates_io_package_with_fetch(set, name, |url, limit| {
+            Ok(Some(fetch(url, limit)?))
+        })?;
+        match status {
+            RegistryCrateStatus::Verified(package) => verified.push(package),
+            RegistryCrateStatus::Absent => {
+                bail!("crates.io index does not contain the package version")
+            }
+        }
+    }
+    Ok(verified)
+}
+
+fn inspect_crates_io_package_with_fetch<F>(
+    set: &VerifiedCrateSet,
+    name: &str,
+    mut fetch: F,
+) -> Result<RegistryCrateStatus>
+where
+    F: FnMut(&str, u64) -> Result<Option<Vec<u8>>>,
+{
     if set.authority != CRATE_SET_AUTHORITY || set.registry != "crates-io" {
         bail!("crate set is outside the crates.io verification authority");
     }
+    let package = set
+        .packages
+        .get(name)
+        .context("crate is absent from the authenticated set")?;
     let config_bytes = fetch(
         "https://index.crates.io/config.json",
         CRATES_IO_CONFIG_LIMIT,
     )
-    .context("fetch crates.io registry configuration")?;
+    .context("fetch crates.io registry configuration")?
+    .context("crates.io registry configuration is absent")?;
     let config: CratesIoConfig =
         serde_json::from_slice(&config_bytes).context("parse crates.io registry configuration")?;
     if config.api != "https://crates.io" || config.auth_required {
         bail!("crates.io registry configuration is unsupported");
     }
-    let mut verified = Vec::with_capacity(set.packages.len());
-    for (name, package) in &set.packages {
-        let index_url = crates_io_index_url(name)?;
-        let index = fetch(&index_url, CRATES_IO_INDEX_LIMIT)
-            .with_context(|| format!("fetch crates.io index entry for {name}"))?;
-        verify_crates_io_index_entry(name, package, &index)?;
-        let download_url = crates_io_download_url(&config.dl, name, package)?;
-        let bytes = fetch(&download_url, package.length)
-            .with_context(|| format!("download crates.io package {name}"))?;
-        verify_crate_package_bytes(set, name, &package.version.to_string(), &bytes)?;
-        verified.push(VerifiedRegistryCrate {
-            name: name.clone(),
-            version: package.version.clone(),
-            length: package.length,
-            sha256: package.sha256.clone(),
-        });
+    let index_url = crates_io_index_url(name)?;
+    let Some(index) = fetch(&index_url, CRATES_IO_INDEX_LIMIT)
+        .with_context(|| format!("fetch crates.io index entry for {name}"))?
+    else {
+        return Ok(RegistryCrateStatus::Absent);
+    };
+    let Some(entry) = crates_io_index_entry(name, package, &index)? else {
+        return Ok(RegistryCrateStatus::Absent);
+    };
+    if entry.yanked || entry.cksum != package.sha256 || !valid_lower_hex(&entry.cksum, 64) {
+        bail!("crates.io index package identity does not match the authenticated set");
     }
-    Ok(verified)
+    let download_url = crates_io_download_url(&config.dl, name, package)?;
+    let bytes = fetch(&download_url, package.length)
+        .with_context(|| format!("download crates.io package {name}"))?
+        .context("crates.io package download is absent")?;
+    verify_crate_package_bytes(set, name, &package.version.to_string(), &bytes)?;
+    Ok(RegistryCrateStatus::Verified(VerifiedRegistryCrate {
+        name: name.into(),
+        version: package.version.clone(),
+        length: package.length,
+        sha256: package.sha256.clone(),
+    }))
 }
 
-fn verify_crates_io_index_entry(
+fn crates_io_index_entry(
     expected_name: &str,
     expected: &VerifiedCratePackage,
     input: &[u8],
-) -> Result<()> {
+) -> Result<Option<CratesIoIndexEntry>> {
     require_bounded(
         input,
         CRATES_IO_INDEX_LIMIT as usize,
@@ -728,11 +797,7 @@ fn verify_crates_io_index_entry(
             bail!("crates.io index contains a duplicate package version");
         }
     }
-    let entry = selected.context("crates.io index does not contain the package version")?;
-    if entry.yanked || entry.cksum != expected.sha256 || !valid_lower_hex(&entry.cksum, 64) {
-        bail!("crates.io index package identity does not match the authenticated set");
-    }
-    Ok(())
+    Ok(selected)
 }
 
 fn crates_io_index_url(name: &str) -> Result<String> {
@@ -999,6 +1064,25 @@ pub fn fetch_https(
     limit: u64,
     etag: Option<&str>,
 ) -> Result<HttpsResponse> {
+    fetch_https_response(url, policy, limit, etag, false)?
+        .context("release response was unexpectedly absent")
+}
+
+fn fetch_optional_https(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+) -> Result<Option<HttpsResponse>> {
+    fetch_https_response(url, policy, limit, None, true)
+}
+
+fn fetch_https_response(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    etag: Option<&str>,
+    allow_not_found: bool,
+) -> Result<Option<HttpsResponse>> {
     validate_https_request(url, policy, limit)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .https_only(true)
@@ -1025,12 +1109,6 @@ pub fn fetch_https(
         request = request.header("If-None-Match", etag);
     }
     let mut response = request.call().with_context(|| format!("GET {url}"))?;
-    if response.status().as_u16() == 304 {
-        bail!("release response was not modified");
-    }
-    if !response.status().is_success() {
-        bail!("GET {url} returned HTTP {}", response.status());
-    }
     if let Some(history) = response.get_redirect_history() {
         for uri in history {
             if uri.scheme_str() != Some("https")
@@ -1050,6 +1128,15 @@ pub fn fetch_https(
     {
         bail!("release request resolved to an untrusted origin");
     }
+    if response.status().as_u16() == 304 {
+        bail!("release response was not modified");
+    }
+    if allow_not_found && response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        bail!("GET {url} returned HTTP {}", response.status());
+    }
     let etag = response
         .headers()
         .get("etag")
@@ -1057,7 +1144,7 @@ pub fn fetch_https(
         .map(str::to_owned);
     let bytes = read_bounded_body(response.body_mut(), limit)
         .with_context(|| format!("read bounded response from {url}"))?;
-    Ok(HttpsResponse { bytes, etag })
+    Ok(Some(HttpsResponse { bytes, etag }))
 }
 
 fn read_bounded_body(body: &mut ureq::Body, limit: u64) -> Result<Vec<u8>> {
@@ -1672,8 +1759,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_bounded_body, sha256_hex, verify_crates_io_package_set_with_fetch,
-        VerifiedCratePackage, VerifiedCrateSet, CRATE_SET_AUTHORITY,
+        inspect_crates_io_package_with_fetch, read_bounded_body, sha256_hex,
+        verify_crates_io_package_set_with_fetch, RegistryCrateStatus, VerifiedCratePackage,
+        VerifiedCrateSet, CRATE_SET_AUTHORITY,
     };
     use semver::Version;
     use std::collections::BTreeMap;
@@ -1815,6 +1903,24 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("fixed registry authority"));
+    }
+
+    #[test]
+    fn crates_io_inspection_distinguishes_an_absent_index_entry() {
+        let set = crate_set(b"authenticated crate bytes");
+
+        let status =
+            inspect_crates_io_package_with_fetch(&set, "dev-tools-command", |url, _| match url {
+                "https://index.crates.io/config.json" => Ok(Some(
+                    br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#
+                        .to_vec(),
+                )),
+                "https://index.crates.io/de/v-/dev-tools-command" => Ok(None),
+                _ => panic!("download must not start for an absent index entry"),
+            })
+            .unwrap();
+
+        assert_eq!(status, RegistryCrateStatus::Absent);
     }
 
     fn crate_set(package_bytes: &[u8]) -> VerifiedCrateSet {

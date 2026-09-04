@@ -16,16 +16,26 @@ use dev_tools_release::{
     CrateSetSpec, EnvelopeSignature, ManifestArtifact, ProductManifestSpec, ReleaseAuthority,
     ReleaseMetadata, RootDocumentSpec, RootReleaseKey, CRATE_SET_AUTHORITY,
 };
+#[cfg(target_os = "linux")]
+use dev_tools_release::{inspect_crates_io_package, RegistryCrateStatus};
 use ed25519_dalek::{Signer, SigningKey};
 use flate2::read::GzDecoder;
+#[cfg(target_os = "linux")]
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Read};
+#[cfg(target_os = "linux")]
+use std::io::Seek;
+use std::io::{BufRead, Cursor, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -41,6 +51,12 @@ const CRATE_ARCHIVE_ENTRY_LIMIT: usize = 4096;
 const CRATE_METADATA_LIMIT: u64 = 512 * 1024;
 const BUILD_OUTPUT_LIMIT: usize = 1024 * 1024;
 const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(target_os = "linux")]
+const CREDENTIAL_LIMIT: u64 = 4096;
+#[cfg(target_os = "linux")]
+const CREDENTIAL_PROTOCOL_LIMIT: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const REGISTRY_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -126,6 +142,8 @@ enum CrateSetCommand {
     Verify(CrateSetVerifyArgs),
     /// Anonymously verify published crates against the signed inventory.
     VerifyRegistry(CrateSetVerifyRegistryArgs),
+    /// Bootstrap-publish an authenticated set with one private stdin token.
+    BootstrapPublish(CrateSetBootstrapPublishArgs),
 }
 
 #[derive(Debug, Args)]
@@ -195,6 +213,30 @@ struct CrateSetVerifyRegistryArgs {
 }
 
 #[derive(Debug, Args)]
+struct CrateSetBootstrapPublishArgs {
+    #[arg(long)]
+    source_root: PathBuf,
+    #[arg(long)]
+    source_commit: String,
+    #[arg(long)]
+    git: PathBuf,
+    #[arg(long)]
+    cargo: PathBuf,
+    #[arg(long)]
+    work_root: PathBuf,
+    #[arg(long = "package", required = true)]
+    packages: Vec<String>,
+    #[arg(long)]
+    root_document: PathBuf,
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    trusted_root_public_key: PathBuf,
+    #[arg(long)]
+    credential_stdin: bool,
+}
+
+#[derive(Debug, Args)]
 struct ManifestBuildArgs {
     #[arg(long)]
     product: String,
@@ -252,6 +294,10 @@ pub fn main_entry<I>(arguments: I) -> i32
 where
     I: IntoIterator<Item = OsString>,
 {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    if arguments == [OsString::from("--cargo-plugin")] {
+        return run_crates_io_credential_provider();
+    }
     let mut argv = vec![OsString::from("release-admin")];
     argv.extend(arguments);
     match Cli::try_parse_from(argv) {
@@ -294,6 +340,12 @@ where
                     command: CrateSetCommand::VerifyRegistry(arguments),
                 }),
         }) => run_result(verify_crate_set_registry(arguments)),
+        Ok(Cli {
+            command:
+                Command::CrateSet(CrateSetArgs {
+                    command: CrateSetCommand::BootstrapPublish(arguments),
+                }),
+        }) => run_result(bootstrap_publish_crate_set(arguments)),
         Ok(Cli {
             command:
                 Command::Set(SetArgs {
@@ -1017,6 +1069,617 @@ fn verify_crate_set_registry(arguments: CrateSetVerifyRegistryArgs) -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn bootstrap_publish_crate_set(arguments: CrateSetBootstrapPublishArgs) -> Result<()> {
+    if !valid_lower_hex(&arguments.source_commit, 40)
+        || !arguments.source_root.is_absolute()
+        || !arguments.git.is_absolute()
+        || !arguments.cargo.is_absolute()
+        || !arguments.work_root.is_absolute()
+    {
+        bail!("crate bootstrap publication input is invalid");
+    }
+    if Path::new("/.cargo/config").exists() || Path::new("/.cargo/config.toml").exists() {
+        bail!("crate bootstrap publication found an ambient root Cargo configuration");
+    }
+    let source_root = require_canonical_directory(&arguments.source_root, false)
+        .context("validate source checkout")?;
+    let work_root = require_canonical_directory(&arguments.work_root, true)
+        .context("validate private publication work root")?;
+    let trusted_root = read_public_key_text(&arguments.trusted_root_public_key)
+        .context("read trusted root public key")?;
+    let verified = verify_crate_set_metadata(
+        &CrateSetMetadata {
+            root: read_bounded_file(&arguments.root_document, METADATA_LIMIT)
+                .context("read root document")?,
+            manifest: read_bounded_file(&arguments.manifest, METADATA_LIMIT)
+                .context("read crate-set manifest")?,
+        },
+        &CrateSetAuthority {
+            trusted_root_key: trusted_root,
+            registry: "crates-io".into(),
+            source_commit: arguments.source_commit.clone(),
+        },
+    )?;
+    verify_crate_package_inputs(&verified, &arguments.packages)?;
+    let package_order = ordered_crate_package_inputs(&arguments.packages)?;
+    let git = HeldExecutable::open(&arguments.git).context("hold exact Git identity")?;
+    let cargo = HeldExecutable::open(&arguments.cargo).context("hold exact Cargo identity")?;
+    inspect_clean_checkout(&git, &arguments.git, &source_root, &arguments.source_commit)?;
+
+    let mut missing = Vec::new();
+    for package in &package_order {
+        match inspect_crates_io_package(&verified, &package.name)
+            .with_context(|| format!("inspect crates.io package {}", package.name))?
+        {
+            RegistryCrateStatus::Absent => missing.push(package.clone()),
+            RegistryCrateStatus::Verified(_) => {}
+        }
+    }
+    if missing.is_empty() {
+        write_bootstrap_publish_result(&arguments.source_commit, package_order.len(), 0)?;
+        return Ok(());
+    }
+    if !arguments.credential_stdin {
+        bail!("crate bootstrap publication requires private credential input");
+    }
+    let token = read_bootstrap_token(std::io::stdin().lock())?;
+    let work = tempfile::Builder::new()
+        .prefix(".release-admin-publish-")
+        .tempdir_in(&work_root)
+        .context("create private crate publication directory")?;
+    let checkout = work.path().join("checkout");
+    run_git(
+        &git,
+        &arguments.git,
+        &[
+            OsString::from("clone"),
+            OsString::from("--quiet"),
+            OsString::from("--no-local"),
+            OsString::from("--no-checkout"),
+            OsString::from("--"),
+            source_root.as_os_str().to_owned(),
+            checkout.as_os_str().to_owned(),
+        ],
+        work.path(),
+    )
+    .context("clone exact publication source")?;
+    run_git(
+        &git,
+        &arguments.git,
+        &[
+            OsString::from("-C"),
+            checkout.as_os_str().to_owned(),
+            OsString::from("checkout"),
+            OsString::from("--detach"),
+            OsString::from("--quiet"),
+            OsString::from(&arguments.source_commit),
+        ],
+        work.path(),
+    )
+    .context("check out exact publication source")?;
+    inspect_clean_checkout(&git, &arguments.git, &checkout, &arguments.source_commit)?;
+    if checkout.join(".gitmodules").exists() {
+        bail!("crate publication does not admit submodules");
+    }
+
+    let mut changed = 0_usize;
+    for package in missing {
+        let publish_result = publish_one_crate_with_cargo(
+            &cargo,
+            &arguments.cargo,
+            &checkout,
+            &arguments.source_commit,
+            &arguments.root_document,
+            &arguments.manifest,
+            &arguments.trusted_root_public_key,
+            &package,
+            &token,
+            work.path(),
+        );
+        inspect_clean_checkout(&git, &arguments.git, &checkout, &arguments.source_commit)?;
+        complete_registry_publication(publish_result, || {
+            wait_for_registry_package(&verified, &package.name)
+        })?;
+        changed += 1;
+    }
+    write_bootstrap_publish_result(&arguments.source_commit, package_order.len(), changed)
+}
+
+#[cfg(target_os = "linux")]
+fn complete_registry_publication(
+    publish_result: Result<()>,
+    verify: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    match (publish_result, verify()) {
+        (_, Ok(())) => Ok(()),
+        (Ok(()), Err(verification)) => Err(verification),
+        (Err(publication), Err(verification)) => Err(publication
+            .context("Cargo publication failed and anonymous verification did not resolve it")
+            .context(verification)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bootstrap_publish_crate_set(_arguments: CrateSetBootstrapPublishArgs) -> Result<()> {
+    bail!("crate bootstrap publication is not accepted on this platform")
+}
+
+#[cfg(target_os = "linux")]
+fn ordered_crate_package_inputs(values: &[String]) -> Result<Vec<CratePackageRequest>> {
+    let mut packages = Vec::with_capacity(values.len());
+    let mut names = BTreeMap::new();
+    for value in values {
+        let (name, version, _) = parse_crate_package_argument(value)?;
+        if names.insert(name.clone(), ()).is_some() {
+            bail!("crate package input is duplicated");
+        }
+        packages.push(CratePackageRequest { name, version });
+    }
+    Ok(packages)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bootstrap_token(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>> {
+    let mut token = Zeroizing::new(Vec::new());
+    input
+        .by_ref()
+        .take(CREDENTIAL_LIMIT + 1)
+        .read_to_end(&mut token)
+        .context("read private registry credential")?;
+    if token.len() as u64 > CREDENTIAL_LIMIT {
+        bail!("private registry credential exceeds its size bound");
+    }
+    if token.ends_with(b"\r\n") {
+        let length = token.len() - 2;
+        token.truncate(length);
+    } else if token.ends_with(b"\n") {
+        let length = token.len() - 1;
+        token.truncate(length);
+    }
+    if token.is_empty()
+        || token.contains(&0)
+        || !token
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    {
+        bail!("private registry credential has an unsupported encoding");
+    }
+    Ok(token)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn publish_one_crate_with_cargo(
+    cargo: &HeldExecutable,
+    cargo_path: &Path,
+    checkout: &Path,
+    source_commit: &str,
+    root_document: &Path,
+    manifest: &Path,
+    trusted_root_public_key: &Path,
+    package: &CratePackageRequest,
+    token: &[u8],
+    work_root: &Path,
+) -> Result<()> {
+    let cargo_home = work_root.join(format!("cargo-home-{}", package.name));
+    fs::create_dir(&cargo_home).context("create private publication Cargo home")?;
+    fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700))
+        .context("protect private publication Cargo home")?;
+    let token_file = sealed_registry_credential(token)?;
+    let token_fd = token_file.as_raw_fd();
+    let coordinator_pid = std::process::id();
+    let cargo_metadata = fs::metadata(cargo_path).context("inspect exact Cargo identity")?;
+    let provider_args = vec![
+        "/proc/".to_owned() + &coordinator_pid.to_string() + "/exe",
+        "crate-bootstrap-v1".into(),
+        "--source-commit".into(),
+        source_commit.into(),
+        "--root-document".into(),
+        root_document.display().to_string(),
+        "--manifest".into(),
+        manifest.display().to_string(),
+        "--trusted-root-public-key".into(),
+        trusted_root_public_key.display().to_string(),
+        "--token-fd".into(),
+        token_fd.to_string(),
+        "--coordinator-pid".into(),
+        coordinator_pid.to_string(),
+        "--cargo-device".into(),
+        cargo_metadata.dev().to_string(),
+        "--cargo-inode".into(),
+        cargo_metadata.ino().to_string(),
+    ];
+    let config = format!(
+        "[registry]\nglobal-credential-providers = [\"release-admin-bootstrap\"]\n\n[credential-alias]\nrelease-admin-bootstrap = {}\n\n[net]\nretry = 0\n\n[http]\ntimeout = 30\n",
+        toml::Value::Array(provider_args.into_iter().map(toml::Value::String).collect())
+    );
+    write_new_private_file(&cargo_home.join("config.toml"), config.as_bytes())?;
+
+    let mut command = cargo
+        .command(cargo_path.as_os_str())
+        .context("prepare exact Cargo publication identity")?;
+    // SAFETY: token_file remains open through the synchronous bounded Cargo
+    // execution. Clearing CLOEXEC in the child only allows Cargo's exact
+    // credential-provider subprocess to read this anonymous descriptor; the
+    // parent descriptor retains CLOEXEC and the sealed anonymous memory is
+    // released when this operation closes its final descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(token_fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(token_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .env_clear()
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TERM_COLOR", "never")
+        .env("LC_ALL", "C")
+        .env(
+            "PATH",
+            fixed_build_path(
+                cargo_path
+                    .parent()
+                    .context("exact Cargo executable has no parent")?,
+            ),
+        )
+        // Cargo discovers configuration from its current directory rather than
+        // from --manifest-path. Root prevents source-controlled or user-home
+        // ancestor configuration from widening the private Cargo home below.
+        .current_dir("/")
+        .args([
+            OsString::from("publish"),
+            OsString::from("--manifest-path"),
+            checkout.join("Cargo.toml").into_os_string(),
+            OsString::from("--package"),
+            OsString::from(&package.name),
+            OsString::from("--registry"),
+            OsString::from("crates-io"),
+            OsString::from("--locked"),
+            OsString::from("--no-verify"),
+            OsString::from("--color"),
+            OsString::from("never"),
+        ]);
+    let output =
+        run_prepared_bounded_command(&mut command, BUILD_COMMAND_TIMEOUT, BUILD_OUTPUT_LIMIT)
+            .map_err(|_| anyhow::anyhow!("bounded Cargo publication failed"))?;
+    if !output.status.success() {
+        bail!("Cargo registry publication failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_registry_credential(token: &[u8]) -> Result<fs::File> {
+    let token_descriptor = rustix::fs::memfd_create(
+        "release-admin-registry-token",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .context("create anonymous registry credential transport")?;
+    let mut token_file = fs::File::from(token_descriptor);
+    rustix::fs::fchmod(&token_file, rustix::fs::Mode::from_bits_truncate(0o600))
+        .context("protect anonymous registry credential transport")?;
+    token_file
+        .write_all(token)
+        .context("stage private registry credential")?;
+    token_file
+        .seek(std::io::SeekFrom::Start(0))
+        .context("rewind private registry credential")?;
+    rustix::fs::fcntl_add_seals(
+        &token_file,
+        rustix::fs::SealFlags::SEAL
+            | rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::WRITE,
+    )
+    .context("seal anonymous registry credential transport")?;
+    Ok(token_file)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_registry_package(
+    verified: &dev_tools_release::VerifiedCrateSet,
+    name: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + REGISTRY_VISIBILITY_TIMEOUT;
+    loop {
+        match inspect_crates_io_package(verified, name) {
+            Ok(RegistryCrateStatus::Verified(_)) => return Ok(()),
+            Ok(RegistryCrateStatus::Absent) | Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Ok(RegistryCrateStatus::Absent) | Err(_) => {
+                bail!("registry accepted publication but anonymous verification is pending")
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_bootstrap_publish_result(
+    source_commit: &str,
+    packages: usize,
+    published: usize,
+) -> Result<()> {
+    let result = json!({
+        "schema": "release-admin-crate-bootstrap-publish-v1",
+        "authority": CRATE_SET_AUTHORITY,
+        "source_commit": source_commit,
+        "registry": "crates-io",
+        "packages": packages,
+        "published": published,
+        "changed": published != 0,
+        "verified": true,
+    });
+    serde_json::to_writer(std::io::stdout().lock(), &result)
+        .context("write crate bootstrap publication result")?;
+    println!();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize)]
+struct CargoCredentialRequest {
+    v: u32,
+    kind: String,
+    operation: String,
+    name: String,
+    vers: String,
+    cksum: String,
+    registry: CargoCredentialRegistry,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize)]
+struct CargoCredentialRegistry {
+    #[serde(rename = "index-url")]
+    index_url: String,
+    name: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct BootstrapProviderContext {
+    source_commit: String,
+    root_document: PathBuf,
+    manifest: PathBuf,
+    trusted_root_public_key: PathBuf,
+    token_fd: i32,
+    coordinator_pid: u32,
+    cargo_device: u64,
+    cargo_inode: u64,
+}
+
+fn run_crates_io_credential_provider() -> i32 {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    if output.write_all(b"{\"v\":[1]}\n").is_err() || output.flush().is_err() {
+        return 1;
+    }
+    match provide_crates_io_credential(&mut input, &mut output) {
+        Ok(()) => 0,
+        Err(_) => {
+            let _ = output.write_all(
+                b"{\"Err\":{\"kind\":\"other\",\"message\":\"registry publication authority denied\"}}\n",
+            );
+            let _ = output.flush();
+            1
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provide_crates_io_credential(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
+    let mut request_bytes = Zeroizing::new(Vec::new());
+    input
+        .take(CREDENTIAL_PROTOCOL_LIMIT + 1)
+        .read_until(b'\n', &mut request_bytes)
+        .context("read Cargo credential request")?;
+    if request_bytes.len() as u64 > CREDENTIAL_PROTOCOL_LIMIT
+        || request_bytes.last() != Some(&b'\n')
+    {
+        bail!("Cargo credential request exceeds its protocol bound");
+    }
+    request_bytes.pop();
+    let request: CargoCredentialRequest =
+        serde_json::from_slice(&request_bytes).context("parse Cargo credential request")?;
+    let context = parse_bootstrap_provider_context(&request.args)?;
+    authorize_cargo_credential_request(&request, &context)?;
+    let token = read_inherited_registry_credential(context.token_fd)?;
+    output.write_all(b"{\"Ok\":{\"kind\":\"get\",\"token\":\"")?;
+    output.write_all(&token)?;
+    output.write_all(b"\",\"cache\":\"never\",\"operation_independent\":false}}\n")?;
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn provide_crates_io_credential(_input: &mut impl BufRead, _output: &mut impl Write) -> Result<()> {
+    bail!("crate bootstrap publication is not accepted on this platform")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_bootstrap_provider_context(args: &[String]) -> Result<BootstrapProviderContext> {
+    if args.len() != 17 || args.first().map(String::as_str) != Some("crate-bootstrap-v1") {
+        bail!("Cargo credential provider context is invalid");
+    }
+    let value = |index: usize, expected: &str| -> Result<&str> {
+        if args.get(index).map(String::as_str) != Some(expected) {
+            bail!("Cargo credential provider context is invalid");
+        }
+        args.get(index + 1)
+            .map(String::as_str)
+            .context("Cargo credential provider context is incomplete")
+    };
+    let source_commit = value(1, "--source-commit")?;
+    let root_document = PathBuf::from(value(3, "--root-document")?);
+    let manifest = PathBuf::from(value(5, "--manifest")?);
+    let trusted_root_public_key = PathBuf::from(value(7, "--trusted-root-public-key")?);
+    let token_fd = value(9, "--token-fd")?
+        .parse::<i32>()
+        .context("parse registry credential descriptor")?;
+    let coordinator_pid = value(11, "--coordinator-pid")?
+        .parse::<u32>()
+        .context("parse registry publication coordinator")?;
+    let cargo_device = value(13, "--cargo-device")?
+        .parse::<u64>()
+        .context("parse exact Cargo device")?;
+    let cargo_inode = value(15, "--cargo-inode")?
+        .parse::<u64>()
+        .context("parse exact Cargo inode")?;
+    if !valid_lower_hex(source_commit, 40)
+        || !root_document.is_absolute()
+        || !manifest.is_absolute()
+        || !trusted_root_public_key.is_absolute()
+        || token_fd < 3
+        || coordinator_pid == 0
+    {
+        bail!("Cargo credential provider context is invalid");
+    }
+    Ok(BootstrapProviderContext {
+        source_commit: source_commit.into(),
+        root_document,
+        manifest,
+        trusted_root_public_key,
+        token_fd,
+        coordinator_pid,
+        cargo_device,
+        cargo_inode,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn authorize_cargo_credential_request(
+    request: &CargoCredentialRequest,
+    context: &BootstrapProviderContext,
+) -> Result<()> {
+    if request.v != 1
+        || request.kind != "get"
+        || request.operation != "publish"
+        || !valid_crate_name(&request.name)
+        || semver::Version::parse(&request.vers)
+            .ok()
+            .is_none_or(|version| !version.pre.is_empty() || version.to_string() != request.vers)
+        || !valid_lower_hex(&request.cksum, 64)
+        || !matches!(
+            request.registry.index_url.as_str(),
+            "sparse+https://index.crates.io/" | "https://github.com/rust-lang/crates.io-index"
+        )
+        || request
+            .registry
+            .name
+            .as_deref()
+            .is_some_and(|name| name != "crates-io")
+    {
+        bail!("Cargo credential request is outside publication authority");
+    }
+    validate_publication_process(context)?;
+    let trusted_root = read_public_key_text(&context.trusted_root_public_key)?;
+    let verified = verify_crate_set_metadata(
+        &CrateSetMetadata {
+            root: read_bounded_file(&context.root_document, METADATA_LIMIT)?,
+            manifest: read_bounded_file(&context.manifest, METADATA_LIMIT)?,
+        },
+        &CrateSetAuthority {
+            trusted_root_key: trusted_root,
+            registry: "crates-io".into(),
+            source_commit: context.source_commit.clone(),
+        },
+    )?;
+    let package = verified
+        .packages
+        .get(&request.name)
+        .context("Cargo credential request names an unauthorized crate")?;
+    if package.version.to_string() != request.vers || package.sha256 != request.cksum {
+        bail!("Cargo credential request package identity is unauthorized");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_publication_process(context: &BootstrapProviderContext) -> Result<()> {
+    let cargo_pid = unsafe { libc::getppid() } as u32;
+    let cargo_status = fs::read_to_string(format!("/proc/{cargo_pid}/status"))
+        .context("inspect Cargo publication parent")?;
+    let cargo_parent = cargo_status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:\t"))
+        .context("Cargo publication parent has no process authority")?
+        .trim()
+        .parse::<u32>()
+        .context("parse Cargo publication parent")?;
+    let cargo = fs::metadata(format!("/proc/{cargo_pid}/exe"))
+        .context("inspect live Cargo publication identity")?;
+    let coordinator = fs::metadata(format!("/proc/{}/exe", context.coordinator_pid))
+        .context("inspect live publication coordinator")?;
+    let provider =
+        fs::metadata("/proc/self/exe").context("inspect credential provider identity")?;
+    if cargo_parent != context.coordinator_pid
+        || cargo.dev() != context.cargo_device
+        || cargo.ino() != context.cargo_inode
+        || coordinator.dev() != provider.dev()
+        || coordinator.ino() != provider.ino()
+    {
+        bail!("Cargo credential provider process authority is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_inherited_registry_credential(descriptor: i32) -> Result<Zeroizing<Vec<u8>>> {
+    // SAFETY: dup validates the inherited descriptor and creates a child-local
+    // owned descriptor without changing the original Cargo/provider transport.
+    let duplicated = unsafe { libc::dup(descriptor) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("duplicate private registry credential descriptor");
+    }
+    // SAFETY: duplicated was returned by dup and is now uniquely owned here.
+    let mut file = unsafe { fs::File::from_raw_fd(duplicated) };
+    let metadata = file
+        .metadata()
+        .context("inspect private registry credential descriptor")?;
+    let required_seals = rustix::fs::SealFlags::SEAL
+        | rustix::fs::SealFlags::SHRINK
+        | rustix::fs::SealFlags::GROW
+        | rustix::fs::SealFlags::WRITE;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != current_owner_uid()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 0
+        || metadata.len() == 0
+        || metadata.len() > CREDENTIAL_LIMIT
+        || !rustix::fs::fcntl_get_seals(&file)
+            .context("inspect registry credential transport seals")?
+            .contains(required_seals)
+    {
+        bail!("private registry credential descriptor is unsafe");
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .context("rewind private registry credential descriptor")?;
+    let mut token = Zeroizing::new(Vec::new());
+    file.take(CREDENTIAL_LIMIT + 1)
+        .read_to_end(&mut token)
+        .context("read private registry credential descriptor")?;
+    if token.len() as u64 > CREDENTIAL_LIMIT
+        || token.is_empty()
+        || token.contains(&0)
+        || !token
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    {
+        bail!("private registry credential has an unsupported encoding");
+    }
+    Ok(token)
+}
+
 fn crate_package_specs(values: &[String], source_commit: &str) -> Result<Vec<CratePackageSpec>> {
     values
         .iter()
@@ -1474,4 +2137,87 @@ fn valid_public_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{
+        complete_registry_publication, parse_bootstrap_provider_context, read_bootstrap_token,
+        read_inherited_registry_credential, sealed_registry_credential,
+    };
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn bootstrap_token_is_bounded_normalized_and_never_accepts_json_metacharacters() {
+        assert_eq!(
+            read_bootstrap_token(&b"cio-token_123\r\n"[..])
+                .unwrap()
+                .as_slice(),
+            b"cio-token_123"
+        );
+        assert!(read_bootstrap_token(&b"bad\"token\n"[..]).is_err());
+        assert!(read_bootstrap_token(&b"line\nbreak\n"[..]).is_err());
+        assert!(read_bootstrap_token(&vec![b'x'; 4097][..]).is_err());
+    }
+
+    #[test]
+    fn registry_credential_transport_is_an_owner_only_sealed_memfd() {
+        let file = sealed_registry_credential(b"cio-token_123").unwrap();
+        let token = read_inherited_registry_credential(file.as_raw_fd()).unwrap();
+        assert_eq!(token.as_slice(), b"cio-token_123");
+    }
+
+    #[test]
+    fn credential_provider_context_has_one_exact_grammar() {
+        let arguments = [
+            "crate-bootstrap-v1",
+            "--source-commit",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--root-document",
+            "/private/root.json",
+            "--manifest",
+            "/private/set.json",
+            "--trusted-root-public-key",
+            "/private/root.txt",
+            "--token-fd",
+            "9",
+            "--coordinator-pid",
+            "42",
+            "--cargo-device",
+            "7",
+            "--cargo-inode",
+            "11",
+        ]
+        .map(str::to_owned);
+        let parsed = parse_bootstrap_provider_context(&arguments).unwrap();
+        assert_eq!(parsed.token_fd, 9);
+        assert_eq!(parsed.coordinator_pid, 42);
+        assert_eq!(parsed.cargo_device, 7);
+        assert_eq!(parsed.cargo_inode, 11);
+
+        let mut widened = arguments.to_vec();
+        widened.push("--extra".into());
+        assert!(parse_bootstrap_provider_context(&widened).is_err());
+    }
+
+    #[test]
+    fn anonymous_exact_bytes_resolve_an_ambiguous_cargo_failure() {
+        let resolved =
+            complete_registry_publication(Err(anyhow::anyhow!("ambiguous Cargo failure")), || {
+                Ok(())
+            });
+        assert!(resolved.is_ok());
+    }
+
+    #[test]
+    fn unresolved_cargo_failure_remains_terminal() {
+        let unresolved =
+            complete_registry_publication(Err(anyhow::anyhow!("ambiguous Cargo failure")), || {
+                Err(anyhow::anyhow!("exact bytes are not visible"))
+            })
+            .unwrap_err();
+        assert!(unresolved
+            .to_string()
+            .contains("exact bytes are not visible"));
+    }
 }
