@@ -1044,6 +1044,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-tools-secret"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "dev-tools-update"
 version = "0.1.0"
 dependencies = [

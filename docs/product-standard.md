@@ -66,6 +66,7 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | `dev-tools-installation` | Receipts, immutable versions, aliases, locks, journals, repair, rollback, and owned uninstall. |
 | `dev-tools-command` | Bounded direct process execution and prepared-command execution. |
 | `dev-tools-privilege` | One-shot typed privileged-operation authorization. |
+| `dev-tools-secret` | Provider-neutral secret identifiers, operation capabilities, bounded cancellation contexts, zeroizing material, and value-free failures. |
 | `dev-tools-reconcile-protocol` | Typed external reconciliation documents. |
 
 `dev-tools-update` provides the executable product-neutral operation ordering and adapter contract. Persistent authenticated-cache transports and product adapters remain product-owned and are introduced incrementally behind that contract. A later privilege-session foundation remains separate from the mandatory one-shot authorization primitive. `release-admin` is a product, not a shared authority crate.

@@ -14,6 +14,7 @@
 - [Shared Rust crates](shared-rust-crates.md)
 - [Shared command execution](dev-tools-command.md)
 - [One-shot privilege authorization](dev-tools-privilege.md)
+- [Provider-neutral secret operations](dev-tools-secret.md)
 - [Typed external reconciliation](dev-tools-reconcile-protocol.md)
 - [Threat model](threat-model.md)
 - [Development and validation](development.md)

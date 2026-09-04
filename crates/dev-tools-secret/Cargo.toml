@@ -1,0 +1,11 @@
+[package]
+name = "dev-tools-secret"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+description = "Provider-neutral secret operation contracts for standalone Dev Tools products"
+
+[dependencies]
+zeroize = "1"
