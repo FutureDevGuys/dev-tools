@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::process::Command as ProcessCommand;
 
 #[test]
 fn exposes_common_identity_without_loading_release_inputs() {
@@ -249,6 +251,198 @@ fn crate_set_build_rejects_mislabeled_archive_before_invoking_the_signer() {
         .failure()
         .stderr(predicate::str::contains("crate archive package identity"));
     assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crate_set_package_reproduces_exact_clean_commit_bytes_twice() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let (source, source_commit) = write_git_crate_fixture(root.path());
+
+    let fixture = root.path().join("fixture.crate");
+    write_crate_archive(
+        &fixture,
+        "dev-tools-command",
+        "0.1.0",
+        &source_commit,
+        b"pub fn command() {}\n",
+    );
+    let marker = root.path().join("cargo-count");
+    let cargo = root.path().join("cargo");
+    fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nset -eu\ntarget=\npackage=\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --target-dir) target=$2; shift 2 ;;\n    --package) package=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ \"$package\" = dev-tools-command ]\nmkdir -p \"$target/package\"\ncp '{}' \"$target/package/dev-tools-command-0.1.0.crate\"\nprintf x >> '{}'\n",
+            fixture.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+    let output = root.path().join("packages");
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "package"])
+        .args(["--source-root", source.to_str().unwrap()])
+        .args(["--source-commit", &source_commit])
+        .args(["--git", "/usr/bin/git"])
+        .args(["--cargo", cargo.to_str().unwrap()])
+        .args(["--cargo-home", cargo_home.to_str().unwrap()])
+        .args(["--package", "dev-tools-command@0.1.0"])
+        .args(["--output", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"schema\":\"release-admin-crate-package-v1\"",
+        ))
+        .stderr("");
+
+    assert_eq!(fs::read(&marker).unwrap(), b"xx");
+    assert_eq!(
+        fs::read(output.join("dev-tools-command-0.1.0.crate")).unwrap(),
+        fs::read(&fixture).unwrap()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crate_set_package_rejects_a_dirty_source_before_running_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let (source, source_commit) = write_git_crate_fixture(root.path());
+    fs::write(source.join("untracked"), "dirty\n").unwrap();
+    let marker = root.path().join("cargo-ran");
+    let cargo = root.path().join("cargo");
+    fs::write(
+        &cargo,
+        format!("#!/bin/sh\ntouch '{}'\nexit 92\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "package"])
+        .args(["--source-root", source.to_str().unwrap()])
+        .args(["--source-commit", &source_commit])
+        .args(["--git", "/usr/bin/git"])
+        .args(["--cargo", cargo.to_str().unwrap()])
+        .args(["--cargo-home", cargo_home.to_str().unwrap()])
+        .args(["--package", "dev-tools-command@0.1.0"])
+        .args(["--output", root.path().join("packages").to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("source checkout is not clean"));
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crate_set_package_rejects_a_committed_symlink_before_running_cargo() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let (source, _) = write_git_crate_fixture(root.path());
+    let outside = root.path().join("outside.rs");
+    fs::write(&outside, "pub fn injected() {}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("src/injected.rs")).unwrap();
+    git(&source, &["add", "src/injected.rs"]);
+    git(&source, &["commit", "--quiet", "-m", "linked fixture"]);
+    let source_commit = git_output(&source, &["rev-parse", "HEAD"]);
+    let marker = root.path().join("cargo-ran");
+    let cargo = root.path().join("cargo");
+    fs::write(
+        &cargo,
+        format!("#!/bin/sh\ntouch '{}'\nexit 92\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "package"])
+        .args(["--source-root", source.to_str().unwrap()])
+        .args(["--source-commit", &source_commit])
+        .args(["--git", "/usr/bin/git"])
+        .args(["--cargo", cargo.to_str().unwrap()])
+        .args(["--cargo-home", cargo_home.to_str().unwrap()])
+        .args(["--package", "dev-tools-command@0.1.0"])
+        .args(["--output", root.path().join("packages").to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "source checkout contains a non-regular tracked entry",
+        ));
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crate_set_package_rejects_nonreproducible_bytes_without_publishing_output() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let (source, source_commit) = write_git_crate_fixture(root.path());
+    let first = root.path().join("first.crate");
+    let second = root.path().join("second.crate");
+    write_crate_archive(
+        &first,
+        "dev-tools-command",
+        "0.1.0",
+        &source_commit,
+        b"pub fn command() { println!(\"first\"); }\n",
+    );
+    write_crate_archive(
+        &second,
+        "dev-tools-command",
+        "0.1.0",
+        &source_commit,
+        b"pub fn command() { println!(\"second\"); }\n",
+    );
+    let marker = root.path().join("cargo-count");
+    let cargo = root.path().join("cargo");
+    fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nset -eu\ntarget=\npackage=\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --target-dir) target=$2; shift 2 ;;\n    --package) package=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ \"$package\" = dev-tools-command ]\nmkdir -p \"$target/package\"\nif [ -e '{}' ]; then source='{}'; else source='{}'; fi\ncp \"$source\" \"$target/package/dev-tools-command-0.1.0.crate\"\nprintf x >> '{}'\n",
+            marker.display(),
+            second.display(),
+            first.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+    let output = root.path().join("packages");
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "package"])
+        .args(["--source-root", source.to_str().unwrap()])
+        .args(["--source-commit", &source_commit])
+        .args(["--git", "/usr/bin/git"])
+        .args(["--cargo", cargo.to_str().unwrap()])
+        .args(["--cargo-home", cargo_home.to_str().unwrap()])
+        .args(["--package", "dev-tools-command@0.1.0"])
+        .args(["--output", output.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "independent crate package builds are not byte-identical",
+        ));
+    assert_eq!(fs::read(&marker).unwrap(), b"xx");
+    assert!(!output.exists());
 }
 
 #[cfg(unix)]
@@ -680,4 +874,48 @@ fn write_crate_archive(
         archive.append_data(&mut header, entry_path, bytes).unwrap();
     }
     archive.into_inner().unwrap().finish().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn git(root: &std::path::Path, arguments: &[&str]) {
+    let status = ProcessCommand::new("/usr/bin/git")
+        .current_dir(root)
+        .args(arguments)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git fixture command failed");
+}
+
+#[cfg(target_os = "linux")]
+fn git_output(root: &std::path::Path, arguments: &[&str]) -> String {
+    let output = ProcessCommand::new("/usr/bin/git")
+        .current_dir(root)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git fixture command failed");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn write_git_crate_fixture(root: &std::path::Path) -> (std::path::PathBuf, String) {
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(source.join("src")).unwrap();
+    fs::write(
+        source.join("Cargo.toml"),
+        "[package]\nname = \"dev-tools-command\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(source.join("src/lib.rs"), "pub fn command() {}\n").unwrap();
+    git(&source, &["init", "--quiet"]);
+    git(&source, &["config", "user.name", "release test"]);
+    git(
+        &source,
+        &["config", "user.email", "release@example.invalid"],
+    );
+    git(&source, &["add", "Cargo.toml", "src/lib.rs"]);
+    git(&source, &["commit", "--quiet", "-m", "fixture"]);
+    let source_commit = git_output(&source, &["rev-parse", "HEAD"]);
+    (source, source_commit)
 }

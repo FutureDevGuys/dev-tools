@@ -2,7 +2,9 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
-use dev_tools_command::{run_prepared_bounded_command_with_public_input, HeldExecutable};
+use dev_tools_command::{
+    run_prepared_bounded_command, run_prepared_bounded_command_with_public_input, HeldExecutable,
+};
 use dev_tools_installation::{write_atomic_document, ArtifactIdentity, DocumentAuthority};
 use dev_tools_product::{BuildInfo, ProductId};
 use dev_tools_release::{
@@ -23,8 +25,9 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Duration;
 #[cfg(unix)]
 use zeroize::Zeroizing;
@@ -36,6 +39,8 @@ const CRATE_PACKAGE_LIMIT: u64 = 10 * 1024 * 1024;
 const CRATE_ARCHIVE_EXPANDED_LIMIT: u64 = 64 * 1024 * 1024;
 const CRATE_ARCHIVE_ENTRY_LIMIT: usize = 4096;
 const CRATE_METADATA_LIMIT: u64 = 512 * 1024;
+const BUILD_OUTPUT_LIMIT: usize = 1024 * 1024;
+const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -113,10 +118,30 @@ struct CrateSetArgs {
 
 #[derive(Debug, Subcommand)]
 enum CrateSetCommand {
+    /// Reproduce registry packages twice from one clean exact source commit.
+    Package(CrateSetPackageArgs),
     /// Build one signed source-bound crate inventory.
     Build(CrateSetBuildArgs),
     /// Verify one signed crate inventory and every exact package byte stream.
     Verify(CrateSetVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct CrateSetPackageArgs {
+    #[arg(long)]
+    source_root: PathBuf,
+    #[arg(long)]
+    source_commit: String,
+    #[arg(long)]
+    git: PathBuf,
+    #[arg(long)]
+    cargo: PathBuf,
+    #[arg(long)]
+    cargo_home: PathBuf,
+    #[arg(long = "package", required = true)]
+    packages: Vec<String>,
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -235,6 +260,12 @@ where
                     command: ManifestCommand::Build(arguments),
                 }),
         }) => run_result(build_manifest(arguments)),
+        Ok(Cli {
+            command:
+                Command::CrateSet(CrateSetArgs {
+                    command: CrateSetCommand::Package(arguments),
+                }),
+        }) => run_result(package_crate_set(arguments)),
         Ok(Cli {
             command:
                 Command::CrateSet(CrateSetArgs {
@@ -450,6 +481,407 @@ fn build_manifest(arguments: ManifestBuildArgs) -> Result<()> {
         .context("write manifest build result")?;
     println!();
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CratePackageRequest {
+    name: String,
+    version: String,
+}
+
+fn package_crate_set(arguments: CrateSetPackageArgs) -> Result<()> {
+    if !valid_lower_hex(&arguments.source_commit, 40)
+        || !arguments.source_root.is_absolute()
+        || !arguments.git.is_absolute()
+        || !arguments.cargo.is_absolute()
+        || !arguments.cargo_home.is_absolute()
+        || !arguments.output.is_absolute()
+        || arguments.output.exists()
+    {
+        bail!("crate package construction input is invalid");
+    }
+    let source_root = require_canonical_directory(&arguments.source_root, false)
+        .context("validate source checkout")?;
+    let cargo_home =
+        require_canonical_directory(&arguments.cargo_home, false).context("validate Cargo home")?;
+    let output_parent = arguments
+        .output
+        .parent()
+        .context("crate package output has no parent")?;
+    require_canonical_directory(output_parent, true)
+        .context("validate private crate package output parent")?;
+    let packages = parse_crate_package_requests(&arguments.packages)?;
+    let git = HeldExecutable::open(&arguments.git).context("hold exact Git identity")?;
+    let cargo = HeldExecutable::open(&arguments.cargo).context("hold exact Cargo identity")?;
+    inspect_clean_checkout(&git, &arguments.git, &source_root, &arguments.source_commit)?;
+
+    let work = tempfile::Builder::new()
+        .prefix(".release-admin-crates-")
+        .tempdir_in(output_parent)
+        .context("create private crate package work directory")?;
+    let first = build_crate_package_pass(
+        &git,
+        &arguments.git,
+        &cargo,
+        &arguments.cargo,
+        &cargo_home,
+        &source_root,
+        &arguments.source_commit,
+        &packages,
+        work.path(),
+        "first",
+    )?;
+    inspect_clean_checkout(&git, &arguments.git, &source_root, &arguments.source_commit)?;
+    let second = build_crate_package_pass(
+        &git,
+        &arguments.git,
+        &cargo,
+        &arguments.cargo,
+        &cargo_home,
+        &source_root,
+        &arguments.source_commit,
+        &packages,
+        work.path(),
+        "second",
+    )?;
+    inspect_clean_checkout(&git, &arguments.git, &source_root, &arguments.source_commit)?;
+    if first != second {
+        bail!("independent crate package builds are not byte-identical");
+    }
+
+    let staged_output = work.path().join("packages");
+    fs::create_dir(&staged_output).context("create staged crate package output")?;
+    #[cfg(unix)]
+    fs::set_permissions(&staged_output, fs::Permissions::from_mode(0o700))
+        .context("protect staged crate package output")?;
+    let mut reported = Vec::with_capacity(packages.len());
+    for package in &packages {
+        let bytes = first
+            .get(&package.name)
+            .context("reproduced crate package is missing")?;
+        let filename = crate_package_filename(package);
+        write_new_private_file_with_limit(
+            &staged_output.join(&filename),
+            bytes,
+            CRATE_PACKAGE_LIMIT,
+        )?;
+        reported.push(json!({
+            "name": package.name,
+            "version": package.version,
+            "path": arguments.output.join(filename),
+            "length": bytes.len(),
+            "sha256": format!("{:x}", Sha256::digest(bytes)),
+        }));
+    }
+    fs::rename(&staged_output, &arguments.output)
+        .context("publish reproduced crate package directory")?;
+    sync_directory(output_parent).context("persist reproduced crate package directory")?;
+    let result = json!({
+        "schema": "release-admin-crate-package-v1",
+        "source_commit": arguments.source_commit,
+        "registry": "crates-io",
+        "packages": reported,
+        "output": arguments.output,
+        "reproduced": true,
+    });
+    serde_json::to_writer(std::io::stdout().lock(), &result)
+        .context("write crate package result")?;
+    println!();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_crate_package_pass(
+    git: &HeldExecutable,
+    git_path: &Path,
+    cargo: &HeldExecutable,
+    cargo_path: &Path,
+    cargo_home: &Path,
+    source_root: &Path,
+    source_commit: &str,
+    packages: &[CratePackageRequest],
+    work_root: &Path,
+    label: &str,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let checkout = work_root.join(format!("checkout-{label}"));
+    run_git(
+        git,
+        git_path,
+        &[
+            OsString::from("clone"),
+            OsString::from("--quiet"),
+            OsString::from("--no-local"),
+            OsString::from("--no-checkout"),
+            OsString::from("--"),
+            source_root.as_os_str().to_owned(),
+            checkout.as_os_str().to_owned(),
+        ],
+        work_root,
+    )
+    .context("clone exact source repository")?;
+    run_git(
+        git,
+        git_path,
+        &[
+            OsString::from("-C"),
+            checkout.as_os_str().to_owned(),
+            OsString::from("checkout"),
+            OsString::from("--detach"),
+            OsString::from("--quiet"),
+            OsString::from(source_commit),
+        ],
+        work_root,
+    )
+    .context("check out exact source commit")?;
+    inspect_clean_checkout(git, git_path, &checkout, source_commit)?;
+    if checkout.join(".gitmodules").exists() {
+        bail!("crate package construction does not admit submodules");
+    }
+    let target = work_root.join(format!("target-{label}"));
+    let mut built = BTreeMap::new();
+    for package in packages {
+        let mut command = cargo
+            .command(cargo_path.as_os_str())
+            .context("prepare exact Cargo identity")?;
+        let cargo_bin = cargo_path
+            .parent()
+            .context("exact Cargo executable has no parent")?;
+        command
+            .env_clear()
+            .env("CARGO_HOME", cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TERM_COLOR", "never")
+            .env("LC_ALL", "C")
+            .env("PATH", fixed_build_path(cargo_bin))
+            .current_dir(&checkout)
+            .args([
+                OsString::from("package"),
+                OsString::from("--manifest-path"),
+                checkout.join("Cargo.toml").into_os_string(),
+                OsString::from("--package"),
+                OsString::from(&package.name),
+                OsString::from("--frozen"),
+                OsString::from("--no-verify"),
+                OsString::from("--quiet"),
+                OsString::from("--color"),
+                OsString::from("never"),
+                OsString::from("--target-dir"),
+                target.as_os_str().to_owned(),
+            ]);
+        let output =
+            run_prepared_bounded_command(&mut command, BUILD_COMMAND_TIMEOUT, BUILD_OUTPUT_LIMIT)
+                .map_err(|_| anyhow::anyhow!("bounded Cargo package execution failed"))?;
+        require_success(output.status, "Cargo package execution failed")?;
+        let archive_path = target.join("package").join(crate_package_filename(package));
+        let bytes = read_bounded_file(&archive_path, CRATE_PACKAGE_LIMIT)
+            .context("read constructed crate package")?;
+        validate_crate_archive_bytes(&bytes, &package.name, &package.version, source_commit)
+            .context("constructed crate package identity is invalid")?;
+        built.insert(package.name.clone(), bytes);
+    }
+    inspect_clean_checkout(git, git_path, &checkout, source_commit)?;
+    Ok(built)
+}
+
+fn inspect_clean_checkout(
+    git: &HeldExecutable,
+    git_path: &Path,
+    source_root: &Path,
+    source_commit: &str,
+) -> Result<()> {
+    let top_level = run_git(
+        git,
+        git_path,
+        &[
+            OsString::from("-C"),
+            source_root.as_os_str().to_owned(),
+            OsString::from("rev-parse"),
+            OsString::from("--show-toplevel"),
+        ],
+        source_root,
+    )?;
+    let top_level = one_utf8_line(&top_level, "Git source root")?;
+    if Path::new(top_level) != source_root {
+        bail!("source checkout root does not match the selected source");
+    }
+    let head = run_git(
+        git,
+        git_path,
+        &[
+            OsString::from("-C"),
+            source_root.as_os_str().to_owned(),
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("HEAD"),
+        ],
+        source_root,
+    )?;
+    if one_utf8_line(&head, "Git source commit")? != source_commit {
+        bail!("source checkout does not match the selected commit");
+    }
+    let status = run_git(
+        git,
+        git_path,
+        &[
+            OsString::from("-C"),
+            source_root.as_os_str().to_owned(),
+            OsString::from("status"),
+            OsString::from("--porcelain=v1"),
+            OsString::from("--untracked-files=all"),
+        ],
+        source_root,
+    )?;
+    if !status.is_empty() {
+        bail!("source checkout is not clean");
+    }
+    let tracked = run_git(
+        git,
+        git_path,
+        &[
+            OsString::from("-C"),
+            source_root.as_os_str().to_owned(),
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("-z"),
+        ],
+        source_root,
+    )?;
+    validate_regular_tracked_entries(&tracked)?;
+    Ok(())
+}
+
+fn validate_regular_tracked_entries(input: &[u8]) -> Result<()> {
+    for record in input
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if !(record.starts_with(b"100644 ") || record.starts_with(b"100755 ")) {
+            bail!("source checkout contains a non-regular tracked entry");
+        }
+    }
+    Ok(())
+}
+
+fn run_git(
+    git: &HeldExecutable,
+    git_path: &Path,
+    arguments: &[OsString],
+    cwd: &Path,
+) -> Result<Vec<u8>> {
+    let mut command = git
+        .command(git_path.as_os_str())
+        .context("prepare exact Git identity")?;
+    command
+        .env_clear()
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C")
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(cwd)
+        .args(arguments);
+    let output =
+        run_prepared_bounded_command(&mut command, BUILD_COMMAND_TIMEOUT, BUILD_OUTPUT_LIMIT)
+            .map_err(|_| anyhow::anyhow!("bounded Git execution failed"))?;
+    require_success(output.status, "Git execution failed")?;
+    Ok(output.stdout)
+}
+
+fn require_success(status: ExitStatus, diagnostic: &str) -> Result<()> {
+    if !status.success() {
+        bail!("{diagnostic}");
+    }
+    Ok(())
+}
+
+fn one_utf8_line<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str> {
+    let value = std::str::from_utf8(bytes).with_context(|| format!("{label} is not UTF-8"))?;
+    let value = value
+        .strip_suffix('\n')
+        .with_context(|| format!("{label} is not one line"))?;
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        bail!("{label} is not one line");
+    }
+    Ok(value)
+}
+
+fn parse_crate_package_requests(values: &[String]) -> Result<Vec<CratePackageRequest>> {
+    let mut packages = BTreeMap::new();
+    for value in values {
+        let (name, version) = value
+            .split_once('@')
+            .context("crate package must use NAME@VERSION")?;
+        if !valid_crate_name(name)
+            || version.is_empty()
+            || version.contains('@')
+            || semver::Version::parse(version).is_err()
+        {
+            bail!("crate package must use a valid NAME@VERSION");
+        }
+        let parsed = semver::Version::parse(version).context("parse crate package version")?;
+        if !parsed.pre.is_empty() || parsed.to_string() != version {
+            bail!("crate package version is not a canonical stable semantic version");
+        }
+        if packages
+            .insert(
+                name.to_owned(),
+                CratePackageRequest {
+                    name: name.to_owned(),
+                    version: version.to_owned(),
+                },
+            )
+            .is_some()
+        {
+            bail!("crate package request is duplicated");
+        }
+    }
+    Ok(packages.into_values().collect())
+}
+
+fn valid_crate_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn crate_package_filename(package: &CratePackageRequest) -> String {
+    format!("{}-{}.crate", package.name, package.version)
+}
+
+fn fixed_build_path(cargo_bin: &Path) -> OsString {
+    let mut value = cargo_bin.as_os_str().to_owned();
+    value.push(":/usr/bin:/bin");
+    value
+}
+
+fn require_canonical_directory(path: &Path, private: bool) -> Result<PathBuf> {
+    #[cfg(not(unix))]
+    let _ = private;
+    let metadata = fs::symlink_metadata(path).context("inspect directory")?;
+    if !metadata.file_type().is_dir()
+        || fs::canonicalize(path).context("canonicalize directory")? != path
+    {
+        bail!("directory is not an exact canonical directory");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != current_owner_uid() || (private && metadata.mode() & 0o077 != 0) {
+        bail!("directory has unsafe filesystem authority");
+    }
+    Ok(path.to_owned())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    let directory = fs::File::open(path).context("open release output parent")?;
+    directory.sync_all().context("sync release output parent")
 }
 
 fn build_crate_set(arguments: CrateSetBuildArgs) -> Result<()> {
@@ -957,6 +1389,10 @@ fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_new_private_file_with_limit(path, bytes, METADATA_LIMIT)
+}
+
+fn write_new_private_file_with_limit(path: &Path, bytes: &[u8], limit: u64) -> Result<()> {
     let parent = path.parent().context("release output has no parent")?;
     let parent_metadata = fs::symlink_metadata(parent).context("inspect release output parent")?;
     if !parent_metadata.file_type().is_dir() {
@@ -968,7 +1404,7 @@ fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         &DocumentAuthority {
             owner_uid: current_owner_uid(),
             mode: 0o600,
-            limit: METADATA_LIMIT,
+            limit,
         },
         None,
     )

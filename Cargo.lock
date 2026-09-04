@@ -2865,6 +2865,7 @@ dependencies = [
  "libc",
  "predicates",
  "rustix",
+ "semver",
  "serde",
  "serde_jcs",
  "serde_json",
