@@ -19,6 +19,7 @@ use dev_tools_installation::{
 
 const METADATA_LIMIT: usize = 512 * 1024;
 const ARTIFACT_LIMIT: usize = 256 * 1024 * 1024;
+const MAX_MANIFEST_ARTIFACTS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseBundle {
@@ -203,35 +204,20 @@ pub fn validate_unsigned_product_manifest(input: &[u8]) -> Result<UnsignedProduc
     if manifest.product.is_empty()
         || manifest.generation == 0
         || manifest.engine_protocol != 1
-        || manifest.artifacts.len() != 1
+        || manifest.artifacts.is_empty()
+        || manifest.artifacts.len() > MAX_MANIFEST_ARTIFACTS
     {
         bail!("unsigned release manifest has an unsupported contract");
     }
-    match (
-        manifest.schema.as_str(),
-        manifest.product.as_str(),
-        manifest.source_commit.as_deref(),
-    ) {
-        ("dev-tools-product-v1", product, None) if product != "dev-auth" => {}
-        ("dev-auth-product-v2", "dev-auth", Some(commit)) if valid_hex(commit, 40) => {}
-        _ => bail!("unsigned release manifest has an unsupported schema"),
-    }
+    validate_manifest_schema(&manifest)
+        .context("unsigned release manifest has an unsupported schema")?;
     let version = Version::parse(&manifest.version).context("parse product manifest version")?;
     if !version.pre.is_empty() {
         bail!("unsigned release manifest version is not stable");
     }
-    let (target, artifact) = manifest
-        .artifacts
-        .iter()
-        .next()
-        .context("unsigned release manifest has no artifact")?;
-    if target.is_empty()
-        || !artifact.url.starts_with("https://")
-        || artifact.length == 0
-        || artifact.length as usize > ARTIFACT_LIMIT
-        || !valid_hex(&artifact.sha256, 64)
-    {
-        bail!("unsigned release manifest artifact identity is invalid");
+    for (target, artifact) in &manifest.artifacts {
+        validate_artifact_identity(target, artifact)
+            .context("unsigned release manifest artifact identity is invalid")?;
     }
     Ok(UnsignedProductManifest {
         schema: manifest.schema,
@@ -783,10 +769,12 @@ fn validate_manifest(manifest: &ProductManifest, authority: &ReleaseAuthority) -
         || manifest.product != authority.product
         || manifest.generation == 0
         || manifest.engine_protocol != authority.engine_protocol
-        || manifest.artifacts.len() != 1
+        || manifest.artifacts.is_empty()
+        || manifest.artifacts.len() > MAX_MANIFEST_ARTIFACTS
     {
         bail!("release manifest has an unsupported contract");
     }
+    validate_manifest_schema(manifest).context("release manifest has an unsupported schema")?;
     Version::parse(&manifest.version).context("parse product manifest version")?;
     match &manifest.source_commit {
         Some(commit) if valid_hex(commit, 40) => {}
@@ -795,6 +783,20 @@ fn validate_manifest(manifest: &ProductManifest, authority: &ReleaseAuthority) -
             bail!("release manifest does not bind a source commit")
         }
         None => {}
+    }
+    for (target, artifact) in &manifest.artifacts {
+        validate_artifact_identity(target, artifact)
+            .context("release manifest artifact identity is invalid")?;
+        if let ArtifactUrlPolicy::GitHubRelease { owner, repository } = &authority.artifact_url {
+            let artifact_name = native_artifact_name(&manifest.product, &manifest.version, target);
+            let expected_url = format!(
+                "https://github.com/{owner}/{repository}/releases/download/{}%2Fv{}/{artifact_name}",
+                manifest.product, manifest.version
+            );
+            if artifact.url != expected_url {
+                bail!("release manifest artifact identity is invalid");
+            }
+        }
     }
     let artifact = manifest
         .artifacts
@@ -811,12 +813,34 @@ fn validate_manifest(manifest: &ProductManifest, authority: &ReleaseAuthority) -
             )
         }
     };
-    if artifact.url != expected_url
+    if artifact.url != expected_url {
+        bail!("release manifest artifact identity is invalid");
+    }
+    Ok(())
+}
+
+fn validate_manifest_schema(manifest: &ProductManifest) -> Result<()> {
+    match (
+        manifest.schema.as_str(),
+        manifest.product.as_str(),
+        manifest.source_commit.as_deref(),
+        manifest.artifacts.len(),
+    ) {
+        ("dev-tools-product-v1", product, None, 1) if product != "dev-auth" => Ok(()),
+        ("dev-auth-product-v2", "dev-auth", Some(commit), 1) if valid_hex(commit, 40) => Ok(()),
+        ("dev-tools-product-v2", _, Some(commit), _) if valid_hex(commit, 40) => Ok(()),
+        _ => bail!("release manifest schema is unsupported"),
+    }
+}
+
+fn validate_artifact_identity(target: &str, artifact: &ArtifactIdentity) -> Result<()> {
+    if target.is_empty()
+        || !artifact.url.starts_with("https://")
         || artifact.length == 0
         || artifact.length as usize > ARTIFACT_LIMIT
         || !valid_hex(&artifact.sha256, 64)
     {
-        bail!("release manifest artifact identity is invalid");
+        bail!("release artifact identity is invalid");
     }
     Ok(())
 }

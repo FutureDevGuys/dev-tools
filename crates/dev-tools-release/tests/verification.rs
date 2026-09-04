@@ -126,14 +126,21 @@ fn release_fixture(
 }
 
 fn fixture(schema: &str, source_commit: Option<&str>) -> (ReleaseBundle, ReleaseAuthority) {
-    let artifact_url = "https://github.com/FutureDevGuys/dev-tools/releases/download/product%2Fv1.2.3/product-1.2.3-linux-x86_64";
+    let product = if schema == "dev-auth-product-v2" {
+        "dev-auth"
+    } else {
+        "product"
+    };
+    let artifact_url = format!(
+        "https://github.com/FutureDevGuys/dev-tools/releases/download/{product}%2Fv1.2.3/{product}-1.2.3-linux-x86_64"
+    );
     release_fixture(
-        "product",
+        product,
         schema,
         source_commit,
         "linux-x86_64",
-        artifact_url,
-        ArtifactUrlPolicy::Exact(artifact_url.into()),
+        &artifact_url,
+        ArtifactUrlPolicy::Exact(artifact_url.clone()),
     )
 }
 
@@ -219,6 +226,113 @@ fn verifies_v1_and_source_bound_v2_without_weakening_either_contract() {
     let (unsigned_source, mut strict_authority) = fixture("dev-tools-product-v1", None);
     strict_authority.require_source_commit = true;
     assert!(verify_release_bytes(&unsigned_source, &strict_authority).is_err());
+}
+
+#[test]
+fn legacy_manifest_schemas_remain_bound_to_their_original_products() {
+    let artifact_url = "https://github.com/FutureDevGuys/dev-tools/releases/download/product%2Fv1.2.3/product-1.2.3-linux-x86_64";
+    let (dev_auth_schema_for_other_product, authority) = release_fixture(
+        "product",
+        "dev-auth-product-v2",
+        Some(&"a".repeat(40)),
+        "linux-x86_64",
+        artifact_url,
+        ArtifactUrlPolicy::Exact(artifact_url.into()),
+    );
+    assert!(verify_release_bytes(&dev_auth_schema_for_other_product, &authority).is_err());
+
+    let (v1_schema_for_dev_auth, authority) = release_fixture(
+        "dev-auth",
+        "dev-tools-product-v1",
+        None,
+        "linux-x86_64",
+        artifact_url,
+        ArtifactUrlPolicy::Exact(artifact_url.into()),
+    );
+    assert!(verify_release_bytes(&v1_schema_for_dev_auth, &authority).is_err());
+}
+
+#[test]
+fn verifies_a_source_bound_multi_target_v2_as_one_selected_target() {
+    let root_key = SigningKey::from_bytes(&[7; 32]);
+    let release_key = SigningKey::from_bytes(&[9; 32]);
+    let root = signed(
+        json!({
+            "schema": "dev-tools-root-v1",
+            "generation": 3,
+            "release_keys": [{
+                "key_id": "release-test",
+                "public_key": hex(&release_key.verifying_key().to_bytes()),
+                "revoked": false,
+            }],
+        }),
+        "root-test",
+        &root_key,
+    );
+    let linux_artifact = b"linux release";
+    let macos_artifact = b"macos release".to_vec();
+    let source_commit = "a".repeat(40);
+    let manifest_document = json!({
+        "schema": "dev-tools-product-v2",
+        "product": "product",
+        "generation": 12,
+        "version": "1.2.3",
+        "source_commit": source_commit,
+        "engine_protocol": 1,
+        "artifacts": {
+            "linux-x86_64": {
+                "url": "https://github.com/FutureDevGuys/dev-tools/releases/download/product%2Fv1.2.3/product-1.2.3-linux-x86_64",
+                "length": linux_artifact.len(),
+                "sha256": format!("{:x}", Sha256::digest(linux_artifact)),
+            },
+            "macos-aarch64": {
+                "url": "https://github.com/FutureDevGuys/dev-tools/releases/download/product%2Fv1.2.3/product-1.2.3-macos-aarch64",
+                "length": macos_artifact.len(),
+                "sha256": format!("{:x}", Sha256::digest(&macos_artifact)),
+            },
+        },
+    });
+    let unsigned = serde_jcs::to_vec(&manifest_document).unwrap();
+    let validated = validate_unsigned_product_manifest(&unsigned).unwrap();
+    assert_eq!(validated.schema, "dev-tools-product-v2");
+    let mut missing_source = manifest_document.clone();
+    missing_source
+        .as_object_mut()
+        .unwrap()
+        .remove("source_commit");
+    assert!(
+        validate_unsigned_product_manifest(&serde_jcs::to_vec(&missing_source).unwrap()).is_err()
+    );
+    let manifest = signed(manifest_document, "release-test", &release_key);
+    let authority = ReleaseAuthority {
+        trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
+        product: "product".into(),
+        accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+        target: "macos-aarch64".into(),
+        artifact_url: ArtifactUrlPolicy::GitHubRelease {
+            owner: "FutureDevGuys".into(),
+            repository: "dev-tools".into(),
+        },
+        require_source_commit: true,
+        engine_protocol: 1,
+    };
+
+    let verified = verify_release_bytes(
+        &ReleaseBundle {
+            root,
+            manifest,
+            artifact: macos_artifact,
+        },
+        &authority,
+    )
+    .unwrap();
+
+    assert_eq!(verified.manifest_schema, "dev-tools-product-v2");
+    assert_eq!(
+        verified.source_commit.as_deref(),
+        Some(source_commit.as_str())
+    );
+    assert_eq!(verified.target, "macos-aarch64");
 }
 
 #[test]

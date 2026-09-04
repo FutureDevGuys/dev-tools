@@ -16,13 +16,13 @@ verification: pending
 
 The workspace provides two focused libraries. `dev-tools-release` owns product-neutral signed-root and signed-manifest verification, stable SemVer selection, artifact identity, anti-rollback and equivocation state, and explicit authenticated-cache handling. `dev-tools-installation` owns product-neutral nofollow filesystem admission, immutable version publication, receipt-owned aliases and pointers, rollback, uninstall, locking, and crash recovery.
 
-Products supply their release authority, target identity, product-specific layout, service lifecycle, health verification, and user-facing result model. The libraries do not install third-party packages, manage services, interpret product policy, or enroll credentials. Manifest v1 remains valid for existing `update-all` products. Dev-auth manifest v2 additionally requires an exact source-commit binding and cannot be downgraded to the v1 contract.
+Products supply their release authority, target identity, product-specific layout, service lifecycle, health verification, and user-facing result model. The libraries do not install third-party packages, manage services, interpret product policy, or enroll credentials. Manifest v1 and the Dev Auth-specific v2 remain readable for authenticated migration and rollback. Shared `dev-tools-product-v2` requires an exact source-commit binding and may contain multiple target artifacts; each verifier selects and authenticates one declared target without weakening the complete signed document.
 
 `update-all` migrates behind behavior-parity tests. Its CLI, stable-channel selection, update-only absence behavior, external-manager collision behavior, health checks, retained rollback, and reporting remain product-owned and unchanged.
 
 ## Invariants
 
-- A caller selects an accepted manifest schema and whether source-commit binding is mandatory; metadata cannot weaken that authority.
+- A caller selects an accepted manifest schema and whether source-commit binding is mandatory; metadata cannot weaken that authority, and shared v2 always requires source binding.
 - Online resolution failure never silently becomes evidence that cached metadata is current. Offline cache use is explicit and uses only previously authenticated bytes and persisted anti-rollback state.
 - Installation replaces or removes only artifacts named by a valid receipt and matching their recorded identity.
 - Shared libraries contain no dev-auth, update-all, service-manager, credential, policy, or package-manager behavior.

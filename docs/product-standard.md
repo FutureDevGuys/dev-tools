@@ -42,6 +42,8 @@ An externally managed public command is reported as `external` and is never over
 
 Ordinary product operations and `--version` never access the network. Remote release metadata may describe product identity and artifacts, but it may not provide executable commands, arbitrary destinations, shell programs, or privileged effects.
 
+New product releases use a canonical source-bound manifest that may contain multiple target artifacts for one product version and generation. Each target retains its own URL, length, and digest. A product verifies only its selected target after authenticating the complete manifest. Legacy manifest schemas remain readable only for explicitly bounded migration and receipt-owned rollback. Once shared v2 becomes authoritative for a product, its online release authority accepts only source-bound schemas; retained rollback never weakens online resolution.
+
 ## Common result contract
 
 Machine-readable common operations use `dev-tools-operation-result-v1`. The result identifies the product, operation, outcome, changed state, process exit category, fixed value-free error kind, managed or external installation state, cache freshness, and installed or available versions when applicable.
