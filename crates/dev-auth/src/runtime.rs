@@ -4175,7 +4175,7 @@ pub fn broker_sign_release_manifest(profile: &str, payload: &[u8]) -> Result<Vec
     if payload.len() > 16 * 1024 {
         bail!("release manifest exceeds the size limit");
     }
-    let manifest = dev_tools_release::validate_unsigned_product_manifest(payload)
+    let document = dev_tools_release::validate_unsigned_release_document(payload)
         .context("validate release manifest signing request")?;
     let (_, receipt) = crate::setup::current_runtime_installation()?;
     let active = active_broker_profile(&receipt)?;
@@ -4190,7 +4190,7 @@ pub fn broker_sign_release_manifest(profile: &str, payload: &[u8]) -> Result<Vec
     if !active
         .profile
         .release_signing_products
-        .contains(&manifest.product)
+        .contains(&document.authority)
     {
         bail!("release manifest product is outside workload authority");
     }

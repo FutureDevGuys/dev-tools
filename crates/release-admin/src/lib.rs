@@ -6,21 +6,25 @@ use dev_tools_command::{run_prepared_bounded_command_with_public_input, HeldExec
 use dev_tools_installation::{write_atomic_document, ArtifactIdentity, DocumentAuthority};
 use dev_tools_product::{BuildInfo, ProductId};
 use dev_tools_release::{
-    authorized_release_public_key, build_signed_envelope, build_unsigned_product_manifest,
-    build_unsigned_root_document, root_key_id, verify_artifact_bytes, verify_release_metadata,
-    verify_release_set_metadata, verify_root_bytes, ArtifactUrlPolicy, EnvelopeSignature,
+    authorized_release_public_key, build_signed_envelope, build_unsigned_crate_set,
+    build_unsigned_product_manifest, build_unsigned_root_document, root_key_id,
+    verify_artifact_bytes, verify_crate_package_bytes, verify_crate_set_metadata,
+    verify_release_metadata, verify_release_set_metadata, verify_root_bytes, ArtifactUrlPolicy,
+    CratePackageSpec, CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature,
     ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseMetadata, RootDocumentSpec,
-    RootReleaseKey,
+    RootReleaseKey, CRATE_SET_AUTHORITY,
 };
 use ed25519_dalek::{Signer, SigningKey};
+use flate2::read::GzDecoder;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Cursor, Read};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 #[cfg(unix)]
 use zeroize::Zeroizing;
@@ -28,6 +32,10 @@ use zeroize::Zeroizing;
 const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const SIGNER_OUTPUT_LIMIT: usize = 256;
+const CRATE_PACKAGE_LIMIT: u64 = 10 * 1024 * 1024;
+const CRATE_ARCHIVE_EXPANDED_LIMIT: u64 = 64 * 1024 * 1024;
+const CRATE_ARCHIVE_ENTRY_LIMIT: usize = 4096;
+const CRATE_METADATA_LIMIT: u64 = 512 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +59,8 @@ enum Command {
     Root(RootArgs),
     /// Construct source-bound product manifests.
     Manifest(ManifestArgs),
+    /// Construct and verify authenticated registry crate inventories.
+    CrateSet(CrateSetArgs),
     /// Build, verify, and publish complete release sets.
     Set(SetArgs),
 }
@@ -93,6 +103,56 @@ struct ManifestArgs {
 enum ManifestCommand {
     /// Build one source-bound, multi-target product manifest.
     Build(ManifestBuildArgs),
+}
+
+#[derive(Debug, Args)]
+struct CrateSetArgs {
+    #[command(subcommand)]
+    command: CrateSetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CrateSetCommand {
+    /// Build one signed source-bound crate inventory.
+    Build(CrateSetBuildArgs),
+    /// Verify one signed crate inventory and every exact package byte stream.
+    Verify(CrateSetVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct CrateSetBuildArgs {
+    #[arg(long)]
+    source_commit: String,
+    #[arg(long)]
+    generation: u64,
+    #[arg(long = "package", required = true)]
+    packages: Vec<String>,
+    #[arg(long)]
+    root_document: PathBuf,
+    #[arg(long)]
+    trusted_root_public_key: PathBuf,
+    #[arg(long)]
+    release_key_id: String,
+    #[arg(long)]
+    signer: PathBuf,
+    #[arg(long)]
+    signer_profile: String,
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct CrateSetVerifyArgs {
+    #[arg(long)]
+    source_commit: String,
+    #[arg(long = "package", required = true)]
+    packages: Vec<String>,
+    #[arg(long)]
+    root_document: PathBuf,
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    trusted_root_public_key: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -175,6 +235,18 @@ where
                     command: ManifestCommand::Build(arguments),
                 }),
         }) => run_result(build_manifest(arguments)),
+        Ok(Cli {
+            command:
+                Command::CrateSet(CrateSetArgs {
+                    command: CrateSetCommand::Build(arguments),
+                }),
+        }) => run_result(build_crate_set(arguments)),
+        Ok(Cli {
+            command:
+                Command::CrateSet(CrateSetArgs {
+                    command: CrateSetCommand::Verify(arguments),
+                }),
+        }) => run_result(verify_crate_set(arguments)),
         Ok(Cli {
             command:
                 Command::Set(SetArgs {
@@ -377,6 +449,252 @@ fn build_manifest(arguments: ManifestBuildArgs) -> Result<()> {
     serde_json::to_writer(std::io::stdout().lock(), &summary)
         .context("write manifest build result")?;
     println!();
+    Ok(())
+}
+
+fn build_crate_set(arguments: CrateSetBuildArgs) -> Result<()> {
+    if !valid_public_id(&arguments.release_key_id)
+        || !valid_public_id(&arguments.signer_profile)
+        || !arguments.output.is_absolute()
+    {
+        bail!("crate-set output or signer identity is invalid");
+    }
+    if arguments.output.exists() {
+        bail!("crate-set output already exists");
+    }
+    let trusted_root = read_public_key_text(&arguments.trusted_root_public_key)
+        .context("read trusted root public key")?;
+    let root = read_bounded_file(&arguments.root_document, METADATA_LIMIT)
+        .context("read root document")?;
+    authorized_release_public_key(&root, &trusted_root, &arguments.release_key_id)
+        .context("authenticate routine release-signing key")?;
+    let packages = crate_package_specs(&arguments.packages, &arguments.source_commit)?;
+    let unsigned = build_unsigned_crate_set(&CrateSetSpec {
+        generation: arguments.generation,
+        source_commit: arguments.source_commit.clone(),
+        registry: "crates-io".into(),
+        packages,
+    })?;
+    let signature = invoke_signer(&arguments.signer, &arguments.signer_profile, &unsigned)?;
+    let manifest = build_signed_envelope(
+        &unsigned,
+        &[EnvelopeSignature {
+            key_id: arguments.release_key_id,
+            signature: signature.to_vec(),
+        }],
+    )?;
+    let verified = verify_crate_set_metadata(
+        &CrateSetMetadata {
+            root,
+            manifest: manifest.clone(),
+        },
+        &CrateSetAuthority {
+            trusted_root_key: trusted_root,
+            registry: "crates-io".into(),
+            source_commit: arguments.source_commit.clone(),
+        },
+    )?;
+    verify_crate_package_inputs(&verified, &arguments.packages)?;
+    write_new_private_file(&arguments.output, &manifest)?;
+    let result = json!({
+        "schema": "release-admin-crate-set-build-v1",
+        "authority": CRATE_SET_AUTHORITY,
+        "source_commit": arguments.source_commit,
+        "registry": "crates-io",
+        "packages": verified.packages.len(),
+        "output": arguments.output,
+    });
+    serde_json::to_writer(std::io::stdout().lock(), &result)
+        .context("write crate-set build result")?;
+    println!();
+    Ok(())
+}
+
+fn verify_crate_set(arguments: CrateSetVerifyArgs) -> Result<()> {
+    let trusted_root = read_public_key_text(&arguments.trusted_root_public_key)
+        .context("read trusted root public key")?;
+    let metadata = CrateSetMetadata {
+        root: read_bounded_file(&arguments.root_document, METADATA_LIMIT)
+            .context("read root document")?,
+        manifest: read_bounded_file(&arguments.manifest, METADATA_LIMIT)
+            .context("read crate-set manifest")?,
+    };
+    let verified = verify_crate_set_metadata(
+        &metadata,
+        &CrateSetAuthority {
+            trusted_root_key: trusted_root,
+            registry: "crates-io".into(),
+            source_commit: arguments.source_commit.clone(),
+        },
+    )?;
+    verify_crate_package_inputs(&verified, &arguments.packages)?;
+    let result = json!({
+        "schema": "release-admin-crate-set-verify-v1",
+        "authority": CRATE_SET_AUTHORITY,
+        "source_commit": arguments.source_commit,
+        "registry": "crates-io",
+        "packages": verified.packages.len(),
+        "verified": true,
+    });
+    serde_json::to_writer(std::io::stdout().lock(), &result)
+        .context("write crate-set verification result")?;
+    println!();
+    Ok(())
+}
+
+fn crate_package_specs(values: &[String], source_commit: &str) -> Result<Vec<CratePackageSpec>> {
+    values
+        .iter()
+        .map(|value| {
+            let (name, version, path) = parse_crate_package_argument(value)?;
+            let bytes =
+                read_bounded_file(&path, CRATE_PACKAGE_LIMIT).context("read crate package")?;
+            validate_crate_archive_bytes(&bytes, &name, &version, source_commit)
+                .context("crate archive package identity is invalid")?;
+            Ok(CratePackageSpec {
+                name,
+                version,
+                length: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect()
+}
+
+fn verify_crate_package_inputs(
+    verified: &dev_tools_release::VerifiedCrateSet,
+    values: &[String],
+) -> Result<()> {
+    let mut supplied = BTreeMap::new();
+    for value in values {
+        let (name, version, path) = parse_crate_package_argument(value)?;
+        if supplied.insert(name.clone(), ()).is_some() {
+            bail!("crate package input is duplicated");
+        }
+        let bytes = read_bounded_file(&path, CRATE_PACKAGE_LIMIT).context("read crate package")?;
+        validate_crate_archive_bytes(&bytes, &name, &version, &verified.source_commit)
+            .context("crate archive package identity is invalid")?;
+        verify_crate_package_bytes(verified, &name, &version, &bytes)?;
+    }
+    if supplied.len() != verified.packages.len()
+        || verified
+            .packages
+            .keys()
+            .any(|name| !supplied.contains_key(name))
+    {
+        bail!("crate package inputs do not exactly match the authenticated set");
+    }
+    Ok(())
+}
+
+fn parse_crate_package_argument(value: &str) -> Result<(String, String, PathBuf)> {
+    let (identity, path) = value
+        .split_once('=')
+        .context("crate package must use NAME@VERSION=PATH")?;
+    let (name, version) = identity
+        .split_once('@')
+        .context("crate package must use NAME@VERSION=PATH")?;
+    let path = PathBuf::from(path);
+    if name.is_empty()
+        || version.is_empty()
+        || !path.is_absolute()
+        || path.extension().and_then(|part| part.to_str()) != Some("crate")
+    {
+        bail!("crate package must use NAME@VERSION=/absolute/PACKAGE.crate");
+    }
+    Ok((name.into(), version.into(), path))
+}
+
+fn validate_crate_archive_bytes(
+    bytes: &[u8],
+    expected_name: &str,
+    expected_version: &str,
+    expected_source_commit: &str,
+) -> Result<()> {
+    let root = format!("{expected_name}-{expected_version}");
+    let decoder = GzDecoder::new(Cursor::new(bytes));
+    let bounded_decoder = decoder.take(CRATE_ARCHIVE_EXPANDED_LIMIT + 1);
+    let mut archive = tar::Archive::new(bounded_decoder);
+    let mut cargo_manifest = None;
+    let mut vcs_info = None;
+    let mut entry_count = 0_usize;
+    let mut declared_size = 0_u64;
+    for entry in archive.entries().context("read crate archive entries")? {
+        let mut entry = entry.context("read crate archive entry")?;
+        entry_count = entry_count
+            .checked_add(1)
+            .context("crate archive entry count overflow")?;
+        if entry_count > CRATE_ARCHIVE_ENTRY_LIMIT || !entry.header().entry_type().is_file() {
+            bail!("crate archive contains an unsupported entry");
+        }
+        declared_size = declared_size
+            .checked_add(entry.size())
+            .context("crate archive expanded size overflow")?;
+        if declared_size > CRATE_ARCHIVE_EXPANDED_LIMIT {
+            bail!("crate archive exceeds its expanded size limit");
+        }
+        let path = entry.path().context("read crate archive entry path")?;
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::Normal(part)) if part == root.as_str())
+            || !components
+                .clone()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            bail!("crate archive entry escapes its package root");
+        }
+        let destination = match components.as_path().to_str() {
+            Some("Cargo.toml") => &mut cargo_manifest,
+            Some(".cargo_vcs_info.json") => &mut vcs_info,
+            _ => continue,
+        };
+        if destination.is_some() {
+            bail!("crate archive metadata entry is duplicated");
+        }
+        let mut value = Vec::new();
+        Read::by_ref(&mut entry)
+            .take(CRATE_METADATA_LIMIT + 1)
+            .read_to_end(&mut value)
+            .context("read crate archive metadata")?;
+        if value.len() as u64 > CRATE_METADATA_LIMIT {
+            bail!("crate archive metadata exceeds its size limit");
+        }
+        *destination = Some(value);
+    }
+    let mut bounded_decoder = archive.into_inner();
+    std::io::copy(&mut bounded_decoder, &mut std::io::sink())
+        .context("finish crate archive stream")?;
+    if bounded_decoder.limit() == 0
+        || bounded_decoder.into_inner().into_inner().position() != bytes.len() as u64
+    {
+        bail!("crate archive has trailing or excessive compressed data");
+    }
+    let manifest = cargo_manifest.context("crate archive has no normalized Cargo.toml")?;
+    let manifest = std::str::from_utf8(&manifest).context("crate Cargo.toml is not UTF-8")?;
+    let manifest: toml::Value = toml::from_str(manifest).context("parse crate Cargo.toml")?;
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .context("crate Cargo.toml has no package table")?;
+    if package.get("name").and_then(toml::Value::as_str) != Some(expected_name)
+        || package.get("version").and_then(toml::Value::as_str) != Some(expected_version)
+    {
+        bail!("crate archive package identity does not match its signed label");
+    }
+    let vcs: serde_json::Value =
+        serde_json::from_slice(&vcs_info.context("crate archive has no Cargo VCS identity")?)
+            .context("parse crate Cargo VCS identity")?;
+    let git = vcs
+        .get("git")
+        .and_then(serde_json::Value::as_object)
+        .context("crate Cargo VCS identity has no Git record")?;
+    if git.get("sha1").and_then(serde_json::Value::as_str) != Some(expected_source_commit)
+        || git
+            .get("dirty")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        bail!("crate archive source commit does not match its signed source");
+    }
     Ok(())
 }
 

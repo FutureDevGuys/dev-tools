@@ -20,6 +20,9 @@ use dev_tools_installation::{
 const METADATA_LIMIT: usize = 512 * 1024;
 const ARTIFACT_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_MANIFEST_ARTIFACTS: usize = 16;
+const CRATE_PACKAGE_LIMIT: usize = 10 * 1024 * 1024;
+const MAX_CRATE_SET_PACKAGES: usize = 64;
+pub const CRATE_SET_AUTHORITY: &str = "dev-tools-shared-crates";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseBundle {
@@ -180,12 +183,87 @@ struct ProductManifest {
     artifacts: BTreeMap<String, ArtifactIdentity>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CrateSetDocument {
+    schema: String,
+    authority: String,
+    generation: u64,
+    source_commit: String,
+    registry: String,
+    packages: BTreeMap<String, CratePackageIdentity>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CratePackageIdentity {
+    version: String,
+    length: u64,
+    sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsignedProductManifest {
     pub schema: String,
     pub product: String,
     pub generation: u64,
     pub version: Version,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedReleaseDocument {
+    pub schema: String,
+    pub authority: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CratePackageSpec {
+    pub name: String,
+    pub version: String,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateSetSpec {
+    pub generation: u64,
+    pub source_commit: String,
+    pub registry: String,
+    pub packages: Vec<CratePackageSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateSetMetadata {
+    pub root: Vec<u8>,
+    pub manifest: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateSetAuthority {
+    pub trusted_root_key: String,
+    pub registry: String,
+    pub source_commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCratePackage {
+    pub version: Version,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCrateSet {
+    pub root_generation: u64,
+    pub root_sha256: String,
+    pub manifest_generation: u64,
+    pub manifest_sha256: String,
+    pub schema: String,
+    pub authority: String,
+    pub source_commit: String,
+    pub registry: String,
+    pub packages: BTreeMap<String, VerifiedCratePackage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +352,46 @@ pub fn build_unsigned_product_manifest(spec: &ProductManifestSpec) -> Result<Vec
     };
     let bytes = serde_jcs::to_vec(&manifest).context("canonicalize product manifest")?;
     validate_unsigned_product_manifest(&bytes)?;
+    Ok(bytes)
+}
+
+/// Constructs a canonical authorization inventory of exact registry package bytes
+/// and their declared source identity.
+///
+/// This document authenticates what may be published; it does not perform the
+/// externally irreversible registry upload.
+pub fn build_unsigned_crate_set(spec: &CrateSetSpec) -> Result<Vec<u8>> {
+    if spec.generation == 0
+        || !valid_lower_hex(&spec.source_commit, 40)
+        || spec.registry != "crates-io"
+        || spec.packages.is_empty()
+        || spec.packages.len() > MAX_CRATE_SET_PACKAGES
+    {
+        bail!("crate-set specification is invalid");
+    }
+    let mut packages = BTreeMap::new();
+    for package in &spec.packages {
+        let identity = CratePackageIdentity {
+            version: package.version.clone(),
+            length: package.length,
+            sha256: package.sha256.clone(),
+        };
+        validate_crate_package_identity(&package.name, &identity)
+            .context("crate-set package identity is invalid")?;
+        if packages.insert(package.name.clone(), identity).is_some() {
+            bail!("crate-set package is duplicated");
+        }
+    }
+    let document = CrateSetDocument {
+        schema: "dev-tools-crate-set-v1".into(),
+        authority: CRATE_SET_AUTHORITY.into(),
+        generation: spec.generation,
+        source_commit: spec.source_commit.clone(),
+        registry: spec.registry.clone(),
+        packages,
+    };
+    let bytes = serde_jcs::to_vec(&document).context("canonicalize crate set")?;
+    validate_unsigned_crate_set(&bytes)?;
     Ok(bytes)
 }
 
@@ -391,6 +509,148 @@ pub fn validate_unsigned_product_manifest(input: &[u8]) -> Result<UnsignedProduc
         generation: manifest.generation,
         version,
     })
+}
+
+/// Validates any canonical document admitted by the release-signing operation
+/// and returns its policy authority without exposing schema-specific contents.
+pub fn validate_unsigned_release_document(input: &[u8]) -> Result<UnsignedReleaseDocument> {
+    require_bounded(input, METADATA_LIMIT, "unsigned release document")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(input).context("parse unsigned release document")?;
+    if serde_jcs::to_vec(&value).context("canonicalize unsigned release document")? != input {
+        bail!("unsigned release document is not canonical JSON");
+    }
+    match value.get("schema").and_then(serde_json::Value::as_str) {
+        Some("dev-tools-crate-set-v1") => {
+            let document = validate_unsigned_crate_set(input)?;
+            Ok(UnsignedReleaseDocument {
+                schema: document.schema,
+                authority: document.authority,
+                generation: document.generation,
+            })
+        }
+        Some(_) => {
+            let manifest = validate_unsigned_product_manifest(input)?;
+            Ok(UnsignedReleaseDocument {
+                schema: manifest.schema,
+                authority: manifest.product,
+                generation: manifest.generation,
+            })
+        }
+        None => bail!("unsigned release document has no schema"),
+    }
+}
+
+/// Authenticates a signed crate inventory against the release root and its exact
+/// declared source, registry, and policy authority.
+pub fn verify_crate_set_metadata(
+    metadata: &CrateSetMetadata,
+    authority: &CrateSetAuthority,
+) -> Result<VerifiedCrateSet> {
+    if authority.registry != "crates-io" || !valid_lower_hex(&authority.source_commit, 40) {
+        bail!("crate-set authority is invalid");
+    }
+    require_bounded(&metadata.root, METADATA_LIMIT, "root document")?;
+    require_bounded(&metadata.manifest, METADATA_LIMIT, "crate-set manifest")?;
+    let root = parse_and_verify_root(&metadata.root, &authority.trusted_root_key)?;
+    let envelope: SignedEnvelope<CrateSetDocument> =
+        serde_json::from_slice(&metadata.manifest).context("parse signed crate set")?;
+    verify_release_signature(&envelope, &root.signed)?;
+    let canonical = serde_jcs::to_vec(&envelope.signed).context("canonicalize signed crate set")?;
+    let document = validate_unsigned_crate_set(&canonical)?;
+    if document.authority != CRATE_SET_AUTHORITY
+        || document.registry != authority.registry
+        || document.source_commit != authority.source_commit
+    {
+        bail!("signed crate set is outside the selected authority");
+    }
+    let packages = document
+        .packages
+        .into_iter()
+        .map(|(name, identity)| {
+            let version =
+                Version::parse(&identity.version).context("parse crate package version")?;
+            Ok((
+                name,
+                VerifiedCratePackage {
+                    version,
+                    length: identity.length,
+                    sha256: identity.sha256,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(VerifiedCrateSet {
+        root_generation: root.signed.generation,
+        root_sha256: sha256_hex(&metadata.root),
+        manifest_generation: document.generation,
+        manifest_sha256: sha256_hex(&metadata.manifest),
+        schema: document.schema,
+        authority: document.authority,
+        source_commit: document.source_commit,
+        registry: document.registry,
+        packages,
+    })
+}
+
+/// Verifies exact package bytes against one authenticated crate-set entry.
+pub fn verify_crate_package_bytes(
+    set: &VerifiedCrateSet,
+    name: &str,
+    version: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    require_bounded(bytes, CRATE_PACKAGE_LIMIT, "crate package")?;
+    let package = set
+        .packages
+        .get(name)
+        .context("crate package is absent from the authenticated set")?;
+    if package.version.to_string() != version
+        || package.length != bytes.len() as u64
+        || package.sha256 != sha256_hex(bytes)
+    {
+        bail!("crate package bytes do not match the authenticated set");
+    }
+    Ok(())
+}
+
+fn validate_unsigned_crate_set(input: &[u8]) -> Result<CrateSetDocument> {
+    require_bounded(input, METADATA_LIMIT, "unsigned crate set")?;
+    let document: CrateSetDocument =
+        serde_json::from_slice(input).context("parse unsigned crate set")?;
+    if serde_jcs::to_vec(&document).context("canonicalize unsigned crate set")? != input {
+        bail!("unsigned crate set is not canonical JSON");
+    }
+    if document.schema != "dev-tools-crate-set-v1"
+        || document.authority != CRATE_SET_AUTHORITY
+        || document.generation == 0
+        || !valid_lower_hex(&document.source_commit, 40)
+        || document.registry != "crates-io"
+        || document.packages.is_empty()
+        || document.packages.len() > MAX_CRATE_SET_PACKAGES
+    {
+        bail!("unsigned crate set has an unsupported contract");
+    }
+    for (name, identity) in &document.packages {
+        validate_crate_package_identity(name, identity)
+            .context("unsigned crate-set package identity is invalid")?;
+    }
+    Ok(document)
+}
+
+fn validate_crate_package_identity(name: &str, identity: &CratePackageIdentity) -> Result<()> {
+    if !valid_product_id(name)
+        || identity.length == 0
+        || identity.length > CRATE_PACKAGE_LIMIT as u64
+        || !valid_lower_hex(&identity.sha256, 64)
+    {
+        bail!("crate package identity is invalid");
+    }
+    let version = Version::parse(&identity.version).context("parse crate package version")?;
+    if !version.pre.is_empty() || version.to_string() != identity.version {
+        bail!("crate package version is not canonical stable semantic version");
+    }
+    Ok(())
 }
 
 pub fn verify_release_bytes(
@@ -1109,8 +1369,8 @@ fn native_artifact_name(product: &str, version: &str, target: &str) -> String {
     format!("{product}-{version}-{target}{executable_suffix}")
 }
 
-fn verify_release_signature(
-    manifest: &SignedEnvelope<ProductManifest>,
+fn verify_release_signature<T: Serialize>(
+    manifest: &SignedEnvelope<T>,
     root: &RootDocument,
 ) -> Result<()> {
     let canonical = serde_jcs::to_vec(&manifest.signed).context("canonicalize release manifest")?;

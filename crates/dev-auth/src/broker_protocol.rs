@@ -390,7 +390,7 @@ fn validate_request_envelope(request: &BrokerRequestEnvelope) -> Result<()> {
         } => {
             validate_resource_component(profile, "release-signing profile")?;
             dev_tools_release::parse_release_public_key(release_public_key)?;
-            dev_tools_release::validate_unsigned_product_manifest(payload)?;
+            dev_tools_release::validate_unsigned_release_document(payload)?;
             Ok(())
         }
     }

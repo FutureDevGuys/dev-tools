@@ -1051,8 +1051,8 @@ fn session_response(
             ..
         } => match session.authority.release_signing.as_ref() {
             Some(grant) if grant.public_key == release_public_key => {
-                match dev_tools_release::validate_unsigned_product_manifest(&payload) {
-                    Ok(manifest) if grant.products.contains(&manifest.product) => match backend
+                match dev_tools_release::validate_unsigned_release_document(&payload) {
+                    Ok(document) if grant.products.contains(&document.authority) => match backend
                         .sign_release_manifest(operation, &session.session_id, grant, &payload)
                     {
                         Ok(signature) => BrokerResponse::Signature { signature },
@@ -1166,8 +1166,8 @@ fn request_audit_record<'a>(
             release_public_key,
             payload,
         } => {
-            let product = dev_tools_release::validate_unsigned_product_manifest(payload)
-                .map(|manifest| manifest.product)
+            let product = dev_tools_release::validate_unsigned_release_document(payload)
+                .map(|document| document.authority)
                 .unwrap_or_else(|_| "invalid".into());
             (
                 "release_manifest_signing",
@@ -1361,8 +1361,8 @@ fn session_authorizes(
                     .as_ref()
                     .is_some_and(|grant| {
                         grant.public_key == *release_public_key
-                            && dev_tools_release::validate_unsigned_product_manifest(payload)
-                                .is_ok_and(|manifest| grant.products.contains(&manifest.product))
+                            && dev_tools_release::validate_unsigned_release_document(payload)
+                                .is_ok_and(|document| grant.products.contains(&document.authority))
                     })
         }
     }
@@ -2436,6 +2436,40 @@ mod tests {
         assert_eq!(
             session_response(&provider_operation(), &session, request(), &SigningBackend).unwrap(),
             BrokerResponse::Signature { signature: payload }
+        );
+
+        let crate_set = serde_jcs::to_vec(&serde_json::json!({
+            "schema": "dev-tools-crate-set-v1",
+            "authority": "dev-tools-shared-crates",
+            "generation": 1,
+            "source_commit": "a".repeat(40),
+            "registry": "crates-io",
+            "packages": {"dev-tools-command": {
+                "version": "0.1.0",
+                "length": 42,
+                "sha256": "b".repeat(64),
+            }}
+        }))
+        .unwrap();
+        session.authority.release_signing.as_mut().unwrap().products =
+            vec!["dev-tools-shared-crates".into()];
+        let crate_request = BrokerRequest::SignReleaseManifest {
+            profile: "release".into(),
+            release_public_key: "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072"
+                .into(),
+            payload: crate_set.clone(),
+        };
+        assert_eq!(
+            session_response(
+                &provider_operation(),
+                &session,
+                crate_request,
+                &SigningBackend
+            )
+            .unwrap(),
+            BrokerResponse::Signature {
+                signature: crate_set
+            }
         );
     }
 

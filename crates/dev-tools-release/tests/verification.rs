@@ -1,10 +1,12 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dev_tools_release::{
-    accept_verified_release, build_signed_envelope, build_unsigned_product_manifest,
-    build_unsigned_root_document, fetch_https, release_key_id, root_key_id,
-    select_stable_release_assets, validate_unsigned_product_manifest, verify_artifact_bytes,
-    verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy, EnvelopeSignature,
+    accept_verified_release, build_signed_envelope, build_unsigned_crate_set,
+    build_unsigned_product_manifest, build_unsigned_root_document, fetch_https, release_key_id,
+    root_key_id, select_stable_release_assets, validate_unsigned_product_manifest,
+    validate_unsigned_release_document, verify_artifact_bytes, verify_crate_package_bytes,
+    verify_crate_set_metadata, verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy,
+    CratePackageSpec, CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature,
     HttpsPolicy, ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseBundle,
     ReleaseMetadata, ReleaseState, RootDocumentSpec, RootReleaseKey,
 };
@@ -111,6 +113,130 @@ fn shared_builder_is_the_canonical_source_bound_manifest_authority() {
         ],
     };
     assert!(build_unsigned_product_manifest(&duplicate).is_err());
+}
+
+#[test]
+fn crate_set_builder_and_verifier_bind_exact_packages_to_reviewed_source() {
+    let root_key = SigningKey::from_bytes(&[7; 32]);
+    let release_key = SigningKey::from_bytes(&[9; 32]);
+    let release_id = release_key_id(&hex(&release_key.verifying_key().to_bytes())).unwrap();
+    let unsigned_root = build_unsigned_root_document(&RootDocumentSpec {
+        generation: 4,
+        release_keys: vec![RootReleaseKey {
+            public_key: hex(&release_key.verifying_key().to_bytes()),
+            revoked: false,
+        }],
+    })
+    .unwrap();
+    let root = build_signed_envelope(
+        &unsigned_root,
+        &[EnvelopeSignature {
+            key_id: root_key_id(&hex(&root_key.verifying_key().to_bytes())).unwrap(),
+            signature: root_key.sign(&unsigned_root).to_bytes().to_vec(),
+        }],
+    )
+    .unwrap();
+    let command = b"command crate bytes";
+    let product = b"product crate bytes";
+    let source_commit = "a".repeat(40);
+    let unsigned = build_unsigned_crate_set(&CrateSetSpec {
+        generation: 1,
+        source_commit: source_commit.clone(),
+        registry: "crates-io".into(),
+        packages: vec![
+            CratePackageSpec {
+                name: "dev-tools-product".into(),
+                version: "0.1.0".into(),
+                length: product.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(product)),
+            },
+            CratePackageSpec {
+                name: "dev-tools-command".into(),
+                version: "0.1.0".into(),
+                length: command.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(command)),
+            },
+        ],
+    })
+    .unwrap();
+    assert_eq!(
+        unsigned,
+        format!(
+            "{{\"authority\":\"dev-tools-shared-crates\",\"generation\":1,\"packages\":{{\"dev-tools-command\":{{\"length\":{},\"sha256\":\"{:x}\",\"version\":\"0.1.0\"}},\"dev-tools-product\":{{\"length\":{},\"sha256\":\"{:x}\",\"version\":\"0.1.0\"}}}},\"registry\":\"crates-io\",\"schema\":\"dev-tools-crate-set-v1\",\"source_commit\":\"{}\"}}",
+            command.len(),
+            Sha256::digest(command),
+            product.len(),
+            Sha256::digest(product),
+            source_commit
+        )
+        .as_bytes()
+    );
+    let identity = validate_unsigned_release_document(&unsigned).unwrap();
+    assert_eq!(identity.authority, "dev-tools-shared-crates");
+    assert_eq!(identity.schema, "dev-tools-crate-set-v1");
+    let manifest = build_signed_envelope(
+        &unsigned,
+        &[EnvelopeSignature {
+            key_id: release_id,
+            signature: release_key.sign(&unsigned).to_bytes().to_vec(),
+        }],
+    )
+    .unwrap();
+    let verified = verify_crate_set_metadata(
+        &CrateSetMetadata { root, manifest },
+        &CrateSetAuthority {
+            trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
+            registry: "crates-io".into(),
+            source_commit: source_commit.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(verified.packages.len(), 2);
+    verify_crate_package_bytes(&verified, "dev-tools-command", "0.1.0", command).unwrap();
+    assert!(verify_crate_package_bytes(&verified, "dev-tools-command", "0.1.0", product).is_err());
+}
+
+#[test]
+fn crate_set_contract_rejects_duplicates_prereleases_and_unknown_documents() {
+    let package = CratePackageSpec {
+        name: "dev-tools-command".into(),
+        version: "0.1.0".into(),
+        length: 3,
+        sha256: "b".repeat(64),
+    };
+    let mut duplicate = package.clone();
+    duplicate.sha256 = "c".repeat(64);
+    assert!(build_unsigned_crate_set(&CrateSetSpec {
+        generation: 1,
+        source_commit: "a".repeat(40),
+        registry: "crates-io".into(),
+        packages: vec![package.clone(), duplicate],
+    })
+    .is_err());
+    let mut prerelease = package;
+    prerelease.version = "0.1.0-alpha.1".into();
+    assert!(build_unsigned_crate_set(&CrateSetSpec {
+        generation: 1,
+        source_commit: "a".repeat(40),
+        registry: "crates-io".into(),
+        packages: vec![prerelease],
+    })
+    .is_err());
+    let wrong_authority = serde_jcs::to_vec(&json!({
+        "schema": "dev-tools-crate-set-v1",
+        "authority": "dev-auth",
+        "generation": 1,
+        "source_commit": "a".repeat(40),
+        "registry": "crates-io",
+        "packages": {"dev-tools-command": {
+            "version": "0.1.0",
+            "length": 3,
+            "sha256": "b".repeat(64),
+        }},
+    }))
+    .unwrap();
+    assert!(validate_unsigned_release_document(&wrong_authority).is_err());
+    assert!(validate_unsigned_release_document(br#"{\"schema\":\"unknown\"}"#).is_err());
 }
 
 #[test]

@@ -17,17 +17,17 @@ python scripts/build-root-document.py \
   --output /run/user/$(id -u)/dev-tools-signing/dev-tools-root.json
 ```
 
-Routine release construction uses one clean-checkout recipe with the signed public root document. A verified dev-auth workload can ask its broker to sign the canonical manifest with an authorized profile; the profile name is deployment-defined (`publish` is illustrative below, while this repository's workstation deployment uses `source-maintenance`). Only the public release-key identifier is supplied to the builder, while the private key remains behind the broker's 1Password boundary. Release signing is a distinct opt-in authority: the administrator cap lists exact `release_signing_products`, the user profile narrows that list and declares a separate raw Ed25519 `release_signing_key`, and Git signing or SSH authentication grants cannot satisfy a release request. During migration the broker validates canonical stable `dev-tools-product-v1`, `dev-auth-product-v2`, and `dev-tools-product-v2` payloads, but new releases use only shared v2 and remain limited to products in the session grant.
+Routine release construction uses one clean-checkout recipe with the signed public root document. A verified dev-auth workload can ask its broker to sign a canonical release document with an authorized profile; the profile name is deployment-defined (`publish` is illustrative below, while this repository's workstation deployment uses `source-maintenance`). Only the public release-key identifier is supplied to the builder, while the private key remains behind the broker's 1Password boundary. Release signing is a distinct opt-in authority: the administrator cap lists exact `release_signing_products`, the user profile narrows that list and declares a separate raw Ed25519 `release_signing_key`, and Git signing or SSH authentication grants cannot satisfy a release request. During migration the broker validates canonical stable `dev-tools-product-v1`, `dev-auth-product-v2`, `dev-tools-product-v2`, and `dev-tools-crate-set-v1` payloads. Binary releases use only shared product v2; shared-crate publication uses the independently granted `dev-tools-shared-crates` namespace.
 
 ```toml
 # administrator policy
 [authority_caps.release]
-release_signing_products = ["dev-auth", "update-all", "sync-configs"]
+release_signing_products = ["dev-auth", "update-all", "sync-configs", "dev-tools-shared-crates"]
 release_signing_keys = [{ private_key_ref = "op://Automation/dev-tools release signing key/private key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }]
 
 # native user's config-v2.toml
 [authority_profiles.publish]
-release_signing_products = ["dev-auth", "update-all", "sync-configs"]
+release_signing_products = ["dev-auth", "update-all", "sync-configs", "dev-tools-shared-crates"]
 release_signing_key = { private_key_ref = "op://Automation/dev-tools release signing key/private key", public_key = "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072" }
 ```
 

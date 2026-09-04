@@ -5,10 +5,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 #[cfg(unix)]
 use dev_tools_release::{
-    build_signed_envelope, build_unsigned_product_manifest, build_unsigned_root_document,
-    release_key_id, root_key_id, verify_release_bytes, verify_root_bytes, ArtifactUrlPolicy,
-    EnvelopeSignature, ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseBundle,
-    RootDocumentSpec, RootReleaseKey,
+    build_signed_envelope, build_unsigned_crate_set, build_unsigned_product_manifest,
+    build_unsigned_root_document, release_key_id, root_key_id, verify_crate_package_bytes,
+    verify_crate_set_metadata, verify_release_bytes, verify_root_bytes, ArtifactUrlPolicy,
+    CratePackageSpec, CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature,
+    ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseBundle, RootDocumentSpec,
+    RootReleaseKey,
 };
 #[cfg(unix)]
 use ed25519_dalek::{Signer, SigningKey};
@@ -55,10 +57,198 @@ fn help_exposes_only_native_typed_release_operations() {
         .success()
         .stdout(predicate::str::contains("root"))
         .stdout(predicate::str::contains("manifest"))
+        .stdout(predicate::str::contains("crate-set"))
         .stdout(predicate::str::contains("set"))
         .stdout(predicate::str::contains("publish"))
         .stdout(predicate::str::contains("verify"))
         .stdout(predicate::str::contains("build-info"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crate_set_build_and_verify_use_one_operation_only_signer_and_exact_package_bytes() {
+    let root = tempfile::tempdir().expect("root");
+    let root_key = SigningKey::from_bytes(&[7; 32]);
+    let release_key = SigningKey::from_bytes(&[9; 32]);
+    let release_id = release_key_id(&hex(&release_key.verifying_key().to_bytes())).unwrap();
+    let unsigned_root = build_unsigned_root_document(&RootDocumentSpec {
+        generation: 1,
+        release_keys: vec![RootReleaseKey {
+            public_key: hex(&release_key.verifying_key().to_bytes()),
+            revoked: false,
+        }],
+    })
+    .unwrap();
+    let root_document = build_signed_envelope(
+        &unsigned_root,
+        &[EnvelopeSignature {
+            key_id: root_key_id(&hex(&root_key.verifying_key().to_bytes())).unwrap(),
+            signature: root_key.sign(&unsigned_root).to_bytes().to_vec(),
+        }],
+    )
+    .unwrap();
+    let root_path = root.path().join("root.json");
+    fs::write(&root_path, &root_document).unwrap();
+    let trusted_root = root.path().join("root-public-key.txt");
+    fs::write(
+        &trusted_root,
+        format!("{}\n", hex(&root_key.verifying_key().to_bytes())),
+    )
+    .unwrap();
+    let source_commit = "d".repeat(40);
+    let package = root.path().join("dev-tools-command-0.1.0.crate");
+    write_crate_archive(
+        &package,
+        "dev-tools-command",
+        "0.1.0",
+        &source_commit,
+        b"pub fn command() {}\n",
+    );
+    let package_bytes = fs::read(&package).unwrap();
+    let unsigned = build_unsigned_crate_set(&CrateSetSpec {
+        generation: 1,
+        source_commit: source_commit.clone(),
+        registry: "crates-io".into(),
+        packages: vec![CratePackageSpec {
+            name: "dev-tools-command".into(),
+            version: "0.1.0".into(),
+            length: package_bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&package_bytes)),
+        }],
+    })
+    .unwrap();
+    let signature = BASE64.encode(release_key.sign(&unsigned).to_bytes());
+    let signer_marker = root.path().join("signer-count");
+    let signer = root.path().join("signer");
+    fs::write(
+        &signer,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = sign-release-manifest ] || exit 2\n[ \"$2\" = --profile ] || exit 2\n[ \"$3\" = source-maintenance ] || exit 2\ncat >/dev/null\nprintf x >> '{}'\nprintf '%s\\n' '{}'\n",
+            signer_marker.display(), signature
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&signer, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = root.path().join("shared-crates.json");
+    let package_argument = format!("dev-tools-command@0.1.0={}", package.display());
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "build"])
+        .args(["--source-commit", &source_commit, "--generation", "1"])
+        .args(["--package", &package_argument])
+        .args(["--root-document", root_path.to_str().unwrap()])
+        .args(["--trusted-root-public-key", trusted_root.to_str().unwrap()])
+        .args(["--release-key-id", &release_id])
+        .args(["--signer", signer.to_str().unwrap()])
+        .args(["--signer-profile", "source-maintenance"])
+        .args(["--output", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr("");
+    assert_eq!(fs::read(&signer_marker).unwrap(), b"x");
+
+    let verified = verify_crate_set_metadata(
+        &CrateSetMetadata {
+            root: root_document,
+            manifest: fs::read(&output).unwrap(),
+        },
+        &CrateSetAuthority {
+            trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
+            registry: "crates-io".into(),
+            source_commit: source_commit.clone(),
+        },
+    )
+    .unwrap();
+    verify_crate_package_bytes(
+        &verified,
+        "dev-tools-command",
+        "0.1.0",
+        &fs::read(&package).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "verify"])
+        .args(["--source-commit", &source_commit])
+        .args(["--package", &package_argument])
+        .args(["--root-document", root_path.to_str().unwrap()])
+        .args(["--manifest", output.to_str().unwrap()])
+        .args(["--trusted-root-public-key", trusted_root.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"packages\":1"))
+        .stderr("");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn crate_set_build_rejects_mislabeled_archive_before_invoking_the_signer() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("dev-tools-command-0.1.0.crate");
+    let source_commit = "d".repeat(40);
+    write_crate_archive(
+        &package,
+        "different-package",
+        "0.1.0",
+        &source_commit,
+        b"pub fn wrong() {}\n",
+    );
+    let signer = root.path().join("signer");
+    let marker = root.path().join("signer-ran");
+    fs::write(
+        &signer,
+        format!("#!/bin/sh\ntouch '{}'\nexit 2\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&signer, fs::Permissions::from_mode(0o755)).unwrap();
+    let root_key = SigningKey::from_bytes(&[7; 32]);
+    let release_key = SigningKey::from_bytes(&[9; 32]);
+    let release_id = release_key_id(&hex(&release_key.verifying_key().to_bytes())).unwrap();
+    let unsigned_root = build_unsigned_root_document(&RootDocumentSpec {
+        generation: 1,
+        release_keys: vec![RootReleaseKey {
+            public_key: hex(&release_key.verifying_key().to_bytes()),
+            revoked: false,
+        }],
+    })
+    .unwrap();
+    let root_document = build_signed_envelope(
+        &unsigned_root,
+        &[EnvelopeSignature {
+            key_id: root_key_id(&hex(&root_key.verifying_key().to_bytes())).unwrap(),
+            signature: root_key.sign(&unsigned_root).to_bytes().to_vec(),
+        }],
+    )
+    .unwrap();
+    let root_path = root.path().join("root.json");
+    fs::write(&root_path, root_document).unwrap();
+    let trusted_root = root.path().join("root-public-key.txt");
+    fs::write(
+        &trusted_root,
+        format!("{}\n", hex(&root_key.verifying_key().to_bytes())),
+    )
+    .unwrap();
+
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["crate-set", "build"])
+        .args(["--source-commit", &source_commit, "--generation", "1"])
+        .args([
+            "--package",
+            &format!("dev-tools-command@0.1.0={}", package.display()),
+        ])
+        .args(["--root-document", root_path.to_str().unwrap()])
+        .args(["--trusted-root-public-key", trusted_root.to_str().unwrap()])
+        .args(["--release-key-id", &release_id])
+        .args(["--signer", signer.to_str().unwrap()])
+        .args(["--signer-profile", "source-maintenance"])
+        .args(["--output", root.path().join("set.json").to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("crate archive package identity"));
+    assert!(!marker.exists());
 }
 
 #[cfg(unix)]
@@ -461,4 +651,33 @@ fn manifest_artifact(
         length: bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(bytes)),
     }
+}
+
+#[cfg(unix)]
+fn write_crate_archive(
+    path: &std::path::Path,
+    name: &str,
+    version: &str,
+    source_commit: &str,
+    source: &[u8],
+) {
+    let file = fs::File::create(path).unwrap();
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let root = format!("{name}-{version}");
+    let manifest =
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
+    let vcs = format!("{{\"git\":{{\"sha1\":\"{source_commit}\"}}}}");
+    for (entry_path, bytes) in [
+        (format!("{root}/Cargo.toml"), manifest.as_bytes()),
+        (format!("{root}/.cargo_vcs_info.json"), vcs.as_bytes()),
+        (format!("{root}/src/lib.rs"), source),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive.append_data(&mut header, entry_path, bytes).unwrap();
+    }
+    archive.into_inner().unwrap().finish().unwrap();
 }

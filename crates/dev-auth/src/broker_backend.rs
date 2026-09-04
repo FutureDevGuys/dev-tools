@@ -710,11 +710,11 @@ impl CapabilityBackend for SystemCapabilityBackend {
         payload: &[u8],
     ) -> Result<Vec<u8>> {
         operation.checkpoint()?;
-        let manifest = dev_tools_release::validate_unsigned_product_manifest(payload)?;
-        if !grant.products.contains(&manifest.product) {
+        let document = dev_tools_release::validate_unsigned_release_document(payload)?;
+        if !grant.products.contains(&document.authority) {
             bail!("release manifest product is outside the session grant");
         }
-        let service_token = self.validate_release_signing_grant(grant, &manifest.product)?;
+        let service_token = self.validate_release_signing_grant(grant, &document.authority)?;
         broker_sign_release_manifest_bytes(
             operation,
             &self.policy.programs.op,
