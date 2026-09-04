@@ -3,10 +3,11 @@ use crate::linux_admission::{
     SessionGitHubGrant, SessionOperationKeyGrant, SessionReleaseSigningGrant,
 };
 use crate::policy_v2::{SystemMode, SystemPolicyV2};
+use crate::provider_operation::ProviderOperation;
 use crate::runtime::{
     broker_github_token_for_repositories, broker_github_token_for_repository,
-    broker_revoke_github_token, broker_sign_release_manifest_bytes, broker_sign_ssh,
-    BrokerGitHubAuthority, BrokerGitHubToken,
+    broker_revoke_github_token_with_timeout, broker_sign_release_manifest_bytes, broker_sign_ssh,
+    BrokerGitHubAuthority, BrokerGitHubToken, GITHUB_API_TIMEOUT,
 };
 use crate::SecretString;
 use anyhow::{bail, Context, Result};
@@ -17,11 +18,13 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 const CREDENTIAL_LIMIT: u64 = 64 * 1024;
 const TOKEN_REFRESH_MARGIN_SECONDS: i64 = 300;
 const SERVICE_CREDENTIAL_PREFIX: &str = "op-service-account-token_";
+pub(crate) const SESSION_CLEANUP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn repository_cache_key(
     session_id: &str,
@@ -45,16 +48,23 @@ fn repository_cache_key(
 pub(crate) trait CapabilityBackend: Send + Sync {
     fn github_token(
         &self,
+        operation: &ProviderOperation<'_>,
         session_id: &str,
         grant: &SessionGitHubGrant,
         owner: &str,
         repository: &str,
     ) -> Result<BrokerGitHubToken>;
 
-    fn gh_token(&self, session_id: &str, grant: &SessionGitHubGrant) -> Result<BrokerGitHubToken>;
+    fn gh_token(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session_id: &str,
+        grant: &SessionGitHubGrant,
+    ) -> Result<BrokerGitHubToken>;
 
     fn invalidate_github_token(
         &self,
+        operation: &ProviderOperation<'_>,
         session_id: &str,
         grant: &SessionGitHubGrant,
         owner: &str,
@@ -63,6 +73,7 @@ pub(crate) trait CapabilityBackend: Send + Sync {
 
     fn sign_ssh(
         &self,
+        operation: &ProviderOperation<'_>,
         session_id: &str,
         purpose: SshOperationPurpose,
         grant: &SessionOperationKeyGrant,
@@ -71,24 +82,132 @@ pub(crate) trait CapabilityBackend: Send + Sync {
 
     fn sign_release_manifest(
         &self,
+        operation: &ProviderOperation<'_>,
         session_id: &str,
         grant: &SessionReleaseSigningGrant,
         payload: &[u8],
     ) -> Result<Vec<u8>>;
 
     fn revoke_session(&self, session_id: &str) -> Result<()>;
+
+    fn revoke_session_before(&self, session_id: &str, deadline: Instant) -> Result<()> {
+        if deadline <= Instant::now() {
+            bail!("session cleanup deadline elapsed");
+        }
+        self.revoke_session(session_id)
+    }
 }
 
+#[derive(Clone)]
 struct CachedToken {
+    generation: u64,
+    scope_key: String,
     session_id: String,
     token: SecretString,
     expires_at: i64,
 }
 
+#[derive(Default)]
+struct TokenCache {
+    active: BTreeMap<String, CachedToken>,
+    pending_revocation: BTreeMap<u64, CachedToken>,
+    next_generation: u64,
+}
+
+#[derive(Clone)]
+enum CachedTokenLocation {
+    Active { key: String, generation: u64 },
+    Pending { generation: u64 },
+}
+
+#[derive(Clone)]
+struct CachedTokenRevocation {
+    location: CachedTokenLocation,
+    token: SecretString,
+}
+
+impl TokenCache {
+    fn next_generation(&mut self) -> Result<u64> {
+        let generation = self.next_generation;
+        self.next_generation = generation
+            .checked_add(1)
+            .context("broker token cache generation overflowed")?;
+        Ok(generation)
+    }
+
+    fn session_revocations(&self, session_id: &str) -> Vec<CachedTokenRevocation> {
+        let active = self
+            .active
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(key, entry)| CachedTokenRevocation {
+                location: CachedTokenLocation::Active {
+                    key: key.clone(),
+                    generation: entry.generation,
+                },
+                token: entry.token.clone(),
+            });
+        let pending = self
+            .pending_revocation
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(generation, entry)| CachedTokenRevocation {
+                location: CachedTokenLocation::Pending {
+                    generation: *generation,
+                },
+                token: entry.token.clone(),
+            });
+        active.chain(pending).collect()
+    }
+
+    fn scope_revocations(&self, session_id: &str, key: &str) -> Vec<CachedTokenRevocation> {
+        let active = self
+            .active
+            .get(key)
+            .filter(|entry| entry.session_id == session_id)
+            .map(|entry| CachedTokenRevocation {
+                location: CachedTokenLocation::Active {
+                    key: key.to_owned(),
+                    generation: entry.generation,
+                },
+                token: entry.token.clone(),
+            });
+        let pending = self
+            .pending_revocation
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id && entry.scope_key == key)
+            .map(|(generation, entry)| CachedTokenRevocation {
+                location: CachedTokenLocation::Pending {
+                    generation: *generation,
+                },
+                token: entry.token.clone(),
+            });
+        active.into_iter().chain(pending).collect()
+    }
+
+    fn remove_revoked(&mut self, location: &CachedTokenLocation) {
+        match location {
+            CachedTokenLocation::Active { key, generation } => {
+                if self
+                    .active
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == *generation)
+                {
+                    self.active.remove(key);
+                }
+                self.pending_revocation.remove(generation);
+            }
+            CachedTokenLocation::Pending { generation } => {
+                self.pending_revocation.remove(generation);
+            }
+        }
+    }
+}
+
 pub(crate) struct SystemCapabilityBackend {
     policy: SystemPolicyV2,
     service_tokens: BTreeMap<String, SecretString>,
-    cache: Mutex<BTreeMap<String, CachedToken>>,
+    cache: Mutex<TokenCache>,
 }
 
 impl SystemCapabilityBackend {
@@ -109,7 +228,7 @@ impl SystemCapabilityBackend {
                 policy.credential_slots.keys().map(String::as_str),
             )?,
             policy,
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(TokenCache::default()),
         })
     }
 
@@ -122,7 +241,7 @@ impl SystemCapabilityBackend {
         Ok(Self {
             policy,
             service_tokens,
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(TokenCache::default()),
         })
     }
 
@@ -275,61 +394,215 @@ impl SystemCapabilityBackend {
         self.service_token(&grant.credential_slot)
     }
 
-    fn cached(&self, key: &str, now: i64) -> Result<Option<BrokerGitHubToken>> {
+    fn cached(
+        &self,
+        operation: &ProviderOperation<'_>,
+        key: &str,
+        now: i64,
+    ) -> Result<Option<BrokerGitHubToken>> {
+        operation.checkpoint()?;
         let cache = self
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?;
-        Ok(cache.get(key).and_then(|entry| {
+        let token = cache.active.get(key).and_then(|entry| {
             (entry.expires_at > now + TOKEN_REFRESH_MARGIN_SECONDS).then(|| BrokerGitHubToken {
                 token: entry.token.clone(),
                 expires_at: entry.expires_at,
             })
-        }))
+        });
+        drop(cache);
+        if token.is_some() {
+            operation.checkpoint()?;
+        }
+        Ok(token)
     }
 
-    fn cache(&self, session_id: &str, key: String, token: &BrokerGitHubToken) -> Result<()> {
-        let replaced = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
-            .insert(
-                key,
-                CachedToken {
-                    session_id: session_id.to_owned(),
-                    token: token.token.clone(),
-                    expires_at: token.expires_at,
-                },
-            );
-        if let Some(replaced) = replaced {
-            broker_revoke_github_token(&replaced.token)?;
+    fn cache(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session_id: &str,
+        key: String,
+        token: &BrokerGitHubToken,
+    ) -> Result<()> {
+        self.cache_with(
+            session_id,
+            key,
+            token,
+            || operation.checkpoint(),
+            |replaced| {
+                operation.checkpoint()?;
+                broker_revoke_github_token_with_timeout(replaced, operation.http_timeout()?)
+            },
+        )
+    }
+
+    fn cache_with(
+        &self,
+        session_id: &str,
+        key: String,
+        token: &BrokerGitHubToken,
+        mut checkpoint: impl FnMut() -> Result<()>,
+        mut revoke: impl FnMut(&SecretString) -> Result<()>,
+    ) -> Result<()> {
+        let replaced = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?;
+            let generation = cache.next_generation()?;
+            let scope_key = key.clone();
+            let entry = CachedToken {
+                generation,
+                scope_key,
+                session_id: session_id.to_owned(),
+                token: token.token.clone(),
+                expires_at: token.expires_at,
+            };
+            if let Err(error) = checkpoint() {
+                // The provider may already have created this token. It must
+                // remain session-owned even though cancellation prevents
+                // publication, so close cleanup can revoke it before ack.
+                cache.pending_revocation.insert(generation, entry);
+                return Err(error);
+            }
+            let replaced = cache.active.insert(key, entry);
+            replaced.map(|entry| {
+                let generation = entry.generation;
+                let token = entry.token.clone();
+                cache.pending_revocation.insert(generation, entry);
+                (generation, token)
+            })
+        };
+        if let Some((generation, replaced)) = replaced {
+            revoke(&replaced)?;
+            self.cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
+                .pending_revocation
+                .remove(&generation);
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn take_cached(&self, key: &str) -> Result<Option<CachedToken>> {
         self.cache
             .lock()
             .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))
-            .map(|mut cache| cache.remove(key))
+            .map(|mut cache| cache.active.remove(key))
+    }
+
+    #[cfg(test)]
+    fn active_revocation(&self, key: &str) -> Result<Option<CachedTokenRevocation>> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?;
+        Ok(cache.active.get(key).map(|entry| CachedTokenRevocation {
+            location: CachedTokenLocation::Active {
+                key: key.to_owned(),
+                generation: entry.generation,
+            },
+            token: entry.token.clone(),
+        }))
+    }
+
+    fn remove_revoked(&self, location: &CachedTokenLocation) -> Result<()> {
+        self.cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
+            .remove_revoked(location);
+        Ok(())
+    }
+
+    fn invalidate_scope_with(
+        &self,
+        session_id: &str,
+        key: &str,
+        mut revoke: impl FnMut(&SecretString) -> Result<()>,
+    ) -> Result<()> {
+        let tokens = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
+            .scope_revocations(session_id, key);
+        let mut failed = false;
+        for entry in tokens {
+            match revoke(&entry.token) {
+                Ok(()) => self.remove_revoked(&entry.location)?,
+                Err(_) => failed = true,
+            }
+        }
+        let retained = !self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
+            .scope_revocations(session_id, key)
+            .is_empty();
+        if failed || retained {
+            bail!("one or more scoped GitHub tokens could not be revoked");
+        }
+        Ok(())
+    }
+
+    fn revoke_session_before_with(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+        mut now: impl FnMut() -> Instant,
+        mut revoke: impl FnMut(&SecretString, Duration) -> Result<()>,
+    ) -> Result<()> {
+        let tokens = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
+            .session_revocations(session_id);
+        let mut failed = false;
+        for entry in tokens {
+            let Some(remaining) = deadline
+                .checked_duration_since(now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                failed = true;
+                break;
+            };
+            match revoke(&entry.token, remaining.min(GITHUB_API_TIMEOUT)) {
+                Ok(()) => self.remove_revoked(&entry.location)?,
+                Err(_) => failed = true,
+            }
+        }
+        let retained = !self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?
+            .session_revocations(session_id)
+            .is_empty();
+        if failed || retained {
+            bail!("one or more session tokens could not be revoked");
+        }
+        Ok(())
     }
 }
 
 impl CapabilityBackend for SystemCapabilityBackend {
     fn github_token(
         &self,
+        operation: &ProviderOperation<'_>,
         session_id: &str,
         grant: &SessionGitHubGrant,
         owner: &str,
         repository: &str,
     ) -> Result<BrokerGitHubToken> {
+        operation.checkpoint()?;
         let service_token = self.validate_grant(grant)?;
         let key = repository_cache_key(session_id, grant, owner, repository)?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if let Some(token) = self.cached(&key, now)? {
+        if let Some(token) = self.cached(operation, &key, now)? {
             return Ok(token);
         }
         let token = broker_github_token_for_repository(
+            operation,
             BrokerGitHubAuthority {
                 op_program: &self.policy.programs.op,
                 service_token,
@@ -342,11 +615,17 @@ impl CapabilityBackend for SystemCapabilityBackend {
             owner,
             repository,
         )?;
-        self.cache(session_id, key, &token)?;
+        self.cache(operation, session_id, key, &token)?;
         Ok(token)
     }
 
-    fn gh_token(&self, session_id: &str, grant: &SessionGitHubGrant) -> Result<BrokerGitHubToken> {
+    fn gh_token(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session_id: &str,
+        grant: &SessionGitHubGrant,
+    ) -> Result<BrokerGitHubToken> {
+        operation.checkpoint()?;
         let service_token = self.validate_grant(grant)?;
         let [owner] = grant.owners.as_slice() else {
             bail!("GitHub CLI authority requires exactly one owner");
@@ -364,10 +643,11 @@ impl CapabilityBackend for SystemCapabilityBackend {
         ))?;
         let key = format!("{:x}", Sha256::digest(public_scope));
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if let Some(token) = self.cached(&key, now)? {
+        if let Some(token) = self.cached(operation, &key, now)? {
             return Ok(token);
         }
         let token = broker_github_token_for_repositories(
+            operation,
             BrokerGitHubAuthority {
                 op_program: &self.policy.programs.op,
                 service_token,
@@ -380,35 +660,39 @@ impl CapabilityBackend for SystemCapabilityBackend {
             owner,
             &grant.repositories,
         )?;
-        self.cache(session_id, key, &token)?;
+        self.cache(operation, session_id, key, &token)?;
         Ok(token)
     }
 
     fn invalidate_github_token(
         &self,
+        operation: &ProviderOperation<'_>,
         session_id: &str,
         grant: &SessionGitHubGrant,
         owner: &str,
         repository: &str,
     ) -> Result<()> {
+        operation.checkpoint()?;
         self.validate_grant(grant)?;
         let key = repository_cache_key(session_id, grant, owner, repository)?;
-        let removed = self.take_cached(&key)?;
-        if let Some(removed) = removed {
-            broker_revoke_github_token(&removed.token)?;
-        }
-        Ok(())
+        self.invalidate_scope_with(session_id, &key, |token| {
+            operation.checkpoint()?;
+            broker_revoke_github_token_with_timeout(token, operation.http_timeout()?)
+        })
     }
 
     fn sign_ssh(
         &self,
+        operation: &ProviderOperation<'_>,
         _session_id: &str,
         purpose: SshOperationPurpose,
         grant: &SessionOperationKeyGrant,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
+        operation.checkpoint()?;
         let service_token = self.validate_operation_grant(purpose, grant)?;
         broker_sign_ssh(
+            operation,
             &self.policy.programs.op,
             service_token,
             &grant.private_key_ref,
@@ -420,16 +704,19 @@ impl CapabilityBackend for SystemCapabilityBackend {
 
     fn sign_release_manifest(
         &self,
+        operation: &ProviderOperation<'_>,
         _session_id: &str,
         grant: &SessionReleaseSigningGrant,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
+        operation.checkpoint()?;
         let manifest = dev_tools_release::validate_unsigned_product_manifest(payload)?;
         if !grant.products.contains(&manifest.product) {
             bail!("release manifest product is outside the session grant");
         }
         let service_token = self.validate_release_signing_grant(grant, &manifest.product)?;
         broker_sign_release_manifest_bytes(
+            operation,
             &self.policy.programs.op,
             service_token,
             &grant.private_key_ref,
@@ -439,29 +726,16 @@ impl CapabilityBackend for SystemCapabilityBackend {
     }
 
     fn revoke_session(&self, session_id: &str) -> Result<()> {
-        let tokens = {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("broker token cache lock is poisoned"))?;
-            let keys = cache
-                .iter()
-                .filter_map(|(key, token)| (token.session_id == session_id).then_some(key.clone()))
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| cache.remove(&key))
-                .collect::<Vec<_>>()
-        };
-        let mut revocation_failed = false;
-        for token in tokens {
-            if broker_revoke_github_token(&token.token).is_err() {
-                revocation_failed = true;
-            }
-        }
-        if revocation_failed {
-            bail!("one or more session tokens could not be revoked");
-        }
-        Ok(())
+        let deadline = Instant::now()
+            .checked_add(SESSION_CLEANUP_ATTEMPT_TIMEOUT)
+            .context("session cleanup deadline overflowed")?;
+        self.revoke_session_before(session_id, deadline)
+    }
+
+    fn revoke_session_before(&self, session_id: &str, deadline: Instant) -> Result<()> {
+        self.revoke_session_before_with(session_id, deadline, Instant::now, |token, timeout| {
+            broker_revoke_github_token_with_timeout(token, timeout)
+        })
     }
 }
 
@@ -578,6 +852,11 @@ mod tests {
         AuthorityCap, CredentialSlotCap, GitHubAppCap, Permission, SystemPrograms,
     };
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicBool;
+
+    fn operation() -> ProviderOperation<'static> {
+        ProviderOperation::uncancelled().unwrap()
+    }
 
     fn policy_with_two_slots() -> SystemPolicyV2 {
         let authority_cap = |app: &str, reference: &str| AuthorityCap {
@@ -664,7 +943,7 @@ mod tests {
                 ("alpha".into(), SecretString::new("token-alpha".into())),
                 ("beta".into(), SecretString::new("token-beta".into())),
             ]),
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(TokenCache::default()),
         };
         let mut grant = SessionGitHubGrant {
             credential_slot: "beta".into(),
@@ -690,7 +969,7 @@ mod tests {
         let backend = SystemCapabilityBackend {
             policy: policy_with_two_slots(),
             service_tokens: BTreeMap::new(),
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(TokenCache::default()),
         };
         let mut grant = SessionGitHubGrant {
             credential_slot: "beta".into(),
@@ -712,6 +991,7 @@ mod tests {
         for key in [selected_key, all_key] {
             backend
                 .cache(
+                    &operation(),
                     "session",
                     key.clone(),
                     &BrokerGitHubToken {
@@ -723,6 +1003,309 @@ mod tests {
             assert!(backend.take_cached(&key).unwrap().is_some());
             assert!(backend.take_cached(&key).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn cancelled_cache_reads_and_publication_never_issue_a_token() {
+        let backend = SystemCapabilityBackend {
+            policy: policy_with_two_slots(),
+            service_tokens: BTreeMap::new(),
+            cache: Mutex::new(TokenCache::default()),
+        };
+        let live = AtomicBool::new(false);
+        let operation =
+            ProviderOperation::with_test_timeout(&live, Duration::from_secs(60)).unwrap();
+        backend
+            .cache(
+                &operation,
+                "session",
+                "active-scope".into(),
+                &BrokerGitHubToken {
+                    token: SecretString::new("active-token".into()),
+                    expires_at: i64::MAX,
+                },
+            )
+            .unwrap();
+
+        live.store(true, std::sync::atomic::Ordering::Release);
+        assert!(backend.cached(&operation, "active-scope", 0).is_err());
+        assert!(backend
+            .cache(
+                &operation,
+                "session",
+                "cancelled-scope".into(),
+                &BrokerGitHubToken {
+                    token: SecretString::new("cancelled-token".into()),
+                    expires_at: i64::MAX,
+                },
+            )
+            .is_err());
+
+        let retained = backend.cache.lock().unwrap().session_revocations("session");
+        assert_eq!(retained.len(), 2);
+        let cleanup_start = Instant::now();
+        backend
+            .revoke_session_before_with(
+                "session",
+                cleanup_start + Duration::from_secs(1),
+                || cleanup_start,
+                |_token, _timeout| Ok(()),
+            )
+            .unwrap();
+        assert!(backend
+            .cache
+            .lock()
+            .unwrap()
+            .session_revocations("session")
+            .is_empty());
+    }
+
+    #[test]
+    fn explicit_invalidation_revokes_active_and_pending_tokens_for_only_the_exact_scope() {
+        let backend = SystemCapabilityBackend {
+            policy: policy_with_two_slots(),
+            service_tokens: BTreeMap::new(),
+            cache: Mutex::new(TokenCache::default()),
+        };
+        let grant = SessionGitHubGrant {
+            credential_slot: "beta".into(),
+            app_id: 2,
+            repository_selection: crate::RepositorySelection::Selected,
+            private_key_ref: "op://Vault/beta/private-key".into(),
+            owners: vec!["exampleorg".into()],
+            repositories: vec!["repository".into()],
+            permissions: BTreeMap::from([("contents".into(), Permission::Read)]),
+            installation_ids: Vec::new(),
+        };
+        let session_id = "target-session";
+        let target_key =
+            repository_cache_key(session_id, &grant, "ExampleOrg", "Repository").unwrap();
+        let other_scope_key =
+            repository_cache_key(session_id, &grant, "ExampleOrg", "OtherRepository").unwrap();
+        let other_session_key =
+            repository_cache_key("other-session", &grant, "ExampleOrg", "Repository").unwrap();
+
+        let seed_failed_refresh = |key: &str, session: &str, prefix: &str| {
+            backend
+                .cache_with(
+                    session,
+                    key.to_owned(),
+                    &BrokerGitHubToken {
+                        token: SecretString::new(format!("{prefix}-old")),
+                        expires_at: i64::MAX,
+                    },
+                    || Ok(()),
+                    |_token| Ok(()),
+                )
+                .unwrap();
+            assert!(backend
+                .cache_with(
+                    session,
+                    key.to_owned(),
+                    &BrokerGitHubToken {
+                        token: SecretString::new(format!("{prefix}-active")),
+                        expires_at: i64::MAX,
+                    },
+                    || Ok(()),
+                    |token| {
+                        assert_eq!(token.expose(), format!("{prefix}-old"));
+                        bail!("injected refresh revocation failure")
+                    },
+                )
+                .is_err());
+        };
+        seed_failed_refresh(&target_key, session_id, "target");
+        seed_failed_refresh(&other_scope_key, session_id, "other-scope");
+        seed_failed_refresh(&other_session_key, "other-session", "other-session");
+
+        let mut revoked = BTreeSet::new();
+        backend
+            .invalidate_scope_with(session_id, &target_key, |token| {
+                revoked.insert(token.expose().to_owned());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            revoked,
+            BTreeSet::from(["target-active".to_owned(), "target-old".to_owned()])
+        );
+        let cache = backend.cache.lock().unwrap();
+        assert!(cache.scope_revocations(session_id, &target_key).is_empty());
+        assert_eq!(
+            cache.scope_revocations(session_id, &other_scope_key).len(),
+            2
+        );
+        assert_eq!(
+            cache
+                .scope_revocations("other-session", &other_session_key)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn explicit_invalidation_retains_only_failed_tokens_for_retry() {
+        let backend = SystemCapabilityBackend {
+            policy: policy_with_two_slots(),
+            service_tokens: BTreeMap::new(),
+            cache: Mutex::new(TokenCache::default()),
+        };
+        let session_id = "retry-invalidation-session";
+        let key = "retry-invalidation-scope";
+        backend
+            .cache_with(
+                session_id,
+                key.into(),
+                &BrokerGitHubToken {
+                    token: SecretString::new("old-token".into()),
+                    expires_at: i64::MAX,
+                },
+                || Ok(()),
+                |_token| Ok(()),
+            )
+            .unwrap();
+        assert!(backend
+            .cache_with(
+                session_id,
+                key.into(),
+                &BrokerGitHubToken {
+                    token: SecretString::new("active-token".into()),
+                    expires_at: i64::MAX,
+                },
+                || Ok(()),
+                |_token| bail!("injected refresh revocation failure"),
+            )
+            .is_err());
+
+        assert!(backend
+            .invalidate_scope_with(session_id, key, |token| {
+                if token.expose() == "old-token" {
+                    bail!("injected invalidation revocation failure");
+                }
+                Ok(())
+            })
+            .is_err());
+        let retained = backend
+            .cache
+            .lock()
+            .unwrap()
+            .scope_revocations(session_id, key);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].token.expose(), "old-token");
+
+        backend
+            .invalidate_scope_with(session_id, key, |_token| Ok(()))
+            .unwrap();
+        assert!(backend
+            .cache
+            .lock()
+            .unwrap()
+            .scope_revocations(session_id, key)
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_session_cleanup_retains_token_for_a_later_successful_retry() {
+        let backend = SystemCapabilityBackend {
+            policy: policy_with_two_slots(),
+            service_tokens: BTreeMap::new(),
+            cache: Mutex::new(TokenCache::default()),
+        };
+        let session_id = "retry-session";
+        let key = "scope".to_owned();
+        backend
+            .cache(
+                &operation(),
+                session_id,
+                key.clone(),
+                &BrokerGitHubToken {
+                    token: SecretString::new("installation-token".into()),
+                    expires_at: i64::MAX,
+                },
+            )
+            .unwrap();
+        let start = Instant::now();
+        let deadline = start + SESSION_CLEANUP_ATTEMPT_TIMEOUT;
+
+        assert!(backend
+            .revoke_session_before_with(
+                session_id,
+                deadline,
+                || start,
+                |_token, timeout| {
+                    assert_eq!(timeout, GITHUB_API_TIMEOUT);
+                    bail!("injected provider failure")
+                },
+            )
+            .is_err());
+        assert!(backend.active_revocation(&key).unwrap().is_some());
+
+        backend
+            .revoke_session_before_with(
+                session_id,
+                deadline,
+                || start,
+                |_token, timeout| {
+                    assert_eq!(timeout, GITHUB_API_TIMEOUT);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(backend.active_revocation(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_cleanup_shares_one_deadline_and_leaves_unattempted_tokens_for_retry() {
+        let backend = SystemCapabilityBackend {
+            policy: policy_with_two_slots(),
+            service_tokens: BTreeMap::new(),
+            cache: Mutex::new(TokenCache::default()),
+        };
+        let session_id = "bounded-session";
+        for key in ["scope-a", "scope-b"] {
+            backend
+                .cache(
+                    &operation(),
+                    session_id,
+                    key.into(),
+                    &BrokerGitHubToken {
+                        token: SecretString::new(format!("installation-token-{key}")),
+                        expires_at: i64::MAX,
+                    },
+                )
+                .unwrap();
+        }
+        let start = Instant::now();
+        let deadline = start + SESSION_CLEANUP_ATTEMPT_TIMEOUT;
+        let mut times = [start, deadline].into_iter();
+        let mut observed_timeouts = Vec::new();
+
+        assert!(backend
+            .revoke_session_before_with(
+                session_id,
+                deadline,
+                || times.next().unwrap(),
+                |_token, timeout| {
+                    observed_timeouts.push(timeout);
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert_eq!(observed_timeouts, vec![GITHUB_API_TIMEOUT]);
+        assert_eq!(
+            backend
+                .cache
+                .lock()
+                .unwrap()
+                .session_revocations(session_id)
+                .len(),
+            1
+        );
+
+        backend
+            .revoke_session_before_with(session_id, deadline, || start, |_token, _timeout| Ok(()))
+            .unwrap();
     }
 
     #[test]

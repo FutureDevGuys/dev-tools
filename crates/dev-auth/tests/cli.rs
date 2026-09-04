@@ -2,9 +2,15 @@
 
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::symlink;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -15,6 +21,124 @@ use wait_timeout::ChildExt;
 
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider() {
+    use std::os::unix::process::CommandExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("op");
+    fs::write(
+        &provider,
+        b"#!/bin/sh\n\
+[ \"$#\" -eq 3 ] || exit 90\n\
+[ \"$1\" = read ] || exit 91\n\
+[ \"$2\" = --no-newline ] || exit 92\n\
+[ \"$3\" = op://Automation/provider/private-key ] || exit 93\n\
+[ \"${OP_SERVICE_ACCOUNT_TOKEN-}\" = transport-test-token ] || exit 94\n\
+for descriptor in /proc/$$/fd/*; do\n\
+  case \"$(/usr/bin/readlink \"$descriptor\")\" in\n\
+    *dev-auth-provider-token*) exit 95 ;;\n\
+  esac\n\
+done\n\
+case \"$(/usr/bin/tr '\\000' '\\n' </proc/$$/cmdline)\" in\n\
+  *transport-test-token*) exit 96 ;;\n\
+esac\n\
+printf provider-secret",
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut provider_options = fs::OpenOptions::new();
+    provider_options
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC);
+    let provider_guard = provider_options.open(&provider).unwrap();
+    let mut child_options = fs::OpenOptions::new();
+    child_options
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC);
+    let child_guard = child_options.open(env!("CARGO_BIN_EXE_dev-auth")).unwrap();
+    let token_descriptor = rustix::fs::memfd_create(
+        "dev-auth-provider-token",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .unwrap();
+    let mut token = fs::File::from(token_descriptor);
+    rustix::fs::fchmod(&token, rustix::fs::Mode::from_bits_truncate(0o600)).unwrap();
+    token.write_all(b"transport-test-token").unwrap();
+    token.seek(SeekFrom::Start(0)).unwrap();
+    rustix::fs::fcntl_add_seals(
+        &token,
+        rustix::fs::SealFlags::SEAL
+            | rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::WRITE,
+    )
+    .unwrap();
+
+    let child_fd = child_guard.as_raw_fd();
+    let provider_fd = provider_guard.as_raw_fd();
+    let token_fd = token.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
+    command
+        .arg0("dev-auth-provider-exec")
+        .args([
+            "--child-fd".into(),
+            child_fd.to_string(),
+            "--provider-fd".into(),
+            provider_fd.to_string(),
+            "--token-fd".into(),
+            token_fd.to_string(),
+            "--provider-argv0".into(),
+            provider.to_string_lossy().into_owned(),
+            "--reference".into(),
+            "op://Automation/provider/private-key".into(),
+        ])
+        .env_clear();
+    // SAFETY: all three File owners remain live until bounded_output completes.
+    // Clearing FD_CLOEXEC is async-signal-safe and occurs only in the child.
+    unsafe {
+        command.pre_exec(move || {
+            for descriptor in [child_fd, provider_fd, token_fd] {
+                // SAFETY: the File owners above retain these exact descriptors
+                // through the pre-exec callback.
+                let descriptor = BorrowedFd::borrow_raw(descriptor);
+                rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())?;
+            }
+            Ok(())
+        });
+    }
+    let output = bounded_output(&mut command);
+    assert!(
+        output.status.success(),
+        "provider child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"provider-secret");
+    assert!(!output
+        .stderr
+        .windows(b"transport-test-token".len())
+        .any(|window| { window == b"transport-test-token" }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn internal_provider_child_argv0_rejects_missing_descriptor_authority() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
+    command
+        .arg0("dev-auth-provider-exec")
+        .args(["--child-fd", "9"])
+        .env_clear();
+    let output = bounded_output(&mut command);
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.starts_with("dev-auth-provider-exec:"), "{error}");
+    assert!(error.contains("internal provider child protocol is malformed"));
+}
 
 #[cfg(target_os = "linux")]
 #[test]

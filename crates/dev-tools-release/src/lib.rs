@@ -802,14 +802,14 @@ fn validate_manifest(manifest: &ProductManifest, authority: &ReleaseAuthority) -
         .context("release manifest has no artifact for the selected target")?;
     let expected_url = match &authority.artifact_url {
         ArtifactUrlPolicy::Exact(url) => url.clone(),
-        ArtifactUrlPolicy::GitHubRelease { owner, repository } => format!(
-            "https://github.com/{owner}/{repository}/releases/download/{}%2Fv{}/{}-{}-{}",
-            manifest.product,
-            manifest.version,
-            manifest.product,
-            manifest.version,
-            authority.target
-        ),
+        ArtifactUrlPolicy::GitHubRelease { owner, repository } => {
+            let artifact_name =
+                native_artifact_name(&manifest.product, &manifest.version, &authority.target);
+            format!(
+                "https://github.com/{owner}/{repository}/releases/download/{}%2Fv{}/{artifact_name}",
+                manifest.product, manifest.version
+            )
+        }
     };
     if artifact.url != expected_url
         || artifact.length == 0
@@ -819,6 +819,15 @@ fn validate_manifest(manifest: &ProductManifest, authority: &ReleaseAuthority) -
         bail!("release manifest artifact identity is invalid");
     }
     Ok(())
+}
+
+fn native_artifact_name(product: &str, version: &str, target: &str) -> String {
+    let executable_suffix = if target.starts_with("windows-") {
+        ".exe"
+    } else {
+        ""
+    };
+    format!("{product}-{version}-{target}{executable_suffix}")
 }
 
 fn verify_release_signature(

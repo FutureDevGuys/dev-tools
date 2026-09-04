@@ -22,6 +22,7 @@ from release_signing import (
     verify_product_manifest,
     verify_root_document,
 )
+from release_targets import require_accepted_release_target
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -216,6 +217,7 @@ def load_release(
     target, record = next(iter(artifacts.items()))
     if not isinstance(target, str) or not TARGET_RE.fullmatch(target):
         raise SystemExit("product manifest target is invalid")
+    require_accepted_release_target(product, target)
     if not isinstance(record, dict) or set(record) != {"url", "length", "sha256"}:
         raise SystemExit("product manifest artifact record is invalid")
     tag = f"{product}/v{version}"

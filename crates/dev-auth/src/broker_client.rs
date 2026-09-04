@@ -5,20 +5,64 @@ use crate::broker_protocol::{
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const SYSTEM_BROKER_SOCKET: &str = "/run/dev-auth/broker.sock";
 pub const USER_BROKER_SOCKET_ENV: &str = "DEV_AUTH_USER_BROKER_SOCKET";
 pub const USER_BROKER_SESSION_ENV: &str = "DEV_AUTH_USER_SESSION";
 #[cfg(target_os = "linux")]
 pub const SYSTEM_CONTROL_SOCKET: &str = "/run/dev-auth/control.sock";
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+// Capability and teardown responses each reserve one absolute 120-second server
+// operation budget plus a small framing margin. A teardown's budget is shared
+// across cancellation, drain, and cleanup rather than renewed between phases.
+const OPERATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(125);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct BrokerTimeouts {
+    local_io: Duration,
+    operation_response: Duration,
+}
+
+const BROKER_TIMEOUTS: BrokerTimeouts = BrokerTimeouts {
+    local_io: LOCAL_IO_TIMEOUT,
+    operation_response: OPERATION_RESPONSE_TIMEOUT,
+};
+
+impl BrokerTimeouts {
+    fn response_timeout(self, request: &BrokerRequest) -> Duration {
+        match request {
+            BrokerRequest::Probe
+            | BrokerRequest::ActivateSession { .. }
+            | BrokerRequest::RenewSession { .. } => self.local_io,
+            BrokerRequest::EndSession { .. }
+            | BrokerRequest::GitCredential { .. }
+            | BrokerRequest::InvalidateGitCredential { .. }
+            | BrokerRequest::GhExecutionToken
+            | BrokerRequest::SignSsh { .. }
+            | BrokerRequest::SignReleaseManifest { .. } => self.operation_response,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn control_response_timeout(
+        self,
+        request: &crate::control_protocol::ControlRequest,
+    ) -> Duration {
+        match request {
+            crate::control_protocol::ControlRequest::Prepare { .. }
+            | crate::control_protocol::ControlRequest::Register { .. }
+            | crate::control_protocol::ControlRequest::Renew { .. } => self.local_io,
+            crate::control_protocol::ControlRequest::Revoke { .. } => self.operation_response,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveBrokerEndpoint {
@@ -205,35 +249,177 @@ pub fn exchange_at(
     socket: &Path,
     request: &BrokerRequestEnvelope,
 ) -> Result<crate::broker_protocol::BrokerResponseEnvelope> {
+    exchange_at_with_timeouts(socket, request, BROKER_TIMEOUTS)
+}
+
+fn exchange_at_with_timeouts(
+    socket: &Path,
+    request: &BrokerRequestEnvelope,
+    timeouts: BrokerTimeouts,
+) -> Result<crate::broker_protocol::BrokerResponseEnvelope> {
     let payload = encode_request_frame(request)?;
-    let length = u32::try_from(payload.len()).context("broker request frame is too large")?;
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to workload broker at {}", socket.display()))?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .context("set broker read timeout")?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .context("set broker write timeout")?;
-    stream
-        .write_all(&length.to_be_bytes())
-        .context("write broker frame length")?;
-    stream.write_all(&payload).context("write broker request")?;
-    stream.flush().context("flush broker request")?;
+    write_frame_with_clock(
+        &mut stream,
+        &payload,
+        timeouts.local_io,
+        "broker",
+        Instant::now,
+    )?;
+    let response = read_frame_with_clock(
+        &mut stream,
+        timeouts.response_timeout(&request.request),
+        "broker",
+        Instant::now,
+    )?;
+    decode_response_frame(&response)
+}
 
+trait FramedIo: Read + Write {
+    fn set_frame_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_frame_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl FramedIo for UnixStream {
+    fn set_frame_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+
+    fn set_frame_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_write_timeout(timeout)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AbsoluteDeadline {
+    started_at: Instant,
+    budget: Duration,
+}
+
+impl AbsoluteDeadline {
+    fn new(started_at: Instant, budget: Duration) -> Self {
+        Self { started_at, budget }
+    }
+
+    fn remaining(self, now: Instant) -> io::Result<Duration> {
+        self.budget
+            .checked_sub(now.saturating_duration_since(self.started_at))
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "frame deadline elapsed"))
+    }
+}
+
+fn write_frame_with_clock<S, C>(
+    stream: &mut S,
+    payload: &[u8],
+    timeout: Duration,
+    description: &str,
+    mut now: C,
+) -> Result<()>
+where
+    S: FramedIo,
+    C: FnMut() -> Instant,
+{
+    let length = u32::try_from(payload.len()).context("broker request frame is too large")?;
+    let deadline = AbsoluteDeadline::new(now(), timeout);
+    write_all_before_deadline(stream, &length.to_be_bytes(), deadline, &mut now)
+        .with_context(|| format!("write {description} frame length"))?;
+    write_all_before_deadline(stream, payload, deadline, &mut now)
+        .with_context(|| format!("write {description} request"))?;
+    flush_before_deadline(stream, deadline, &mut now)
+        .with_context(|| format!("flush {description} request"))
+}
+
+fn read_frame_with_clock<S, C>(
+    stream: &mut S,
+    timeout: Duration,
+    description: &str,
+    mut now: C,
+) -> Result<Vec<u8>>
+where
+    S: FramedIo,
+    C: FnMut() -> Instant,
+{
+    let deadline = AbsoluteDeadline::new(now(), timeout);
     let mut length_bytes = [0_u8; 4];
-    stream
-        .read_exact(&mut length_bytes)
-        .context("read broker response length")?;
+    read_exact_before_deadline(stream, &mut length_bytes, deadline, &mut now)
+        .with_context(|| format!("read {description} response length"))?;
     let response_length = u32::from_be_bytes(length_bytes) as usize;
     if response_length > MAX_BROKER_FRAME_BYTES {
-        bail!("broker response exceeds the frame limit");
+        bail!("{description} response exceeds the frame limit");
     }
     let mut response = vec![0_u8; response_length];
-    stream
-        .read_exact(&mut response)
-        .context("read broker response")?;
-    decode_response_frame(&response)
+    read_exact_before_deadline(stream, &mut response, deadline, &mut now)
+        .with_context(|| format!("read {description} response"))?;
+    Ok(response)
+}
+
+fn write_all_before_deadline<S, C>(
+    stream: &mut S,
+    mut buffer: &[u8],
+    deadline: AbsoluteDeadline,
+    now: &mut C,
+) -> io::Result<()>
+where
+    S: FramedIo,
+    C: FnMut() -> Instant,
+{
+    while !buffer.is_empty() {
+        stream.set_frame_write_timeout(Some(deadline.remaining(now())?))?;
+        match stream.write(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write the complete frame",
+                ));
+            }
+            Ok(written) => buffer = &buffer[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn flush_before_deadline<S, C>(
+    stream: &mut S,
+    deadline: AbsoluteDeadline,
+    now: &mut C,
+) -> io::Result<()>
+where
+    S: FramedIo,
+    C: FnMut() -> Instant,
+{
+    stream.set_frame_write_timeout(Some(deadline.remaining(now())?))?;
+    stream.flush()
+}
+
+fn read_exact_before_deadline<S, C>(
+    stream: &mut S,
+    mut buffer: &mut [u8],
+    deadline: AbsoluteDeadline,
+    now: &mut C,
+) -> io::Result<()>
+where
+    S: FramedIo,
+    C: FnMut() -> Instant,
+{
+    while !buffer.is_empty() {
+        stream.set_frame_read_timeout(Some(deadline.remaining(now())?))?;
+        match stream.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "frame ended before its declared length",
+                ));
+            }
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -252,12 +438,19 @@ pub fn control_request_at(
         decode_control_response, encode_control_request, ControlEnvelope,
     };
     let request_id = request_id();
-    let payload = encode_control_request(&ControlEnvelope {
+    let envelope = ControlEnvelope {
         version: BROKER_PROTOCOL_VERSION,
         request_id: request_id.clone(),
         request,
-    })?;
-    let response = exchange_raw_at(socket, &payload, "broker control")?;
+    };
+    let payload = encode_control_request(&envelope)?;
+    let response = exchange_raw_at(
+        socket,
+        &payload,
+        "broker control",
+        &envelope.request,
+        BROKER_TIMEOUTS,
+    )?;
     let response = decode_control_response(&response)?;
     if response.request_id != request_id {
         bail!("broker control response correlation does not match the request");
@@ -265,42 +458,32 @@ pub fn control_request_at(
     Ok(response.response)
 }
 
-fn exchange_raw_at(socket: &Path, payload: &[u8], description: &str) -> Result<Vec<u8>> {
+#[cfg(target_os = "linux")]
+fn exchange_raw_at(
+    socket: &Path,
+    payload: &[u8],
+    description: &str,
+    control_request: &crate::control_protocol::ControlRequest,
+    timeouts: BrokerTimeouts,
+) -> Result<Vec<u8>> {
     if payload.len() > MAX_BROKER_FRAME_BYTES {
         bail!("{description} request exceeds the frame limit");
     }
-    let length = u32::try_from(payload.len()).context("broker request frame is too large")?;
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to {description} at {}", socket.display()))?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .with_context(|| format!("set {description} read timeout"))?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .with_context(|| format!("set {description} write timeout"))?;
-    stream
-        .write_all(&length.to_be_bytes())
-        .with_context(|| format!("write {description} frame length"))?;
-    stream
-        .write_all(payload)
-        .with_context(|| format!("write {description} request"))?;
-    stream
-        .flush()
-        .with_context(|| format!("flush {description} request"))?;
-
-    let mut length_bytes = [0_u8; 4];
-    stream
-        .read_exact(&mut length_bytes)
-        .with_context(|| format!("read {description} response length"))?;
-    let response_length = u32::from_be_bytes(length_bytes) as usize;
-    if response_length > MAX_BROKER_FRAME_BYTES {
-        bail!("{description} response exceeds the frame limit");
-    }
-    let mut response = vec![0_u8; response_length];
-    stream
-        .read_exact(&mut response)
-        .with_context(|| format!("read {description} response"))?;
-    Ok(response)
+    write_frame_with_clock(
+        &mut stream,
+        payload,
+        timeouts.local_io,
+        description,
+        Instant::now,
+    )?;
+    read_frame_with_clock(
+        &mut stream,
+        timeouts.control_response_timeout(control_request),
+        description,
+        Instant::now,
+    )
 }
 
 fn request_id() -> String {
@@ -321,8 +504,88 @@ fn request_id() -> String {
 mod tests {
     use super::*;
     use crate::broker_protocol::{encode_response_frame, BrokerResponseEnvelope};
+    use std::cell::{Cell, RefCell};
     use std::os::unix::net::UnixListener;
+    use std::rc::Rc;
     use std::thread;
+
+    struct StepIo {
+        elapsed: Rc<Cell<Duration>>,
+        step: Duration,
+        read_data: Vec<u8>,
+        read_offset: usize,
+        written: Vec<u8>,
+        read_timeouts: RefCell<Vec<Duration>>,
+        write_timeouts: RefCell<Vec<Duration>>,
+        flush_count: usize,
+    }
+
+    impl StepIo {
+        fn new(elapsed: Rc<Cell<Duration>>, step: Duration, read_data: Vec<u8>) -> Self {
+            Self {
+                elapsed,
+                step,
+                read_data,
+                read_offset: 0,
+                written: Vec::new(),
+                read_timeouts: RefCell::new(Vec::new()),
+                write_timeouts: RefCell::new(Vec::new()),
+                flush_count: 0,
+            }
+        }
+
+        fn advance(&self) {
+            self.elapsed.set(self.elapsed.get() + self.step);
+        }
+    }
+
+    impl Read for StepIo {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let Some(byte) = self.read_data.get(self.read_offset).copied() else {
+                return Ok(0);
+            };
+            buffer[0] = byte;
+            self.read_offset += 1;
+            self.advance();
+            Ok(1)
+        }
+    }
+
+    impl Write for StepIo {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let Some(byte) = buffer.first().copied() else {
+                return Ok(0);
+            };
+            self.written.push(byte);
+            self.advance();
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_count += 1;
+            self.advance();
+            Ok(())
+        }
+    }
+
+    impl FramedIo for StepIo {
+        fn set_frame_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.read_timeouts
+                .borrow_mut()
+                .push(timeout.expect("read deadline must be bounded"));
+            Ok(())
+        }
+
+        fn set_frame_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.write_timeouts
+                .borrow_mut()
+                .push(timeout.expect("write deadline must be bounded"));
+            Ok(())
+        }
+    }
 
     #[test]
     fn user_only_broker_hint_requires_the_private_native_runtime_shape() {
@@ -383,5 +646,94 @@ mod tests {
         });
         assert_eq!(probe_at(&socket).unwrap(), BrokerSessionProbe::NoSession);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn slow_drip_response_cannot_renew_the_frame_deadline() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let mut frame = (4_u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(b"body");
+        let mut stream = StepIo::new(elapsed.clone(), Duration::from_millis(1), frame);
+        let started_at = Instant::now();
+
+        let error = read_frame_with_clock(&mut stream, Duration::from_millis(5), "test", || {
+            started_at + elapsed.get()
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .expect("deadline error")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(stream.read_offset, 5);
+        assert_eq!(
+            *stream.read_timeouts.borrow(),
+            [5_u64, 4, 3, 2, 1].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn framed_write_recomputes_one_deadline_across_header_body_and_flush() {
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let mut stream = StepIo::new(elapsed.clone(), Duration::from_millis(1), Vec::new());
+        let started_at = Instant::now();
+
+        write_frame_with_clock(&mut stream, b"ok", Duration::from_millis(8), "test", || {
+            started_at + elapsed.get()
+        })
+        .unwrap();
+
+        assert_eq!(stream.written, [0, 0, 0, 2, b'o', b'k']);
+        assert_eq!(stream.flush_count, 1);
+        assert_eq!(
+            *stream.write_timeouts.borrow(),
+            [8_u64, 7, 6, 5, 4, 3, 2].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn capability_and_teardown_responses_share_one_bounded_operation_deadline() {
+        assert_eq!(
+            BROKER_TIMEOUTS.response_timeout(&BrokerRequest::GhExecutionToken),
+            OPERATION_RESPONSE_TIMEOUT
+        );
+        assert_eq!(OPERATION_RESPONSE_TIMEOUT, Duration::from_secs(125));
+        assert_eq!(BROKER_TIMEOUTS.local_io, Duration::from_secs(2));
+        assert_eq!(
+            BROKER_TIMEOUTS.response_timeout(&BrokerRequest::Probe),
+            LOCAL_IO_TIMEOUT
+        );
+        assert_eq!(
+            BROKER_TIMEOUTS.response_timeout(&BrokerRequest::EndSession {
+                session_id: "0123456789abcdef0123456789abcdef".into(),
+            }),
+            OPERATION_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_revoke_uses_operation_deadline_without_relaxing_renew() {
+        use crate::control_protocol::ControlRequest;
+
+        let session_id = "0123456789abcdef0123456789abcdef";
+
+        assert_eq!(
+            BROKER_TIMEOUTS.control_response_timeout(&ControlRequest::Revoke {
+                session_id: session_id.into(),
+            }),
+            OPERATION_RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            BROKER_TIMEOUTS.control_response_timeout(&ControlRequest::Renew {
+                session_id: session_id.into(),
+                expires_at_unix: 1,
+            }),
+            LOCAL_IO_TIMEOUT
+        );
     }
 }

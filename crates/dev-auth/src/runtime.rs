@@ -4,6 +4,9 @@ use crate::{
     CredentialRequest, CredentialStore, ExecProfile, SecretString, SelectedRepository, SshProfile,
 };
 use anyhow::{bail, Context, Result};
+use dev_tools_command::{
+    run_prepared_bounded_command_with_cancellation, BoundedCommandErrorKind, BoundedCommandOutput,
+};
 use directories::{BaseDirs, ProjectDirs};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use fs2::FileExt;
@@ -28,9 +31,11 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -61,6 +66,9 @@ pub use git_runtime::{run_git, workspace_status};
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
+const OP_READ_OUTPUT_LIMIT: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const OP_SERVICE_TOKEN_LIMIT: u64 = 64 * 1024;
 // Reviewed against github/cli tag v2.98.0 at
 // a255baf71d13fe5947a4eb7ad521ffd412d64cee.
 const SUPPORTED_GH_VERSION: &str = "2.98.0";
@@ -935,33 +943,432 @@ pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
 
 fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString> {
     let service_token = service_account_token(&config.credential_store)?;
-    read_declared_secret_with_token(&config.programs.op, &service_token, reference)
+    let operation = crate::provider_operation::ProviderOperation::uncancelled()?;
+    read_declared_secret_with_token(&operation, &config.programs.op, &service_token, reference)
 }
 
-pub(crate) fn read_declared_secret_with_token(
+fn map_op_read_error(error: dev_tools_command::BoundedCommandError) -> anyhow::Error {
+    let message = if error.cleanup_failures().is_empty() {
+        match error.kind() {
+            BoundedCommandErrorKind::Cancelled => "1Password item read was cancelled",
+            BoundedCommandErrorKind::TimedOut => "1Password item read exceeded its deadline",
+            BoundedCommandErrorKind::OutputLimit(_) => {
+                "1Password item read exceeded its output limit"
+            }
+            BoundedCommandErrorKind::Start => "1Password item read could not start",
+            BoundedCommandErrorKind::InvalidExecutable
+            | BoundedCommandErrorKind::InvalidResourceLimits
+            | BoundedCommandErrorKind::InvalidWorkingDirectory
+            | BoundedCommandErrorKind::Wait
+            | BoundedCommandErrorKind::Capture(_)
+            | BoundedCommandErrorKind::Cleanup => "1Password item read failed",
+        }
+    } else {
+        "1Password item read cleanup failed"
+    };
+    anyhow::anyhow!(message)
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxProviderExecInvocation<'a> {
+    command: GuardedCommand<'a>,
+    _token: File,
+    _provider_guard: &'a ProgramGuard,
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_provider_token(service_token: &SecretString) -> Result<File> {
+    let token = service_token.expose().as_bytes();
+    if token.is_empty()
+        || token.len() as u64 > OP_SERVICE_TOKEN_LIMIT
+        || token.contains(&b'\n')
+        || token.contains(&b'\r')
+        || token.contains(&0)
+    {
+        bail!("service credential is malformed");
+    }
+    let descriptor = rustix::fs::memfd_create(
+        "dev-auth-provider-token",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .context("create anonymous provider credential transport")?;
+    let mut file = File::from(descriptor);
+    rustix::fs::fchmod(&file, rustix::fs::Mode::from_bits_truncate(0o600))
+        .context("restrict anonymous provider credential transport")?;
+    file.write_all(token)
+        .context("write anonymous provider credential transport")?;
+    file.seek(SeekFrom::Start(0))
+        .context("rewind anonymous provider credential transport")?;
+    rustix::fs::fcntl_add_seals(
+        &file,
+        rustix::fs::SealFlags::SEAL
+            | rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::WRITE,
+    )
+    .context("seal anonymous provider credential transport")?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_provider_exec<'a>(
+    provider_child_guard: &'a ProgramGuard,
+    provider_guard: &'a ProgramGuard,
+    op_program: &str,
+    service_token: &SecretString,
+    reference: &str,
+) -> Result<LinuxProviderExecInvocation<'a>> {
+    let token = sealed_provider_token(service_token)?;
+    let child_fd = provider_child_guard.executable.as_raw_fd();
+    let provider_fd = provider_guard.executable.as_raw_fd();
+    let token_fd = token.as_raw_fd();
+    if child_fd <= nix::libc::STDERR_FILENO
+        || provider_fd <= nix::libc::STDERR_FILENO
+        || token_fd <= nix::libc::STDERR_FILENO
+        || child_fd == provider_fd
+        || child_fd == token_fd
+        || provider_fd == token_fd
+    {
+        bail!("provider child descriptor allocation is invalid");
+    }
+
+    let mut command = guarded_command("dev-auth-provider-exec", provider_child_guard)?;
+    command
+        .args([
+            OsString::from("--child-fd"),
+            OsString::from(child_fd.to_string()),
+            OsString::from("--provider-fd"),
+            OsString::from(provider_fd.to_string()),
+            OsString::from("--token-fd"),
+            OsString::from(token_fd.to_string()),
+            OsString::from("--provider-argv0"),
+            OsString::from(op_program),
+            OsString::from("--reference"),
+            OsString::from(reference),
+        ])
+        .env_clear()
+        .envs(sanitized_current_environment());
+    // SAFETY: both descriptors remain owned by LinuxProviderExecInvocation and
+    // ProgramGuard through spawn and completion. The child-only callbacks clear
+    // FD_CLOEXEC using async-signal-safe fcntl so the internal provider child can
+    // consume the sealed token and execute the already-held provider identity.
+    unsafe {
+        command.pre_exec(move || {
+            // SAFETY: the invocation and provider guard keep both exact raw
+            // descriptors valid through this pre-exec callback.
+            let provider = BorrowedFd::borrow_raw(provider_fd);
+            rustix::io::fcntl_setfd(provider, rustix::io::FdFlags::empty())
+                .map_err(io::Error::from)?;
+            let token = BorrowedFd::borrow_raw(token_fd);
+            rustix::io::fcntl_setfd(token, rustix::io::FdFlags::empty()).map_err(io::Error::from)
+        });
+    }
+    Ok(LinuxProviderExecInvocation {
+        command,
+        _token: token,
+        _provider_guard: provider_guard,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_provider_read(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    child_executable: &Path,
+    op_program: &str,
+    provider_guard: &ProgramGuard,
+    service_token: &SecretString,
+    reference: &str,
+    timeout: Duration,
+) -> Result<BoundedCommandOutput> {
+    let child_guard = lock_linux_program(child_executable, "running dev-auth executable")
+        .context("lock internal provider child executable")?;
+    let mut invocation = prepare_linux_provider_exec(
+        &child_guard,
+        provider_guard,
+        op_program,
+        service_token,
+        reference,
+    )?;
+    run_prepared_bounded_command_with_cancellation(
+        &mut invocation.command,
+        timeout,
+        OP_READ_OUTPUT_LIMIT,
+        operation.cancellation(),
+    )
+    .map_err(map_op_read_error)
+}
+
+#[cfg(target_os = "linux")]
+fn provider_child_fd(
+    arguments: &mut impl Iterator<Item = OsString>,
+    selector: &str,
+) -> Result<RawFd> {
+    if arguments.next().as_deref() != Some(OsStr::new(selector)) {
+        bail!("internal provider child protocol is malformed");
+    }
+    let value = arguments
+        .next()
+        .context("internal provider child descriptor is missing")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("internal provider child descriptor is invalid"))?;
+    let descriptor = value
+        .parse::<RawFd>()
+        .context("internal provider child descriptor is invalid")?;
+    if descriptor <= nix::libc::STDERR_FILENO {
+        bail!("internal provider child descriptor is invalid");
+    }
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_inherited_raw_fd(descriptor: RawFd) -> Result<()> {
+    // SAFETY: fcntl(F_GETFD) only asks the kernel to inspect this integer and
+    // does not dereference process memory. The internal child starts
+    // single-threaded, so a successful result establishes that the descriptor
+    // cannot be concurrently closed before it is borrowed or adopted below.
+    let result = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+    if result == -1 {
+        return Err(io::Error::last_os_error())
+            .context("validate inherited provider child descriptor");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_provider_execution_path(provider: BorrowedFd<'_>) -> Result<PathBuf> {
+    let metadata = rustix::fs::fstat(provider).context("inspect inherited provider executable")?;
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile {
+        bail!("inherited provider executable has an unsafe object type");
+    }
+    let path = PathBuf::from(format!("/proc/self/fd/{}", provider.as_raw_fd()));
+    let execution_metadata = fs::metadata(&path).context("inspect inherited provider identity")?;
+    if execution_metadata.dev() != metadata.st_dev || execution_metadata.ino() != metadata.st_ino {
+        bail!("inherited provider identity does not match its descriptor");
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+fn read_inherited_provider_token(token_fd: RawFd) -> Result<(File, zeroize::Zeroizing<Vec<u8>>)> {
+    // SAFETY: the internal protocol accepts each validated descriptor exactly
+    // once. This function takes ownership of token_fd and closes it on failure;
+    // the caller rejects descriptor aliasing before reaching this point.
+    let mut token = unsafe { File::from_raw_fd(token_fd) };
+    let metadata = rustix::fs::fstat(&token).context("inspect provider credential transport")?;
+    let required_seals = rustix::fs::SealFlags::SEAL
+        | rustix::fs::SealFlags::SHRINK
+        | rustix::fs::SealFlags::GROW
+        | rustix::fs::SealFlags::WRITE;
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::RegularFile
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_nlink != 0
+        || metadata.st_mode & 0o777 != 0o600
+        || metadata.st_size <= 0
+        || metadata.st_size as u64 > OP_SERVICE_TOKEN_LIMIT
+        || !rustix::fs::fcntl_get_seals(&token)
+            .context("inspect provider credential transport seals")?
+            .contains(required_seals)
+    {
+        bail!("provider credential transport is not a protected sealed memfd");
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    std::io::Read::by_ref(&mut token)
+        .take(OP_SERVICE_TOKEN_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .context("read provider credential transport")?;
+    if bytes.is_empty()
+        || bytes.len() as u64 > OP_SERVICE_TOKEN_LIMIT
+        || bytes.contains(&b'\n')
+        || bytes.contains(&b'\r')
+        || bytes.contains(&0)
+        || std::str::from_utf8(&bytes).is_err()
+    {
+        bail!("provider credential transport is malformed");
+    }
+    Ok((token, bytes))
+}
+
+/// Execute the internal Linux provider child selected exclusively by argv0.
+///
+/// This is public only so the package binary can enter the library-owned
+/// implementation; it is not an installed or stable external interface.
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub fn run_provider_exec_child() -> Result<i32> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut arguments = env::args_os().skip(1);
+    let child_fd = provider_child_fd(&mut arguments, "--child-fd")?;
+    let provider_fd = provider_child_fd(&mut arguments, "--provider-fd")?;
+    let token_fd = provider_child_fd(&mut arguments, "--token-fd")?;
+    if child_fd == provider_fd || child_fd == token_fd || provider_fd == token_fd {
+        bail!("internal provider child descriptors are not distinct");
+    }
+    validate_inherited_raw_fd(child_fd)?;
+    validate_inherited_raw_fd(provider_fd)?;
+    validate_inherited_raw_fd(token_fd)?;
+    if arguments.next().as_deref() != Some(OsStr::new("--provider-argv0")) {
+        bail!("internal provider child protocol is malformed");
+    }
+    let provider_argv0 = arguments
+        .next()
+        .context("internal provider child argv0 is missing")?;
+    if !Path::new(&provider_argv0).is_absolute() {
+        bail!("internal provider child argv0 must be an absolute path");
+    }
+    if arguments.next().as_deref() != Some(OsStr::new("--reference")) {
+        bail!("internal provider child protocol is malformed");
+    }
+    let reference = arguments
+        .next()
+        .context("internal provider child reference is missing")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("internal provider child reference is invalid"))?;
+    if arguments.next().is_some() {
+        bail!("internal provider child protocol has trailing arguments");
+    }
+    crate::validate_op_reference(&reference)?;
+
+    // SAFETY: the three raw descriptors were validated as open, positive, and
+    // distinct in this newly execed single-threaded process. The child
+    // descriptor remains borrowed; the provider descriptor must stay open
+    // across exec, and the token descriptor is adopted below.
+    let child = unsafe { BorrowedFd::borrow_raw(child_fd) };
+    // SAFETY: see the distinct inherited-descriptor invariant above.
+    let provider = unsafe { BorrowedFd::borrow_raw(provider_fd) };
+    let child_metadata = rustix::fs::fstat(child).context("inspect provider child executable")?;
+    let running_metadata = fs::metadata("/proc/self/exe")
+        .context("inspect running internal provider child identity")?;
+    if running_metadata.dev() != child_metadata.st_dev
+        || running_metadata.ino() != child_metadata.st_ino
+    {
+        bail!("internal provider child identity does not match its descriptor");
+    }
+    let provider_path = inherited_provider_execution_path(provider)?;
+    let (token, token_bytes) = read_inherited_provider_token(token_fd)?;
+    let token_text =
+        std::str::from_utf8(&token_bytes).context("provider credential transport is not UTF-8")?;
+
+    rustix::io::fcntl_setfd(child, rustix::io::FdFlags::CLOEXEC)
+        .context("close provider child identity across provider exec")?;
+    rustix::io::fcntl_setfd(token.as_fd(), rustix::io::FdFlags::CLOEXEC)
+        .context("close provider credential transport across provider exec")?;
+    let error = Command::new(provider_path)
+        .arg0(provider_argv0)
+        .args(["read", "--no-newline", &reference])
+        .env_clear()
+        .envs(sanitized_current_environment())
+        .env("OP_SERVICE_ACCOUNT_TOKEN", token_text)
+        .exec();
+    Err(error).context("execute held 1Password CLI provider")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_provider_read(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    op_program: &str,
+    provider_guard: &ProgramGuard,
+    service_token: &SecretString,
+    reference: &str,
+    timeout: Duration,
+) -> Result<BoundedCommandOutput> {
+    let mut command = guarded_command(op_program, provider_guard)?;
+    command
+        .args(["read", "--no-newline", reference])
+        .env_clear()
+        .envs(sanitized_current_environment())
+        .env("OP_SERVICE_ACCOUNT_TOKEN", service_token.expose());
+    run_prepared_bounded_command_with_cancellation(
+        &mut command,
+        timeout,
+        OP_READ_OUTPUT_LIMIT,
+        operation.cancellation(),
+    )
+    .map_err(map_op_read_error)
+}
+
+#[cfg(target_os = "linux")]
+fn read_declared_secret_with_token_at_child(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    child_executable: &Path,
     op_program: &str,
     service_token: &SecretString,
     reference: &str,
 ) -> Result<SecretString> {
+    operation.checkpoint()?;
     crate::validate_op_reference(reference)?;
     let program_guard = program_guard(op_program, "1Password CLI")?;
-    let output = guarded_command(op_program, &program_guard)?
-        .args(["read", "--no-newline", reference])
-        .env_clear()
-        .envs(sanitized_current_environment())
-        .env("OP_SERVICE_ACCOUNT_TOKEN", service_token.expose())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("run bounded 1Password item read")?;
+    operation.checkpoint()?;
+    let timeout = operation.subprocess_timeout()?;
+    let output = run_linux_provider_read(
+        operation,
+        child_executable,
+        op_program,
+        &program_guard,
+        service_token,
+        reference,
+        timeout,
+    )?;
+    validate_provider_read_output(operation, output)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_declared_secret_with_token(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    op_program: &str,
+    service_token: &SecretString,
+    reference: &str,
+) -> Result<SecretString> {
+    let child_executable = env::current_exe().context("resolve running dev-auth executable")?;
+    read_declared_secret_with_token_at_child(
+        operation,
+        &child_executable,
+        op_program,
+        service_token,
+        reference,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_declared_secret_with_token(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    op_program: &str,
+    service_token: &SecretString,
+    reference: &str,
+) -> Result<SecretString> {
+    operation.checkpoint()?;
+    crate::validate_op_reference(reference)?;
+    let program_guard = program_guard(op_program, "1Password CLI")?;
+    operation.checkpoint()?;
+    let timeout = operation.subprocess_timeout()?;
+    let output = run_provider_read(
+        operation,
+        op_program,
+        &program_guard,
+        service_token,
+        reference,
+        timeout,
+    )?;
+    validate_provider_read_output(operation, output)
+}
+
+fn validate_provider_read_output(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    output: BoundedCommandOutput,
+) -> Result<SecretString> {
+    let stdout = zeroize::Zeroizing::new(output.stdout);
+    let _stderr = zeroize::Zeroizing::new(output.stderr);
+    operation.checkpoint()?;
     if !output.status.success() {
         bail!("1Password denied the declared item read");
     }
-    let value = String::from_utf8(output.stdout).context("1Password item value is not UTF-8")?;
+    let value = std::str::from_utf8(&stdout).context("1Password item value is not UTF-8")?;
     if value.is_empty() || value.contains('\0') {
         bail!("1Password item value is empty or malformed");
     }
-    Ok(SecretString::new(value))
+    let value = SecretString::new(value.to_owned());
+    operation.checkpoint()?;
+    Ok(value)
 }
 
 #[derive(Debug, Serialize)]
@@ -1009,15 +1416,32 @@ struct RepositoryInstallationResponse {
     suspended_at: Option<serde_json::Value>,
 }
 
-fn github_app_jwt(config: &Config, now: i64) -> Result<String> {
-    let private_key = read_declared_secret(config, &config.github.private_key_ref)?;
-    github_app_jwt_with_key(config.github.app_id, &private_key, now)
+fn github_app_jwt(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    config: &Config,
+    now: i64,
+) -> Result<SecretString> {
+    operation.checkpoint()?;
+    let service_token = service_account_token(&config.credential_store)?;
+    let private_key = read_declared_secret_with_token(
+        operation,
+        &config.programs.op,
+        &service_token,
+        &config.github.private_key_ref,
+    )?;
+    github_app_jwt_with_key(operation, config.github.app_id, &private_key, now)
 }
 
-fn github_app_jwt_with_key(app_id: u64, private_key: &SecretString, now: i64) -> Result<String> {
+fn github_app_jwt_with_key(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    app_id: u64,
+    private_key: &SecretString,
+    now: i64,
+) -> Result<SecretString> {
+    operation.checkpoint()?;
     let key = EncodingKey::from_rsa_pem(private_key.expose().as_bytes())
         .context("GitHub App private key is not a valid RSA PEM key")?;
-    encode(
+    let jwt = encode(
         &Header::new(Algorithm::RS256),
         &AppJwtClaims {
             iat: now - 60,
@@ -1026,44 +1450,60 @@ fn github_app_jwt_with_key(app_id: u64, private_key: &SecretString, now: i64) ->
         },
         &key,
     )
-    .context("sign GitHub App JWT")
+    .context("sign GitHub App JWT")?;
+    let jwt = SecretString::new(jwt);
+    operation.checkpoint()?;
+    Ok(jwt)
 }
 
-fn github_api_agent() -> ureq::Agent {
+#[cfg(target_os = "linux")]
+pub(crate) const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn github_api_agent_with_timeout(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
         .http_status_as_error(false)
         .max_redirects(0)
-        .timeout_global(Some(Duration::from_secs(30)))
+        .timeout_global(Some(timeout))
         .user_agent(format!("dev-auth/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
 }
 
 fn discover_repository_installation(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     config: &Config,
     owner: &str,
     repository: &str,
     now: i64,
 ) -> Result<SelectedRepository> {
-    let jwt = github_app_jwt(config, now)?;
-    discover_repository_installation_with_jwt(&config.github, owner, repository, &jwt)
+    let jwt = github_app_jwt(operation, config, now)?;
+    discover_repository_installation_with_jwt(
+        operation,
+        &config.github,
+        owner,
+        repository,
+        jwt.expose(),
+    )
 }
 
 fn discover_repository_installation_with_jwt(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     profile: &crate::GitHubProfile,
     owner: &str,
     repository: &str,
     jwt: &str,
 ) -> Result<SelectedRepository> {
+    operation.checkpoint()?;
     let url = format!("https://api.github.com/repos/{owner}/{repository}/installation");
-    let mut response = github_api_agent()
+    let mut response = github_api_agent_with_timeout(operation.http_timeout()?)
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {jwt}"))
         .header("X-GitHub-Api-Version", "2026-03-10")
         .call()
         .context("discover exact repository GitHub App installation")?;
+    operation.checkpoint()?;
     if !response.status().is_success() {
         bail!(
             "GitHub App repository installation lookup returned HTTP {}",
@@ -1076,44 +1516,70 @@ fn discover_repository_installation_with_jwt(
         .limit(RESPONSE_LIMIT)
         .read_to_vec()
         .context("read bounded GitHub App installation response")?;
-    validate_repository_installation_response(profile, owner, repository, &bytes)
+    operation.checkpoint()?;
+    let selected = validate_repository_installation_response(profile, owner, repository, &bytes)?;
+    operation.checkpoint()?;
+    Ok(selected)
 }
 
 #[cfg(target_os = "linux")]
 fn discover_owner_installation_with_jwt(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     profile: &crate::GitHubProfile,
     owner: &str,
     jwt: &str,
 ) -> Result<u64> {
-    let agent = github_api_agent();
+    operation.checkpoint()?;
+    let installation_id =
+        discover_owner_installation_with_lookup(profile, owner, |account_kind| {
+            operation.checkpoint()?;
+            let url = format!("https://api.github.com/{account_kind}/{owner}/installation");
+            let mut response = github_api_agent_with_timeout(operation.http_timeout()?)
+                .get(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", format!("Bearer {jwt}"))
+                .header("X-GitHub-Api-Version", "2026-03-10")
+                .call()
+                .context("discover owner GitHub App installation")?;
+            operation.checkpoint()?;
+            let status = response.status();
+            let bytes = if response.status().is_success() {
+                response
+                    .body_mut()
+                    .with_config()
+                    .limit(RESPONSE_LIMIT)
+                    .read_to_vec()
+                    .context("read bounded GitHub App owner installation response")?
+            } else {
+                Vec::new()
+            };
+            operation.checkpoint()?;
+            Ok((status, bytes))
+        })?;
+    operation.checkpoint()?;
+    Ok(installation_id)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn discover_owner_installation_with_lookup(
+    profile: &crate::GitHubProfile,
+    owner: &str,
+    mut lookup: impl FnMut(&str) -> Result<(ureq::http::StatusCode, Vec<u8>)>,
+) -> Result<u64> {
     let mut installation_id = None;
     for account_kind in ["orgs", "users"] {
-        let url = format!("https://api.github.com/{account_kind}/{owner}/installation");
-        let mut response = agent
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("Authorization", format!("Bearer {jwt}"))
-            .header("X-GitHub-Api-Version", "2026-03-10")
-            .call()
-            .context("discover owner GitHub App installation")?;
-        if response.status().as_u16() == 404 {
+        let (status, bytes) = lookup(account_kind)?;
+        if status == ureq::http::StatusCode::NOT_FOUND {
             continue;
         }
-        if !response.status().is_success() {
-            bail!(
-                "GitHub App owner installation lookup returned HTTP {}",
-                response.status()
-            );
+        if !status.is_success() {
+            bail!("GitHub App owner installation lookup returned HTTP {status}");
         }
-        let bytes = response
-            .body_mut()
-            .with_config()
-            .limit(RESPONSE_LIMIT)
-            .read_to_vec()
-            .context("read bounded GitHub App owner installation response")?;
         let selected = validate_owner_installation_response(profile, owner, &bytes)?;
-        if installation_id.replace(selected).is_some() {
-            bail!("GitHub App owner installation lookup is ambiguous");
+        match installation_id {
+            None => installation_id = Some(selected),
+            Some(expected) if expected == selected => {}
+            Some(_) => bail!("GitHub App owner installation lookup is ambiguous"),
         }
     }
     installation_id.context("GitHub App has no installation for the authorized owner")
@@ -1164,16 +1630,18 @@ fn validate_repository_installation_response(
 }
 
 fn mint_installation_token(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     config: &Config,
     installation_id: u64,
     owner: &str,
     repository: &str,
     now: i64,
 ) -> Result<CacheEntry> {
-    let jwt = github_app_jwt(config, now)?;
+    let jwt = github_app_jwt(operation, config, now)?;
     mint_installation_token_with_jwt(
+        operation,
         &config.github,
-        &jwt,
+        jwt.expose(),
         installation_id,
         owner,
         repository,
@@ -1182,6 +1650,7 @@ fn mint_installation_token(
 }
 
 fn mint_installation_token_with_jwt(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     profile: &crate::GitHubProfile,
     jwt: &str,
     installation_id: u64,
@@ -1191,6 +1660,7 @@ fn mint_installation_token_with_jwt(
 ) -> Result<CacheEntry> {
     let repositories = [repository.to_owned()];
     let token = mint_scoped_installation_token_with_jwt(
+        operation,
         profile,
         jwt,
         installation_id,
@@ -1210,6 +1680,7 @@ fn mint_installation_token_with_jwt(
 }
 
 fn mint_scoped_installation_token_with_jwt(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     profile: &crate::GitHubProfile,
     jwt: &str,
     installation_id: u64,
@@ -1217,6 +1688,7 @@ fn mint_scoped_installation_token_with_jwt(
     repositories: &[String],
     now: i64,
 ) -> Result<BrokerGitHubToken> {
+    operation.checkpoint()?;
     if repositories.len() > 500 {
         bail!("GitHub token scope must not exceed 500 repositories");
     }
@@ -1237,9 +1709,14 @@ fn mint_scoped_installation_token_with_jwt(
         }
         Some(expected)
     };
-    let agent = github_api_agent();
     let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
-    let mut response = agent
+    operation.checkpoint()?;
+    let request_timeout = operation.http_timeout()?;
+    // After GitHub accepts this POST it may have created an installation token.
+    // Do not observe cancellation again until the caller has placed a successful
+    // response into its revocation-owning cache; dropping it here would make
+    // teardown unable to revoke the provider-side credential.
+    let mut response = github_api_agent_with_timeout(request_timeout)
         .post(&url)
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {jwt}"))
@@ -1255,12 +1732,14 @@ fn mint_scoped_installation_token_with_jwt(
             response.status()
         );
     }
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(RESPONSE_LIMIT)
-        .read_to_vec()
-        .context("read bounded GitHub App response")?;
+    let bytes = zeroize::Zeroizing::new(
+        response
+            .body_mut()
+            .with_config()
+            .limit(RESPONSE_LIMIT)
+            .read_to_vec()
+            .context("read bounded GitHub App response")?,
+    );
     validate_installation_token_response(
         profile,
         owner,
@@ -1354,8 +1833,14 @@ pub(crate) struct BrokerGitHubToken {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn broker_revoke_github_token(token: &SecretString) -> Result<()> {
-    let response = github_api_agent()
+pub(crate) fn broker_revoke_github_token_with_timeout(
+    token: &SecretString,
+    timeout: Duration,
+) -> Result<()> {
+    if timeout.is_zero() {
+        bail!("GitHub App token revocation deadline elapsed");
+    }
+    let response = github_api_agent_with_timeout(timeout.min(GITHUB_API_TIMEOUT))
         .delete("https://api.github.com/installation/token")
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("token {}", token.expose()))
@@ -1370,29 +1855,33 @@ pub(crate) fn broker_revoke_github_token(token: &SecretString) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn broker_github_token_for_repository(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     authority: BrokerGitHubAuthority<'_>,
     owner: &str,
     repository: &str,
 ) -> Result<BrokerGitHubToken> {
-    broker_github_token_for_repositories(authority, owner, &[repository.to_owned()])
+    broker_github_token_for_repositories(operation, authority, owner, &[repository.to_owned()])
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn broker_github_token_for_repositories(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     authority: BrokerGitHubAuthority<'_>,
     owner: &str,
     repositories: &[String],
 ) -> Result<BrokerGitHubToken> {
+    operation.checkpoint()?;
     if repositories.len() > 500 {
         bail!("GitHub CLI authority exceeds the repository limit");
     }
     let private_key = read_declared_secret_with_token(
+        operation,
         authority.op_program,
         authority.service_token,
         authority.private_key_ref,
     )?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let jwt = github_app_jwt_with_key(authority.app_id, &private_key, now)?;
+    let jwt = github_app_jwt_with_key(operation, authority.app_id, &private_key, now)?;
     let profile = crate::GitHubProfile {
         app_id: authority.app_id,
         private_key_ref: authority.private_key_ref.to_owned(),
@@ -1402,12 +1891,17 @@ pub(crate) fn broker_github_token_for_repositories(
         permissions: authority.permissions,
     };
     let installation_id = if repositories.is_empty() {
-        discover_owner_installation_with_jwt(&profile, owner, &jwt)?
+        discover_owner_installation_with_jwt(operation, &profile, owner, jwt.expose())?
     } else {
         let mut installation_id = None;
         for repository in repositories {
-            let selected =
-                discover_repository_installation_with_jwt(&profile, owner, repository, &jwt)?;
+            let selected = discover_repository_installation_with_jwt(
+                operation,
+                &profile,
+                owner,
+                repository,
+                jwt.expose(),
+            )?;
             match installation_id {
                 None => installation_id = Some(selected.installation_id),
                 Some(expected) if expected == selected.installation_id => {}
@@ -1425,8 +1919,9 @@ pub(crate) fn broker_github_token_for_repositories(
         bail!("GitHub App installation is outside the workload authority cap");
     }
     mint_scoped_installation_token_with_jwt(
+        operation,
         &profile,
-        &jwt,
+        jwt.expose(),
         installation_id,
         owner,
         repositories,
@@ -1434,7 +1929,7 @@ pub(crate) fn broker_github_token_for_repositories(
     )
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CacheFile {
     token: String,
@@ -1444,6 +1939,12 @@ struct CacheFile {
     owner: String,
     repository: String,
     permissions: BTreeMap<String, String>,
+}
+
+impl Drop for CacheFile {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.token);
+    }
 }
 
 impl From<&CacheEntry> for CacheFile {
@@ -1461,15 +1962,15 @@ impl From<&CacheEntry> for CacheFile {
 }
 
 impl From<CacheFile> for CacheEntry {
-    fn from(value: CacheFile) -> Self {
+    fn from(mut value: CacheFile) -> Self {
         CacheEntry::new(
-            SecretString::new(value.token),
+            SecretString::new(std::mem::take(&mut value.token)),
             value.expires_at,
             value.app_id,
             value.installation_id,
-            value.owner,
-            value.repository,
-            value.permissions,
+            std::mem::take(&mut value.owner),
+            std::mem::take(&mut value.repository),
+            std::mem::take(&mut value.permissions),
         )
     }
 }
@@ -1562,6 +2063,7 @@ where
 }
 
 fn locked_cache_entry<F>(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     paths: &RuntimePaths,
     config: &Config,
     selected: &SelectedRepository,
@@ -1588,6 +2090,7 @@ where
                 &selected.repository,
                 &config.github.permissions,
             ) {
+                operation.checkpoint()?;
                 return Ok(entry);
             }
         }
@@ -1602,12 +2105,15 @@ where
         ) {
             bail!("new installation token is not usable for the requested scope");
         }
-        write_cache(&config.credential_store, &key, &entry)?;
+        publish_provider_token_to_user_cache(operation, || {
+            write_cache(&config.credential_store, &key, &entry)
+        })?;
         Ok(entry)
     })
 }
 
 fn locked_dynamic_cache_entry(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     paths: &RuntimePaths,
     config: &Config,
     owner: &str,
@@ -1624,7 +2130,7 @@ fn locked_dynamic_cache_entry(
     )?;
     with_cache_scope_lock(paths, &key, || {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        resolve_dynamic_cache_entry(
+        let entry = resolve_dynamic_cache_entry(
             DynamicRepositoryScope {
                 now,
                 app_id: config.github.app_id,
@@ -1632,10 +2138,11 @@ fn locked_dynamic_cache_entry(
                 repository: &repository,
                 permissions: &config.github.permissions,
             },
-            || discover_repository_installation(config, &owner, &repository, now),
+            || discover_repository_installation(operation, config, &owner, &repository, now),
             || read_cache(&config.credential_store, &key),
             |installation_id| {
                 mint_installation_token(
+                    operation,
                     config,
                     installation_id,
                     &owner,
@@ -1643,8 +2150,14 @@ fn locked_dynamic_cache_entry(
                     OffsetDateTime::now_utc().unix_timestamp(),
                 )
             },
-            |entry| write_cache(&config.credential_store, &key, entry),
-        )
+            |entry| {
+                publish_provider_token_to_user_cache(operation, || {
+                    write_cache(&config.credential_store, &key, entry)
+                })
+            },
+        )?;
+        operation.checkpoint()?;
+        Ok(entry)
     })
 }
 
@@ -1733,9 +2246,11 @@ fn cache_entry(store: &CredentialStore, key: &str) -> Result<Entry> {
 }
 
 fn read_cache(store: &CredentialStore, key: &str) -> Result<CacheEntry> {
-    let secret = cache_entry(store, key)?
-        .get_password()
-        .context("read native installation-token cache")?;
+    let secret = zeroize::Zeroizing::new(
+        cache_entry(store, key)?
+            .get_password()
+            .context("read native installation-token cache")?,
+    );
     let value: CacheFile =
         serde_json::from_str(&secret).context("parse installation-token cache")?;
     if value.token.is_empty() || value.token.contains(['\n', '\r', '\0']) {
@@ -1745,11 +2260,27 @@ fn read_cache(store: &CredentialStore, key: &str) -> Result<CacheEntry> {
 }
 
 fn write_cache(store: &CredentialStore, key: &str, entry: &CacheEntry) -> Result<()> {
-    let secret = serde_json::to_string(&CacheFile::from(entry))
-        .context("serialize installation-token cache")?;
+    let secret = zeroize::Zeroizing::new(
+        serde_json::to_string(&CacheFile::from(entry))
+            .context("serialize installation-token cache")?,
+    );
     cache_entry(store, key)?
         .set_password(&secret)
         .context("write native installation-token cache")
+}
+
+fn publish_provider_token_to_user_cache(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    write: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // A successful provider mint must acquire a local revocation owner even if
+    // cancellation arrived immediately afterward. Preserve the cancellation
+    // result, perform the cache publication, then return the cancellation only
+    // after the token is recoverable by the cache lifecycle.
+    let checkpoint = operation.checkpoint();
+    write()?;
+    checkpoint?;
+    operation.checkpoint()
 }
 
 fn token_entry_for_repository(
@@ -1758,12 +2289,14 @@ fn token_entry_for_repository(
     owner: &str,
     repository: &str,
 ) -> Result<CacheEntry> {
+    let operation = crate::provider_operation::ProviderOperation::uncancelled()?;
     if config.github.discover_installations {
-        return locked_dynamic_cache_entry(paths, config, owner, repository);
+        return locked_dynamic_cache_entry(&operation, paths, config, owner, repository);
     }
     let selected = config.github.select_repository(owner, repository)?;
-    locked_cache_entry(paths, config, &selected, || {
+    locked_cache_entry(&operation, paths, config, &selected, || {
         mint_installation_token(
+            &operation,
             config,
             selected.installation_id,
             &selected.owner,
@@ -3541,6 +4074,7 @@ impl Agent<PrivateNamedPipeListener> for DeclaredAgent {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn broker_sign_ssh(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     op_program: &str,
     service_token: &SecretString,
     private_key_ref: &str,
@@ -3548,11 +4082,30 @@ pub(crate) fn broker_sign_ssh(
     declared_fingerprint: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    operation.checkpoint()?;
     if payload.is_empty() || payload.len() > 1024 * 1024 {
         bail!("SSH signing payload size is invalid");
     }
-    let source = read_declared_secret_with_token(op_program, service_token, private_key_ref)?;
-    let private_key = parse_declared_ssh_private_key(&source)?;
+    let source =
+        read_declared_secret_with_token(operation, op_program, service_token, private_key_ref)?;
+    broker_sign_ssh_with_source(
+        operation,
+        &source,
+        declared_public_key,
+        declared_fingerprint,
+        payload,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn broker_sign_ssh_with_source(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    source: &SecretString,
+    declared_public_key: &str,
+    declared_fingerprint: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let private_key = parse_declared_ssh_private_key(source)?;
     let public_key = PublicKey::from_openssh(declared_public_key)
         .context("declared operation public key is invalid")?;
     if private_key.public_key().key_data() != public_key.key_data()
@@ -3563,21 +4116,36 @@ pub(crate) fn broker_sign_ssh(
     let signature = private_key
         .try_sign(payload)
         .context("perform broker-backed SSH signature")?;
-    Vec::<u8>::try_from(signature).context("encode broker-backed SSH signature")
+    let encoded = Vec::<u8>::try_from(signature).context("encode broker-backed SSH signature")?;
+    operation.checkpoint()?;
+    Ok(encoded)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn broker_sign_release_manifest_bytes(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
     op_program: &str,
     service_token: &SecretString,
     private_key_ref: &str,
     declared_public_key: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    operation.checkpoint()?;
     if payload.is_empty() || payload.len() > 16 * 1024 {
         bail!("release manifest signing payload size is invalid");
     }
-    let source = read_declared_secret_with_token(op_program, service_token, private_key_ref)?;
+    let source =
+        read_declared_secret_with_token(operation, op_program, service_token, private_key_ref)?;
+    broker_sign_release_manifest_with_source(operation, &source, declared_public_key, payload)
+}
+
+#[cfg(target_os = "linux")]
+fn broker_sign_release_manifest_with_source(
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    source: &SecretString,
+    declared_public_key: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
     let encoded = source.expose().trim();
     if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("declared release private key is not raw Ed25519 hex material");
@@ -3593,7 +4161,9 @@ pub(crate) fn broker_sign_release_manifest_bytes(
     if signing_key.verifying_key() != public_key {
         bail!("declared release key identity does not match private material");
     }
-    Ok(signing_key.sign(payload).to_bytes().to_vec())
+    let signature = signing_key.sign(payload).to_bytes().to_vec();
+    operation.checkpoint()?;
+    Ok(signature)
 }
 
 #[cfg(target_os = "linux")]
@@ -3923,6 +4493,83 @@ mod tests {
     fn write_linux_test_program(path: &Path, output: &str, mode: u32) {
         fs::write(path, format!("#!/bin/sh\nprintf {output}\n")).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_linux_op_program(directory: &Path, body: &str) -> PathBuf {
+        let path = directory.join("op");
+        fs::write(&path, format!("#!/usr/bin/bash\nset -eu\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_linux_provider_child(directory: &Path) -> PathBuf {
+        let path = directory.join("dev-auth-provider-exec-test");
+        fs::write(
+            &path,
+            "#!/usr/bin/bash\n\
+set -eu\n\
+[ \"$1\" = --child-fd ]\n\
+[ \"$3\" = --provider-fd ]\n\
+[ \"$5\" = --token-fd ]\n\
+[ \"$7\" = --provider-argv0 ]\n\
+[ \"$9\" = --reference ]\n\
+token=\"$(/usr/bin/cat \"/proc/self/fd/$6\")\"\n\
+export OP_SERVICE_ACCOUNT_TOKEN=\"$token\"\n\
+exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_exec_parent_command_contains_only_descriptor_authority() {
+        let directory = linux_program_test_directory();
+        let child = directory.path().join("dev-auth");
+        let provider = directory.path().join("op");
+        write_linux_test_program(&child, "'child\\n'", 0o700);
+        write_linux_test_program(&provider, "'provider\\n'", 0o700);
+        let child_guard = program_guard(child.to_str().unwrap(), "provider child").unwrap();
+        let provider_guard = program_guard(provider.to_str().unwrap(), "provider").unwrap();
+        let token = SecretString::new("transport-token-that-must-not-enter-command".into());
+
+        let invocation = prepare_linux_provider_exec(
+            &child_guard,
+            &provider_guard,
+            provider.to_str().unwrap(),
+            &token,
+            "op://Automation/provider/private-key",
+        )
+        .unwrap();
+
+        let rendered_arguments = invocation
+            .command
+            .get_args()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!rendered_arguments.contains(token.expose()));
+        assert!(invocation.command.get_envs().all(|(name, value)| {
+            name != OsStr::new("OP_SERVICE_ACCOUNT_TOKEN")
+                && match value {
+                    Some(value) => !value.to_string_lossy().contains(token.expose()),
+                    None => true,
+                }
+        }));
+        let metadata = rustix::fs::fstat(&invocation._token).unwrap();
+        assert_eq!(metadata.st_nlink, 0);
+        assert_eq!(metadata.st_mode & 0o777, 0o600);
+        assert!(rustix::fs::fcntl_get_seals(&invocation._token)
+            .unwrap()
+            .contains(
+                rustix::fs::SealFlags::SEAL
+                    | rustix::fs::SealFlags::SHRINK
+                    | rustix::fs::SealFlags::GROW
+                    | rustix::fs::SealFlags::WRITE
+            ));
     }
 
     #[test]
@@ -4264,6 +4911,88 @@ mod tests {
             &serde_json::to_vec(&all_installation).unwrap(),
         )
         .is_ok());
+    }
+
+    fn owner_installation_lookup_profile() -> crate::GitHubProfile {
+        crate::GitHubProfile {
+            app_id: 42,
+            private_key_ref: "op://Automation/app/private-key".into(),
+            repository_selection: crate::RepositorySelection::Selected,
+            discover_installations: true,
+            installations: Vec::new(),
+            permissions: BTreeMap::from([("contents".into(), "write".into())]),
+        }
+    }
+
+    fn owner_installation_lookup_response(installation_id: u64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": installation_id,
+            "app_id": 42,
+            "account": {"login": "ExampleOrg"},
+            "permissions": {"contents": "write"},
+            "repository_selection": "selected",
+            "suspended_at": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn owner_installation_lookup_deduplicates_matching_account_aliases() {
+        let profile = owner_installation_lookup_profile();
+        let mut queried = Vec::new();
+        let installation_id =
+            discover_owner_installation_with_lookup(&profile, "exampleorg", |account_kind| {
+                queried.push(account_kind.to_owned());
+                Ok((
+                    ureq::http::StatusCode::OK,
+                    owner_installation_lookup_response(101),
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(installation_id, 101);
+        assert_eq!(queried, ["orgs", "users"]);
+    }
+
+    #[test]
+    fn owner_installation_lookup_rejects_distinct_account_aliases_as_ambiguous() {
+        let profile = owner_installation_lookup_profile();
+        let mut installation_ids = [101, 202].into_iter();
+        let error =
+            discover_owner_installation_with_lookup(&profile, "exampleorg", |_account_kind| {
+                Ok((
+                    ureq::http::StatusCode::OK,
+                    owner_installation_lookup_response(installation_ids.next().unwrap()),
+                ))
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "GitHub App owner installation lookup is ambiguous"
+        );
+    }
+
+    #[test]
+    fn owner_installation_lookup_accepts_not_found_then_matching_user_alias() {
+        let profile = owner_installation_lookup_profile();
+        let mut queried = Vec::new();
+        let installation_id =
+            discover_owner_installation_with_lookup(&profile, "exampleorg", |account_kind| {
+                queried.push(account_kind.to_owned());
+                match account_kind {
+                    "orgs" => Ok((ureq::http::StatusCode::NOT_FOUND, Vec::new())),
+                    "users" => Ok((
+                        ureq::http::StatusCode::OK,
+                        owner_installation_lookup_response(101),
+                    )),
+                    _ => unreachable!("owner lookup queried an unexpected account alias"),
+                }
+            })
+            .unwrap();
+
+        assert_eq!(installation_id, 101);
+        assert_eq!(queried, ["orgs", "users"]);
     }
 
     #[test]
@@ -5413,7 +6142,167 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn declared_secret_read_terminalizes_a_hanging_provider_at_one_deadline() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let op = write_linux_op_program(directory.path(), "exec /usr/bin/sleep 60");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let operation = crate::provider_operation::ProviderOperation::with_test_timeout(
+            &cancelled,
+            Duration::from_millis(2_100),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+
+        let error = read_declared_secret_with_token_at_child(
+            &operation,
+            &child,
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/provider/private-key",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "1Password item read exceeded its deadline"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn declared_secret_read_observes_session_cancellation_during_provider_execution() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let started = directory.path().join("started");
+        let op = write_linux_op_program(
+            directory.path(),
+            &format!(
+                "/usr/bin/touch -- '{}'; exec /usr/bin/sleep 60",
+                started.display()
+            ),
+        );
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let operation = crate::provider_operation::ProviderOperation::with_test_timeout(
+            &cancelled,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+
+        let error = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !started.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(started.exists(), "provider process never reported startup");
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+            });
+            read_declared_secret_with_token_at_child(
+                &operation,
+                &child,
+                op.to_str().unwrap(),
+                &SecretString::new("test-service-token".into()),
+                "op://Automation/provider/private-key",
+            )
+            .unwrap_err()
+        });
+
+        assert_eq!(error.to_string(), "1Password item read was cancelled");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn declared_secret_read_rejects_oversized_provider_output_without_echoing_it() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let op = write_linux_op_program(directory.path(), "exec /usr/bin/head -c 65537 /dev/zero");
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+
+        let error = read_declared_secret_with_token_at_child(
+            &operation,
+            &child,
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/provider/private-key",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "1Password item read exceeded its output limit"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn declared_secret_read_rejects_malformed_provider_output_without_echoing_it() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let op = write_linux_op_program(directory.path(), "printf '\\377'");
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+
+        let error = read_declared_secret_with_token_at_child(
+            &operation,
+            &child,
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/provider/private-key",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "1Password item value is not UTF-8");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn declared_secret_read_failure_does_not_echo_provider_stderr() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let op = write_linux_op_program(
+            directory.path(),
+            "printf 'provider-secret-diagnostic' >&2; exit 1",
+        );
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+
+        let error = read_declared_secret_with_token_at_child(
+            &operation,
+            &child,
+            op.to_str().unwrap(),
+            &SecretString::new("test-service-token".into()),
+            "op://Automation/provider/private-key",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "1Password denied the declared item read");
+        assert!(!format!("{error:?}").contains("provider-secret-diagnostic"));
+    }
+
+    #[test]
+    fn user_cache_publication_retains_a_minted_token_before_reporting_cancellation() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let operation = crate::provider_operation::ProviderOperation::with_test_timeout(
+            &cancelled,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let published = std::cell::Cell::new(false);
+
+        let error = publish_provider_token_to_user_cache(&operation, || {
+            published.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(published.get());
+        assert_eq!(error.to_string(), "provider operation was cancelled");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn broker_signing_returns_only_a_verifiable_signature_for_the_declared_key() {
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
         let directory = linux_program_test_directory();
         let private_key = PrivateKey::new(
             KeypairData::Ed25519(Ed25519Keypair::from_seed(&[29; 32])),
@@ -5439,12 +6328,20 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&op, fs::Permissions::from_mode(0o700)).unwrap();
-
-        let payload = b"broker-backed commit signature";
-        let encoded = broker_sign_ssh(
+        let child = write_linux_provider_child(directory.path());
+        let source = read_declared_secret_with_token_at_child(
+            &operation,
+            &child,
             op.to_str().unwrap(),
             &SecretString::new("test-service-token".into()),
             "op://Automation/signing/private-key",
+        )
+        .unwrap();
+
+        let payload = b"broker-backed commit signature";
+        let encoded = broker_sign_ssh_with_source(
+            &operation,
+            &source,
             &public_key.to_openssh().unwrap(),
             &fingerprint,
             payload,
@@ -5453,10 +6350,9 @@ mod tests {
         let signature = Signature::try_from(encoded.as_slice()).unwrap();
         signature::Verifier::verify(&public_key, payload, &signature).unwrap();
 
-        assert!(broker_sign_ssh(
-            op.to_str().unwrap(),
-            &SecretString::new("test-service-token".into()),
-            "op://Automation/signing/private-key",
+        assert!(broker_sign_ssh_with_source(
+            &operation,
+            &source,
             &public_key.to_openssh().unwrap(),
             "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             payload,
@@ -5467,6 +6363,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn broker_release_signing_uses_only_raw_ed25519_release_keys() {
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
         let directory = linux_program_test_directory();
         let private_key = [29_u8; 32];
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_key);
@@ -5491,12 +6388,20 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&op, fs::Permissions::from_mode(0o700)).unwrap();
-
-        let payload = b"canonical release manifest payload";
-        let encoded = broker_sign_release_manifest_bytes(
+        let child = write_linux_provider_child(directory.path());
+        let source = read_declared_secret_with_token_at_child(
+            &operation,
+            &child,
             op.to_str().unwrap(),
             &SecretString::new("test-service-token".into()),
             "op://Automation/release/private-key",
+        )
+        .unwrap();
+
+        let payload = b"canonical release manifest payload";
+        let encoded = broker_sign_release_manifest_with_source(
+            &operation,
+            &source,
             &public_key
                 .to_bytes()
                 .iter()
@@ -5509,10 +6414,9 @@ mod tests {
         public_key.verify_strict(payload, &signature).unwrap();
         assert_eq!(encoded.len(), 64);
 
-        assert!(broker_sign_release_manifest_bytes(
-            op.to_str().unwrap(),
-            &SecretString::new("test-service-token".into()),
-            "op://Automation/release/private-key",
+        assert!(broker_sign_release_manifest_with_source(
+            &operation,
+            &source,
             "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072",
             payload,
         )

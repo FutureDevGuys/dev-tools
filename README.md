@@ -18,7 +18,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 
 Verified release artifacts are the supported installation path. Every product uses its own nested release tag, such as `update-all/v1.2.3`. A one-time Update All seed establishes the embedded trust root; authenticated native HTTPS then resolves and installs current stable products without Git, GitHub CLI, curl, wget, authentication, or a source checkout. The seed is not desired-version state and never needs to be refreshed.
 
-On Linux x86-64, download `update-all-0.1.6-linux-x86_64` from the [`update-all/v0.1.6` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.6), make it executable, and run:
+After `update-all` 0.1.6 and native `sync-configs` 0.2.0 complete publication and acceptance, a native Linux x86-64 host can download `update-all-0.1.6-linux-x86_64` from the [`update-all/v0.1.6` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.6), make it executable, and run:
 
 ```sh
 ./update-all-0.1.6-linux-x86_64 self install
@@ -29,11 +29,11 @@ On Linux x86-64, download `update-all-0.1.6-linux-x86_64` from the [`update-all/
 
 The current stable `dev-auth` is distributed through the same signed release format but remains provisioned by the workstation configuration authority during the reversible v0.3 transition. The v0.3 successor owns its installer, broker services, same-name launchers, migration, diagnostics, and credential lifecycle; Syscfg becomes only an optional policy and deployment client after standalone clean-device acceptance. `dev-auth` remains deliberately outside unattended `update-all` product installation because setup includes administrator policy and explicit credential enrollment.
 
-After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. The platform-neutral `sync-configs` artifact bundles its Python dependencies and requires Python 3.11 or newer.
+After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. Fresh and steady-state `sync-configs` installations use a target-specific native executable and need no Python runtime. A managed upgrade from the retained Python `sync-configs 0.1.13` artifact keeps that interpreter available only through adoption and the rollback window, as described in the [sync-configs guide](docs/sync-configs.md).
 
 | Platform | Status | Notes |
 |---|---|---|
-| Linux x86-64 | Supported | Signed artifacts, native updater checks, installation, rollback, and fresh-shell runtime acceptance. |
+| Linux x86-64 | Cutover pending | The native implementation and release boundary are ready; support is claimed only after the signed generation is installed and passes installation, rollback, and fresh-shell runtime acceptance. |
 | Windows | Acceptance pending | Artifacts may be built, but runtime support is not claimed until native Windows acceptance passes. |
 | WSL | Acceptance pending | Runtime support is not claimed until the WSL acceptance harness passes. |
 | macOS | Unclaimed | Some updater definitions are portable, but product runtime acceptance is not complete. |
@@ -45,8 +45,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny check
-python -m pytest tests sync-configs/tests
-python sync-configs/scripts/build_zipapp.py
+python -m pytest tests
 ```
 
 See the [documentation index](docs/README.md), [security policy](SECURITY.md), [contribution guide](CONTRIBUTING.md), and [license terms](LICENSE-MIT) ([Apache-2.0](LICENSE-APACHE)).

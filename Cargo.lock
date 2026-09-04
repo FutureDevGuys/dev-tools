@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "dev-auth"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -964,8 +964,11 @@ name = "dev-tools-command"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rustix",
  "tempfile",
  "wait-timeout",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1492,6 +1495,19 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+]
+
+[[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -3076,6 +3092,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "service-binding"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3364,6 +3393,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-configs"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "clap_complete",
+ "ctrlc",
+ "dev-tools-command",
+ "dev-tools-installation",
+ "dev-tools-reconcile-protocol",
+ "globset",
+ "libc",
+ "nix 0.31.3",
+ "predicates",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml_edit",
+ "uuid",
+ "walkdir",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3633,8 +3691,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
  "indexmap",
+ "serde_core",
+ "serde_spanned",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 
@@ -3745,6 +3806,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

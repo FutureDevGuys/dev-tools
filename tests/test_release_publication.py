@@ -20,6 +20,7 @@ assert PUBLISH_SPEC is not None and PUBLISH_SPEC.loader is not None
 PUBLISH_MODULE = importlib.util.module_from_spec(PUBLISH_SPEC)
 sys.modules[PUBLISH_SPEC.name] = PUBLISH_MODULE
 PUBLISH_SPEC.loader.exec_module(PUBLISH_MODULE)
+from release_signing import envelope as sign_envelope
 
 
 def write_private_key(path: Path, key: Ed25519PrivateKey) -> None:
@@ -31,7 +32,9 @@ def write_public_key(path: Path, key: Ed25519PrivateKey) -> None:
     path.write_text(key.public_key().public_bytes_raw().hex() + "\n", encoding="ascii")
 
 
-def build_release_set(tmp_path: Path) -> tuple[Path, Path, str]:
+def build_release_set(
+    tmp_path: Path, *, sync_configs_target: str = "linux-x86_64"
+) -> tuple[Path, Path, str]:
     root_key = Ed25519PrivateKey.from_private_bytes(bytes([3]) * 32)
     release_key = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
     root_private = tmp_path / "root.key"
@@ -62,9 +65,9 @@ def build_release_set(tmp_path: Path) -> tuple[Path, Path, str]:
         check=True,
     )
     release_root = tmp_path / "releases"
-    for product, version, artifact_name in (
-        ("update-all", "1.2.3", "update-all"),
-        ("sync-configs", "2.3.4", "sync-configs.pyz"),
+    for product, version, target, artifact_name in (
+        ("update-all", "1.2.3", "linux-x86_64", "update-all"),
+        ("sync-configs", "2.3.4", "linux-x86_64", "sync-configs.pyz"),
     ):
         artifact = tmp_path / artifact_name
         artifact.write_bytes(f"{product} fixture\n".encode())
@@ -77,7 +80,7 @@ def build_release_set(tmp_path: Path) -> tuple[Path, Path, str]:
                 "--version",
                 version,
                 "--target",
-                "linux-x86_64",
+                target,
                 "--artifact",
                 str(artifact),
                 "--root-document",
@@ -95,6 +98,25 @@ def build_release_set(tmp_path: Path) -> tuple[Path, Path, str]:
             check=True,
             capture_output=True,
             text=True,
+        )
+    if sync_configs_target != "linux-x86_64":
+        # The shared builder now rejects an unaccepted target before signing.
+        # Construct an authentically signed, policy-invalid fixture directly so
+        # the publisher's independent fail-closed boundary is still exercised.
+        manifest_path = release_root / "sync-configs/sync-configs-stable.json"
+        manifest_envelope = json.loads(manifest_path.read_text(encoding="utf-8"))
+        signed = manifest_envelope["signed"]
+        artifact = signed["artifacts"].pop("linux-x86_64")
+        signed["artifacts"] = {sync_configs_target: artifact}
+        key_id = manifest_envelope["signatures"][0]["key_id"]
+        manifest_path.write_text(
+            json.dumps(
+                sign_envelope(signed, key_id, release_key),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
         )
     return release_root, trusted_root, "a" * 40
 
@@ -302,6 +324,32 @@ def test_publisher_rejects_a_tampered_artifact_before_provider_calls(
         invoke_publisher(
             monkeypatch, release_root, trusted_root, source_commit, git, gh
         )
+    assert not (state / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "target",
+    ("windows-x86_64", "macos-aarch64", "linux-aarch64"),
+)
+def test_publisher_rejects_an_unaccepted_sync_configs_target_before_provider_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    release_root, trusted_root, source_commit = build_release_set(
+        tmp_path, sync_configs_target=target
+    )
+    git, gh, state = write_fake_commands(tmp_path)
+    monkeypatch.setenv("PUBLICATION_TEST_STATE", str(state))
+
+    with pytest.raises(
+        SystemExit,
+        match=f"sync-configs release target is not accepted: {target}",
+    ):
+        invoke_publisher(
+            monkeypatch, release_root, trusted_root, source_commit, git, gh
+        )
+
     assert not (state / "calls.jsonl").exists()
 
 

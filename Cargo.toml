@@ -8,6 +8,7 @@ members = [
     "crates/dev-tools-reconcile-protocol",
     "crates/dev-tools-release",
     "crates/skills-sync",
+    "crates/sync-configs",
     "crates/update-all",
 ]
 resolver = "2"

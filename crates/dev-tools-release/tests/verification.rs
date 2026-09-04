@@ -1,17 +1,22 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dev_tools_release::{
-    accept_verified_release, accept_verified_release_at, cache_verified_release, fetch_https,
-    load_cached_release, load_release_state_at, select_stable_release_assets,
+    accept_verified_release, fetch_https, select_stable_release_assets,
     validate_unsigned_product_manifest, verify_artifact_bytes, verify_release_bytes,
     verify_release_metadata, ArtifactUrlPolicy, HttpsPolicy, ReleaseAuthority, ReleaseBundle,
     ReleaseMetadata, ReleaseState,
+};
+#[cfg(unix)]
+use dev_tools_release::{
+    accept_verified_release_at, cache_verified_release, load_cached_release, load_release_state_at,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::time::Duration;
 
@@ -60,7 +65,14 @@ fn signed(value: Value, key_id: &str, key: &SigningKey) -> Vec<u8> {
     .unwrap()
 }
 
-fn fixture(schema: &str, source_commit: Option<&str>) -> (ReleaseBundle, ReleaseAuthority) {
+fn release_fixture(
+    product: &str,
+    schema: &str,
+    source_commit: Option<&str>,
+    target: &str,
+    artifact_url: &str,
+    artifact_url_policy: ArtifactUrlPolicy,
+) -> (ReleaseBundle, ReleaseAuthority) {
     let root_key = SigningKey::from_bytes(&[7; 32]);
     let release_key = SigningKey::from_bytes(&[9; 32]);
     let root = signed(
@@ -77,16 +89,15 @@ fn fixture(schema: &str, source_commit: Option<&str>) -> (ReleaseBundle, Release
         &root_key,
     );
     let artifact = b"signed product fixture".to_vec();
-    let expected_url = "https://github.com/FutureDevGuys/dev-tools/releases/download/product%2Fv1.2.3/product-1.2.3-linux-x86_64";
     let mut manifest = json!({
         "schema": schema,
-        "product": "product",
+        "product": product,
         "generation": 11,
         "version": "1.2.3",
         "engine_protocol": 1,
         "artifacts": {
-            "linux-x86_64": {
-                "url": expected_url,
+            target: {
+                "url": artifact_url,
                 "length": artifact.len(),
                 "sha256": format!("{:x}", Sha256::digest(&artifact)),
             }
@@ -104,14 +115,94 @@ fn fixture(schema: &str, source_commit: Option<&str>) -> (ReleaseBundle, Release
         },
         ReleaseAuthority {
             trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
-            product: "product".into(),
+            product: product.into(),
             accepted_manifest_schemas: vec![schema.into()],
-            target: "linux-x86_64".into(),
-            artifact_url: ArtifactUrlPolicy::Exact(expected_url.into()),
+            target: target.into(),
+            artifact_url: artifact_url_policy,
             require_source_commit: source_commit.is_some(),
             engine_protocol: 1,
         },
     )
+}
+
+fn fixture(schema: &str, source_commit: Option<&str>) -> (ReleaseBundle, ReleaseAuthority) {
+    let artifact_url = "https://github.com/FutureDevGuys/dev-tools/releases/download/product%2Fv1.2.3/product-1.2.3-linux-x86_64";
+    release_fixture(
+        "product",
+        schema,
+        source_commit,
+        "linux-x86_64",
+        artifact_url,
+        ArtifactUrlPolicy::Exact(artifact_url.into()),
+    )
+}
+
+fn github_release_fixture(
+    product: &str,
+    target: &str,
+    artifact_name: &str,
+) -> (ReleaseBundle, ReleaseAuthority) {
+    let artifact_url = format!(
+        "https://github.com/FutureDevGuys/dev-tools/releases/download/{product}%2Fv1.2.3/{artifact_name}"
+    );
+    let (schema, source_commit) = if product == "dev-auth" {
+        ("dev-auth-product-v2", Some("a".repeat(40)))
+    } else {
+        ("dev-tools-product-v1", None)
+    };
+    release_fixture(
+        product,
+        schema,
+        source_commit.as_deref(),
+        target,
+        &artifact_url,
+        ArtifactUrlPolicy::GitHubRelease {
+            owner: "FutureDevGuys".into(),
+            repository: "dev-tools".into(),
+        },
+    )
+}
+
+#[test]
+fn github_release_policy_matches_native_artifact_names_for_every_product_and_target() {
+    let products = [
+        "update-all",
+        "dev-auth",
+        "dev-cache",
+        "sync-configs",
+        "skills-sync",
+    ];
+    let targets = [
+        ("linux-x86_64", ""),
+        ("linux-aarch64", ""),
+        ("macos-x86_64", ""),
+        ("macos-aarch64", ""),
+        ("windows-x86_64", ".exe"),
+        ("windows-aarch64", ".exe"),
+    ];
+
+    for product in products {
+        for (target, executable_suffix) in targets {
+            let artifact_name = format!("{product}-1.2.3-{target}{executable_suffix}");
+            let (bundle, authority) = github_release_fixture(product, target, &artifact_name);
+
+            let verified = verify_release_metadata(
+                &ReleaseMetadata {
+                    root: bundle.root,
+                    manifest: bundle.manifest,
+                },
+                &authority,
+            )
+            .unwrap_or_else(|error| panic!("{product} {target}: {error:#}"));
+
+            assert_eq!(
+                verified.artifact_url,
+                format!(
+                    "https://github.com/FutureDevGuys/dev-tools/releases/download/{product}%2Fv1.2.3/{artifact_name}"
+                )
+            );
+        }
+    }
 }
 
 #[test]
@@ -286,6 +377,7 @@ fn release_state_rejects_rollback_and_equivocation() {
 }
 
 #[test]
+#[cfg(unix)]
 fn accepted_release_state_is_locked_persistent_and_idempotent() {
     let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"e".repeat(40)));
     let verified = verify_release_bytes(&bundle, &authority).unwrap();
@@ -307,6 +399,7 @@ fn accepted_release_state_is_locked_persistent_and_idempotent() {
 }
 
 #[test]
+#[cfg(unix)]
 fn verified_release_cache_round_trips_only_authenticated_exact_bytes() {
     let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"f".repeat(40)));
     let root = tempfile::tempdir().unwrap();
@@ -335,6 +428,7 @@ fn verified_release_cache_round_trips_only_authenticated_exact_bytes() {
 }
 
 #[test]
+#[cfg(unix)]
 fn verified_release_cache_resumes_receipt_last_and_rejects_linked_entries() {
     let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"1".repeat(40)));
     let root = tempfile::tempdir().unwrap();

@@ -33,6 +33,7 @@ release_signing_key = { private_key_ref = "op://Automation/dev-tools release sig
 
 ```sh
 release_signer_profile=source-maintenance # exact name from the installed config-v2.toml
+next_dev_auth_generation=NEXT_UNUSED_GENERATION
 /usr/bin/env -u ARGV0 "$HOME/.local/bin/release-builder" \
   "$PWD/scripts/build-release-set.py" \
   --product dev-auth \
@@ -40,8 +41,8 @@ release_signer_profile=source-maintenance # exact name from the installed config
   --release-signer /usr/local/bin/dev-auth \
   --release-signer-profile "$release_signer_profile" \
   --release-key-id release-ca568413f0f27130 \
-  --manifest-generation 20 \
-  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-v0.3.9"
+  --manifest-generation "$next_dev_auth_generation" \
+  --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-release-set"
 ```
 
 The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.
@@ -51,7 +52,7 @@ Release publication is a separate operation from construction and signing. Run t
 ```sh
 /usr/bin/env -u ARGV0 "$HOME/.local/bin/release-builder" \
   "$PWD/scripts/publish-release-set.py" \
-  --release-root "$HOME/.cache/dev-tools-release/RELEASE-SET/signed/releases" \
+  --release-root "$HOME/.cache/dev-tools-release/dev-auth-release-set/releases" \
   --source-commit "$(/usr/bin/git rev-parse HEAD)" \
   --repository FutureDevGuys/dev-tools \
   --git-command /usr/local/bin/git \
@@ -65,14 +66,7 @@ Only `dev-auth-product-v2` currently cryptographically binds the artifact manife
 
 The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before producing deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
 
-Repeat `--product` to construct more than one product from the same exact source
-revision, or omit it to construct all five. For multiple products, repeat the
-generation option as `--manifest-generation update-all=7` and
-`--manifest-generation dev-cache=9`; every selected product must be named
-exactly once. Each product therefore keeps its own version and manifest
-generation, and independent nested release lines never need to be artificially
-synchronized. The output path should live on persistent owner-controlled
-storage rather than a memory-backed temporary filesystem.
+Repeat `--product` to construct more than one product from the same exact source revision. Omit it to select all five only on `linux-x86_64`: `sync-configs` is presently accepted solely for that release target, so an all-products build on any other target fails closed before compilation and must instead name only the accepted products explicitly. For multiple products, repeat the generation option as `--manifest-generation update-all=7` and `--manifest-generation dev-cache=9`; every selected product must be named exactly once. Each product therefore keeps its own version and manifest generation, and independent nested release lines never need to be artificially synchronized. The output path should live on persistent owner-controlled storage rather than a memory-backed temporary filesystem.
 
 Each product uses independent nested tags: `update-all/vX.Y.Z`, `dev-auth/vX.Y.Z`, `dev-cache/vX.Y.Z`, `sync-configs/vX.Y.Z`, and `skills-sync/vX.Y.Z`.
 

@@ -368,17 +368,20 @@ impl LinuxSessionRegistry {
     }
 
     pub fn renew(&self, session_id: &str, expires_at_unix: i64) -> Result<()> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        if expires_at_unix <= now || expires_at_unix > now + 15 * 60 {
-            bail!("session renewal is outside the 15-minute lease window");
-        }
         let mut sessions = self
             .sessions
             .write()
             .map_err(|_| anyhow::anyhow!("session registry lock is poisoned"))?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if expires_at_unix <= now || expires_at_unix > now + 15 * 60 {
+            bail!("session renewal is outside the 15-minute lease window");
+        }
         let session = sessions
             .get_mut(session_id)
             .context("session renewal references an inactive session")?;
+        if session.registration.expires_at_unix <= now {
+            bail!("session renewal cannot revive an expired lease");
+        }
         if !pidfd_process_is_alive(&session.supervisor_pidfd)? {
             bail!("session supervisor exited before renewal");
         }
@@ -894,5 +897,61 @@ mod tests {
         let mut wrong_cgroup = pending;
         wrong_cgroup.cgroup = PathBuf::from("/sys/fs/cgroup/system.slice/other.service");
         assert!(registry.prepare_root_owned(wrong_cgroup).is_err());
+    }
+
+    #[test]
+    fn renew_rejects_an_expired_registered_session_before_the_reaper_prunes_it() {
+        let registry = LinuxSessionRegistry::new();
+        let cgroup = tempfile::tempdir().unwrap();
+        let cgroup_handle = File::open(cgroup.path()).unwrap();
+        let cgroup_metadata = cgroup_handle.metadata().unwrap();
+        let supervisor_pidfd = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let expired_at = now - 1;
+        let session_id = "0123456789abcdef0123456789abcdef";
+        registry.sessions.write().unwrap().insert(
+            session_id.into(),
+            RegisteredSession {
+                registration: SessionRegistration {
+                    session_id: session_id.into(),
+                    owner_uid: nix::unistd::Uid::effective().as_raw(),
+                    execution_uid: nix::unistd::Uid::effective().as_raw(),
+                    execution_gid: nix::unistd::getegid().as_raw(),
+                    workload: "codex".into(),
+                    profile: "automation".into(),
+                    authority: SessionAuthorityGrant {
+                        github: None,
+                        signing: None,
+                        release_signing: None,
+                        ssh: Vec::new(),
+                    },
+                    cgroup: cgroup.path().to_path_buf(),
+                    expires_at_unix: expired_at,
+                },
+                supervisor_pidfd,
+                cgroup_handle,
+                cgroup_device: cgroup_metadata.dev(),
+                cgroup_inode: cgroup_metadata.ino(),
+            },
+        );
+
+        let error = registry.renew(session_id, now + 10 * 60).unwrap_err();
+
+        assert!(format!("{error:#}").contains("session renewal cannot revive an expired lease"));
+        assert_eq!(
+            registry
+                .sessions
+                .read()
+                .unwrap()
+                .get(session_id)
+                .unwrap()
+                .registration
+                .expires_at_unix,
+            expired_at
+        );
     }
 }

@@ -30,7 +30,7 @@ from release_signing import (
     verify_root_document,
     write_json,
 )
-
+from release_targets import require_accepted_release_target
 
 PRODUCTS = {"update-all", "dev-auth", "dev-cache", "sync-configs", "skills-sync"}
 OWNER = "FutureDevGuys"
@@ -52,7 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trusted-root-public-key",
         type=Path,
-        default=Path(__file__).parents[1] / "crates/update-all/trust/root-public-key.txt",
+        default=Path(__file__).parents[1]
+        / "crates/update-all/trust/root-public-key.txt",
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--manifest-generation", required=True, type=int)
@@ -106,12 +107,21 @@ def external_signature(
     try:
         public_key.verify(signature, payload)
     except InvalidSignature as exc:
-        raise SystemExit("release signer response does not match the authorized key") from exc
+        raise SystemExit(
+            "release signer response does not match the authorized key"
+        ) from exc
     return signature
+
+
+def artifact_name(product: str, version: str, target: str) -> str:
+    """Return the public name for one native, target-specific executable."""
+    suffix = ".exe" if target.startswith("windows-") else ""
+    return f"{product}-{version}-{target}{suffix}"
 
 
 def main() -> int:
     args = parse_args()
+    require_accepted_release_target(args.product, args.target)
     if not args.artifact.is_file():
         raise SystemExit(f"artifact does not exist: {args.artifact}")
     if args.manifest_generation < 1:
@@ -149,17 +159,12 @@ def main() -> int:
         release_public_key = authorized_release_public_key(root_document, release_id)
 
     tag = f"{args.product}/v{args.version}"
-    suffix = (
-        ".pyz"
-        if args.product == "sync-configs"
-        else (".exe" if args.target.startswith("windows-") else "")
-    )
-    artifact_name = f"{args.product}-{args.version}-{args.target}{suffix}"
+    release_artifact_name = artifact_name(args.product, args.version, args.target)
     artifact_bytes = args.artifact.read_bytes()
     artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
     artifact_url = (
         f"https://github.com/{OWNER}/{REPOSITORY}/releases/download/"
-        f"{quote(tag, safe='')}/{quote(artifact_name)}"
+        f"{quote(tag, safe='')}/{quote(release_artifact_name)}"
     )
 
     manifest = {
@@ -187,7 +192,7 @@ def main() -> int:
     if destination.exists() and any(destination.iterdir()):
         raise SystemExit(f"release output directory is not empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(args.artifact, destination / artifact_name)
+    shutil.copy2(args.artifact, destination / release_artifact_name)
     write_json(
         destination / "dev-tools-root.json",
         root_document,
@@ -215,7 +220,7 @@ def main() -> int:
         }
     write_json(destination / f"{args.product}-stable.json", manifest_envelope)
     summary = {
-        "artifact": artifact_name,
+        "artifact": release_artifact_name,
         "length": len(artifact_bytes),
         "product": args.product,
         "sha256": artifact_digest,

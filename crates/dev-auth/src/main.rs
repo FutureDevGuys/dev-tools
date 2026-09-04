@@ -1975,6 +1975,8 @@ fn main() {
         ("gh-dev-auth", _, _) => run_gh_frontend(),
         ("ssh-keygen-dev-auth", _, _) => run_ssh_keygen_frontend(),
         #[cfg(target_os = "linux")]
+        ("dev-auth-provider-exec", false, false) => dev_auth::run_provider_exec_child(),
+        #[cfg(target_os = "linux")]
         ("dev-auth-setup-helper", false, false) => run_setup_helper_os(),
         #[cfg(target_os = "linux")]
         ("dev-auth-workload-launcher", false, false) => run_privileged_launcher_os(),

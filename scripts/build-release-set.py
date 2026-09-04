@@ -11,14 +11,13 @@ import shutil
 import stat
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
+from release_targets import require_accepted_release_target
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGNER = ROOT / "scripts" / "build-signed-release.py"
 PRODUCTS = ("update-all", "dev-auth", "dev-cache", "sync-configs", "skills-sync")
-RUST_PRODUCTS = ("update-all", "dev-auth", "dev-cache", "skills-sync")
 
 
 def run(*args: str, env: dict[str, str] | None = None) -> str:
@@ -75,16 +74,14 @@ def exact_source(public_git: Path) -> tuple[str, str]:
 
 
 def product_versions() -> dict[str, str]:
-    metadata = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1"))
+    metadata = json.loads(
+        run("cargo", "metadata", "--no-deps", "--format-version", "1")
+    )
     versions = {
         package["name"]: package["version"]
         for package in metadata["packages"]
         if package["name"] in PRODUCTS
     }
-    sync_metadata = tomllib.loads(
-        (ROOT / "sync-configs/pyproject.toml").read_text(encoding="utf-8")
-    )
-    versions["sync-configs"] = str(sync_metadata["project"]["version"])
     if set(versions) != set(PRODUCTS):
         raise SystemExit(f"release version metadata is incomplete: {sorted(versions)}")
     return versions
@@ -93,9 +90,7 @@ def product_versions() -> dict[str, str]:
 def target_id() -> str:
     system = platform.system().lower()
     machine = platform.machine().lower()
-    os_name = {"linux": "linux", "darwin": "macos", "windows": "windows"}.get(
-        system
-    )
+    os_name = {"linux": "linux", "darwin": "macos", "windows": "windows"}.get(system)
     arch = {
         "x86_64": "x86_64",
         "amd64": "x86_64",
@@ -148,33 +143,38 @@ def release_environment(commit: str, timestamp: str, output: Path) -> dict[str, 
         (Path.home().resolve(), Path("/dev-tools/home")),
     )
     encoded_rustflags = "\x1f".join(
-        f"--remap-path-prefix={source}={destination}"
-        for source, destination in remaps
+        f"--remap-path-prefix={source}={destination}" for source, destination in remaps
     )
     environment = dict(os.environ)
     environment.pop("RUSTFLAGS", None)
     environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
-    environment.update({
-        "CARGO_ENCODED_RUSTFLAGS": encoded_rustflags,
-        "DEV_TOOLS_GIT_COMMIT": commit,
-        "DEV_AUTH_SOURCE_COMMIT": commit,
-        "DEV_TOOLS_GIT_DIRTY": "0",
-        "SOURCE_DATE_EPOCH": timestamp,
-        "PYTHONDONTWRITEBYTECODE": "1",
-    })
+    environment.update(
+        {
+            "CARGO_ENCODED_RUSTFLAGS": encoded_rustflags,
+            "DEV_TOOLS_GIT_COMMIT": commit,
+            "DEV_AUTH_SOURCE_COMMIT": commit,
+            "DEV_TOOLS_GIT_DIRTY": "0",
+            "SOURCE_DATE_EPOCH": timestamp,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
     return environment
 
 
-def build_sync_configs(env: dict[str, str]) -> None:
-    """Build the zipapp without contaminating the release summary stream."""
-    subprocess.run(
-        [sys.executable, str(ROOT / "sync-configs/scripts/build_zipapp.py")],
-        cwd=ROOT,
-        env=env,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    )
+def release_artifacts(cargo_target: Path, target: str) -> dict[str, Path]:
+    """Resolve every product to its native Cargo release artifact."""
+    suffix = ".exe" if target.startswith("windows-") else ""
+    return {
+        product: cargo_target / "release" / f"{product}{suffix}" for product in PRODUCTS
+    }
+
+
+def cargo_build_command(products: tuple[str, ...]) -> list[str]:
+    """Build only the selected native product executables."""
+    command = ["cargo", "build", "--release", "--locked"]
+    for product in products:
+        command.extend(["--bin", product])
+    return command
 
 
 def parse_args() -> argparse.Namespace:
@@ -250,12 +250,14 @@ def release_signer_arguments(args: argparse.Namespace) -> list[str]:
 
 def main() -> int:
     args = parse_args()
+    products = tuple(dict.fromkeys(args.products or PRODUCTS))
+    target = target_id()
+    for product in products:
+        require_accepted_release_target(product, target)
     signer_arguments = release_signer_arguments(args)
     commit, timestamp = exact_source(resolve_public_git(args.public_git_command))
     versions = product_versions()
-    products = tuple(dict.fromkeys(args.products or PRODUCTS))
     generations = manifest_generations(args.manifest_generation, products)
-    target = target_id()
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         raise SystemExit(f"release output directory is not empty: {output}")
@@ -276,23 +278,9 @@ def main() -> int:
             "DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY": trusted_root,
         }
     )
-    rust_products = [product for product in products if product in RUST_PRODUCTS]
-    if rust_products:
-        cargo_command = ["cargo", "build", "--release", "--locked"]
-        for product in rust_products:
-            cargo_command.extend(["--bin", product])
-        subprocess.run(cargo_command, cwd=ROOT, env=env, check=True)
-    if "sync-configs" in products:
-        build_sync_configs(env)
-    suffix = ".exe" if target.startswith("windows-") else ""
-    artifacts = {
-        "update-all": cargo_target / "release" / f"update-all{suffix}",
-        "dev-auth": cargo_target / "release" / f"dev-auth{suffix}",
-        "dev-cache": cargo_target / "release" / f"dev-cache{suffix}",
-        "skills-sync": cargo_target / "release" / f"skills-sync{suffix}",
-        "sync-configs": ROOT
-        / f"sync-configs/dist/sync-configs-{versions['sync-configs']}.pyz",
-    }
+    if products:
+        subprocess.run(cargo_build_command(products), cwd=ROOT, env=env, check=True)
+    artifacts = release_artifacts(cargo_target, target)
     summaries: list[dict[str, object]] = []
     for product in products:
         destination = output / "releases" / product
