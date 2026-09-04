@@ -16,6 +16,7 @@ Read the applicable records before changing a public product contract or cross-p
 | [0005](0005-rust-operational-language-and-platform-policy.md) | Rust operational language and platform policy | proposed | pending |
 | [0006](0006-public-producer-private-consumer-direction.md) | Public producer and private consumer direction | proposed | pending |
 | [0007](0007-provider-neutral-secret-operations.md) | Provider-neutral secret operations | proposed | pending |
+| [0008](0008-trusted-hook-execution-context.md) | Trusted hook execution context | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

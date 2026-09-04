@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sync_configs::hooks::{
-    EntryConvergence, HookDecision, HookError, HookOutputStream, HookPhase, HookPlan, HookRunMode,
-    HookShell, HookState, PostHookDecision,
+    EntryConvergence, HookContext, HookDecision, HookError, HookOutputStream, HookPhase, HookPlan,
+    HookRunMode, HookShell, HookState, PostHookDecision,
 };
 use sync_configs::manifest::{load_manifest, select_entries_for_profiles, LoadOptions, Manifest};
 use sync_configs::paths::{PathContext, PathPlatform};
@@ -87,6 +87,13 @@ with log.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(arguments) + "\n")
 if arguments == ["-n", "-v"] or arguments == ["-v"]:
     raise SystemExit(0)
+if len(arguments) > 2 and arguments[0] == "-n" and arguments[1].startswith("--preserve-env="):
+    import os
+    keys = arguments[1].split("=", 1)[1].split(",")
+    environment = {{key: os.environ[key] for key in keys}}
+    assert arguments[2] == "--"
+    completed = subprocess.run(arguments[3:], env=environment, check=False)
+    raise SystemExit(completed.returncode)
 if arguments[:2] == ["-n", "--"]:
     completed = subprocess.run(arguments[2:], check=False)
     raise SystemExit(completed.returncode)
@@ -104,6 +111,77 @@ fn read_argv_log(path: &Path) -> Vec<Vec<String>> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("argv JSON"))
         .collect()
+}
+
+#[test]
+fn metadata_contract_is_equivalent_through_user_and_environment_reset_sudo() {
+    for privilege in ["user", "sudo"] {
+        let root = TempDir::new().expect("temp root");
+        let probe = root.path().join("probe.py");
+        fs::write(&probe, "import os,json\nprint(json.dumps({k:v for k,v in os.environ.items() if k.startswith('SYNC_CONFIGS_')}))\n").unwrap();
+        let command = format!("/usr/bin/python3 '{}'", probe.display());
+        let manifest = load(root.path(), &format!(
+            "entries:\n  - name: metadata\n    source: ./source\n    target: ./target\n    mode: copy\n    profiles: [desktop, linux]\n    pre_script: {command:?}\n    post_script: {command:?}\n    pre_script_privilege: {privilege}\n    post_script_privilege: {privilege}\n"));
+        let (sudo, _) = forwarding_sudo(root.path());
+        let session = PrivilegeSession::new_authenticated_injected_sudo_for_test(sudo).unwrap();
+        let plan = HookPlan::prepare(
+            manifest.entries.iter(),
+            root.path(),
+            HookShell::current().unwrap(),
+            HookRunMode::Apply,
+        )
+        .unwrap()
+        .with_context(HookContext::new(
+            manifest.path.clone(),
+            &["desktop".into(), "linux".into(), "desktop".into()],
+            Some("test-run"),
+            path_context(root.path()),
+        ));
+        let pre = plan.run_pre_hooks(Some(&session)).unwrap();
+        assert_eq!(
+            pre[0].execution.as_ref().unwrap().status().state,
+            HookState::Succeeded
+        );
+        let mut expected = serde_json::json!({
+            "SYNC_CONFIGS_HOOK_API_VERSION":"1",
+            "SYNC_CONFIGS_ACTIVE_PROFILES":"desktop,linux",
+            "SYNC_CONFIGS_MANIFEST_PATH":manifest.path,
+            "SYNC_CONFIGS_CONFIG_DIR":root.path(),
+            "SYNC_CONFIGS_RUN_ID":"test-run",
+            "SYNC_CONFIGS_HOOK_PHASE":"pre",
+            "SYNC_CONFIGS_HOOK_PRIVILEGE":privilege,
+            "SYNC_CONFIGS_ENTRY_NAME":"metadata",
+            "SYNC_CONFIGS_ENTRY_SCOPE":"root",
+            "SYNC_CONFIGS_ENTRY_SOURCE":root.path().join("source"),
+            "SYNC_CONFIGS_ENTRY_TARGET":root.path().join("target"),
+            "SYNC_CONFIGS_ENTRY_MODE":"copy",
+            "SYNC_CONFIGS_ENTRY_PROFILES":"desktop,linux"
+        });
+        let actual: serde_json::Value =
+            serde_json::from_slice(pre[0].execution.as_ref().unwrap().stdout()).unwrap();
+        // Other application variables are not part of the product-owned contract.
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&actual[key], value, "{key}");
+        }
+        assert!(actual.get("SYNC_CONFIGS_ENTRY_CONVERGENCE").is_none());
+        for (outcome, label) in [
+            (EntryConvergence::Changed, "changed"),
+            (EntryConvergence::UpToDate, "up_to_date"),
+        ] {
+            let post = plan.run_post_hooks(Some(&session), |_| outcome).unwrap();
+            assert_eq!(post[0].execution.status().state, HookState::Succeeded);
+            let actual: serde_json::Value =
+                serde_json::from_slice(post[0].execution.stdout()).unwrap();
+            expected["SYNC_CONFIGS_HOOK_PHASE"] = "post".into();
+            expected["SYNC_CONFIGS_ENTRY_CONVERGENCE"] = label.into();
+            for (key, value) in expected.as_object().unwrap() {
+                assert_eq!(&actual[key], value, "{key}");
+            }
+            if privilege == "sudo" {
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }
 
 #[test]

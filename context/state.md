@@ -1,5 +1,7 @@
 # Active work
 
+- Complete additive pre/post hook metadata for sync-configs: test product-owned context, sudo delivery, run-log correlation, and release the accepted native binary before downstream profile-aware hooks depend on it.
+
 - Publish the registry-ready shared Rust crates in dependency order through an authenticated crates.io release operation, record the exact versions and registry checksums, and only then replace Syscfg's non-production exact-Git compatibility probe with the registry dependency.
 - Use the admitted operation-only release path to rebuild, publish, install, and accept Update All 0.1.6 generation 7 and native sync-configs 0.2.0 generation 14 from the final merged source; the earlier `acd45e4` artifacts are superseded and must not be published.
 - Run the current Syscfg manifest through installed native sync-configs twice and require the second pass to perform no configuration mutations or unnecessary authentication.

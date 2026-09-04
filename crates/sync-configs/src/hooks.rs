@@ -353,11 +353,61 @@ struct EntryHooks<'a> {
     post: Option<HookSpec<'a>>,
 }
 
+/// Product-owned execution metadata for trusted manifest hooks. Values are
+/// intentionally not exposed through Debug or diagnostic records.
+pub struct HookContext {
+    manifest_path: PathBuf,
+    profiles: Vec<String>,
+    run_id: Option<String>,
+    paths: crate::paths::PathContext,
+}
+
+impl HookContext {
+    /// Construct from the loaded absolute manifest path and resolved profiles.
+    pub fn new(
+        manifest_path: PathBuf,
+        profiles: &[String],
+        run_id: Option<&str>,
+        paths: crate::paths::PathContext,
+    ) -> Self {
+        let mut selected = Vec::new();
+        for profile in profiles {
+            if !selected.contains(profile) {
+                selected.push(profile.clone());
+            }
+        }
+        Self {
+            manifest_path,
+            profiles: selected,
+            run_id: run_id.map(str::to_owned),
+            paths,
+        }
+    }
+}
+
+const CONTRACT_KEYS: &[&str] = &[
+    "SYNC_CONFIGS_HOOK_API_VERSION",
+    "SYNC_CONFIGS_ACTIVE_PROFILES",
+    "SYNC_CONFIGS_MANIFEST_PATH",
+    "SYNC_CONFIGS_CONFIG_DIR",
+    "SYNC_CONFIGS_RUN_ID",
+    "SYNC_CONFIGS_HOOK_PHASE",
+    "SYNC_CONFIGS_HOOK_PRIVILEGE",
+    "SYNC_CONFIGS_ENTRY_NAME",
+    "SYNC_CONFIGS_ENTRY_SCOPE",
+    "SYNC_CONFIGS_ENTRY_SOURCE",
+    "SYNC_CONFIGS_ENTRY_TARGET",
+    "SYNC_CONFIGS_ENTRY_MODE",
+    "SYNC_CONFIGS_ENTRY_PROFILES",
+    "SYNC_CONFIGS_ENTRY_CONVERGENCE",
+];
+
 pub struct HookPlan<'a> {
     entries: Vec<EntryHooks<'a>>,
     config_dir: PathBuf,
     shell: HookShell,
     environment: BTreeMap<OsString, OsString>,
+    context: Option<HookContext>,
     limits: HookExecutionLimits,
     mode: HookRunMode,
     requires_pre_privilege: bool,
@@ -424,11 +474,92 @@ impl<'a> HookPlan<'a> {
             config_dir: config_dir.to_path_buf(),
             shell,
             environment: std::env::vars_os().collect(),
+            context: None,
             limits: HookExecutionLimits::default(),
             mode,
             requires_pre_privilege,
             requires_post_privilege,
         })
+    }
+
+    /// Attach the engine's resolved execution context without changing hook policy.
+    pub fn with_context(mut self, context: HookContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    fn execution_environment(
+        &self,
+        hook: &HookSpec<'_>,
+        convergence: Option<EntryConvergence>,
+    ) -> BTreeMap<OsString, OsString> {
+        let mut environment = self.environment.clone();
+        let Some(context) = &self.context else {
+            return environment;
+        };
+        for key in CONTRACT_KEYS {
+            environment.remove(std::ffi::OsStr::new(key));
+        }
+        let entry = hook.entry;
+        for (key, value) in [
+            ("SYNC_CONFIGS_HOOK_API_VERSION", OsString::from("1")),
+            (
+                "SYNC_CONFIGS_ACTIVE_PROFILES",
+                context.profiles.join(",").into(),
+            ),
+            (
+                "SYNC_CONFIGS_MANIFEST_PATH",
+                context.manifest_path.as_os_str().to_owned(),
+            ),
+            (
+                "SYNC_CONFIGS_CONFIG_DIR",
+                self.config_dir.as_os_str().to_owned(),
+            ),
+            (
+                "SYNC_CONFIGS_HOOK_PHASE",
+                match hook.phase {
+                    HookPhase::Pre => "pre",
+                    HookPhase::Post => "post",
+                }
+                .into(),
+            ),
+            (
+                "SYNC_CONFIGS_HOOK_PRIVILEGE",
+                match hook.privilege {
+                    Privilege::User => "user",
+                    Privilege::Sudo => "sudo",
+                }
+                .into(),
+            ),
+            ("SYNC_CONFIGS_ENTRY_NAME", entry.name.clone().into()),
+            ("SYNC_CONFIGS_ENTRY_SCOPE", entry.scope_label().into()),
+            (
+                "SYNC_CONFIGS_ENTRY_SOURCE",
+                entry.source.as_os_str().to_owned(),
+            ),
+            (
+                "SYNC_CONFIGS_ENTRY_TARGET",
+                crate::paths::canonical_target_key(&entry.target, &context.paths).into_os_string(),
+            ),
+            ("SYNC_CONFIGS_ENTRY_MODE", entry.mode.to_string().into()),
+            (
+                "SYNC_CONFIGS_ENTRY_PROFILES",
+                entry.profiles.join(",").into(),
+            ),
+        ] {
+            environment.insert(key.into(), value);
+        }
+        if let Some(run_id) = &context.run_id {
+            environment.insert("SYNC_CONFIGS_RUN_ID".into(), run_id.into());
+        }
+        if let Some(value) = match convergence {
+            Some(EntryConvergence::Changed) => Some("changed"),
+            Some(EntryConvergence::UpToDate) => Some("up_to_date"),
+            _ => None,
+        } {
+            environment.insert("SYNC_CONFIGS_ENTRY_CONVERGENCE".into(), value.into());
+        }
+        environment
     }
 
     /// Replace production resource bounds for fast deterministic integration
@@ -550,7 +681,7 @@ impl<'a> HookPlan<'a> {
                     execution: Some(planned_execution(hook.phase)),
                 }),
                 HookRunMode::Apply => {
-                    let execution = self.execute(hook, session)?;
+                    let execution = self.execute(hook, session, None)?;
                     records.push(PreHookRecord {
                         entry: entry.entry,
                         decision: pre_decision(execution.status.state),
@@ -582,7 +713,8 @@ impl<'a> HookPlan<'a> {
             let Some(hook) = entry.post.as_ref() else {
                 continue;
             };
-            if self.mode == HookRunMode::Apply && !convergence(entry.entry).permits_post_hook() {
+            let outcome = (self.mode == HookRunMode::Apply).then(|| convergence(entry.entry));
+            if outcome.is_some_and(|value| !value.permits_post_hook()) {
                 continue;
             }
             let progress = hook.progress(if self.mode == HookRunMode::DryRun {
@@ -593,7 +725,7 @@ impl<'a> HookPlan<'a> {
             let execution = if self.mode == HookRunMode::DryRun {
                 planned_execution(hook.phase)
             } else {
-                self.execute(hook, session)?
+                self.execute(hook, session, outcome)?
             };
             let decision = if execution.status.state == HookState::FailedAbort {
                 PostHookDecision::Abort
@@ -614,7 +746,9 @@ impl<'a> HookPlan<'a> {
         &self,
         hook: &HookSpec<'_>,
         session: Option<&PrivilegeSession>,
+        convergence: Option<EntryConvergence>,
     ) -> Result<HookExecution, HookError> {
+        let environment = self.execution_environment(hook, convergence);
         // Linux can briefly return ETXTBSY for a newly replaced executable
         // while an older mapping is being released. Rebuild the exact command
         // and retry only that transient kernel condition; every other spawn
@@ -623,13 +757,13 @@ impl<'a> HookPlan<'a> {
         loop {
             let command = match hook.privilege {
                 Privilege::User => self.user_command(hook.command),
-                Privilege::Sudo => self.privileged_command(hook.command, session)?,
+                Privilege::Sudo => self.privileged_command(hook.command, session, &environment)?,
             };
             let output = run_bounded_command_with_cancellation(
                 &BoundedCommand {
                     executable: &command.executable,
                     arguments: &command.arguments,
-                    environment: &self.environment,
+                    environment: &environment,
                     cwd: Some(&self.config_dir),
                     timeout: self.limits.timeout,
                     output_limit: self.limits.output_limit,
@@ -660,13 +794,24 @@ impl<'a> HookPlan<'a> {
         &self,
         script: &str,
         session: Option<&PrivilegeSession>,
+        environment: &BTreeMap<OsString, OsString>,
     ) -> Result<PreparedHookCommand, HookError> {
         let session = session.ok_or(HookError::MissingPrivilegeSession)?;
         if !session.is_authenticated() {
             return Err(HookError::MissingPrivilegeSession);
         }
         let shell = session.elevated_executable(&self.shell.executable)?;
-        let mut arguments = vec![OsString::from("-n"), OsString::from("--")];
+        let mut arguments = vec![OsString::from("-n")];
+        if self.context.is_some() {
+            let keys = CONTRACT_KEYS
+                .iter()
+                .copied()
+                .filter(|key| environment.contains_key(std::ffi::OsStr::new(key)))
+                .collect::<Vec<_>>()
+                .join(",");
+            arguments.push(format!("--preserve-env={keys}").into());
+        }
+        arguments.push(OsString::from("--"));
         arguments.push(shell.into_os_string());
         arguments.extend(self.shell.arguments_before_script.iter().cloned());
         arguments.push(OsString::from(script));
