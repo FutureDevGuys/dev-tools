@@ -5,8 +5,8 @@ owner: dev-tools
 
 # ADR 0003: Native release administration and separated authority
 
-status: accepted
-verification: runtime acceptance remains required before release administration is declared complete
+status: proposed
+verification: pending
 
 ## Context
 

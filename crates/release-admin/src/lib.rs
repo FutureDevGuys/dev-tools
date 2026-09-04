@@ -43,6 +43,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod publication;
+mod set_build;
 
 const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
@@ -272,6 +273,8 @@ struct SetArgs {
 
 #[derive(Debug, Subcommand)]
 enum SetCommand {
+    /// Construct one controlled source-bound binary release candidate.
+    Build(set_build::SetBuildArgs),
     /// Verify a complete release set without network access.
     Verify(SetVerifyArgs),
     /// Publish and independently verify an authenticated release set.
@@ -350,6 +353,12 @@ where
                     command: CrateSetCommand::BootstrapPublish(arguments),
                 }),
         }) => run_result(bootstrap_publish_crate_set(arguments)),
+        Ok(Cli {
+            command:
+                Command::Set(SetArgs {
+                    command: SetCommand::Build(arguments),
+                }),
+        }) => run_result(set_build::build_release_set(arguments)),
         Ok(Cli {
             command:
                 Command::Set(SetArgs {
@@ -492,6 +501,23 @@ fn build_manifest(arguments: ManifestBuildArgs) -> Result<()> {
     if arguments.output.exists() {
         bail!("manifest output already exists");
     }
+    let manifest = construct_product_manifest(&arguments)?;
+    write_new_private_file(&arguments.output, &manifest)?;
+    let summary = json!({
+        "schema": "release-admin-manifest-build-v1",
+        "product": arguments.product,
+        "version": arguments.version,
+        "source_commit": arguments.source_commit,
+        "targets": arguments.artifacts.len(),
+        "output": arguments.output,
+    });
+    serde_json::to_writer(std::io::stdout().lock(), &summary)
+        .context("write manifest build result")?;
+    println!();
+    Ok(())
+}
+
+fn construct_product_manifest(arguments: &ManifestBuildArgs) -> Result<Vec<u8>> {
     let artifacts =
         manifest_artifacts(&arguments.product, &arguments.version, &arguments.artifacts)?;
     let trusted_root = read_bounded_file(&arguments.trusted_root_public_key, 256)
@@ -517,7 +543,7 @@ fn build_manifest(arguments: ManifestBuildArgs) -> Result<()> {
     let manifest = build_signed_envelope(
         &unsigned,
         &[EnvelopeSignature {
-            key_id: arguments.release_key_id,
+            key_id: arguments.release_key_id.clone(),
             signature: signature.to_vec(),
         }],
     )
@@ -542,19 +568,7 @@ fn build_manifest(arguments: ManifestBuildArgs) -> Result<()> {
         },
     )
     .context("verify signed product manifest")?;
-    write_new_private_file(&arguments.output, &manifest)?;
-    let summary = json!({
-        "schema": "release-admin-manifest-build-v1",
-        "product": arguments.product,
-        "version": arguments.version,
-        "source_commit": arguments.source_commit,
-        "targets": arguments.artifacts.len(),
-        "output": arguments.output,
-    });
-    serde_json::to_writer(std::io::stdout().lock(), &summary)
-        .context("write manifest build result")?;
-    println!();
-    Ok(())
+    Ok(manifest)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

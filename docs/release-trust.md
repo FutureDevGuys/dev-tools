@@ -34,18 +34,25 @@ release_signing_key = { private_key_ref = "op://Automation/dev-tools release sig
 ```sh
 release_signer_profile=source-maintenance # exact name from the installed config-v2.toml
 next_dev_auth_generation=NEXT_UNUSED_GENERATION
-/usr/bin/env -u ARGV0 "$HOME/.local/bin/release-builder" \
-  "$PWD/scripts/build-release-set.py" \
+source_commit=$(/usr/bin/git rev-parse HEAD)
+"$HOME/.local/bin/release-admin" set build \
+  --source-root "$PWD" \
+  --source-commit "$source_commit" \
+  --git /usr/bin/git \
+  --cargo "$EXACT_CARGO" \
+  --cargo-home "$PRIVATE_OFFLINE_CARGO_HOME" \
+  --target linux-x86_64 \
   --product dev-auth \
-  --public-git-command /usr/bin/git \
-  --release-signer /usr/local/bin/dev-auth \
-  --release-signer-profile "$release_signer_profile" \
+  --root-document "$PWD/release-trust/dev-tools-root.json" \
+  --trusted-root-public-key "$PWD/crates/update-all/trust/root-public-key.txt" \
+  --signer /usr/local/bin/dev-auth \
+  --signer-profile "$release_signer_profile" \
   --release-key-id release-ca568413f0f27130 \
   --manifest-generation "$next_dev_auth_generation" \
   --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-release-set"
 ```
 
-The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.
+`EXACT_CARGO` names the reviewed native Cargo executable and `PRIVATE_OFFLINE_CARGO_HOME` is an existing canonical owner-only Cargo home containing the locked dependency cache but no release credential. The output parent is also an existing canonical owner-only directory. The native builder clears its environment, forces Cargo offline, retains the exact Git, Cargo, and signer identities, clones the exact clean commit into a private non-local checkout, remaps host paths, and publishes the release directory atomically only after the source-bound v2 manifest and built artifact verify. Cargo identity alone does not authenticate the compiler/linker toolchain, so two independent invocations under the accepted pinned build environment must still produce byte-identical release directories before publication.
 
 Release publication is a separate operation from construction and signing. Run the standalone native publisher from a clean canonical checkout inside an admitted workload whose profile grants the required source-maintenance Git, GitHub, and SSH-signing operations. Its exact same-name `git` and `gh` children receive only that workload authority. `EXPECTED_GIT_SIGNING_PUBLIC_KEY` is the public OpenSSH key from the approved workload profile; it is reviewed input rather than a value discovered from repository Git configuration. Outside an admitted workload, `git` and `gh` intentionally remain native human passthrough and SHALL NOT be used for unattended publication.
 
@@ -67,7 +74,7 @@ The publisher accepts only source-bound shared product-v2 manifests and independ
 
 Legacy `dev-tools-product-v1` does not cryptographically bind artifact provenance to the source tag, while `dev-auth-product-v2` binds only the historical Dev Auth release shape. New releases use shared `dev-tools-product-v2`, which requires the exact source commit and authenticates the complete target set. Legacy readers remain only for explicitly bounded migration and receipt-owned rollback and never report v1 as source-bound. After a product cuts over, its online authority accepts only source-bound schemas.
 
-The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty checkout, derives each selected product's version and the exact full source commit from `HEAD`, uses the commit timestamp as `SOURCE_DATE_EPOCH`, builds the selected products from scratch, and then invokes `scripts/build-signed-release.py` for each nested release. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before producing deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
+The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty or mismatched checkout, derives each selected product's version from its package manifest, uses the exact commit timestamp as `SOURCE_DATE_EPOCH`, and builds the selected products from scratch without invoking Python or a sibling product. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before the builder produces deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
 
 Repeat `--product` to construct more than one product from the same exact source revision. Omit it to select all five only on `linux-x86_64`: `sync-configs` is presently accepted solely for that release target, so an all-products build on any other target fails closed before compilation and must instead name only the accepted products explicitly. For multiple products, repeat the generation option as `--manifest-generation update-all=7` and `--manifest-generation dev-cache=9`; every selected product must be named exactly once. Each product therefore keeps its own version and manifest generation, and independent nested release lines never need to be artificially synchronized. The output path should live on persistent owner-controlled storage rather than a memory-backed temporary filesystem.
 

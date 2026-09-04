@@ -78,7 +78,196 @@ fn help_exposes_only_native_typed_release_operations() {
         .args(["set", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("build"))
         .stdout(predicate::str::contains("publish"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn set_build_constructs_one_exact_source_bound_release_without_python() {
+    let root = tempfile::tempdir().expect("root");
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(source.join("crates/update-all")).unwrap();
+    fs::write(
+        source.join("crates/update-all/Cargo.toml"),
+        "[package]\nname = \"update-all\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    git(&source, &["init", "--quiet"]);
+    git(&source, &["config", "user.name", "release test"]);
+    git(
+        &source,
+        &["config", "user.email", "release@example.invalid"],
+    );
+    git(&source, &["add", "crates/update-all/Cargo.toml"]);
+    git(&source, &["commit", "--quiet", "-m", "fixture"]);
+    let source_commit = git_output(&source, &["rev-parse", "HEAD"]);
+
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+    fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700)).unwrap();
+    let fake_cargo = root.path().join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nset -eu\nmkdir -p \"$CARGO_TARGET_DIR/release\"\nprintf 'native release\\n' >\"$CARGO_TARGET_DIR/release/update-all\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let root_key = SigningKey::from_bytes(&[7; 32]);
+    let release_key = SigningKey::from_bytes(&[9; 32]);
+    let release_id = release_key_id(&hex(&release_key.verifying_key().to_bytes())).unwrap();
+    let unsigned_root = build_unsigned_root_document(&RootDocumentSpec {
+        generation: 1,
+        release_keys: vec![RootReleaseKey {
+            public_key: hex(&release_key.verifying_key().to_bytes()),
+            revoked: false,
+        }],
+    })
+    .unwrap();
+    let root_document = build_signed_envelope(
+        &unsigned_root,
+        &[EnvelopeSignature {
+            key_id: root_key_id(&hex(&root_key.verifying_key().to_bytes())).unwrap(),
+            signature: root_key.sign(&unsigned_root).to_bytes().to_vec(),
+        }],
+    )
+    .unwrap();
+    let root_path = root.path().join("root.json");
+    fs::write(&root_path, &root_document).unwrap();
+    let trusted_root = root.path().join("root-public-key.txt");
+    fs::write(
+        &trusted_root,
+        format!("{}\n", hex(&root_key.verifying_key().to_bytes())),
+    )
+    .unwrap();
+
+    let artifact_fixture = root.path().join("artifact-fixture");
+    fs::write(&artifact_fixture, b"native release\n").unwrap();
+    let unsigned_manifest = build_unsigned_product_manifest(&ProductManifestSpec {
+        product: "update-all".into(),
+        generation: 7,
+        version: "1.2.3".into(),
+        source_commit: source_commit.clone(),
+        artifacts: vec![manifest_artifact(
+            "update-all",
+            "1.2.3",
+            "linux-x86_64",
+            &artifact_fixture,
+        )],
+    })
+    .unwrap();
+    let signer_marker = root.path().join("signer-count");
+    let signer = root.path().join("signer");
+    fs::write(
+        &signer,
+        format!(
+            "#!/bin/sh\nset -eu\n[ \"$1\" = sign-release-manifest ]\n[ \"$2\" = --profile ]\n[ \"$3\" = source-maintenance ]\ncat >/dev/null\nprintf x >>'{}'\nprintf '%s\\n' '{}'\n",
+            signer_marker.display(),
+            BASE64.encode(release_key.sign(&unsigned_manifest).to_bytes())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&signer, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = root.path().join("release-set");
+
+    let result = Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "build"])
+        .args(["--source-root", source.to_str().unwrap()])
+        .args(["--source-commit", &source_commit])
+        .args(["--git", "/usr/bin/git"])
+        .args(["--cargo", fake_cargo.to_str().unwrap()])
+        .args(["--cargo-home", cargo_home.to_str().unwrap()])
+        .args(["--target", "linux-x86_64"])
+        .args(["--product", "update-all"])
+        .args(["--manifest-generation", "update-all=7"])
+        .args(["--root-document", root_path.to_str().unwrap()])
+        .args(["--trusted-root-public-key", trusted_root.to_str().unwrap()])
+        .args(["--release-key-id", &release_id])
+        .args(["--signer", signer.to_str().unwrap()])
+        .args(["--signer-profile", "source-maintenance"])
+        .args(["--output", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "set build failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stderr.is_empty());
+    let summary: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(summary["schema"], "release-admin-set-build-v1");
+    assert_eq!(summary["source_commit"], source_commit);
+    assert_eq!(summary["controlled_build"], true);
+    assert!(summary.get("reproducible_input").is_none());
+    assert_eq!(summary["products"].as_array().unwrap().len(), 1);
+    assert_eq!(fs::read(&signer_marker).unwrap(), b"x");
+
+    let product = output.join("releases/update-all");
+    let artifact = product.join("update-all-1.2.3-linux-x86_64");
+    let verified = verify_release_bytes(
+        &ReleaseBundle {
+            root: fs::read(product.join("dev-tools-root.json")).unwrap(),
+            manifest: fs::read(product.join("update-all-stable.json")).unwrap(),
+            artifact: fs::read(&artifact).unwrap(),
+        },
+        &ReleaseAuthority {
+            trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
+            product: "update-all".into(),
+            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            target: "linux-x86_64".into(),
+            artifact_url: ArtifactUrlPolicy::GitHubRelease {
+                owner: "FutureDevGuys".into(),
+                repository: "dev-tools".into(),
+            },
+            require_source_commit: true,
+            engine_protocol: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        verified.source_commit.as_deref(),
+        Some(source_commit.as_str())
+    );
+    assert_eq!(fs::read(&artifact).unwrap(), b"native release\n");
+    assert!(!output.join("build").exists());
+    assert!(git_output(&source, &["status", "--porcelain"]).is_empty());
+
+    let second_output = root.path().join("release-set-second");
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "build"])
+        .args(["--source-root", source.to_str().unwrap()])
+        .args(["--source-commit", &source_commit])
+        .args(["--git", "/usr/bin/git"])
+        .args(["--cargo", fake_cargo.to_str().unwrap()])
+        .args(["--cargo-home", cargo_home.to_str().unwrap()])
+        .args(["--target", "linux-x86_64"])
+        .args(["--product", "update-all"])
+        .args(["--manifest-generation", "update-all=7"])
+        .args(["--root-document", root_path.to_str().unwrap()])
+        .args(["--trusted-root-public-key", trusted_root.to_str().unwrap()])
+        .args(["--release-key-id", &release_id])
+        .args(["--signer", signer.to_str().unwrap()])
+        .args(["--signer-profile", "source-maintenance"])
+        .args(["--output", second_output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr("");
+    assert_eq!(fs::read(&signer_marker).unwrap(), b"xx");
+    for name in [
+        "dev-tools-root.json",
+        "update-all-stable.json",
+        "update-all-1.2.3-linux-x86_64",
+    ] {
+        assert_eq!(
+            fs::read(output.join("releases/update-all").join(name)).unwrap(),
+            fs::read(second_output.join("releases/update-all").join(name)).unwrap(),
+            "independent release bytes differ for {name}"
+        );
+    }
 }
 
 #[test]
