@@ -8,15 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Read;
-#[cfg(any(
-    not(unix),
-    target_os = "cygwin",
-    target_os = "horizon",
-    target_os = "openbsd",
-    target_os = "redox",
-    target_os = "wasi"
-))]
-use std::io::Seek;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result as AnyhowResult};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use wait_timeout::ChildExt;
 use zeroize::Zeroize;
 #[cfg(all(
@@ -39,6 +33,7 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 const MAX_OUTPUT_LIMIT: usize = 16 << 20;
+const MAX_PUBLIC_INPUT_LIMIT: usize = 16 << 20;
 const MONITOR_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(all(
     unix,
@@ -61,6 +56,89 @@ pub struct BoundedCommand<'a> {
     pub cwd: Option<&'a Path>,
     pub timeout: Duration,
     pub output_limit: usize,
+}
+
+/// One executable identity held independently of its source pathname.
+///
+/// Linux is the first accepted backend. Every path component is opened without
+/// following links, the executable is retained by descriptor, and child
+/// commands execute that descriptor through a validated procfs mount.
+#[cfg(target_os = "linux")]
+pub struct HeldExecutable {
+    executable: OwnedFd,
+    execution_path: PathBuf,
+    _ancestors: Vec<OwnedFd>,
+    _proc_fd_directory: OwnedFd,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub struct HeldExecutable;
+
+pub struct HeldCommand<'a> {
+    command: Command,
+    _held: &'a HeldExecutable,
+}
+
+impl std::ops::Deref for HeldCommand<'_> {
+    type Target = Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl std::ops::DerefMut for HeldCommand<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl HeldExecutable {
+    pub fn open(path: &Path) -> AnyhowResult<Self> {
+        hold_linux_executable(path)
+    }
+
+    pub fn command<'a>(&'a self, argv0: &OsStr) -> AnyhowResult<HeldCommand<'a>> {
+        use std::os::unix::process::CommandExt as _;
+
+        let descriptor = self.executable.as_raw_fd();
+        let mut command = Command::new(&self.execution_path);
+        command.arg0(argv0);
+        // SAFETY: HeldCommand borrows this HeldExecutable through spawn and the
+        // synchronous bounded runner. The descriptor is therefore valid in the
+        // forked child. fcntl(F_SETFD) is async-signal-safe, and clearing only
+        // FD_CLOEXEC lets a script interpreter reopen the already-held identity.
+        unsafe {
+            command.pre_exec(move || {
+                // SAFETY: the HeldCommand borrow above keeps this descriptor
+                // open until the child-only callback has completed.
+                let descriptor = BorrowedFd::borrow_raw(descriptor);
+                rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
+                    .map_err(io::Error::from)
+            });
+        }
+        Ok(HeldCommand {
+            command,
+            _held: self,
+        })
+    }
+
+    pub fn is_cloexec(&self) -> bool {
+        rustix::io::fcntl_getfd(&self.executable)
+            .is_ok_and(|flags| flags.contains(rustix::io::FdFlags::CLOEXEC))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl HeldExecutable {
+    pub fn open(_path: &Path) -> AnyhowResult<Self> {
+        bail!("held executable identity is not accepted on this platform")
+    }
+
+    pub fn command<'a>(&'a self, _argv0: &OsStr) -> AnyhowResult<HeldCommand<'a>> {
+        bail!("held executable identity is not accepted on this platform")
+    }
 }
 
 #[derive(Debug)]
@@ -240,6 +318,7 @@ pub enum BoundedCommandErrorKind {
     InvalidExecutable,
     InvalidResourceLimits,
     InvalidWorkingDirectory,
+    InvalidPublicInput,
     Start,
     Wait,
     Cancelled,
@@ -345,6 +424,9 @@ impl fmt::Display for BoundedCommandError {
             BoundedCommandErrorKind::InvalidWorkingDirectory => {
                 formatter.write_str("bounded command working directory must be absolute")
             }
+            BoundedCommandErrorKind::InvalidPublicInput => {
+                formatter.write_str("bounded command public input exceeds the size limit")
+            }
             BoundedCommandErrorKind::Start => formatter.write_str("start bounded command"),
             BoundedCommandErrorKind::Wait => formatter.write_str("wait for bounded command"),
             BoundedCommandErrorKind::Cancelled => {
@@ -423,6 +505,73 @@ pub fn run_bounded_command_with_cancellation(
     )
 }
 
+/// Run an exact executable with bounded, explicitly public standard input.
+///
+/// The input is staged in an anonymous temporary file so a child that never
+/// reads cannot block the controller or require an auxiliary writer process.
+/// Callers must not use this API for secrets because the operating system may
+/// back that anonymous file with persistent storage.
+pub fn run_bounded_command_with_public_input(
+    request: &BoundedCommand<'_>,
+    input: &[u8],
+) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
+    validate_bounded_command(request)?;
+    if input.len() > MAX_PUBLIC_INPUT_LIMIT {
+        return Err(BoundedCommandError::new(
+            BoundedCommandErrorKind::InvalidPublicInput,
+        ));
+    }
+    let mut command = Command::new(request.executable);
+    command
+        .args(request.arguments)
+        .env_clear()
+        .envs(request.environment);
+    if let Some(cwd) = request.cwd {
+        command.current_dir(cwd);
+    }
+    run_prepared_bounded_command_with_public_input(
+        &mut command,
+        input,
+        request.timeout,
+        request.output_limit,
+    )
+}
+
+/// Run a caller-prepared command with bounded, explicitly public input.
+///
+/// Program identity, argv, environment, working directory, and child setup
+/// remain caller-owned. The input may be backed by persistent storage and must
+/// therefore never contain credentials or other secret material.
+pub fn run_prepared_bounded_command_with_public_input(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    output_limit: usize,
+) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
+    validate_resource_limits(timeout, output_limit)?;
+    if input.len() > MAX_PUBLIC_INPUT_LIMIT {
+        return Err(BoundedCommandError::new(
+            BoundedCommandErrorKind::InvalidPublicInput,
+        ));
+    }
+    let mut input_file = tempfile::tempfile().map_err(|source| {
+        BoundedCommandError::with_source(BoundedCommandErrorKind::InvalidPublicInput, source)
+    })?;
+    input_file.write_all(input).map_err(|source| {
+        BoundedCommandError::with_source(BoundedCommandErrorKind::InvalidPublicInput, source)
+    })?;
+    input_file.rewind().map_err(|source| {
+        BoundedCommandError::with_source(BoundedCommandErrorKind::InvalidPublicInput, source)
+    })?;
+    command.stdin(Stdio::from(input_file));
+    run_prepared_bounded_command_with_configured_input(
+        command,
+        timeout,
+        output_limit,
+        &NEVER_CANCELLED,
+    )
+}
+
 /// Run a caller-prepared command with bounded output and no cancellation.
 ///
 /// The caller's program, argument vector, environment, working directory, and
@@ -461,10 +610,17 @@ pub fn run_prepared_bounded_command_with_cancellation(
     if cancelled.load(Ordering::Acquire) {
         return Err(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(Stdio::null());
+    run_prepared_bounded_command_with_configured_input(command, timeout, output_limit, cancelled)
+}
+
+fn run_prepared_bounded_command_with_configured_input(
+    command: &mut Command,
+    timeout: Duration,
+    output_limit: usize,
+    cancelled: &AtomicBool,
+) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(all(
         unix,
         not(any(
@@ -516,6 +672,123 @@ fn validate_bounded_command(
         return Err(BoundedCommandError::new(
             BoundedCommandErrorKind::InvalidWorkingDirectory,
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
+    use std::path::Component;
+
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        bail!("held executable path must be absolute");
+    }
+    let names = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => bail!("held executable path is not canonical"),
+        })
+        .collect::<AnyhowResult<Vec<_>>>()?;
+    let (file_name, directory_names) = names
+        .split_last()
+        .context("held executable path has no file name")?;
+    let directory_flags = rustix::fs::OFlags::PATH
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    let current_uid = rustix::process::geteuid().as_raw();
+    let root = rustix::fs::open("/", directory_flags, rustix::fs::Mode::empty())
+        .context("open held executable filesystem root")?;
+    validate_held_component(
+        &rustix::fs::fstat(&root).context("inspect held executable filesystem root")?,
+        rustix::fs::FileType::Directory,
+        current_uid,
+        true,
+    )?;
+    let mut ancestors = vec![root];
+    for name in directory_names {
+        let directory = rustix::fs::openat(
+            ancestors
+                .last()
+                .context("held executable ancestor chain is empty")?,
+            name,
+            directory_flags,
+            rustix::fs::Mode::empty(),
+        )
+        .context("open held executable ancestor without following links")?;
+        validate_held_component(
+            &rustix::fs::fstat(&directory).context("inspect held executable ancestor")?,
+            rustix::fs::FileType::Directory,
+            current_uid,
+            true,
+        )?;
+        ancestors.push(directory);
+    }
+    let executable = rustix::fs::openat(
+        ancestors
+            .last()
+            .context("held executable ancestor chain is empty")?,
+        file_name,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .context("open held executable without following links")?;
+    let executable_metadata =
+        rustix::fs::fstat(&executable).context("inspect held executable identity")?;
+    validate_held_component(
+        &executable_metadata,
+        rustix::fs::FileType::RegularFile,
+        current_uid,
+        false,
+    )?;
+    if executable_metadata.st_mode & 0o111 == 0 {
+        bail!("held executable is not executable");
+    }
+    let proc_fd_directory =
+        rustix::fs::open("/proc/self/fd", directory_flags, rustix::fs::Mode::empty())
+            .context("open process file-descriptor directory")?;
+    if rustix::fs::fstatfs(&proc_fd_directory)
+        .context("inspect process file-descriptor filesystem")?
+        .f_type as u64
+        != 0x0000_9fa0
+    {
+        bail!("process file-descriptor directory is not procfs");
+    }
+    let execution_path = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+    let execution_metadata = fs::metadata(&execution_path)
+        .context("inspect held executable through process file-descriptor path")?;
+    use std::os::unix::fs::MetadataExt as _;
+    if execution_metadata.dev() != executable_metadata.st_dev
+        || execution_metadata.ino() != executable_metadata.st_ino
+    {
+        bail!("held executable descriptor identity is inconsistent");
+    }
+    Ok(HeldExecutable {
+        executable,
+        execution_path,
+        _ancestors: ancestors,
+        _proc_fd_directory: proc_fd_directory,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_held_component(
+    metadata: &rustix::fs::Stat,
+    expected_type: rustix::fs::FileType,
+    current_uid: u32,
+    allow_root_sticky_directory: bool,
+) -> AnyhowResult<()> {
+    if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != expected_type
+        || (metadata.st_uid != 0 && metadata.st_uid != current_uid)
+    {
+        bail!("held executable path has unsafe ownership or object type");
+    }
+    let writable_by_others = metadata.st_mode & 0o022 != 0;
+    let protected_shared_directory =
+        allow_root_sticky_directory && metadata.st_uid == 0 && metadata.st_mode & 0o1000 != 0;
+    if writable_by_others && !protected_shared_directory {
+        bail!("held executable path is writable by another user");
     }
     Ok(())
 }

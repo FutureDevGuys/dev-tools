@@ -1,10 +1,12 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use dev_tools_release::{
-    accept_verified_release, fetch_https, select_stable_release_assets,
-    validate_unsigned_product_manifest, verify_artifact_bytes, verify_release_bytes,
-    verify_release_metadata, ArtifactUrlPolicy, HttpsPolicy, ReleaseAuthority, ReleaseBundle,
-    ReleaseMetadata, ReleaseState,
+    accept_verified_release, build_signed_envelope, build_unsigned_product_manifest,
+    build_unsigned_root_document, fetch_https, release_key_id, root_key_id,
+    select_stable_release_assets, validate_unsigned_product_manifest, verify_artifact_bytes,
+    verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy, EnvelopeSignature,
+    HttpsPolicy, ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseBundle,
+    ReleaseMetadata, ReleaseState, RootDocumentSpec, RootReleaseKey,
 };
 #[cfg(unix)]
 use dev_tools_release::{
@@ -53,6 +55,103 @@ fn unsigned_manifest_validation_requires_canonical_stable_release_contract() {
     assert!(validate_unsigned_product_manifest(&serde_jcs::to_vec(&arbitrary).unwrap()).is_err());
 }
 
+#[test]
+fn shared_builder_is_the_canonical_source_bound_manifest_authority() {
+    let bytes = build_unsigned_product_manifest(&ProductManifestSpec {
+        product: "release-admin".into(),
+        generation: 7,
+        version: "1.2.3".into(),
+        source_commit: "a".repeat(40),
+        artifacts: vec![
+            ManifestArtifact {
+                target: "linux-x86_64".into(),
+                url: "https://github.com/FutureDevGuys/dev-tools/releases/download/release-admin%2Fv1.2.3/release-admin-1.2.3-linux-x86_64".into(),
+                length: 41,
+                sha256: "b".repeat(64),
+            },
+            ManifestArtifact {
+                target: "windows-x86_64".into(),
+                url: "https://github.com/FutureDevGuys/dev-tools/releases/download/release-admin%2Fv1.2.3/release-admin-1.2.3-windows-x86_64.exe".into(),
+                length: 42,
+                sha256: "c".repeat(64),
+            },
+        ],
+    })
+    .expect("build canonical manifest");
+
+    assert_eq!(
+        bytes,
+        br#"{"artifacts":{"linux-x86_64":{"length":41,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","url":"https://github.com/FutureDevGuys/dev-tools/releases/download/release-admin%2Fv1.2.3/release-admin-1.2.3-linux-x86_64"},"windows-x86_64":{"length":42,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","url":"https://github.com/FutureDevGuys/dev-tools/releases/download/release-admin%2Fv1.2.3/release-admin-1.2.3-windows-x86_64.exe"}},"engine_protocol":1,"generation":7,"product":"release-admin","schema":"dev-tools-product-v2","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","version":"1.2.3"}"#
+    );
+    assert_eq!(
+        validate_unsigned_product_manifest(&bytes)
+            .expect("validate builder output")
+            .product,
+        "release-admin"
+    );
+
+    let duplicate = ProductManifestSpec {
+        product: "release-admin".into(),
+        generation: 7,
+        version: "1.2.3".into(),
+        source_commit: "a".repeat(40),
+        artifacts: vec![
+            ManifestArtifact {
+                target: "linux-x86_64".into(),
+                url: "https://example.invalid/one".into(),
+                length: 1,
+                sha256: "b".repeat(64),
+            },
+            ManifestArtifact {
+                target: "linux-x86_64".into(),
+                url: "https://example.invalid/two".into(),
+                length: 1,
+                sha256: "c".repeat(64),
+            },
+        ],
+    };
+    assert!(build_unsigned_product_manifest(&duplicate).is_err());
+}
+
+#[test]
+fn shared_root_builder_sorts_keys_and_emits_one_canonical_envelope() {
+    let root_key = SigningKey::from_bytes(&[7; 32]);
+    let first_release = SigningKey::from_bytes(&[8; 32]);
+    let second_release = SigningKey::from_bytes(&[9; 32]);
+    let unsigned = build_unsigned_root_document(&RootDocumentSpec {
+        generation: 3,
+        release_keys: vec![
+            RootReleaseKey {
+                public_key: hex(&second_release.verifying_key().to_bytes()),
+                revoked: false,
+            },
+            RootReleaseKey {
+                public_key: hex(&first_release.verifying_key().to_bytes()),
+                revoked: true,
+            },
+        ],
+    })
+    .expect("build root payload");
+    let signed = build_signed_envelope(
+        &unsigned,
+        &[EnvelopeSignature {
+            key_id: root_key_id(&hex(&root_key.verifying_key().to_bytes())).unwrap(),
+            signature: root_key.sign(&unsigned).to_bytes().to_vec(),
+        }],
+    )
+    .expect("build signed root");
+    let value: Value = serde_json::from_slice(&signed).expect("root envelope JSON");
+    let keys = value["signed"]["release_keys"]
+        .as_array()
+        .expect("release keys");
+    assert!(keys[0]["key_id"].as_str() < keys[1]["key_id"].as_str());
+    assert_eq!(
+        keys[1]["key_id"],
+        release_key_id(&hex(&second_release.verifying_key().to_bytes())).unwrap()
+    );
+    assert_eq!(signed.last(), Some(&b'\n'));
+}
+
 fn signed(value: Value, key_id: &str, key: &SigningKey) -> Vec<u8> {
     let canonical = serde_jcs::to_vec(&value).unwrap();
     serde_json::to_vec(&json!({
@@ -75,12 +174,13 @@ fn release_fixture(
 ) -> (ReleaseBundle, ReleaseAuthority) {
     let root_key = SigningKey::from_bytes(&[7; 32]);
     let release_key = SigningKey::from_bytes(&[9; 32]);
+    let release_id = release_key_id(&hex(&release_key.verifying_key().to_bytes())).unwrap();
     let root = signed(
         json!({
             "schema": "dev-tools-root-v1",
             "generation": 3,
             "release_keys": [{
-                "key_id": "release-test",
+                "key_id": release_id.clone(),
                 "public_key": hex(&release_key.verifying_key().to_bytes()),
                 "revoked": false,
             }],
@@ -106,7 +206,7 @@ fn release_fixture(
     if let Some(commit) = source_commit {
         manifest["source_commit"] = Value::String(commit.into());
     }
-    let manifest = signed(manifest, "release-test", &release_key);
+    let manifest = signed(manifest, &release_id, &release_key);
     (
         ReleaseBundle {
             root,
@@ -256,12 +356,13 @@ fn legacy_manifest_schemas_remain_bound_to_their_original_products() {
 fn verifies_a_source_bound_multi_target_v2_as_one_selected_target() {
     let root_key = SigningKey::from_bytes(&[7; 32]);
     let release_key = SigningKey::from_bytes(&[9; 32]);
+    let release_id = release_key_id(&hex(&release_key.verifying_key().to_bytes())).unwrap();
     let root = signed(
         json!({
             "schema": "dev-tools-root-v1",
             "generation": 3,
             "release_keys": [{
-                "key_id": "release-test",
+                "key_id": release_id.clone(),
                 "public_key": hex(&release_key.verifying_key().to_bytes()),
                 "revoked": false,
             }],
@@ -303,7 +404,7 @@ fn verifies_a_source_bound_multi_target_v2_as_one_selected_target() {
     assert!(
         validate_unsigned_product_manifest(&serde_jcs::to_vec(&missing_source).unwrap()).is_err()
     );
-    let manifest = signed(manifest_document, "release-test", &release_key);
+    let manifest = signed(manifest_document, &release_id, &release_key);
     let authority = ReleaseAuthority {
         trusted_root_key: hex(&root_key.verifying_key().to_bytes()),
         product: "product".into(),

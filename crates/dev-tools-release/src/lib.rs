@@ -101,6 +101,14 @@ pub struct SelectedReleaseAssets {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRoot {
+    pub generation: u64,
+    pub sha256: String,
+    pub active_release_keys: usize,
+    pub revoked_release_keys: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpsPolicy {
     pub allowed_hosts: BTreeSet<String>,
     pub max_redirects: u32,
@@ -180,12 +188,170 @@ pub struct UnsignedProductManifest {
     pub version: Version,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestArtifact {
+    pub target: String,
+    pub url: String,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductManifestSpec {
+    pub product: String,
+    pub generation: u64,
+    pub version: String,
+    pub source_commit: String,
+    pub artifacts: Vec<ManifestArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootReleaseKey {
+    pub public_key: String,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootDocumentSpec {
+    pub generation: u64,
+    pub release_keys: Vec<RootReleaseKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeSignature {
+    pub key_id: String,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactIdentity {
     url: String,
     length: u64,
     sha256: String,
+}
+
+/// Constructs the sole source-bound product-manifest representation written by
+/// native release tooling. The returned bytes are RFC 8785 canonical JSON and
+/// are therefore the exact bytes presented to the release-signing authority.
+pub fn build_unsigned_product_manifest(spec: &ProductManifestSpec) -> Result<Vec<u8>> {
+    if !valid_product_id(&spec.product)
+        || spec.generation == 0
+        || !valid_lower_hex(&spec.source_commit, 40)
+        || spec.artifacts.is_empty()
+        || spec.artifacts.len() > MAX_MANIFEST_ARTIFACTS
+    {
+        bail!("product manifest specification is invalid");
+    }
+    let version = Version::parse(&spec.version).context("parse product manifest version")?;
+    if !version.pre.is_empty() || version.to_string() != spec.version {
+        bail!("product manifest version is not canonical stable semantic version");
+    }
+    let mut artifacts = BTreeMap::new();
+    for artifact in &spec.artifacts {
+        let identity = ArtifactIdentity {
+            url: artifact.url.clone(),
+            length: artifact.length,
+            sha256: artifact.sha256.clone(),
+        };
+        validate_artifact_identity(&artifact.target, &identity)
+            .context("product manifest artifact identity is invalid")?;
+        if artifacts
+            .insert(artifact.target.clone(), identity)
+            .is_some()
+        {
+            bail!("product manifest target is duplicated");
+        }
+    }
+    let manifest = ProductManifest {
+        schema: "dev-tools-product-v2".into(),
+        product: spec.product.clone(),
+        generation: spec.generation,
+        version: spec.version.clone(),
+        source_commit: Some(spec.source_commit.clone()),
+        engine_protocol: 1,
+        artifacts,
+    };
+    let bytes = serde_jcs::to_vec(&manifest).context("canonicalize product manifest")?;
+    validate_unsigned_product_manifest(&bytes)?;
+    Ok(bytes)
+}
+
+/// Constructs the exact canonical root payload signed by offline root keys.
+pub fn build_unsigned_root_document(spec: &RootDocumentSpec) -> Result<Vec<u8>> {
+    if spec.generation == 0 || spec.release_keys.is_empty() || spec.release_keys.len() > 32 {
+        bail!("root document specification is invalid");
+    }
+    let mut identities = BTreeSet::new();
+    let mut release_keys = Vec::with_capacity(spec.release_keys.len());
+    for key in &spec.release_keys {
+        let verifying_key = parse_release_public_key(&key.public_key)
+            .context("parse root-authorized release public key")?;
+        let key_id = key_id("release", verifying_key.as_bytes());
+        if !identities.insert(key_id.clone()) {
+            bail!("root document release key is duplicated");
+        }
+        release_keys.push(ReleaseKey {
+            key_id,
+            public_key: key.public_key.clone(),
+            revoked: key.revoked,
+        });
+    }
+    if release_keys.iter().all(|key| key.revoked) {
+        bail!("root document must authorize at least one active release key");
+    }
+    release_keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+    serde_jcs::to_vec(&RootDocument {
+        schema: "dev-tools-root-v1".into(),
+        generation: spec.generation,
+        release_keys,
+    })
+    .context("canonicalize root document")
+}
+
+/// Wraps one canonical JSON payload in a deterministic signed envelope.
+pub fn build_signed_envelope(unsigned: &[u8], signatures: &[EnvelopeSignature]) -> Result<Vec<u8>> {
+    require_bounded(unsigned, METADATA_LIMIT, "unsigned signed payload")?;
+    if signatures.is_empty() || signatures.len() > 8 {
+        bail!("signed envelope has an invalid signature count");
+    }
+    let signed: serde_json::Value =
+        serde_json::from_slice(unsigned).context("parse unsigned signed payload")?;
+    if serde_jcs::to_vec(&signed).context("canonicalize unsigned signed payload")? != unsigned {
+        bail!("unsigned signed payload is not canonical JSON");
+    }
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::with_capacity(signatures.len());
+    for signature in signatures {
+        if !valid_key_id(&signature.key_id)
+            || signature.signature.len() != ed25519_dalek::SIGNATURE_LENGTH
+            || !seen.insert(signature.key_id.clone())
+        {
+            bail!("signed envelope signature is invalid or duplicated");
+        }
+        rows.push(DocumentSignature {
+            key_id: signature.key_id.clone(),
+            signature: BASE64.encode(&signature.signature),
+        });
+    }
+    rows.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+    let mut bytes = serde_jcs::to_vec(&SignedEnvelope {
+        signed,
+        signatures: rows,
+    })
+    .context("canonicalize signed envelope")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn release_key_id(public_key: &str) -> Result<String> {
+    let key = parse_release_public_key(public_key)?;
+    Ok(key_id("release", key.as_bytes()))
+}
+
+pub fn root_key_id(public_key: &str) -> Result<String> {
+    let key = parse_release_public_key(public_key)?;
+    Ok(key_id("root", key.as_bytes()))
 }
 
 /// Validates the exact canonical bytes that the release tooling signs.
@@ -201,7 +367,7 @@ pub fn validate_unsigned_product_manifest(input: &[u8]) -> Result<UnsignedProduc
     if canonical != input {
         bail!("unsigned release manifest is not canonical JSON");
     }
-    if manifest.product.is_empty()
+    if !valid_product_id(&manifest.product)
         || manifest.generation == 0
         || manifest.engine_protocol != 1
         || manifest.artifacts.is_empty()
@@ -246,44 +412,93 @@ pub fn verify_release_metadata(
     metadata: &ReleaseMetadata,
     authority: &ReleaseAuthority,
 ) -> Result<VerifiedRelease> {
+    let releases = verify_release_set_metadata(metadata, authority)?;
+    releases
+        .into_iter()
+        .find(|release| release.target == authority.target)
+        .context("release manifest has no artifact for the selected target")
+}
+
+/// Verifies one signed manifest and returns every authenticated target
+/// projection in deterministic target order.
+pub fn verify_release_set_metadata(
+    metadata: &ReleaseMetadata,
+    authority: &ReleaseAuthority,
+) -> Result<Vec<VerifiedRelease>> {
     validate_authority(authority)?;
     require_bounded(&metadata.root, METADATA_LIMIT, "root document")?;
     require_bounded(&metadata.manifest, METADATA_LIMIT, "release manifest")?;
 
-    let root: SignedEnvelope<RootDocument> =
-        serde_json::from_slice(&metadata.root).context("parse trusted root document")?;
-    if root.signed.schema != "dev-tools-root-v1" || root.signed.generation == 0 {
-        bail!("release root document has an unsupported contract");
-    }
-    verify_any_signature(
-        &root,
-        &parse_release_public_key(&authority.trusted_root_key)?,
-    )
-    .context("verify release root document")?;
+    let root = parse_and_verify_root(&metadata.root, &authority.trusted_root_key)?;
 
     let manifest: SignedEnvelope<ProductManifest> =
         serde_json::from_slice(&metadata.manifest).context("parse product release manifest")?;
     verify_release_signature(&manifest, &root.signed)?;
     validate_manifest(&manifest.signed, authority)?;
-    let artifact = manifest
+    if matches!(authority.artifact_url, ArtifactUrlPolicy::Exact(_))
+        && manifest.signed.artifacts.len() != 1
+    {
+        bail!("exact artifact URL authority cannot admit a multi-target manifest");
+    }
+    let root_sha256 = sha256_hex(&metadata.root);
+    let manifest_sha256 = sha256_hex(&metadata.manifest);
+    let version = Version::parse(&manifest.signed.version).context("parse product version")?;
+    Ok(manifest
         .signed
         .artifacts
-        .get(&authority.target)
-        .context("release manifest has no artifact for the selected target")?;
-    Ok(VerifiedRelease {
-        root_generation: root.signed.generation,
-        root_sha256: sha256_hex(&metadata.root),
-        manifest_generation: manifest.signed.generation,
-        manifest_sha256: sha256_hex(&metadata.manifest),
-        manifest_schema: manifest.signed.schema,
-        product: manifest.signed.product,
-        version: Version::parse(&manifest.signed.version).context("parse product version")?,
-        source_commit: manifest.signed.source_commit,
-        target: authority.target.clone(),
-        artifact_url: artifact.url.clone(),
-        artifact_length: artifact.length,
-        artifact_sha256: artifact.sha256.clone(),
+        .into_iter()
+        .map(|(target, artifact)| VerifiedRelease {
+            root_generation: root.signed.generation,
+            root_sha256: root_sha256.clone(),
+            manifest_generation: manifest.signed.generation,
+            manifest_sha256: manifest_sha256.clone(),
+            manifest_schema: manifest.signed.schema.clone(),
+            product: manifest.signed.product.clone(),
+            version: version.clone(),
+            source_commit: manifest.signed.source_commit.clone(),
+            target,
+            artifact_url: artifact.url,
+            artifact_length: artifact.length,
+            artifact_sha256: artifact.sha256,
+        })
+        .collect())
+}
+
+pub fn verify_root_bytes(root: &[u8], trusted_root_key: &str) -> Result<VerifiedRoot> {
+    let envelope = parse_and_verify_root(root, trusted_root_key)?;
+    Ok(VerifiedRoot {
+        generation: envelope.signed.generation,
+        sha256: sha256_hex(root),
+        active_release_keys: envelope
+            .signed
+            .release_keys
+            .iter()
+            .filter(|key| !key.revoked)
+            .count(),
+        revoked_release_keys: envelope
+            .signed
+            .release_keys
+            .iter()
+            .filter(|key| key.revoked)
+            .count(),
     })
+}
+
+/// Authenticates a root document and returns the public key for one active
+/// routine release-signing identity.
+pub fn authorized_release_public_key(
+    root: &[u8],
+    trusted_root_key: &str,
+    release_key_id: &str,
+) -> Result<String> {
+    let envelope = parse_and_verify_root(root, trusted_root_key)?;
+    envelope
+        .signed
+        .release_keys
+        .into_iter()
+        .find(|key| key.key_id == release_key_id && !key.revoked)
+        .map(|key| key.public_key)
+        .context("release key is not active in the authenticated root")
 }
 
 pub fn verify_artifact_bytes(verified: &VerifiedRelease, artifact: &[u8]) -> Result<()> {
@@ -725,6 +940,46 @@ fn ensure_release_cache_directory(path: &Path, owner_uid: u32) -> Result<()> {
     Ok(())
 }
 
+fn parse_and_verify_root(
+    bytes: &[u8],
+    trusted_root_key: &str,
+) -> Result<SignedEnvelope<RootDocument>> {
+    require_bounded(bytes, METADATA_LIMIT, "root document")?;
+    let root: SignedEnvelope<RootDocument> =
+        serde_json::from_slice(bytes).context("parse trusted root document")?;
+    validate_root_document(&root.signed)?;
+    if root.signatures.is_empty() || root.signatures.len() > 8 {
+        bail!("release root document signatures are invalid");
+    }
+    verify_any_signature(&root, &parse_release_public_key(trusted_root_key)?)
+        .context("verify release root document")?;
+    Ok(root)
+}
+
+fn validate_root_document(root: &RootDocument) -> Result<()> {
+    if root.schema != "dev-tools-root-v1"
+        || root.generation == 0
+        || root.release_keys.is_empty()
+        || root.release_keys.len() > 32
+    {
+        bail!("release root document has an unsupported contract");
+    }
+    let mut identities = BTreeSet::new();
+    for key in &root.release_keys {
+        let verifying_key = parse_release_public_key(&key.public_key)
+            .context("parse root-authorized release public key")?;
+        if key.key_id != key_id("release", verifying_key.as_bytes())
+            || !identities.insert(key.key_id.clone())
+        {
+            bail!("release root key identity is invalid or duplicated");
+        }
+    }
+    if root.release_keys.iter().all(|key| key.revoked) {
+        bail!("release root document has no active release key");
+    }
+    Ok(())
+}
+
 fn validate_authority(authority: &ReleaseAuthority) -> Result<()> {
     if authority.product.is_empty()
         || authority.target.is_empty()
@@ -834,7 +1089,7 @@ fn validate_manifest_schema(manifest: &ProductManifest) -> Result<()> {
 }
 
 fn validate_artifact_identity(target: &str, artifact: &ArtifactIdentity) -> Result<()> {
-    if target.is_empty()
+    if !valid_release_target(target)
         || !artifact.url.starts_with("https://")
         || artifact.length == 0
         || artifact.length as usize > ARTIFACT_LIMIT
@@ -925,6 +1180,46 @@ fn require_bounded(bytes: &[u8], limit: usize, label: &str) -> Result<()> {
 
 fn valid_hex(value: &str, length: usize) -> bool {
     value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn key_id(prefix: &str, public_key: &[u8]) -> String {
+    let digest = sha256_hex(public_key);
+    format!("{prefix}-{}", &digest[..16])
+}
+
+fn valid_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_product_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_release_target(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 fn valid_github_component(value: &str) -> bool {

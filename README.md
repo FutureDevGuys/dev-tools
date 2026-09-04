@@ -13,7 +13,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 | [`dev-cache`](docs/dev-cache.md) | Route and automatically maintain known disposable build caches on storage you select without moving source or deliverables. |
 | [`sync-configs`](docs/sync-configs.md) | Converge explicitly selected files, directories, and structured overlays from a trusted manifest. |
 | [`skills-sync`](docs/skills-sync.md) | Reconcile installed agent skills and their links from an explicit lock and provider selection. |
-| `release-admin` (planned) | Build, verify, sign, publish, and audit releases while preserving separate authority boundaries. |
+| [`release-admin`](docs/release-admin.md) (planned) | Build, verify, sign, publish, and audit releases while preserving separate authority boundaries. |
 
 ## Installation
 

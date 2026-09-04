@@ -234,11 +234,14 @@ mod tests {
     fn signed_release_binds_source_target_url_and_artifact() {
         let root_key = SigningKey::from_bytes(&[7; 32]);
         let release_key = SigningKey::from_bytes(&[9; 32]);
+        let release_id =
+            dev_tools_release::release_key_id(&hex(&release_key.verifying_key().to_bytes()))
+                .unwrap();
         let root = RootDocument {
             schema: "dev-tools-root-v1".into(),
             generation: 3,
             release_keys: vec![ReleaseKey {
-                key_id: "release-test".into(),
+                key_id: release_id.clone(),
                 public_key: hex(&release_key.verifying_key().to_bytes()),
                 revoked: false,
             }],
@@ -263,7 +266,7 @@ mod tests {
             artifacts: BTreeMap::from([("linux-x86_64".into(), artifact)]),
         };
         let envelope = SignedEnvelope {
-            signatures: vec![signature(&manifest, "release-test", &release_key)],
+            signatures: vec![signature(&manifest, &release_id, &release_key)],
             signed: manifest,
         };
         let root_bytes = serde_json::to_vec(&root).unwrap();

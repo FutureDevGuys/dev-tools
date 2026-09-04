@@ -959,6 +959,7 @@ fn map_op_read_error(error: dev_tools_command::BoundedCommandError) -> anyhow::E
             BoundedCommandErrorKind::InvalidExecutable
             | BoundedCommandErrorKind::InvalidResourceLimits
             | BoundedCommandErrorKind::InvalidWorkingDirectory
+            | BoundedCommandErrorKind::InvalidPublicInput
             | BoundedCommandErrorKind::Wait
             | BoundedCommandErrorKind::Capture(_)
             | BoundedCommandErrorKind::Cleanup => "1Password item read failed",

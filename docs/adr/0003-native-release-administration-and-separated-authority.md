@@ -10,7 +10,7 @@ verification: pending
 
 ## Context
 
-The remaining release administration path uses repository-owned Python programs. Converting it to Rust removes an interpreter dependency and permits shared typed release contracts, but combining the workflow must not combine build, offline root, release-signing, publication, or privileged-installation authority.
+Release administration spans deterministic compilation, offline root authorization, routine manifest signing, provider publication, anonymous verification, and installation. A standalone native implementation removes interpreter and checkout dependencies, but consolidating orchestration must not consolidate those authorities.
 
 ## Decision
 
@@ -24,7 +24,7 @@ New releases use one canonical `dev-tools-product-v2` manifest per product versi
 - Every published artifact binds the exact product, source commit, target, length, digest, version, and generation.
 - A selected target is verified as one projection of the complete signed target set; accepting one target never permits unsigned additions or substitutions.
 - Remote metadata cannot select commands or privileged effects.
-- Python release tooling remains authoritative until native parity and rollback acceptance pass, then is removed rather than retained as a second path.
+- During migration, the incumbent release tooling remains authoritative until native parity and rollback acceptance pass. Cutover removes the incumbent implementation rather than retaining a second authority.
 
 ## Verification
 

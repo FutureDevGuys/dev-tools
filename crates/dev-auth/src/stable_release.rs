@@ -403,6 +403,9 @@ mod tests {
     fn release_fixture() -> (ReleaseAuthority, ReleaseMetadata, Vec<u8>) {
         let root_key = SigningKey::from_bytes(&[7; 32]);
         let release_key = SigningKey::from_bytes(&[9; 32]);
+        let release_id =
+            dev_tools_release::release_key_id(&hex(&release_key.verifying_key().to_bytes()))
+                .unwrap();
         let target = "linux-x86_64";
         let version = "0.3.8";
         let artifact = b"authenticated local release fixture".to_vec();
@@ -411,7 +414,7 @@ mod tests {
                 schema: "dev-tools-root-v1".into(),
                 generation: 7,
                 release_keys: vec![TestReleaseKey {
-                    key_id: "release-test".into(),
+                    key_id: release_id.clone(),
                     public_key: hex(&release_key.verifying_key().to_bytes()),
                     revoked: false,
                 }],
@@ -436,7 +439,7 @@ mod tests {
                     },
                 )]),
             },
-            "release-test",
+            &release_id,
             &release_key,
         );
         (

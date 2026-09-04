@@ -21,9 +21,13 @@ fn windows_executable_validation_requires_a_native_command_regular_file() {
     assert!(!dev_tools_command::is_executable_file(&text));
 }
 
+#[cfg(target_os = "linux")]
+use dev_tools_command::HeldExecutable;
 #[cfg(unix)]
 use dev_tools_command::{
-    executable_candidates, first_executable, run_prepared_bounded_command, BoundedCommandStream,
+    executable_candidates, first_executable, run_bounded_command_with_public_input,
+    run_prepared_bounded_command, run_prepared_bounded_command_with_public_input,
+    BoundedCommandStream,
 };
 #[cfg(all(
     unix,
@@ -156,64 +160,74 @@ fn bounded_command_preserves_exact_environment_and_null_stdin() {
     assert_eq!(output.stdout, b"eof");
 }
 
+#[cfg(unix)]
+#[test]
+fn bounded_command_with_input_preserves_exact_bytes_without_a_writer_process() {
+    let arguments = [OsString::from("-")];
+    let output = run_bounded_command_with_public_input(
+        &BoundedCommand {
+            executable: Path::new("/usr/bin/cat"),
+            arguments: &arguments,
+            environment: &BTreeMap::new(),
+            cwd: None,
+            timeout: Duration::from_secs(1),
+            output_limit: 32,
+        },
+        b"exact\0input\n",
+    )
+    .expect("run command with bounded input");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"exact\0input\n");
+    assert!(output.stderr.is_empty());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn prepared_command_preserves_held_executable_identity_and_configuration() {
-    use std::os::fd::{AsRawFd, BorrowedFd};
-    use std::os::unix::process::CommandExt;
-
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("held-script");
     fs::write(
         &source,
-        b"#!/bin/sh\nprintf '%s\\n%s\\n' \"$1\" \"$ONLY_VAR\"\npwd\n",
+        b"#!/bin/sh\nread line\nprintf '%s\\n%s\\n%s\\n' \"$1\" \"$ONLY_VAR\" \"$line\"\npwd\n",
     )
     .unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
-    let held = rustix::fs::open(
-        &source,
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .unwrap();
-    let raw_descriptor = held.as_raw_fd();
-    let execution_path = PathBuf::from(format!("/proc/self/fd/{raw_descriptor}"));
+    let held = HeldExecutable::open(&source).expect("hold executable identity");
 
     fs::remove_file(&source).unwrap();
     fs::write(&source, b"#!/bin/sh\nprintf replacement\n").unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut command = std::process::Command::new(&execution_path);
+    let mut command = held
+        .command(source.as_os_str())
+        .expect("prepare held executable command");
     command
         .arg("argument")
         .env_clear()
         .env("ONLY_VAR", "present")
         .current_dir(root.path());
-    // SAFETY: `held` stays alive until the synchronous runner returns, so this
-    // exact descriptor remains valid through the child-only callback. Clearing
-    // only FD_CLOEXEC is async-signal-safe and lets the script interpreter
-    // reopen the already-admitted executable through `/proc/self/fd`.
-    unsafe {
-        command.pre_exec(move || {
-            let descriptor = BorrowedFd::borrow_raw(raw_descriptor);
-            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
-                .map_err(std::io::Error::from)
-        });
-    }
 
-    let output = run_prepared_bounded_command(&mut command, Duration::from_secs(1), 4096)
-        .expect("run the caller-prepared held executable");
+    let output = run_prepared_bounded_command_with_public_input(
+        &mut command,
+        b"public-input\n",
+        Duration::from_secs(1),
+        4096,
+    )
+    .expect("run the caller-prepared held executable");
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
-        format!("argument\npresent\n{}\n", root.path().display()).into_bytes()
+        format!(
+            "argument\npresent\npublic-input\n{}\n",
+            root.path().display()
+        )
+        .into_bytes()
     );
     assert!(output.stderr.is_empty());
     assert!(
-        rustix::io::fcntl_getfd(&held)
-            .unwrap()
-            .contains(rustix::io::FdFlags::CLOEXEC),
-        "the child-only transition changed the parent descriptor"
+        held.is_cloexec(),
+        "child execution changed the parent descriptor"
     );
 }
 

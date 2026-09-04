@@ -1,0 +1,9 @@
+# Release Admin
+
+`release-admin` is the planned standalone native authority coordinator for Dev Tools releases. It is compiled from the same focused Rust release, installation, product, and command foundations as the products it administers; it does not invoke repository Python tooling or accept ambient publication credentials.
+
+The pre-acceptance command surface constructs canonical signed root documents from explicitly supplied offline root keys, constructs source-bound multi-target product manifests through an operation-only signer, and verifies a complete release set without network access. Root private keys must be owner-owned, owner-only, single-link regular files on accepted Unix hosts. Routine manifest signing receives only canonical public manifest bytes through standard input; the raw release key remains behind the configured signer. Linux is the first accepted manifest-signing host: it retains the exact signer executable by file descriptor and fails closed on platforms without an equivalent held-executable backend.
+
+`release-admin set build` and `release-admin set publish` remain unavailable until their native implementations pass the ADR 0003 acceptance contract. The product therefore remains at the conformance inventory stage and is not distributed as a supported public release.
+
+The accepted target registry is fail closed. Release-candidate metadata is currently limited to `linux-x86_64` for `update-all`, `dev-auth`, `dev-cache`, `sync-configs`, and `skills-sync`; unknown products, `release-admin` itself, and every other target are rejected before signing. Constructing authenticated candidate metadata is necessary for native acceptance and is not a support or publication claim. Publication remains a separate admitted operation and requires the product's native acceptance gate.
