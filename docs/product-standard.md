@@ -46,6 +46,8 @@ New product releases use a canonical source-bound manifest that may contain mult
 
 ## Common result contract
 
+ADR 0003 defines the sole construction/publication exception during signer bootstrap: exact Dev Auth `0.3.11` uses the historical source-bound Dev Auth v2 format. This exception preserves cryptographic source/artifact binding and does not authorize other legacy-format releases.
+
 Machine-readable common operations use `dev-tools-operation-result-v1`. The result identifies the product, operation, outcome, changed state, process exit category, fixed value-free error kind, managed or external installation state, cache freshness, and installed or available versions when applicable.
 
 Common exit categories are `0` for completed or clean no-op, `1` for operational failure, `2` for invalid invocation or configuration, `3` for blocked, deferred, unsupported, or requires-setup outcomes, `4` for authenticity, integrity, or authority violations, and `130` for orderly interruption.

@@ -9,12 +9,12 @@ use dev_tools_installation::{write_atomic_document, ArtifactIdentity, DocumentAu
 use dev_tools_product::{BuildInfo, ProductId};
 use dev_tools_release::{
     authorized_release_public_key, build_signed_envelope, build_unsigned_crate_set,
-    build_unsigned_product_manifest, build_unsigned_root_document, root_key_id,
-    verify_artifact_bytes, verify_crate_package_bytes, verify_crate_set_metadata,
-    verify_crates_io_package_set, verify_release_metadata, verify_release_set_metadata,
-    verify_root_bytes, ArtifactUrlPolicy, CratePackageSpec, CrateSetAuthority, CrateSetMetadata,
-    CrateSetSpec, EnvelopeSignature, ManifestArtifact, ProductManifestSpec, ReleaseAuthority,
-    ReleaseMetadata, RootDocumentSpec, RootReleaseKey, CRATE_SET_AUTHORITY,
+    build_unsigned_root_document, root_key_id, verify_artifact_bytes, verify_crate_package_bytes,
+    verify_crate_set_metadata, verify_crates_io_package_set, verify_release_metadata,
+    verify_release_set_metadata, verify_root_bytes, ArtifactUrlPolicy, CratePackageSpec,
+    CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature, ManifestArtifact,
+    ProductManifestSpec, ReleaseAuthority, ReleaseMetadata, RootDocumentSpec, RootReleaseKey,
+    CRATE_SET_AUTHORITY,
 };
 #[cfg(target_os = "linux")]
 use dev_tools_release::{inspect_crates_io_package, RegistryCrateStatus};
@@ -42,6 +42,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use zeroize::Zeroizing;
 
+mod manifest_policy;
 mod publication;
 mod set_build;
 mod set_compare;
@@ -541,7 +542,7 @@ fn construct_product_manifest(arguments: &ManifestBuildArgs) -> Result<Vec<u8>> 
         .context("read root document")?;
     authorized_release_public_key(&root, &trusted_root, &arguments.release_key_id)
         .context("authenticate routine release-signing key")?;
-    let unsigned = build_unsigned_product_manifest(&ProductManifestSpec {
+    let unsigned = manifest_policy::construct(&ProductManifestSpec {
         product: arguments.product.clone(),
         generation: arguments.generation,
         version: arguments.version.clone(),
@@ -566,7 +567,7 @@ fn construct_product_manifest(arguments: &ManifestBuildArgs) -> Result<Vec<u8>> 
         &ReleaseAuthority {
             trusted_root_key: trusted_root,
             product: arguments.product.clone(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: manifest_policy::accepted_schemas(&arguments.product),
             target: selected_target,
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -1899,7 +1900,7 @@ fn verify_release_set(arguments: SetVerifyArgs) -> Result<()> {
         &ReleaseAuthority {
             trusted_root_key: trusted_root,
             product: arguments.product.clone(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: manifest_policy::accepted_schemas(&arguments.product),
             target: selected_target.clone(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -1918,6 +1919,11 @@ fn verify_release_set(arguments: SetVerifyArgs) -> Result<()> {
         bail!("release artifact inputs do not exactly match the signed target set");
     }
     for release in &releases {
+        manifest_policy::require_publishable(
+            &release.product,
+            &release.version.to_string(),
+            &release.manifest_schema,
+        )?;
         if release.source_commit.as_deref() != Some(arguments.source_commit.as_str()) {
             bail!("release manifest source commit does not match the expected source");
         }

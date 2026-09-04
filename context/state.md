@@ -1,6 +1,7 @@
 # Active work
 
 - Release and install native sync-configs with the additive pre/post hook metadata contract before downstream profile-aware hooks depend on it; complete full consumer repeat convergence after activation.
+- Complete the user-approved exact Dev Auth 0.3.11 source-bound legacy-manifest bootstrap through native construction, operation-only signing, reproducible comparison, publication, normal setup, and signer acceptance. The installed 0.3.10 cannot sign shared product-v2 or crate-set documents; no raw keys or unsigned overlay. Finish review/gates/integration of the version-bound exception in the existing main worktree, then retire its construction path after acceptance. Preserve the parked artifact-update changes and consolidate after verification.
 
 - Publish the registry-ready shared Rust crates in dependency order through an authenticated crates.io release operation, record the exact versions and registry checksums, and only then replace Syscfg's non-production exact-Git compatibility probe with the registry dependency.
 - Use the admitted operation-only release path to rebuild, publish, install, and accept Update All 0.1.6 generation 7 and native sync-configs 0.2.0 generation 14 from the final merged source; the earlier `acd45e4` artifacts are superseded and must not be published.

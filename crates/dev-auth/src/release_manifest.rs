@@ -140,7 +140,12 @@ fn verify_release_documents(
         &ReleaseAuthority {
             trusted_root_key: trusted_root.into(),
             product: "dev-auth".into(),
-            accepted_manifest_schemas: vec!["dev-auth-product-v2".into()],
+            // Local verification also serves receipt-owned rollback of the
+            // source-bound predecessor. Online discovery has a stricter policy.
+            accepted_manifest_schemas: vec![
+                "dev-tools-product-v2".into(),
+                "dev-auth-product-v2".into(),
+            ],
             target: target.into(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -232,6 +237,17 @@ mod tests {
 
     #[test]
     fn signed_release_binds_source_target_url_and_artifact() {
+        verify_fixture_schema("dev-auth-product-v2", &"a".repeat(40), true);
+    }
+
+    #[test]
+    fn shared_manifest_preserves_source_binding_and_rejects_legacy_unbound_schema() {
+        verify_fixture_schema("dev-tools-product-v2", &"a".repeat(40), true);
+        verify_fixture_schema("dev-tools-product-v2", "", false);
+        verify_fixture_schema("dev-tools-product-v1", &"a".repeat(40), false);
+    }
+
+    fn verify_fixture_schema(schema: &str, source_commit: &str, accepted: bool) {
         let root_key = SigningKey::from_bytes(&[7; 32]);
         let release_key = SigningKey::from_bytes(&[9; 32]);
         let release_id =
@@ -257,11 +273,11 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(artifact_bytes)),
         };
         let manifest = DevAuthManifest {
-            schema: "dev-auth-product-v2".into(),
+            schema: schema.into(),
             product: "dev-auth".into(),
             generation: 11,
             version: "0.3.0".into(),
-            source_commit: "a".repeat(40),
+            source_commit: source_commit.into(),
             engine_protocol: 1,
             artifacts: BTreeMap::from([("linux-x86_64".into(), artifact)]),
         };
@@ -283,8 +299,12 @@ mod tests {
             artifact_bytes,
             &trusted,
             "linux-x86_64",
-        )
-        .unwrap();
+        );
+        if !accepted {
+            assert!(verified.is_err(), "invalid source/schema must be rejected");
+            return;
+        }
+        let verified = verified.unwrap();
         assert_eq!(verified.source_commit, "a".repeat(40));
         assert_eq!(verified.manifest_generation, 11);
 

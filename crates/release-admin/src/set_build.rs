@@ -552,7 +552,7 @@ fn verify_constructed_product(
         &ReleaseAuthority {
             trusted_root_key: trusted_root.to_owned(),
             product: product.to_owned(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: super::manifest_policy::accepted_schemas(product),
             target: target.to_owned(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -566,6 +566,11 @@ fn verify_constructed_product(
     if releases.len() != 1 || releases[0].source_commit.as_deref() != Some(source_commit) {
         bail!("constructed release metadata does not bind the exact source");
     }
+    super::manifest_policy::require_publishable(
+        product,
+        &releases[0].version.to_string(),
+        &releases[0].manifest_schema,
+    )?;
     verify_artifact_bytes(&releases[0], artifact).context("verify constructed release artifact")
 }
 

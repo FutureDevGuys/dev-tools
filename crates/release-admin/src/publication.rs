@@ -106,6 +106,7 @@ struct ManifestEnvelopeHint {
 struct ManifestHint {
     schema: String,
     product: String,
+    version: String,
     artifacts: BTreeMap<String, Value>,
 }
 
@@ -367,10 +368,12 @@ fn load_product_release(
         read_bounded_file(&manifest_path, METADATA_LIMIT).context("read product manifest")?;
     let hint: ManifestEnvelopeHint =
         serde_json::from_slice(&manifest).context("inspect product manifest routing")?;
-    if hint.signed.schema != "dev-tools-product-v2"
-        || hint.signed.product != product
-        || hint.signed.artifacts.len() != 1
-    {
+    super::manifest_policy::require_publishable(
+        product,
+        &hint.signed.version,
+        &hint.signed.schema,
+    )?;
+    if hint.signed.product != product || hint.signed.artifacts.len() != 1 {
         bail!("product manifest has an unsupported publication contract");
     }
     let target = hint
@@ -388,7 +391,7 @@ fn load_product_release(
         &ReleaseAuthority {
             trusted_root_key: trusted_root.to_owned(),
             product: product.to_owned(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: super::manifest_policy::accepted_schemas(product),
             target: target.clone(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -1476,11 +1479,26 @@ mod tests {
     }
 
     fn fixture(product: &str, target: &str, schema: &str) -> Fixture {
+        fixture_version(product, target, schema, "1.2.3")
+    }
+
+    #[test]
+    fn signed_bootstrap_publication_accepts_only_dev_auth_0311() {
+        for version in ["0.3.10", "0.3.11", "0.3.12"] {
+            let fixture =
+                fixture_version("dev-auth", "linux-x86_64", "dev-auth-product-v2", version);
+            assert_eq!(
+                load_release_set(&fixture.release_root, &fixture.trusted_root, SOURCE).is_ok(),
+                version == "0.3.11",
+            );
+        }
+    }
+
+    fn fixture_version(product: &str, target: &str, schema: &str, version: &str) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let release_root = directory.path().join("releases");
         let product_root = release_root.join(product);
         fs::create_dir_all(&product_root).unwrap();
-        let version = "1.2.3";
         let suffix = if target.starts_with("windows-") {
             ".exe"
         } else {
@@ -1528,7 +1546,7 @@ mod tests {
             })
             .unwrap()
         } else {
-            serde_jcs::to_vec(&json!({
+            let mut legacy = json!({
                 "schema": schema,
                 "product": product,
                 "generation": 1,
@@ -1541,8 +1559,11 @@ mod tests {
                         "sha256": format!("{:x}", Sha256::digest(&artifact)),
                     }
                 }
-            }))
-            .unwrap()
+            });
+            if schema == "dev-auth-product-v2" {
+                legacy["source_commit"] = SOURCE.into();
+            }
+            serde_jcs::to_vec(&legacy).unwrap()
         };
         let manifest = build_signed_envelope(
             &unsigned_manifest,
