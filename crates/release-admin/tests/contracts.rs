@@ -61,9 +61,16 @@ fn help_exposes_only_native_typed_release_operations() {
         .stdout(predicate::str::contains("manifest"))
         .stdout(predicate::str::contains("crate-set"))
         .stdout(predicate::str::contains("set"))
-        .stdout(predicate::str::contains("publish"))
+        .stdout(predicate::str::contains("publish").not())
         .stdout(predicate::str::contains("verify"))
         .stdout(predicate::str::contains("build-info"));
+
+    Command::cargo_bin("release-admin")
+        .expect("release-admin binary")
+        .args(["crate-set", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("verify-registry"));
 }
 
 #[cfg(target_os = "linux")]

@@ -5,8 +5,8 @@ owner: dev-tools
 
 # ADR 0003: Native release administration and separated authority
 
-status: proposed
-verification: pending
+status: accepted
+verification: runtime acceptance remains required before release administration is declared complete
 
 ## Context
 
@@ -14,7 +14,7 @@ Release administration spans deterministic compilation, offline root authorizati
 
 ## Decision
 
-A native `release-admin` product owns deterministic build orchestration, manifest and root construction, offline verification, operation-only signer invocation, admitted publication, anonymous redownload verification, root rotation, and audit reporting. The command coordinates distinct authorities through typed inputs and never receives raw routine signing keys or ambient publication credentials.
+A native `release-admin` product owns deterministic build orchestration, manifest and root construction, offline verification, operation-only signer invocation, admitted publication, anonymous redownload verification, root rotation, and audit reporting. The command coordinates distinct authorities through typed inputs and never receives raw routine signing keys or ambient publication credentials. Each command is exposed only when its implementation enforces this decision; unavailable stages remain absent rather than delegating to a repository script.
 
 Crate archive inspection uses the Rust `flate2` and `tar` libraries behind strict compressed-size, expanded-size, entry-count, entry-type, path, and metadata bounds. It reads package name and version from the normalized embedded `Cargo.toml`, rejects Cargo's dirty-worktree flag, and requires the embedded VCS commit to equal the declared source commit. Cargo defines that VCS file as a best-effort snapshot rather than provenance proof, so this check is necessary but never substitutes for clean-checkout construction and independent reproduction. Native construction requires the selected checkout to be canonical, clean, and at the exact commit, requires every tracked entry to be a regular file, retains the exact Git and Cargo executable identities, creates two private non-local clones, runs Cargo offline in separate target directories, rejects symlinks and submodules, and publishes only byte-identical package archives. This dedicated archive dependency is accepted because treating a caller-provided filename as package identity would invalidate the authorization boundary; release administration does not invoke a platform archive executable or caller `PATH`.
 

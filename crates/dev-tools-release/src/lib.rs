@@ -22,6 +22,8 @@ const ARTIFACT_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_MANIFEST_ARTIFACTS: usize = 16;
 const CRATE_PACKAGE_LIMIT: usize = 10 * 1024 * 1024;
 const MAX_CRATE_SET_PACKAGES: usize = 64;
+const CRATES_IO_INDEX_LIMIT: u64 = 1024 * 1024;
+const CRATES_IO_CONFIG_LIMIT: u64 = 64 * 1024;
 pub const CRATE_SET_AUTHORITY: &str = "dev-tools-shared-crates";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +266,30 @@ pub struct VerifiedCrateSet {
     pub source_commit: String,
     pub registry: String,
     pub packages: BTreeMap<String, VerifiedCratePackage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRegistryCrate {
+    pub name: String,
+    pub version: Version,
+    pub length: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoConfig {
+    dl: String,
+    api: String,
+    #[serde(default, rename = "auth-required")]
+    auth_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoIndexEntry {
+    name: String,
+    vers: String,
+    cksum: String,
+    yanked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,6 +638,155 @@ pub fn verify_crate_package_bytes(
         bail!("crate package bytes do not match the authenticated set");
     }
     Ok(())
+}
+
+/// Anonymously authenticates every package in a signed crate set against the
+/// crates.io sparse index and the exact downloaded registry bytes.
+pub fn verify_crates_io_package_set(set: &VerifiedCrateSet) -> Result<Vec<VerifiedRegistryCrate>> {
+    let index_policy = HttpsPolicy {
+        allowed_hosts: BTreeSet::from(["index.crates.io".into()]),
+        max_redirects: 3,
+        timeout: Duration::from_secs(30),
+        user_agent: concat!("dev-tools-release/", env!("CARGO_PKG_VERSION")).into(),
+    };
+    let artifact_policy = HttpsPolicy {
+        allowed_hosts: BTreeSet::from(["static.crates.io".into()]),
+        ..index_policy.clone()
+    };
+    verify_crates_io_package_set_with_fetch(set, |url, limit| {
+        let policy = if url.starts_with("https://index.crates.io/") {
+            &index_policy
+        } else if url.starts_with("https://static.crates.io/") {
+            &artifact_policy
+        } else {
+            bail!("crates.io verification URL is outside the fixed registry authority");
+        };
+        Ok(fetch_https(url, policy, limit, None)?.bytes)
+    })
+}
+
+fn verify_crates_io_package_set_with_fetch<F>(
+    set: &VerifiedCrateSet,
+    mut fetch: F,
+) -> Result<Vec<VerifiedRegistryCrate>>
+where
+    F: FnMut(&str, u64) -> Result<Vec<u8>>,
+{
+    if set.authority != CRATE_SET_AUTHORITY || set.registry != "crates-io" {
+        bail!("crate set is outside the crates.io verification authority");
+    }
+    let config_bytes = fetch(
+        "https://index.crates.io/config.json",
+        CRATES_IO_CONFIG_LIMIT,
+    )
+    .context("fetch crates.io registry configuration")?;
+    let config: CratesIoConfig =
+        serde_json::from_slice(&config_bytes).context("parse crates.io registry configuration")?;
+    if config.api != "https://crates.io" || config.auth_required {
+        bail!("crates.io registry configuration is unsupported");
+    }
+    let mut verified = Vec::with_capacity(set.packages.len());
+    for (name, package) in &set.packages {
+        let index_url = crates_io_index_url(name)?;
+        let index = fetch(&index_url, CRATES_IO_INDEX_LIMIT)
+            .with_context(|| format!("fetch crates.io index entry for {name}"))?;
+        verify_crates_io_index_entry(name, package, &index)?;
+        let download_url = crates_io_download_url(&config.dl, name, package)?;
+        let bytes = fetch(&download_url, package.length)
+            .with_context(|| format!("download crates.io package {name}"))?;
+        verify_crate_package_bytes(set, name, &package.version.to_string(), &bytes)?;
+        verified.push(VerifiedRegistryCrate {
+            name: name.clone(),
+            version: package.version.clone(),
+            length: package.length,
+            sha256: package.sha256.clone(),
+        });
+    }
+    Ok(verified)
+}
+
+fn verify_crates_io_index_entry(
+    expected_name: &str,
+    expected: &VerifiedCratePackage,
+    input: &[u8],
+) -> Result<()> {
+    require_bounded(
+        input,
+        CRATES_IO_INDEX_LIMIT as usize,
+        "crates.io index entry",
+    )?;
+    let version = expected.version.to_string();
+    let mut selected = None;
+    for line in input
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let entry: CratesIoIndexEntry =
+            serde_json::from_slice(line).context("parse crates.io index record")?;
+        if entry.name == expected_name && entry.vers == version && selected.replace(entry).is_some()
+        {
+            bail!("crates.io index contains a duplicate package version");
+        }
+    }
+    let entry = selected.context("crates.io index does not contain the package version")?;
+    if entry.yanked || entry.cksum != expected.sha256 || !valid_lower_hex(&entry.cksum, 64) {
+        bail!("crates.io index package identity does not match the authenticated set");
+    }
+    Ok(())
+}
+
+fn crates_io_index_url(name: &str) -> Result<String> {
+    if !valid_product_id(name) {
+        bail!("crate name is invalid for the crates.io sparse index");
+    }
+    let prefix = match name.len() {
+        1 => "1".into(),
+        2 => "2".into(),
+        3 => format!("3/{}", &name[..1]),
+        _ => format!("{}/{}", &name[..2], &name[2..4]),
+    };
+    Ok(format!("https://index.crates.io/{prefix}/{name}"))
+}
+
+fn crates_io_download_url(
+    template: &str,
+    name: &str,
+    package: &VerifiedCratePackage,
+) -> Result<String> {
+    let prefix = match name.len() {
+        1 => "1".into(),
+        2 => "2".into(),
+        3 => format!("3/{}", &name[..1]),
+        _ => format!("{}/{}", &name[..2], &name[2..4]),
+    };
+    let version = package.version.to_string();
+    let has_marker = [
+        "{crate}",
+        "{version}",
+        "{prefix}",
+        "{lowerprefix}",
+        "{sha256-checksum}",
+    ]
+    .iter()
+    .any(|marker| template.contains(marker));
+    let mut url = template
+        .replace("{crate}", name)
+        .replace("{version}", &version)
+        .replace("{prefix}", &prefix)
+        .replace("{lowerprefix}", &prefix.to_ascii_lowercase())
+        .replace("{sha256-checksum}", &package.sha256);
+    if !has_marker {
+        url = format!("{}/{name}/{version}/download", url.trim_end_matches('/'));
+    }
+    let parsed: ureq::http::Uri = url.parse().context("parse crates.io download URL")?;
+    if parsed.scheme_str() != Some("https")
+        || parsed.host() != Some("static.crates.io")
+        || parsed.port_u16().is_some_and(|port| port != 443)
+        || url.contains(['{', '}', '\r', '\n', '\0'])
+    {
+        bail!("crates.io download URL is outside the fixed registry authority");
+    }
+    Ok(url)
 }
 
 fn validate_unsigned_crate_set(input: &[u8]) -> Result<CrateSetDocument> {
@@ -1496,7 +1671,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::read_bounded_body;
+    use super::{
+        read_bounded_body, sha256_hex, verify_crates_io_package_set_with_fetch,
+        VerifiedCratePackage, VerifiedCrateSet, CRATE_SET_AUTHORITY,
+    };
+    use semver::Version;
+    use std::collections::BTreeMap;
 
     #[test]
     fn bounded_body_accepts_the_exact_authenticated_length() {
@@ -1505,5 +1685,156 @@ mod tests {
 
         let mut oversized = ureq::Body::builder().data(b"larger".to_vec());
         assert!(read_bounded_body(&mut oversized, 5).is_err());
+    }
+
+    #[test]
+    fn crates_io_verification_matches_the_signed_index_and_download_bytes() {
+        let package_bytes = b"authenticated crate bytes";
+        let set = crate_set(package_bytes);
+        let checksum = sha256_hex(package_bytes);
+        let mut requests = Vec::new();
+
+        let verified = verify_crates_io_package_set_with_fetch(&set, |url, limit| {
+            requests.push((url.to_owned(), limit));
+            match url {
+                "https://index.crates.io/config.json" => Ok(
+                    br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#
+                        .to_vec(),
+                ),
+                "https://index.crates.io/de/v-/dev-tools-command" => Ok(format!(
+                    "{{\"name\":\"dev-tools-command\",\"vers\":\"0.1.0\",\"cksum\":\"{checksum}\",\"yanked\":false}}\n"
+                )
+                .into_bytes()),
+                "https://static.crates.io/crates/dev-tools-command/0.1.0/download" => {
+                    Ok(package_bytes.to_vec())
+                }
+                _ => panic!("unexpected URL: {url}"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].name, "dev-tools-command");
+        assert_eq!(verified[0].version, Version::parse("0.1.0").unwrap());
+        assert_eq!(verified[0].length, package_bytes.len() as u64);
+        assert_eq!(verified[0].sha256, checksum);
+        assert_eq!(
+            requests,
+            vec![
+                (
+                    "https://index.crates.io/config.json".into(),
+                    super::CRATES_IO_CONFIG_LIMIT,
+                ),
+                (
+                    "https://index.crates.io/de/v-/dev-tools-command".into(),
+                    super::CRATES_IO_INDEX_LIMIT,
+                ),
+                (
+                    "https://static.crates.io/crates/dev-tools-command/0.1.0/download".into(),
+                    package_bytes.len() as u64,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn crates_io_verification_rejects_index_identity_before_download() {
+        let package_bytes = b"authenticated crate bytes";
+        let set = crate_set(package_bytes);
+        let mut downloaded = false;
+
+        let error = verify_crates_io_package_set_with_fetch(&set, |url, _| match url {
+            "https://index.crates.io/config.json" => Ok(
+                br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#
+                    .to_vec(),
+            ),
+            "https://index.crates.io/de/v-/dev-tools-command" => Ok(format!(
+                "{{\"name\":\"dev-tools-command\",\"vers\":\"0.1.0\",\"cksum\":\"{}\",\"yanked\":false}}\n",
+                "0".repeat(64)
+            )
+            .into_bytes()),
+            _ => {
+                downloaded = true;
+                Ok(package_bytes.to_vec())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("identity does not match"));
+        assert!(!downloaded);
+    }
+
+    #[test]
+    fn crates_io_verification_rejects_yanked_or_duplicate_versions() {
+        let package_bytes = b"authenticated crate bytes";
+        let set = crate_set(package_bytes);
+        let checksum = sha256_hex(package_bytes);
+        for index in [
+            format!(
+                "{{\"name\":\"dev-tools-command\",\"vers\":\"0.1.0\",\"cksum\":\"{checksum}\",\"yanked\":true}}\n"
+            ),
+            format!(
+                "{{\"name\":\"dev-tools-command\",\"vers\":\"0.1.0\",\"cksum\":\"{checksum}\",\"yanked\":false}}\n{{\"name\":\"dev-tools-command\",\"vers\":\"0.1.0\",\"cksum\":\"{checksum}\",\"yanked\":false}}\n"
+            ),
+        ] {
+            let error = verify_crates_io_package_set_with_fetch(&set, |url, _| match url {
+                "https://index.crates.io/config.json" => Ok(
+                    br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#
+                        .to_vec(),
+                ),
+                "https://index.crates.io/de/v-/dev-tools-command" => {
+                    Ok(index.as_bytes().to_vec())
+                }
+                _ => panic!("download must not start for rejected index state"),
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("identity does not match")
+                    || error.to_string().contains("duplicate package version")
+            );
+        }
+    }
+
+    #[test]
+    fn crates_io_verification_rejects_an_untrusted_download_authority() {
+        let package_bytes = b"authenticated crate bytes";
+        let set = crate_set(package_bytes);
+        let checksum = sha256_hex(package_bytes);
+
+        let error = verify_crates_io_package_set_with_fetch(&set, |url, _| match url {
+            "https://index.crates.io/config.json" => Ok(
+                br#"{"dl":"https://packages.example.invalid/{crate}/{version}","api":"https://crates.io"}"#
+                    .to_vec(),
+            ),
+            "https://index.crates.io/de/v-/dev-tools-command" => Ok(format!(
+                "{{\"name\":\"dev-tools-command\",\"vers\":\"0.1.0\",\"cksum\":\"{checksum}\",\"yanked\":false}}\n"
+            )
+            .into_bytes()),
+            _ => panic!("download must not start for an untrusted authority"),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fixed registry authority"));
+    }
+
+    fn crate_set(package_bytes: &[u8]) -> VerifiedCrateSet {
+        VerifiedCrateSet {
+            root_generation: 1,
+            root_sha256: "1".repeat(64),
+            manifest_generation: 1,
+            manifest_sha256: "2".repeat(64),
+            schema: "dev-tools-crate-set-v1".into(),
+            authority: CRATE_SET_AUTHORITY.into(),
+            source_commit: "3".repeat(40),
+            registry: "crates-io".into(),
+            packages: BTreeMap::from([(
+                "dev-tools-command".into(),
+                VerifiedCratePackage {
+                    version: Version::parse("0.1.0").unwrap(),
+                    length: package_bytes.len() as u64,
+                    sha256: sha256_hex(package_bytes),
+                },
+            )]),
+        }
     }
 }

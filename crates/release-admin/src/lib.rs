@@ -11,10 +11,10 @@ use dev_tools_release::{
     authorized_release_public_key, build_signed_envelope, build_unsigned_crate_set,
     build_unsigned_product_manifest, build_unsigned_root_document, root_key_id,
     verify_artifact_bytes, verify_crate_package_bytes, verify_crate_set_metadata,
-    verify_release_metadata, verify_release_set_metadata, verify_root_bytes, ArtifactUrlPolicy,
-    CratePackageSpec, CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature,
-    ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseMetadata, RootDocumentSpec,
-    RootReleaseKey, CRATE_SET_AUTHORITY,
+    verify_crates_io_package_set, verify_release_metadata, verify_release_set_metadata,
+    verify_root_bytes, ArtifactUrlPolicy, CratePackageSpec, CrateSetAuthority, CrateSetMetadata,
+    CrateSetSpec, EnvelopeSignature, ManifestArtifact, ProductManifestSpec, ReleaseAuthority,
+    ReleaseMetadata, RootDocumentSpec, RootReleaseKey, CRATE_SET_AUTHORITY,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use flate2::read::GzDecoder;
@@ -66,7 +66,7 @@ enum Command {
     Manifest(ManifestArgs),
     /// Construct and verify authenticated registry crate inventories.
     CrateSet(CrateSetArgs),
-    /// Build, verify, and publish complete release sets.
+    /// Verify complete release sets.
     Set(SetArgs),
 }
 
@@ -124,6 +124,8 @@ enum CrateSetCommand {
     Build(CrateSetBuildArgs),
     /// Verify one signed crate inventory and every exact package byte stream.
     Verify(CrateSetVerifyArgs),
+    /// Anonymously verify published crates against the signed inventory.
+    VerifyRegistry(CrateSetVerifyRegistryArgs),
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +183,18 @@ struct CrateSetVerifyArgs {
 }
 
 #[derive(Debug, Args)]
+struct CrateSetVerifyRegistryArgs {
+    #[arg(long)]
+    source_commit: String,
+    #[arg(long)]
+    root_document: PathBuf,
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    trusted_root_public_key: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct ManifestBuildArgs {
     #[arg(long)]
     product: String,
@@ -214,12 +228,8 @@ struct SetArgs {
 
 #[derive(Debug, Subcommand)]
 enum SetCommand {
-    /// Build a deterministic release set from explicit source identity.
-    Build,
     /// Verify a complete release set without network access.
     Verify(SetVerifyArgs),
-    /// Publish and anonymously verify one authenticated release set.
-    Publish,
 }
 
 #[derive(Debug, Args)]
@@ -280,14 +290,16 @@ where
         }) => run_result(verify_crate_set(arguments)),
         Ok(Cli {
             command:
+                Command::CrateSet(CrateSetArgs {
+                    command: CrateSetCommand::VerifyRegistry(arguments),
+                }),
+        }) => run_result(verify_crate_set_registry(arguments)),
+        Ok(Cli {
+            command:
                 Command::Set(SetArgs {
                     command: SetCommand::Verify(arguments),
                 }),
         }) => run_result(verify_release_set(arguments)),
-        Ok(_) => {
-            eprintln!("release-admin: requested operation is not implemented");
-            2
-        }
         Err(error) => {
             let code = error.exit_code();
             let _ = error.print();
@@ -970,6 +982,37 @@ fn verify_crate_set(arguments: CrateSetVerifyArgs) -> Result<()> {
     });
     serde_json::to_writer(std::io::stdout().lock(), &result)
         .context("write crate-set verification result")?;
+    println!();
+    Ok(())
+}
+
+fn verify_crate_set_registry(arguments: CrateSetVerifyRegistryArgs) -> Result<()> {
+    let trusted_root = read_public_key_text(&arguments.trusted_root_public_key)
+        .context("read trusted root public key")?;
+    let verified = verify_crate_set_metadata(
+        &CrateSetMetadata {
+            root: read_bounded_file(&arguments.root_document, METADATA_LIMIT)
+                .context("read root document")?,
+            manifest: read_bounded_file(&arguments.manifest, METADATA_LIMIT)
+                .context("read crate-set manifest")?,
+        },
+        &CrateSetAuthority {
+            trusted_root_key: trusted_root,
+            registry: "crates-io".into(),
+            source_commit: arguments.source_commit.clone(),
+        },
+    )?;
+    let packages = verify_crates_io_package_set(&verified)?;
+    let result = json!({
+        "schema": "release-admin-crate-set-registry-verify-v1",
+        "authority": CRATE_SET_AUTHORITY,
+        "source_commit": arguments.source_commit,
+        "registry": "crates-io",
+        "packages": packages.len(),
+        "verified": true,
+    });
+    serde_json::to_writer(std::io::stdout().lock(), &result)
+        .context("write crate registry verification result")?;
     println!();
     Ok(())
 }
