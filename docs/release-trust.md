@@ -47,20 +47,23 @@ next_dev_auth_generation=NEXT_UNUSED_GENERATION
 
 The owner-only `--release-private-key` mode remains available for initial bootstrap and recovery. It is mutually exclusive with the external signer mode and is not the routine strong-mode path.
 
-Release publication is a separate operation from construction and signing. Run the checked-in bounded publisher from a clean canonical checkout inside the configured `release-builder` workload so its exact same-name `git` and `gh` children receive the short-lived `source-maintenance` authority. Outside that admitted workload, `git` and `gh` intentionally remain native human passthrough and SHALL NOT be used for unattended publication.
+Release publication is a separate operation from construction and signing. Run the standalone native publisher from a clean canonical checkout inside an admitted workload whose profile grants the required source-maintenance Git, GitHub, and SSH-signing operations. Its exact same-name `git` and `gh` children receive only that workload authority. `EXPECTED_GIT_SIGNING_PUBLIC_KEY` is the public OpenSSH key from the approved workload profile; it is reviewed input rather than a value discovered from repository Git configuration. Outside an admitted workload, `git` and `gh` intentionally remain native human passthrough and SHALL NOT be used for unattended publication.
 
 ```sh
-/usr/bin/env -u ARGV0 "$HOME/.local/bin/release-builder" \
-  "$PWD/scripts/publish-release-set.py" \
+"$HOME/.local/bin/release-admin" set publish \
+  --source-root "$PWD" \
   --release-root "$HOME/.cache/dev-tools-release/dev-auth-release-set/releases" \
+  --trusted-root-public-key "$PWD/crates/update-all/trust/root-public-key.txt" \
   --source-commit "$(/usr/bin/git rev-parse HEAD)" \
   --repository FutureDevGuys/dev-tools \
+  --dev-auth-command /usr/local/bin/dev-auth \
+  --git-signing-public-key "$EXPECTED_GIT_SIGNING_PUBLIC_KEY" \
   --git-command /usr/local/bin/git \
   --gh-command /usr/local/bin/gh \
   --format json
 ```
 
-The publisher authenticates every signed manifest and artifact before provider mutation, creates and verifies signed source tags, creates only matching non-draft stable GitHub releases, anonymously re-downloads every published asset through the admitted `gh` child, and verifies exact length and SHA-256. Its admitted `git` and `gh` launchers and resolved executables must be root-owned and reachable only through root-owned non-writable path components; execution pins the validated executable while preserving the same-name launcher as `argv[0]`. A second invocation is an idempotent verification pass. It refuses dirty source, conflicting tags or releases, unexpected files, ambiguous provider responses, and artifacts that change before upload.
+The publisher accepts only source-bound shared product-v2 manifests and independently proves a verified strong workload admission before any provider action. It authenticates every signed manifest and artifact before provider mutation, clears ambient Git/GitHub authority from each child, requires the Git fetch and push URLs to name the exact publication repository, creates and verifies the exact signed source-tag object, creates only matching non-draft stable GitHub releases, anonymously re-downloads every published asset without the admitted `gh` identity, and verifies exact length and SHA-256. Its admitted `dev-auth`, `git`, and `gh` launchers and resolved executables must be root-owned and reachable only through root-owned non-writable path components; execution pins the validated executable while preserving each same-name launcher as `argv[0]`. A second invocation is an idempotent verification pass. It refuses dirty source, conflicting tags or releases, unexpected files, provider errors disguised as absence, and artifacts that change before upload. An ambiguous tag or release write succeeds only when the independently read final state exactly matches the signed set.
 
 Legacy `dev-tools-product-v1` does not cryptographically bind artifact provenance to the source tag, while `dev-auth-product-v2` binds only the historical Dev Auth release shape. New releases use shared `dev-tools-product-v2`, which requires the exact source commit and authenticates the complete target set. Legacy readers remain only for explicitly bounded migration and receipt-owned rollback and never report v1 as source-bound. After a product cuts over, its online authority accepts only source-bound schemas.
 

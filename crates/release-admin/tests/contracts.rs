@@ -72,6 +72,13 @@ fn help_exposes_only_native_typed_release_operations() {
         .success()
         .stdout(predicate::str::contains("verify-registry"))
         .stdout(predicate::str::contains("bootstrap-publish"));
+
+    Command::cargo_bin("release-admin")
+        .expect("release-admin binary")
+        .args(["set", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("publish"));
 }
 
 #[test]

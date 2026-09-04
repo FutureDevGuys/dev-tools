@@ -42,6 +42,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use zeroize::Zeroizing;
 
+mod publication;
+
 const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const SIGNER_OUTPUT_LIMIT: usize = 256;
@@ -272,6 +274,8 @@ struct SetArgs {
 enum SetCommand {
     /// Verify a complete release set without network access.
     Verify(SetVerifyArgs),
+    /// Publish and independently verify an authenticated release set.
+    Publish(publication::SetPublishArgs),
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +356,12 @@ where
                     command: SetCommand::Verify(arguments),
                 }),
         }) => run_result(verify_release_set(arguments)),
+        Ok(Cli {
+            command:
+                Command::Set(SetArgs {
+                    command: SetCommand::Publish(arguments),
+                }),
+        }) => run_result(publication::publish_release_set(arguments)),
         Err(error) => {
             let code = error.exit_code();
             let _ = error.print();
