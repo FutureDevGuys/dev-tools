@@ -79,7 +79,125 @@ fn help_exposes_only_native_typed_release_operations() {
         .assert()
         .success()
         .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("compare"))
         .stdout(predicate::str::contains("publish"));
+}
+
+#[cfg(unix)]
+#[test]
+fn set_compare_requires_two_exact_owner_private_byte_identical_trees() {
+    let root = tempfile::tempdir().expect("root");
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    for candidate in [&first, &second] {
+        fs::create_dir(candidate).unwrap();
+        fs::set_permissions(candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(candidate.join("releases")).unwrap();
+        fs::set_permissions(
+            candidate.join("releases"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(candidate.join("releases/manifest.json"), b"signed\n").unwrap();
+        fs::set_permissions(
+            candidate.join("releases/manifest.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    let output = Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "compare"])
+        .args(["--first", first.to_str().unwrap()])
+        .args(["--second", second.to_str().unwrap()])
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "comparison failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema"], "release-admin-set-compare-v1");
+    assert_eq!(result["identical"], true);
+    assert_eq!(result["files"], 1);
+    assert_eq!(result["bytes"], 7);
+
+    fs::write(second.join("releases/manifest.json"), b"changed\n").unwrap();
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "compare"])
+        .args(["--first", first.to_str().unwrap()])
+        .args(["--second", second.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "release-set candidates are not byte-identical",
+        ));
+
+    fs::write(second.join("releases/manifest.json"), b"signed\n").unwrap();
+    fs::set_permissions(
+        second.join("releases/manifest.json"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "compare"])
+        .args(["--first", first.to_str().unwrap()])
+        .args(["--second", second.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "release-set candidates are not byte-identical",
+        ));
+
+    fs::set_permissions(
+        second.join("releases/manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::create_dir(second.join("releases/empty")).unwrap();
+    fs::set_permissions(
+        second.join("releases/empty"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "compare"])
+        .args(["--first", first.to_str().unwrap()])
+        .args(["--second", second.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "release-set candidates are not byte-identical",
+        ));
+
+    fs::remove_dir(second.join("releases/empty")).unwrap();
+    fs::set_permissions(
+        second.join("releases/manifest.json"),
+        fs::Permissions::from_mode(0o4600),
+    )
+    .unwrap();
+    Command::cargo_bin("release-admin")
+        .unwrap()
+        .args(["set", "compare"])
+        .args(["--first", first.to_str().unwrap()])
+        .args(["--second", second.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "release-set entry has unsafe filesystem authority",
+        ));
 }
 
 #[cfg(target_os = "linux")]

@@ -44,6 +44,7 @@ use zeroize::Zeroizing;
 
 mod publication;
 mod set_build;
+mod set_compare;
 
 const METADATA_LIMIT: u64 = 512 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
@@ -275,6 +276,8 @@ struct SetArgs {
 enum SetCommand {
     /// Construct one controlled source-bound binary release candidate.
     Build(set_build::SetBuildArgs),
+    /// Compare two independently constructed release candidates.
+    Compare(set_compare::SetCompareArgs),
     /// Verify a complete release set without network access.
     Verify(SetVerifyArgs),
     /// Publish and independently verify an authenticated release set.
@@ -359,6 +362,12 @@ where
                     command: SetCommand::Build(arguments),
                 }),
         }) => run_result(set_build::build_release_set(arguments)),
+        Ok(Cli {
+            command:
+                Command::Set(SetArgs {
+                    command: SetCommand::Compare(arguments),
+                }),
+        }) => run_result(set_compare::compare_release_sets(arguments)),
         Ok(Cli {
             command:
                 Command::Set(SetArgs {
