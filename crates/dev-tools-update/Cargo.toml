@@ -4,11 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+publish = ["crates-io"]
+description = "Product-neutral authenticated update orchestration for Dev Tools products"
 
 [dependencies]
-dev-tools-product = { path = "../dev-tools-product" }
-dev-tools-release = { path = "../dev-tools-release" }
+dev-tools-product = { version = "0.1.0", path = "../dev-tools-product" }
+dev-tools-release = { version = "0.1.0", path = "../dev-tools-release" }
 semver = "1"
 
 [dev-dependencies]

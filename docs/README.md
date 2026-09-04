@@ -11,6 +11,7 @@
 - [Catalogs](catalogs.md)
 - [Release trust](release-trust.md)
 - [Release Admin](release-admin.md)
+- [Shared Rust crates](shared-rust-crates.md)
 - [Shared command execution](dev-tools-command.md)
 - [One-shot privilege authorization](dev-tools-privilege.md)
 - [Typed external reconciliation](dev-tools-reconcile-protocol.md)

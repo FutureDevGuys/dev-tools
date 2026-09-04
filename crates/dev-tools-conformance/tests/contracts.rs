@@ -145,3 +145,53 @@ fn dependency_audit_rejects_external_paths_and_product_runtime_coupling() {
         ]
     );
 }
+
+#[test]
+fn downstream_shared_crates_are_registry_publishable_with_versioned_internal_edges() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let output = Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .current_dir(workspace)
+        .output()
+        .expect("run cargo metadata");
+    assert!(output.status.success(), "cargo metadata failed");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata JSON");
+    let packages = metadata["packages"].as_array().expect("package array");
+    let shared = [
+        "dev-tools-command",
+        "dev-tools-product",
+        "dev-tools-installation",
+        "dev-tools-privilege",
+        "dev-tools-reconcile-protocol",
+        "dev-tools-release",
+        "dev-tools-update",
+    ];
+    for name in shared {
+        let package = packages
+            .iter()
+            .find(|package| package["name"] == name)
+            .expect("shared package");
+        assert_eq!(package["version"], "0.1.0", "{name} version authority");
+        assert_eq!(
+            package["publish"],
+            serde_json::json!(["crates-io"]),
+            "{name} registry authority"
+        );
+        for dependency in package["dependencies"]
+            .as_array()
+            .expect("dependency array")
+        {
+            let dependency_name = dependency["name"].as_str().expect("dependency name");
+            if shared.contains(&dependency_name) {
+                assert_eq!(
+                    dependency["req"], "^0.1.0",
+                    "{name} -> {dependency_name} version authority"
+                );
+            }
+        }
+    }
+}
