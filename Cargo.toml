@@ -9,6 +9,7 @@ members = [
     "crates/dev-tools-product",
     "crates/dev-tools-reconcile-protocol",
     "crates/dev-tools-release",
+    "crates/dev-tools-update",
     "crates/skills-sync",
     "crates/sync-configs",
     "crates/update-all",

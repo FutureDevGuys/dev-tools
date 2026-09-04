@@ -66,7 +66,7 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | `dev-tools-privilege` | One-shot typed privileged-operation authorization. |
 | `dev-tools-reconcile-protocol` | Typed external reconciliation documents. |
 
-`dev-tools-update` is introduced only when its cache and product-adapter contracts are executable. A later privilege-session foundation remains separate from the mandatory one-shot authorization primitive. `release-admin` is a product, not a shared authority crate.
+`dev-tools-update` provides the executable product-neutral operation ordering and adapter contract. Persistent authenticated-cache transports and product adapters remain product-owned and are introduced incrementally behind that contract. A later privilege-session foundation remains separate from the mandatory one-shot authorization primitive. `release-admin` is a product, not a shared authority crate.
 
 Rust is the operational implementation, not a wrapper around embedded Python, PowerShell, or shell programs. Non-Rust material is limited to declarative configuration and schemas, generated completions, explicit user-owned hooks, minimal platform bootstrap launchers, protocol fixtures, and tests whose subject is a foreign-language boundary. A bootstrap launcher may locate and verify a pinned native binary but contains no package, release, migration, or policy business logic.
 
