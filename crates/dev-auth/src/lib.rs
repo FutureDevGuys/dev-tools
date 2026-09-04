@@ -38,6 +38,7 @@ pub mod setup;
 pub mod setup_authorization;
 #[cfg(unix)]
 pub mod setup_v3;
+pub mod smart_binding;
 #[cfg(unix)]
 pub mod stable_release;
 #[cfg(target_os = "linux")]
