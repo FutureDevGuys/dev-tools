@@ -16,6 +16,7 @@ dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-privilege = { path = "../dev-tools-privilege" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 dev-tools-release = { path = "../dev-tools-release" }
+dev-tools-secret = { path = "../dev-tools-secret" }
 ed25519-dalek.workspace = true
 fs2 = "0.4"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }

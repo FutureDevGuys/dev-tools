@@ -7,6 +7,11 @@ use anyhow::{bail, Context, Result};
 use dev_tools_command::{
     run_prepared_bounded_command_with_cancellation, BoundedCommandErrorKind, BoundedCommandOutput,
 };
+use dev_tools_secret::{
+    OperationContext as SecretOperationContext, ProviderCapabilities, ProviderHealth, ProviderId,
+    ProviderSignature, PublicMaterial as SecretPublicMaterial, SecretError, SecretErrorKind,
+    SecretMaterial, SecretMetadata, SecretProvider, SecretPurpose, SecretReference,
+};
 use directories::{BaseDirs, ProjectDirs};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use fs2::FileExt;
@@ -947,27 +952,65 @@ fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString
     read_declared_secret_with_token(&operation, &config.programs.op, &service_token, reference)
 }
 
-fn map_op_read_error(error: dev_tools_command::BoundedCommandError) -> anyhow::Error {
-    let message = if error.cleanup_failures().is_empty() {
+struct OnePasswordProvider<'a> {
+    id: ProviderId,
+    op_program: &'a str,
+    service_token: &'a SecretString,
+    #[cfg(target_os = "linux")]
+    child_executable: PathBuf,
+}
+
+impl<'a> OnePasswordProvider<'a> {
+    fn new(op_program: &'a str, service_token: &'a SecretString) -> Result<Self> {
+        Ok(Self {
+            id: ProviderId::parse("one-password")?,
+            op_program,
+            service_token,
+            #[cfg(target_os = "linux")]
+            child_executable: env::current_exe()
+                .context("resolve running dev-auth provider executable")?,
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn at_child(
+        op_program: &'a str,
+        service_token: &'a SecretString,
+        child_executable: &Path,
+    ) -> Result<Self> {
+        Ok(Self {
+            id: ProviderId::parse("one-password")?,
+            op_program,
+            service_token,
+            child_executable: child_executable.to_owned(),
+        })
+    }
+}
+
+fn secret_error(kind: SecretErrorKind) -> SecretError {
+    SecretError::new(kind)
+}
+
+fn map_op_read_error(error: dev_tools_command::BoundedCommandError) -> SecretError {
+    let kind = if error.cleanup_failures().is_empty() {
         match error.kind() {
-            BoundedCommandErrorKind::Cancelled => "1Password item read was cancelled",
-            BoundedCommandErrorKind::TimedOut => "1Password item read exceeded its deadline",
-            BoundedCommandErrorKind::OutputLimit(_) => {
-                "1Password item read exceeded its output limit"
+            BoundedCommandErrorKind::Cancelled => SecretErrorKind::Cancelled,
+            BoundedCommandErrorKind::TimedOut => SecretErrorKind::DeadlineExceeded,
+            BoundedCommandErrorKind::OutputLimit(_) => SecretErrorKind::ResourceLimitExceeded,
+            BoundedCommandErrorKind::Start | BoundedCommandErrorKind::InvalidExecutable => {
+                SecretErrorKind::ProviderUnavailable
             }
-            BoundedCommandErrorKind::Start => "1Password item read could not start",
-            BoundedCommandErrorKind::InvalidExecutable
-            | BoundedCommandErrorKind::InvalidResourceLimits
+            BoundedCommandErrorKind::Cleanup => SecretErrorKind::CleanupFailed,
+            BoundedCommandErrorKind::InvalidResourceLimits
             | BoundedCommandErrorKind::InvalidWorkingDirectory
             | BoundedCommandErrorKind::InvalidPublicInput
             | BoundedCommandErrorKind::Wait
-            | BoundedCommandErrorKind::Capture(_)
-            | BoundedCommandErrorKind::Cleanup => "1Password item read failed",
+            | BoundedCommandErrorKind::Capture(_) => SecretErrorKind::ProviderFailure,
         }
     } else {
-        "1Password item read cleanup failed"
+        SecretErrorKind::CleanupFailed
     };
-    anyhow::anyhow!(message)
+    secret_error(kind)
 }
 
 #[cfg(target_os = "linux")]
@@ -1073,28 +1116,29 @@ fn prepare_linux_provider_exec<'a>(
 
 #[cfg(target_os = "linux")]
 fn run_linux_provider_read(
-    operation: &crate::provider_operation::ProviderOperation<'_>,
+    operation: SecretOperationContext<'_>,
     child_executable: &Path,
     op_program: &str,
     provider_guard: &ProgramGuard,
     service_token: &SecretString,
     reference: &str,
     timeout: Duration,
-) -> Result<BoundedCommandOutput> {
+) -> std::result::Result<BoundedCommandOutput, SecretError> {
     let child_guard = lock_linux_program(child_executable, "running dev-auth executable")
-        .context("lock internal provider child executable")?;
+        .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
     let mut invocation = prepare_linux_provider_exec(
         &child_guard,
         provider_guard,
         op_program,
         service_token,
         reference,
-    )?;
+    )
+    .map_err(|_| secret_error(SecretErrorKind::ProviderFailure))?;
     run_prepared_bounded_command_with_cancellation(
         &mut invocation.command,
         timeout,
         OP_READ_OUTPUT_LIMIT,
-        operation.cancellation(),
+        operation.cancellation_signal(),
     )
     .map_err(map_op_read_error)
 }
@@ -1266,14 +1310,15 @@ pub fn run_provider_exec_child() -> Result<i32> {
 
 #[cfg(not(target_os = "linux"))]
 fn run_provider_read(
-    operation: &crate::provider_operation::ProviderOperation<'_>,
+    operation: SecretOperationContext<'_>,
     op_program: &str,
     provider_guard: &ProgramGuard,
     service_token: &SecretString,
     reference: &str,
     timeout: Duration,
-) -> Result<BoundedCommandOutput> {
-    let mut command = guarded_command(op_program, provider_guard)?;
+) -> std::result::Result<BoundedCommandOutput, SecretError> {
+    let mut command = guarded_command(op_program, provider_guard)
+        .map_err(|_| secret_error(SecretErrorKind::ProviderFailure))?;
     command
         .args(["read", "--no-newline", reference])
         .env_clear()
@@ -1283,12 +1328,193 @@ fn run_provider_read(
         &mut command,
         timeout,
         OP_READ_OUTPUT_LIMIT,
-        operation.cancellation(),
+        operation.cancellation_signal(),
     )
     .map_err(map_op_read_error)
 }
 
 #[cfg(target_os = "linux")]
+fn read_one_password_material_at_child(
+    operation: SecretOperationContext<'_>,
+    child_executable: &Path,
+    op_program: &str,
+    service_token: &SecretString,
+    reference: &SecretReference,
+) -> std::result::Result<SecretMaterial, SecretError> {
+    operation.checkpoint()?;
+    crate::validate_op_reference(reference.expose_to_provider())
+        .map_err(|_| secret_error(SecretErrorKind::InvalidReference))?;
+    let program_guard = program_guard(op_program, "1Password CLI")
+        .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
+    operation.checkpoint()?;
+    let timeout = operation
+        .remaining()?
+        .checked_sub(Duration::from_secs(2))
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| secret_error(SecretErrorKind::DeadlineExceeded))?;
+    let output = run_linux_provider_read(
+        operation,
+        child_executable,
+        op_program,
+        &program_guard,
+        service_token,
+        reference.expose_to_provider(),
+        timeout,
+    )?;
+    validate_provider_read_output(operation, output)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_one_password_material(
+    operation: SecretOperationContext<'_>,
+    op_program: &str,
+    service_token: &SecretString,
+    reference: &SecretReference,
+) -> std::result::Result<SecretMaterial, SecretError> {
+    operation.checkpoint()?;
+    crate::validate_op_reference(reference.expose_to_provider())
+        .map_err(|_| secret_error(SecretErrorKind::InvalidReference))?;
+    let program_guard = program_guard(op_program, "1Password CLI")
+        .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
+    operation.checkpoint()?;
+    let timeout = operation
+        .remaining()?
+        .checked_sub(Duration::from_secs(2))
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| secret_error(SecretErrorKind::DeadlineExceeded))?;
+    let output = run_provider_read(
+        operation,
+        op_program,
+        &program_guard,
+        service_token,
+        reference.expose_to_provider(),
+        timeout,
+    )?;
+    validate_provider_read_output(operation, output)
+}
+
+fn validate_provider_read_output(
+    operation: SecretOperationContext<'_>,
+    output: BoundedCommandOutput,
+) -> std::result::Result<SecretMaterial, SecretError> {
+    let stdout = zeroize::Zeroizing::new(output.stdout);
+    let _stderr = zeroize::Zeroizing::new(output.stderr);
+    operation.checkpoint()?;
+    if !output.status.success() {
+        return Err(secret_error(SecretErrorKind::PermissionDenied));
+    }
+    let value =
+        std::str::from_utf8(&stdout).map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
+    if value.is_empty() || value.contains('\0') {
+        return Err(secret_error(SecretErrorKind::InvalidResponse));
+    }
+    let value = SecretMaterial::new(value.as_bytes().to_vec())?;
+    operation.checkpoint()?;
+    Ok(value)
+}
+
+impl SecretProvider for OnePasswordProvider<'_> {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            exportable_read: true,
+            public_material: false,
+            signing: false,
+            metadata: true,
+        }
+    }
+
+    fn health(
+        &self,
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<ProviderHealth, SecretError> {
+        operation.checkpoint()?;
+        program_guard(self.op_program, "1Password CLI")
+            .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
+        operation.checkpoint()?;
+        Ok(ProviderHealth::Healthy)
+    }
+
+    fn metadata(
+        &self,
+        reference: &SecretReference,
+        purpose: SecretPurpose,
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<SecretMetadata, SecretError> {
+        operation.checkpoint()?;
+        crate::validate_op_reference(reference.expose_to_provider())
+            .map_err(|_| secret_error(SecretErrorKind::InvalidReference))?;
+        if !self.capabilities().allows(purpose) {
+            return Err(secret_error(SecretErrorKind::Unsupported));
+        }
+        Ok(SecretMetadata {
+            exportable: true,
+            public_material: false,
+            signing: false,
+        })
+    }
+
+    fn read_exportable(
+        &self,
+        reference: &SecretReference,
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<SecretMaterial, SecretError> {
+        #[cfg(target_os = "linux")]
+        {
+            read_one_password_material_at_child(
+                operation,
+                &self.child_executable,
+                self.op_program,
+                self.service_token,
+                reference,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            read_one_password_material(operation, self.op_program, self.service_token, reference)
+        }
+    }
+
+    fn public_material(
+        &self,
+        _reference: &SecretReference,
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<SecretPublicMaterial, SecretError> {
+        operation.checkpoint()?;
+        Err(secret_error(SecretErrorKind::Unsupported))
+    }
+
+    fn sign(
+        &self,
+        _reference: &SecretReference,
+        _payload: &[u8],
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<ProviderSignature, SecretError> {
+        operation.checkpoint()?;
+        Err(secret_error(SecretErrorKind::Unsupported))
+    }
+}
+
+fn provider_material_as_secret_string(material: &SecretMaterial) -> Result<SecretString> {
+    let value = std::str::from_utf8(material.expose_secret())
+        .map_err(|_| SecretError::new(SecretErrorKind::InvalidResponse))?;
+    Ok(SecretString::new(value.to_owned()))
+}
+
+fn read_exportable_from_provider(
+    provider: &dyn SecretProvider,
+    operation: &crate::provider_operation::ProviderOperation<'_>,
+    reference: &str,
+) -> Result<SecretString> {
+    let reference = SecretReference::new(reference)?;
+    let material = provider.read_exportable(&reference, operation.secret_context())?;
+    provider_material_as_secret_string(&material)
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn read_declared_secret_with_token_at_child(
     operation: &crate::provider_operation::ProviderOperation<'_>,
     child_executable: &Path,
@@ -1296,80 +1522,18 @@ fn read_declared_secret_with_token_at_child(
     service_token: &SecretString,
     reference: &str,
 ) -> Result<SecretString> {
-    operation.checkpoint()?;
-    crate::validate_op_reference(reference)?;
-    let program_guard = program_guard(op_program, "1Password CLI")?;
-    operation.checkpoint()?;
-    let timeout = operation.subprocess_timeout()?;
-    let output = run_linux_provider_read(
-        operation,
-        child_executable,
-        op_program,
-        &program_guard,
-        service_token,
-        reference,
-        timeout,
-    )?;
-    validate_provider_read_output(operation, output)
+    let provider = OnePasswordProvider::at_child(op_program, service_token, child_executable)?;
+    read_exportable_from_provider(&provider, operation, reference)
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn read_declared_secret_with_token(
     operation: &crate::provider_operation::ProviderOperation<'_>,
     op_program: &str,
     service_token: &SecretString,
     reference: &str,
 ) -> Result<SecretString> {
-    let child_executable = env::current_exe().context("resolve running dev-auth executable")?;
-    read_declared_secret_with_token_at_child(
-        operation,
-        &child_executable,
-        op_program,
-        service_token,
-        reference,
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn read_declared_secret_with_token(
-    operation: &crate::provider_operation::ProviderOperation<'_>,
-    op_program: &str,
-    service_token: &SecretString,
-    reference: &str,
-) -> Result<SecretString> {
-    operation.checkpoint()?;
-    crate::validate_op_reference(reference)?;
-    let program_guard = program_guard(op_program, "1Password CLI")?;
-    operation.checkpoint()?;
-    let timeout = operation.subprocess_timeout()?;
-    let output = run_provider_read(
-        operation,
-        op_program,
-        &program_guard,
-        service_token,
-        reference,
-        timeout,
-    )?;
-    validate_provider_read_output(operation, output)
-}
-
-fn validate_provider_read_output(
-    operation: &crate::provider_operation::ProviderOperation<'_>,
-    output: BoundedCommandOutput,
-) -> Result<SecretString> {
-    let stdout = zeroize::Zeroizing::new(output.stdout);
-    let _stderr = zeroize::Zeroizing::new(output.stderr);
-    operation.checkpoint()?;
-    if !output.status.success() {
-        bail!("1Password denied the declared item read");
-    }
-    let value = std::str::from_utf8(&stdout).context("1Password item value is not UTF-8")?;
-    if value.is_empty() || value.contains('\0') {
-        bail!("1Password item value is empty or malformed");
-    }
-    let value = SecretString::new(value.to_owned());
-    operation.checkpoint()?;
-    Ok(value)
+    let provider = OnePasswordProvider::new(op_program, service_token)?;
+    read_exportable_from_provider(&provider, operation, reference)
 }
 
 #[derive(Debug, Serialize)]
@@ -5518,7 +5682,14 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
             .unwrap()
             .success());
         assert!(Command::new("/usr/bin/git")
-            .args(["commit", "--quiet", "-m", "initial"])
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
             .current_dir(&repository)
             .status()
             .unwrap()
@@ -6143,6 +6314,30 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn one_password_reads_through_the_provider_neutral_contract() {
+        use dev_tools_secret::{SecretProvider as _, SecretReference};
+
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let op = write_linux_op_program(directory.path(), "printf 'provider-value'");
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+        let service_token = SecretString::new("test-service-token".into());
+        let provider =
+            OnePasswordProvider::at_child(op.to_str().unwrap(), &service_token, &child).unwrap();
+        let reference = SecretReference::new("op://Automation/provider/value").unwrap();
+
+        let material = provider
+            .read_exportable(&reference, operation.secret_context())
+            .unwrap();
+
+        assert_eq!(provider.id().as_str(), "one-password");
+        assert_eq!(material.expose_secret(), b"provider-value");
+        assert!(provider.capabilities().exportable_read);
+        assert!(!provider.capabilities().signing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn declared_secret_read_terminalizes_a_hanging_provider_at_one_deadline() {
         let directory = linux_program_test_directory();
         let child = write_linux_provider_child(directory.path());
@@ -6164,10 +6359,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
         )
         .unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "1Password item read exceeded its deadline"
-        );
+        assert_eq!(error.to_string(), "secret operation deadline was exceeded");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -6210,7 +6402,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
             .unwrap_err()
         });
 
-        assert_eq!(error.to_string(), "1Password item read was cancelled");
+        assert_eq!(error.to_string(), "secret operation was cancelled");
     }
 
     #[cfg(target_os = "linux")]
@@ -6232,7 +6424,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
 
         assert_eq!(
             error.to_string(),
-            "1Password item read exceeded its output limit"
+            "secret provider operation exceeded a resource limit"
         );
     }
 
@@ -6253,7 +6445,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
         )
         .unwrap_err();
 
-        assert_eq!(error.to_string(), "1Password item value is not UTF-8");
+        assert_eq!(error.to_string(), "secret provider response is invalid");
     }
 
     #[cfg(target_os = "linux")]
@@ -6276,7 +6468,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
         )
         .unwrap_err();
 
-        assert_eq!(error.to_string(), "1Password denied the declared item read");
+        assert_eq!(error.to_string(), "secret operation is not permitted");
         assert!(!format!("{error:?}").contains("provider-secret-diagnostic"));
     }
 

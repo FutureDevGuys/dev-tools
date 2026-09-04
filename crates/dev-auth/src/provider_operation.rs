@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use dev_tools_secret::OperationContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -49,16 +50,12 @@ impl<'a> ProviderOperation<'a> {
         self.checkpoint_at(Instant::now())
     }
 
-    pub(crate) fn subprocess_timeout(&self) -> Result<Duration> {
-        self.subprocess_timeout_at(Instant::now())
-    }
-
     pub(crate) fn http_timeout(&self) -> Result<Duration> {
         self.http_timeout_at(Instant::now())
     }
 
-    pub(crate) fn cancellation(&self) -> &AtomicBool {
-        self.cancellation
+    pub(crate) fn secret_context(&self) -> OperationContext<'a> {
+        OperationContext::new(self.deadline, self.cancellation)
     }
 
     fn checkpoint_at(&self, now: Instant) -> Result<()> {
@@ -78,10 +75,6 @@ impl<'a> ProviderOperation<'a> {
             .and_then(|remaining| remaining.checked_sub(FINALIZATION_RESERVE))
             .filter(|remaining| !remaining.is_zero())
             .context("provider operation has insufficient time remaining")
-    }
-
-    fn subprocess_timeout_at(&self, now: Instant) -> Result<Duration> {
-        self.remaining_with_reserve_at(now)
     }
 
     fn http_timeout_at(&self, now: Instant) -> Result<Duration> {
@@ -109,18 +102,18 @@ mod tests {
         };
 
         assert_eq!(
-            operation.subprocess_timeout_at(start).unwrap(),
+            operation.remaining_with_reserve_at(start).unwrap(),
             Duration::from_secs(48)
         );
         assert_eq!(
             operation
-                .subprocess_timeout_at(start + Duration::from_secs(20))
+                .remaining_with_reserve_at(start + Duration::from_secs(20))
                 .unwrap(),
             Duration::from_secs(28)
         );
         assert_eq!(
             operation
-                .subprocess_timeout_at(start + Duration::from_secs(48))
+                .remaining_with_reserve_at(start + Duration::from_secs(48))
                 .unwrap_err()
                 .to_string(),
             "provider operation has insufficient time remaining"
@@ -162,7 +155,10 @@ mod tests {
             "provider operation was cancelled"
         );
         assert_eq!(
-            operation.subprocess_timeout().unwrap_err().to_string(),
+            operation
+                .remaining_with_reserve_at(Instant::now())
+                .unwrap_err()
+                .to_string(),
             "provider operation was cancelled"
         );
         assert_eq!(

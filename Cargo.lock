@@ -913,6 +913,7 @@ dependencies = [
  "dev-tools-privilege",
  "dev-tools-reconcile-protocol",
  "dev-tools-release",
+ "dev-tools-secret",
  "directories",
  "ed25519-dalek",
  "fs2",

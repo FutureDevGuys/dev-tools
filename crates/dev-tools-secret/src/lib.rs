@@ -203,6 +203,12 @@ impl<'a> OperationContext<'a> {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Borrows the cancellation signal for a bounded child runner. The signal
+    /// remains process-local authority owned by the trusted coordinator.
+    pub fn cancellation_signal(self) -> &'a AtomicBool {
+        self.cancelled
+    }
+
     pub fn remaining(self) -> Result<Duration, SecretError> {
         self.checkpoint()?;
         self.deadline
@@ -259,6 +265,8 @@ pub enum SecretErrorKind {
     ProviderUnavailable,
     ProviderFailure,
     InvalidResponse,
+    ResourceLimitExceeded,
+    CleanupFailed,
     Cancelled,
     DeadlineExceeded,
 }
@@ -294,6 +302,10 @@ impl fmt::Display for SecretError {
             SecretErrorKind::ProviderUnavailable => "secret provider is unavailable",
             SecretErrorKind::ProviderFailure => "secret provider operation failed",
             SecretErrorKind::InvalidResponse => "secret provider response is invalid",
+            SecretErrorKind::ResourceLimitExceeded => {
+                "secret provider operation exceeded a resource limit"
+            }
+            SecretErrorKind::CleanupFailed => "secret provider cleanup failed",
             SecretErrorKind::Cancelled => "secret operation was cancelled",
             SecretErrorKind::DeadlineExceeded => "secret operation deadline was exceeded",
         })

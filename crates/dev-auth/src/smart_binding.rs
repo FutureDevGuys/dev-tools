@@ -717,12 +717,13 @@ fn current_platform() -> String {
 
 pub fn default_proxy_directories() -> Result<Vec<PathBuf>> {
     let base = directories::BaseDirs::new().context("resolve native user directories")?;
-    let mut directories = vec![base.data_local_dir().join("dev-auth/workload-bindings/bin")];
-    #[cfg(target_os = "linux")]
-    directories.insert(
-        0,
-        PathBuf::from("/usr/local/lib/dev-auth/workload-bindings/bin"),
-    );
+    let mut directories = Vec::with_capacity(2);
+    if cfg!(target_os = "linux") {
+        directories.push(PathBuf::from(
+            "/usr/local/lib/dev-auth/workload-bindings/bin",
+        ));
+    }
+    directories.push(base.data_local_dir().join("dev-auth/workload-bindings/bin"));
     Ok(directories)
 }
 
