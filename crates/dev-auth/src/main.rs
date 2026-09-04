@@ -48,15 +48,33 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
     bail!("workload termination signal unexpectedly returned")
 }
 
-fn usage() -> &'static str {
+fn base_usage() -> &'static str {
     "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+}
+
+fn usage() -> String {
+    format!(
+        "{}\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
+        base_usage()
+    )
 }
 
 #[cfg(target_os = "linux")]
 fn run_workload_os() -> Result<i32> {
     let mut arguments = std::env::args_os().skip(2);
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("launch")) {
-        bail!("workload requires the operation launch");
+    let operation = arguments.next().context("workload operation is required")?;
+    if operation != std::ffi::OsStr::new("launch") {
+        let operation = operation
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("workload operation is not UTF-8"))?;
+        let arguments = arguments
+            .map(|argument| {
+                argument
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("workload management argument is not UTF-8"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return run_workload_management(std::iter::once(operation).chain(arguments));
     }
     let workload = arguments
         .next()
@@ -69,6 +87,127 @@ fn run_workload_os() -> Result<i32> {
     let arguments = arguments.collect::<Vec<_>>();
     let status = dev_auth::supervisor::run_workload_alias(&workload, &arguments)?;
     workload_status_code(status)
+}
+
+fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
+    if arguments.next().as_deref() != Some("bind") {
+        bail!("workload management requires bind; launch is available on strong Linux")
+    }
+    match arguments.next().as_deref() {
+        Some("discover") => {
+            let command_name = arguments
+                .next()
+                .context("workload bind discover requires a command name")?;
+            let json = match arguments.next().as_deref() {
+                None => false,
+                Some("--json") if arguments.next().is_none() => true,
+                _ => bail!("workload bind discover accepts only COMMAND [--json]"),
+            };
+            let search_path = std::env::var_os("PATH").context("PATH is not set")?;
+            let excluded = dev_auth::smart_binding::default_proxy_directories()?;
+            let resolved = dev_auth::smart_binding::resolve_continuation(
+                &command_name,
+                &search_path,
+                &excluded,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema": "dev-auth-workload-binding-discovery-v1",
+                        "command_name": command_name,
+                        "resolved": resolved,
+                    }))?
+                );
+            } else {
+                println!("command_name={command_name}");
+                println!("visible_path={}", resolved.visible_path.display());
+                println!("canonical_path={}", resolved.canonical_path.display());
+                println!("authority={:?}", resolved.identity.authority);
+            }
+            Ok(0)
+        }
+        Some("plan") => {
+            let name = arguments
+                .next()
+                .context("workload bind plan requires a binding name")?;
+            let mut workload = None;
+            let mut command_name = None;
+            let mut target = None;
+            let mut output = None;
+            let mut json = false;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--workload" if workload.is_none() => {
+                        workload = Some(
+                            arguments
+                                .next()
+                                .context("--workload requires a workload name")?,
+                        );
+                    }
+                    "--command-name" if command_name.is_none() => {
+                        command_name = Some(
+                            arguments
+                                .next()
+                                .context("--command-name requires a command name")?,
+                        );
+                    }
+                    "--target" if target.is_none() => {
+                        target = Some(
+                            arguments
+                                .next()
+                                .context("--target requires a target kind")?,
+                        );
+                    }
+                    "--output" if output.is_none() => {
+                        output = Some(std::path::PathBuf::from(
+                            arguments.next().context("--output requires a path")?,
+                        ));
+                    }
+                    "--json" if !json => json = true,
+                    _ => bail!("workload bind plan contains a duplicate or unknown argument"),
+                }
+            }
+            let workload = workload.context("workload bind plan requires --workload")?;
+            let command_name =
+                command_name.context("workload bind plan requires --command-name")?;
+            if target.as_deref() != Some("current-resolution") {
+                bail!("this release plans only the current-resolution binding target")
+            }
+            let output = output.context("workload bind plan requires --output")?;
+            if !output.is_absolute() {
+                bail!("workload binding plan output must be absolute")
+            }
+            let search_path = std::env::var_os("PATH").context("PATH is not set")?;
+            let excluded = dev_auth::smart_binding::default_proxy_directories()?;
+            let resolved = dev_auth::smart_binding::resolve_continuation(
+                &command_name,
+                &search_path,
+                &excluded,
+            )?;
+            let intent =
+                dev_auth::smart_binding::BindingIntent::continuation(command_name, workload)?;
+            let plan = dev_auth::smart_binding::build_binding_plan(name, intent, resolved, None)?;
+            let digest = dev_auth::smart_binding::write_binding_plan(&output, &plan)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema": "dev-auth-workload-binding-plan-result-v1",
+                        "plan": output,
+                        "sha256": digest,
+                        "change": plan.change,
+                    }))?
+                );
+            } else {
+                println!("binding_plan={}", output.display());
+                println!("binding_plan_sha256={digest}");
+                println!("change={:?}", plan.change);
+            }
+            Ok(0)
+        }
+        _ => bail!("workload bind requires discover or plan"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1526,6 +1665,7 @@ fn run() -> Result<i32> {
         }
         "setup" => run_setup(arguments),
         "reconcile" => run_reconcile(arguments),
+        "workload" => run_workload_management(arguments),
         "broker" => {
             if arguments.next().as_deref() != Some("serve") || arguments.next().is_some() {
                 bail!("broker requires the exact operation: serve");

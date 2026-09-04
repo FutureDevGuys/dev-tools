@@ -1,13 +1,15 @@
 #![cfg(unix)]
 
 use dev_auth::smart_binding::{
-    advance_binding, classify_binding_change, require_automatic_refresh, resolve_continuation,
-    validate_binding_receipt_structure, BindingAuthority, BindingChange, BindingIntent,
-    BindingMode, BindingReceipt,
+    advance_binding, build_binding_plan, canonical_binding_plan, classify_binding_change,
+    default_proxy_directories, require_automatic_refresh, resolve_continuation,
+    validate_binding_receipt_structure, write_binding_plan, BindingAuthority, BindingChange,
+    BindingIntent, BindingMode, BindingPlanChange, BindingReceipt,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 fn executable(path: &Path, body: &[u8]) {
     fs::write(path, body).unwrap();
@@ -180,4 +182,115 @@ fn continuation_rejects_relative_search_entries_and_proxy_only_cycles() {
     assert!(resolve_continuation("agent", std::ffi::OsStr::new("relative"), &[]).is_err());
     let path = std::env::join_paths([&proxy]).unwrap();
     assert!(resolve_continuation("agent", &path, &[proxy]).is_err());
+}
+
+#[test]
+fn canonical_binding_plans_are_value_stable_and_create_new() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    executable(&bin.join("agent"), b"one");
+    let search_path = std::env::join_paths([&bin]).unwrap();
+    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let resolution = resolve_continuation("agent", &search_path, &[]).unwrap();
+    let first =
+        build_binding_plan("agent-binding", intent.clone(), resolution.clone(), None).unwrap();
+    let second = build_binding_plan("agent-binding", intent, resolution, None).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.change, BindingPlanChange::Install);
+    assert_eq!(first.actions.len(), 3);
+
+    let output = root.path().join("binding-plan.json");
+    let digest = write_binding_plan(&output, &first).unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(write_binding_plan(&output, &first).is_err());
+    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(persisted["schema"], "dev-auth-workload-binding-plan-v1");
+    assert_eq!(persisted["change"], "install");
+}
+
+#[test]
+fn non_install_plans_are_recomputed_from_the_embedded_current_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    executable(&bin.join("agent"), b"one");
+    let search_path = std::env::join_paths([&bin]).unwrap();
+    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let resolution = resolve_continuation("agent", &search_path, &[]).unwrap();
+    let receipt = BindingReceipt::new(intent.clone(), resolution.clone()).unwrap();
+    let mut plan = build_binding_plan("agent-binding", intent, resolution, Some(&receipt)).unwrap();
+    assert_eq!(plan.change, BindingPlanChange::Unchanged);
+    canonical_binding_plan(&plan).unwrap();
+
+    plan.change = BindingPlanChange::Refresh;
+    assert!(canonical_binding_plan(&plan).is_err());
+}
+
+#[test]
+fn standard_proxy_roots_include_strong_and_user_only_installations() {
+    let roots = default_proxy_directories().unwrap();
+    assert!(roots.contains(&Path::new("/usr/local/lib/dev-auth/workload-bindings/bin").into()));
+    assert!(roots
+        .iter()
+        .any(|root| { root.ends_with(Path::new(".local/share/dev-auth/workload-bindings/bin",)) }));
+}
+
+#[test]
+fn cli_discovers_and_plans_the_current_continuation_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    executable(&bin.join("agent"), b"wrapper");
+    let search_path = std::env::join_paths([&bin]).unwrap();
+
+    let discovery = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .args(["workload", "bind", "discover", "agent", "--json"])
+        .env("PATH", &search_path)
+        .output()
+        .unwrap();
+    assert!(
+        discovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&discovery.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&discovery.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-auth-workload-binding-discovery-v1");
+    assert_eq!(report["command_name"], "agent");
+    assert_eq!(
+        report["resolved"]["visible_path"],
+        bin.join("agent").to_str().unwrap()
+    );
+
+    let plan = root.path().join("plan.json");
+    let planned = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .args([
+            "workload",
+            "bind",
+            "plan",
+            "agent-binding",
+            "--workload",
+            "automation",
+            "--command-name",
+            "agent",
+            "--target",
+            "current-resolution",
+            "--output",
+            plan.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", &search_path)
+        .output()
+        .unwrap();
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(result["schema"], "dev-auth-workload-binding-plan-result-v1");
+    assert_eq!(result["change"], "install");
+    assert_eq!(result["sha256"].as_str().unwrap().len(), 64);
+    assert!(plan.is_file());
+    assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
 }

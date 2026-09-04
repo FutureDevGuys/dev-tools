@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
@@ -32,6 +32,32 @@ pub enum BindingChange {
     Unchanged,
     Refresh,
     Rebind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingPlanChange {
+    Install,
+    Unchanged,
+    Refresh,
+    Rebind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingPlanActionKind {
+    ValidateTarget,
+    DeactivateProxy,
+    PublishBinding,
+    ActivateProxy,
+    VerifyBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BindingPlanAction {
+    pub order: u16,
+    pub action: BindingPlanActionKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,6 +178,24 @@ pub struct BindingReceipt {
     pub previous: Option<BindingGeneration>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BindingPlan {
+    pub schema: String,
+    pub platform: String,
+    pub name: String,
+    pub intent: BindingIntent,
+    pub resolved: ResolvedContinuation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_receipt: Option<BindingReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_receipt_sha256: Option<String>,
+    pub change: BindingPlanChange,
+    pub actions: Vec<BindingPlanAction>,
+}
+
 impl BindingReceipt {
     pub fn new(intent: BindingIntent, resolved: ResolvedContinuation) -> Result<Self> {
         validate_intent_resolution(&intent, &resolved)?;
@@ -168,6 +212,124 @@ impl BindingReceipt {
     }
 }
 
+pub fn build_binding_plan(
+    name: impl Into<String>,
+    intent: BindingIntent,
+    resolved: ResolvedContinuation,
+    current: Option<&BindingReceipt>,
+) -> Result<BindingPlan> {
+    let name = name.into();
+    require_simple_name(&name, "binding name")?;
+    validate_intent_resolution(&intent, &resolved)?;
+    let (current_generation, current_receipt_sha256, change) = match current {
+        Some(receipt) => {
+            validate_binding_receipt_structure(receipt)?;
+            let change = match classify_binding_change(receipt, &intent, &resolved) {
+                BindingChange::Unchanged => BindingPlanChange::Unchanged,
+                BindingChange::Refresh => BindingPlanChange::Refresh,
+                BindingChange::Rebind => BindingPlanChange::Rebind,
+            };
+            (
+                Some(receipt.active.generation),
+                Some(binding_receipt_sha256(receipt)?),
+                change,
+            )
+        }
+        None => (None, None, BindingPlanChange::Install),
+    };
+    let action_kinds: &[BindingPlanActionKind] = match change {
+        BindingPlanChange::Install => &[
+            BindingPlanActionKind::ValidateTarget,
+            BindingPlanActionKind::PublishBinding,
+            BindingPlanActionKind::ActivateProxy,
+        ],
+        BindingPlanChange::Unchanged => &[BindingPlanActionKind::VerifyBinding],
+        BindingPlanChange::Refresh | BindingPlanChange::Rebind => &[
+            BindingPlanActionKind::DeactivateProxy,
+            BindingPlanActionKind::ValidateTarget,
+            BindingPlanActionKind::PublishBinding,
+            BindingPlanActionKind::ActivateProxy,
+        ],
+    };
+    let actions = action_kinds
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            Ok(BindingPlanAction {
+                order: u16::try_from(index + 1).context("binding action graph is too large")?,
+                action: *action,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BindingPlan {
+        schema: "dev-auth-workload-binding-plan-v1".to_owned(),
+        platform: current_platform(),
+        name,
+        intent,
+        resolved,
+        current_receipt: current.cloned(),
+        current_generation,
+        current_receipt_sha256,
+        change,
+        actions,
+    })
+}
+
+pub fn canonical_binding_plan(plan: &BindingPlan) -> Result<Vec<u8>> {
+    validate_binding_plan(plan)?;
+    serde_jcs::to_vec(plan).context("canonicalize workload binding plan")
+}
+
+pub fn binding_plan_sha256(plan: &BindingPlan) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(canonical_binding_plan(plan)?)
+    ))
+}
+
+pub fn write_binding_plan(path: &Path, plan: &BindingPlan) -> Result<String> {
+    require_absolute_normal_path(path, "binding plan output")?;
+    let bytes = canonical_binding_plan(plan)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(nix::libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create workload binding plan {}", path.display()))?;
+    file.write_all(&bytes)
+        .context("write workload binding plan")?;
+    file.sync_all().context("sync workload binding plan")?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn validate_binding_plan(plan: &BindingPlan) -> Result<()> {
+    if plan.schema != "dev-auth-workload-binding-plan-v1" {
+        bail!("workload binding plan schema is not supported");
+    }
+    if plan.platform != current_platform() {
+        bail!("workload binding plan belongs to a different native platform");
+    }
+    require_simple_name(&plan.name, "binding name")?;
+    validate_intent_resolution(&plan.intent, &plan.resolved)?;
+    let expected = build_binding_plan(
+        plan.name.clone(),
+        plan.intent.clone(),
+        plan.resolved.clone(),
+        plan.current_receipt.as_ref(),
+    )?;
+    if &expected != plan {
+        bail!("workload binding plan is not canonical for its current-state snapshot");
+    }
+    Ok(())
+}
+
+fn binding_receipt_sha256(receipt: &BindingReceipt) -> Result<String> {
+    validate_binding_receipt_structure(receipt)?;
+    let bytes = serde_jcs::to_vec(receipt).context("canonicalize workload binding receipt")?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 pub fn resolve_continuation(
     command_name: &str,
     search_path: &OsStr,
@@ -178,9 +340,13 @@ pub fn resolve_continuation(
         .iter()
         .map(|directory| {
             require_absolute_normal_path(directory, "excluded proxy directory")?;
-            fs::canonicalize(directory).with_context(|| {
-                format!("resolve excluded proxy directory {}", directory.display())
-            })
+            match fs::canonicalize(directory) {
+                Ok(canonical) => Ok(canonical),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(directory.clone()),
+                Err(error) => Err(error).with_context(|| {
+                    format!("resolve excluded proxy directory {}", directory.display())
+                }),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -547,6 +713,17 @@ fn require_absolute_normal_path(path: &Path, description: &str) -> Result<()> {
 
 fn current_platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+pub fn default_proxy_directories() -> Result<Vec<PathBuf>> {
+    let base = directories::BaseDirs::new().context("resolve native user directories")?;
+    let mut directories = vec![base.data_local_dir().join("dev-auth/workload-bindings/bin")];
+    #[cfg(target_os = "linux")]
+    directories.insert(
+        0,
+        PathBuf::from("/usr/local/lib/dev-auth/workload-bindings/bin"),
+    );
+    Ok(directories)
 }
 
 #[cfg(unix)]
