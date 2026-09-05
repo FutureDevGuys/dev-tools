@@ -12,7 +12,7 @@ This document is the normative current contract for public Dev Tools products. A
 
 Public products are independently distributed end-user or maintainer commands. Internal helpers are narrowly scoped protocol executables, privileged helpers, broker workers, or test fixtures and do not inherit the general public-product CLI.
 
-The public products are `update-all`, `dev-auth`, `dev-cache`, `sync-configs`, `skills-sync`, and the future `release-admin`. Adding or retiring a public product updates this list, the release product registry, and the executable conformance inventory in the same accepted change.
+The public products are `update-all`, `artifact-update`, `dev-auth`, `dev-cache`, `sync-configs`, `skills-sync`, and `release-admin`. Adding or retiring a public product updates this list, the release product registry, and the executable conformance inventory in the same accepted change.
 
 A public product must build, test, release, install, and operate without another Dev Tools product, a source checkout, an interpreter, Git, GitHub CLI, curl, wget, or a private downstream repository. A released binary contains the shared Rust implementation it uses. Operating-system facilities and explicitly documented product prerequisites are not sibling-product dependencies.
 
@@ -42,6 +42,8 @@ An externally managed public command is reported as `external` and is never over
 
 Ordinary product operations and `--version` never access the network. Remote release metadata may describe product identity and artifacts, but it may not provide executable commands, arbitrary destinations, shell programs, or privileged effects.
 
+`artifact-update` is the standalone configuration-driven form of the shared update foundation. Its local `artifact-update-config-v1` authority selects providers, version conventions, artifact types, platform/architecture mappings, deterministic exact/glob/linear-time-regex selectors, verification requirements, and managed destinations for independently packaged applications. Unverifiable sources are check-only. Selection ambiguity is terminal, downloads are bounded and streaming, and install/rollback mutate only receipt-owned state.
+
 New product releases use a canonical source-bound manifest that may contain multiple target artifacts for one product version and generation. Each target retains its own URL, length, and digest. A product verifies only its selected target after authenticating the complete manifest. Legacy manifest schemas remain readable only for explicitly bounded migration and receipt-owned rollback. Once shared v2 becomes authoritative for a product, its online release authority accepts only source-bound schemas; retained rollback never weakens online resolution.
 
 ## Common result contract
@@ -61,7 +63,7 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | Foundation | Product-neutral responsibility |
 | --- | --- |
 | `dev-tools-product` | Product and build identity, common operation results, fixed error kinds, and exit categories. |
-| `dev-tools-update` | Signed release discovery, authenticated caching, freshness assessment, installation-adapter contracts, and rollback coordination. |
+| `dev-tools-update` | Generic artifact source/selection contracts, signed release discovery, authenticated caching, freshness assessment, installation-adapter contracts, and rollback coordination. |
 | `dev-tools-release` | Trust roots, signed manifests, source binding, anti-rollback checks, and artifact verification. |
 | `dev-tools-installation` | Receipts, immutable versions, aliases, locks, journals, repair, rollback, and owned uninstall. |
 | `dev-tools-command` | Bounded direct process execution and prepared-command execution. |

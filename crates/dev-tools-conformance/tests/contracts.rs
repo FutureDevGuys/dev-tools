@@ -45,6 +45,11 @@ fn public_product_inventory_is_explicit_and_release_admin_is_planned() {
                 ProductLifecycle::Planned,
                 ProductStandardStage::Inventory,
             ),
+            (
+                "artifact-update",
+                ProductLifecycle::Planned,
+                ProductStandardStage::BuildInfo,
+            ),
         ]
     );
 }
@@ -109,7 +114,7 @@ fn workspace_dependency_direction_is_enforced_from_cargo_metadata() {
     let report = audit_workspace_metadata(&workspace, &output.stdout).expect("audit metadata");
 
     assert!(report.is_conformant(), "{report:#?}");
-    assert_eq!(report.workspace_package_count, 14);
+    assert_eq!(report.workspace_package_count, 16);
     assert!(report.failures.is_empty());
 }
 

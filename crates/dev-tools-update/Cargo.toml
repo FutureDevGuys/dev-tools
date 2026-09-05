@@ -8,9 +8,13 @@ publish = ["crates-io"]
 description = "Product-neutral authenticated update orchestration for Dev Tools products"
 
 [dependencies]
+http = "1"
 dev-tools-product = { version = "0.1.0", path = "../dev-tools-product" }
 dev-tools-release = { version = "0.1.0", path = "../dev-tools-release" }
 semver = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "1.0"
 
 [dev-dependencies]
 serde_json = "1"

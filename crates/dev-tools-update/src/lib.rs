@@ -13,6 +13,8 @@ use semver::Version;
 use std::error::Error;
 use std::fmt;
 
+pub mod artifact;
+
 pub const MAX_CACHE_AGE_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

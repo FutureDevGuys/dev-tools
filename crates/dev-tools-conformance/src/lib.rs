@@ -35,7 +35,7 @@ pub struct ProductDefinition {
     pub standard_stage: ProductStandardStage,
 }
 
-pub const PUBLIC_PRODUCTS: [ProductDefinition; 6] = [
+pub const PUBLIC_PRODUCTS: [ProductDefinition; 7] = [
     ProductDefinition {
         name: "update-all",
         lifecycle: ProductLifecycle::Current,
@@ -65,6 +65,11 @@ pub const PUBLIC_PRODUCTS: [ProductDefinition; 6] = [
         name: "release-admin",
         lifecycle: ProductLifecycle::Planned,
         standard_stage: ProductStandardStage::Inventory,
+    },
+    ProductDefinition {
+        name: "artifact-update",
+        lifecycle: ProductLifecycle::Planned,
+        standard_stage: ProductStandardStage::BuildInfo,
     },
 ];
 
