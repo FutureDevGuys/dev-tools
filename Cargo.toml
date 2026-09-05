@@ -7,6 +7,7 @@ members = [
     "crates/dev-tools-conformance",
     "crates/dev-tools-installation",
     "crates/dev-tools-privilege",
+    "crates/dev-tools-privilege-session",
     "crates/dev-tools-product",
     "crates/dev-tools-reconcile-protocol",
     "crates/dev-tools-release",

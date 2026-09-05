@@ -114,7 +114,7 @@ fn workspace_dependency_direction_is_enforced_from_cargo_metadata() {
     let report = audit_workspace_metadata(&workspace, &output.stdout).expect("audit metadata");
 
     assert!(report.is_conformant(), "{report:#?}");
-    assert_eq!(report.workspace_package_count, 16);
+    assert_eq!(report.workspace_package_count, 17);
     assert!(report.failures.is_empty());
 }
 

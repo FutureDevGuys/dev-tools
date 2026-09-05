@@ -1023,6 +1023,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-tools-privilege-session"
+version = "0.1.0"
+
+[[package]]
 name = "dev-tools-product"
 version = "0.1.0"
 dependencies = [
