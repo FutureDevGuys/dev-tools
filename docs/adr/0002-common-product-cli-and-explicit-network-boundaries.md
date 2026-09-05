@@ -22,6 +22,8 @@ The source layer admits GitHub, GitLab, Forgejo/Gitea, generic JSON, XML/Atom/RS
 
 One bounded Rust HTTP/TLS implementation owns HTTPS, allowed-host redirect policy, ETag and Last-Modified validation, 304 reuse, Retry-After and rate-limit handling, size limits, streaming downloads, timeouts, cancellation, and bounded global/per-host concurrency. A runtime replacement is accepted only through comparative startup, memory, binary-size, throughput, and p95 latency evidence; implementation fashion alone does not add a second network stack.
 
+Redirect admission precedes each network request. Automatic client redirection is disabled; the transport resolves bounded locations with the shared standard URL parser, rejects prohibited origins and credential-bearing URLs before connection, and retains one deadline across all hops. Conditional validators belong to the initial resource and are not forwarded to a redirected resource. The URL parser is not a second HTTP or TLS stack; its dependency and binary-size impact remains part of release measurement.
+
 ## Invariants
 
 - Ordinary commands, `--version`, `build-info`, `doctor`, status, and rollback are network-free.

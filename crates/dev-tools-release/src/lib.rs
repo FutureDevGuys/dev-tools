@@ -11,7 +11,8 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use ureq::ResponseExt;
+
+mod https;
 
 use dev_tools_installation::{
     read_atomic_document, write_atomic_document, DocumentAuthority, InstallationLock,
@@ -1083,51 +1084,27 @@ fn fetch_https_response(
     etag: Option<&str>,
     allow_not_found: bool,
 ) -> Result<Option<HttpsResponse>> {
-    validate_https_request(url, policy, limit)?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .https_only(true)
-        .http_status_as_error(false)
-        .max_redirects(policy.max_redirects)
-        .max_redirects_will_error(true)
-        .save_redirect_history(true)
-        .timeout_global(Some(policy.timeout))
-        .user_agent(policy.user_agent.clone())
-        .build()
-        .into();
-    let mut request = agent.get(url).header(
-        "Accept",
-        if url.starts_with("https://api.github.com/") {
-            "application/vnd.github+json"
-        } else {
-            "application/octet-stream"
-        },
-    );
     if let Some(etag) = etag {
-        if etag.is_empty() || etag.contains(['\r', '\n', '\0']) {
+        if etag.is_empty() || etag.len() > 8192 || etag.contains(['\r', '\n', '\0']) {
             bail!("release ETag is invalid");
         }
-        request = request.header("If-None-Match", etag);
     }
-    let mut response = request.call().with_context(|| format!("GET {url}"))?;
-    if let Some(history) = response.get_redirect_history() {
-        for uri in history {
-            if uri.scheme_str() != Some("https")
-                || !policy
-                    .allowed_hosts
-                    .contains(uri.host().unwrap_or_default())
-            {
-                bail!("release request traversed an untrusted redirect");
-            }
+    let mut response = https::guarded_response(url, policy, limit, |url, remaining, initial| {
+        let agent: ureq::Agent = https_single_hop_config(policy, remaining).into();
+        let mut request = agent.get(url).header(
+            "Accept",
+            if url.starts_with("https://api.github.com/") {
+                "application/vnd.github+json"
+            } else {
+                "application/octet-stream"
+            },
+        );
+        // An ETag identifies the original resource, not a redirected target.
+        if let Some(etag) = etag.filter(|_| initial) {
+            request = request.header("If-None-Match", etag);
         }
-    }
-    let final_uri = response.get_uri();
-    if final_uri.scheme_str() != Some("https")
-        || !policy
-            .allowed_hosts
-            .contains(final_uri.host().unwrap_or_default())
-    {
-        bail!("release request resolved to an untrusted origin");
-    }
+        request.call().context("request HTTPS release resource")
+    })?;
     if response.status().as_u16() == 304 {
         bail!("release response was not modified");
     }
@@ -1135,16 +1112,26 @@ fn fetch_https_response(
         return Ok(None);
     }
     if !response.status().is_success() {
-        bail!("GET {url} returned HTTP {}", response.status());
+        bail!("release request returned HTTP {}", response.status());
     }
     let etag = response
         .headers()
         .get("etag")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let bytes = read_bounded_body(response.body_mut(), limit)
-        .with_context(|| format!("read bounded response from {url}"))?;
+    let bytes =
+        read_bounded_body(response.body_mut(), limit).context("read bounded release response")?;
     Ok(Some(HttpsResponse { bytes, etag }))
+}
+
+fn https_single_hop_config(policy: &HttpsPolicy, remaining: Duration) -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        .https_only(true)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(remaining))
+        .user_agent(policy.user_agent.clone())
+        .build()
 }
 
 fn read_bounded_body(body: &mut ureq::Body, limit: u64) -> Result<Vec<u8>> {
