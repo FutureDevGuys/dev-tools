@@ -664,7 +664,8 @@ fn run_main(cli: Cli) -> i32 {
             cli.log_level,
             cli.dry_run,
         ));
-    let result = crate::engine::execute_observed(&cli, &mut output_profiles);
+    let result =
+        crate::engine::execute_observed_with_run_id(&cli, &mut output_profiles, recorder.run_id());
     let interrupted_by_engine = result.as_ref().is_err_and(|error| error.is_interrupted());
     let interrupted = interrupt_guard.begin_finalization() || interrupted_by_engine;
     if interrupted {

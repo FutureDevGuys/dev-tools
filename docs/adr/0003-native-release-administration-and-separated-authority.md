@@ -24,6 +24,8 @@ Binary releases use one canonical `dev-tools-product-v2` manifest per product ve
 
 ## Invariants
 
+The signer bootstrap has one version-bound exception: native release administration constructs and publishes Dev Auth `0.3.11` in the existing source-bound `dev-auth-product-v2` format with exactly one target. This lets the installed `0.3.10` operation-only broker authenticate its replacement without exporting a key or installing unsigned code. The exception does not apply to any other product or version, including build-metadata variants. Dev Auth permits that exact release at new bundle/online intake while preserving exact accepted predecessor bytes for offline use and rollback. All later releases require shared product v2. Release administration owns this exception and removes its construction path after `0.3.11` is published, installed, and its replacement signer is accepted; its authenticated reader remains only through the receipt-owned rollback window. This narrowly overrides the new-format-only rule above, not source binding, reproducibility, native approval, anti-rollback, or equivocation protection.
+
 - Build, root, signing, publication, and privileged installation remain independently authorized.
 - Every published artifact binds the exact product, source commit, target, length, digest, version, and generation.
 - Every published shared crate is present in one signed crate-set inventory whose authority is granted independently from binary-product signing; registry upload cannot select or alter package bytes, and reproducible construction separately proves their source derivation.

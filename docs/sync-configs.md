@@ -115,7 +115,30 @@ When mutation is required, `sync-configs` acquires or reuses one native sudo tim
 
 Trusted entries may independently set `pre_script_privilege: sudo` or `post_script_privilege: sudo`; the default is `user`. After profile selection, a normal run requests one native sudo timestamp immediately before the first eligible privileged phase: before a privileged pre-hook, before target/reconciler mutation that needs sudo, or before a privileged post-hook only when that entry actually converged successfully. Existing cached authorization is reused; dry-run, disabled profiles, ineligible post-hooks, blocked/no-op targets, and unselected reconcilers never authenticate. An unavailable or rejected session stops before the affected mutation boundary. The manifest remains the sole authority for which command is elevated, and sudo remains the sole credential cache and authorization boundary. The selected sudo binary, elevated shell, privileged-target helpers, and sudo reconciler executable must resolve through root-owned, non-group/world-writable files and ancestor paths; user-writable aliases are rejected during preflight and before authentication.
 
-Each user hook receives closed stdin, the environment captured when the run was planned, a five-minute timeout, and independent 16 MiB stdout/stderr result bounds. A privileged hook launches `sudo` from that captured environment, but the environment visible after elevation remains governed by the host's sudo policy; `sync-configs` does not bypass `env_reset` or forward arbitrary variables as command-line values. A hook timeout or limit failure is value-free in structured status. On Unix the shared command runner owns the hook process group and terminalizes it before returning; platforms without an accepted descendant-containment primitive must not claim equivalent process-tree cleanup from compilation alone.
+Each user hook receives closed stdin, the environment captured when the run was planned, a five-minute timeout, and independent 16 MiB stdout/stderr result bounds. Product-owned hook metadata overrides captured values as described below. A privileged hook requests preservation of only the explicit metadata keys through sudo's `--preserve-env=KEYS`; it does not use `sudo -E`, bypass sudo policy, or forward arbitrary variables. A host policy that rejects that request fails the privileged invocation normally. A hook timeout or limit failure is value-free in structured status. On Unix the shared command runner owns the hook process group and terminalizes it before returning; platforms without an accepted descendant-containment primitive must not claim equivalent process-tree cleanup from compilation alone.
+
+### Hook environment API 1
+
+Every executed manifest pre/post hook receives this additive public contract. Consumers should tolerate additional fields. Metadata is delivered to the hook, not added to diagnostic events; trusted hooks remain responsible for what they print. Ambient values cannot override these keys, including optional keys that must be absent. Validation and dry-run never execute hooks. External reconciler protocol I/O is unchanged.
+
+| Variable | Value |
+| --- | --- |
+| `SYNC_CONFIGS_HOOK_API_VERSION` | `1` |
+| `SYNC_CONFIGS_ACTIVE_PROFILES` | Selected profiles, deduplicated in selection order, comma-separated |
+| `SYNC_CONFIGS_MANIFEST_PATH` | Absolute loaded manifest path |
+| `SYNC_CONFIGS_CONFIG_DIR` | Absolute hook working directory |
+| `SYNC_CONFIGS_RUN_ID` | Existing diagnostic run ID; absent when logging is off |
+| `SYNC_CONFIGS_HOOK_PHASE` | `pre` or `post` |
+| `SYNC_CONFIGS_HOOK_PRIVILEGE` | `user` or `sudo` |
+| `SYNC_CONFIGS_ENTRY_NAME` | Selected entry name |
+| `SYNC_CONFIGS_ENTRY_SCOPE` | Existing group/subgroup scope label, or `root` |
+| `SYNC_CONFIGS_ENTRY_SOURCE` | Resolved absolute source path |
+| `SYNC_CONFIGS_ENTRY_TARGET` | Resolved absolute target path using the engine's target resolution |
+| `SYNC_CONFIGS_ENTRY_MODE` | `symlink`, `copy`, `json_overlay`, or `toml_overlay` |
+| `SYNC_CONFIGS_ENTRY_PROFILES` | Entry-declared profiles, comma-separated |
+| `SYNC_CONFIGS_ENTRY_CONVERGENCE` | Post-only: `changed` or `up_to_date`; absent in pre-hooks |
+
+The environment describes the selected manifest entry, not each recursively expanded child. Relative target resolution retains the engine's caller-directory semantics even when the hook's working directory is elsewhere.
 
 ```yaml
 entries:

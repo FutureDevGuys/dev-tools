@@ -153,8 +153,12 @@ pub(crate) fn build_release_set(arguments: SetBuildArgs) -> Result<()> {
         let artifact_source = cargo_target
             .join("release")
             .join(native_binary_name(product, &arguments.target));
-        let artifact_bytes = read_bounded_file(&artifact_source, ARTIFACT_LIMIT)
-            .context("read constructed release artifact")?;
+        let artifact_bytes = super::read_bounded_file_with_origin(
+            &artifact_source,
+            ARTIFACT_LIMIT,
+            super::InputOrigin::ControlledBuild,
+        )
+        .context("read constructed release artifact")?;
         let artifact_name = public_artifact_name(product, version, &arguments.target);
         let artifact_output = product_dir.join(&artifact_name);
         write_new_private_file_with_limit(&artifact_output, &artifact_bytes, ARTIFACT_LIMIT)?;
@@ -548,7 +552,7 @@ fn verify_constructed_product(
         &ReleaseAuthority {
             trusted_root_key: trusted_root.to_owned(),
             product: product.to_owned(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: super::manifest_policy::accepted_schemas(product),
             target: target.to_owned(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -562,6 +566,11 @@ fn verify_constructed_product(
     if releases.len() != 1 || releases[0].source_commit.as_deref() != Some(source_commit) {
         bail!("constructed release metadata does not bind the exact source");
     }
+    super::manifest_policy::require_publishable(
+        product,
+        &releases[0].version.to_string(),
+        &releases[0].manifest_schema,
+    )?;
     verify_artifact_bytes(&releases[0], artifact).context("verify constructed release artifact")
 }
 

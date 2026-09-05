@@ -9,12 +9,12 @@ use dev_tools_installation::{write_atomic_document, ArtifactIdentity, DocumentAu
 use dev_tools_product::{BuildInfo, ProductId};
 use dev_tools_release::{
     authorized_release_public_key, build_signed_envelope, build_unsigned_crate_set,
-    build_unsigned_product_manifest, build_unsigned_root_document, root_key_id,
-    verify_artifact_bytes, verify_crate_package_bytes, verify_crate_set_metadata,
-    verify_crates_io_package_set, verify_release_metadata, verify_release_set_metadata,
-    verify_root_bytes, ArtifactUrlPolicy, CratePackageSpec, CrateSetAuthority, CrateSetMetadata,
-    CrateSetSpec, EnvelopeSignature, ManifestArtifact, ProductManifestSpec, ReleaseAuthority,
-    ReleaseMetadata, RootDocumentSpec, RootReleaseKey, CRATE_SET_AUTHORITY,
+    build_unsigned_root_document, root_key_id, verify_artifact_bytes, verify_crate_package_bytes,
+    verify_crate_set_metadata, verify_crates_io_package_set, verify_release_metadata,
+    verify_release_set_metadata, verify_root_bytes, ArtifactUrlPolicy, CratePackageSpec,
+    CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature, ManifestArtifact,
+    ProductManifestSpec, ReleaseAuthority, ReleaseMetadata, RootDocumentSpec, RootReleaseKey,
+    CRATE_SET_AUTHORITY,
 };
 #[cfg(target_os = "linux")]
 use dev_tools_release::{inspect_crates_io_package, RegistryCrateStatus};
@@ -42,6 +42,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use zeroize::Zeroizing;
 
+mod manifest_policy;
 mod publication;
 mod set_build;
 mod set_compare;
@@ -541,7 +542,7 @@ fn construct_product_manifest(arguments: &ManifestBuildArgs) -> Result<Vec<u8>> 
         .context("read root document")?;
     authorized_release_public_key(&root, &trusted_root, &arguments.release_key_id)
         .context("authenticate routine release-signing key")?;
-    let unsigned = build_unsigned_product_manifest(&ProductManifestSpec {
+    let unsigned = manifest_policy::construct(&ProductManifestSpec {
         product: arguments.product.clone(),
         generation: arguments.generation,
         version: arguments.version.clone(),
@@ -566,7 +567,7 @@ fn construct_product_manifest(arguments: &ManifestBuildArgs) -> Result<Vec<u8>> 
         &ReleaseAuthority {
             trusted_root_key: trusted_root,
             product: arguments.product.clone(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: manifest_policy::accepted_schemas(&arguments.product),
             target: selected_target,
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -1899,7 +1900,7 @@ fn verify_release_set(arguments: SetVerifyArgs) -> Result<()> {
         &ReleaseAuthority {
             trusted_root_key: trusted_root,
             product: arguments.product.clone(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v2".into()],
+            accepted_manifest_schemas: manifest_policy::accepted_schemas(&arguments.product),
             target: selected_target.clone(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
@@ -1918,6 +1919,11 @@ fn verify_release_set(arguments: SetVerifyArgs) -> Result<()> {
         bail!("release artifact inputs do not exactly match the signed target set");
     }
     for release in &releases {
+        manifest_policy::require_publishable(
+            &release.product,
+            &release.version.to_string(),
+            &release.manifest_schema,
+        )?;
         if release.source_commit.as_deref() != Some(arguments.source_commit.as_str()) {
             bail!("release manifest source commit does not match the expected source");
         }
@@ -2096,6 +2102,21 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    read_bounded_file_with_origin(path, limit, InputOrigin::External)
+}
+
+#[derive(Clone, Copy)]
+enum InputOrigin {
+    External,
+    ControlledBuild,
+}
+
+// Only the constructor's private Cargo target tree uses ControlledBuild. Cargo
+// normally hard-links final executables to release/deps; those bytes are copied
+// into new single-link release files before signing or publication.
+fn read_bounded_file_with_origin(path: &Path, limit: u64, origin: InputOrigin) -> Result<Vec<u8>> {
+    #[cfg(not(unix))]
+    let _ = origin;
     if !path.is_absolute() || limit == 0 {
         bail!("release input path or bound is invalid");
     }
@@ -2113,7 +2134,7 @@ fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
         bail!("release input has unsafe filesystem authority");
     }
     #[cfg(unix)]
-    if metadata.nlink() != 1 {
+    if matches!(origin, InputOrigin::External) && metadata.nlink() != 1 {
         bail!("release input must have exactly one filesystem link");
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -2125,6 +2146,28 @@ fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
         bail!("release input changed while being read");
     }
     Ok(bytes)
+}
+
+#[cfg(all(test, unix))]
+mod input_link_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_build_links_do_not_relax_external_input_or_symlink_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("artifact");
+        fs::write(&artifact, b"built bytes").unwrap();
+        fs::hard_link(&artifact, root.path().join("cargo-alias")).unwrap();
+        assert!(read_bounded_file(&artifact, 100).is_err());
+        assert_eq!(
+            read_bounded_file_with_origin(&artifact, 100, InputOrigin::ControlledBuild).unwrap(),
+            b"built bytes"
+        );
+        assert!(read_bounded_file_with_origin(&artifact, 1, InputOrigin::ControlledBuild).is_err());
+        let link = root.path().join("symlink");
+        std::os::unix::fs::symlink(&artifact, &link).unwrap();
+        assert!(read_bounded_file_with_origin(&link, 100, InputOrigin::ControlledBuild).is_err());
+    }
 }
 
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {

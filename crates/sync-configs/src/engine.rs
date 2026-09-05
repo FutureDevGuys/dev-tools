@@ -157,6 +157,14 @@ pub fn execute_observed(
     cli: &Cli,
     observed_profiles: &mut Vec<String>,
 ) -> Result<RunOutput, EngineError> {
+    execute_observed_with_run_id(cli, observed_profiles, None)
+}
+
+pub(crate) fn execute_observed_with_run_id(
+    cli: &Cli,
+    observed_profiles: &mut Vec<String>,
+    run_id: Option<&str>,
+) -> Result<RunOutput, EngineError> {
     if cli.print_example {
         if let Ok(path_context) = PathContext::from_current_environment() {
             if let Ok(profiles) = resolve_profiles(cli, &path_context) {
@@ -184,7 +192,7 @@ pub fn execute_observed(
         return validate_request(cli, &loaded).map(RunOutput::Validation);
     }
 
-    converge(cli, loaded).map(RunOutput::Convergence)
+    converge(cli, loaded, run_id).map(RunOutput::Convergence)
 }
 
 fn validate_request(cli: &Cli, loaded: &LoadedRequest) -> Result<Report, EngineError> {
@@ -289,7 +297,7 @@ fn load_request(
     })
 }
 
-fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
+fn converge(cli: &Cli, loaded: LoadedRequest, run_id: Option<&str>) -> Result<Report, EngineError> {
     crate::interrupt::check()?;
     check_state_preconditions(&loaded.manifest)?;
 
@@ -318,7 +326,13 @@ fn converge(cli: &Cli, loaded: LoadedRequest) -> Result<Report, EngineError> {
         config_dir,
         HookShell::current()?,
         hook_mode,
-    )?;
+    )?
+    .with_context(crate::hooks::HookContext::new(
+        loaded.manifest.path.clone(),
+        &loaded.profiles,
+        run_id,
+        loaded.path_context.clone(),
+    ));
     hooks.validate_privileged_authority()?;
 
     // Privileged entry planning resolves identities and snapshots every target

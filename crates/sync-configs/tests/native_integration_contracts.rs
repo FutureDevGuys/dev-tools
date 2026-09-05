@@ -390,6 +390,32 @@ fn successful_hooks_and_aborting_pre_hook_follow_runtime_contract() {
 }
 
 #[test]
+fn hooks_receive_selected_profiles_and_owned_metadata() {
+    let sandbox = Sandbox::new();
+    sandbox.write("source.txt", "payload");
+    sandbox.write("metadata.sh", "set -eu\ntest \"$SYNC_CONFIGS_HOOK_API_VERSION\" = 1\ntest \"$SYNC_CONFIGS_ACTIVE_PROFILES\" = desktop,linux\ntest \"$SYNC_CONFIGS_ENTRY_NAME\" = metadata\ntest \"$SYNC_CONFIGS_ENTRY_MODE\" = copy\ntest \"$SYNC_CONFIGS_HOOK_PHASE\" = \"$1\"\nif [ \"$1\" = pre ]; then test -z \"${SYNC_CONFIGS_ENTRY_CONVERGENCE+x}\"; else test \"$SYNC_CONFIGS_ENTRY_CONVERGENCE\" = changed; fi\ntest -z \"${SYNC_CONFIGS_RUN_ID+x}\"\n");
+    let manifest = sandbox.manifest("entries:\n  - name: metadata\n    profiles: [desktop]\n    source: ./source.txt\n    target: ./out.txt\n    mode: copy\n    pre_script: /bin/sh metadata.sh pre\n    post_script: /bin/sh metadata.sh post\n    post_script_on_fail: abort\n");
+    let output = sync_configs_command(&sandbox)
+        .args(["--log-style", "off", "--config"])
+        .arg(manifest)
+        .args([
+            "--profile",
+            "desktop",
+            "--profile",
+            "linux",
+            "--profile",
+            "desktop",
+        ])
+        .env("SYNC_CONFIGS_ACTIVE_PROFILES", "spoofed")
+        .env("SYNC_CONFIGS_RUN_ID", "spoofed")
+        .env("SYNC_CONFIGS_ENTRY_CONVERGENCE", "spoofed")
+        .output()
+        .expect("execute hooks");
+    assert_success(&output);
+    assert!(sandbox.path().join("out.txt").exists());
+}
+
+#[test]
 fn dry_run_is_read_only_end_to_end() {
     let sandbox = Sandbox::new();
     let manifest = hook_fixture(&sandbox, false);
@@ -399,6 +425,26 @@ fn dry_run_is_read_only_end_to_end() {
     assert!(!sandbox.path().join("generated.txt").exists());
     assert!(!sandbox.path().join("post.marker").exists());
     assert!(!sandbox.path().join("output/target.txt").exists());
+}
+
+#[test]
+fn hook_run_identity_matches_the_diagnostic_run_without_logging_metadata_values() {
+    let sandbox = Sandbox::new();
+    sandbox.write("source.txt", "payload");
+    let manifest = sandbox.manifest("entries:\n  - name: metadata\n    source: ./source.txt\n    target: ./out.txt\n    mode: copy\n    pre_script: 'test -z \"$SYNC_CONFIGS_ACTIVE_PROFILES\" && printf %s \"$SYNC_CONFIGS_RUN_ID\" > hook-run-id'\n");
+    let output = sync_configs_command(&sandbox)
+        .args(["--log-style", "events", "--config"])
+        .arg(manifest)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let id = fs::read_to_string(sandbox.path().join("hook-run-id")).unwrap();
+    let run = sandbox.path().join("logs").join(&id);
+    let metadata: Value = serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+    assert_eq!(metadata["run_id"], id);
+    let events = fs::read_to_string(run.join("events.jsonl")).unwrap();
+    assert!(!events.contains("SYNC_CONFIGS_"));
+    assert!(!events.contains(&sandbox.path().display().to_string()));
 }
 
 #[test]

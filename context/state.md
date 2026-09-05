@@ -1,6 +1,8 @@
 # Active work
 
-- Publish the registry-ready shared Rust crates in dependency order through an authenticated crates.io release operation, record the exact versions and registry checksums, and only then replace Syscfg's non-production exact-Git compatibility probe with the registry dependency.
+- Release and install native sync-configs with the additive pre/post hook metadata contract before downstream profile-aware hooks depend on it; complete full consumer repeat convergence after activation.
+- Retire the version-bound Dev Auth 0.3.11 legacy-manifest constructor after its bootstrap window; retain only the explicit receipt/rollback verification compatibility required by supported installations.
+- Publish the signed first shared-crate batch under `/home/rashino/.cache/dev-tools-registry-staging/shared-46066ec.eRFZhD` from clean source `46066ec96d2e527c397d2e197a39d9955fa6a485`; private bootstrap-token input remains required. Then package/sign/publish dependent shared crates in registry-visible dependency order, verify exact registry checksums, replace the downstream exact-Git probe, configure Trusted Publishing, and revoke the bootstrap token.
 - Use the admitted operation-only release path to rebuild, publish, install, and accept Update All 0.1.6 generation 7 and native sync-configs 0.2.0 generation 14 from the final merged source; the earlier `acd45e4` artifacts are superseded and must not be published.
 - Run the current Syscfg manifest through installed native sync-configs twice and require the second pass to perform no configuration mutations or unnecessary authentication.
 - Replace Update All's optional Python `package_authority` bridge only after Syscfg owns and accepts an equivalent native package catalog/executor; until then the bridge is a known temporary violation of the public/private dependency boundary and must not gain new behavior.

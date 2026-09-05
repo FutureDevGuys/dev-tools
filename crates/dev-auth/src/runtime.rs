@@ -3206,26 +3206,16 @@ fn validated_agent_socket(
     required: bool,
 ) -> Result<Option<PathBuf>> {
     let value = std::env::var_os(variable).map(PathBuf::from);
-    let Some(socket) = value else {
-        if required {
-            bail!("configured workload capability has no broker SSH agent socket");
-        }
+    let expected = crate::broker_agent::agent_socket_path(
+        active.mode,
+        active.owner_uid,
+        &active.session_id,
+        purpose,
+    );
+    let Some(socket) = select_admitted_agent_socket(value, expected, required)? else {
         return Ok(None);
     };
-    if !required {
-        bail!("workload environment exposes an undeclared broker SSH agent");
-    }
     let execution_uid = nix::unistd::Uid::effective().as_raw();
-    if socket
-        != crate::broker_agent::agent_socket_path(
-            active.mode,
-            active.owner_uid,
-            &active.session_id,
-            purpose,
-        )
-    {
-        bail!("broker SSH agent socket does not match the admitted session");
-    }
     let metadata = fs::symlink_metadata(&socket).context("inspect broker SSH agent socket")?;
     if !metadata.file_type().is_socket()
         || metadata.file_type().is_symlink()
@@ -3235,6 +3225,54 @@ fn validated_agent_socket(
         bail!("broker SSH agent socket has unsafe authority");
     }
     Ok(Some(socket))
+}
+
+#[cfg(target_os = "linux")]
+fn select_admitted_agent_socket(
+    value: Option<PathBuf>,
+    expected: PathBuf,
+    required: bool,
+) -> Result<Option<PathBuf>> {
+    let Some(socket) = value else {
+        if required {
+            // The verified broker session, not inherited environment, owns
+            // this location. The caller still validates the socket's custody.
+            return Ok(Some(expected));
+        }
+        return Ok(None);
+    };
+    if !required {
+        bail!("workload environment exposes an undeclared broker SSH agent");
+    }
+    if socket != expected {
+        bail!("broker SSH agent socket does not match the admitted session");
+    }
+    Ok(Some(socket))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn admitted_agent_socket_does_not_require_environment_authority() {
+    let expected = PathBuf::from("/run/dev-auth/workloads/1000/session/signing.sock");
+    assert_eq!(
+        select_admitted_agent_socket(None, expected.clone(), true).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        select_admitted_agent_socket(Some(expected.clone()), expected.clone(), true).unwrap(),
+        Some(expected.clone())
+    );
+    assert!(select_admitted_agent_socket(
+        Some(PathBuf::from("/tmp/foreign.sock")),
+        expected.clone(),
+        true
+    )
+    .is_err());
+    assert!(select_admitted_agent_socket(Some(expected.clone()), expected.clone(), false).is_err());
+    assert_eq!(
+        select_admitted_agent_socket(None, expected, false).unwrap(),
+        None
+    );
 }
 
 #[cfg(target_os = "linux")]
