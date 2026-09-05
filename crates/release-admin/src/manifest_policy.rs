@@ -1,21 +1,6 @@
-//! Product-owned, one-release signer bootstrap. Not a shared trust primitive.
+//! Product-owned verification compatibility for the published signer bootstrap.
 use anyhow::{bail, Result};
-use dev_tools_release::ProductManifestSpec;
-
-pub(super) fn construct(spec: &ProductManifestSpec) -> Result<Vec<u8>> {
-    let bytes = dev_tools_release::build_unsigned_product_manifest(spec)?;
-    if spec.product != "dev-auth" || spec.version != "0.3.11" {
-        return Ok(bytes);
-    }
-    if spec.artifacts.len() != 1 {
-        bail!("Dev Auth signer bootstrap requires exactly one target");
-    }
-    let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
-    document["schema"] = "dev-auth-product-v2".into();
-    let bytes = serde_jcs::to_vec(&document)?;
-    dev_tools_release::validate_unsigned_product_manifest(&bytes)?;
-    Ok(bytes)
-}
+pub(super) use dev_tools_release::build_unsigned_product_manifest as construct;
 
 pub(super) fn accepted_schemas(product: &str) -> Vec<String> {
     let mut schemas = vec!["dev-tools-product-v2".into()];
@@ -38,7 +23,7 @@ pub(super) fn require_publishable(product: &str, version: &str, schema: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dev_tools_release::ManifestArtifact;
+    use dev_tools_release::{ManifestArtifact, ProductManifestSpec};
 
     #[test]
     fn legacy_publication_is_limited_to_exact_bootstrap_identity() {
@@ -55,9 +40,9 @@ mod tests {
     }
 
     #[test]
-    fn only_dev_auth_0311_uses_the_source_bound_bootstrap_format() {
+    fn construction_never_emits_the_retired_bootstrap_format() {
         for (product, version, schema) in [
-            ("dev-auth", "0.3.11", "dev-auth-product-v2"),
+            ("dev-auth", "0.3.11", "dev-tools-product-v2"),
             ("dev-auth", "0.3.12", "dev-tools-product-v2"),
             ("dev-auth", "0.3.10", "dev-tools-product-v2"),
             ("update-all", "0.3.11", "dev-tools-product-v2"),

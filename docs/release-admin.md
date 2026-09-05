@@ -1,6 +1,6 @@
 # Release Admin
 
-The only legacy-format construction/publication exception is exact Dev Auth `0.3.11`, whose source-bound `dev-auth-product-v2` manifest lets the installed operation-only signer authenticate its replacement. All other new binary releases use shared product v2. The version-bound bootstrap and its removal condition are specified in [ADR 0003](adr/0003-native-release-administration-and-separated-authority.md); there is no general schema-downgrade option.
+All binary manifest construction uses shared `dev-tools-product-v2`. Verification and idempotent publication retain the exact already-published Dev Auth `0.3.11` source-bound `dev-auth-product-v2` exception; there is no legacy constructor or general schema-downgrade option. The bounded compatibility contract is specified in [ADR 0003](adr/0003-native-release-administration-and-separated-authority.md).
 
 `release-admin` is the standalone native authority coordinator for Dev Tools releases. It is compiled from the same focused Rust release, installation, product, and command foundations as the products it administers; it does not invoke repository Python tooling or accept ambient publication credentials.
 

@@ -48,7 +48,7 @@ New product releases use a canonical source-bound manifest that may contain mult
 
 ## Common result contract
 
-ADR 0003 defines the sole construction/publication exception during signer bootstrap: exact Dev Auth `0.3.11` uses the historical source-bound Dev Auth v2 format. This exception preserves cryptographic source/artifact binding and does not authorize other legacy-format releases.
+ADR 0003 defines verification and idempotent publication compatibility for the existing exact Dev Auth `0.3.11` source-bound Dev Auth v2 release. All manifest construction uses shared product v2; compatibility never authorizes another legacy-format release or reissuing accepted bytes.
 
 Machine-readable common operations use `dev-tools-operation-result-v1`. The result identifies the product, operation, outcome, changed state, process exit category, fixed value-free error kind, managed or external installation state, cache freshness, and installed or available versions when applicable.
 
@@ -70,6 +70,7 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | `dev-tools-installation` | Receipts, immutable versions, aliases, locks, journals, repair, rollback, and owned uninstall. |
 | `dev-tools-command` | Bounded direct process execution and prepared-command execution. |
 | `dev-tools-privilege` | One-shot typed privileged-operation authorization. |
+| `dev-tools-privilege-session` (planned) | Workload-bound lease lifecycle, bounded authority delegation, expiry, revocation, and native containment contracts. |
 | `dev-tools-secret` | Provider-neutral secret identifiers, operation capabilities, bounded cancellation contexts, zeroizing material, and value-free failures. |
 | `dev-tools-reconcile-protocol` | Typed external reconciliation documents. |
 
@@ -87,9 +88,9 @@ Managed mutation uses receipts, serialized locks, crash journals, atomic activat
 
 Authority-bearing schemas deny unknown fields, identify their schema and capability requirements, and fail before mutation when a required capability is absent. Migrations are monotonic, journaled when they mutate authority, and preserve the last authenticated rollback candidate until the documented acceptance window ends. Compatibility code declares its owner, supported source versions, rollback window, and executable removal condition.
 
-External processes use direct native argv, an explicit executable authority, controlled environment and working directory, closed or explicitly selected standard input, bounded output, timeout, cancellation, and owned-process cleanup. Shell interpretation is permitted only for an explicit user-owned hook or a shell-language output whose purpose is the shell itself.
+External processes use direct native argv, an explicit executable authority, controlled environment and working directory, closed or explicitly selected standard input, bounded output, timeout, cancellation, and owned-process cleanup. Shell interpretation is permitted only for an explicit user-owned hook, an acknowledged policy-permitted pinned-shell binding or administrator session under ADR 0004, or a shell-language output whose purpose is the shell itself.
 
-Release authenticity does not grant privilege. Privileged behavior uses typed operations and identity-validated helpers; generic root command, arbitrary write, shell, password, or ambient `PATH` capability is prohibited.
+Release authenticity does not grant privilege. Ordinary product helpers use typed operations and identity-validated helpers and expose no generic root command, arbitrary write, shell, password, or ambient `PATH` capability. ADR 0004 defines the separate explicitly approved Dev Auth administrator-session tiers, including a root/admin-equivalent unrestricted exception. That exception never widens ordinary setup, configuration reconciliation, update, or release authority. No tier stores passwords or refreshes global sudo timestamps.
 
 ## Dependencies, performance, and platform support
 

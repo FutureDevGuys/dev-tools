@@ -3,32 +3,40 @@ authority: canonical
 owner: dev-tools
 ---
 
-# ADR 0004: Typed privilege operations and plan bundles
+# ADR 0004: One-shot authorization and bounded administrator sessions
 
 status: proposed
 verification: pending
 
 ## Context
 
-Several products need bounded privileged effects. Reusing ambient sudo timestamps or introducing a general root broker would make authorization broader than the work the user approved and would not translate safely across operating systems.
+Standalone products need bounded privileged effects, while an operator may deliberately authorize a wider workload. Reusing ambient sudo timestamps confuses these authorities and does not translate safely across operating systems. The distinction between an exact invocation and a restriction on that invocation's effects must remain visible.
 
 ## Decision
 
-The mandatory primitive authorizes one typed operation against one absolute identity-validated helper. A later optional plan-bundle session may authorize multiple fully prepared typed plans under one visible approval. A bundle binds plan and helper digests, caller operating-system identity, product and operation audiences, protocol versions, use limits, and expiry. It is memory-only, nonrenewable, and revocable.
+`dev-tools-privilege` authorizes one typed operation against one absolute identity-validated helper. `dev-tools-privilege-session` owns the separate product-neutral lease lifecycle; products compile the shared implementation and own their policy and narrow helpers. Neither primitive requires a sibling product at runtime. Dev Auth exposes explicit administrator sessions for user-selected work, not an expansion of ordinary setup or update authority.
 
-Default bundle lifetime is 15 minutes idle and two hours hard. Administrative policy may lower either value or explicitly raise the hard limit to at most eight hours. An admitted operation may finish after expiry, but no new operation may begin. Unplanned work requires new approval.
+A lease binds native caller and retained workload identity, product and operation audiences, helper and plan identities, resource scope, use limits, and idle and hard expiry. The tiers are `typed`, `exact-plan`, and `unrestricted`. Typed authority admits only product-defined operations. Exact-plan authority admits only the approved executable graph and streams; its approval discloses broad-effect executables and interpreters rather than implying that fixed argv constrains all resulting effects. Unrestricted authority requires separate administrator-policy permission and visible native approval and is explicitly root/admin-equivalent.
+
+Default lifetime is 30 minutes idle and two hours hard. Administrative policy may lower either value or explicitly raise the hard limit to at most eight hours. Time accounting is monotonic and includes suspension where the native contract requires it. Only accepted useful activity resets idle time. Polling, heartbeats, and delegation never extend hard expiry. Leases are memory-only and broker restart invalidates them.
+
+Expiry and revocation deny new admissions, recursively invalidate descendant authority, cancel managed commands, permit bounded cleanup, and then force termination and join through the retained native boundary. Failure to prove cleanup is a failure outcome, not successful revocation. A delegated lease can only narrow authority, lifetime, and the parent's conserved use budget. Attaching authority to an arbitrary existing PID is prohibited.
+
+Executable plans use a bounded DAG with exact native argv, environment and working-directory policy, run-as identity, binary-safe pipes, explicit stdin/output modes, PTY or ConPTY, output limits, cancellation, and `last`, `all`, or `pipefail` exit aggregation. Shell interpretation exists only for explicitly approved pinned-shell or unrestricted work. An optional same-name sudo binding preserves native passthrough outside an eligible lease; it does not implement sudo grammar or turn a typed lease into arbitrary administrator authority.
 
 ## Invariants
 
-- There is no generic root command, arbitrary write, shell, password, or unrestricted filesystem capability.
+- Ordinary product helpers expose no arbitrary root command, write, shell, or filesystem capability. The separately approved unrestricted Dev Auth tier is the explicit exception, never an implicit fallback.
+- No tier handles passwords, refreshes global sudo timestamps, trusts environment variables as authority, or exposes an unauthenticated root endpoint.
 - Release authenticity and privilege authorization are independent.
 - Each product owns a narrow receipt-bound helper and can operate without a separate broker product.
-- Logout, authority loss, helper replacement, revocation, or policy change ends a bundle.
+- Logout, authority loss, helper replacement, revocation, or policy change invalidates the affected lease and starts cleanup.
+- Revocation cannot undo completed privileged effects or guarantee containment against a malicious administrator who disables enforcement. This limitation is disclosed before unrestricted approval.
 
 ## Verification
 
-Contract tests cover exact-plan admission, replay, audience confusion, identity replacement, expiry, use exhaustion, revocation, interruption, crash recovery, unplanned operations, and value-free audit output. Each platform backend additionally proves native caller identity and helper custody.
+Contract tests cover all tiers, exact-plan admission, replay, audience confusion, identity replacement, idle/hard expiry, suspension, use exhaustion, delegated-budget conservation, recursive revocation, binary pipelines, terminal streams, interruption, broker crashes, cleanup failure, and value-free audit output. Each platform backend additionally proves native caller identity, helper custody, and retained process containment before exposing session operations.
 
 ## Runtime acceptance
 
-Linux, macOS, and Windows are accepted separately through their native approval and IPC boundaries. No platform claim follows from another platform's tests or a cross-compiled binary.
+Linux, macOS, Windows, and WSL2 are accepted separately through their native approval, IPC, process, and filesystem boundaries. Linux uses retained pidfds and directly managed cgroup v2; systemd, OpenRC, runit, and s6 are service adapters rather than identity authority. WSL admission does not grant Windows authority. Native host access, signing identities, and required entitlements are acceptance prerequisites. No platform claim follows from another platform's tests or a cross-compiled binary.

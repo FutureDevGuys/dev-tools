@@ -20,12 +20,15 @@ Provider adapters own provider authentication and protocol behavior. Products ow
 
 Exportable reads and operation-only authority are distinct capabilities. A provider may return an explicitly exportable value to a trusted product, return public material, or perform a cryptographic operation without exposing the private key. Products must reject an operation that policy or provider capabilities do not authorize.
 
+Dev Auth administrator policy binds logical names to provider authentication slots, opaque references, purposes, native users, profiles, and projection rights. User configuration can only narrow these bindings. `secret read` deliberately exports only an authorized exportable value to the selected output; `secret public` returns public material; `secret exec` projects approved values into a retained child through stdin, descriptors or handles, private ephemeral files, or an explicitly permitted environment overlay. Projection lifecycle, cancellation, and cleanup are owned by the product, not by provider output or caller-supplied shell text. Operation-only GitHub App, host-authentication, SSH-signing, and release-signing private keys cannot be selected for export or projection.
+
 ## Invariants
 
 - Secret material is bounded, non-cloneable, non-debuggable, non-serializable, and zeroized on drop.
 - Provider-native references are opaque outside the trusted adapter boundary and never appear in shared diagnostics.
 - One trusted adapter operation retains one process-local absolute deadline and cancellation signal across every provider stage; a stage does not reset the authority window. The context is not serialized or delegated as authority. When an adapter uses a child process, the parent derives its bounded child timeout from the remaining absolute budget, retains cancellation, and owns terminalization.
 - Shared errors communicate only a fixed category. Provider output and secret-bearing context do not become diagnostics.
+- Secret literals never enter CLI arguments, authority documents, plans, receipts, or diagnostics. An explicitly permitted environment projection is confined to its approved child and is documented as observable within the relevant native trust boundary; it is not an ambient authentication source.
 - A product may compile an adapter into its standalone binary, but no product invokes another product to access a secret provider.
 
 ## Verification
