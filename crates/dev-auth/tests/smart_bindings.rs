@@ -4,7 +4,7 @@ use dev_auth::smart_binding::{
     advance_binding, build_binding_plan, canonical_binding_plan, classify_binding_change,
     default_proxy_directories, require_automatic_refresh, resolve_continuation,
     validate_binding_receipt_structure, write_binding_plan, BindingAuthority, BindingChange,
-    BindingIntent, BindingMode, BindingPlanChange, BindingReceipt,
+    BindingIntent, BindingMode, BindingPlanChange, BindingReceipt, BindingTargetIntent,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -293,4 +293,82 @@ fn cli_discovers_and_plans_the_current_continuation_without_mutation() {
     assert_eq!(result["sha256"].as_str().unwrap().len(), 64);
     assert!(plan.is_file());
     assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
+}
+
+#[test]
+fn structured_plans_bind_the_declared_executable_and_argument_position() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    executable(&bin.join("agent"), b"wrapper");
+    let path = std::env::join_paths([&bin]).unwrap();
+    let resolved = resolve_continuation("agent", &path, &[]).unwrap();
+    let intent = BindingIntent::structured(
+        "agent",
+        "automation",
+        &resolved.canonical_path,
+        ["--mode", "batch"],
+    )
+    .unwrap();
+    assert!(build_binding_plan("binding", intent.clone(), resolved.clone(), None).is_ok());
+    let mut substituted = intent.clone();
+    if let BindingTargetIntent::Structured { executable, .. } = &mut substituted.target {
+        *executable = root.path().join("different-executable");
+    }
+    assert!(
+        build_binding_plan("binding", substituted, resolved.clone(), None).is_err(),
+        "structured target cannot differ from the pinned executable"
+    );
+    let mut invalid_position = intent;
+    if let BindingTargetIntent::Structured {
+        caller_argument_index,
+        ..
+    } = &mut invalid_position.target
+    {
+        *caller_argument_index = 3;
+    }
+    assert!(build_binding_plan("binding", invalid_position, resolved, None).is_err());
+}
+
+#[test]
+fn pinned_shell_cannot_be_planned_without_its_source_and_policy_custody() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    executable(&bin.join("agent"), b"wrapper");
+    let path = std::env::join_paths([&bin]).unwrap();
+    let resolved = resolve_continuation("agent", &path, &[]).unwrap();
+    let mut intent = BindingIntent::continuation("agent", "automation").unwrap();
+    intent.target = BindingTargetIntent::PinnedShell {
+        shell: resolved.canonical_path.clone(),
+        source_sha256: "a".repeat(64),
+    };
+    assert!(build_binding_plan("binding", intent, resolved, None).is_err());
+}
+
+#[test]
+fn discovery_rejects_a_symlink_to_fifo_without_blocking() {
+    use dev_tools_command::run_prepared_bounded_command;
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fifo = root.path().join("fifo");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    symlink(&fifo, bin.join("agent")).unwrap();
+    let result = run_prepared_bounded_command(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["workload", "bind", "discover", "agent", "--json"])
+            .env("PATH", &bin),
+        Duration::from_secs(5),
+        4096,
+    )
+    .expect("discovery must reject special files without waiting for a writer");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
 }

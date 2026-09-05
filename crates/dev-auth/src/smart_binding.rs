@@ -520,6 +520,25 @@ fn validate_intent_resolution_structure(
     if resolved.identity.canonical_path != resolved.canonical_path {
         bail!("resolved command identity does not match its canonical path");
     }
+    match &intent.target {
+        BindingTargetIntent::Continuation => {}
+        BindingTargetIntent::Structured {
+            executable,
+            argv_prefix,
+            caller_argument_index,
+        } => {
+            require_absolute_normal_path(executable, "structured binding executable")?;
+            if executable != &resolved.canonical_path {
+                bail!("structured binding executable does not match its pinned identity");
+            }
+            if *caller_argument_index > argv_prefix.len() {
+                bail!("structured binding caller position is outside its fixed arguments");
+            }
+        }
+        BindingTargetIntent::PinnedShell { .. } => {
+            bail!("pinned-shell planning requires source custody and explicit policy permission; this planning contract does not support it");
+        }
+    }
     let continuation_entries = std::env::split_paths(&resolved.continuation_path)
         .map(|entry| {
             require_absolute_normal_path(&entry, "continuation search path entry")?;
@@ -729,5 +748,7 @@ pub fn default_proxy_directories() -> Result<Vec<PathBuf>> {
 
 #[cfg(unix)]
 fn libc_no_follow() -> i32 {
-    nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC
+    // Inspect the opened file type before reading. Without nonblocking mode, a
+    // symlink-resolved FIFO can wait for a writer before metadata rejects it.
+    nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK
 }
