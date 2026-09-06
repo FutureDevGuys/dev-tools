@@ -14,7 +14,9 @@ use std::time::Duration;
 
 mod https;
 mod stream;
-pub use https::{canonical_https_host, probe_https_location, resolve_https_reference};
+pub use https::{
+    canonical_https_host, probe_https_location, resolve_https_reference, HttpsAdmissionFailure,
+};
 pub use stream::{fetch_artifact_to_staging, ArtifactTransferError, ArtifactTransferErrorKind};
 
 use dev_tools_installation::{

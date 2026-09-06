@@ -772,7 +772,10 @@ fn https_transport_rejects_untrusted_origins_before_network_access() {
         user_agent: "dev-tools-release-test".into(),
     };
     assert!(fetch_https("http://api.github.com/releases", &policy, 1024, None).is_err());
-    assert!(fetch_https("https://example.invalid/releases", &policy, 1024, None).is_err());
+    let denied = fetch_https("https://example.invalid/releases", &policy, 1024, None).unwrap_err();
+    assert!(denied
+        .downcast_ref::<dev_tools_release::HttpsAdmissionFailure>()
+        .is_some());
     assert!(fetch_https("https://api.github.com/releases", &policy, 0, None).is_err());
     assert!(fetch_https(
         "https://api.github.com/releases",

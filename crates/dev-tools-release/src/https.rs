@@ -9,6 +9,19 @@ use url::Url;
 type HttpResponse = Response<ureq::Body>;
 const MAX_URL_BYTES: usize = 8192;
 
+/// Value-free URL or redirect admission rejection, distinguishable from an
+/// operational transport failure through `anyhow::Error::downcast_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpsAdmissionFailure;
+
+impl std::fmt::Display for HttpsAdmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HTTPS resource is outside the admitted authority")
+    }
+}
+
+impl std::error::Error for HttpsAdmissionFailure {}
+
 #[derive(Clone)]
 pub(super) struct ResponseLocation(pub String);
 
@@ -101,7 +114,7 @@ fn guarded_response_with_clock(
     mut now: impl FnMut() -> Instant,
 ) -> Result<HttpResponse> {
     validate_url_text(input)?;
-    let mut current = Url::parse(input).context("parse HTTPS request URL")?;
+    let mut current = Url::parse(input).map_err(|_| HttpsAdmissionFailure)?;
     let deadline = now()
         .checked_add(policy.timeout)
         .context("HTTPS deadline overflowed")?;
@@ -127,16 +140,14 @@ fn guarded_response_with_clock(
         let mut locations = response.headers().get_all("location").iter();
         let location = locations
             .next()
-            .context("HTTPS redirect has no location")?
+            .ok_or(HttpsAdmissionFailure)?
             .to_str()
-            .context("HTTPS redirect location is invalid")?;
+            .map_err(|_| HttpsAdmissionFailure)?;
         if locations.next().is_some() {
-            bail!("HTTPS redirect location is ambiguous");
+            bail!(HttpsAdmissionFailure);
         }
         validate_url_text(location)?;
-        current = current
-            .join(location)
-            .context("resolve HTTPS redirect location")?;
+        current = current.join(location).map_err(|_| HttpsAdmissionFailure)?;
         // This is checked again immediately before send; perform it here as
         // well so invalid metadata is not mistaken for an exhausted deadline.
         validate_url(&current, policy, limit)?;
@@ -152,17 +163,17 @@ fn validate_url_text(value: &str) -> Result<()> {
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
-        bail!("HTTPS URL is invalid or exceeds its size bound");
+        bail!(HttpsAdmissionFailure);
     }
     Ok(())
 }
 
 fn validate_url(url: &Url, policy: &HttpsPolicy, limit: u64) -> Result<()> {
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        bail!("HTTPS URL contains prohibited authority or fragment data");
+        bail!(HttpsAdmissionFailure);
     }
     validate_url_text(url.as_str())?;
-    validate_https_request(url.as_str(), policy, limit)
+    validate_https_request(url.as_str(), policy, limit).map_err(|_| HttpsAdmissionFailure.into())
 }
 
 #[cfg(test)]
@@ -554,6 +565,32 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status().as_u16(), status);
         }
+    }
+
+    #[test]
+    fn admission_errors_are_typed_and_value_free_without_reclassifying_io() {
+        for url in [
+            "https://untrusted.test/private-value",
+            "https://user:private-value@example.test/file",
+        ] {
+            let error = guarded_response(url, &policy(), 100, |_, _, _| {
+                panic!("inadmissible request reached transport")
+            })
+            .unwrap_err();
+            assert!(error.downcast_ref::<HttpsAdmissionFailure>().is_some());
+            assert!(!format!("{error:#}").contains("private-value"));
+        }
+        let error = guarded_response("https://example.test/file", &policy(), 100, |_, _, _| {
+            bail!("fixture transport unavailable")
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<HttpsAdmissionFailure>().is_none());
+        let error = guarded_response("https://example.test/file", &policy(), 100, |_, _, _| {
+            Ok(reply(302, Some("https://untrusted.test/private-value")))
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<HttpsAdmissionFailure>().is_some());
+        assert!(!format!("{error:#}").contains("private-value"));
     }
 
     #[test]

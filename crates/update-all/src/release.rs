@@ -30,7 +30,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use ureq::ResponseExt;
 use wait_timeout::ChildExt;
 
 const ENGINE_PROTOCOL: u32 = 1;
@@ -68,6 +67,17 @@ impl std::fmt::Display for ReleaseMutationBusy {
 }
 
 impl std::error::Error for ReleaseMutationBusy {}
+
+#[derive(Debug)]
+struct MetadataNotModified;
+
+impl std::fmt::Display for MetadataNotModified {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("release metadata was not modified")
+    }
+}
+
+impl std::error::Error for MetadataNotModified {}
 
 #[cfg(unix)]
 #[derive(Debug)]
@@ -1044,7 +1054,7 @@ fn fetch_cached(url: &str, cache: &Path, etag_path: &Path, limit: u64) -> Result
             }
             Ok(fetched.bytes)
         }
-        Err(err) if err.to_string().contains("not modified") && cache.is_file() => {
+        Err(err) if err.downcast_ref::<MetadataNotModified>().is_some() && cache.is_file() => {
             fs::read(cache).with_context(|| format!("read cached metadata {}", cache.display()))
         }
         Err(err) => Err(err),
@@ -1052,74 +1062,62 @@ fn fetch_cached(url: &str, cache: &Path, etag_path: &Path, limit: u64) -> Result
 }
 
 fn https_get(url: &str, etag: Option<&str>, limit: u64) -> Result<FetchResult> {
-    if !url.starts_with("https://") {
-        return integrity("release URL must use HTTPS");
-    }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .https_only(true)
-        .http_status_as_error(false)
-        .max_redirects(3)
-        .max_redirects_will_error(true)
-        .save_redirect_history(true)
-        .timeout_global(Some(Duration::from_secs(30)))
-        .user_agent(format!("update-all/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
-    let mut request = agent.get(url).header("Accept", accept_media_type(url));
-    if let Some(etag) = etag {
-        request = request.header("If-None-Match", etag);
-    }
-    let mut response = request.call().with_context(|| format!("GET {url}"))?;
-    if response.status().as_u16() == 304 {
-        bail!("not modified");
-    }
-    if !response.status().is_success() {
-        bail!("GET {url} returned HTTP {}", response.status());
-    }
-    if let Some(history) = response.get_redirect_history() {
-        for uri in history {
-            if uri.scheme_str() != Some("https")
-                || !allowed_release_host(uri.host().unwrap_or_default())
-            {
-                return integrity("release request traversed an untrusted redirect");
-            }
-        }
-    }
-    let final_host = response.get_uri().host().unwrap_or_default();
-    if !allowed_release_host(final_host) {
-        return integrity("release request redirected to an untrusted host");
-    }
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .with_context(|| format!("read bounded response from {url}"))?;
-    Ok(FetchResult { bytes, etag })
-}
-
-fn accept_media_type(url: &str) -> &'static str {
-    if url.starts_with("https://api.github.com/") {
-        "application/vnd.github+json"
-    } else {
-        "application/octet-stream"
-    }
-}
-
-fn allowed_release_host(host: &str) -> bool {
-    matches!(
-        host,
-        "api.github.com"
-            | "github.com"
-            | "objects.githubusercontent.com"
-            | "github-releases.githubusercontent.com"
-            | "release-assets.githubusercontent.com"
+    let validators = dev_tools_release::HttpsValidators {
+        etag: etag.map(str::to_owned),
+        last_modified: None,
+    };
+    let response = dev_tools_release::fetch_conditional_https(
+        url,
+        &release_https_policy(),
+        limit,
+        &validators,
     )
+    .map_err(|error| {
+        if error
+            .downcast_ref::<dev_tools_release::HttpsAdmissionFailure>()
+            .is_some()
+        {
+            anyhow::Error::from(IntegrityFailure(
+                "release HTTPS authority was rejected".into(),
+            ))
+        } else {
+            error
+        }
+    })?;
+    decode_release_response(response)
+}
+
+fn decode_release_response(
+    response: dev_tools_release::ConditionalHttpsResponse,
+) -> Result<FetchResult> {
+    match response {
+        dev_tools_release::ConditionalHttpsResponse::Modified { response, .. } => Ok(FetchResult {
+            bytes: response.bytes,
+            etag: response.etag,
+        }),
+        dev_tools_release::ConditionalHttpsResponse::NotModified { .. } => {
+            Err(MetadataNotModified.into())
+        }
+        _ => bail!("unsupported release HTTPS response"),
+    }
+}
+
+fn release_https_policy() -> dev_tools_release::HttpsPolicy {
+    dev_tools_release::HttpsPolicy {
+        allowed_hosts: [
+            "api.github.com",
+            "github.com",
+            "objects.githubusercontent.com",
+            "github-releases.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        max_redirects: 3,
+        timeout: Duration::from_secs(30),
+        user_agent: format!("update-all/{}", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 fn resolve_release_urls(product: Product) -> Result<(String, String)> {
@@ -2869,15 +2867,62 @@ mod tests {
     }
 
     #[test]
-    fn github_release_discovery_requests_json_while_assets_request_bytes() {
-        assert_eq!(
-            accept_media_type("https://api.github.com/repos/example/releases"),
-            "application/vnd.github+json"
+    fn release_https_rejects_unapproved_origin_before_connecting() -> Result<()> {
+        const CHILD: &str = "UPDATE_ALL_HTTPS_ADMISSION_TEST_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let mut child = Command::new(env::current_exe()?)
+                .args([
+                    "--exact",
+                    "release::tests::release_https_rejects_unapproved_origin_before_connecting",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .spawn()?;
+            let status = child.wait_timeout(Duration::from_secs(40))?;
+            if status.is_none() {
+                let _ = child.kill();
+                child.wait()?;
+            }
+            assert!(status.is_some_and(|status| status.success()));
+            return Ok(());
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("https://{}/release", listener.local_addr()?);
+        let error = match https_get(&url, None, METADATA_LIMIT) {
+            Ok(_) => bail!("unapproved origin was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<IntegrityFailure>().is_some());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "unapproved origin received a connection before rejection"
         );
-        assert_eq!(
-            accept_media_type("https://github.com/example/releases/download/tag/artifact"),
-            "application/octet-stream"
-        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_https_response_preserves_bytes_and_typed_cache_outcome() -> Result<()> {
+        let decoded =
+            decode_release_response(dev_tools_release::ConditionalHttpsResponse::Modified {
+                response: dev_tools_release::HttpsResponse {
+                    bytes: b"release bytes".to_vec(),
+                    etag: Some("\"identity\"".into()),
+                },
+                validators: dev_tools_release::HttpsValidators::default(),
+            })?;
+        assert_eq!(decoded.bytes, b"release bytes");
+        assert_eq!(decoded.etag.as_deref(), Some("\"identity\""));
+        let unchanged =
+            decode_release_response(dev_tools_release::ConditionalHttpsResponse::NotModified {
+                validators: dev_tools_release::HttpsValidators::default(),
+            });
+        assert!(unchanged
+            .err()
+            .is_some_and(|error| error.downcast_ref::<MetadataNotModified>().is_some()));
+        Ok(())
     }
 
     #[cfg(unix)]
