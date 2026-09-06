@@ -1649,7 +1649,16 @@ fn atomic_write(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("create {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2286,6 +2295,69 @@ mod tests {
         verified.version = Version::new(0, 1, 4);
         verified.manifest_generation = 6;
         assert!(validate_online_migration_window(Product::SkillsSync, &verified).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_metadata_cache_creates_private_installation_ancestors() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        const CHILD: &str = "UPDATE_ALL_PRIVATE_DIRECTORY_TEST_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "sh"])
+                .arg(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "release::tests::fresh_metadata_cache_creates_private_installation_ancestors",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+            let status = child.wait_timeout(Duration::from_secs(20)).unwrap();
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(status.is_some_and(|status| status.success()));
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        let product_root = existing.join("products/update-all");
+        let cache = product_root.join("cache/root.json");
+        atomic_write(&cache, b"{}", false).unwrap();
+
+        dev_tools_installation::ensure_owned_directory(
+            &product_root,
+            fs::metadata(root.path()).unwrap().uid(),
+            0o700,
+        )
+        .unwrap();
+        for path in [
+            existing.join("products"),
+            product_root,
+            cache.parent().unwrap().to_path_buf(),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        atomic_write(&cache, b"{}", false).unwrap();
+        assert_eq!(
+            fs::metadata(cache).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
