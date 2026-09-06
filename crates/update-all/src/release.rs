@@ -361,7 +361,9 @@ where
     }
     let (writer, mut state) = ReleaseStateWriter::begin(paths)?;
     #[cfg(unix)]
-    adopt_legacy_installation(product, paths, &mut state)?;
+    let recovered = adopt_legacy_installation(product, paths, &mut state)?;
+    #[cfg(not(unix))]
+    let recovered = false;
     let verified = fetch_manifest(product, paths, &writer)?;
     accept_manifest_metadata(&mut state, &verified)?;
     if activation_is_current(paths, &state, &verified)? {
@@ -370,9 +372,9 @@ where
         return Ok(Activation {
             product,
             version: Some(verified.manifest.version.clone()),
-            changed: false,
+            changed: recovered,
             managed: true,
-            outcome: "no_op".into(),
+            outcome: if recovered { "updated" } else { "no_op" }.into(),
             path: Some(version_binary(paths, &verified.manifest.version)),
         });
     }
@@ -390,7 +392,11 @@ where
     }
     let bytes = fetch_release_artifact(&verified.artifact)?;
     verify_artifact(&bytes, &verified.artifact)?;
-    let activation = activate(product, paths, &mut state, &verified, &bytes)?;
+    let mut activation = activate(product, paths, &mut state, &verified, &bytes)?;
+    if recovered {
+        activation.changed = true;
+        activation.outcome = "updated".into();
+    }
     state.last_successful_check_unix = Some(now_unix());
     writer.save(&state)?;
     Ok(activation)
@@ -1585,14 +1591,14 @@ fn adopt_legacy_installation(
     product: Product,
     paths: &Paths,
     state: &mut ReleaseState,
-) -> Result<()> {
+) -> Result<bool> {
     let layout = shared_installation_layout(product, paths)?;
     let receipt_present = path_entry_present(
         &paths.product_root.join("installation-receipt-v1.json"),
         "inspect installation receipt path",
     )?;
     if receipt_present {
-        repair_versioned_installation(&layout, |candidate| {
+        let report = repair_versioned_installation(&layout, |candidate| {
             let version = candidate
                 .parent()
                 .and_then(Path::file_name)
@@ -1600,19 +1606,22 @@ fn adopt_legacy_installation(
                 .context("installed candidate has no version directory")?;
             verify_candidate_health(product, candidate, version)
         })?;
-        return Ok(());
+        synchronize_installation_state(state, &report.receipt);
+        return Ok(report.changed);
     }
-    if path_entry_present(
+    let recovered = path_entry_present(
         &paths.product_root.join("installation-transition-v1.json"),
         "inspect installation transition path",
-    )? {
+    )?;
+    if recovered {
         if let Some(receipt) = inspect_versioned_installation(&layout)? {
             verify_candidate_health(
                 product,
                 &version_binary(paths, &receipt.active_version),
                 &receipt.active_version,
             )?;
-            return Ok(());
+            synchronize_installation_state(state, &receipt);
+            return Ok(true);
         }
     }
     let topology = observe_legacy_topology(product, paths)?;
@@ -1620,7 +1629,7 @@ fn adopt_legacy_installation(
         if topology.present {
             return managed_legacy_missing_authority();
         }
-        return Ok(());
+        return Ok(recovered);
     };
     if topology
         .version
@@ -1644,10 +1653,11 @@ fn adopt_legacy_installation(
         },
         version_pointer: paths.current.clone(),
     };
-    adopt_two_level_versioned_installation(&adoption, |candidate| {
+    let report = adopt_two_level_versioned_installation(&adoption, |candidate| {
         verify_candidate_health(product, candidate, version)
     })?;
-    Ok(())
+    synchronize_installation_state(state, &report.receipt);
+    Ok(recovered || report.changed)
 }
 
 #[cfg(unix)]
@@ -2261,6 +2271,127 @@ mod tests {
             public_binary: root.join("bin/update-all"),
             executable_name: "update-all".into(),
             product_root,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_installation_refreshes_state_without_false_noop_or_payload_fetch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Exercise the product orchestration, not just the shared report. The
+        // metadata boundary is already verified; payload retrieval must stay idle.
+        for (recovery, stale) in ["none", "alias", "committed", "uncommitted"]
+            .into_iter()
+            .flat_map(|recovery| [false, true].map(|stale| (recovery, stale)))
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = state_test_paths(temp.path());
+            let layout = shared_installation_layout(Product::UpdateAll, &paths).unwrap();
+            let mut receipts = Vec::new();
+            for version in ["1.0.0", "2.0.0"] {
+                let source = temp.path().join(format!("source-{version}"));
+                crate::test_support::write_executable(
+                    &source,
+                    &format!("#!/bin/sh\nprintf '%s\\n' 'update-all {version}'\n"),
+                )
+                .unwrap();
+                receipts.push(
+                    apply_versioned_installation(
+                        &VersionedInstallRequest {
+                            layout: layout.clone(),
+                            version: version.into(),
+                            identity: ArtifactIdentity::from_file(&source, ARTIFACT_LIMIT).unwrap(),
+                            source,
+                            aliases: vec!["update-all".into()],
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap()
+                    .receipt,
+                );
+            }
+            let journal = paths.product_root.join("installation-transition-v1.json");
+            if recovery == "alias" {
+                fs::remove_file(&paths.public_binary).unwrap();
+            } else if matches!(recovery, "committed" | "uncommitted") {
+                fs::write(
+                    &journal,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema": "dev-tools-versioned-transition-v1",
+                        "prior": receipts[0],
+                        "next": receipts[1]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+                if recovery == "uncommitted" {
+                    fs::write(
+                        paths.product_root.join("installation-receipt-v1.json"),
+                        serde_json::to_vec(&receipts[0]).unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+            let expected = &receipts[usize::from(recovery != "uncommitted")];
+            let verified = VerifiedManifest {
+                root_generation: 1,
+                root_sha256: "11".repeat(32),
+                manifest: ProductManifest {
+                    schema: "dev-tools-product-v2".into(),
+                    product: "update-all".into(),
+                    generation: 1,
+                    version: expected.active_version.clone(),
+                    engine_protocol: ENGINE_PROTOCOL,
+                    source_commit: Some("33".repeat(20)),
+                    artifacts: BTreeMap::new(),
+                },
+                artifact: Artifact {
+                    url: "https://github.com/fixture".into(),
+                    length: expected.active_identity.length,
+                    sha256: expected.active_identity.sha256.clone(),
+                },
+                manifest_sha256: "22".repeat(32),
+            };
+            let mut state = ReleaseState::default();
+            accept_manifest_metadata(&mut state, &verified).unwrap();
+            if stale {
+                state.active_version = Some("stale-active".into());
+                state.previous_version = Some("stale-previous".into());
+            } else {
+                synchronize_installation_state(&mut state, expected);
+            }
+            save_state(&paths, &state).unwrap();
+            for repeat in [false, true] {
+                let activation = update_managed_with_sources(
+                    Product::UpdateAll,
+                    &paths,
+                    |_, _, _| Ok(verified.clone()),
+                    |_| panic!("receipt-current recovery must not retrieve payload bytes"),
+                )
+                .unwrap();
+                let state = load_state(&paths).unwrap();
+                assert_eq!(
+                    state.active_version.as_deref(),
+                    Some(expected.active_version.as_str())
+                );
+                assert_eq!(state.previous_version, expected.previous_version);
+                assert_eq!(
+                    activation.changed,
+                    !repeat && recovery != "none",
+                    "{recovery}"
+                );
+                assert_eq!(
+                    activation.outcome,
+                    if activation.changed {
+                        "updated"
+                    } else {
+                        "no_op"
+                    }
+                );
+                assert!(!journal.exists());
+            }
         }
     }
 
