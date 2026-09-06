@@ -2,8 +2,8 @@
 
 use dev_tools_command::run_prepared_bounded_command_with_cancellation;
 use dev_tools_installation::{
-    apply_versioned_installation, versioned_v2, ArtifactIdentity, InstallationLock,
-    VersionedInstallRequest, VersionedLayout,
+    apply_versioned_installation, versioned_v2, ArtifactIdentity, DocumentAuthority,
+    InstallationLock, VersionedInstallRequest, VersionedLayout,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -231,7 +231,20 @@ fn exercise_legacy_writer(directory_fence: bool) {
                 "legacy checker did not prepare its state write",
             ))
         } else if directory_fence {
-            fs::create_dir(&state)
+            let authority = DocumentAuthority {
+                owner_uid: product.metadata().unwrap().uid(),
+                mode: 0o600,
+                limit: 1024,
+            };
+            dev_tools_installation::write_atomic_document(&state, successor, &authority, None)
+                .and_then(|_| {
+                    dev_tools_installation::retire_atomic_document(&state, &authority, false)
+                })
+                .map(|(changed, captured)| {
+                    assert!(changed);
+                    assert_eq!(captured.unwrap().bytes, successor);
+                })
+                .map_err(std::io::Error::other)
         } else {
             fs::OpenOptions::new()
                 .write(true)
@@ -261,6 +274,15 @@ fn exercise_legacy_writer(directory_fence: bool) {
                 trace.contains("EISDIR"),
                 "failure was not the state-path fence: {trace}"
             );
+            let authority = DocumentAuthority {
+                owner_uid: product.metadata().unwrap().uid(),
+                mode: 0o600,
+                limit: 1024,
+            };
+            let (changed, captured) =
+                dev_tools_installation::retire_atomic_document(&state, &authority, false).unwrap();
+            assert!(!changed);
+            assert_eq!(captured.unwrap().bytes, successor);
         } else {
             assert!(output.status.success(), "legacy check failed: {output:?}");
             let bytes = fs::read(&state).unwrap();

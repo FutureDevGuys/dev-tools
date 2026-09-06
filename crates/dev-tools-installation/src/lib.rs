@@ -10,6 +10,11 @@ use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(target_os = "linux")]
+mod document_retirement;
+#[cfg(target_os = "linux")]
+pub use document_retirement::retire_atomic_document;
+
+#[cfg(target_os = "linux")]
 mod directory_publication;
 #[cfg(target_os = "linux")]
 mod staging;

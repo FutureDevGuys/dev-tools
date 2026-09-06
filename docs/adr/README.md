@@ -32,6 +32,7 @@ Read the applicable records before changing a public product contract or cross-p
 | [0021](0021-linux-atomic-document-durability.md) | Linux atomic-document durability | proposed | pending |
 | [0022](0022-linux-public-regular-file-stdout.md) | Linux public regular-file stdout | proposed | pending |
 | [0023](0023-explicit-installation-protocol-cutover.md) | Explicit installation-protocol cutover | proposed | pending |
+| [0024](0024-linux-atomic-document-retirement.md) | Linux atomic-document retirement | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 
