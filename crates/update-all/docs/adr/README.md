@@ -25,6 +25,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0013](0013-five-shell-immutable-completion-activation.md) | Five-shell immutable completion activation | proposed | pending |
 | [0014](0014-bounded-run-retention.md) | Bounded run retention | proposed | pending |
 | [0015](0015-bounded-release-state-observation.md) | Bounded release-state observation | proposed | pending |
+| [0016](0016-serialized-release-mutation-admission.md) | Serialized release mutation admission | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

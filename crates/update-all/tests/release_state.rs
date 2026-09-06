@@ -39,3 +39,38 @@ fn standalone_status_preserves_absent_and_hostile_release_state() {
     assert!(!missing.exists());
     assert_eq!(fs::read_dir(&product).unwrap().count(), 1);
 }
+
+#[test]
+fn native_release_writer_excludes_mutations_but_not_status() {
+    let root = tempfile::tempdir().unwrap();
+    let product = root.path().join("state/dev-tools/products/update-all");
+    fs::create_dir_all(&product).unwrap();
+    fs::set_permissions(&product, fs::Permissions::from_mode(0o700)).unwrap();
+    let held =
+        dev_tools_installation::InstallationLock::acquire(&product.join("release-writer-v1.lock"))
+            .unwrap();
+    for operation in ["check", "install", "update", "rollback"] {
+        Command::new(assert_cmd::cargo::cargo_bin!("update-all"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("PATH", "/nonexistent")
+            .current_dir(root.path())
+            .args(["self", operation, "--json"])
+            .timeout(Duration::from_secs(5))
+            .assert()
+            .failure()
+            .stdout("")
+            .stderr(predicates::str::contains(
+                "another release mutation is active",
+            ));
+    }
+    status(root.path()).assert().success();
+    assert_eq!(fs::read_dir(&product).unwrap().count(), 1);
+    drop(held);
+    assert!(dev_tools_installation::InstallationLock::try_acquire(
+        &product.join("release-writer-v1.lock")
+    )
+    .unwrap()
+    .is_some());
+}

@@ -58,6 +58,17 @@ impl std::fmt::Display for UnsupportedSyncConfigsRuntime {
 
 impl std::error::Error for UnsupportedSyncConfigsRuntime {}
 
+#[derive(Debug)]
+struct ReleaseMutationBusy;
+
+impl std::fmt::Display for ReleaseMutationBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("another release mutation is active")
+    }
+}
+
+impl std::error::Error for ReleaseMutationBusy {}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct ManagedLegacyMissingAuthority;
@@ -283,6 +294,8 @@ fn check_for_runtime(product: Product, runtime: &RuntimeObservation) -> Result<C
 
 fn check_after_runtime_gate(product: Product) -> Result<Check> {
     let paths = Paths::resolve(product)?;
+    load_state(&paths)?;
+    let _release_lock = acquire_release_writer(&paths)?;
     let mut state = load_state(&paths)?;
     let verified = fetch_verified_manifest(product, &paths, &state)?;
     accept_manifest_metadata(&mut state, &verified)?;
@@ -324,8 +337,8 @@ where
     FetchManifest: FnOnce(Product, &Paths, &ReleaseState) -> Result<VerifiedManifest>,
     FetchArtifact: FnOnce(&Artifact) -> Result<Vec<u8>>,
 {
-    let mut state = match load_state(paths) {
-        Ok(state) => state,
+    match load_state(paths) {
+        Ok(_) => {}
         Err(error) => {
             #[cfg(unix)]
             if observe_legacy_topology(product, paths)?.present {
@@ -333,7 +346,9 @@ where
             }
             return Err(error);
         }
-    };
+    }
+    let _release_lock = acquire_release_writer(paths)?;
+    let mut state = load_state(paths)?;
     #[cfg(unix)]
     adopt_legacy_installation(product, paths, &mut state)?;
     let verified = fetch_manifest(product, paths, &state)?;
@@ -475,6 +490,14 @@ fn rollback_with_runtime_policy(
     runtime: Option<&RuntimeObservation>,
 ) -> Result<Activation> {
     let paths = Paths::resolve(product)?;
+    load_state(&paths)?;
+    #[cfg(unix)]
+    if product == Product::SyncConfigs
+        && runtime.is_some_and(|runtime| require_accepted_runtime(product, runtime).is_err())
+    {
+        preflight_restricted_rollback(product, &paths, runtime)?;
+    }
+    let _release_lock = acquire_release_writer(&paths)?;
     let mut state = load_state(&paths)?;
     #[cfg(unix)]
     {
@@ -491,19 +514,7 @@ fn rollback_with_runtime_policy(
             verify_candidate_health(product, candidate, version)
         };
         let report = if unsupported_runtime {
-            if path_entry_present(
-                &paths.product_root.join("installation-transition-v1.json"),
-                "inspect installation transition path",
-            )? {
-                return unsupported_sync_configs_runtime();
-            }
-            let receipt = read_versioned_installation_receipt(&layout)?
-                .ok_or(UnsupportedSyncConfigsRuntime)?;
-            let candidate = receipt
-                .previous_version
-                .as_deref()
-                .ok_or(UnsupportedSyncConfigsRuntime)?;
-            require_rollback_runtime(product, candidate, runtime)?;
+            preflight_restricted_rollback(product, &paths, runtime)?;
             rollback_versioned_installation_with_link_repair(&layout, verify_candidate)
         } else {
             adopt_legacy_installation(product, &paths, &mut state)?;
@@ -557,6 +568,28 @@ fn rollback_with_runtime_policy(
             path: Some(binary),
         })
     }
+}
+
+#[cfg(unix)]
+fn preflight_restricted_rollback(
+    product: Product,
+    paths: &Paths,
+    runtime: Option<&RuntimeObservation>,
+) -> Result<()> {
+    if path_entry_present(
+        &paths.product_root.join("installation-transition-v1.json"),
+        "inspect installation transition path",
+    )? {
+        return unsupported_sync_configs_runtime();
+    }
+    let receipt =
+        read_versioned_installation_receipt(&shared_installation_layout(product, paths)?)?
+            .ok_or(UnsupportedSyncConfigsRuntime)?;
+    let candidate = receipt
+        .previous_version
+        .as_deref()
+        .ok_or(UnsupportedSyncConfigsRuntime)?;
+    require_rollback_runtime(product, candidate, runtime)
 }
 
 pub(crate) fn maybe_auto_update() -> Result<Option<Activation>> {
@@ -1581,6 +1614,17 @@ fn load_state(paths: &Paths) -> Result<ReleaseState> {
     }
 }
 
+// Retained coordination identity: never unlink this file. The outer release
+// lease precedes installation locks and spans bounded product-owned retrieval
+// and health verification. Nonblocking admission prevents reentrant waiting.
+fn acquire_release_writer(paths: &Paths) -> Result<dev_tools_installation::InstallationLock> {
+    state_document_authority(paths)?;
+    dev_tools_installation::InstallationLock::try_acquire(
+        &paths.product_root.join("release-writer-v1.lock"),
+    )?
+    .ok_or_else(|| ReleaseMutationBusy.into())
+}
+
 fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::DocumentAuthority> {
     if !paths.state.is_absolute() || !paths.product_root.is_absolute() {
         bail!("release-state authority must be absolute");
@@ -1786,6 +1830,36 @@ mod tests {
             executable_name: "update-all".into(),
             product_root,
         }
+    }
+
+    #[test]
+    fn release_mutation_rejects_a_live_writer_before_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        create_private_dir(&paths.product_root).unwrap();
+        let _held = dev_tools_installation::InstallationLock::acquire(
+            &paths.product_root.join("release-writer-v1.lock"),
+        )
+        .unwrap();
+        let mut discovered = false;
+        let result = update_managed_with_sources(
+            Product::UpdateAll,
+            &paths,
+            |_, _, _| {
+                discovered = true;
+                bail!("fixture discovery reached")
+            },
+            |_| bail!("fixture artifact fetch reached"),
+        );
+        assert!(result
+            .unwrap_err()
+            .downcast_ref::<ReleaseMutationBusy>()
+            .is_some());
+        assert!(
+            !discovered,
+            "a competing release mutation must not enter discovery"
+        );
+        assert!(!paths.state.exists());
     }
 
     #[test]
