@@ -1,11 +1,14 @@
 use crate::IntegrityFailure;
+mod common;
 #[cfg(target_os = "linux")]
 mod protocol;
+
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(test)]
 use base64::Engine as _;
+pub(crate) use common::status as common_status;
 #[cfg(unix)]
 use dev_tools_installation::{
     adopt_two_level_versioned_installation, adopt_versioned_installation,

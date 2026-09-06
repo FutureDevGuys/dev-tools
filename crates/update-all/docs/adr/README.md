@@ -31,6 +31,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0019](0019-url-bound-metadata-cache.md) | URL-bound metadata cache | proposed | pending |
 | [0020](0020-bounded-candidate-health.md) | Bounded candidate health | proposed | pending |
 | [0021](0021-authenticated-product-state-cutover.md) | Authenticated product-state cutover | proposed | pending |
+| [0022](0022-common-local-update-observation.md) | Common local update observation | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

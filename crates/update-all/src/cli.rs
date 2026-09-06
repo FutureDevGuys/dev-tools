@@ -97,6 +97,8 @@ pub struct RunCli {
 
 #[derive(clap::Subcommand, Debug)]
 enum RunSubcommand {
+    /// Observe common update state (remaining common operations are pending).
+    Update(CommonUpdateCli),
     /// Show checkout-independent product build information.
     BuildInfo(BuildInfoCli),
     /// Emit shell completion for update-all itself.
@@ -229,6 +231,7 @@ impl RunCli {
         }
 
         match self.subcommand.take() {
+            Some(RunSubcommand::Update(cli)) => return cli.run(),
             Some(RunSubcommand::BuildInfo(cli)) => return cli.run(),
             Some(RunSubcommand::Completion(cli)) => return cli.run(),
             Some(RunSubcommand::Completions(cli)) => return cli.run(self.config),
@@ -1492,6 +1495,40 @@ impl CompletionsCli {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct CommonUpdateCli {
+    #[command(subcommand)]
+    command: CommonUpdateCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum CommonUpdateCommand {
+    /// Observe local installation state without network, repair or initialization.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl CommonUpdateCli {
+    fn run(self) -> Result<()> {
+        let CommonUpdateCommand::Status { json } = self.command;
+        let result = crate::release::common_status()?;
+        if json {
+            crate::ua_outln!("{}", serde_json::to_string(&result)?);
+        } else {
+            crate::ua_outln!("update-all update status: {:?}", result.outcome);
+            if let Some(kind) = result.error_kind {
+                crate::ua_errln!("update status failed: {kind:?}");
+            }
+        }
+        if result.exit_code != 0 {
+            return Err(crate::CommonOperationExit(result.exit_code).into());
         }
         Ok(())
     }

@@ -4,6 +4,9 @@ fn main() {
     }
 
     if let Err(err) = update_all::main_entry() {
+        if let Some(exit) = err.downcast_ref::<update_all::CommonOperationExit>() {
+            std::process::exit(exit.0);
+        }
         if err.downcast_ref::<update_all::Cancelled>().is_some() {
             std::process::exit(3);
         }

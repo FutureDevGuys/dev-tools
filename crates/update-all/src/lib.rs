@@ -34,6 +34,18 @@ impl std::error::Error for InvalidPlan {}
 #[derive(Debug)]
 pub struct IntegrityFailure(pub String);
 
+/// A common operation already emitted its value-free result document.
+#[derive(Debug)]
+pub struct CommonOperationExit(pub i32);
+
+impl std::fmt::Display for CommonOperationExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("common operation failed")
+    }
+}
+
+impl std::error::Error for CommonOperationExit {}
+
 impl std::fmt::Display for IntegrityFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "updater integrity failure: {}", self.0)

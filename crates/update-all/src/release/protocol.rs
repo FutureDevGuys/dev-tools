@@ -148,6 +148,13 @@ fn load(product: Product, paths: &Paths) -> Result<AcceptedAuthority> {
     AcceptedAuthority::validate(serde_json::from_slice(&document.bytes)?, product)
 }
 
+pub(super) fn observe_authenticated(paths: &Paths) -> Result<Option<VersionedReceipt>> {
+    let layout = shared_installation_layout(Product::UpdateAll, paths)?;
+    let receipt = versioned_v2::observe(&layout, ARTIFACT_LIMIT)?;
+    load(Product::UpdateAll, paths)?.verify_receipt(receipt.as_ref())?;
+    Ok(receipt)
+}
+
 fn migration_history(paths: &Paths) -> Result<ReleaseState> {
     match dev_tools_installation::observe_retired_atomic_document(
         &paths.state,
@@ -165,7 +172,7 @@ fn migration_history(paths: &Paths) -> Result<ReleaseState> {
 /// acquired before the installation lock, then the retirement lease. Missing
 /// proofs or an interrupted publication leave the upgrade journal in place;
 /// no error restores the legacy writer. Supplied evidence is not freshness.
-fn initialize(
+pub(super) fn initialize(
     product: Product,
     paths: &Paths,
     evidence: &[ReleaseMetadata],
