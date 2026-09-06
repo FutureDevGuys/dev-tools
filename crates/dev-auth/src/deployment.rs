@@ -102,7 +102,7 @@ pub fn parse_deployment_document(input: &[u8]) -> Result<DeploymentDocument> {
     }
     let text = std::str::from_utf8(input).context("deployment document is not UTF-8")?;
     let document: DeploymentDocument =
-        toml::from_str(text).context("parse dev-auth deployment document")?;
+        toml::from_str(text).map_err(|_| anyhow::anyhow!("parse dev-auth deployment document"))?;
     validate_document(&document)?;
     Ok(document)
 }
@@ -114,7 +114,9 @@ pub fn read_deployment_document(path: &Path) -> Result<DeploymentDocument> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    // Inspect the opened object before reading; a FIFO must not wait for a
+    // writer before its non-regular file type can be rejected.
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
     let mut file = options
         .open(path)
         .with_context(|| format!("open deployment document {}", path.display()))?;

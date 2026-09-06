@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use dev_tools_command::{
     run_prepared_bounded_command, run_prepared_bounded_command_with_public_input, HeldExecutable,
 };
@@ -76,6 +76,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print a static native-shell completion script.
+    Completion {
+        #[arg(value_enum)]
+        shell: dev_tools_completion::Shell,
+    },
     /// Print checkout-independent build identity.
     BuildInfo {
         #[arg(long)]
@@ -313,6 +318,9 @@ where
     argv.extend(arguments);
     match Cli::try_parse_from(argv) {
         Ok(Cli {
+            command: Command::Completion { shell },
+        }) => print_completion(shell),
+        Ok(Cli {
             command: Command::BuildInfo { json },
         }) => print_build_info(json),
         Ok(Cli {
@@ -387,6 +395,21 @@ where
             code
         }
     }
+}
+
+fn print_completion(shell: dev_tools_completion::Shell) -> i32 {
+    let bytes = match dev_tools_completion::render(shell, Cli::command(), "release-admin") {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!("release-admin: could not render completion output");
+            return 1;
+        }
+    };
+    if std::io::stdout().lock().write_all(&bytes).is_err() {
+        eprintln!("release-admin: could not write completion output");
+        return 1;
+    }
+    0
 }
 
 fn run_result(result: Result<()>) -> i32 {

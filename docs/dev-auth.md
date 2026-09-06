@@ -1,5 +1,9 @@
 # dev-auth
 
+`dev-auth --version` emits the stable product/version line, and `dev-auth build-info --json` emits the common `dev-tools-build-info-v1` document from build-time values without configuration, credential, broker or repository access. The existing no-argument `dev-auth build-info` output and library `BuildInfo` API retain their three-field release-verification format. That compatibility path remains until release/setup consumers use the common document and the last receipt-owned 0.3 rollback generation requiring the old shape has left its acceptance window; removal requires release and rollback tests against those consumers.
+
+`dev-auth completion bash|zsh|fish|elvish|powershell` prints static shell code for implemented public commands without loading configuration or credentials, contacting the broker, or editing startup files. Private helper entrypoints and runtime profile names are not suggested. The command remains behind normal frontend identity checks; it is not an alternate entry into setup, workload or credential operations.
+
 > The v0.3 branch is a standalone transparent workload-identity broker. The detailed v0.2 behavior below remains the rollback contract until Linux strong-mode acceptance and cutover are complete.
 
 ## Standalone v0.3 ownership

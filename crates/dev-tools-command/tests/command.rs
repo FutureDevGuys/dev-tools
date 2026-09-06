@@ -21,13 +21,10 @@ fn windows_executable_validation_requires_a_native_command_regular_file() {
     assert!(!dev_tools_command::is_executable_file(&text));
 }
 
-#[cfg(target_os = "linux")]
-use dev_tools_command::HeldExecutable;
 #[cfg(unix)]
 use dev_tools_command::{
     executable_candidates, first_executable, run_bounded_command_with_public_input,
-    run_prepared_bounded_command, run_prepared_bounded_command_with_public_input,
-    BoundedCommandStream,
+    run_prepared_bounded_command, BoundedCommandStream,
 };
 #[cfg(all(
     unix,
@@ -42,6 +39,8 @@ use dev_tools_command::{
 use dev_tools_command::{
     run_bounded_command_with_cancellation, run_prepared_bounded_command_with_cancellation,
 };
+#[cfg(target_os = "linux")]
+use dev_tools_command::{run_prepared_bounded_command_with_public_input, HeldExecutable};
 #[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -182,6 +181,137 @@ fn bounded_command_with_input_preserves_exact_bytes_without_a_writer_process() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn public_input_cancellation_rejects_before_spawn() {
+    use dev_tools_command::{
+        run_bounded_command_with_public_input_and_cancellation,
+        run_prepared_bounded_command_with_public_input_and_cancellation,
+    };
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("never-spawn-this");
+    let executable = std::env::current_exe().unwrap();
+    let error = run_bounded_command_with_public_input_and_cancellation(
+        &BoundedCommand {
+            executable: &executable,
+            arguments: &["--list".into()],
+            environment: &BTreeMap::new(),
+            cwd: None,
+            timeout: Duration::from_secs(1),
+            output_limit: 32,
+        },
+        b"public\0input",
+        &cancelled,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), BoundedCommandErrorKind::Cancelled);
+
+    let mut command = std::process::Command::new(&missing);
+    let error = run_prepared_bounded_command_with_public_input_and_cancellation(
+        &mut command,
+        b"public\0input",
+        Duration::from_secs(1),
+        32,
+        &cancelled,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), BoundedCommandErrorKind::Cancelled);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellable_public_input_preserves_bytes_bounds_and_releases_staged_handle() {
+    use dev_tools_command::run_prepared_bounded_command_with_public_input_and_cancellation;
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let mut command = std::process::Command::new("/usr/bin/cat");
+    command.arg("/dev/stdin").env_clear();
+    for input in [Vec::new(), b"exact\0input\n".to_vec(), vec![42; 16 << 20]] {
+        let output = run_prepared_bounded_command_with_public_input_and_cancellation(
+            &mut command,
+            &input,
+            Duration::from_secs(5),
+            16 << 20,
+            &cancelled,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, input);
+        assert!(output.stderr.is_empty());
+        // Reusing the caller-owned command cannot reuse the staged descriptor,
+        // even if the previous child could seek in it.
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    let error = run_prepared_bounded_command_with_public_input_and_cancellation(
+        &mut command,
+        &vec![0; (16 << 20) + 1],
+        Duration::from_secs(1),
+        32,
+        &cancelled,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), BoundedCommandErrorKind::InvalidPublicInput);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_executable_read_handles_follow_the_held_inode_not_the_replaced_path() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("program");
+    fs::write(&source, b"original executable bytes").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+    let original = fs::metadata(&source).unwrap();
+    let held = HeldExecutable::open(&source).unwrap();
+    fs::remove_file(&source).unwrap();
+    fs::write(&source, b"replacement bytes").unwrap();
+
+    let mut first = held.open_read_handle().unwrap();
+    assert!(rustix::io::fcntl_getfd(&first)
+        .unwrap()
+        .contains(rustix::io::FdFlags::CLOEXEC));
+    let metadata = first.metadata().unwrap();
+    assert_eq!(
+        (metadata.dev(), metadata.ino()),
+        (original.dev(), original.ino())
+    );
+    let mut bytes = Vec::new();
+    first.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"original executable bytes");
+    assert!(first.write_all(b"cannot write").is_err());
+
+    let mut second = held.open_read_handle().unwrap();
+    drop(held);
+    bytes.clear();
+    second.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"original executable bytes");
+    assert_eq!(fs::read(source).unwrap(), b"replacement bytes");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_script_execution_exposes_a_descriptor_path_to_the_interpreter() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("script");
+    fs::write(&source, b"#!/bin/sh\nprintf '%s' \"$0\"\n").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+    let direct = std::process::Command::new(&source).output().unwrap();
+    assert!(direct.status.success());
+    use std::os::unix::ffi::OsStrExt;
+    assert_eq!(direct.stdout, source.as_os_str().as_bytes());
+
+    let held = HeldExecutable::open(&source).unwrap();
+    let mut command = held.command(source.as_os_str()).unwrap();
+    command.env_clear();
+    let output = run_prepared_bounded_command(&mut command, Duration::from_secs(3), 4096).unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"/proc/self/fd/"));
+    assert_ne!(output.stdout, direct.stdout);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn prepared_command_preserves_held_executable_identity_and_configuration() {
@@ -301,6 +431,27 @@ fn prepared_command_rejects_invalid_limits_and_precancellation_before_spawn() {
 ))]
 #[test]
 fn cancellation_terminalizes_the_owned_process_group_before_returning() {
+    assert_cancellation_terminalizes_process_group(0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn public_input_cancellation_terminalizes_a_nonreading_child_and_its_descendants() {
+    assert_cancellation_terminalizes_process_group(1);
+    assert_cancellation_terminalizes_process_group(2);
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+fn assert_cancellation_terminalizes_process_group(input_mode: u8) {
     let root = tempfile::tempdir().unwrap();
     let ready = root.path().join("ready");
     let release = root.path().join("release");
@@ -319,23 +470,36 @@ fn cancellation_terminalizes_the_owned_process_group_before_returning() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let runner_cancelled = Arc::clone(&cancelled);
     let (sender, receiver) = mpsc::sync_channel(1);
-    let runner = thread::spawn(move || {
-        let arguments = [OsString::from("-c"), OsString::from(script)];
-        let result = run_bounded_command_with_cancellation(
-            &BoundedCommand {
+    let runner =
+        thread::spawn(move || {
+            let arguments = [OsString::from("-c"), OsString::from(script)];
+            let request = BoundedCommand {
                 executable: Path::new("/bin/sh"),
                 arguments: &arguments,
                 environment: &BTreeMap::new(),
                 cwd: None,
                 timeout: Duration::from_secs(30),
                 output_limit: 32,
-            },
-            &runner_cancelled,
-        )
+            };
+            let input = vec![42; 1 << 20];
+            let result = match input_mode {
+            0 => run_bounded_command_with_cancellation(&request, &runner_cancelled),
+            1 => dev_tools_command::run_bounded_command_with_public_input_and_cancellation(
+                &request, &input, &runner_cancelled,
+            ),
+            2 => {
+                let mut command = std::process::Command::new(request.executable);
+                command.args(request.arguments).env_clear();
+                dev_tools_command::run_prepared_bounded_command_with_public_input_and_cancellation(
+                    &mut command, &input, request.timeout, request.output_limit, &runner_cancelled,
+                )
+            }
+            _ => unreachable!("unknown test input mode"),
+        }
         .map(|_| ())
         .map_err(|error| error.kind());
-        let _ = sender.send(result);
-    });
+            let _ = sender.send(result);
+        });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !ready.exists() && std::time::Instant::now() < deadline {

@@ -1838,7 +1838,7 @@ fn cli_usage_errors_return_two() {
 
 #[test]
 fn completion_scripts_are_generated_from_the_live_cli_for_supported_shells() {
-    for shell in ["bash", "elvish", "fish", "power-shell", "zsh"] {
+    for shell in ["bash", "elvish", "fish", "powershell", "power-shell", "zsh"] {
         let output = Command::new(env!("CARGO_BIN_EXE_dev-cache"))
             .args(["completion", shell])
             .output()
@@ -1971,6 +1971,301 @@ fn doctor_reports_an_invalid_root_without_aborting() {
     assert!(report["status"]["error"]
         .as_str()
         .is_some_and(|error| error.contains("missing-root")));
+}
+
+#[cfg(unix)]
+fn diagnostic_command(home: &Path, root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dev-cache"));
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/nonexistent")
+        .current_dir(home)
+        .arg("--root")
+        .arg(root)
+        .args(["--mode", "on"]);
+    // Keep runtime-domain identity equal to the parent-created fixture on WSL,
+    // without inheriting operational configuration or tool-search authority.
+    for name in ["WSL_DISTRO_NAME", "WSL_INTEROP", "COMPUTERNAME"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_commands_never_prepare_missing_root_state() {
+    for arguments in [
+        &["status"][..],
+        &["doctor"],
+        &["report"],
+        &["path", "npm"],
+        &["migrate", "npm", "preview-source"],
+        &["gc"],
+    ] {
+        let operation = arguments[0];
+        for missing_domain in [false, true] {
+            let temp = tempfile::tempdir().expect("diagnostic fixture");
+            fs::write(temp.path().join("preview-source"), b"preview only").unwrap();
+            let root = RootHandle::initialize(&temp.path().join("cache-root"))
+                .expect("initialize fixture root");
+            let missing_directory = root.platform_root.join("migration");
+            fs::remove_dir(&missing_directory).expect("remove empty fixture directory");
+            if missing_domain {
+                let mut marker = root.marker.clone();
+                marker.runtime_domains.clear();
+                fs::write(root.marker_path(), serde_json::to_vec(&marker).unwrap()).unwrap();
+            }
+            let marker_before = fs::read(root.marker_path()).unwrap();
+            let output = diagnostic_command(temp.path(), &root.root)
+                .args(arguments)
+                .arg("--json")
+                .output()
+                .expect("run diagnostic");
+            assert_eq!(
+                fs::read(root.marker_path()).unwrap(),
+                marker_before,
+                "{operation} must not enroll a runtime domain"
+            );
+            assert!(
+                !missing_directory.exists(),
+                "{operation} must not recreate missing layout"
+            );
+            assert!(!output.status.success(), "incomplete root must be reported");
+            if operation == "doctor" {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(report["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|check| check["name"] == "root" && check["ok"] == false));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn diagnostic_commands_do_not_probe_root_writability() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    for arguments in [
+        &["status"][..],
+        &["doctor"],
+        &["report"],
+        &["path", "npm"],
+        &["migrate", "npm", "preview-source"],
+        &["gc"],
+    ] {
+        let operation = arguments[0];
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("preview-source"), b"preview only").unwrap();
+        let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+        // An old deterministic directory mtime reveals even a created-and-removed
+        // write probe, unlike comparing the final directory inventory alone.
+        let directory = fs::File::open(&root.root).unwrap();
+        directory
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        let before = directory.metadata().unwrap().modified().unwrap();
+        let output = diagnostic_command(temp.path(), &root.root)
+            .args(arguments)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if operation == "status" {
+            assert_eq!(report["root_valid"], true);
+        } else if operation == "doctor" {
+            assert!(report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["name"] == "root" && check["ok"] == true));
+        } else {
+            assert!(output.status.success());
+        }
+        assert_eq!(
+            directory.metadata().unwrap().modified().unwrap(),
+            before,
+            "{operation} must not create even temporary root entries"
+        );
+    }
+}
+
+#[test]
+fn root_write_probe_does_not_overwrite_an_existing_pid_named_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let collision = root
+        .root
+        .join(format!(".dev-cache-write-probe-{}", std::process::id()));
+    fs::write(&collision, b"user-owned collision").unwrap();
+    RootHandle::open(&root.root).expect("prepare with an independent private probe");
+    assert_eq!(fs::read(&collision).unwrap(), b"user-owned collision");
+}
+
+#[cfg(unix)]
+#[test]
+fn root_write_probe_does_not_follow_an_existing_pid_named_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let target = temp.path().join("unrelated-file");
+    fs::write(&target, b"preserved").unwrap();
+    let collision = root
+        .root
+        .join(format!(".dev-cache-write-probe-{}", std::process::id()));
+    std::os::unix::fs::symlink(&target, &collision).unwrap();
+    RootHandle::open(&root.root).expect("prepare with an independent private probe");
+    assert_eq!(fs::read(&target).unwrap(), b"preserved");
+    assert_eq!(fs::read_link(&collision).unwrap(), target);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_preview_preserves_stale_activity_records_and_cache_inventory() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let bytes = entry
+                    .file_type()
+                    .is_file()
+                    .then(|| fs::read(entry.path()).unwrap());
+                (
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    bytes,
+                )
+            })
+            .collect()
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let stale = root.control().join("leases/stale-fixture.json");
+    fs::write(&stale, br#"{"schema_version":1,"pid":4294967295,"started_unix":0,"operation":"fixture","resource_ids":[]}"#).unwrap();
+    let before = snapshot(&root.root);
+    let output = diagnostic_command(temp.path(), &root.root)
+        .args(["gc", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["applied"], false);
+    assert_eq!(
+        snapshot(&root.root),
+        before,
+        "preview must not perform lease maintenance"
+    );
+    gc::collect(
+        &root,
+        &Config::default().gc,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .unwrap();
+    assert!(
+        !stale.exists(),
+        "applied collection retains stale-lease cleanup"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_preview_refuses_missing_coordination_without_creating_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let lock = root.control().join("root.lock");
+    if lock.exists() {
+        fs::remove_file(&lock).unwrap();
+    }
+    let output = diagnostic_command(temp.path(), &root.root)
+        .args(["gc", "--json"])
+        .output()
+        .unwrap();
+    assert!(!lock.exists(), "preview must not initialize coordination");
+    assert!(!output.status.success());
+    RootHandle::initialize(&root.root).expect("explicit initialization prepares coordination");
+    assert!(lock.is_file());
+}
+
+#[test]
+fn gc_preview_keeps_nonblocking_exclusion_against_routed_setup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let policy = Config::default().gc;
+    let lease = RootLease::shared(&root, "held-fixture").unwrap();
+    assert!(
+        gc::collect_if_idle(&root, &policy, 120, &GcOverrides::default(), false)
+            .unwrap()
+            .is_none()
+    );
+    drop(lease);
+    assert!(
+        gc::collect_if_idle(&root, &policy, 120, &GcOverrides::default(), false)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_preview_and_mutation_reject_symlinked_coordination_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let target = temp.path().join("unrelated-coordination");
+    fs::write(&target, b"unrelated").unwrap();
+    let lock = root.control().join("root.lock");
+    fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(&target, &lock).unwrap();
+    let output = diagnostic_command(temp.path(), &root.root)
+        .args(["gc", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "preview must not lock an unrelated file"
+    );
+    assert!(RootLease::exclusive(&root).is_err());
+    assert_eq!(fs::read_link(&lock).unwrap(), target);
+    assert_eq!(fs::read(&target).unwrap(), b"unrelated");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_preview_rejects_fifo_coordination_without_blocking() {
+    use wait_timeout::ChildExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+    let lock = root.control().join("root.lock");
+    fs::remove_file(&lock).unwrap();
+    assert!(Command::new("/usr/bin/mkfifo")
+        .arg(&lock)
+        .status()
+        .unwrap()
+        .success());
+    let mut child = diagnostic_command(temp.path(), &root.root)
+        .args(["gc", "--json"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = child
+        .wait_timeout(std::time::Duration::from_secs(3))
+        .unwrap();
+    if status.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(
+        status.is_some_and(|status| !status.success()),
+        "preview must reject a non-regular coordination file without waiting for a writer"
+    );
 }
 
 #[cfg(unix)]

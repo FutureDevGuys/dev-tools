@@ -4,6 +4,7 @@ members = [
     "crates/dev-auth",
     "crates/dev-cache",
     "crates/dev-tools-command",
+    "crates/dev-tools-completion",
     "crates/dev-tools-conformance",
     "crates/dev-tools-installation",
     "crates/dev-tools-privilege",

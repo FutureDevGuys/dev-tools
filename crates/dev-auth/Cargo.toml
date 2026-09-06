@@ -9,11 +9,14 @@ description = "Transparent workload-identity broker for Git and GitHub CLI"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", default-features = false, features = ["std"] }
+dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 base64.workspace = true
 directories = "6"
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-privilege = { path = "../dev-tools-privilege" }
+dev-tools-product = { path = "../dev-tools-product" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 dev-tools-release = { path = "../dev-tools-release" }
 dev-tools-secret = { path = "../dev-tools-secret" }

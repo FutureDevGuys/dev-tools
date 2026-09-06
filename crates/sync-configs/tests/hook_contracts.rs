@@ -437,6 +437,42 @@ fn post_hooks_never_run_for_failed_missing_or_skipped_entries() {
 
 #[test]
 fn one_shared_sudo_authentication_executes_exact_shell_argv_for_both_phases() {
+    const CHILD: &str = "SYNC_CONFIGS_TEST_SHARED_AUTH_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        // Other test threads can fork while this fixture's executable is open
+        // for writing. CLOEXEC closes that inherited descriptor only at exec;
+        // until then Linux can reject our synthetic sudo with ETXTBSY. Create
+        // and execute it after entering an isolated, single-test process.
+        let executable = std::env::current_exe().expect("test executable");
+        let arguments = [
+            "--exact".into(),
+            "one_shared_sudo_authentication_executes_exact_shell_argv_for_both_phases".into(),
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ];
+        let environment = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("TMPDIR".into(), std::env::temp_dir().into_os_string()),
+            (CHILD.into(), "1".into()),
+        ]);
+        let output = dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
+            executable: &executable,
+            arguments: &arguments,
+            environment: &environment,
+            cwd: None,
+            timeout: Duration::from_secs(30),
+            output_limit: 64 * 1024,
+        })
+        .expect("run isolated shared-authentication fixture");
+        assert!(
+            output.status.success(),
+            "isolated shared-authentication fixture failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let root = TempDir::new().expect("temp root");
     let marker = root.path().join("privileged-order");
     let pre = format!("printf pre >> '{}'", marker.display());

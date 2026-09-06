@@ -18,6 +18,14 @@ Read the applicable records before changing a public product contract or cross-p
 | [0007](0007-provider-neutral-secret-operations.md) | Provider-neutral secret operations | proposed | pending |
 | [0008](0008-trusted-hook-execution-context.md) | Trusted hook execution context | proposed | pending |
 | [0009](0009-smart-workload-continuation-bindings.md) | Smart workload continuation bindings | proposed | pending |
+| [0010](0010-cancellable-public-command-input.md) | Cancellable public command input | proposed | pending |
+| [0011](0011-strict-authority-request-decoding.md) | Strict authority-request decoding | proposed | pending |
+| [0012](0012-static-product-completion-rendering.md) | Static product completion rendering | proposed | pending |
+| [0013](0013-compiler-intercept-maintenance-boundary.md) | Compiler intercept maintenance boundary | proposed | pending |
+| [0014](0014-skills-sync-explicit-repair-transition.md) | Skills Sync explicit repair transition | proposed | pending |
+| [0015](0015-dev-cache-read-only-root-observation.md) | Dev Cache read-only root observation | proposed | pending |
+| [0016](0016-artifact-update-common-doctor-result.md) | Artifact Update common doctor result | proposed | pending |
+| [0017](0017-binding-target-specific-resolution.md) | Binding target-specific resolution | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

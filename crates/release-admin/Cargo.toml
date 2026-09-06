@@ -12,6 +12,7 @@ anyhow = "1"
 base64.workspace = true
 clap = { version = "4", features = ["derive"] }
 dev-tools-command = { path = "../dev-tools-command" }
+dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-product = { path = "../dev-tools-product" }
 dev-tools-release = { path = "../dev-tools-release" }

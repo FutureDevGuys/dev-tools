@@ -2,6 +2,7 @@ use super::*;
 
 fn manager_task(program: &str, args: &[&str], requires_elevation: bool) -> CommandTask {
     CommandTask {
+        report_scoped_deltas: Vec::new(),
         program: program.to_string(),
         args: args.iter().map(|arg| (*arg).to_string()).collect(),
         mode: None,
@@ -162,6 +163,7 @@ fn windows_elevated_cmd_scripts_use_start_process_runas() {
 #[test]
 fn windows_shell_tasks_use_cmd_c() {
     let task = CommandTask {
+        report_scoped_deltas: Vec::new(),
         program: "echo hello".to_string(),
         args: Vec::new(),
         mode: None,
@@ -192,6 +194,7 @@ fn windows_shell_tasks_use_cmd_c() {
 #[test]
 fn windows_shell_tasks_preserve_metacharacters_and_quote_spaces_only() {
     let task = CommandTask {
+        report_scoped_deltas: Vec::new(),
         program: r#""C:\Program Files\Tool\runner.cmd""#.to_string(),
         args: vec![
             "hello world".to_string(),

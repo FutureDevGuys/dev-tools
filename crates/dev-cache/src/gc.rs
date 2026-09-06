@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 use crate::artifacts::{self, ArtifactRecord};
 use crate::cargo_intercept;
 use crate::config::GcConfig;
-use crate::lease::{active_resource_ids, RootLease};
+use crate::lease::{active_resource_ids, observe_active_resource_ids, RootLease};
 use crate::repository::{
     classify_identity_record, current_identity_record, records_describe_same_workspace,
     scan_identity_issues, validate_identity_record, IdentityDisposition, IdentityIssue,
@@ -107,8 +107,10 @@ struct NativeOutput {
 
 pub fn pressure_needed(root: &RootHandle, policy: &GcConfig) -> Result<bool> {
     let free = fs2::available_space(&root.root)?;
-    let bytes = directory_size(&root.platform_root);
-    Ok(free < policy.min_free_bytes || policy.max_bytes.is_some_and(|limit| bytes > limit))
+    Ok(free < policy.min_free_bytes
+        || policy
+            .max_bytes
+            .is_some_and(|limit| directory_size(&root.platform_root) > limit))
 }
 
 pub fn maintenance_status(root: &RootHandle) -> Result<MaintenanceStatus> {
@@ -133,7 +135,11 @@ pub fn collect(
     overrides: &GcOverrides,
     apply: bool,
 ) -> Result<GcReport> {
-    let _lease = RootLease::exclusive(root)?;
+    let _lease = if apply {
+        RootLease::exclusive(root)?
+    } else {
+        RootLease::exclusive_read_only(root)?
+    };
     collect_with_lease(root, policy, artifact_stale_after_days, overrides, apply)
 }
 
@@ -144,7 +150,12 @@ pub fn collect_if_idle(
     overrides: &GcOverrides,
     apply: bool,
 ) -> Result<Option<GcReport>> {
-    let Some(_lease) = RootLease::try_exclusive(root)? else {
+    let lease = if apply {
+        RootLease::try_exclusive(root)?
+    } else {
+        RootLease::try_exclusive_read_only(root)?
+    };
+    let Some(_lease) = lease else {
         return Ok(None);
     };
     collect_with_lease(root, policy, artifact_stale_after_days, overrides, apply).map(Some)
@@ -172,7 +183,11 @@ fn collect_with_lease(
     let max_bytes = overrides.max_bytes.or(policy.max_bytes);
     let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
     let now = now_unix();
-    let active_resource_ids = active_resource_ids(root)?;
+    let active_resource_ids = if apply {
+        active_resource_ids(root)?
+    } else {
+        observe_active_resource_ids(root)?
+    };
     let active_paths = active_resource_paths(root, &active_resource_ids)?;
     let mut abstentions = Vec::new();
     let (repository_actions, repository_abstentions) =

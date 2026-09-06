@@ -1,5 +1,7 @@
 //! Native implementation of the `skills-sync` command.
 
+mod completion;
+
 mod build_info {
     include!("../../build_info_runtime.rs");
 }
@@ -466,6 +468,9 @@ struct App {
 }
 
 pub fn main_entry(args: Vec<String>) -> i32 {
+    if args.first().is_some_and(|arg| arg == "completion") {
+        return completion::run(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "--version") {
         println!("skills-sync {}", env!("CARGO_PKG_VERSION"));
         return 0;
@@ -589,7 +594,7 @@ impl Options {
                     options.apply = false;
                     index += 1;
                 }
-                "doctor" => {
+                "doctor" | "repair" => {
                     options.mode = CommandMode::Doctor;
                     options.apply = true;
                     index += 1;
@@ -4087,10 +4092,10 @@ WHAT IT DOES
 
 START HERE
     1. Preview the global repair plan:
-       skills-sync doctor -g -n -c skills
+       skills-sync repair -g -n -c skills
 
     2. If the plan looks right, apply it:
-       skills-sync doctor -g -c skills
+       skills-sync repair -g -c skills
 
     3. Check that future updates can see the repaired state:
        skills-sync status -g -c skills
@@ -4100,12 +4105,14 @@ WHAT CHANGES FILES?
     Read-only:
       skills-sync help
       skills-sync build-info --json
+      skills-sync completion bash|zsh|fish|elvish|powershell
       skills-sync status
       skills-sync lock status
       any command with --dry-run
 
     Makes changes:
       skills-sync sync
+      skills-sync repair
       skills-sync doctor
       skills-sync lock repair
       skills-sync adopt
@@ -4181,13 +4188,17 @@ COMMANDS
     status
         Show what sync would do without making changes.
 
-    doctor
+    repair (doctor remains a compatibility alias)
         The broad repair command. It normalizes the selected lock, restores missing
         locked skills, relinks installed-but-unlinked skills, and safely adopts
         installed skills when their source can be inferred. If a skill was
         installed by Codex Desktop into a per-agent directory, doctor can adopt
         it when the copied skill matches Codex Desktop's local vendor import
         metadata and the vendor checkout has a supported GitHub origin.
+
+        Both spellings currently retain the legacy JSON command value "doctor".
+        doctor is not yet the common read-only diagnostic command. Use repair
+        in new repair workflows before that separately released transition.
 
     lock status
         Show the selected global lock and its readable state.

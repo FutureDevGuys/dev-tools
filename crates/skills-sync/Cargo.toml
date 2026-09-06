@@ -9,6 +9,11 @@ description = "Reconcile agent skills from explicit sources and locks"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", default-features = false, features = ["std"] }
+dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-product = { path = "../dev-tools-product" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

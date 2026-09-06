@@ -1216,22 +1216,79 @@ fn write_crate_archive(
 }
 
 #[cfg(target_os = "linux")]
-fn git(root: &std::path::Path, arguments: &[&str]) {
-    let status = ProcessCommand::new("/usr/bin/git")
+fn fixture_git_command(root: &std::path::Path, arguments: &[&str]) -> ProcessCommand {
+    let mut command = ProcessCommand::new("/usr/bin/git");
+    // Only synthetic fixture repositories use this environment. Their commits
+    // are inert test inputs, never authenticated release or publication source.
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .current_dir(root)
-        .args(arguments)
-        .status()
+        .args(arguments);
+    command
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_git_environment_probe() {
+    if std::env::var_os("DEV_TOOLS_TEST_GIT_ENV_PROBE").is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let output = fixture_git_command(root.path(), &["config", "--get", "fixture.injected"])
+        .output()
         .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "fixture Git inherited caller configuration"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_git_does_not_inherit_caller_configuration() {
+    let output = ProcessCommand::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fixture_git_environment_probe", "--nocapture"])
+        .env("DEV_TOOLS_TEST_GIT_ENV_PROBE", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "fixture.injected")
+        .env("GIT_CONFIG_VALUE_0", "must-not-reach-fixture")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn git(root: &std::path::Path, arguments: &[&str]) {
+    let status = fixture_git_command(root, arguments).status().unwrap();
     assert!(status.success(), "git fixture command failed");
 }
 
 #[cfg(target_os = "linux")]
 fn git_output(root: &std::path::Path, arguments: &[&str]) -> String {
-    let output = ProcessCommand::new("/usr/bin/git")
-        .current_dir(root)
-        .args(arguments)
-        .output()
-        .unwrap();
+    let output = fixture_git_command(root, arguments).output().unwrap();
     assert!(output.status.success(), "git fixture command failed");
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }

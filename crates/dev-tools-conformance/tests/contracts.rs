@@ -23,7 +23,7 @@ fn public_product_inventory_is_explicit_and_release_admin_is_planned() {
             (
                 "dev-auth",
                 ProductLifecycle::Current,
-                ProductStandardStage::Inventory,
+                ProductStandardStage::BuildInfo,
             ),
             (
                 "dev-cache",
@@ -43,7 +43,7 @@ fn public_product_inventory_is_explicit_and_release_admin_is_planned() {
             (
                 "release-admin",
                 ProductLifecycle::Planned,
-                ProductStandardStage::Inventory,
+                ProductStandardStage::BuildInfo,
             ),
             (
                 "artifact-update",
@@ -114,7 +114,7 @@ fn workspace_dependency_direction_is_enforced_from_cargo_metadata() {
     let report = audit_workspace_metadata(&workspace, &output.stdout).expect("audit metadata");
 
     assert!(report.is_conformant(), "{report:#?}");
-    assert_eq!(report.workspace_package_count, 17);
+    assert_eq!(report.workspace_package_count, 18);
     assert!(report.failures.is_empty());
 }
 
@@ -168,6 +168,7 @@ fn downstream_shared_crates_are_registry_publishable_with_versioned_internal_edg
     let packages = metadata["packages"].as_array().expect("package array");
     let shared = [
         "dev-tools-command",
+        "dev-tools-completion",
         "dev-tools-product",
         "dev-tools-installation",
         "dev-tools-privilege",

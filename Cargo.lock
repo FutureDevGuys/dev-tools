@@ -144,13 +144,20 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "artifact-update"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "dev-tools-command",
+ "dev-tools-completion",
+ "dev-tools-installation",
  "dev-tools-product",
+ "dev-tools-release",
  "dev-tools-update",
  "directories",
+ "ed25519-dalek",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -922,9 +929,12 @@ version = "0.3.11"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "clap",
  "dev-tools-command",
+ "dev-tools-completion",
  "dev-tools-installation",
  "dev-tools-privilege",
+ "dev-tools-product",
  "dev-tools-reconcile-protocol",
  "dev-tools-release",
  "dev-tools-secret",
@@ -958,12 +968,14 @@ name = "dev-cache"
 version = "0.1.6"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "blake3",
  "clap",
- "clap_complete",
  "dev-tools-command",
+ "dev-tools-completion",
  "dev-tools-product",
  "fs2",
+ "libc",
  "same-file",
  "serde",
  "serde_json",
@@ -985,6 +997,16 @@ dependencies = [
  "wait-timeout",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "dev-tools-completion"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "dev-tools-command",
+ "tempfile",
 ]
 
 [[package]]
@@ -1074,13 +1096,18 @@ dependencies = [
 name = "dev-tools-update"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dev-tools-product",
  "dev-tools-release",
+ "ed25519-dalek",
+ "html5gum",
  "http",
+ "quick-xml",
  "regex",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "toml 1.1.4+spec-1.1.0",
 ]
 
@@ -1650,6 +1677,12 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
 ]
+
+[[package]]
+name = "html5gum"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "428502d3ec1742c35e015871aef742bc4722a9acfcb616b8ff79b519922e1c36"
 
 [[package]]
 name = "http"
@@ -2670,6 +2703,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2888,6 +2930,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "dev-tools-command",
+ "dev-tools-completion",
  "dev-tools-installation",
  "dev-tools-product",
  "dev-tools-release",
@@ -3300,9 +3343,12 @@ name = "skills-sync"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "clap",
+ "dev-tools-completion",
  "dev-tools-product",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3503,6 +3549,7 @@ dependencies = [
  "clap_complete",
  "ctrlc",
  "dev-tools-command",
+ "dev-tools-completion",
  "dev-tools-installation",
  "dev-tools-product",
  "dev-tools-reconcile-protocol",
@@ -3940,9 +3987,9 @@ dependencies = [
  "assert_cmd",
  "base64 0.22.1",
  "clap",
- "clap_complete",
  "crossterm",
  "ctrlc",
+ "dev-tools-completion",
  "dev-tools-installation",
  "dev-tools-product",
  "dev-tools-release",

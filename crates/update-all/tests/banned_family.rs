@@ -557,6 +557,12 @@ fn find_banned_prefix(line: &str, prefix: &str, kind: &MatchKind) -> Option<usiz
                 i += 1;
                 continue;
             }
+            // The built-in lint attribute is metadata, not an expect call.
+            // Skip only its name; later calls on the same line remain visible.
+            if prefix == "expect" && is_direct_attribute_name(&line[..i]) {
+                i += prefix_bytes.len();
+                continue;
+            }
             let mut j = i + prefix_bytes.len();
             while j < bytes.len() && is_ident_char(bytes[j]) {
                 j += 1;
@@ -567,7 +573,7 @@ fn find_banned_prefix(line: &str, prefix: &str, kind: &MatchKind) -> Option<usiz
                     while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                         k += 1;
                     }
-                    if k < bytes.len() && bytes[k] == b'!' {
+                    if k < bytes.len() && bytes[k] == b'!' && bytes.get(k + 1) != Some(&b'=') {
                         return Some(i);
                     }
                 }
@@ -576,7 +582,7 @@ fn find_banned_prefix(line: &str, prefix: &str, kind: &MatchKind) -> Option<usiz
                     while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                         k += 1;
                     }
-                    if k < bytes.len() && bytes[k] == b'!' {
+                    if k < bytes.len() && bytes[k] == b'!' && bytes.get(k + 1) != Some(&b'=') {
                         return Some(i);
                     }
                     if j == i + prefix_bytes.len() {
@@ -594,6 +600,18 @@ fn find_banned_prefix(line: &str, prefix: &str, kind: &MatchKind) -> Option<usiz
         i += 1;
     }
     None
+}
+
+fn is_direct_attribute_name(before: &str) -> bool {
+    let Some(before_bracket) = before.trim_end().strip_suffix('[') else {
+        return false;
+    };
+    let before_bracket = before_bracket.trim_end();
+    let before_marker = before_bracket
+        .strip_suffix('!')
+        .unwrap_or(before_bracket)
+        .trim_end();
+    before_marker.ends_with('#')
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1145,6 +1163,34 @@ mod tests {
     }
 
     #[test]
+    fn lint_expect_attributes_do_not_hide_real_expect_calls() {
+        for line in [
+            "#[expect(clippy::panic)]",
+            "#![expect(clippy::panic)]",
+            "# [ expect(",
+            "# ! [ expect(",
+        ] {
+            assert_eq!(
+                find_banned_prefix(line, "expect", &MatchKind::MacroOrCall),
+                None,
+                "{line}"
+            );
+        }
+        for line in [
+            "#[expect(clippy::panic)] value.expect(\"reason\")",
+            "#![expect(clippy::panic)] expect(value)",
+            "let values = [expect(value)];",
+            "let values = [result.expect(\"reason\")];",
+        ] {
+            assert_eq!(
+                find_banned_prefix(line, "expect", &MatchKind::MacroOrCall),
+                line.rfind("expect("),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn find_banned_prefix_detects_unwrap_expect_err_variants() {
         assert_eq!(
             find_banned_prefix("value.unwrap_err()", "unwrap_err", &MatchKind::MacroOrCall),
@@ -1181,6 +1227,29 @@ mod tests {
         assert_eq!(
             find_banned_prefix("ctx.expectation()", "expect", &MatchKind::MacroOrCall),
             None
+        );
+    }
+
+    #[test]
+    fn inequality_is_not_a_banned_macro_invocation() {
+        for (line, prefix, kind) in [
+            ("if &expected != plan {", "expect", MatchKind::MacroOrCall),
+            (
+                "expected.is_some_and(|expected| expected != &prior)",
+                "expect",
+                MatchKind::MacroOrCall,
+            ),
+            ("if dbg_value != other {", "dbg", MatchKind::MacroOnly),
+        ] {
+            assert_eq!(find_banned_prefix(line, prefix, &kind), None, "{line}");
+        }
+        assert_eq!(
+            find_banned_prefix("panic!(\"bug\")", "panic", &MatchKind::MacroOrCall),
+            Some(0)
+        );
+        assert_eq!(
+            find_banned_prefix("dbg!(value)", "dbg", &MatchKind::MacroOnly),
+            Some(0)
         );
     }
 

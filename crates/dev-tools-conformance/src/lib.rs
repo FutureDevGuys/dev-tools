@@ -44,7 +44,7 @@ pub const PUBLIC_PRODUCTS: [ProductDefinition; 7] = [
     ProductDefinition {
         name: "dev-auth",
         lifecycle: ProductLifecycle::Current,
-        standard_stage: ProductStandardStage::Inventory,
+        standard_stage: ProductStandardStage::BuildInfo,
     },
     ProductDefinition {
         name: "dev-cache",
@@ -64,7 +64,7 @@ pub const PUBLIC_PRODUCTS: [ProductDefinition; 7] = [
     ProductDefinition {
         name: "release-admin",
         lifecycle: ProductLifecycle::Planned,
-        standard_stage: ProductStandardStage::Inventory,
+        standard_stage: ProductStandardStage::BuildInfo,
     },
     ProductDefinition {
         name: "artifact-update",

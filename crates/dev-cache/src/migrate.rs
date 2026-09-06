@@ -297,6 +297,10 @@ fn make_directories_writable(path: &Path) -> Result<()> {
         if entry.file_type().is_dir() {
             let mut permissions = entry.metadata()?.permissions();
             if permissions.readonly() {
+                #[expect(
+                    clippy::permissions_set_readonly_false,
+                    reason = "Windows-only: clears FILE_ATTRIBUTE_READONLY; the Unix implementation adds only owner write/search bits"
+                )]
                 permissions.set_readonly(false);
                 fs::set_permissions(entry.path(), permissions).with_context(|| {
                     format!(

@@ -383,7 +383,10 @@ pub struct ResolvedPolicy {
 
 pub fn parse_system_policy_v2(input: &[u8]) -> Result<SystemPolicyV2> {
     let text = std::str::from_utf8(input).context("system policy is not UTF-8")?;
-    let policy: SystemPolicyV2 = toml::from_str(text).context("system policy is not valid TOML")?;
+    // TOML errors can embed source lines and unexpected values. Authority
+    // documents must not become part of a diagnostic's source chain.
+    let policy: SystemPolicyV2 =
+        toml::from_str(text).map_err(|_| anyhow::anyhow!("system policy is not valid TOML"))?;
     validate_system_policy(&policy)?;
     Ok(policy)
 }
@@ -792,8 +795,8 @@ fn validate_sandbox_mount_arguments(arguments: &[String], description: &str) -> 
 
 pub fn parse_user_config_v2(input: &[u8]) -> Result<UserConfigV2> {
     let text = std::str::from_utf8(input).context("user configuration is not UTF-8")?;
-    let config: UserConfigV2 =
-        toml::from_str(text).context("user configuration is not valid TOML")?;
+    let config: UserConfigV2 = toml::from_str(text)
+        .map_err(|_| anyhow::anyhow!("user configuration is not valid TOML"))?;
     validate_user_config(&config)?;
     Ok(config)
 }

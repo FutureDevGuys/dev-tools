@@ -60,8 +60,9 @@ pub struct BrokerRequestEnvelope {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "operation", rename_all = "snake_case")]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerRequest {
+    #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
     Probe,
     ActivateSession {
         session_id: String,
@@ -84,6 +85,7 @@ pub enum BrokerRequest {
         owner: String,
         repository: String,
     },
+    #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
     GhExecutionToken,
     SignSsh {
         profile: String,

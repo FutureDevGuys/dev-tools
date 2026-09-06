@@ -1,5 +1,7 @@
 # Release Admin
 
+`release-admin completion bash|zsh|fish|elvish|powershell` prints a static script from the implemented command definitions. It does not load release inputs, consult credentials, invoke external commands or install shell startup configuration. The shared renderer and native-shell acceptance boundaries are described in [ADR 0012](adr/0012-static-product-completion-rendering.md).
+
 All binary manifest construction uses shared `dev-tools-product-v2`. Verification and idempotent publication retain the exact already-published Dev Auth `0.3.11` source-bound `dev-auth-product-v2` exception; there is no legacy constructor or general schema-downgrade option. The bounded compatibility contract is specified in [ADR 0003](adr/0003-native-release-administration-and-separated-authority.md).
 
 `release-admin` is the standalone native authority coordinator for Dev Tools releases. It is compiled from the same focused Rust release, installation, product, and command foundations as the products it administers; it does not invoke repository Python tooling or accept ambient publication credentials.

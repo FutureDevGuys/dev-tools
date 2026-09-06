@@ -29,6 +29,38 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn located_https_public_boundary_rejects_invalid_authority_without_io() {
+    let policy = HttpsPolicy {
+        allowed_hosts: BTreeSet::from(["example.test".into()]),
+        max_redirects: 2,
+        timeout: Duration::from_secs(1),
+        user_agent: "test".into(),
+    };
+    for url in [
+        "http://example.test/feed",
+        "https://untrusted.test/feed",
+        "https://user@example.test/feed",
+        "https://example.test/feed#fragment",
+    ] {
+        assert!(dev_tools_release::fetch_located_conditional_https(
+            url,
+            &policy,
+            1024,
+            &dev_tools_release::HttpsValidators::default()
+        )
+        .is_err());
+    }
+    assert_eq!(
+        dev_tools_release::resolve_https_reference(
+            "https://example.test/releases/feed",
+            "../app.zip"
+        )
+        .unwrap(),
+        "https://example.test/app.zip"
+    );
+}
+
+#[test]
 fn unsigned_manifest_validation_requires_canonical_stable_release_contract() {
     let manifest = json!({
         "schema": "dev-auth-product-v2",
@@ -368,6 +400,62 @@ fn fixture(schema: &str, source_commit: Option<&str>) -> (ReleaseBundle, Release
         &artifact_url,
         ArtifactUrlPolicy::Exact(artifact_url.clone()),
     )
+}
+
+#[test]
+fn staged_download_authenticates_metadata_and_bounds_before_any_transfer() {
+    let (bundle, authority) = fixture("dev-tools-product-v2", Some(&"a".repeat(40)));
+    let mut metadata = ReleaseMetadata {
+        root: bundle.root,
+        manifest: bundle.manifest,
+    };
+    let policy = HttpsPolicy {
+        allowed_hosts: BTreeSet::new(), // Any attempted connection must fail admission.
+        max_redirects: 0,
+        timeout: Duration::from_secs(1),
+        user_agent: "staging-test".into(),
+    };
+    let mut staged = Vec::new();
+    for limit in [0, 1, u64::MAX] {
+        let error = dev_tools_release::fetch_artifact_to_staging(
+            &metadata,
+            &authority,
+            &policy,
+            limit,
+            &mut staged,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("artifact size bound"),
+            "{error:#}"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<dev_tools_release::ArtifactTransferError>()
+                .unwrap()
+                .kind(),
+            dev_tools_release::ArtifactTransferErrorKind::InvalidLimit
+        );
+        assert!(staged.is_empty());
+    }
+    metadata.manifest[0] ^= 1;
+    let error = dev_tools_release::fetch_artifact_to_staging(
+        &metadata,
+        &authority,
+        &policy,
+        256 * 1024 * 1024,
+        &mut staged,
+    )
+    .unwrap_err();
+    assert!(!error.to_string().contains("HTTPS"), "{error:#}");
+    assert_eq!(
+        error
+            .downcast_ref::<dev_tools_release::ArtifactTransferError>()
+            .unwrap()
+            .kind(),
+        dev_tools_release::ArtifactTransferErrorKind::Authentication
+    );
+    assert!(staged.is_empty());
 }
 
 fn github_release_fixture(
@@ -715,6 +803,28 @@ fn release_state_rejects_rollback_and_equivocation() {
     version_rollback.manifest_generation += 1;
     version_rollback.version = semver::Version::parse("1.2.2").unwrap();
     assert!(accept_verified_release(&mut state, &version_rollback).is_err());
+}
+
+#[test]
+fn release_state_preserves_version_bytes_across_metadata_rotation() {
+    let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"c".repeat(40)));
+    let verified = verify_release_bytes(&bundle, &authority).unwrap();
+    let mut state = ReleaseState::default();
+    accept_verified_release(&mut state, &verified).unwrap();
+    let original = serde_json::to_vec(&state).unwrap();
+
+    let mut replacement = verified.clone();
+    replacement.manifest_generation += 1;
+    replacement.manifest_sha256 = "d".repeat(64);
+    replacement.artifact_sha256 = "e".repeat(64);
+    assert!(accept_verified_release(&mut state, &replacement).is_err());
+    assert_eq!(serde_json::to_vec(&state).unwrap(), original);
+
+    replacement.artifact_sha256 = verified.artifact_sha256;
+    replacement.root_generation += 1;
+    replacement.root_sha256 = "f".repeat(64);
+    assert!(accept_verified_release(&mut state, &replacement).unwrap());
+    assert!(!accept_verified_release(&mut state, &replacement).unwrap());
 }
 
 #[test]

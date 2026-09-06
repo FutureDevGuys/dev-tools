@@ -26,8 +26,11 @@ pub enum PrivilegeError {
     Interrupted,
     #[error("sudo executable has unsafe authority")]
     UnsafeSudo,
-    #[error("unable to authenticate one shared sudo session")]
-    Authentication,
+    #[error("unable to authenticate one shared sudo session ({stage}: {failure})")]
+    Authentication {
+        stage: AuthenticationStage,
+        failure: AuthenticationFailure,
+    },
     #[error("privileged command executable has unsafe authority")]
     UnsafeCommand,
     #[error("privileged command requires an authenticated sudo session")]
@@ -44,6 +47,51 @@ pub enum PrivilegeError {
     Failed,
     #[error("sudo privilege is not available on this platform")]
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationStage {
+    CachedCheck,
+    Prompt,
+}
+
+impl std::fmt::Display for AuthenticationStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CachedCheck => "cached check",
+            Self::Prompt => "prompt",
+        })
+    }
+}
+
+/// Value-free process evidence: no executable path, arguments, environment,
+/// captured output or original I/O error text is retained.
+#[derive(Debug, Error)]
+pub enum AuthenticationFailure {
+    #[error("process error {kind:?}, OS code {os_code:?}")]
+    Process {
+        kind: std::io::ErrorKind,
+        os_code: Option<i32>,
+    },
+    #[error("exit code {code:?}, signal {signal:?}")]
+    Exit {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
+
+#[cfg(unix)]
+fn authentication_process_error(
+    stage: AuthenticationStage,
+    error: std::io::Error,
+) -> PrivilegeError {
+    PrivilegeError::Authentication {
+        stage,
+        failure: AuthenticationFailure::Process {
+            kind: error.kind(),
+            os_code: error.raw_os_error(),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -232,7 +280,9 @@ impl PrivilegeSession {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .map_err(|_| PrivilegeError::Authentication)?;
+                .map_err(|error| {
+                    authentication_process_error(AuthenticationStage::CachedCheck, error)
+                })?;
             if crate::interrupt::check().is_err() {
                 return Err(PrivilegeError::Interrupted);
             }
@@ -240,12 +290,21 @@ impl PrivilegeSession {
                 let prompted = Command::new(&self.sudo)
                     .arg("-v")
                     .status()
-                    .map_err(|_| PrivilegeError::Authentication)?;
+                    .map_err(|error| {
+                        authentication_process_error(AuthenticationStage::Prompt, error)
+                    })?;
                 if crate::interrupt::check().is_err() {
                     return Err(PrivilegeError::Interrupted);
                 }
                 if !prompted.success() {
-                    return Err(PrivilegeError::Authentication);
+                    use std::os::unix::process::ExitStatusExt;
+                    return Err(PrivilegeError::Authentication {
+                        stage: AuthenticationStage::Prompt,
+                        failure: AuthenticationFailure::Exit {
+                            code: prompted.code(),
+                            signal: prompted.signal(),
+                        },
+                    });
                 }
             }
             self.authenticated = true;

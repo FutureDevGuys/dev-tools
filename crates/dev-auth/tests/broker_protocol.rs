@@ -74,6 +74,27 @@ fn verified_claim_routes_to_broker_session() {
 }
 
 #[test]
+fn request_operations_reject_unknown_fields_before_authority_dispatch() {
+    for request in [
+        serde_json::json!({"operation": "probe"}),
+        serde_json::json!({"operation": "gh_execution_token"}),
+        serde_json::json!({"operation": "renew_session", "session_id": "0123456789abcdef0123456789abcdef"}),
+        serde_json::json!({"operation": "git_credential", "protocol": "https", "host": "github.com", "owner": "ExampleOrg", "repository": "repo"}),
+    ] {
+        let mut frame = serde_json::json!({"version": BROKER_PROTOCOL_VERSION, "request_id": "0123456789abcdef0123456789abcdef", "request": request});
+        let valid = serde_json::to_vec(&frame).unwrap();
+        let decoded = decode_request_frame(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_request_frame(&decoded).unwrap())
+                .unwrap(),
+            frame
+        );
+        frame["request"]["purported_scope"] = serde_json::json!({"repository": "narrower"});
+        assert!(decode_request_frame(&serde_json::to_vec(&frame).unwrap()).is_err());
+    }
+}
+
+#[test]
 fn request_frames_are_bounded_versioned_and_closed() {
     let valid = br#"{"version":2,"request_id":"0123456789abcdef0123456789abcdef","request":{"operation":"git_credential","protocol":"https","host":"github.com","owner":"ExampleOrg","repository":"repo"}}"#;
     let decoded = decode_request_frame(valid).unwrap();

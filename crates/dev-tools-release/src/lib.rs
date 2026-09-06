@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod https;
+mod stream;
+pub use https::{canonical_https_host, probe_https_location, resolve_https_reference};
+pub use stream::{fetch_artifact_to_staging, ArtifactTransferError, ArtifactTransferErrorKind};
 
 use dev_tools_installation::{
     read_atomic_document, write_atomic_document, DocumentAuthority, InstallationLock,
@@ -126,6 +129,95 @@ pub struct HttpsPolicy {
 pub struct HttpsResponse {
     pub bytes: Vec<u8>,
     pub etag: Option<String>,
+}
+
+/// Resource-scoped HTTP validators, not signatures or installation authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpsValidators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConditionalHttpsResponse {
+    Modified {
+        response: HttpsResponse,
+        validators: HttpsValidators,
+    },
+    /// The caller must already hold the exact original resource's cached bytes.
+    /// Omitted validators retain their previous values; this is not freshness
+    /// or authenticity evidence independent of that cache binding.
+    NotModified { validators: HttpsValidators },
+}
+
+/// The final admitted resource and its bounded conditional response. Location
+/// is observational data, not authentication or permission to fetch linked URLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedConditionalHttpsResponse {
+    pub final_url: String,
+    pub response: ConditionalHttpsResponse,
+}
+
+/// Metadata retrieval retaining the actual final URL for relative link resolution.
+/// Redirect admission, byte bounds and validator scoping are unchanged.
+pub fn fetch_located_conditional_https(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    validators: &HttpsValidators,
+) -> Result<LocatedConditionalHttpsResponse> {
+    let (response, conditional_sent, initial_resource) =
+        request_https_response(url, policy, limit, validators)?;
+    decode_located_resource_response(response, limit, conditional_sent, initial_resource)
+}
+
+fn decode_located_resource_response(
+    response: ureq::http::Response<ureq::Body>,
+    limit: u64,
+    conditional_sent: bool,
+    initial_resource: bool,
+) -> Result<LocatedConditionalHttpsResponse> {
+    let final_url = response
+        .extensions()
+        .get::<https::ResponseLocation>()
+        .context("HTTPS response location is unavailable")?
+        .0
+        .clone();
+    let response = decode_resource_response(response, limit, conditional_sent, initial_resource)?;
+    Ok(LocatedConditionalHttpsResponse {
+        final_url,
+        response,
+    })
+}
+
+/// Explicit bounded metadata request. Validators are sent only to the initial
+/// resource, never to redirects. An unsolicited/redirected 304 fails closed.
+pub fn fetch_conditional_https(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    validators: &HttpsValidators,
+) -> Result<ConditionalHttpsResponse> {
+    let (response, conditional_sent, initial_resource) =
+        request_https_response(url, policy, limit, validators)?;
+    decode_resource_response(response, limit, conditional_sent, initial_resource)
+}
+
+/// Bounded JSON representation request with the same redirect and validator
+/// rules as `fetch_conditional_https`. This sets `Accept: application/json`;
+/// callers still validate returned bytes, schema, identity and authority.
+/// Supplied validators must belong to this exact URL and JSON representation,
+/// not a cache populated with another Accept header.
+pub fn fetch_conditional_json_https(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    validators: &HttpsValidators,
+) -> Result<ConditionalHttpsResponse> {
+    let (response, conditional_sent, initial_resource) =
+        request_https_response_with_representation(url, policy, limit, validators, true)?;
+    decode_resource_response(response, limit, conditional_sent, initial_resource)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1084,27 +1176,11 @@ fn fetch_https_response(
     etag: Option<&str>,
     allow_not_found: bool,
 ) -> Result<Option<HttpsResponse>> {
-    if let Some(etag) = etag {
-        if etag.is_empty() || etag.len() > 8192 || etag.contains(['\r', '\n', '\0']) {
-            bail!("release ETag is invalid");
-        }
-    }
-    let mut response = https::guarded_response(url, policy, limit, |url, remaining, initial| {
-        let agent: ureq::Agent = https_single_hop_config(policy, remaining).into();
-        let mut request = agent.get(url).header(
-            "Accept",
-            if url.starts_with("https://api.github.com/") {
-                "application/vnd.github+json"
-            } else {
-                "application/octet-stream"
-            },
-        );
-        // An ETag identifies the original resource, not a redirected target.
-        if let Some(etag) = etag.filter(|_| initial) {
-            request = request.header("If-None-Match", etag);
-        }
-        request.call().context("request HTTPS release resource")
-    })?;
+    let validators = HttpsValidators {
+        etag: etag.map(str::to_owned),
+        last_modified: None,
+    };
+    let (mut response, _, _) = request_https_response(url, policy, limit, &validators)?;
     if response.status().as_u16() == 304 {
         bail!("release response was not modified");
     }
@@ -1122,6 +1198,141 @@ fn fetch_https_response(
     let bytes =
         read_bounded_body(response.body_mut(), limit).context("read bounded release response")?;
     Ok(Some(HttpsResponse { bytes, etag }))
+}
+
+fn validate_http_validator(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 8192
+        || value.bytes().any(|byte| !(32..=126).contains(&byte))
+    {
+        bail!("HTTPS conditional validator is invalid");
+    }
+    Ok(())
+}
+
+fn request_https_response(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    validators: &HttpsValidators,
+) -> Result<(ureq::http::Response<ureq::Body>, bool, bool)> {
+    request_https_response_with_representation(url, policy, limit, validators, false)
+}
+
+fn representation_request(
+    agent: &ureq::Agent,
+    url: &str,
+    json: bool,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    agent.get(url).header(
+        "Accept",
+        if json {
+            "application/json"
+        } else if url.starts_with("https://api.github.com/") {
+            "application/vnd.github+json"
+        } else {
+            "application/octet-stream"
+        },
+    )
+}
+
+fn request_https_response_with_representation(
+    url: &str,
+    policy: &HttpsPolicy,
+    limit: u64,
+    validators: &HttpsValidators,
+    json: bool,
+) -> Result<(ureq::http::Response<ureq::Body>, bool, bool)> {
+    for value in [&validators.etag, &validators.last_modified]
+        .into_iter()
+        .flatten()
+    {
+        validate_http_validator(value)?;
+    }
+    let mut conditional_sent = false;
+    let mut initial_resource = true;
+    let response = https::guarded_response(url, policy, limit, |url, remaining, initial| {
+        initial_resource = initial;
+        let agent: ureq::Agent = https_single_hop_config(policy, remaining).into();
+        let mut request = representation_request(&agent, url, json);
+        // An ETag identifies the original resource, not a redirected target.
+        conditional_sent =
+            initial && (validators.etag.is_some() || validators.last_modified.is_some());
+        if initial {
+            if let Some(etag) = &validators.etag {
+                request = request.header("If-None-Match", etag);
+            }
+            if let Some(modified) = &validators.last_modified {
+                request = request.header("If-Modified-Since", modified);
+            }
+        }
+        request.call().context("request HTTPS release resource")
+    })?;
+    Ok((response, conditional_sent, initial_resource))
+}
+
+fn decode_resource_response(
+    response: ureq::http::Response<ureq::Body>,
+    limit: u64,
+    conditional_sent: bool,
+    initial_resource: bool,
+) -> Result<ConditionalHttpsResponse> {
+    let mut decoded =
+        decode_conditional_response(response, limit, conditional_sent && initial_resource)?;
+    if !initial_resource {
+        // The final resource's validators cannot be replayed against the
+        // original URL on a later check. Redirects require a new full fetch.
+        if let ConditionalHttpsResponse::Modified {
+            response,
+            validators,
+        } = &mut decoded
+        {
+            response.etag = None;
+            *validators = HttpsValidators::default();
+        }
+    }
+    Ok(decoded)
+}
+
+fn decode_conditional_response(
+    mut response: ureq::http::Response<ureq::Body>,
+    limit: u64,
+    conditional_sent: bool,
+) -> Result<ConditionalHttpsResponse> {
+    let read_validator = |name: &str| -> Result<Option<String>> {
+        let mut values = response.headers().get_all(name).iter();
+        let Some(value) = values.next() else {
+            return Ok(None);
+        };
+        if values.next().is_some() {
+            bail!("HTTPS conditional validator is ambiguous");
+        }
+        let value = value
+            .to_str()
+            .context("HTTPS conditional validator is invalid")?;
+        validate_http_validator(value)?;
+        Ok(Some(value.to_owned()))
+    };
+    let validators = HttpsValidators {
+        etag: read_validator("etag")?,
+        last_modified: read_validator("last-modified")?,
+    };
+    match response.status().as_u16() {
+        304 if conditional_sent => Ok(ConditionalHttpsResponse::NotModified { validators }),
+        304 => bail!("HTTPS response has no matching conditional request"),
+        200 => {
+            let bytes = read_bounded_body(response.body_mut(), limit)?;
+            let response = HttpsResponse {
+                bytes,
+                etag: validators.etag.clone(),
+            };
+            Ok(ConditionalHttpsResponse::Modified {
+                response,
+                validators,
+            })
+        }
+        _ => bail!("HTTPS metadata request returned an unsupported status"),
+    }
 }
 
 fn https_single_hop_config(policy: &HttpsPolicy, remaining: Duration) -> ureq::config::Config {
@@ -1216,6 +1427,14 @@ pub fn accept_verified_release(
         bail!("release version rollback detected");
     }
     let verified_version = verified.version.to_string();
+    if state.accepted_version.as_deref() == Some(verified_version.as_str())
+        && state
+            .accepted_binary_sha256
+            .as_ref()
+            .is_some_and(|accepted| accepted != &verified.artifact_sha256)
+    {
+        bail!("release version artifact equivocation detected");
+    }
     let changed = state.accepted_root_generation != verified.root_generation
         || state.accepted_root_sha256.as_ref() != Some(&verified.root_sha256)
         || state.accepted_generation != verified.manifest_generation
@@ -1711,7 +1930,8 @@ fn valid_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn valid_product_id(value: &str) -> bool {
+/// Whether a product identifier satisfies the shared signed-manifest grammar.
+pub fn valid_product_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -1723,7 +1943,8 @@ fn valid_product_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn valid_release_target(value: &str) -> bool {
+/// Whether a target identifier satisfies the shared signed-manifest grammar.
+pub fn valid_release_target(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value.bytes().all(|byte| {
@@ -1745,6 +1966,38 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_requests_negotiate_json_without_changing_legacy_resource_accept() {
+        let agent = ureq::Agent::new_with_defaults();
+        for (url, json, expected) in [
+            (
+                "https://registry.npmjs.org/tool/latest",
+                true,
+                "application/json",
+            ),
+            (
+                "https://redirect.example/document",
+                true,
+                "application/json",
+            ),
+            (
+                "https://api.github.com/repos/org/tool/releases",
+                false,
+                "application/vnd.github+json",
+            ),
+            (
+                "https://downloads.example/artifact",
+                false,
+                "application/octet-stream",
+            ),
+        ] {
+            let request = super::representation_request(&agent, url, json);
+            assert_eq!(
+                request.headers_ref().unwrap().get("Accept").unwrap(),
+                expected
+            );
+        }
+    }
     use super::{
         inspect_crates_io_package_with_fetch, read_bounded_body, sha256_hex,
         verify_crates_io_package_set_with_fetch, RegistryCrateStatus, VerifiedCratePackage,

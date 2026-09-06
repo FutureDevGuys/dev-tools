@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -8,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::util::{now_unix, write_json_atomic};
 
 const MARKER_NAME: &str = ".dev-cache-root.json";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Observe,
+    Prepare,
+}
 
 #[derive(Clone, Debug)]
 pub struct RootHandle {
@@ -39,7 +46,7 @@ impl RootHandle {
             .with_context(|| format!("resolve cache root {}", path.display()))?;
         let marker_path = canonical.join(MARKER_NAME);
         if marker_path.exists() {
-            return Self::open(&canonical);
+            return Self::initialize_coordination(&canonical);
         }
         let mut entries =
             fs::read_dir(&canonical).with_context(|| format!("inspect {}", canonical.display()))?;
@@ -63,10 +70,27 @@ impl RootHandle {
             runtime_domains,
         };
         write_json_atomic(&marker_path, &marker)?;
-        Self::open(&canonical)
+        Self::initialize_coordination(&canonical)
+    }
+
+    fn initialize_coordination(path: &Path) -> Result<Self> {
+        let root = Self::open(path)?;
+        crate::lease::prepare_root_lock(&root)?;
+        Ok(root)
     }
 
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_mode(path, OpenMode::Prepare)
+    }
+
+    /// Inspect an already initialized runtime layout without creating entries,
+    /// probing writability or enrolling a runtime domain. Missing state is an
+    /// error, not permission to repair it. This does not prove write access.
+    pub fn observe(path: &Path) -> Result<Self> {
+        Self::open_with_mode(path, OpenMode::Observe)
+    }
+
+    fn open_with_mode(path: &Path, mode: OpenMode) -> Result<Self> {
         let requested = crate::util::path_from_home(path);
         if !requested.is_dir() {
             bail!("configured cache root is missing: {}", requested.display());
@@ -101,10 +125,15 @@ impl RootHandle {
                 current_volume
             );
         }
-        ensure_writable(&canonical)?;
+        if mode == OpenMode::Prepare {
+            ensure_writable(&canonical)?;
+        }
         let platform = platform_namespace();
         let key = runtime_key();
         if !marker.runtime_domains.contains_key(&key) {
+            if mode == OpenMode::Observe {
+                bail!("cache root has no initialized domain for this runtime");
+            }
             marker.runtime_domains.insert(key.clone(), random_id());
             write_json_atomic(&marker_path, &marker)?;
         }
@@ -120,8 +149,13 @@ impl RootHandle {
             "migration",
             "trash",
         ] {
-            fs::create_dir_all(platform_root.join(relative))
-                .with_context(|| format!("create cache layout {relative}"))?;
+            let directory = platform_root.join(relative);
+            if mode == OpenMode::Prepare {
+                fs::create_dir_all(&directory)
+                    .with_context(|| format!("create cache layout {relative}"))?;
+            } else if !directory.is_dir() {
+                bail!("cache layout is missing directory {relative}");
+            }
         }
         Ok(Self {
             root: canonical,
@@ -197,10 +231,23 @@ impl RootHandle {
 }
 
 fn ensure_writable(path: &Path) -> Result<()> {
-    let probe = path.join(format!(".dev-cache-write-probe-{}", std::process::id()));
-    fs::write(&probe, b"probe")
-        .with_context(|| format!("cache root is not writable: {}", path.display()))?;
-    fs::remove_file(&probe).with_context(|| format!("remove write probe {}", probe.display()))
+    let probe = path.join(format!(".dev-cache-write-probe-{}", random_id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&probe)
+        .with_context(|| format!("create private cache-root write probe: {}", path.display()))?;
+    let written = file.write_all(b"probe");
+    drop(file);
+    // Attempt cleanup even on a failed write, preserving the primary failure.
+    let removed = fs::remove_file(&probe);
+    written.with_context(|| format!("cache root is not writable: {}", path.display()))?;
+    removed.with_context(|| format!("remove write probe {}", probe.display()))
 }
 
 fn random_id() -> String {

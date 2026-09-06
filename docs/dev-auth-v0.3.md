@@ -24,6 +24,12 @@ Workloads are generic named configurations consisting of one trusted launcher, o
 
 ## Provider and secret boundary
 
+Malformed administrator policies, user configurations and deployment TOML return fixed document-category errors without retaining the parser's source excerpt, unexpected field name or value in the error chain. This protects ordinary, alternate and debug error rendering from echoing malformed authority input, including accidentally pasted credentials. Schema validation remains strict; this does not make credential literals valid configuration. Contract tests exercise malformed syntax, invalid field types and unknown fields through the public parsers.
+
+Broker protocol v2 and root control requests reject undeclared fields inside the operation as well as the envelope. Unit operations such as `probe` and `gh_execution_token` accept no extra options; an unrecognized field cannot silently act as a scope restriction. Valid wire bytes, correlation and frame limits are unchanged, and the server still derives authority from its verified session grant. Invalid frames close before capability dispatch without reflecting parser details. The same strictness applies to continuation-target documents while preserving their public unit representation; see [ADR 0011](adr/0011-strict-authority-request-decoding.md).
+
+Unix runtime policy loading binds its pathname custody check to the opened regular file: the non-following, nonblocking open must retain the observed device, inode, ownership, mode, link count, length and modification/change timestamps. Reads are bounded to one MiB and the retained file's metadata and exact length are checked again before parsing. This rejects observed replacement or mutation; it is not a filesystem snapshot or a guarantee against a trusted owner modifying bytes without an observable metadata change. Existing owner and permissions requirements remain unchanged. Tests cover the public loaders' regular-file and rejection behavior and deterministic metadata comparisons; they do not deterministically schedule a replacement inside a live loader call.
+
 Dev Auth routes provider operations through the provider-neutral `dev-tools-secret` contract; product policy still decides which logical operation and opaque provider reference are authorized. Strong enrollment accepts the scoped 1Password Service Account token once through standard input and encrypts it as an operating-system system credential. Only the protected broker receives the decrypted credential. The 1Password adapter invokes the exact administrator-pinned provider program with a sanitized environment and reads only references admitted by the resolved profile. On Linux, each provider read transfers the service credential through a sealed anonymous memory file to a held copy of the running dev-auth executable; that disposable child alone places the credential in the held 1Password CLI process environment and then replaces itself with that exact executable. The credential is absent from the broker-owned command environment, argv, persistent files, and provider child command line, and the anonymous descriptor closes across the provider exec.
 
 Each admitted provider request has one absolute 120-second budget shared by its 1Password read, GitHub discovery, token minting, cache publication, and cancellation checks. HTTP stages use at most 30 seconds of the remaining budget, subprocesses are terminalized on timeout or cancellation, and bounded capture buffers are zeroized when discarded. Broker frames use absolute two-second local I/O deadlines so slow or abandoned peers cannot occupy workers or hold session teardown indefinitely. Closing a session stops new admissions, cancels and drains in-flight work, and revokes active and pending token generations before acknowledging closure; failed cleanup remains fail-closed and retryable by the background reaper rather than silently forgetting authority.
@@ -38,7 +44,7 @@ An admitted workload can intentionally reveal a derived bearer token. Its contai
 
 The signed binary owns embedded configuration templates, discovery, approval plans, installation receipts, versioned binaries, product aliases, same-name launchers, workload launchers and desktop entries, policy and user-configuration installation and compare-and-swap updates, system service assets, enrollment and rotation, activation, verification, diagnostics, repair, migration, rollback, and uninstall. `dev-auth setup template deployment|administrator-policy|user-only-policy|user-config` prints a version-matched nonsecret starting document, so a source checkout is never needed to begin setup. Discovery checks fixed platform candidates and never blindly trusts caller `PATH`. `dev-auth build-info` emits machine-readable product, version, and embedded source commit; the signed stable manifest carries the same exact source commit alongside the artifact digest.
 
-The account-neutral [deployment example](../crates/dev-auth/deployment-v1.example.toml) is the complete nonsecret setup input. On a new Linux machine, an authenticated compatible bootstrap and the source documents are sufficient; neither a Dev Tools nor Syscfg checkout participates at runtime. The operator first runs configuration-aware discovery, then approves one canonical plan, supplies any required credential through a private channel, and verifies that exact plan:
+The account-neutral [deployment example](../crates/dev-auth/deployment-v1.example.toml) is the complete nonsecret setup input. Deployment input must be a bounded regular file; on Unix the reader rejects symlinks, multiply linked files and group/world-writable files, and rejects FIFOs without waiting for a writer. On a new Linux machine, an authenticated compatible bootstrap and the source documents are sufficient; neither a Dev Tools nor Syscfg checkout participates at runtime. The operator first runs configuration-aware discovery, then approves one canonical plan, supplies any required credential through a private channel, and verifies that exact plan:
 
 ```text
 dev-auth setup template deployment > /absolute/source/deployment.toml
@@ -70,6 +76,27 @@ Version changes first remove any legacy global same-name launchers. A strong upd
 A v1 migration begins with `setup migrate-v1-preview`, which is read-only and omits secret references. `setup migrate-v1` requires the approved digests of both the current v1 document and an explicit v2 user configuration, proves the v2 resolution does not widen v1 programs, workspaces, GitHub scope, author identity, secret references, or SSH operation keys, writes an exact owner-private backup under `~/.config/dev-auth/migrations/v1/<sha256>/config.toml`, and only then installs v2. The original v1 file remains unchanged for rollback. The installed v0.2 release and its configuration remain reversible until v0.3 clean-device and rollback acceptance complete.
 
 Normal uninstall preserves policy and credential enrollment throughout the rollback window. After the installation and all receipted launchers are absent, the separate `setup purge-system-state` or `setup purge-user-state` operation removes only safe owner-bound v2 policy/configuration and the matching broker credential; it never removes the v1 configuration or migration backup. This split keeps ordinary rollback reversible and makes permanent credential removal deliberate and idempotent.
+
+## Workload binding plans
+
+The pre-activation binding interface inspects a currently visible executable or wrapper and writes a digest-bound plan without installing a proxy, enrolling credentials or admitting a workload:
+
+```sh
+dev-auth workload bind discover agent --json
+dev-auth workload bind plan agent-binding --workload automation --command-name agent --target current-resolution --output /absolute/private/directory/binding-plan.json --json
+```
+
+The output parent must already exist, and the plan file must be absent; planning never replaces an existing file. The result identifies the plan digest, not setup approval or workload readiness. The recorded workload name does not establish that administrator policy permits it. [ADR 0009](adr/0009-smart-workload-continuation-bindings.md) describes the remaining activation, receipt and rollback contract.
+
+An explicit structured target can have a different filename from its public alias and needs no PATH lookup:
+
+```sh
+dev-auth workload bind plan agent-binding --workload automation --command-name agent --target structured --executable /absolute/canonical/vendor-runtime --arg --mode --arg batch --caller-argument-index 1 --output /absolute/private/directory/binding-plan.json --json
+```
+
+Each `--arg` records one literal public UTF-8 argument; do not put credentials in a plan. The optional zero-based caller insertion index defaults to the end of the fixed arguments and cannot exceed their count. Planning inspects the canonical executable but never runs it. Both target kinds produce v2 draft plans with target-specific resolution evidence; regenerate older v1 drafts rather than relabeling them or reusing their digests. This is not activation support: argument forwarding, environment/cwd policy and setup integration remain incomplete, and pinned-shell planning is unavailable. [ADR 0017](adr/0017-binding-target-specific-resolution.md) records the cutover and its limits.
+
+Discovery excludes existing resolvable owned proxy layers and preserves the visible wrapper path and continuation search cursor. Missing absolute search directories are retained without being created; broken candidate symlinks and Unix regular files with no executable bits are skipped. Relative search entries and errors other than absence still fail closed. The selected target must pass the bounded stable-identity checks; a plan does not approve future bytes at an absent or changed path.
 
 ## Sandboxes and platforms
 

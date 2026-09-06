@@ -55,6 +55,7 @@ enum CompletionShell {
     Bash,
     Elvish,
     Fish,
+    #[value(name = "powershell", alias = "power-shell")]
     PowerShell,
     Zsh,
 }
@@ -455,40 +456,14 @@ fn print_standard_build_info(json: bool) -> Result<()> {
 }
 
 fn generate_completion(shell: CompletionShell, output: Option<&Path>) -> Result<Option<bool>> {
-    let mut command = Cli::command();
-    let mut payload = Vec::new();
-    match shell {
-        CompletionShell::Bash => clap_complete::generate(
-            clap_complete::shells::Bash,
-            &mut command,
-            "dev-cache",
-            &mut payload,
-        ),
-        CompletionShell::Elvish => clap_complete::generate(
-            clap_complete::shells::Elvish,
-            &mut command,
-            "dev-cache",
-            &mut payload,
-        ),
-        CompletionShell::Fish => clap_complete::generate(
-            clap_complete::shells::Fish,
-            &mut command,
-            "dev-cache",
-            &mut payload,
-        ),
-        CompletionShell::PowerShell => clap_complete::generate(
-            clap_complete::shells::PowerShell,
-            &mut command,
-            "dev-cache",
-            &mut payload,
-        ),
-        CompletionShell::Zsh => clap_complete::generate(
-            clap_complete::shells::Zsh,
-            &mut command,
-            "dev-cache",
-            &mut payload,
-        ),
-    }
+    let shell = match shell {
+        CompletionShell::Bash => dev_tools_completion::Shell::Bash,
+        CompletionShell::Elvish => dev_tools_completion::Shell::Elvish,
+        CompletionShell::Fish => dev_tools_completion::Shell::Fish,
+        CompletionShell::PowerShell => dev_tools_completion::Shell::PowerShell,
+        CompletionShell::Zsh => dev_tools_completion::Shell::Zsh,
+    };
+    let payload = dev_tools_completion::render(shell, Cli::command(), "dev-cache")?;
     if let Some(path) = output {
         if fs::read(path).ok().as_deref() == Some(payload.as_slice()) {
             return Ok(Some(false));
@@ -597,6 +572,18 @@ fn open_root(config: &Config) -> Result<RootHandle> {
     )
 }
 
+fn observe_root(config: &Config) -> Result<RootHandle> {
+    if !config.enabled {
+        bail!("routing is disabled");
+    }
+    RootHandle::observe(
+        config
+            .root
+            .as_deref()
+            .context("routing root is not configured")?,
+    )
+}
+
 fn status_report(config: &Config) -> Result<StatusReport> {
     let intercept = install::default_intercept_dir();
     if !config.enabled {
@@ -624,7 +611,7 @@ fn status_report(config: &Config) -> Result<StatusReport> {
             maintenance: None,
         });
     }
-    let root = open_root(config)?;
+    let root = observe_root(config)?;
     let repository = Repository::discover(&env::current_dir()?, &root)?;
     let details = status_adapter_details(config, &root, repository.as_ref())?;
     let mut activation = install::activation_audit(&intercept);
@@ -842,7 +829,7 @@ fn doctor(config: &Config, config_path: Option<&Path>, json: bool) -> Result<i32
     checks.push(serde_json::json!({"name":"config","ok":config_ok,"path":config_path}));
     let mut maintenance_ok = true;
     let (root_check, root_ok) = if config.enabled {
-        match open_root(config) {
+        match observe_root(config) {
             Ok(root) => {
                 let maintenance = gc::maintenance_status(&root)?;
                 maintenance_ok = maintenance.catalog_issues.is_empty()
@@ -1088,7 +1075,7 @@ fn enabled_adapter_names(config: &Config) -> Vec<String> {
 }
 
 fn report(config: &Config, json: bool) -> Result<i32> {
-    let root = open_root(config)?;
+    let root = observe_root(config)?;
     let report = serde_json::json!({
         "root": root.root,
         "platform": root.platform,
@@ -1108,7 +1095,7 @@ fn path_command(
     repo_path: Option<&Path>,
     json: bool,
 ) -> Result<i32> {
-    let root = open_root(config)?;
+    let root = observe_root(config)?;
     let path = adapter_path(&root, adapter, repo_path)?;
     if json {
         print_value(true, &serde_json::json!({"adapter":adapter,"path":path}))?;
@@ -1280,7 +1267,11 @@ fn gc_command(config: &Config, args: GcArgs, json: bool) -> Result<i32> {
     if args.automatic && !config.enabled {
         return Ok(0);
     }
-    let root = open_root(config)?;
+    let root = if args.apply || args.automatic {
+        open_root(config)?
+    } else {
+        observe_root(config)?
+    };
     if args.automatic {
         if !config.maintenance.automatic {
             return Ok(0);
@@ -1343,7 +1334,11 @@ fn artifact_command(config: &Config, command: ArtifactCommand, json: bool) -> Re
 }
 
 fn migrate_command(config: &Config, args: MigrateArgs, json: bool) -> Result<i32> {
-    let root = open_root(config)?;
+    let root = if args.apply {
+        open_root(config)?
+    } else {
+        observe_root(config)?
+    };
     let repository = if matches!(args.adapter, Adapter::Temp) {
         Repository::discover(args.repo.as_deref().unwrap_or(&env::current_dir()?), &root)?
     } else {
@@ -1418,7 +1413,12 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     let root = open_root(&config)?;
     let workspace =
         Repository::discover(&current_dir, &root)?.context("resolve current workspace scope")?;
-    maybe_automatic_gc(&root, &config, true);
+    // Compiler aliases and cache launchers run once per compilation, not once
+    // per build. Outer routed tools and explicit GC own full-root maintenance.
+    let automatic_maintenance = !matches!(adapter, Adapter::Ccache | Adapter::Sccache);
+    if automatic_maintenance {
+        maybe_automatic_gc(&root, &config, true);
+    }
     let setup_lease = RootLease::shared(&root, &format!("intercept:{command}"))?;
     let context = AdapterContext {
         worktree_cache: workspace.cache_dir.clone(),
@@ -1450,7 +1450,9 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     };
     resources::complete(&root, &resource_ids)?;
     drop(active_lease);
-    maybe_automatic_gc(&root, &config, false);
+    if automatic_maintenance {
+        maybe_automatic_gc(&root, &config, false);
+    }
     Ok(code)
 }
 
@@ -2008,7 +2010,11 @@ fn cargo_routing(
     supports_build_dir: bool,
 ) -> Result<CargoRouting> {
     let mut routed = Vec::new();
-    let mut status = "routing disabled".to_owned();
+    let mut status = if help && config.enabled && config.cargo.enabled {
+        "Cargo routing configured; no cache paths opened for help/version".to_owned()
+    } else {
+        "routing disabled".to_owned()
+    };
     let mut lease = None;
     let mut maintenance_root = None;
     let mut resource_ids = Vec::new();

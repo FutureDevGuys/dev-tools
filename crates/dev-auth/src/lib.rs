@@ -41,6 +41,7 @@ pub mod setup_v3;
 pub mod smart_binding;
 #[cfg(unix)]
 pub mod stable_release;
+mod strict_serde;
 #[cfg(target_os = "linux")]
 pub mod supervisor;
 

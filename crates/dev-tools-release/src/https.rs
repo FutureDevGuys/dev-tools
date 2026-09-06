@@ -9,6 +9,81 @@ use url::Url;
 type HttpResponse = Response<ureq::Body>;
 const MAX_URL_BYTES: usize = 8192;
 
+#[derive(Clone)]
+pub(super) struct ResponseLocation(pub String);
+
+/// Header-only location observation. An unsupported HEAD request fails without
+/// a GET fallback; a successful location is not artifact authentication.
+pub fn probe_https_location(url: &str, policy: &HttpsPolicy) -> Result<String> {
+    probe_location_with_send(url, policy, |url, remaining, _| {
+        let agent: ureq::Agent = crate::https_single_hop_config(policy, remaining).into();
+        head_request(&agent, url)
+            .call()
+            .context("request HTTPS resource headers")
+    })
+}
+
+fn head_request(
+    agent: &ureq::Agent,
+    url: &str,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    agent.head(url).header("Accept", "application/octet-stream")
+}
+
+fn probe_location_with_send(
+    url: &str,
+    policy: &HttpsPolicy,
+    send: impl FnMut(&str, Duration, bool) -> Result<HttpResponse>,
+) -> Result<String> {
+    let response = guarded_response(url, policy, 1, send)?;
+    if response.status().as_u16() != 200 {
+        bail!("HTTPS header request did not identify an available resource");
+    }
+    response
+        .extensions()
+        .get::<ResponseLocation>()
+        .map(|location| location.0.clone())
+        .context("HTTPS response location is unavailable")
+}
+
+/// Resolve an inert reference against an absolute HTTPS resource URL without
+/// network access. This validates URL syntax, not host admission, authenticity
+/// or installation authority; a future request still requires its own policy.
+pub fn resolve_https_reference(base: &str, reference: &str) -> Result<String> {
+    canonical_https_host(base)?;
+    validate_url_text(reference)?;
+    let resolved = Url::parse(base)
+        .context("parse HTTPS reference base")?
+        .join(reference)
+        .context("resolve HTTPS reference")?;
+    canonical_https_host(resolved.as_str())?;
+    Ok(resolved.into())
+}
+
+/// Derive a host-policy entry from a trusted local HTTPS URL using the same
+/// normalization and validation as the transport. Never use remote URLs to
+/// extend an existing allowed-host policy.
+pub fn canonical_https_host(input: &str) -> Result<String> {
+    validate_url_text(input)?;
+    let parsed = Url::parse(input).context("parse HTTPS policy URL")?;
+    let uri: ureq::http::Uri = parsed
+        .as_str()
+        .parse()
+        .context("parse normalized HTTPS policy URL")?;
+    let host = uri
+        .host()
+        .context("HTTPS policy URL has no host")?
+        .to_owned();
+    let policy = HttpsPolicy {
+        allowed_hosts: std::collections::BTreeSet::from([host.clone()]),
+        max_redirects: 0,
+        timeout: Duration::from_secs(1),
+        user_agent: "dev-tools-release".into(),
+    };
+    validate_url(&parsed, &policy, 1)?;
+    Ok(host)
+}
+
 pub(super) fn guarded_response(
     input: &str,
     policy: &HttpsPolicy,
@@ -36,11 +111,14 @@ fn guarded_response_with_clock(
             .checked_duration_since(now())
             .filter(|remaining| !remaining.is_zero())
             .context("HTTPS request deadline expired")?;
-        let response = send(current.as_str(), remaining, hop == 0)?;
+        let mut response = send(current.as_str(), remaining, hop == 0)?;
         if now() >= deadline {
             bail!("HTTPS request deadline expired");
         }
         if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            response
+                .extensions_mut()
+                .insert(ResponseLocation(current.into()));
             return Ok(response);
         }
         if hop == policy.max_redirects {
@@ -90,9 +168,277 @@ fn validate_url(url: &Url, policy: &HttpsPolicy, limit: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_location_is_the_admitted_request_not_response_metadata() {
+        let response = guarded_response(
+            "https://example.test/start",
+            &policy(),
+            100,
+            |_, _, initial| {
+                let mut response = if initial {
+                    reply(302, Some("/files/feed.zsync"))
+                } else {
+                    reply(200, None)
+                };
+                response
+                    .extensions_mut()
+                    .insert(ResponseLocation("https://untrusted.test/spoof".into()));
+                Ok(response)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            response.extensions().get::<ResponseLocation>().unwrap().0,
+            "https://example.test/files/feed.zsync"
+        );
+    }
+
+    #[test]
+    fn located_metadata_keeps_body_bounds_and_redirect_validator_scope() {
+        let response = guarded_response(
+            "https://example.test/start",
+            &policy(),
+            100,
+            |_, _, initial| {
+                Ok(if initial {
+                    reply(302, Some("/feed"))
+                } else {
+                    Response::builder()
+                        .status(200)
+                        .header("etag", "\"final\"")
+                        .body(ureq::Body::builder().data(b"metadata".to_vec()))
+                        .unwrap()
+                })
+            },
+        )
+        .unwrap();
+        let result = crate::decode_located_resource_response(response, 100, false, false).unwrap();
+        assert_eq!(result.final_url, "https://example.test/feed");
+        let crate::ConditionalHttpsResponse::Modified {
+            response,
+            validators,
+        } = result.response
+        else {
+            panic!("modified")
+        };
+        assert_eq!(response.bytes, b"metadata");
+        assert!(response.etag.is_none());
+        assert_eq!(validators, crate::HttpsValidators::default());
+        for (status, limit, initial) in [(200, 1, true), (206, 100, true), (304, 100, false)] {
+            let response =
+                guarded_response("https://example.test/feed", &policy(), 100, |_, _, _| {
+                    Ok(reply(status, None))
+                })
+                .unwrap();
+            assert!(
+                crate::decode_located_resource_response(response, limit, true, initial).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn inert_https_reference_resolution_uses_the_explicit_base() {
+        assert_eq!(
+            resolve_https_reference(
+                "https://example.test/rel/feed.zsync",
+                "../assets/app.AppImage?download=1"
+            )
+            .unwrap(),
+            "https://example.test/assets/app.AppImage?download=1"
+        );
+        assert_eq!(
+            resolve_https_reference("https://example.test/feed", "https://other.test/app").unwrap(),
+            "https://other.test/app"
+        );
+        for reference in [
+            "",
+            "http://other.test/app",
+            "https://user@other.test/app",
+            "#fragment",
+            "file:///not-read",
+            "\\other.test\\app",
+            "with space",
+            "\n/evil",
+        ] {
+            assert!(resolve_https_reference("https://example.test/feed", reference).is_err());
+        }
+        assert!(resolve_https_reference("http://example.test/feed", "app").is_err());
+    }
+
+    #[test]
+    fn header_probe_uses_head_and_the_admitted_final_location() {
+        let agent: ureq::Agent =
+            crate::https_single_hop_config(&policy(), Duration::from_secs(1)).into();
+        assert_eq!(
+            head_request(&agent, "https://example.test/start").method_ref(),
+            Some(&ureq::http::Method::HEAD)
+        );
+        let mut requests = Vec::new();
+        let location = probe_location_with_send(
+            "https://example.test/start",
+            &policy(),
+            |url, _, initial| {
+                requests.push(url.to_owned());
+                Ok(if initial {
+                    reply(302, Some("/app-42.zip"))
+                } else {
+                    reply(200, None)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(location, "https://example.test/app-42.zip");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn header_probe_never_falls_back_after_unsupported_head() {
+        for status in [204, 206, 304, 403, 404, 405, 429, 500, 501] {
+            let mut calls = 0;
+            assert!(
+                probe_location_with_send("https://example.test/file", &policy(), |_, _, _| {
+                    calls += 1;
+                    Ok(reply(status, None))
+                })
+                .is_err()
+            );
+            assert_eq!(calls, 1);
+        }
+        let mut calls = 0;
+        assert!(
+            probe_location_with_send("https://example.test/file", &policy(), |_, _, _| {
+                calls += 1;
+                Ok(reply(302, Some("https://untrusted.test/file")))
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn header_probe_does_not_read_response_content() {
+        struct Unreadable;
+        impl std::io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("HEAD probe read artifact content")
+            }
+        }
+        let result = probe_location_with_send("https://example.test/app", &policy(), |_, _, _| {
+            Ok(Response::builder()
+                .status(200)
+                .body(ureq::Body::builder().reader(Unreadable))
+                .unwrap())
+        })
+        .unwrap();
+        assert_eq!(result, "https://example.test/app");
+        assert_eq!(
+            crate::https_single_hop_config(&policy(), Duration::from_secs(1))
+                .max_response_header_size(),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn local_host_policy_uses_transport_normalization() {
+        assert_eq!(
+            canonical_https_host("https://EXAMPLE.com/root").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            canonical_https_host("https://[2001:0db8:0:0:0:0:0:1]/root").unwrap(),
+            "[2001:db8::1]"
+        );
+        for url in [
+            "http://example.com/",
+            "https://user@example.com/",
+            "https://example.com/#fragment",
+        ] {
+            assert!(canonical_https_host(url).is_err());
+        }
+    }
     use crate::HttpsPolicy;
     use std::collections::BTreeSet;
     use std::time::Duration;
+
+    #[test]
+    fn conditional_response_requires_the_original_validator() {
+        use crate::{decode_conditional_response, ConditionalHttpsResponse};
+        let response = || {
+            Response::builder()
+                .status(304)
+                .body(ureq::Body::builder().data("ignored"))
+                .unwrap()
+        };
+        assert!(decode_conditional_response(response(), 64, false).is_err());
+        assert!(matches!(
+            decode_conditional_response(response(), 64, true).unwrap(),
+            ConditionalHttpsResponse::NotModified { .. }
+        ));
+    }
+
+    #[test]
+    fn redirected_response_validators_are_not_retained_for_original_url() {
+        use crate::{decode_resource_response, ConditionalHttpsResponse};
+        let response = Response::builder()
+            .status(200)
+            .header("etag", "\"final-resource\"")
+            .header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(ureq::Body::builder().data("bytes"))
+            .unwrap();
+        match decode_resource_response(response, 64, false, false).unwrap() {
+            ConditionalHttpsResponse::Modified {
+                response,
+                validators,
+            } => {
+                assert!(response.etag.is_none());
+                assert!(validators.etag.is_none());
+                assert!(validators.last_modified.is_none());
+                assert_eq!(response.bytes, b"bytes");
+            }
+            _ => panic!("redirected 200 is modified, not a cache hit"),
+        }
+    }
+
+    #[test]
+    fn conditional_metadata_is_bounded_and_unambiguous() {
+        use crate::{decode_conditional_response, ConditionalHttpsResponse};
+        let response = Response::builder()
+            .status(200)
+            .header("etag", "\"v1\"")
+            .header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(ureq::Body::builder().data("bytes"))
+            .unwrap();
+        match decode_conditional_response(response, 5, false).unwrap() {
+            ConditionalHttpsResponse::Modified {
+                response,
+                validators,
+            } => {
+                assert_eq!(response.bytes, b"bytes");
+                assert_eq!(validators.etag.as_deref(), Some("\"v1\""));
+                assert_eq!(
+                    validators.last_modified.as_deref(),
+                    Some("Wed, 21 Oct 2015 07:28:00 GMT")
+                );
+            }
+            _ => panic!("200 must contain new bytes"),
+        }
+        for values in [vec!["a".into(), "b".into()], vec!["x".repeat(8193)]] {
+            let mut builder = Response::builder().status(304);
+            for value in values {
+                builder = builder.header("etag", value);
+            }
+            let response = builder.body(ureq::Body::builder().data("ignored")).unwrap();
+            assert!(decode_conditional_response(response, 64, true).is_err());
+        }
+        for (status, limit) in [(200, 4), (206, 64), (404, 64), (429, 64)] {
+            let response = Response::builder()
+                .status(status)
+                .body(ureq::Body::builder().data("bytes"))
+                .unwrap();
+            assert!(decode_conditional_response(response, limit, false).is_err());
+        }
+    }
 
     fn policy() -> HttpsPolicy {
         HttpsPolicy {

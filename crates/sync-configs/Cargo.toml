@@ -15,6 +15,7 @@ test-support = []
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 ctrlc = "3"
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }

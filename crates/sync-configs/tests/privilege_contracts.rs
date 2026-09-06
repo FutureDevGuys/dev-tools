@@ -10,7 +10,9 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sync_configs::privilege::{PrivilegeError, PrivilegeSession};
+use sync_configs::privilege::{
+    AuthenticationFailure, AuthenticationStage, PrivilegeError, PrivilegeSession,
+};
 use tempfile::TempDir;
 
 static PRIVILEGE_PROCESS_TEST: Mutex<()> = Mutex::new(());
@@ -50,6 +52,72 @@ exit 64
 fn executable_script(path: &Path, script: &str) {
     fs::write(path, script).expect("write executable script");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod executable script");
+}
+
+#[test]
+fn authentication_failures_identify_stage_without_echoing_executable_authority() {
+    let _guard = process_test_guard();
+    let root = TempDir::new().expect("temp root");
+    let sudo = root.path().join("private-executable-sentinel");
+    executable_script(&sudo, "#!/bin/sh\nexit 0\n");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo.clone()).unwrap();
+    fs::remove_file(&sudo).unwrap();
+    let error = session.ensure_authenticated().unwrap_err();
+    let diagnostic = format!("{error}");
+    assert!(diagnostic.contains("cached check"));
+    assert!(diagnostic.contains("process error"));
+    assert!(diagnostic.contains("NotFound"));
+    assert!(!format!("{error:?}").contains("private-executable-sentinel"));
+    assert!(matches!(
+        error,
+        PrivilegeError::Authentication {
+            stage: AuthenticationStage::CachedCheck,
+            failure: AuthenticationFailure::Process {
+                kind: std::io::ErrorKind::NotFound,
+                os_code: Some(libc::ENOENT),
+            },
+        }
+    ));
+    assert!(!session.is_authenticated());
+
+    executable_script(&sudo, "#!/bin/sh\nexit 17\n");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).unwrap();
+    let error = session.ensure_authenticated().unwrap_err();
+    let diagnostic = format!("{error}");
+    assert!(diagnostic.contains("prompt"));
+    assert!(diagnostic.contains("exit code Some(17)"));
+    assert!(!format!("{error:?}").contains("private-executable-sentinel"));
+    assert!(matches!(
+        error,
+        PrivilegeError::Authentication {
+            stage: AuthenticationStage::Prompt,
+            failure: AuthenticationFailure::Exit {
+                code: Some(17),
+                signal: None,
+            },
+        }
+    ));
+    assert!(!session.is_authenticated());
+}
+
+#[test]
+fn authentication_failure_preserves_signal_termination() {
+    let _guard = process_test_guard();
+    let root = TempDir::new().expect("temp root");
+    let sudo = root.path().join("sudo");
+    executable_script(&sudo, "#!/bin/sh\nkill -TERM \"$$\"\n");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).unwrap();
+    assert!(matches!(
+        session.ensure_authenticated().unwrap_err(),
+        PrivilegeError::Authentication {
+            stage: AuthenticationStage::Prompt,
+            failure: AuthenticationFailure::Exit {
+                code: None,
+                signal: Some(libc::SIGTERM),
+            },
+        }
+    ));
+    assert!(!session.is_authenticated());
 }
 
 #[test]

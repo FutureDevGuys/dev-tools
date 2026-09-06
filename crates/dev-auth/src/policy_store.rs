@@ -1,8 +1,8 @@
 use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2, resolve_policy_for_user};
 use anyhow::{bail, Context, Result};
-use std::fs::{self, File};
+use std::fs::{self, Metadata, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const POLICY_LIMIT: u64 = 1024 * 1024;
@@ -101,14 +101,92 @@ fn read_policy_file(
     {
         bail!("{description} has unsafe filesystem authority");
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(path)
-        .with_context(|| format!("open {description}"))?
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open {description}"))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect opened {description}"))?;
+    if !same_policy_metadata(&metadata, &opened) {
+        bail!("{description} changed while being opened");
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    (&file)
         .take(POLICY_LIMIT + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("read {description}"))?;
     if bytes.len() as u64 > POLICY_LIMIT {
         bail!("{description} exceeds the size limit");
     }
+    let after = file
+        .metadata()
+        .with_context(|| format!("reinspect {description}"))?;
+    if bytes.len() as u64 != opened.len() || !same_policy_metadata(&opened, &after) {
+        bail!("{description} changed while being read");
+    }
     Ok(bytes)
+}
+
+fn same_policy_metadata(left: &Metadata, right: &Metadata) -> bool {
+    right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.mode() == right.mode()
+        && left.nlink() == right.nlink()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn policy_metadata_rejects_replacement_and_changed_open_file_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("policy");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let observed = fs::symlink_metadata(&path).unwrap();
+        let held = File::open(&path).unwrap();
+        assert!(same_policy_metadata(&observed, &held.metadata().unwrap()));
+
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"replaced").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(!same_policy_metadata(
+            &observed,
+            &File::open(&path).unwrap().metadata().unwrap()
+        ));
+
+        let before = held.metadata().unwrap();
+        held.set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+        assert!(!same_policy_metadata(&before, &held.metadata().unwrap()));
+    }
+
+    #[test]
+    fn policy_metadata_rejects_growth_but_not_read_access() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("policy");
+        fs::write(&path, b"original").unwrap();
+        let file = File::open(&path).unwrap();
+        let before = file.metadata().unwrap();
+        let mut bytes = Vec::new();
+        (&file).read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        assert!(same_policy_metadata(&before, &file.metadata().unwrap()));
+        fs::write(&path, b"longer replacement").unwrap();
+        assert!(!same_policy_metadata(&before, &file.metadata().unwrap()));
+    }
 }

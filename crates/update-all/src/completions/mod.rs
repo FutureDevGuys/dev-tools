@@ -456,41 +456,14 @@ fn detect_installed_completion_shells() -> Vec<CompletionShell> {
 
 pub fn generate_update_all_completion(shell: &str) -> Result<String> {
     let shell = CompletionShell::parse(shell)?;
-    let mut command = crate::cli::RunCli::command();
-    let mut out = Vec::new();
-
-    match shell {
-        CompletionShell::Bash => clap_complete::generate(
-            clap_complete::shells::Bash,
-            &mut command,
-            "update-all",
-            &mut out,
-        ),
-        CompletionShell::Elvish => clap_complete::generate(
-            clap_complete::shells::Elvish,
-            &mut command,
-            "update-all",
-            &mut out,
-        ),
-        CompletionShell::Fish => clap_complete::generate(
-            clap_complete::shells::Fish,
-            &mut command,
-            "update-all",
-            &mut out,
-        ),
-        CompletionShell::Zsh => clap_complete::generate(
-            clap_complete::shells::Zsh,
-            &mut command,
-            "update-all",
-            &mut out,
-        ),
-        CompletionShell::PowerShell => clap_complete::generate(
-            clap_complete::shells::PowerShell,
-            &mut command,
-            "update-all",
-            &mut out,
-        ),
-    }
+    let shell = match shell {
+        CompletionShell::Bash => dev_tools_completion::Shell::Bash,
+        CompletionShell::Elvish => dev_tools_completion::Shell::Elvish,
+        CompletionShell::Fish => dev_tools_completion::Shell::Fish,
+        CompletionShell::Zsh => dev_tools_completion::Shell::Zsh,
+        CompletionShell::PowerShell => dev_tools_completion::Shell::PowerShell,
+    };
+    let out = dev_tools_completion::render(shell, crate::cli::RunCli::command(), "update-all")?;
 
     String::from_utf8(out).context("encode update-all completion output")
 }

@@ -8,6 +8,10 @@ publish = false
 description = "Standalone, configuration-driven artifact update client"
 
 [dependencies]
+clap = { version = "4", default-features = false, features = ["std", "help", "usage"] }
+dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
+dev-tools-installation = { version = "0.1.0", path = "../dev-tools-installation" }
+sha2.workspace = true
 dev-tools-product = { version = "0.1.0", path = "../dev-tools-product" }
 dev-tools-update = { version = "0.1.0", path = "../dev-tools-update" }
 directories = "6"
@@ -17,7 +21,13 @@ serde_json = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+dev-tools-release = { version = "0.1.0", path = "../dev-tools-release" }
+rustix = { version = "1", features = ["process"] }
+tempfile = "3"
+
 [dev-dependencies]
+ed25519-dalek.workspace = true
 dev-tools-command = { version = "0.1.0", path = "../dev-tools-command" }
 tempfile = "3"
 

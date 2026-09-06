@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v1";
+const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v2";
 const MAX_BINDING_TARGET_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,9 +89,63 @@ pub struct ResolvedContinuation {
     pub identity: ExecutableIdentity,
 }
 
+/// Target-specific evidence. A direct executable has no PATH search cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BindingResolution {
+    Continuation { resolution: ResolvedContinuation },
+    Structured { identity: ExecutableIdentity },
+}
+
+impl From<ResolvedContinuation> for BindingResolution {
+    fn from(resolution: ResolvedContinuation) -> Self {
+        Self::Continuation { resolution }
+    }
+}
+
+impl BindingResolution {
+    fn identity(&self) -> &ExecutableIdentity {
+        match self {
+            Self::Continuation { resolution } => &resolution.identity,
+            Self::Structured { identity } => identity,
+        }
+    }
+}
+
+/// Inspects an explicitly selected canonical executable without PATH lookup.
+/// This returns identity evidence, not approval or execution authority.
+/// Callers planning activation must also supply their known proxy exclusions
+/// through `resolve_structured_target_excluding`.
+pub fn resolve_structured_target(executable: &Path) -> Result<BindingResolution> {
+    Ok(BindingResolution::Structured {
+        identity: inspect_executable_identity(executable)?,
+    })
+}
+
+/// Inspect a direct target while rejecting known proxy-layer paths.
+/// Exclusions are caller-owned discovery inputs, not proof of admission or
+/// static analysis of arbitrary wrappers. The executable must remain canonical.
+pub fn resolve_structured_target_excluding(
+    executable: &Path,
+    excluded_directories: &[PathBuf],
+) -> Result<BindingResolution> {
+    require_absolute_normal_path(executable, "structured binding executable")?;
+    let excluded = canonical_proxy_directories(excluded_directories)?;
+    let canonical =
+        fs::canonicalize(executable).context("resolve structured binding executable")?;
+    if excluded
+        .iter()
+        .any(|directory| executable.starts_with(directory) || canonical.starts_with(directory))
+    {
+        bail!("structured binding target belongs to an excluded proxy layer");
+    }
+    resolve_structured_target(executable)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BindingTargetIntent {
+    #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
     Continuation,
     Structured {
         executable: PathBuf,
@@ -102,6 +156,38 @@ pub enum BindingTargetIntent {
         shell: PathBuf,
         source_sha256: String,
     },
+}
+
+impl BindingTargetIntent {
+    /// Assemble native arguments without shell parsing or target execution.
+    ///
+    /// This pure transformation does not validate executable identity, approve
+    /// a binding, choose an environment/cwd, or supply argv[0]. The admitted
+    /// launcher must establish those boundaries separately. Pinned-shell
+    /// targets require source custody and are deliberately unsupported here.
+    pub fn forward_arguments(&self, caller: &[OsString]) -> Result<Vec<OsString>> {
+        match self {
+            Self::Continuation => Ok(caller.to_vec()),
+            Self::Structured {
+                argv_prefix,
+                caller_argument_index,
+                ..
+            } => {
+                let Some(before) = argv_prefix.get(..*caller_argument_index) else {
+                    bail!("structured binding caller position is outside its fixed arguments");
+                };
+                Ok(before
+                    .iter()
+                    .chain(caller)
+                    .chain(&argv_prefix[*caller_argument_index..])
+                    .cloned()
+                    .collect())
+            }
+            Self::PinnedShell { .. } => {
+                bail!("pinned-shell argument forwarding requires source custody and explicit policy permission");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,7 +251,7 @@ impl BindingIntent {
 pub struct BindingGeneration {
     pub generation: u64,
     pub intent: BindingIntent,
-    pub resolved: ResolvedContinuation,
+    pub resolved: BindingResolution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,7 +271,7 @@ pub struct BindingPlan {
     pub platform: String,
     pub name: String,
     pub intent: BindingIntent,
-    pub resolved: ResolvedContinuation,
+    pub resolved: BindingResolution,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_receipt: Option<BindingReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,7 +283,8 @@ pub struct BindingPlan {
 }
 
 impl BindingReceipt {
-    pub fn new(intent: BindingIntent, resolved: ResolvedContinuation) -> Result<Self> {
+    pub fn new(intent: BindingIntent, resolved: impl Into<BindingResolution>) -> Result<Self> {
+        let resolved = resolved.into();
         validate_intent_resolution(&intent, &resolved)?;
         Ok(Self {
             schema: BINDING_RECEIPT_SCHEMA.to_owned(),
@@ -215,16 +302,17 @@ impl BindingReceipt {
 pub fn build_binding_plan(
     name: impl Into<String>,
     intent: BindingIntent,
-    resolved: ResolvedContinuation,
+    resolved: impl Into<BindingResolution>,
     current: Option<&BindingReceipt>,
 ) -> Result<BindingPlan> {
+    let resolved = resolved.into();
     let name = name.into();
     require_simple_name(&name, "binding name")?;
     validate_intent_resolution(&intent, &resolved)?;
     let (current_generation, current_receipt_sha256, change) = match current {
         Some(receipt) => {
             validate_binding_receipt_structure(receipt)?;
-            let change = match classify_binding_change(receipt, &intent, &resolved) {
+            let change = match classify_resolved_binding_change(receipt, &intent, &resolved) {
                 BindingChange::Unchanged => BindingPlanChange::Unchanged,
                 BindingChange::Refresh => BindingPlanChange::Refresh,
                 BindingChange::Rebind => BindingPlanChange::Rebind,
@@ -241,6 +329,7 @@ pub fn build_binding_plan(
         BindingPlanChange::Install => &[
             BindingPlanActionKind::ValidateTarget,
             BindingPlanActionKind::PublishBinding,
+            BindingPlanActionKind::VerifyBinding,
             BindingPlanActionKind::ActivateProxy,
         ],
         BindingPlanChange::Unchanged => &[BindingPlanActionKind::VerifyBinding],
@@ -248,6 +337,7 @@ pub fn build_binding_plan(
             BindingPlanActionKind::DeactivateProxy,
             BindingPlanActionKind::ValidateTarget,
             BindingPlanActionKind::PublishBinding,
+            BindingPlanActionKind::VerifyBinding,
             BindingPlanActionKind::ActivateProxy,
         ],
     };
@@ -262,7 +352,7 @@ pub fn build_binding_plan(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(BindingPlan {
-        schema: "dev-auth-workload-binding-plan-v1".to_owned(),
+        schema: "dev-auth-workload-binding-plan-v2".to_owned(),
         platform: current_platform(),
         name,
         intent,
@@ -304,7 +394,7 @@ pub fn write_binding_plan(path: &Path, plan: &BindingPlan) -> Result<String> {
 }
 
 fn validate_binding_plan(plan: &BindingPlan) -> Result<()> {
-    if plan.schema != "dev-auth-workload-binding-plan-v1" {
+    if plan.schema != "dev-auth-workload-binding-plan-v2" {
         bail!("workload binding plan schema is not supported");
     }
     if plan.platform != current_platform() {
@@ -330,13 +420,8 @@ fn binding_receipt_sha256(receipt: &BindingReceipt) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-pub fn resolve_continuation(
-    command_name: &str,
-    search_path: &OsStr,
-    excluded_directories: &[PathBuf],
-) -> Result<ResolvedContinuation> {
-    require_simple_name(command_name, "binding command")?;
-    let excluded = excluded_directories
+fn canonical_proxy_directories(excluded_directories: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    excluded_directories
         .iter()
         .map(|directory| {
             require_absolute_normal_path(directory, "excluded proxy directory")?;
@@ -348,13 +433,31 @@ pub fn resolve_continuation(
                 }),
             }
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+pub fn resolve_continuation(
+    command_name: &str,
+    search_path: &OsStr,
+    excluded_directories: &[PathBuf],
+) -> Result<ResolvedContinuation> {
+    require_simple_name(command_name, "binding command")?;
+    let excluded = canonical_proxy_directories(excluded_directories)?;
 
     let mut continuation_entries = Vec::new();
     for entry in std::env::split_paths(search_path) {
         require_absolute_normal_path(&entry, "binding search path entry")?;
-        let canonical_entry = fs::canonicalize(&entry)
-            .with_context(|| format!("resolve binding search path entry {}", entry.display()))?;
+        let canonical_entry = match fs::canonicalize(&entry) {
+            Ok(canonical) => canonical,
+            // An absent optional tool directory does not prevent native PATH
+            // lookup. Retain its position without creating or adopting it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => entry.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("resolve binding search path entry {}", entry.display())
+                })
+            }
+        };
         if excluded
             .iter()
             .any(|directory| canonical_entry.starts_with(directory))
@@ -386,13 +489,28 @@ pub fn resolve_continuation(
         if !(link_metadata.file_type().is_file() || link_metadata.file_type().is_symlink()) {
             continue;
         }
-        let canonical_path = fs::canonicalize(&visible_path)
-            .with_context(|| format!("resolve binding candidate {}", visible_path.display()))?;
+        let canonical_path = match fs::canonicalize(&visible_path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("resolve binding candidate {}", visible_path.display())
+                })
+            }
+        };
         if excluded
             .iter()
             .any(|directory| canonical_path.starts_with(directory))
         {
             continue;
+        }
+        #[cfg(unix)]
+        {
+            let target_metadata = fs::metadata(&canonical_path)
+                .with_context(|| format!("inspect binding candidate {}", visible_path.display()))?;
+            if target_metadata.is_file() && target_metadata.mode() & 0o111 == 0 {
+                continue;
+            }
         }
         let identity = inspect_executable_identity(&canonical_path)?;
         return Ok(ResolvedContinuation {
@@ -411,6 +529,14 @@ pub fn classify_binding_change(
     desired_intent: &BindingIntent,
     desired_resolution: &ResolvedContinuation,
 ) -> BindingChange {
+    classify_resolved_binding_change(current, desired_intent, &desired_resolution.clone().into())
+}
+
+fn classify_resolved_binding_change(
+    current: &BindingReceipt,
+    desired_intent: &BindingIntent,
+    desired_resolution: &BindingResolution,
+) -> BindingChange {
     if current.active.intent != *desired_intent {
         BindingChange::Rebind
     } else if current.active.resolved != *desired_resolution {
@@ -423,11 +549,12 @@ pub fn classify_binding_change(
 pub fn advance_binding(
     current: &BindingReceipt,
     desired_intent: BindingIntent,
-    desired_resolution: ResolvedContinuation,
+    desired_resolution: impl Into<BindingResolution>,
 ) -> Result<BindingReceipt> {
+    let desired_resolution = desired_resolution.into();
     validate_binding_receipt_structure(current)?;
     validate_intent_resolution(&desired_intent, &desired_resolution)?;
-    if classify_binding_change(current, &desired_intent, &desired_resolution)
+    if classify_resolved_binding_change(current, &desired_intent, &desired_resolution)
         == BindingChange::Unchanged
     {
         return Ok(current.clone());
@@ -449,6 +576,11 @@ pub fn advance_binding(
     })
 }
 
+/// Checks target identity and the custody prerequisites for a refresh.
+///
+/// Success does not approve replacement bytes, advance a receipt, or authorize
+/// launch. The caller still needs the separately approved digest-bound plan and
+/// current receipt preconditions; root ownership alone is not refresh approval.
 pub fn require_automatic_refresh(
     mode: BindingMode,
     resolved: &ResolvedContinuation,
@@ -501,43 +633,65 @@ fn validate_binding_generation(generation: &BindingGeneration) -> Result<()> {
     validate_intent_resolution_structure(&generation.intent, &generation.resolved)
 }
 
-fn validate_intent_resolution(
-    intent: &BindingIntent,
-    resolved: &ResolvedContinuation,
-) -> Result<()> {
+fn validate_intent_resolution(intent: &BindingIntent, resolved: &BindingResolution) -> Result<()> {
     validate_intent_resolution_structure(intent, resolved)?;
-    verify_resolution_identity(resolved)
+    verify_executable_identity(resolved.identity())
 }
 
 fn validate_intent_resolution_structure(
     intent: &BindingIntent,
-    resolved: &ResolvedContinuation,
+    resolved: &BindingResolution,
 ) -> Result<()> {
     require_simple_name(&intent.command_name, "binding command")?;
     require_simple_name(&intent.workload, "binding workload")?;
-    require_absolute_normal_path(&resolved.visible_path, "resolved visible command")?;
-    require_absolute_normal_path(&resolved.canonical_path, "resolved canonical command")?;
-    if resolved.identity.canonical_path != resolved.canonical_path {
-        bail!("resolved command identity does not match its canonical path");
+    let identity = resolved.identity();
+    if identity.sha256.len() != 64
+        || !identity
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("binding executable identity digest is not canonical SHA-256");
     }
-    match &intent.target {
-        BindingTargetIntent::Continuation => {}
-        BindingTargetIntent::Structured {
-            executable,
-            argv_prefix,
-            caller_argument_index,
-        } => {
+    if identity.length > MAX_BINDING_TARGET_BYTES {
+        bail!("binding executable identity exceeds the size limit");
+    }
+    match (&intent.target, resolved) {
+        (BindingTargetIntent::Continuation, BindingResolution::Continuation { resolution }) => {
+            validate_continuation_structure(intent, resolution)?;
+        }
+        (
+            BindingTargetIntent::Structured {
+                executable,
+                argv_prefix,
+                caller_argument_index,
+            },
+            BindingResolution::Structured { identity },
+        ) => {
             require_absolute_normal_path(executable, "structured binding executable")?;
-            if executable != &resolved.canonical_path {
+            if executable != &identity.canonical_path {
                 bail!("structured binding executable does not match its pinned identity");
             }
             if *caller_argument_index > argv_prefix.len() {
                 bail!("structured binding caller position is outside its fixed arguments");
             }
         }
-        BindingTargetIntent::PinnedShell { .. } => {
+        (BindingTargetIntent::PinnedShell { .. }, _) => {
             bail!("pinned-shell planning requires source custody and explicit policy permission; this planning contract does not support it");
         }
+        _ => bail!("binding target kind does not match its resolution evidence"),
+    }
+    Ok(())
+}
+
+fn validate_continuation_structure(
+    intent: &BindingIntent,
+    resolved: &ResolvedContinuation,
+) -> Result<()> {
+    require_absolute_normal_path(&resolved.visible_path, "resolved visible command")?;
+    require_absolute_normal_path(&resolved.canonical_path, "resolved canonical command")?;
+    if resolved.identity.canonical_path != resolved.canonical_path {
+        bail!("resolved command identity does not match its canonical path");
     }
     let continuation_entries = std::env::split_paths(&resolved.continuation_path)
         .map(|entry| {
@@ -558,11 +712,90 @@ fn validate_intent_resolution_structure(
 }
 
 fn verify_resolution_identity(resolved: &ResolvedContinuation) -> Result<()> {
-    let observed = inspect_executable_identity(&resolved.canonical_path)?;
-    if observed != resolved.identity {
+    if resolved.canonical_path != resolved.identity.canonical_path {
+        bail!("resolved command identity does not match its canonical path");
+    }
+    verify_executable_identity(&resolved.identity)
+}
+
+fn verify_executable_identity(identity: &ExecutableIdentity) -> Result<()> {
+    let observed = inspect_executable_identity(&identity.canonical_path)?;
+    if observed != *identity {
         bail!("binding executable identity no longer matches the approved target");
     }
     Ok(())
+}
+
+/// Retain and verify the exact executable that a later command will use.
+///
+/// The Linux backend hashes a read handle to the held inode, never a second
+/// lookup of its source pathname. This does not approve a binding or establish
+/// receipt custody, workload admission, environment/cwd policy or strong-mode
+/// authority. A retained inode is not a snapshot against in-place writes; the
+/// launcher must enforce its independently approved target custody policy.
+pub fn retain_binding_executable(
+    identity: &ExecutableIdentity,
+) -> Result<dev_tools_command::HeldExecutable> {
+    require_absolute_normal_path(&identity.canonical_path, "binding executable")?;
+    let retained = dev_tools_command::HeldExecutable::open(&identity.canonical_path)?;
+    let observed = inspect_open_executable_identity(
+        &identity.canonical_path,
+        retained.open_read_handle()?,
+        false,
+        None,
+    )?;
+    if observed != *identity {
+        bail!("retained binding executable no longer matches the approved target");
+    }
+    Ok(retained)
+}
+
+/// Capture digest-verified target bytes into a sealed anonymous data file.
+///
+/// The snapshot has owner-only nonexecutable permissions and close-on-exec set.
+/// It does not grant launch or admission authority. A qualified launcher still
+/// owns path projection, native identity, environment, streams and lifecycle.
+/// Reads use the existing target-size bound and a fixed-size transfer buffer.
+pub fn snapshot_binding_executable(identity: &ExecutableIdentity) -> Result<fs::File> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = identity;
+        bail!("binding executable snapshots are not accepted on this platform")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        require_absolute_normal_path(&identity.canonical_path, "binding executable")?;
+        let retained = dev_tools_command::HeldExecutable::open(&identity.canonical_path)?;
+        let descriptor = rustix::fs::memfd_create(
+            "dev-auth-binding-snapshot",
+            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .context("create anonymous binding snapshot")?;
+        let mut snapshot = fs::File::from(descriptor);
+        rustix::fs::fchmod(&snapshot, rustix::fs::Mode::from_bits_truncate(0o600))
+            .context("restrict anonymous binding snapshot")?;
+        let observed = inspect_open_executable_identity(
+            &identity.canonical_path,
+            retained.open_read_handle()?,
+            false,
+            Some(&mut snapshot),
+        )?;
+        if observed != *identity {
+            bail!("binding snapshot does not match the approved target");
+        }
+        snapshot
+            .seek(SeekFrom::Start(0))
+            .context("rewind anonymous binding snapshot")?;
+        rustix::fs::fcntl_add_seals(
+            &snapshot,
+            rustix::fs::SealFlags::SEAL
+                | rustix::fs::SealFlags::SHRINK
+                | rustix::fs::SealFlags::GROW
+                | rustix::fs::SealFlags::WRITE,
+        )
+        .context("seal anonymous binding snapshot")?;
+        Ok(snapshot)
+    }
 }
 
 fn inspect_executable_identity(path: &Path) -> Result<ExecutableIdentity> {
@@ -576,9 +809,18 @@ fn inspect_executable_identity(path: &Path) -> Result<ExecutableIdentity> {
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc_no_follow());
-    let mut file = options
+    let file = options
         .open(path)
         .with_context(|| format!("open binding executable {}", path.display()))?;
+    inspect_open_executable_identity(path, file, true, None)
+}
+
+fn inspect_open_executable_identity(
+    path: &Path,
+    mut file: fs::File,
+    recheck_source_path: bool,
+    mut snapshot: Option<&mut fs::File>,
+) -> Result<ExecutableIdentity> {
     let metadata = file
         .metadata()
         .with_context(|| format!("inspect binding executable {}", path.display()))?;
@@ -615,6 +857,11 @@ fn inspect_executable_identity(path: &Path) -> Result<ExecutableIdentity> {
             bail!("binding target exceeds the size limit");
         }
         hasher.update(&buffer[..read]);
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot
+                .write_all(&buffer[..read])
+                .context("write anonymous binding snapshot")?;
+        }
     }
     if total != metadata.len() {
         bail!("binding target changed while it was inspected");
@@ -627,14 +874,16 @@ fn inspect_executable_identity(path: &Path) -> Result<ExecutableIdentity> {
     if !same_open_file(&metadata, &after) {
         bail!("binding target changed while it was inspected");
     }
-    let path_after = fs::metadata(path)
-        .with_context(|| format!("reinspect binding executable path {}", path.display()))?;
-    if !same_open_file(&metadata, &path_after) {
-        bail!("binding target path changed while it was inspected");
+    if recheck_source_path {
+        let path_after = fs::metadata(path)
+            .with_context(|| format!("reinspect binding executable path {}", path.display()))?;
+        if !same_open_file(&metadata, &path_after) {
+            bail!("binding target path changed while it was inspected");
+        }
     }
-    let authority = binding_authority(&canonical_path, &metadata)?;
+    let authority = binding_authority(path, &metadata)?;
     Ok(ExecutableIdentity {
-        canonical_path,
+        canonical_path: path.to_path_buf(),
         length: total,
         sha256: format!("{:x}", hasher.finalize()),
         authority,

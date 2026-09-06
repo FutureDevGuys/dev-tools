@@ -9,6 +9,11 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+mod staging;
+#[cfg(target_os = "linux")]
+pub use staging::{StagingArea, StagingLease};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentAuthority {
     pub owner_uid: u32,
@@ -37,6 +42,14 @@ impl InstallationLock {
     }
 
     fn open(path: &Path, nonblocking: bool) -> Result<Option<Self>> {
+        Self::open_with(path, nonblocking, || {})
+    }
+
+    fn open_with(
+        path: &Path,
+        nonblocking: bool,
+        before_lock: impl FnOnce(),
+    ) -> Result<Option<Self>> {
         let parent = path.parent().context("installation lock has no parent")?;
         ensure_directory_chain(parent)?;
         let mut options = OpenOptions::new();
@@ -66,16 +79,39 @@ impl InstallationLock {
                 bail!("installation lock has unsafe filesystem authority");
             }
         }
+        before_lock();
         if nonblocking {
             match file.try_lock_exclusive() {
-                Ok(()) => Ok(Some(Self { file })),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-                Err(error) => Err(error).context("acquire installation lock"),
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error).context("acquire installation lock"),
             }
         } else {
             file.lock_exclusive().context("acquire installation lock")?;
-            Ok(Some(Self { file }))
         }
+        let lock = Self { file };
+        #[cfg(unix)]
+        lock.verify_named_identity(path)?;
+        Ok(Some(lock))
+    }
+
+    // A cooperating uninstaller can unlink a lock while an opener waits on its
+    // old inode. Holding that detached inode must not admit another mutation.
+    #[cfg(unix)]
+    fn verify_named_identity(&self, path: &Path) -> Result<()> {
+        let retained = self
+            .file
+            .metadata()
+            .context("inspect retained installation lock")?;
+        let named = fs::symlink_metadata(path).context("reinspect installation lock")?;
+        if !named.is_file()
+            || named.dev() != retained.dev()
+            || named.ino() != retained.ino()
+            || retained.nlink() != 1
+        {
+            bail!("installation lock identity changed");
+        }
+        Ok(())
     }
 }
 
@@ -118,6 +154,9 @@ pub struct VersionedLayout {
     pub artifact_name: String,
     pub owner_uid: u32,
     pub directory_mode: u32,
+    /// Omission preserves the legacy shared directory mode and wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin_directory_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -239,6 +278,26 @@ impl ArtifactIdentity {
 }
 
 impl VersionedLayout {
+    /// Validate candidate layout syntax, identity shape and canonical aliases
+    /// without filesystem access. This does not verify bytes, custody, release
+    /// authentication or permission to activate an installation.
+    pub fn validate_candidate(
+        &self,
+        version: &str,
+        identity: &ArtifactIdentity,
+        aliases: &[String],
+    ) -> Result<()> {
+        validate_version_and_aliases(self, version, identity, aliases)
+    }
+
+    fn directory_mode_for(&self, path: &Path) -> u32 {
+        if path == self.bin_dir {
+            self.bin_directory_mode.unwrap_or(self.directory_mode)
+        } else {
+            self.directory_mode
+        }
+    }
+
     fn versions_dir(&self) -> PathBuf {
         self.data_root.join("versions")
     }
@@ -268,6 +327,32 @@ impl VersionedLayout {
     }
 }
 
+/// Apply only if the receipt still equals the caller's observed state.
+/// `None` requires no receipt. Comparison, custody verification and activation
+/// share the installation lock. This path rejects journals and link drift
+/// without recovery or repair, and checks the precondition before preparing or
+/// publishing the candidate. Rejection may still create base directories and
+/// the lock file; this is not a read-only API.
+///
+/// The caller owns version policy and release authentication. Receipt equality
+/// does not authenticate a release or detect a change away from and back to the
+/// same receipt. The verifier runs under the lock and must not reacquire it or
+/// wait for an operation that does; it should perform bounded local work only.
+pub fn apply_versioned_installation_if_unchanged<F>(
+    request: &VersionedInstallRequest,
+    expected: Option<&VersionedReceipt>,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    apply_versioned_installation_inner(
+        request,
+        ApplyPrecondition::Exact(expected),
+        post_install_verify,
+    )
+}
+
 pub fn apply_versioned_installation<F>(
     request: &VersionedInstallRequest,
     post_install_verify: F,
@@ -275,15 +360,46 @@ pub fn apply_versioned_installation<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    apply_versioned_installation_inner(
+        request,
+        ApplyPrecondition::RecoverAndRepair,
+        post_install_verify,
+    )
+}
+
+enum ApplyPrecondition<'a> {
+    RecoverAndRepair,
+    Exact(Option<&'a VersionedReceipt>),
+}
+
+fn apply_versioned_installation_inner<F>(
+    request: &VersionedInstallRequest,
+    precondition: ApplyPrecondition<'_>,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     validate_versioned_request(request)?;
-    prepare_layout(&request.layout, Some(&request.version))?;
+    let legacy = matches!(precondition, ApplyPrecondition::RecoverAndRepair);
+    prepare_layout(&request.layout, legacy.then_some(request.version.as_str()))?;
     let _lock = InstallationLock::acquire(&request.layout.lock_path())?;
-    recover_versioned_installation_locked(&request.layout)?;
+    if legacy {
+        recover_versioned_installation_locked(&request.layout)?;
+    } else {
+        require_path_absent(&request.layout.journal_path())
+            .context("installation requires explicit recovery")?;
+    }
 
     let prior = read_versioned_receipt(&request.layout)?;
+    if let ApplyPrecondition::Exact(expected) = precondition {
+        if prior.as_ref() != expected {
+            bail!("installation receipt changed since observation");
+        }
+    }
     let repaired = match &prior {
-        Some(receipt) => repair_missing_receipt_links(&request.layout, receipt)?,
-        None => false,
+        Some(receipt) if legacy => repair_missing_receipt_links(&request.layout, receipt)?,
+        _ => false,
     };
     if let Some(receipt) = &prior {
         verify_versioned_receipt(&request.layout, receipt)?;
@@ -303,6 +419,9 @@ where
     }
 
     preflight_alias_transition(&request.layout, prior.as_ref(), &request.aliases)?;
+    if !legacy {
+        prepare_layout(&request.layout, Some(&request.version))?;
+    }
     let candidate = request.layout.version_artifact(&request.version);
     publish_executable(&request.source, &candidate, &request.identity)?;
     verify_versioned_artifact_authority(&candidate, request.layout.owner_uid, &request.identity)?;
@@ -547,7 +666,11 @@ fn harden_legacy_adoption_layout(layout: &VersionedLayout, version: &str) -> Res
         layout.versions_dir(),
         layout.versions_dir().join(version),
     ] {
-        harden_legacy_adoption_directory(&path, layout.owner_uid, layout.directory_mode)?;
+        harden_legacy_adoption_directory(
+            &path,
+            layout.owner_uid,
+            layout.directory_mode_for(&path),
+        )?;
     }
     Ok(())
 }
@@ -638,6 +761,191 @@ pub fn read_versioned_installation_receipt(
     read_versioned_receipt(layout)
 }
 
+/// Observe receipt-owned state without creating files or performing recovery.
+/// Absence means no managed receipt, not proof that no external installation exists.
+/// A present receipt requires a nonblocking lock on the existing lock file and
+/// no pending journal. The caller supplies the per-artifact read bound and owns
+/// ancestor trust policy. This is observation, not release authentication.
+#[cfg(target_os = "linux")]
+pub fn observe_versioned_installation(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+) -> Result<Option<VersionedReceipt>> {
+    validate_layout(layout)?;
+    if artifact_limit == 0 {
+        bail!("installation observation requires an artifact bound");
+    }
+    match inspect_owned_directory_read_only(&layout.data_root, layout) {
+        Ok(()) => {}
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    }
+    require_path_absent(&layout.journal_path())
+        .context("installation requires explicit recovery")?;
+    if read_versioned_receipt_document(layout)?.is_none() {
+        return Ok(None);
+    }
+    let file = open_read_nofollow(&layout.lock_path())?;
+    let lock_metadata = file
+        .metadata()
+        .context("inspect existing installation lock")?;
+    if !lock_metadata.is_file()
+        || lock_metadata.nlink() != 1
+        || lock_metadata.uid() != layout.owner_uid
+        || lock_metadata.mode() & 0o777 != 0o600
+    {
+        bail!("existing installation lock has unsafe authority");
+    }
+    file.try_lock_exclusive()
+        .context("installation observation is busy")?;
+    let lock = InstallationLock { file };
+    verify_observation_lock(layout, &lock)?;
+    inspect_owned_directory_read_only(&layout.data_root, layout)?;
+    inspect_owned_directory_read_only(&layout.bin_dir, layout)?;
+    require_path_absent(&layout.journal_path())
+        .context("installation requires explicit recovery")?;
+    let Some(receipt) = read_versioned_receipt(layout)? else {
+        return Ok(None);
+    };
+    if receipt.active_identity.length > artifact_limit
+        || receipt
+            .previous_identity
+            .as_ref()
+            .is_some_and(|identity| identity.length > artifact_limit)
+    {
+        bail!("installation observation exceeds its artifact bound");
+    }
+    inspect_owned_directory_read_only(&layout.versions_dir(), layout)?;
+    inspect_owned_directory_read_only(
+        &layout.versions_dir().join(&receipt.active_version),
+        layout,
+    )?;
+    if let Some(previous) = &receipt.previous_version {
+        inspect_owned_directory_read_only(&layout.versions_dir().join(previous), layout)?;
+    }
+    verify_versioned_receipt(layout, &receipt)?;
+    verify_observation_lock(layout, &lock)?;
+    Ok(Some(receipt))
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_owned_directory_read_only(path: &Path, layout: &VersionedLayout) -> Result<()> {
+    let (directory, _) = open_directory_chain(path, false)?;
+    let metadata = rustix::fs::fstat(&directory).context("inspect installation directory")?;
+    if metadata.st_uid != layout.owner_uid
+        || metadata.st_mode & 0o777 != layout.directory_mode_for(path)
+    {
+        bail!("installation directory has unsafe authority");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_observation_lock(layout: &VersionedLayout, lock: &InstallationLock) -> Result<()> {
+    lock.verify_named_identity(&layout.lock_path())
+}
+
+/// Recover a journaled installation after caller verification of its receipts.
+/// Returns whether a journal was resolved and the resulting optional receipt.
+/// Rejects legacy adoption, unrelated receipts and unauthenticated or over-bound
+/// artifact content before changing links or removing the journal. Without a
+/// journal this verifies current state but does not repair missing links.
+/// The caller owns ancestor trust and release authentication. Verification runs
+/// under the installation lock, may be called for both transition receipts and
+/// must be bounded, local and must not reacquire this lock or wait for its holder.
+/// An existing data root is required; acquiring the lock may create its file.
+/// Errors after restoration begins may leave a partially restored journal.
+#[cfg(target_os = "linux")]
+pub fn recover_versioned_installation_with_verification<F>(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+    mut verify: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnMut(&VersionedReceipt) -> Result<()>,
+{
+    validate_layout(layout)?;
+    if artifact_limit == 0 {
+        bail!("installation recovery requires an artifact bound");
+    }
+    inspect_owned_directory_read_only(&layout.data_root, layout)?;
+    let lock = InstallationLock::acquire(&layout.lock_path())?;
+    inspect_owned_directory_read_only(&layout.data_root, layout)?;
+    inspect_owned_directory_read_only(&layout.bin_dir, layout)?;
+    let journal = read_transition_journal(layout)?;
+    let installed = read_versioned_receipt(layout)?;
+    let Some(journal) = journal else {
+        if let Some(receipt) = &installed {
+            verify(receipt)?;
+            verify_recovery_artifacts(layout, receipt, artifact_limit)?;
+            verify_versioned_receipt(layout, receipt)?;
+        }
+        return Ok((false, installed));
+    };
+    if journal.legacy.is_some() {
+        bail!("authenticated recovery does not admit legacy adoption");
+    }
+    let committed = installed.as_ref() == Some(&journal.next);
+    if !committed && installed.as_ref() != journal.prior.as_ref() {
+        bail!("installation receipt changed during interrupted transition");
+    }
+    verify(&journal.next)?;
+    if let Some(prior) = &journal.prior {
+        verify(prior)?;
+    }
+    verify_recovery_artifacts(layout, &journal.next, artifact_limit)?;
+    if let Some(prior) = &journal.prior {
+        verify_recovery_artifacts(layout, prior, artifact_limit)?;
+    }
+    verify_observation_lock(layout, &lock)?;
+    if committed {
+        verify_versioned_receipt(layout, &journal.next)?;
+    } else {
+        restore_transition_prior(layout, &journal)?;
+    }
+    remove_transition_journal(layout)?;
+    Ok((true, installed))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_recovery_artifacts(
+    layout: &VersionedLayout,
+    receipt: &VersionedReceipt,
+    artifact_limit: u64,
+) -> Result<()> {
+    if receipt.active_identity.length > artifact_limit
+        || receipt
+            .previous_identity
+            .as_ref()
+            .is_some_and(|identity| identity.length > artifact_limit)
+    {
+        bail!("installation recovery exceeds its artifact bound");
+    }
+    inspect_owned_directory_read_only(&layout.versions_dir(), layout)?;
+    for (version, identity) in std::iter::once((&receipt.active_version, &receipt.active_identity))
+        .chain(
+            receipt
+                .previous_version
+                .as_ref()
+                .zip(receipt.previous_identity.as_ref()),
+        )
+    {
+        inspect_owned_directory_read_only(&layout.versions_dir().join(version), layout)?;
+        verify_versioned_artifact_authority(
+            &layout.version_artifact(version),
+            layout.owner_uid,
+            identity,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn inspect_versioned_installation(
     layout: &VersionedLayout,
 ) -> Result<Option<VersionedReceipt>> {
@@ -670,6 +978,24 @@ pub fn versioned_installation_receipt_exists(layout: &VersionedLayout) -> Result
     Ok(read_versioned_receipt(layout)?.is_some())
 }
 
+/// Roll back only while the complete caller-observed receipt remains current.
+/// Rejects pending journals and receipt/link drift without recovery or repair.
+/// Comparison, custody verification and activation share the installation lock;
+/// rejection may create a lock file. Receipt equality neither authenticates a
+/// release nor detects a transition away from and back to the same receipt.
+/// The caller owns release/version policy. The verifier runs under the lock and
+/// must perform bounded local work without reacquiring it or waiting for its holder.
+pub fn rollback_versioned_installation_if_unchanged<F>(
+    layout: &VersionedLayout,
+    expected: &VersionedReceipt,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    rollback_versioned_installation_inner(layout, Some(expected), post_install_verify)
+}
+
 pub fn rollback_versioned_installation<F>(
     layout: &VersionedLayout,
     post_install_verify: F,
@@ -677,10 +1003,29 @@ pub fn rollback_versioned_installation<F>(
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    rollback_versioned_installation_inner(layout, None, post_install_verify)
+}
+
+fn rollback_versioned_installation_inner<F>(
+    layout: &VersionedLayout,
+    expected: Option<&VersionedReceipt>,
+    post_install_verify: F,
+) -> Result<VersionedApplyReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     validate_layout(layout)?;
     let _lock = InstallationLock::acquire(&layout.lock_path())?;
-    recover_versioned_installation_locked(layout)?;
+    if expected.is_some() {
+        require_path_absent(&layout.journal_path())
+            .context("installation requires explicit recovery")?;
+    } else {
+        recover_versioned_installation_locked(layout)?;
+    }
     let prior = read_versioned_receipt(layout)?.context("installation receipt is absent")?;
+    if expected.is_some_and(|expected| expected != &prior) {
+        bail!("installation receipt changed since observation");
+    }
     verify_versioned_receipt(layout, &prior)?;
     let previous_version = prior
         .previous_version
@@ -829,7 +1174,7 @@ fn validate_version_and_aliases(
     aliases: &[String],
 ) -> Result<()> {
     validate_layout(layout)?;
-    validate_component(version, "version")?;
+    validate_version_component(version, "version")?;
     validate_identity(identity)?;
     if aliases.is_empty() {
         bail!("versioned installation requires at least one owned alias");
@@ -853,9 +1198,12 @@ fn validate_layout(layout: &VersionedLayout) -> Result<()> {
         || layout.data_root == layout.bin_dir
         || layout.data_root.starts_with(&layout.bin_dir)
         || layout.bin_dir.starts_with(&layout.data_root)
-        || layout.directory_mode & !0o777 != 0
-        || layout.directory_mode & 0o022 != 0
-        || layout.directory_mode & 0o500 != 0o500
+        || [
+            layout.directory_mode,
+            layout.bin_directory_mode.unwrap_or(layout.directory_mode),
+        ]
+        .iter()
+        .any(|mode| mode & !0o777 != 0 || mode & 0o022 != 0 || mode & 0o500 != 0o500)
     {
         bail!("versioned installation layout is invalid");
     }
@@ -863,12 +1211,26 @@ fn validate_layout(layout: &VersionedLayout) -> Result<()> {
 }
 
 fn validate_component(value: &str, description: &str) -> Result<()> {
+    validate_component_characters(value, description, false)
+}
+
+fn validate_version_component(value: &str, description: &str) -> Result<()> {
+    validate_component_characters(value, description, true)
+}
+
+fn validate_component_characters(
+    value: &str,
+    description: &str,
+    allow_build_separator: bool,
+) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
         || value.starts_with(['.', '-'])
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-')
+                || (allow_build_separator && byte == b'+')
+        })
     {
         bail!("versioned installation {description} is invalid");
     }
@@ -878,14 +1240,18 @@ fn validate_component(value: &str, description: &str) -> Result<()> {
 fn prepare_layout(layout: &VersionedLayout, version: Option<&str>) -> Result<()> {
     validate_layout(layout)?;
     ensure_owned_directory(&layout.data_root, layout.owner_uid, layout.directory_mode)?;
-    ensure_owned_directory(&layout.bin_dir, layout.owner_uid, layout.directory_mode)?;
+    ensure_owned_directory(
+        &layout.bin_dir,
+        layout.owner_uid,
+        layout.directory_mode_for(&layout.bin_dir),
+    )?;
     ensure_owned_directory(
         &layout.versions_dir(),
         layout.owner_uid,
         layout.directory_mode,
     )?;
     if let Some(version) = version {
-        validate_component(version, "version")?;
+        validate_version_component(version, "version")?;
         ensure_owned_directory(
             &layout.versions_dir().join(version),
             layout.owner_uid,
@@ -895,7 +1261,91 @@ fn prepare_layout(layout: &VersionedLayout, version: Option<&str>) -> Result<()>
     Ok(())
 }
 
-fn ensure_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<()> {
+/// Atomically publish a new private directory containing one complete document.
+/// Existing final entries are never replaced. Callers own ancestor trust policy;
+/// interrupted staging never creates an empty final directory.
+#[cfg(target_os = "linux")]
+pub fn publish_new_document_directory(
+    path: &Path,
+    document_name: &str,
+    bytes: &[u8],
+    authority: &DocumentAuthority,
+    mode: u32,
+) -> Result<()> {
+    publish_new_document_directory_with(path, document_name, bytes, authority, mode, |_| Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_new_document_directory_with(
+    path: &Path,
+    document_name: &str,
+    bytes: &[u8],
+    authority: &DocumentAuthority,
+    mode: u32,
+    before_publish: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    validate_document_authority(authority)?;
+    if mode & !0o777 != 0 || bytes.is_empty() || bytes.len() as u64 > authority.limit {
+        bail!("initial document directory has invalid bounds");
+    }
+    let mut components = Path::new(document_name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("initial document name must be a single filename");
+    }
+    require_path_absent(path)?;
+    let parent_path = path
+        .parent()
+        .context("installation directory has no parent")?;
+    let name = path
+        .file_name()
+        .context("installation directory has no name")?;
+    let (parent, _) = open_durable_directory_chain(parent_path)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".dev-tools-initial-")
+        .tempdir_in(parent_path)
+        .context("stage initial document directory")?;
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(mode))
+        .context("protect initial document directory")?;
+    ensure_owned_directory(temporary.path(), authority.owner_uid, mode)?;
+    let staged = fs::symlink_metadata(temporary.path()).context("inspect staged directory")?;
+    write_atomic_document(
+        &temporary.path().join(document_name),
+        bytes,
+        authority,
+        None,
+    )?;
+    sync_directory(temporary.path())?;
+    before_publish(temporary.path())?;
+    let staged_name = temporary
+        .path()
+        .file_name()
+        .context("staged directory has no name")?;
+    let retained = rustix::fs::statat(&parent, staged_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .context("reinspect staged directory through retained parent")?;
+    if retained.st_dev != staged.dev() || retained.st_ino != staged.ino() {
+        bail!("staged document directory changed before publication");
+    }
+    rustix::fs::renameat_with(
+        &parent,
+        staged_name,
+        &parent,
+        name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .context("publish initial document directory")?;
+    let _ = temporary.keep();
+    rustix::fs::fsync(&parent).context("sync installation directory parent")?;
+    Ok(())
+}
+
+/// Create a directory or verify its existing exact owner/mode without taking
+/// ownership of an existing collision. Callers own ancestor trust policy.
+/// Exact owner/mode checks are Unix-specific; non-Unix callers still require
+/// their native ACL adapter and qualification before relying on private custody.
+pub fn ensure_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<()> {
+    if mode & !0o777 != 0 {
+        bail!("installation directory mode is invalid");
+    }
     #[cfg(target_os = "linux")]
     {
         let (directory, created) = open_directory_chain(path, true)?;
@@ -986,11 +1436,11 @@ fn validate_versioned_receipt(layout: &VersionedLayout, receipt: &VersionedRecei
     {
         bail!("versioned installation receipt does not match its layout");
     }
-    validate_component(&receipt.active_version, "active version")?;
+    validate_version_component(&receipt.active_version, "active version")?;
     validate_identity(&receipt.active_identity)?;
     match (&receipt.previous_version, &receipt.previous_identity) {
         (Some(version), Some(identity)) => {
-            validate_component(version, "previous version")?;
+            validate_version_component(version, "previous version")?;
             validate_identity(identity)?;
             if version == &receipt.active_version {
                 bail!("active and previous versions must be distinct");
@@ -1609,6 +2059,86 @@ fn remove_directory_if_empty(path: &Path) -> Result<()> {
     }
 }
 
+/// Copy a Linux custody-checked artifact into caller-owned quarantine storage.
+///
+/// The expected identity is supplied by the caller's authentication authority;
+/// this function does not authenticate releases. Memory and transfer size are
+/// bounded independently of source size. Success means the exact expected bytes
+/// were copied and the writer flushed, not fsynced or published. On any error,
+/// the writer may contain unverified partial bytes and must not be activated.
+/// Callers own ancestor trust, destination custody, and durable publication.
+#[cfg(target_os = "linux")]
+pub fn copy_verified_artifact_to_staging(
+    source: &Path,
+    authority: &DocumentAuthority,
+    expected: &ArtifactIdentity,
+    writer: &mut impl Write,
+) -> Result<()> {
+    validate_document_authority(authority)?;
+    if expected.length == 0
+        || expected.length > authority.limit
+        || expected.sha256.len() != 64
+        || !expected
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("artifact staging identity is invalid");
+    }
+    let mut file = open_read_nofollow(source)?;
+    let before = file.metadata().context("inspect artifact staging source")?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != authority.owner_uid
+        || before.mode() & 0o777 != authority.mode
+        || before.len() != expected.length
+    {
+        bail!("artifact staging source has unsafe filesystem authority");
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = expected.length;
+    while remaining != 0 {
+        let bound = remaining.min(buffer.len() as u64) as usize;
+        let read = file
+            .read(&mut buffer[..bound])
+            .context("read artifact staging source")?;
+        if read == 0 {
+            bail!("artifact staging source is truncated");
+        }
+        hasher.update(&buffer[..read]);
+        writer
+            .write_all(&buffer[..read])
+            .context("write artifact quarantine")?;
+        remaining -= read as u64;
+    }
+    if file
+        .read(&mut buffer[..1])
+        .context("inspect artifact staging end")?
+        != 0
+        || format!("{:x}", hasher.finalize()) != expected.sha256
+    {
+        bail!("artifact staging content does not match its approved identity");
+    }
+    let after = file
+        .metadata()
+        .context("reinspect artifact staging source")?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mode() != after.mode()
+        || before.uid() != after.uid()
+        || after.nlink() != 1
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        bail!("artifact staging source changed while being read");
+    }
+    writer.flush().context("flush artifact quarantine")
+}
+
 pub fn read_atomic_document(
     path: &Path,
     authority: &DocumentAuthority,
@@ -1794,7 +2324,7 @@ pub fn publish_executable(
         .prefix(".dev-tools-install-")
         .tempfile_in(parent)
         .context("create private installation temporary")?;
-    std::io::copy(&mut input, temporary.as_file_mut()).context("copy installation artifact")?;
+    copy_exact_length(&mut input, temporary.as_file_mut(), expected.length)?;
     temporary
         .as_file_mut()
         .flush()
@@ -1818,6 +2348,23 @@ pub fn publish_executable(
         .context("publish installation artifact")?;
     sync_directory(parent)?;
     Ok(true)
+}
+
+fn copy_exact_length(input: &mut impl Read, output: &mut impl Write, expected: u64) -> Result<()> {
+    let copied = std::io::copy(&mut input.by_ref().take(expected), output)
+        .context("copy installation artifact")?;
+    if copied != expected {
+        bail!("installation source ended before its approved length");
+    }
+    let mut excess = [0_u8; 1];
+    if input
+        .read(&mut excess)
+        .context("check installation source length")?
+        != 0
+    {
+        bail!("installation source exceeded its approved length");
+    }
+    Ok(())
 }
 
 pub fn remove_owned_file(path: &Path, expected: &ArtifactIdentity) -> Result<bool> {
@@ -1890,6 +2437,22 @@ fn validate_receipt(receipt: &InstallationReceipt) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn open_directory_chain(path: &Path, create: bool) -> Result<(std::os::fd::OwnedFd, bool)> {
+    open_directory_chain_with_sync(path, create, |_| Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn open_durable_directory_chain(path: &Path) -> Result<(std::os::fd::OwnedFd, bool)> {
+    open_directory_chain_with_sync(path, true, |directory| {
+        rustix::fs::fsync(directory).context("sync installation ancestor directory")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_chain_with_sync(
+    path: &Path,
+    create: bool,
+    mut sync_parent: impl FnMut(&std::os::fd::OwnedFd) -> Result<()>,
+) -> Result<(std::os::fd::OwnedFd, bool)> {
     if !path.is_absolute() {
         bail!("installation directory must be absolute");
     }
@@ -1911,16 +2474,19 @@ fn open_directory_chain(path: &Path, create: bool) -> Result<(std::os::fd::Owned
         let opened = match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
             Ok(opened) => opened,
             Err(error) if create && error == rustix::io::Errno::NOENT => {
-                match rustix::fs::mkdirat(&directory, name, rustix::fs::Mode::from_raw_mode(0o755))
-                {
-                    Ok(()) => {}
-                    Err(error) if error == rustix::io::Errno::EXIST => {}
+                let created = match rustix::fs::mkdirat(
+                    &directory,
+                    name,
+                    rustix::fs::Mode::from_raw_mode(0o755),
+                ) {
+                    Ok(()) => true,
+                    Err(error) if error == rustix::io::Errno::EXIST => false,
                     Err(error) => {
                         return Err(error).context("create installation directory component")
                     }
-                }
+                };
                 if index + 1 == names.len() {
-                    final_created = true;
+                    final_created = created;
                 }
                 rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
                     .context("open created installation directory component")?
@@ -1937,6 +2503,12 @@ fn open_directory_chain(path: &Path, create: bool) -> Result<(std::os::fd::Owned
         ) != rustix::fs::FileType::Directory
         {
             bail!("installation directory chain contains a non-directory");
+        }
+        if create {
+            // A prior attempt may have created this entry but failed to sync
+            // its parent. Sync existing links too so retries cannot acknowledge
+            // a descendant while its ancestor remains uncommitted.
+            sync_parent(&directory)?;
         }
         directory = opened;
     }
@@ -1987,7 +2559,7 @@ fn open_read_nofollow(path: &Path) -> Result<File> {
     let file = rustix::fs::openat(
         directory,
         name,
-        rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
     )
     .map_err(std::io::Error::from)
@@ -2002,7 +2574,9 @@ fn open_read_nofollow(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    // Open must not wait for a FIFO peer before the regular-file type check.
+    // Nonblocking mode does not change ordinary regular-file reads.
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     options
         .open(path)
         .with_context(|| format!("open regular file {}", path.display()))
@@ -2040,6 +2614,121 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 #[cfg(all(test, unix))]
 mod versioned_tests {
+    #[test]
+    fn nonblocking_lock_rejects_replaced_name_after_open() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("installation.lock");
+        let mut replacement = None;
+        let result = InstallationLock::open_with(&path, true, || {
+            fs::remove_file(&path).unwrap();
+            replacement = Some(InstallationLock::acquire(&path).unwrap());
+        });
+        assert!(result.is_err());
+        assert!(InstallationLock::try_acquire(&path).unwrap().is_none());
+        drop(replacement);
+        assert!(InstallationLock::try_acquire(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn waiting_lock_rejects_detached_inode_after_acquisition() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for replace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("installation.lock");
+            let held = InstallationLock::acquire(&path).unwrap();
+            let (opened_tx, opened_rx) = mpsc::sync_channel(0);
+            let worker_path = path.clone();
+            let worker = std::thread::spawn(move || {
+                InstallationLock::open_with(&worker_path, false, || {
+                    opened_tx.send(()).unwrap();
+                })
+            });
+            // Opening and initial metadata validation have finished; the old
+            // inode stays locked until the pathname has changed.
+            opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            fs::remove_file(&path).unwrap();
+            let replacement = replace.then(|| InstallationLock::acquire(&path).unwrap());
+            drop(held);
+            assert!(
+                worker.join().unwrap().is_err(),
+                "detached lock must not be admitted"
+            );
+            drop(replacement);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestor_sync_failure_stops_directory_publication_and_retry_resyncs() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let boundary = temp.path().metadata().unwrap();
+        let path = temp.path().join("new-parent/leaf");
+        for _ in 0..2 {
+            let result = open_directory_chain_with_sync(&path, true, |directory| {
+                let metadata = rustix::fs::fstat(directory)?;
+                if metadata.st_dev == boundary.dev() && metadata.st_ino == boundary.ino() {
+                    bail!("injected ancestor durability failure");
+                }
+                rustix::fs::fsync(directory).context("sync test ancestor")
+            });
+            assert!(result.is_err());
+            assert!(temp.path().join("new-parent").is_dir());
+            assert!(!path.exists(), "must stop before creating descendants");
+        }
+        open_durable_directory_chain(&path).unwrap();
+        assert!(path.is_dir());
+        // Read-only custody validation has no durability or mutation effects.
+        assert!(open_directory_chain_with_sync(&path, false, |_| {
+            panic!("read-only path must not sync")
+        })
+        .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_initial_staging_never_publishes_an_empty_directory() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        let authority = DocumentAuthority {
+            owner_uid: temp.path().metadata().unwrap().uid(),
+            mode: 0o600,
+            limit: 32,
+        };
+        let result = publish_new_document_directory_with(
+            &root,
+            "ledger.json",
+            b"initial",
+            &authority,
+            0o700,
+            |staged| {
+                assert!(!root.exists());
+                assert_eq!(fs::read(staged.join("ledger.json")).unwrap(), b"initial");
+                bail!("injected staging interruption")
+            },
+        );
+        assert!(result.is_err());
+        assert!(!root.exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        let result = publish_new_document_directory_with(
+            &root,
+            "ledger.json",
+            b"initial",
+            &authority,
+            0o700,
+            |_| {
+                fs::create_dir(&root)?;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
     use super::*;
     use std::os::unix::fs::symlink;
 
@@ -2055,6 +2744,7 @@ mod versioned_tests {
                 artifact_name: "fixture".into(),
                 owner_uid: fs::metadata(root).unwrap().uid(),
                 directory_mode: 0o700,
+                bin_directory_mode: None,
             },
             version: version.into(),
             identity: ArtifactIdentity::from_file(&source, 4096).unwrap(),
@@ -2279,5 +2969,52 @@ mod versioned_tests {
                 .versions_dir()
                 .join(&request.adoption.version)
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn publication_copy_never_stages_growth_beyond_approved_length() {
+        let mut input = std::io::Cursor::new(vec![42_u8; 4096]);
+        let mut output = Vec::new();
+        let result = copy_exact_length(&mut input, &mut output, 64);
+        assert_eq!(
+            output.len(),
+            64,
+            "excess source bytes must never reach quarantine"
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            input.position(),
+            65,
+            "only one excess byte may be inspected"
+        );
+    }
+
+    #[test]
+    fn publication_copy_requires_exact_length_and_preserves_io_failures() {
+        for (bytes, expected, success) in [(b"abc".as_slice(), 3, true), (b"ab", 3, false)] {
+            let mut input = std::io::Cursor::new(bytes);
+            let mut output = Vec::new();
+            assert_eq!(
+                copy_exact_length(&mut input, &mut output, expected).is_ok(),
+                success
+            );
+            assert_eq!(output, bytes);
+        }
+        struct FailedWriter;
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture writer failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let failure = copy_exact_length(&mut b"abc".as_slice(), &mut FailedWriter, 3).unwrap_err();
+        assert!(failure.downcast_ref::<std::io::Error>().is_some());
     }
 }

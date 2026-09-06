@@ -339,13 +339,21 @@ pub fn main_entry(argv0: OsString, args: Vec<OsString>) -> i32 {
             command: Some(Commands::Completion { shell }),
             ..
         }) => {
-            let mut command = command();
-            clap_complete::generate(
+            let bytes = match dev_tools_completion::render(
                 clap_complete::Shell::from(shell),
-                &mut command,
+                command(),
                 "sync-configs",
-                &mut std::io::stdout(),
-            );
+            ) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    eprintln!("sync-configs: could not render completion output");
+                    return 1;
+                }
+            };
+            if std::io::stdout().lock().write_all(&bytes).is_err() {
+                eprintln!("sync-configs: could not write completion output");
+                return 1;
+            }
             0
         }
         Ok(Cli {

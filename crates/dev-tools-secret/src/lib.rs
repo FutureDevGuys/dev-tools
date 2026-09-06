@@ -112,6 +112,7 @@ pub struct SecretMetadata {
 
 /// Secret bytes zeroized on explicit request and on drop. This type implements
 /// neither `Clone`, `Debug`, `Display`, nor serialization traits.
+/// Construction also zeroizes owned input when rejecting its size.
 ///
 /// ```compile_fail
 /// let material = dev_tools_secret::SecretMaterial::new(vec![1]).unwrap();
@@ -126,10 +127,13 @@ pub struct SecretMaterial(Vec<u8>);
 
 impl SecretMaterial {
     pub fn new(value: Vec<u8>) -> Result<Self, SecretError> {
-        if value.is_empty() || value.len() > MAX_SECRET_BYTES {
+        // Own the bytes behind the zeroizing Drop implementation before any
+        // rejection, including an oversized provider response.
+        let material = Self(value);
+        if material.0.is_empty() || material.0.len() > MAX_SECRET_BYTES {
             return Err(SecretError::new(SecretErrorKind::InvalidResponse));
         }
-        Ok(Self(value))
+        Ok(material)
     }
 
     pub fn expose_secret(&self) -> &[u8] {

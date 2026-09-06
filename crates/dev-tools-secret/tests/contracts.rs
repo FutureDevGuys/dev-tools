@@ -49,6 +49,17 @@ fn secret_material_zeroizes_without_becoming_serializable_or_debuggable() {
 }
 
 #[test]
+fn secret_material_constructor_preserves_its_exact_size_boundary() {
+    for length in [0, 16 * 1024 * 1024 + 1] {
+        let error = SecretMaterial::new(vec![b'x'; length]).err().unwrap();
+        assert_eq!(error.kind(), SecretErrorKind::InvalidResponse);
+        assert_eq!(error.to_string(), "secret provider response is invalid");
+    }
+    let material = SecretMaterial::new(vec![b'x'; 16 * 1024 * 1024]).unwrap();
+    assert_eq!(material.expose_secret().len(), 16 * 1024 * 1024);
+}
+
+#[test]
 fn one_absolute_operation_context_shares_deadline_and_cancellation() {
     let cancelled = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(5);

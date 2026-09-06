@@ -174,6 +174,42 @@ fn offline_apply_uses_only_a_cached_authenticated_artifact() {
 }
 
 #[test]
+fn check_cannot_claim_currentness_from_expired_or_future_evidence() {
+    for (checked_at, now) in [(10, 86_411), (21, 20)] {
+        for installed in ["1.0.0", "1.1.0"] {
+            let mut adapter = FakeAdapter {
+                installation: Some(managed(installed)),
+                refreshed: Some(candidate("1.1.0", checked_at, false)),
+                ..FakeAdapter::default()
+            };
+            let result = execute(&policy(), OperationRequest::check(), now, &mut adapter);
+            assert_eq!(result.outcome, OperationOutcome::Unknown);
+            assert_eq!(result.cache_freshness, Some(CacheFreshness::Expired));
+            assert_eq!(result.available_version.as_deref(), Some("1.1.0"));
+            assert_eq!(result.exit_code, 0);
+            assert!(!result.changed);
+            assert_eq!(adapter.refresh_calls, 1);
+            assert_eq!(
+                adapter.cache_calls + adapter.install_calls + adapter.apply_calls,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn check_accepts_evidence_at_the_exact_freshness_limit() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.1.0")),
+        refreshed: Some(candidate("1.1.0", 10, false)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(&policy(), OperationRequest::check(), 86_410, &mut adapter);
+    assert_eq!(result.outcome, OperationOutcome::Current);
+    assert_eq!(result.cache_freshness, Some(CacheFreshness::Fresh));
+}
+
+#[test]
 fn offline_apply_without_cached_artifact_is_blocked_without_network() {
     let mut adapter = FakeAdapter {
         installation: Some(managed("1.0.0")),

@@ -99,6 +99,30 @@ impl HeldExecutable {
         hold_linux_executable(path)
     }
 
+    /// Open an independent read-only handle to the retained executable inode.
+    ///
+    /// This never reopens the source pathname. Each handle starts at offset zero
+    /// and remains valid after this holder is dropped. Callers own read bounds,
+    /// content verification and change detection; holding an inode does not
+    /// prevent an authorized writer from modifying its bytes in place.
+    pub fn open_read_handle(&self) -> AnyhowResult<fs::File> {
+        let descriptor = rustix::fs::openat(
+            &self._proc_fd_directory,
+            self.executable.as_raw_fd().to_string(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .context("open retained executable for reading")?;
+        let retained = rustix::fs::fstat(&self.executable)
+            .context("inspect retained executable descriptor")?;
+        let opened =
+            rustix::fs::fstat(&descriptor).context("inspect retained executable read handle")?;
+        if retained.st_dev != opened.st_dev || retained.st_ino != opened.st_ino {
+            bail!("retained executable read handle has a different identity");
+        }
+        Ok(descriptor.into())
+    }
+
     pub fn command<'a>(&'a self, argv0: &OsStr) -> AnyhowResult<HeldCommand<'a>> {
         use std::os::unix::process::CommandExt as _;
 
@@ -133,6 +157,10 @@ impl HeldExecutable {
 #[cfg(not(target_os = "linux"))]
 impl HeldExecutable {
     pub fn open(_path: &Path) -> AnyhowResult<Self> {
+        bail!("held executable identity is not accepted on this platform")
+    }
+
+    pub fn open_read_handle(&self) -> AnyhowResult<fs::File> {
         bail!("held executable identity is not accepted on this platform")
     }
 
@@ -515,6 +543,21 @@ pub fn run_bounded_command_with_public_input(
     request: &BoundedCommand<'_>,
     input: &[u8],
 ) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
+    run_bounded_command_with_public_input_and_cancellation(request, input, &NEVER_CANCELLED)
+}
+
+/// Run with bounded public input and caller-owned cancellation.
+///
+/// Input is limited to 16 MiB and must not contain secrets; see
+/// [`run_bounded_command_with_public_input`]. Invalid requests and oversized
+/// input are rejected before cancellation is evaluated. Pre-cancellation
+/// prevents input staging and spawn. Once spawned, cancellation uses the same
+/// process-domain cleanup and error contract as closed-input execution.
+pub fn run_bounded_command_with_public_input_and_cancellation(
+    request: &BoundedCommand<'_>,
+    input: &[u8],
+    cancelled: &AtomicBool,
+) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
     validate_bounded_command(request)?;
     if input.len() > MAX_PUBLIC_INPUT_LIMIT {
         return Err(BoundedCommandError::new(
@@ -529,11 +572,12 @@ pub fn run_bounded_command_with_public_input(
     if let Some(cwd) = request.cwd {
         command.current_dir(cwd);
     }
-    run_prepared_bounded_command_with_public_input(
+    run_prepared_bounded_command_with_public_input_and_cancellation(
         &mut command,
         input,
         request.timeout,
         request.output_limit,
+        cancelled,
     )
 }
 
@@ -548,11 +592,37 @@ pub fn run_prepared_bounded_command_with_public_input(
     timeout: Duration,
     output_limit: usize,
 ) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
+    run_prepared_bounded_command_with_public_input_and_cancellation(
+        command,
+        input,
+        timeout,
+        output_limit,
+        &NEVER_CANCELLED,
+    )
+}
+
+/// Run a caller-prepared command with public input and cancellation.
+///
+/// This retains the caller's executable setup and enforces the input and
+/// cancellation contract of [`run_bounded_command_with_public_input_and_cancellation`].
+/// The timeout covers child execution; temporary-file staging is synchronous.
+/// Cancellation is checked before staging and again before modifying standard
+/// I/O or spawning. The runner clears its staged stdin handle before returning.
+pub fn run_prepared_bounded_command_with_public_input_and_cancellation(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    output_limit: usize,
+    cancelled: &AtomicBool,
+) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
     validate_resource_limits(timeout, output_limit)?;
     if input.len() > MAX_PUBLIC_INPUT_LIMIT {
         return Err(BoundedCommandError::new(
             BoundedCommandErrorKind::InvalidPublicInput,
         ));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
     }
     let mut input_file = tempfile::tempfile().map_err(|source| {
         BoundedCommandError::with_source(BoundedCommandErrorKind::InvalidPublicInput, source)
@@ -563,13 +633,18 @@ pub fn run_prepared_bounded_command_with_public_input(
     input_file.rewind().map_err(|source| {
         BoundedCommandError::with_source(BoundedCommandErrorKind::InvalidPublicInput, source)
     })?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
+    }
     command.stdin(Stdio::from(input_file));
-    run_prepared_bounded_command_with_configured_input(
+    let result = run_prepared_bounded_command_with_configured_input(
         command,
         timeout,
         output_limit,
-        &NEVER_CANCELLED,
-    )
+        cancelled,
+    );
+    command.stdin(Stdio::null());
+    result
 }
 
 /// Run a caller-prepared command with bounded output and no cancellation.

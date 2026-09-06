@@ -32,6 +32,25 @@ fn registration() -> SessionRegistration {
 }
 
 #[test]
+fn control_operations_reject_unknown_scope_fields() {
+    for request in [
+        serde_json::json!({"operation": "renew", "session_id": "0123456789abcdef0123456789abcdef", "expires_at_unix": 2_000_000_000i64}),
+        serde_json::json!({"operation": "revoke", "session_id": "0123456789abcdef0123456789abcdef"}),
+        serde_json::json!({"operation": "register", "session": registration()}),
+    ] {
+        let mut frame = serde_json::json!({"version": BROKER_PROTOCOL_VERSION, "request_id": "0123456789abcdef0123456789abcdef", "request": request});
+        let decoded = decode_control_request(&serde_json::to_vec(&frame).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_control_request(&decoded).unwrap())
+                .unwrap(),
+            frame
+        );
+        frame["request"]["purported_scope"] = serde_json::json!("restricted");
+        assert!(decode_control_request(&serde_json::to_vec(&frame).unwrap()).is_err());
+    }
+}
+
+#[test]
 fn supervisor_control_frames_are_closed_bounded_and_correlated() {
     let request = ControlEnvelope {
         version: BROKER_PROTOCOL_VERSION,

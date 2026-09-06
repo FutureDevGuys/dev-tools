@@ -14,6 +14,8 @@ use std::error::Error;
 use std::fmt;
 
 pub mod artifact;
+pub mod discovery;
+pub mod manifest_ledger;
 
 pub const MAX_CACHE_AGE_SECONDS: u64 = 24 * 60 * 60;
 
@@ -408,16 +410,22 @@ fn check<A: UpdateAdapter>(
     if let Err(error) = validate_candidate(policy, &candidate) {
         return error_result(policy, request.operation, Some(&installation), error);
     }
+    let freshness = cache_freshness(policy, &candidate, now_unix);
+    let outcome = if freshness == CacheFreshness::Expired {
+        OperationOutcome::Unknown
+    } else {
+        release_outcome(&installation, &candidate)
+    };
     operation_result(
         policy,
         request.operation,
-        release_outcome(&installation, &candidate),
+        outcome,
         false,
         ExitCategory::Completed,
         None,
         &installation,
         Some(&candidate),
-        Some(cache_freshness(policy, &candidate, now_unix)),
+        Some(freshness),
     )
 }
 

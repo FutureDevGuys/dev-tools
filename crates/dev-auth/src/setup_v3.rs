@@ -1719,7 +1719,9 @@ fn read_bounded_at(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>
     }
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        // Non-regular inputs must reach descriptor metadata inspection without
+        // waiting for a FIFO writer. Regular-file reads remain synchronous.
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("open {description} {}", path.display()))?;
     let before = file

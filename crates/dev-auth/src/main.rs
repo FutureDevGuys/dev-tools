@@ -6,6 +6,9 @@ use base64::Engine as _;
 use std::io::{self, Read};
 use zeroize::Zeroize;
 
+mod completion;
+mod product_cli;
+
 const REQUEST_LIMIT: u64 = 64 * 1024;
 
 #[cfg(unix)]
@@ -54,7 +57,7 @@ fn base_usage() -> &'static str {
 
 fn usage() -> String {
     format!(
-        "{}\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
+        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
         base_usage()
     )
 }
@@ -134,6 +137,9 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
             let mut workload = None;
             let mut command_name = None;
             let mut target = None;
+            let mut executable = None;
+            let mut fixed_arguments = Vec::new();
+            let mut caller_argument_index = None;
             let mut output = None;
             let mut json = false;
             while let Some(argument) = arguments.next() {
@@ -164,6 +170,23 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                             arguments.next().context("--output requires a path")?,
                         ));
                     }
+                    "--executable" if executable.is_none() => {
+                        executable = Some(std::path::PathBuf::from(
+                            arguments.next().context("--executable requires a path")?,
+                        ));
+                    }
+                    "--arg" => {
+                        fixed_arguments.push(arguments.next().context("--arg requires a value")?);
+                    }
+                    "--caller-argument-index" if caller_argument_index.is_none() => {
+                        caller_argument_index = Some(
+                            arguments
+                                .next()
+                                .context("--caller-argument-index requires an index")?
+                                .parse::<usize>()
+                                .context("caller argument index is invalid")?,
+                        );
+                    }
                     "--json" if !json => json = true,
                     _ => bail!("workload bind plan contains a duplicate or unknown argument"),
                 }
@@ -171,22 +194,61 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
             let workload = workload.context("workload bind plan requires --workload")?;
             let command_name =
                 command_name.context("workload bind plan requires --command-name")?;
-            if target.as_deref() != Some("current-resolution") {
-                bail!("this release plans only the current-resolution binding target")
-            }
             let output = output.context("workload bind plan requires --output")?;
             if !output.is_absolute() {
                 bail!("workload binding plan output must be absolute")
             }
-            let search_path = std::env::var_os("PATH").context("PATH is not set")?;
-            let excluded = dev_auth::smart_binding::default_proxy_directories()?;
-            let resolved = dev_auth::smart_binding::resolve_continuation(
-                &command_name,
-                &search_path,
-                &excluded,
-            )?;
-            let intent =
-                dev_auth::smart_binding::BindingIntent::continuation(command_name, workload)?;
+            let (intent, resolved) = match target.as_deref() {
+                Some("current-resolution") => {
+                    if executable.is_some()
+                        || !fixed_arguments.is_empty()
+                        || caller_argument_index.is_some()
+                    {
+                        bail!("structured arguments require --target structured");
+                    }
+                    let search_path = std::env::var_os("PATH").context("PATH is not set")?;
+                    let excluded = dev_auth::smart_binding::default_proxy_directories()?;
+                    let resolved = dev_auth::smart_binding::resolve_continuation(
+                        &command_name,
+                        &search_path,
+                        &excluded,
+                    )?;
+                    (
+                        dev_auth::smart_binding::BindingIntent::continuation(
+                            command_name,
+                            workload,
+                        )?,
+                        resolved.into(),
+                    )
+                }
+                Some("structured") => {
+                    let executable =
+                        executable.context("structured target requires --executable")?;
+                    let excluded = dev_auth::smart_binding::default_proxy_directories()?;
+                    let resolved = dev_auth::smart_binding::resolve_structured_target_excluding(
+                        &executable,
+                        &excluded,
+                    )?;
+                    let mut intent = dev_auth::smart_binding::BindingIntent::structured(
+                        command_name,
+                        workload,
+                        executable,
+                        fixed_arguments,
+                    )?;
+                    if let (
+                        Some(index),
+                        dev_auth::smart_binding::BindingTargetIntent::Structured {
+                            caller_argument_index,
+                            ..
+                        },
+                    ) = (caller_argument_index, &mut intent.target)
+                    {
+                        *caller_argument_index = index;
+                    }
+                    (intent, resolved)
+                }
+                _ => bail!("binding plan requires --target current-resolution or structured"),
+            };
             let plan = dev_auth::smart_binding::build_binding_plan(name, intent, resolved, None)?;
             let digest = dev_auth::smart_binding::write_binding_plan(&output, &plan)?;
             if json {
@@ -1656,9 +1718,20 @@ fn run() -> Result<i32> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next().context(usage())?;
     match command.as_str() {
-        "build-info" => {
+        "--version" => {
             if arguments.next().is_some() {
-                bail!("build-info accepts no arguments");
+                bail!("--version accepts no additional arguments");
+            }
+            Ok(product_cli::print_version())
+        }
+        "completion" => Ok(completion::run(&arguments.collect::<Vec<_>>())),
+        "build-info" => {
+            let arguments = arguments.collect::<Vec<_>>();
+            if arguments == ["--json"] {
+                return Ok(product_cli::print_build_info());
+            }
+            if !arguments.is_empty() {
+                bail!("build-info accepts no arguments or exactly --json");
             }
             println!("{}", serde_json::to_string(&dev_auth::build_info())?);
             Ok(0)

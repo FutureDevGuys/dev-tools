@@ -22,6 +22,242 @@ use wait_timeout::ChildExt;
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
+#[test]
+fn standard_identity_is_local_and_preserves_legacy_release_build_info() {
+    let root = tempfile::tempdir().unwrap();
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .current_dir(root.path())
+            .arg("--version"),
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("dev-auth {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .current_dir(root.path())
+            .args(["build-info", "--json"]),
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["schema"], "dev-tools-build-info-v1");
+    assert_eq!(info["product"], "dev-auth");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert!(info["source_commit"].is_string());
+    assert!(info["source_state"].is_string());
+    assert!(info["target"]
+        .as_str()
+        .is_some_and(|target| target != "unknown"));
+    assert!(info["profile"]
+        .as_str()
+        .is_some_and(|profile| profile != "unknown"));
+    assert!(info["built_unix"].is_u64());
+    let legacy = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .current_dir(root.path())
+            .arg("build-info"),
+    );
+    assert!(legacy.status.success());
+    let info: serde_json::Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(info.as_object().unwrap().len(), 3);
+    assert_eq!(info["product"], "dev-auth");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert!(info.get("source_commit").is_some());
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn standard_identity_rejects_extra_arguments_without_output() {
+    for arguments in [
+        vec!["--version", "extra"],
+        vec!["build-info", "--json", "extra"],
+        vec!["build-info", "--unknown"],
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .args(arguments),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn static_output_write_failure_is_operational_not_a_panic() {
+    for arguments in [
+        vec!["--version"],
+        vec!["build-info", "--json"],
+        vec!["completion", "bash"],
+    ] {
+        let full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(arguments)
+            .stdout(full)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let Some(status) = child.wait_timeout(Duration::from_secs(5)).unwrap() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("static output operation did not stop after write failure");
+        };
+        assert_eq!(status.code(), Some(1));
+    }
+}
+
+#[test]
+fn static_completion_does_not_load_configuration_or_change_private_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .env("HOME", root.path())
+                .current_dir(root.path())
+                .args(["completion", shell]),
+        );
+        assert!(output.status.success(), "{shell}: {:?}", output.stderr);
+        assert!(output.stderr.is_empty());
+        let script = std::str::from_utf8(&output.stdout).unwrap();
+        for token in [
+            "dev-auth",
+            "completion",
+            "setup",
+            "workload",
+            "ssh-public",
+            "credential-stdin",
+            "caller-argument-index",
+        ] {
+            assert!(script.contains(token), "{shell}: missing {token}");
+        }
+        for hidden in ["supervisor-child", "sandbox-child", "provider-exec"] {
+            assert!(
+                !script.contains(hidden),
+                "{shell}: advertises private {hidden}"
+            );
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    for private_marker in ["DEV_AUTH_GH_CHILD", "DEV_AUTH_GIT_CHILD"] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .env(private_marker, "1")
+                .args(["completion", "bash"]),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unrecognized private child launcher identity"));
+    }
+}
+
+#[test]
+fn static_completion_rejects_invalid_arguments_before_output() {
+    for arguments in [
+        vec!["completion"],
+        vec!["completion", "unknown"],
+        vec!["completion", "bash", "--json"],
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .args(arguments),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn static_completion_bash_resolves_public_nested_commands() {
+    if !Path::new("/usr/bin/bash").is_file() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let generated = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["completion", "bash"]),
+    );
+    assert!(generated.status.success());
+    let script = root.path().join("completion.bash");
+    fs::write(&script, generated.stdout).unwrap();
+    let probe = r#"source "$1"
+read -r -a registration <<< "$(complete -p dev-auth)"
+function_name=
+for ((index=0; index+1<${#registration[@]}; index++)); do
+    if [[ ${registration[index]} == -F ]]; then
+        function_name=${registration[index+1]}
+        break
+    fi
+done
+[[ -n $function_name ]] || exit 1
+COMP_WORDS=(dev-auth build-info --j)
+COMP_CWORD=2
+"$function_name" dev-auth --j build-info
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth ssh-public --pu)
+COMP_CWORD=2
+"$function_name" dev-auth --pu ssh-public
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth setup apply --credential-s)
+COMP_CWORD=3
+"$function_name" dev-auth --credential-s apply
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth setup plan --channel st)
+COMP_CWORD=4
+"$function_name" dev-auth st --channel
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind plan --command-n)
+COMP_CWORD=4
+"$function_name" dev-auth --command-n plan
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind plan --target st)
+COMP_CWORD=5
+"$function_name" dev-auth st --target
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind plan --arg structured --caller-a)
+COMP_CWORD=6
+"$function_name" dev-auth --caller-a structured
+printf '%s\n' "${COMPREPLY[@]}"
+"#;
+    let output = bounded_output(
+        Command::new("/usr/bin/bash")
+            .env_clear()
+            .env("PATH", "/nonexistent")
+            .args(["--noprofile", "--norc", "-c", probe, "fixture"])
+            .arg(script),
+    );
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"--json\n--purpose\n--credential-stdin\nstable\n--command-name\nstructured\n--caller-argument-index\n"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider() {
@@ -143,6 +379,39 @@ fn internal_provider_child_argv0_rejects_missing_descriptor_authority() {
 #[cfg(target_os = "linux")]
 #[test]
 fn signed_release_asset_name_enters_the_setup_cli_without_renaming() {
+    const CHILD: &str = "DEV_AUTH_TEST_RELEASE_ASSET_CHILD";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        run_signed_release_asset_name_child();
+        return;
+    }
+    // A concurrent pre-exec child can inherit fs::copy's writable descriptor,
+    // even with CLOEXEC, and retain it after this thread closes its copy. Linux
+    // then rejects execution with ETXTBSY until that other child execs. Create
+    // and exercise the fixture in an isolated test process instead of retrying.
+    let output = bounded_output_with_timeout(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "signed_release_asset_name_enters_the_setup_cli_without_renaming",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(CHILD, "1"),
+        Duration::from_secs(150),
+        "release asset filename acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "isolated release asset test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn run_signed_release_asset_name_child() {
     let directory = tempfile::tempdir().unwrap();
     let asset = directory.path().join(format!(
         "dev-auth-{}-linux-{}",

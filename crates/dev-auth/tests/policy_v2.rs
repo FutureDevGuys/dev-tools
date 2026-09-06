@@ -5,6 +5,32 @@ use dev_auth::policy_v2::{
 use dev_auth::RepositorySelection;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[test]
+fn malformed_policy_diagnostics_do_not_echo_authority_document_contents() {
+    for input in [
+        b"version = 'accidentally-pasted-private-value'".as_slice(),
+        b"version = 2\naccidentally-pasted-private-value = [".as_slice(),
+        b"version = 2\n[accidentally-pasted-private-value]\nunknown = true".as_slice(),
+    ] {
+        for error in [
+            parse_system_policy_v2(input).unwrap_err(),
+            parse_user_config_v2(input).unwrap_err(),
+        ] {
+            for diagnostic in [
+                format!("{error}"),
+                format!("{error:#}"),
+                format!("{error:?}"),
+            ] {
+                assert!(
+                    !diagnostic.contains("accidentally-pasted-private-value"),
+                    "malformed policy diagnostic echoed the input"
+                );
+                assert!(diagnostic.contains("not valid TOML"));
+            }
+        }
+    }
+}
+
 const SYSTEM_POLICY: &str = r#"
 version = 2
 mode = "strong"

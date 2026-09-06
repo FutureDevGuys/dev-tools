@@ -124,8 +124,13 @@ pub(crate) fn cancellation_flag() -> &'static AtomicBool {
 mod tests {
     use super::*;
 
+    // These scenarios independently own the process-global signal lifecycle.
+    // Serializing test lifetimes does not change the overlap tested within a run.
+    static TEST_LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn first_repeated_and_late_cancellation_have_stable_outcomes() {
+        let _test = TEST_LIFECYCLE.lock().expect("test lifecycle lock");
         let mut guard = RunGuard::begin().expect("begin");
         request_cancellation();
         request_cancellation();
@@ -141,6 +146,7 @@ mod tests {
 
     #[test]
     fn rejected_overlapping_run_does_not_clear_active_cancellation() {
+        let _test = TEST_LIFECYCLE.lock().expect("test lifecycle lock");
         let guard = RunGuard::begin().expect("begin active run");
         request_cancellation();
 

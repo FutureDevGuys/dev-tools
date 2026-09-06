@@ -316,6 +316,7 @@ fn setup_adopts_the_validated_legacy_layout_and_retains_it_for_rollback() {
                 .unwrap()
                 .uid(),
             directory_mode: 0o755,
+            bin_directory_mode: None,
         },
     )
     .unwrap();

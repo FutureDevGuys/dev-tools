@@ -69,6 +69,7 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | `dev-tools-release` | Trust roots, signed manifests, source binding, anti-rollback checks, and artifact verification. |
 | `dev-tools-installation` | Receipts, immutable versions, aliases, locks, journals, repair, rollback, and owned uninstall. |
 | `dev-tools-command` | Bounded direct process execution and prepared-command execution. |
+| `dev-tools-completion` | Static shell rendering from trusted product-owned Clap command definitions; no discovery, execution or publication. |
 | `dev-tools-privilege` | One-shot typed privileged-operation authorization. |
 | `dev-tools-privilege-session` | Local lease expiry, use accounting, and stopping/cleanup lifecycle; identity binding, delegated authority, and native backends remain gated. |
 | `dev-tools-secret` | Provider-neutral secret identifiers, operation capabilities, bounded cancellation contexts, zeroizing material, and value-free failures. |

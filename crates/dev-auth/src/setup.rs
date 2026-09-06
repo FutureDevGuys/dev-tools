@@ -215,6 +215,7 @@ fn shared_installation_layout(
             InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
         },
         directory_mode: 0o755,
+        bin_directory_mode: None,
     }
 }
 

@@ -1418,6 +1418,7 @@ fn shared_installation_layout(product: Product, paths: &Paths) -> Result<Version
         artifact_name: paths.executable_name.clone(),
         owner_uid,
         directory_mode: 0o700,
+        bin_directory_mode: None,
     })
 }
 

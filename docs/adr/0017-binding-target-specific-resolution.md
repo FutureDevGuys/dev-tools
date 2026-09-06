@@ -1,0 +1,47 @@
+---
+authority: canonical
+owner: dev-auth
+---
+
+# ADR 0017: Binding target-specific resolution
+
+status: proposed
+verification: pending
+
+## Context
+
+The pre-activation binding foundation represented every target as a PATH continuation. That incorrectly required an explicit structured executable to occupy the public alias's PATH slot. A direct executable can have a different filename and need not be discoverable through PATH. Reusing the continuation cursor would record evidence that was never observed.
+
+## Decision
+
+The binding plan and receipt foundations use `dev-auth-workload-binding-plan-v2` and `dev-auth-workload-binding-receipt-v2`. Their `resolved` field is a strict tagged union: `continuation` contains the existing visible/canonical path, search path, cursor and identity; `structured` contains only the explicitly selected canonical executable identity. Intent and resolution kinds must match. Structured inspection does not consult PATH, execute the target or infer a continuation. Existing executable custody, bounded hashing, target reinspection, canonical plan hashing and receipt lineage checks remain required.
+
+The additive CLI `workload bind plan NAME --workload WORKLOAD --command-name ALIAS --target structured --executable PATH --output PATH` writes this same normalized plan. Repeated `--arg VALUE` options retain fixed UTF-8 arguments literally, including flag-shaped values. `--caller-argument-index N` records the insertion position among those arguments, defaulting to their end; out-of-range positions fail before writing. Structured-only options are rejected for continuation targets. This interface inspects identity and records intent only: it does not execute argument insertion, supply environment/cwd policy, activate proxies, enroll credentials or admit a workload. Those execution and setup integrations remain governed by ADR 0009 and must be completed before activation is exposed. Pinned-shell planning remains unavailable.
+
+## Compatibility and cutover
+
+Descriptor execution changes the pathname Linux supplies to a shebang interpreter, so retaining bytes and passing `arg0` do not establish transparency for path-sensitive wrappers. The opt-in `binding_namespace_probe` compares direct execution with projecting captured public script bytes read-only at the original pathname in a private Bubblewrap namespace. Its negative control omits the projection and observes the replacement instead; the positive case checks the original script path, adjacent resource, literal non-UTF-8 caller argument, stdout, stderr and exit status while leaving the host replacement intact. This is feasibility evidence for one possible path-preserving mechanism, not a selected mandatory adapter or production launch implementation. Full native UID/GID preservation, approved snapshot custody, mutable workspaces, stdin/terminal/signal behavior, nested sandboxes and broker/cgroup integration remain unqualified by this probe. Equivalent mechanisms remain available subject to ADR 0009's properties.
+
+Run the native probe only with an explicitly selected Bubblewrap executable and available unprivileged user namespaces:
+
+```sh
+DEV_TOOLS_TEST_BWRAP=/usr/bin/bwrap cargo test -p dev-auth --locked --test binding_namespace_probe -- --ignored
+```
+
+Structured CLI planning excludes the same default proxy roots as continuation discovery before writing output. The additive `resolve_structured_target_excluding` API accepts caller-owned known proxy directories, resolves directory aliases, rejects targets within those layers and preserves unrelated sibling paths. Missing excluded directories are not created, while invalid relative exclusions fail. The original identity-only resolver remains available without implicitly discovering home configuration. Neither API proves the absence of cycles inside arbitrary wrapper programs; receipt-owned graph validation and admission-time identity retention remain activation requirements.
+
+`BindingTargetIntent::forward_arguments` supplies the pure argument transformation for later launch integration: continuation retains the caller vector; structured targets insert that vector at the declared position among fixed arguments. Native strings are cloned without Unicode conversion, concatenation, shell expansion or synthetic argv[0]. Invalid positions and pinned-shell targets fail with value-free errors. This helper is not executable validation or admission and does not change the planning-only CLI boundary above; the launcher still owns identity retention, environment/cwd, native argv validity, streams and process lifecycle.
+
+The additive `retain_binding_executable` API verifies the expected executable identity against a read handle from the same `HeldExecutable` later used for command construction. Linux retains the descriptor before bounded hashing and compares content, length, native identity and custody classification; replacing the original pathname afterward cannot substitute the executable. Existing path-based planning inspection retains its final pathname recheck and uses the same bounded hash implementation. The shared read-handle API adds no product policy, dependency or execution authority. This verifies a retained inode, not an immutable content snapshot: in-place writes remain a separate target-custody concern, and strong admission must enforce its independently approved authority policy. Tests execute a retained synthetic script after pathname replacement and reject a wrong digest or replacement before retention. This library integration does not activate a proxy, read a receipt, admit a workload or implement environment/cwd policy; other native execution backends remain unavailable.
+
+This is an intentional cutover of an unintegrated planning foundation, not an additive change to an accepted receipt format. V1 plans and foundation receipts are not accepted under v2; users regenerate draft plans from current identity rather than relabeling documents or transferring old digests. No installed setup receipt, enrollment, release ledger or active workload binding is migrated by this change. Existing continuation discovery output and the observational plan-result schema remain unchanged. Rust callers constructing or inspecting plan/generation resolution fields adopt the tagged type; continuation values remain accepted by the owned-value builders through conversion. The existing continuation-only change-classification and refresh-check interfaces remain available. No published binary or accepted version is reissued.
+
+`snapshot_binding_executable` provides a separate Linux content-capture boundary for a future qualified path-preserving launcher. It copies from the held executable into an anonymous owner-only, nonexecutable, close-on-exec memory file while applying the same bounded hashing and complete expected-identity comparison, then seals writes, growth, shrinkage and further seal changes before returning at offset zero. Transfer buffering remains fixed-size under the existing target byte limit. A caller receives verified public data, not workload or execution authority; no named staging file, proxy or namespace is created. Tests reject a wrong digest, verify the native seals and permissions, reject write/resize attempts and retain the original bytes after an in-place source edit. The opt-in namespace probe consumes this verified capture. Other native snapshot backends remain unsupported, and production descriptor transfer, path projection and approval integration remain separate work.
+
+## Verification and remaining acceptance
+
+Draft install, refresh and rebind action lists place integration verification after generation publication and before final proxy activation, as required by ADR 0009. Canonical validation rejects lists that omit this step even when action ordinals are renumbered. Earlier draft plans missing verification must be regenerated and receive a new approval digest; this does not migrate an installed generation or implement the activation executor.
+
+Receipt structural validation rejects noncanonical SHA-256 digests and lengths beyond the executable inspection bound in both active and historical identities. It does not reopen either generation: historical bytes may have changed or disappeared, while new target acceptance and eventual rollback independently require identity verification. Well-formed receipt encodings are unchanged; passing this structural check grants no custody or launch authority.
+
+Public library and CLI tests cover distinct alias/executable names, operation without PATH or home configuration, no target execution, kind confusion, extra-field rejection, invalid argument positions, no-clobber plan output, replacement identity, unchanged generations, retained predecessor identity and legacy schema rejection. Completion metadata describes the new arguments; the Bash probe checks the structured choice and a flag after a fixed argument. The explicit native Elvish conformance probe checks `--target s` offers `structured` from the generated public-binary completion and loses that candidate when registration is removed; broader grammar limits remain in ADR 0012. Native activation, argument/stream forwarding, environment/cwd policy, proxy-cycle exclusion for explicit targets, setup approval, receipt custody and cross-platform acceptance remain separate gates; a successful draft plan does not establish any of them.

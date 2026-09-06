@@ -13,6 +13,28 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+#[test]
+fn malformed_deployment_diagnostics_do_not_echo_document_contents() {
+    for input in [
+        b"mode = 'accidentally-pasted-private-value'".as_slice(),
+        b"schema = 1\naccidentally-pasted-private-value = [".as_slice(),
+        b"[accidentally-pasted-private-value]\nunknown = true".as_slice(),
+    ] {
+        let error = parse_deployment_document(input).unwrap_err();
+        for diagnostic in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(
+                !diagnostic.contains("accidentally-pasted-private-value"),
+                "malformed deployment diagnostic echoed the input"
+            );
+            assert!(diagnostic.contains("deployment document"));
+        }
+    }
+}
+
 const DEPLOYMENT: &str = r#"
 schema = "dev-auth-deployment-v1"
 mode = "strong"
@@ -34,6 +56,55 @@ slot = "automation"
 intent = "enroll-if-absent"
 "#;
 
+#[test]
+fn deployment_reader_preserves_regular_document_custody_checks() {
+    use dev_auth::deployment::read_deployment_document;
+    let root = tempfile::tempdir().unwrap();
+    let document = root.path().join("deployment.toml");
+    fs::write(&document, DEPLOYMENT).unwrap();
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        read_deployment_document(&document).unwrap(),
+        parse_deployment_document(DEPLOYMENT.as_bytes()).unwrap()
+    );
+    let link = root.path().join("linked.toml");
+    std::os::unix::fs::symlink(&document, &link).unwrap();
+    assert!(read_deployment_document(&link).is_err());
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(read_deployment_document(&document).is_err());
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o600)).unwrap();
+    let hard_link = root.path().join("hard-linked.toml");
+    fs::hard_link(&document, &hard_link).unwrap();
+    assert!(read_deployment_document(&document).is_err());
+}
+
+#[test]
+fn setup_plan_rejects_fifo_deployment_without_waiting_for_a_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let fifo = root.path().join("deployment.toml");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let output = root.path().join("plan.json");
+    let result = dev_tools_command::run_prepared_bounded_command(
+        std::process::Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["setup", "plan", "--deployment"])
+            .arg(&fifo)
+            .arg("--output")
+            .arg(&output),
+        std::time::Duration::from_secs(3),
+        4096,
+    )
+    .expect("special deployment files must be rejected without blocking");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(!output.exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsafe filesystem authority"));
+}
+
 fn cli_equivalent() -> DeploymentCliInput {
     DeploymentCliInput {
         mode: Some(DeploymentMode::Strong),
@@ -48,6 +119,31 @@ fn cli_equivalent() -> DeploymentCliInput {
         user_policies: Vec::new(),
         credential_intents: vec![("automation".into(), CredentialIntent::EnrollIfAbsent)],
     }
+}
+
+#[test]
+fn setup_verify_rejects_fifo_plan_without_waiting_for_a_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let fifo = root.path().join("plan.json");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let result = dev_tools_command::run_prepared_bounded_command(
+        std::process::Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["setup", "verify", "--plan"])
+            .arg(&fifo)
+            .arg("--sha256")
+            .arg("0".repeat(64)),
+        std::time::Duration::from_secs(3),
+        4096,
+    )
+    .expect("special setup plan files must be rejected without blocking");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unsafe filesystem authority"));
 }
 
 #[test]
