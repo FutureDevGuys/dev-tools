@@ -1,4 +1,6 @@
 use crate::IntegrityFailure;
+#[cfg(target_os = "linux")]
+mod protocol;
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -2259,7 +2261,7 @@ mod tests {
         Ok(())
     }
 
-    fn state_test_paths(root: &Path) -> Paths {
+    pub(super) fn state_test_paths(root: &Path) -> Paths {
         let product_root = root.join("product");
         Paths {
             versions: product_root.join("versions"),

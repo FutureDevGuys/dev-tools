@@ -3995,6 +3995,7 @@ dependencies = [
  "dev-tools-installation",
  "dev-tools-product",
  "dev-tools-release",
+ "dev-tools-update",
  "ed25519-dalek",
  "is-terminal",
  "libc",
