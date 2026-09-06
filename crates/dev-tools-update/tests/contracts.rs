@@ -25,9 +25,29 @@ struct FakeAdapter {
     prepare_calls: usize,
     prepared: Option<AuthenticatedCandidate>,
     prepare_error: Option<UpdateError>,
+    recovery_calls: usize,
+    recovery_changed: bool,
+    recovery_snapshot: Option<InstallationSnapshot>,
+    recovery_error: Option<UpdateError>,
 }
 
 impl UpdateAdapter for FakeAdapter {
+    fn prepare_mutation(
+        &mut self,
+        request: OperationRequest,
+        candidate: Option<&AuthenticatedCandidate>,
+    ) -> Result<bool, UpdateError> {
+        self.recovery_calls += 1;
+        assert_eq!(
+            candidate.is_none(),
+            request.operation() == CommonOperation::UpdateRollback
+        );
+        if let Some(snapshot) = &self.recovery_snapshot {
+            self.installation = Some(snapshot.clone());
+        }
+        self.recovery_error.map_or(Ok(self.recovery_changed), Err)
+    }
+
     fn inspect(&mut self) -> Result<InstallationSnapshot, UpdateError> {
         self.inspect_calls += 1;
         if self.inspect_calls > 1 {
@@ -104,6 +124,248 @@ impl UpdateAdapter for FakeAdapter {
 fn policy() -> UpdatePolicy {
     UpdatePolicy::new(ProductId::parse("demo-tool").expect("product"), 86_400)
         .expect("valid policy")
+}
+
+#[test]
+fn already_current_apply_completes_local_recovery_without_payloads() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.0.0")),
+        cached: Some(candidate("1.0.0", 1, false)),
+        recovery_changed: true,
+        ..FakeAdapter::default()
+    };
+    let result = execute(
+        &policy(),
+        OperationRequest::apply(true),
+        100_000,
+        &mut adapter,
+    );
+    assert_eq!(
+        result.changed,
+        Some(true),
+        "same-version recovery must not be skipped"
+    );
+    assert_eq!(result.outcome, OperationOutcome::Updated);
+    assert_eq!(result.installed_version.as_deref(), Some("1.0.0"));
+    assert_eq!(result.cache_freshness, Some(CacheFreshness::Expired));
+    assert_eq!(adapter.inspect_calls, 2);
+    assert_eq!(
+        adapter.prepare_calls + adapter.apply_calls + adapter.refresh_calls,
+        0
+    );
+}
+
+#[test]
+fn recovery_reobserves_version_before_deciding_whether_activation_is_needed() {
+    for (before, after, expected_apply) in [("1.0.0", "2.0.0", 0), ("2.0.0", "1.0.0", 1)] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed(before)),
+            cached: Some(candidate("2.0.0", 1, true)),
+            recovery_changed: true,
+            recovery_snapshot: Some(managed(after)),
+            ..FakeAdapter::default()
+        };
+        let result = execute(&policy(), OperationRequest::apply(true), 2, &mut adapter);
+        assert_eq!(result.changed, Some(true));
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.installed_version.as_deref(), Some("2.0.0"));
+        assert_eq!(adapter.apply_calls, expected_apply);
+        assert_eq!(adapter.refresh_calls + adapter.prepare_calls, 0);
+    }
+}
+
+#[test]
+fn established_recovery_survives_offline_and_later_mutation_failures() {
+    for (offline, available, prepare_error, mutation_error, expected_error) in [
+        (true, false, None, None, ErrorKind::Blocked),
+        (
+            false,
+            false,
+            Some(UpdateError::new(UpdateErrorKind::Network)),
+            None,
+            ErrorKind::Network,
+        ),
+        (
+            true,
+            true,
+            None,
+            Some(UpdateError::new(UpdateErrorKind::Interrupted)),
+            ErrorKind::Interrupted,
+        ),
+        (
+            true,
+            true,
+            None,
+            Some(UpdateError::new(UpdateErrorKind::Operational).with_changed(false)),
+            ErrorKind::Operational,
+        ),
+    ] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed("1.0.0")),
+            cached: Some(candidate("2.0.0", 1, available)),
+            refreshed: Some(candidate("2.0.0", 1, available)),
+            recovery_changed: true,
+            prepare_error,
+            mutation_error,
+            suppress_mutation: true,
+            ..FakeAdapter::default()
+        };
+        let result = execute(&policy(), OperationRequest::apply(offline), 2, &mut adapter);
+        assert_eq!(result.changed, Some(true));
+        assert_eq!(result.error_kind, Some(expected_error));
+        assert_eq!(result.installed_version.as_deref(), Some("1.0.0"));
+    }
+}
+
+#[test]
+fn recovery_failures_preserve_progress_category_and_fresh_observation() {
+    for error in [
+        UpdateError::new(UpdateErrorKind::Interrupted),
+        UpdateError::new(UpdateErrorKind::Interrupted).with_changed(false),
+        UpdateError::new(UpdateErrorKind::Interrupted).with_changed(true),
+    ] {
+        for observation_fails in [false, true] {
+            let mut adapter = FakeAdapter {
+                installation: Some(managed("1.0.0")),
+                cached: Some(candidate("2.0.0", 1, true)),
+                recovery_error: Some(error),
+                recovery_snapshot: Some(managed("0.9.0")),
+                post_inspection_error: observation_fails
+                    .then_some(UpdateError::new(UpdateErrorKind::Operational)),
+                ..FakeAdapter::default()
+            };
+            let result = execute(&policy(), OperationRequest::apply(true), 2, &mut adapter);
+            let expected = if error == UpdateError::new(UpdateErrorKind::Interrupted) {
+                None
+            } else {
+                Some(error == UpdateError::new(UpdateErrorKind::Interrupted).with_changed(true))
+            };
+            assert_eq!(result.changed, expected);
+            assert_eq!(result.exit_code, 130);
+            assert_eq!(result.error_kind, Some(ErrorKind::Interrupted));
+            assert_eq!(
+                result.installed_version.as_deref(),
+                if observation_fails {
+                    None
+                } else {
+                    Some("0.9.0")
+                }
+            );
+            assert_eq!(adapter.apply_calls + adapter.prepare_calls, 0);
+        }
+    }
+}
+
+#[test]
+fn recovery_observation_failure_or_lost_ownership_blocks_further_mutation() {
+    for snapshot in [
+        InstallationSnapshot::external(None),
+        InstallationSnapshot::requires_setup(None),
+        InstallationSnapshot::absent(),
+        InstallationSnapshot::unknown(None),
+        managed("1.0.0"),
+    ] {
+        let observation_fails = snapshot.state() == InstallationState::Managed;
+        let mut adapter = FakeAdapter {
+            installation: Some(managed("1.0.0")),
+            cached: Some(candidate("2.0.0", 1, true)),
+            recovery_changed: true,
+            recovery_snapshot: Some(snapshot),
+            post_inspection_error: observation_fails
+                .then_some(UpdateError::new(UpdateErrorKind::Operational)),
+            ..FakeAdapter::default()
+        };
+        let result = execute(&policy(), OperationRequest::apply(true), 2, &mut adapter);
+        assert_eq!(result.changed, Some(true));
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(adapter.apply_calls + adapter.prepare_calls, 0);
+        if observation_fails {
+            assert_eq!(result.installed_version, None);
+        }
+    }
+}
+
+#[test]
+fn metadata_only_and_rejected_preflight_never_enter_recovery() {
+    for request in [
+        OperationRequest::status(),
+        OperationRequest::check(),
+        OperationRequest::install(false),
+        OperationRequest::apply(true),
+        OperationRequest::rollback(),
+    ] {
+        for snapshot in [
+            InstallationSnapshot::external(None),
+            InstallationSnapshot::requires_setup(None),
+        ] {
+            let mut adapter = FakeAdapter {
+                installation: Some(snapshot),
+                recovery_changed: true,
+                ..FakeAdapter::default()
+            };
+            let result = execute(&policy(), request, 2, &mut adapter);
+            assert_eq!(result.changed, Some(false));
+            assert_eq!(adapter.recovery_calls, 0);
+        }
+    }
+    for request in [OperationRequest::status(), OperationRequest::check()] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed("1.0.0")),
+            cached: Some(candidate("2.0.0", 1, true)),
+            refreshed: Some(candidate("2.0.0", 1, true)),
+            recovery_changed: true,
+            ..FakeAdapter::default()
+        };
+        assert_eq!(
+            execute(&policy(), request, 2, &mut adapter).changed,
+            Some(false)
+        );
+        assert_eq!(adapter.recovery_calls, 0);
+    }
+    for cached in [
+        None,
+        Some({
+            let mut verified = candidate("2.0.0", 1, true).verified().clone();
+            verified.product = "another-product".into();
+            AuthenticatedCandidate::new(verified, 1, true).unwrap()
+        }),
+    ] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed("1.0.0")),
+            cached,
+            recovery_changed: true,
+            ..FakeAdapter::default()
+        };
+        assert_eq!(
+            execute(&policy(), OperationRequest::apply(true), 2, &mut adapter).changed,
+            Some(false)
+        );
+        assert_eq!(adapter.recovery_calls, 0);
+    }
+}
+
+#[test]
+fn initialization_and_rollback_share_local_preparation_change_accounting() {
+    let mut adapter = FakeAdapter {
+        installation: Some(InstallationSnapshot::absent()),
+        cached: Some(candidate("1.0.0", 1, true)),
+        recovery_changed: true,
+        recovery_snapshot: Some(InstallationSnapshot::managed(None)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(&policy(), OperationRequest::install(true), 2, &mut adapter);
+    assert_eq!(result.outcome, OperationOutcome::Installed);
+    assert_eq!(result.changed, Some(true));
+    assert_eq!(result.installed_version.as_deref(), Some("1.0.0"));
+    assert_eq!(adapter.install_calls, 1);
+    adapter.recovery_snapshot = Some(managed("1.0.0"));
+    adapter.mutation_error =
+        Some(UpdateError::new(UpdateErrorKind::Operational).with_changed(false));
+    let result = execute(&policy(), OperationRequest::rollback(), 2, &mut adapter);
+    assert_eq!(result.changed, Some(true));
+    assert_eq!(result.error_kind, Some(ErrorKind::Operational));
+    assert_eq!(result.installed_version.as_deref(), Some("0.9.0"));
+    assert_eq!(adapter.refresh_calls + adapter.prepare_calls, 0);
 }
 
 fn managed(version: &str) -> InstallationSnapshot {

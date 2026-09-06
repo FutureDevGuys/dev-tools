@@ -264,8 +264,8 @@ impl fmt::Display for UpdateError {
 impl Error for UpdateError {}
 
 pub trait UpdateAdapter {
-    /// Read-only, network-free observation. Called again after every entered mutation,
-    /// including failed mutations; never implicitly recovers an installation.
+    /// Read-only, network-free observation. Called again after activation/rollback
+    /// and preparation reporting change or failure; never implicitly recovers.
     fn inspect(&mut self) -> Result<InstallationSnapshot, UpdateError>;
 
     /// Loads locally cached release evidence and never accesses the network.
@@ -287,6 +287,21 @@ pub trait UpdateAdapter {
         _candidate: &AuthenticatedCandidate,
     ) -> Result<AuthenticatedCandidate, UpdateError> {
         Err(UpdateError::new(UpdateErrorKind::Unsupported))
+    }
+
+    /// Completes product-owned local recovery or protocol initialization before
+    /// the version no-op decision. Called only for admitted install/apply/rollback;
+    /// install/apply supply an authenticated candidate, rollback supplies none.
+    /// Never retrieves metadata/payloads, executes commands, or grants setup authority.
+    /// False establishes no installation change and leaves the snapshot valid.
+    /// True requires a fresh observation. Errors have uncertain progress unless
+    /// independently qualified with `UpdateError::with_changed`.
+    fn prepare_mutation(
+        &mut self,
+        _request: OperationRequest,
+        _candidate: Option<&AuthenticatedCandidate>,
+    ) -> Result<bool, UpdateError> {
+        Ok(false)
     }
 
     /// Returns an established installation change fact. Errors default to unknown
@@ -352,37 +367,46 @@ pub fn execute<A: UpdateAdapter>(
             if installation.state != InstallationState::Managed {
                 return blocked_state(policy, request.operation, &installation);
             }
-            let mutation = adapter.rollback();
-            match mutation {
-                Ok(changed) => finish_mutation(
-                    adapter,
-                    operation_result(
-                        policy,
-                        request.operation,
-                        if changed {
-                            OperationOutcome::RolledBack
-                        } else {
-                            OperationOutcome::NoOp
-                        },
-                        changed,
-                        ExitCategory::Completed,
-                        None,
-                        &installation,
-                        None,
-                        Some(CacheFreshness::NotApplicable),
-                    ),
-                    policy,
-                    request.operation,
-                    None,
-                ),
-                Err(error) => finish_mutation(
-                    adapter,
-                    error_result(policy, request.operation, None, error),
-                    policy,
-                    request.operation,
-                    Some(error),
-                ),
-            }
+            with_prepared_mutation(
+                policy,
+                request,
+                adapter,
+                installation,
+                None,
+                |adapter, installation| {
+                    let mutation = adapter.rollback();
+                    match mutation {
+                        Ok(changed) => finish_mutation(
+                            adapter,
+                            operation_result(
+                                policy,
+                                request.operation,
+                                if changed {
+                                    OperationOutcome::RolledBack
+                                } else {
+                                    OperationOutcome::NoOp
+                                },
+                                changed,
+                                ExitCategory::Completed,
+                                None,
+                                &installation,
+                                None,
+                                Some(CacheFreshness::NotApplicable),
+                            ),
+                            policy,
+                            request.operation,
+                            None,
+                        ),
+                        Err(error) => finish_mutation(
+                            adapter,
+                            error_result(policy, request.operation, None, error),
+                            policy,
+                            request.operation,
+                            Some(error),
+                        ),
+                    }
+                },
+            )
         }
         CommonOperation::Doctor => error_result(
             policy,
@@ -480,7 +504,7 @@ fn mutate<A: UpdateAdapter>(
     installation: InstallationSnapshot,
     install: bool,
 ) -> OperationResult {
-    let mut candidate = if request.offline {
+    let candidate = if request.offline {
         match adapter.load_authenticated_candidate() {
             Ok(Some(candidate)) => candidate,
             Ok(None) => return blocked_state(policy, request.operation, &installation),
@@ -499,6 +523,36 @@ fn mutate<A: UpdateAdapter>(
     if let Err(error) = validate_candidate(policy, &candidate) {
         return error_result(policy, request.operation, Some(&installation), error);
     }
+    with_prepared_mutation(
+        policy,
+        request,
+        adapter,
+        installation,
+        Some(&candidate),
+        |adapter, installation| {
+            activate_candidate(
+                policy,
+                request,
+                now_unix,
+                adapter,
+                installation,
+                install,
+                candidate.clone(),
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_candidate<A: UpdateAdapter>(
+    policy: &UpdatePolicy,
+    request: OperationRequest,
+    now_unix: u64,
+    adapter: &mut A,
+    installation: InstallationSnapshot,
+    install: bool,
+    mut candidate: AuthenticatedCandidate,
+) -> OperationResult {
     if installation
         .version
         .as_ref()
@@ -579,6 +633,53 @@ fn mutate<A: UpdateAdapter>(
             request.operation,
             Some(error),
         ),
+    }
+}
+
+fn with_prepared_mutation<A: UpdateAdapter>(
+    policy: &UpdatePolicy,
+    request: OperationRequest,
+    adapter: &mut A,
+    installation: InstallationSnapshot,
+    candidate: Option<&AuthenticatedCandidate>,
+    continue_mutation: impl FnOnce(&mut A, InstallationSnapshot) -> OperationResult,
+) -> OperationResult {
+    match adapter.prepare_mutation(request, candidate) {
+        Ok(false) => continue_mutation(adapter, installation),
+        Err(error) => finish_mutation(
+            adapter,
+            error_result(policy, request.operation, None, error),
+            policy,
+            request.operation,
+            Some(error),
+        ),
+        Ok(true) => {
+            let mut result = match adapter.inspect() {
+                Err(error) => error_result(policy, request.operation, None, error),
+                Ok(observed) => {
+                    let admissible = !observed.setup_required()
+                        && (observed.state == InstallationState::Managed
+                            || (request.operation == CommonOperation::UpdateInstall
+                                && observed.state == InstallationState::Absent));
+                    if admissible {
+                        continue_mutation(adapter, observed)
+                    } else {
+                        blocked_state(policy, request.operation, &observed)
+                    }
+                }
+            };
+            // Established earlier progress survives a later failure, including
+            // an activation error that cannot establish its own progress.
+            result.changed = Some(true);
+            if result.outcome == OperationOutcome::NoOp {
+                result.outcome = match request.operation {
+                    CommonOperation::UpdateInstall => OperationOutcome::Installed,
+                    CommonOperation::UpdateRollback => OperationOutcome::RolledBack,
+                    _ => OperationOutcome::Updated,
+                };
+            }
+            result
+        }
     }
 }
 

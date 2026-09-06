@@ -4,4 +4,6 @@
 
 The crate does not perform arbitrary process execution, contain product-name branches, invoke sibling products, or choose privileged effects. Authenticated release discovery and storage adapters must construct candidates from `dev-tools-release` verification results.
 
+Adapters may implement local `prepare_mutation` for explicit recovery or protocol initialization before version no-op decisions. It never runs during status/check and cannot fetch bytes or execute commands. Established recovery changes survive later failures; changed or failed preparation receives fresh read-only observation. The default performs no work. See [ADR 0026](../../docs/adr/0026-local-update-mutation-preparation.md) for ordering, progress and product-integration boundaries.
+
 Status and check assess freshness against the caller-supplied evaluation time. Evidence older than the configured maximum age, or dated after that evaluation time, produces `unknown` rather than a current/stale claim; exactly the maximum age remains fresh. A successful refresh call alone does not override this assessment. Adapters must use a consistent timestamp horizon when recording refreshed evidence. Explicit offline application may still reuse authenticated cached artifact bytes after discovery evidence expires; that permission does not establish currentness.
