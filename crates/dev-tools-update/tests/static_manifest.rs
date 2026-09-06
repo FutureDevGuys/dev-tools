@@ -10,6 +10,145 @@ fn fixture() -> (String, ReleaseMetadata) {
     fixture_version(2, "1.2.3")
 }
 
+#[test]
+fn direct_authority_import_preserves_high_water_and_serialized_identity() {
+    use dev_tools_update::manifest_ledger::ManifestLedger;
+    let (config, current) = fixture();
+    let catalog = ArtifactCatalog::parse(&config).unwrap();
+    let record = catalog.get("local-name").unwrap();
+    let authority = record.release_authority().unwrap();
+    let mut incumbent = ManifestLedger::new(record).unwrap();
+    incumbent.accept(record, &current).unwrap();
+    let before = incumbent.to_bytes().unwrap();
+    let encoded: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let state = serde_json::from_value(encoded["state"].clone()).unwrap();
+    let mut imported = ManifestLedger::import_release_state(&authority, state).unwrap();
+    let (_, old) = fixture_version(1, "1.2.2");
+    assert!(
+        imported.accept(record, &old).is_err(),
+        "import discarded accepted high water"
+    );
+    assert_eq!(imported.to_bytes().unwrap(), before);
+    assert_eq!(imported.authority_id(), incumbent.authority_id());
+}
+
+#[test]
+fn direct_authority_verification_matches_catalog_contract_and_reapplies_policy() {
+    use dev_tools_update::manifest_ledger::ManifestLedger;
+    let (config, current) = fixture();
+    let catalog = ArtifactCatalog::parse(&config).unwrap();
+    let record = catalog.get("local-name").unwrap();
+    let authority = record.release_authority().unwrap();
+    let mut direct = ManifestLedger::import_release_state(&authority, Default::default()).unwrap();
+    let mut incumbent = ManifestLedger::new(record).unwrap();
+    assert_eq!(direct.to_bytes().unwrap(), incumbent.to_bytes().unwrap());
+    assert_eq!(
+        direct
+            .accept_release_metadata(&authority, &current)
+            .unwrap(),
+        incumbent.accept(record, &current).unwrap()
+    );
+    let original = direct.to_bytes().unwrap();
+    assert_eq!(original, incumbent.to_bytes().unwrap());
+    let mut restored = ManifestLedger::from_bytes_with_authority(&original, &authority).unwrap();
+    assert!(
+        !restored
+            .accept_release_metadata(&authority, &current)
+            .unwrap()
+            .1
+    );
+    let (_, older) = fixture_version(1, "1.2.2");
+    assert_eq!(
+        restored
+            .verify_retained_with_authority(&authority, &older)
+            .unwrap(),
+        incumbent.verify_retained_metadata(record, &older).unwrap()
+    );
+    assert!(restored
+        .accept_release_metadata(&authority, &older)
+        .is_err());
+    let (_, future) = fixture_version(3, "1.2.4");
+    assert!(restored
+        .verify_retained_with_authority(&authority, &future)
+        .is_err());
+    let mut changed_url = authority.clone();
+    changed_url.artifact_url =
+        dev_tools_release::ArtifactUrlPolicy::Exact("https://other.invalid/application".into());
+    let mut changed_schema = authority.clone();
+    changed_schema.accepted_manifest_schemas = vec!["dev-tools-product-v1".into()];
+    let mut changed_protocol = authority.clone();
+    changed_protocol.engine_protocol += 1;
+    let mut changed_key = authority.clone();
+    changed_key.trusted_root_key = "00".repeat(32);
+    for changed in [changed_url, changed_schema, changed_protocol, changed_key] {
+        // Each policy change is checked by the verifier, not supplied by the
+        // imported high-water fields or frozen into an acceptance shortcut.
+        assert!(restored
+            .accept_release_metadata(&changed, &current)
+            .is_err());
+        assert!(restored
+            .verify_retained_with_authority(&changed, &older)
+            .is_err());
+    }
+    let mut wrong_product = authority.clone();
+    wrong_product.product = "another".into();
+    assert!(ManifestLedger::from_bytes_with_authority(&original, &wrong_product).is_err());
+    assert!(restored
+        .accept_release_metadata(&wrong_product, &current)
+        .is_err());
+    let mut tampered = current.clone();
+    tampered.manifest[0] = b'!';
+    assert!(restored
+        .accept_release_metadata(&authority, &tampered)
+        .is_err());
+    assert!(restored
+        .verify_retained_with_authority(&authority, &tampered)
+        .is_err());
+    assert_eq!(restored.to_bytes().unwrap(), original);
+}
+
+#[test]
+fn direct_authority_import_rejects_partial_history_and_ambiguous_stream_names() {
+    use dev_tools_update::manifest_ledger::ManifestLedger;
+    let (config, current) = fixture();
+    let catalog = ArtifactCatalog::parse(&config).unwrap();
+    let record = catalog.get("local-name").unwrap();
+    let authority = record.release_authority().unwrap();
+    let mut incumbent = ManifestLedger::new(record).unwrap();
+    incumbent.accept(record, &current).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&incumbent.to_bytes().unwrap()).unwrap();
+    let state: dev_tools_release::ReleaseState =
+        serde_json::from_value(value["state"].clone()).unwrap();
+    for field in [
+        "accepted_root_generation",
+        "accepted_generation",
+        "accepted_root_sha256",
+        "accepted_manifest_sha256",
+        "accepted_binary_sha256",
+        "accepted_version",
+    ] {
+        let mut invalid = serde_json::to_value(&state).unwrap();
+        invalid[field] = if field.ends_with("generation") {
+            serde_json::json!(0)
+        } else {
+            serde_json::Value::Null
+        };
+        let invalid = serde_json::from_value(invalid).unwrap();
+        assert!(ManifestLedger::import_release_state(&authority, invalid).is_err());
+    }
+    for name in ["", "example\0other", "example\nother"] {
+        let mut invalid = authority.clone();
+        invalid.product = name.into();
+        assert!(ManifestLedger::import_release_state(&invalid, state.clone()).is_err());
+        invalid = authority.clone();
+        invalid.target = name.into();
+        assert!(ManifestLedger::import_release_state(&invalid, state.clone()).is_err());
+    }
+    let mut oversized = authority.clone();
+    oversized.product = "x".repeat(4096);
+    assert!(ManifestLedger::import_release_state(&oversized, state).is_err());
+}
+
 fn fixture_version(generation: u64, version: &str) -> (String, ReleaseMetadata) {
     let root_key = SigningKey::from_bytes(&[7; 32]);
     let release_key = SigningKey::from_bytes(&[8; 32]);
@@ -187,12 +326,21 @@ fn retained_metadata_rechecks_signers_against_the_exact_accepted_root() {
             ledger.verify_retained_metadata(record, &older).is_err(),
             "superseded signed root must not bypass current key policy"
         );
+        assert!(ledger
+            .verify_retained_with_authority(&record.release_authority().unwrap(), &older)
+            .is_err());
         let refreshed = ReleaseMetadata {
             root: root_bytes,
             manifest: older.manifest.clone(),
         };
         assert_eq!(
             ledger.verify_retained_metadata(record, &refreshed).is_ok(),
+            !revoked
+        );
+        assert_eq!(
+            ledger
+                .verify_retained_with_authority(&record.release_authority().unwrap(), &refreshed)
+                .is_ok(),
             !revoked
         );
         assert_eq!(ledger.to_bytes().unwrap(), before);
@@ -228,6 +376,12 @@ fn signed_prerelease_cannot_advance_stable_acceptance() {
     .is_ok());
     assert!(verify_static_manifest_metadata(record, &prerelease).is_err());
     assert!(ledger.accept(record, &prerelease).is_err());
+    assert!(ledger
+        .accept_release_metadata(&record.release_authority().unwrap(), &prerelease)
+        .is_err());
+    assert!(ledger
+        .verify_retained_with_authority(&record.release_authority().unwrap(), &prerelease)
+        .is_err());
     assert_eq!(ledger.to_bytes().unwrap(), original);
 }
 

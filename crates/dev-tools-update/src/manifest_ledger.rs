@@ -3,7 +3,9 @@
 
 use crate::artifact::ArtifactRecord;
 use crate::discovery::{verify_static_manifest_metadata, DiscoveryError};
-use dev_tools_release::{accept_verified_release, ReleaseMetadata, ReleaseState, VerifiedRelease};
+use dev_tools_release::{
+    accept_verified_release, ReleaseAuthority, ReleaseMetadata, ReleaseState, VerifiedRelease,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -23,11 +25,22 @@ impl AuthorityBinding {
         let authority = record
             .release_authority()
             .ok_or(DiscoveryError::Authentication)?;
+        Self::from_authority(&authority)
+    }
+
+    fn from_authority(authority: &ReleaseAuthority) -> Result<Self, DiscoveryError> {
+        if authority.product.is_empty()
+            || authority.target.is_empty()
+            || authority.product.chars().any(char::is_control)
+            || authority.target.chars().any(char::is_control)
+        {
+            return Err(DiscoveryError::Authentication);
+        }
         let key = dev_tools_release::parse_release_public_key(&authority.trusted_root_key)
             .map_err(|_| DiscoveryError::Authentication)?;
         Ok(Self {
-            product: authority.product,
-            target: authority.target,
+            product: authority.product.clone(),
+            target: authority.target.clone(),
             trusted_root_key: key.to_bytes(),
         })
     }
@@ -50,6 +63,45 @@ struct LedgerDocument {
 }
 
 impl ManifestLedger {
+    /// Import an explicitly admitted legacy acceptance history without resetting it.
+    ///
+    /// This validates representation and binds product, target and pinned root;
+    /// it does not authenticate history, prove first use, or permit replacing an
+    /// existing ledger. The product must establish source custody, exclude its
+    /// old writers and durably publish the result without losing concurrent
+    /// history. A default state is only for explicitly authorized first use.
+    /// Original signed metadata remains necessary for subsequent verification.
+    /// Schema/URL policy is reapplied by each verification call, not frozen in
+    /// the durable authority-stream identifier.
+    pub fn import_release_state(
+        authority: &ReleaseAuthority,
+        state: ReleaseState,
+    ) -> Result<Self, DiscoveryError> {
+        if !valid_state(&state) {
+            return Err(DiscoveryError::InvalidMetadata);
+        }
+        let ledger = Self {
+            document: LedgerDocument {
+                schema: SCHEMA.into(),
+                authority: AuthorityBinding::from_authority(authority)?,
+                state,
+            },
+        };
+        ledger.to_bytes()?;
+        Ok(ledger)
+    }
+
+    /// Load the unchanged ledger codec using product-owned release authority.
+    /// File custody and absence/reinitialization policy remain product-owned.
+    pub fn from_bytes_with_authority(
+        bytes: &[u8],
+        authority: &ReleaseAuthority,
+    ) -> Result<Self, DiscoveryError> {
+        let ledger = Self::decode(bytes)?;
+        ledger.require_release_authority(authority)?;
+        Ok(ledger)
+    }
+
     /// Stable authority-stream identity, not authentication or file custody.
     ///
     /// SHA-256 covers the ASCII domain `dev-tools-manifest-authority-v1`, the
@@ -84,6 +136,12 @@ impl ManifestLedger {
     }
 
     pub fn from_bytes(bytes: &[u8], record: &ArtifactRecord) -> Result<Self, DiscoveryError> {
+        let ledger = Self::decode(bytes)?;
+        ledger.require_authority(record)?;
+        Ok(ledger)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DiscoveryError> {
         if bytes.is_empty() || bytes.len() > MANIFEST_LEDGER_LIMIT {
             return Err(DiscoveryError::InventoryLimit);
         }
@@ -92,9 +150,7 @@ impl ManifestLedger {
         if document.schema != SCHEMA || !valid_state(&document.state) {
             return Err(DiscoveryError::InvalidMetadata);
         }
-        let ledger = Self { document };
-        ledger.require_authority(record)?;
-        Ok(ledger)
+        Ok(Self { document })
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, DiscoveryError> {
@@ -116,6 +172,25 @@ impl ManifestLedger {
     ) -> Result<(VerifiedRelease, bool), DiscoveryError> {
         self.require_authority(record)?;
         let verified = verify_static_manifest_metadata(record, metadata)?;
+        self.accept_verified(verified)
+    }
+
+    /// Authenticate under current product policy and apply monotonic acceptance
+    /// in memory. The caller must commit durably before reporting acceptance.
+    pub fn accept_release_metadata(
+        &mut self,
+        authority: &ReleaseAuthority,
+        metadata: &ReleaseMetadata,
+    ) -> Result<(VerifiedRelease, bool), DiscoveryError> {
+        self.require_release_authority(authority)?;
+        let verified = verify_product_metadata(authority, metadata)?;
+        self.accept_verified(verified)
+    }
+
+    fn accept_verified(
+        &mut self,
+        verified: VerifiedRelease,
+    ) -> Result<(VerifiedRelease, bool), DiscoveryError> {
         let mut next = self.clone();
         let changed = accept_verified_release(&mut next.document.state, &verified)
             .map_err(|_| DiscoveryError::Acceptance)?;
@@ -143,6 +218,26 @@ impl ManifestLedger {
     ) -> Result<VerifiedRelease, DiscoveryError> {
         self.require_authority(record)?;
         let verified = verify_static_manifest_metadata(record, metadata)?;
+        self.verify_retained(verified)
+    }
+
+    /// Reauthenticate a retained manifest against the exact accepted root and
+    /// current product policy without changing history. This establishes neither
+    /// historical acceptance nor receipt ownership, custody or rollback permission.
+    pub fn verify_retained_with_authority(
+        &self,
+        authority: &ReleaseAuthority,
+        metadata: &ReleaseMetadata,
+    ) -> Result<VerifiedRelease, DiscoveryError> {
+        self.require_release_authority(authority)?;
+        let verified = verify_product_metadata(authority, metadata)?;
+        self.verify_retained(verified)
+    }
+
+    fn verify_retained(
+        &self,
+        verified: VerifiedRelease,
+    ) -> Result<VerifiedRelease, DiscoveryError> {
         let state = &self.document.state;
         let accepted_version = state
             .accepted_version
@@ -170,6 +265,28 @@ impl ManifestLedger {
         }
         Ok(())
     }
+
+    fn require_release_authority(
+        &self,
+        authority: &ReleaseAuthority,
+    ) -> Result<(), DiscoveryError> {
+        if self.document.authority != AuthorityBinding::from_authority(authority)? {
+            return Err(DiscoveryError::Authentication);
+        }
+        Ok(())
+    }
+}
+
+fn verify_product_metadata(
+    authority: &ReleaseAuthority,
+    metadata: &ReleaseMetadata,
+) -> Result<VerifiedRelease, DiscoveryError> {
+    let verified = dev_tools_release::verify_release_metadata(metadata, authority)
+        .map_err(|_| DiscoveryError::Authentication)?;
+    if !verified.version.pre.is_empty() {
+        return Err(DiscoveryError::InvalidMetadata);
+    }
+    Ok(verified)
 }
 
 fn valid_state(state: &ReleaseState) -> bool {
