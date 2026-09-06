@@ -12,6 +12,90 @@ use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
 #[test]
+fn apply_reports_recovery_even_when_requested_version_is_current() {
+    assert_noop_reports_journal_recovery("apply");
+}
+
+#[test]
+fn repair_reports_recovery_even_when_links_need_no_further_repair() {
+    assert_noop_reports_journal_recovery("repair");
+}
+
+#[test]
+fn adoption_reports_recovery_even_when_receipt_already_matches() {
+    assert_noop_reports_journal_recovery("adopt");
+}
+
+fn assert_noop_reports_journal_recovery(operation: &str) {
+    for committed in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let request = versioned_fixture(temp.path(), "1.0.0", b"first");
+        let first = apply_versioned_installation(&request, |_| Ok(()))
+            .unwrap()
+            .receipt;
+        let (prior, next) = if committed {
+            (None, first.clone())
+        } else {
+            let second = versioned_fixture(temp.path(), "2.0.0", b"second");
+            let next = apply_versioned_installation(&second, |_| Ok(()))
+                .unwrap()
+                .receipt;
+            // A transition can publish pointers before its receipt. Reconstruct
+            // that supported interruption using the exact two owned receipts.
+            fs::write(
+                request
+                    .layout
+                    .data_root
+                    .join("installation-receipt-v1.json"),
+                serde_json::to_vec(&first).unwrap(),
+            )
+            .unwrap();
+            (Some(first.clone()), next)
+        };
+        let journal = request
+            .layout
+            .data_root
+            .join("installation-transition-v1.json");
+        fs::write(
+            &journal,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "dev-tools-versioned-transition-v1", "prior": prior, "next": next,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        let run = || match operation {
+            "apply" => apply_versioned_installation(&request, |_| Ok(())),
+            "repair" => {
+                dev_tools_installation::repair_versioned_installation(&request.layout, |_| Ok(()))
+            }
+            "adopt" => adopt_versioned_installation(
+                &VersionedAdoption {
+                    layout: request.layout.clone(),
+                    version: request.version.clone(),
+                    identity: request.identity.clone(),
+                    aliases: request.aliases.clone(),
+                },
+                |_| Ok(()),
+            ),
+            _ => unreachable!("unknown fixture operation"),
+        };
+        let report = run().unwrap();
+        assert!(!journal.exists(), "fixture did not reach journal recovery");
+        assert_eq!(report.receipt, first);
+        assert!(
+            report.changed,
+            "{operation} hid recovery (committed={committed})"
+        );
+        assert!(
+            !run().unwrap().changed,
+            "repeat operation must be a clean no-op"
+        );
+    }
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn bounded_artifact_copy_checks_custody_identity_and_writer_completion() {
     use dev_tools_installation::copy_verified_artifact_to_staging;

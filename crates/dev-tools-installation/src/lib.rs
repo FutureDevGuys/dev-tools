@@ -223,6 +223,8 @@ pub struct VersionedReceipt {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VersionedApplyReport {
+    /// Includes successful journal recovery even when the requested version
+    /// is already active and no subsequent link repair is needed.
     pub changed: bool,
     pub receipt: VersionedReceipt,
 }
@@ -404,12 +406,13 @@ where
     let legacy = matches!(precondition, ApplyPrecondition::RecoverAndRepair);
     prepare_layout(&request.layout, legacy.then_some(request.version.as_str()))?;
     let _lock = InstallationLock::acquire(&request.layout.lock_path())?;
-    if legacy {
-        recover_versioned_installation_locked(&request.layout)?;
+    let recovered = if legacy {
+        recover_versioned_installation_locked(&request.layout)?
     } else {
         require_path_absent(&request.layout.journal_path())
             .context("installation requires explicit recovery")?;
-    }
+        false
+    };
 
     let prior = read_versioned_receipt(&request.layout)?;
     if let ApplyPrecondition::Exact(expected) = precondition {
@@ -432,7 +435,7 @@ where
             }
             post_install_verify(&request.layout.version_artifact(&request.version))?;
             return Ok(VersionedApplyReport {
-                changed: repaired,
+                changed: recovered || repaired,
                 receipt: receipt.clone(),
             });
         }
@@ -526,7 +529,7 @@ where
     harden_legacy_adoption_layout(&adoption.layout, &adoption.version)?;
     prepare_layout(&adoption.layout, Some(&adoption.version))?;
     let _lock = InstallationLock::acquire(&adoption.layout.lock_path())?;
-    recover_versioned_installation_locked(&adoption.layout)?;
+    let recovered = recover_versioned_installation_locked(&adoption.layout)?;
     if let Some(receipt) = read_versioned_receipt(&adoption.layout)? {
         verify_versioned_receipt(&adoption.layout, &receipt)?;
         if receipt.active_version != adoption.version
@@ -538,7 +541,7 @@ where
         }
         post_install_verify(&adoption.layout.version_artifact(&adoption.version))?;
         return Ok(VersionedApplyReport {
-            changed: false,
+            changed: recovered,
             receipt,
         });
     }
@@ -764,14 +767,17 @@ where
 {
     validate_layout(layout)?;
     let _lock = InstallationLock::acquire(&layout.lock_path())?;
-    recover_versioned_installation_locked(layout)?;
+    let recovered = recover_versioned_installation_locked(layout)?;
     let receipt = read_versioned_receipt(layout)?.context("installation receipt is absent")?;
     let active = layout.version_artifact(&receipt.active_version);
     verify_versioned_artifact_authority(&active, layout.owner_uid, &receipt.active_identity)?;
     post_install_verify(&active).context("installed product verification failed")?;
     let changed = repair_missing_receipt_links(layout, &receipt)?;
     verify_versioned_receipt(layout, &receipt)?;
-    Ok(VersionedApplyReport { changed, receipt })
+    Ok(VersionedApplyReport {
+        changed: recovered || changed,
+        receipt,
+    })
 }
 
 pub fn read_versioned_installation_receipt(
@@ -1763,20 +1769,22 @@ fn remove_transition_journal(layout: &VersionedLayout) -> Result<()> {
     }
 }
 
-fn recover_versioned_installation_locked(layout: &VersionedLayout) -> Result<()> {
+fn recover_versioned_installation_locked(layout: &VersionedLayout) -> Result<bool> {
     let Some(journal) = read_transition_journal(layout)? else {
-        return Ok(());
+        return Ok(false);
     };
     let installed = read_versioned_receipt(layout)?;
     if installed.as_ref() == Some(&journal.next) {
         verify_versioned_receipt(layout, &journal.next)?;
-        return remove_transition_journal(layout);
+        remove_transition_journal(layout)?;
+        return Ok(true);
     }
     if installed.as_ref() != journal.prior.as_ref() {
         bail!("installation receipt changed during interrupted transition");
     }
     restore_transition_prior(layout, &journal)?;
-    remove_transition_journal(layout)
+    remove_transition_journal(layout)?;
+    Ok(true)
 }
 
 fn restore_transition_prior(
