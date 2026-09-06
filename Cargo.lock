@@ -3989,6 +3989,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ctrlc",
+ "dev-tools-command",
  "dev-tools-completion",
  "dev-tools-installation",
  "dev-tools-product",

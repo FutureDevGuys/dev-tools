@@ -28,8 +28,11 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(test)]
+use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
 use wait_timeout::ChildExt;
 
 const ENGINE_PROTOCOL: u32 = 1;
@@ -992,25 +995,39 @@ fn activate_link(product: Product, paths: &Paths, version: &str) -> Result<()> {
 }
 
 fn verify_candidate_health(product: Product, binary: &Path, expected_version: &str) -> Result<()> {
-    let mut child = Command::new(binary)
-        .args(product.health_args())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("launch candidate release {}", binary.display()))?;
-    if child.wait_timeout(Duration::from_secs(10))?.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return integrity("candidate release health check timed out");
-    }
-    let output = child.wait_with_output()?;
+    let mut command = Command::new(binary);
+    command.args(product.health_args());
+    let output = dev_tools_command::run_prepared_bounded_command(
+        &mut command,
+        Duration::from_secs(10),
+        4096,
+    )
+    .map_err(|error| {
+        let integrity_message = match error.kind() {
+            dev_tools_command::BoundedCommandErrorKind::TimedOut => {
+                Some("candidate release health check timed out")
+            }
+            dev_tools_command::BoundedCommandErrorKind::OutputLimit(_) => {
+                Some("candidate release health check exceeded its output bound")
+            }
+            _ => None,
+        };
+        let error = anyhow::Error::new(error);
+        match integrity_message {
+            Some(message) => error.context(IntegrityFailure(message.into())),
+            None => error.context("execute candidate release health check"),
+        }
+    })?;
     if !output.status.success() {
         return integrity("candidate release health check failed");
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| IntegrityFailure("candidate release reported invalid version text".into()))?;
     let expected = format!("{} {expected_version}", product.id());
-    if !stdout.lines().any(|line| line.starts_with(&expected)) {
+    if !stdout.lines().any(|line| {
+        line.strip_prefix(&expected)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(' '))
+    }) {
         return integrity("candidate release reported an unexpected version");
     }
     Ok(())
@@ -3827,5 +3844,88 @@ mod tests {
         verify_candidate_health(Product::UpdateAll, &binary, "1.2.3").unwrap();
         let err = verify_candidate_health(Product::UpdateAll, &binary, "1.2.4").unwrap_err();
         assert!(err.downcast_ref::<IntegrityFailure>().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_health_rejects_a_version_prefix_match() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for version in ["1.2.30", "1.2.3-rc.1", "1.2.3+different"] {
+            let binary = directory.path().join(version);
+            crate::test_support::write_executable(
+                &binary,
+                &format!("#!/bin/sh\nprintf '%s\\n' 'update-all {version} profile=release'\n"),
+            )?;
+            let result = verify_candidate_health(Product::UpdateAll, &binary, "1.2.3");
+            assert!(
+                result.is_err(),
+                "health accepted mismatched version {version}"
+            );
+            assert!(result
+                .unwrap_err()
+                .downcast_ref::<IntegrityFailure>()
+                .is_some());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_health_bounds_both_output_streams() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for (name, redirection) in [("stdout", ""), ("stderr", " >&2")] {
+            let binary = directory.path().join(name);
+            crate::test_support::write_executable(&binary,
+                &format!("#!/bin/sh\nprintf '%s\\n' 'update-all 1.2.3'\nprintf '%4097s' x{redirection}\n"))?;
+            let result = verify_candidate_health(Product::UpdateAll, &binary, "1.2.3");
+            assert!(result.is_err(), "health accepted oversized {name}");
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<IntegrityFailure>().is_some());
+            assert_eq!(error.to_string(), "updater integrity failure: candidate release health check exceeded its output bound");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_health_preserves_arguments_status_and_inclusive_limits() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let binary = directory.path().join("candidate");
+        crate::test_support::write_executable(&binary,
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 41\nif read value; then exit 42; fi\nprintf '%s\\n' 'update-all 1.2.3'\nprintf '%4079s' x\nprintf '%4096s' y >&2\n")?;
+        verify_candidate_health(Product::UpdateAll, &binary, "1.2.3")?;
+        let failed = directory.path().join("failed");
+        crate::test_support::write_executable(
+            &failed,
+            "#!/bin/sh\nprintf '%s\\n' 'update-all 1.2.3'\nexit 7\n",
+        )?;
+        assert!(
+            verify_candidate_health(Product::UpdateAll, &failed, "1.2.3")
+                .unwrap_err()
+                .downcast_ref::<IntegrityFailure>()
+                .is_some()
+        );
+        let invalid = directory.path().join("invalid");
+        crate::test_support::write_executable(
+            &invalid,
+            "#!/bin/sh\nprintf '%s\\n' 'update-all 1.2.3'\nprintf '\\377'\n",
+        )?;
+        assert!(
+            verify_candidate_health(Product::UpdateAll, &invalid, "1.2.3")
+                .unwrap_err()
+                .downcast_ref::<IntegrityFailure>()
+                .is_some()
+        );
+        let missing = verify_candidate_health(
+            Product::UpdateAll,
+            &directory.path().join("missing"),
+            "1.2.3",
+        )
+        .unwrap_err();
+        assert!(missing.downcast_ref::<IntegrityFailure>().is_none());
+        assert!(missing
+            .downcast_ref::<dev_tools_command::BoundedCommandError>()
+            .is_some());
+        Ok(())
     }
 }

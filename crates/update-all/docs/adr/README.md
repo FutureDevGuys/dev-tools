@@ -29,6 +29,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0017](0017-release-state-writer-custody.md) | Release-state writer custody | proposed | pending |
 | [0018](0018-shared-https-admission.md) | Shared HTTPS admission | proposed | pending |
 | [0019](0019-url-bound-metadata-cache.md) | URL-bound metadata cache | proposed | pending |
+| [0020](0020-bounded-candidate-health.md) | Bounded candidate health | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

@@ -10,6 +10,7 @@ description = "Run supported software updaters through one deterministic plan"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dev-tools-command = { version = "0.1.1", path = "../dev-tools-command" }
 dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-release = { path = "../dev-tools-release" }
 dev-tools-installation = { path = "../dev-tools-installation" }
