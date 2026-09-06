@@ -441,6 +441,12 @@ fn public_input_cancellation_terminalizes_a_nonreading_child_and_its_descendants
     assert_cancellation_terminalizes_process_group(2);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn public_file_stdout_cancellation_terminalizes_the_owned_descendants() {
+    assert_cancellation_terminalizes_process_group(3);
+}
+
 #[cfg(all(
     unix,
     not(any(
@@ -470,19 +476,18 @@ fn assert_cancellation_terminalizes_process_group(input_mode: u8) {
     let cancelled = Arc::new(AtomicBool::new(false));
     let runner_cancelled = Arc::clone(&cancelled);
     let (sender, receiver) = mpsc::sync_channel(1);
-    let runner =
-        thread::spawn(move || {
-            let arguments = [OsString::from("-c"), OsString::from(script)];
-            let request = BoundedCommand {
-                executable: Path::new("/bin/sh"),
-                arguments: &arguments,
-                environment: &BTreeMap::new(),
-                cwd: None,
-                timeout: Duration::from_secs(30),
-                output_limit: 32,
-            };
-            let input = vec![42; 1 << 20];
-            let result = match input_mode {
+    let runner = thread::spawn(move || {
+        let arguments = [OsString::from("-c"), OsString::from(script)];
+        let request = BoundedCommand {
+            executable: Path::new("/bin/sh"),
+            arguments: &arguments,
+            environment: &BTreeMap::new(),
+            cwd: None,
+            timeout: Duration::from_secs(30),
+            output_limit: 32,
+        };
+        let input = vec![42; 1 << 20];
+        let result = match input_mode {
             0 => run_bounded_command_with_cancellation(&request, &runner_cancelled),
             1 => dev_tools_command::run_bounded_command_with_public_input_and_cancellation(
                 &request, &input, &runner_cancelled,
@@ -494,12 +499,20 @@ fn assert_cancellation_terminalizes_process_group(input_mode: u8) {
                     &mut command, &input, request.timeout, request.output_limit, &runner_cancelled,
                 )
             }
+            #[cfg(target_os = "linux")]
+            3 => {
+                let mut command = std::process::Command::new(request.executable);
+                command.args(request.arguments).env_clear();
+                dev_tools_command::run_prepared_bounded_command_with_public_file_stdout_and_cancellation(
+                    command, request.timeout, request.output_limit, &runner_cancelled,
+                )
+            }
             _ => unreachable!("unknown test input mode"),
         }
         .map(|_| ())
         .map_err(|error| error.kind());
-            let _ = sender.send(result);
-        });
+        let _ = sender.send(result);
+    });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !ready.exists() && std::time::Instant::now() < deadline {
@@ -658,14 +671,39 @@ fn spawn_failures_preserve_the_typed_io_source() {
 ))]
 #[test]
 fn successful_leader_exit_still_terminalizes_its_process_group() {
+    assert_successful_leader_cleanup(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn public_file_stdout_leader_exit_terminalizes_descendants_holding_the_file() {
+    assert_successful_leader_cleanup(true);
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+fn assert_successful_leader_cleanup(public_file: bool) {
     let root = tempfile::tempdir().unwrap();
     let ready = root.path().join("ready");
     let release = root.path().join("release");
     let survived = root.path().join("survived");
     let descendant_pid = root.path().join("descendant-pid");
+    let output_redirect = if public_file {
+        "2>/dev/null"
+    } else {
+        ">/dev/null 2>&1"
+    };
     let script = format!(
         "( trap '' HUP TERM; touch '{}'; while [ ! -e '{}' ]; do /bin/sleep 0.01; done; touch '{}' ) \
-         </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s' \"$descendant\" > '{}'; \
+         </dev/null {output_redirect} & descendant=$!; printf '%s' \"$descendant\" > '{}'; \
          while [ ! -e '{}' ]; do /bin/sleep 0.01; done; exit 0",
         ready.display(),
         release.display(),
@@ -674,14 +712,30 @@ fn successful_leader_exit_still_terminalizes_its_process_group() {
         ready.display(),
     );
     let arguments = [OsString::from("-c"), OsString::from(script)];
-    let result = run_bounded_command(&BoundedCommand {
+    let request = BoundedCommand {
         executable: Path::new("/bin/sh"),
         arguments: &arguments,
         environment: &BTreeMap::new(),
         cwd: None,
         timeout: Duration::from_secs(1),
         output_limit: 32,
-    });
+    };
+    let result = if public_file {
+        #[cfg(target_os = "linux")]
+        {
+            let mut command = std::process::Command::new(request.executable);
+            command.args(request.arguments).env_clear();
+            dev_tools_command::run_prepared_bounded_command_with_public_file_stdout(
+                command,
+                request.timeout,
+                request.output_limit,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!("public file capture is Linux only")
+    } else {
+        run_bounded_command(&request)
+    };
 
     fs::write(&release, b"release").unwrap();
     for _ in 0..50 {

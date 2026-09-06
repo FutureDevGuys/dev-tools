@@ -989,9 +989,10 @@ dependencies = [
 
 [[package]]
 name = "dev-tools-command"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
+ "libc",
  "rustix",
  "tempfile",
  "wait-timeout",

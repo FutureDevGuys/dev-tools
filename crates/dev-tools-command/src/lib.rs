@@ -1,5 +1,13 @@
 //! Product-neutral executable discovery, PATH composition, and bounded execution.
 
+#[cfg(target_os = "linux")]
+mod public_file_stdout;
+#[cfg(target_os = "linux")]
+pub use public_file_stdout::{
+    run_prepared_bounded_command_with_public_file_stdout,
+    run_prepared_bounded_command_with_public_file_stdout_and_cancellation, OwnedPreparedCommand,
+};
+
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -707,7 +715,14 @@ fn run_prepared_bounded_command_with_configured_input(
         ))
     ))]
     {
-        run_prepared_bounded_command_unix(command, timeout, output_limit, cancelled)
+        run_prepared_bounded_command_unix(
+            command,
+            timeout,
+            output_limit,
+            cancelled,
+            #[cfg(target_os = "linux")]
+            None,
+        )
     }
     #[cfg(any(
         not(unix),
@@ -883,14 +898,20 @@ fn run_prepared_bounded_command_unix(
     timeout: Duration,
     output_limit: usize,
     cancelled: &AtomicBool,
+    #[cfg(target_os = "linux")] stdout_file: Option<fs::File>,
 ) -> std::result::Result<BoundedCommandOutput, BoundedCommandError> {
     configure_process_domain(command);
     let mut child = command.spawn().map_err(|source| {
         BoundedCommandError::with_source(BoundedCommandErrorKind::Start, source)
     })?;
     let domain = ProcessDomain::for_child(&child);
+    #[cfg(target_os = "linux")]
+    let has_file = stdout_file.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let has_file = false;
     let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
+        Some(stdout) => Some(stdout),
+        None if has_file => None,
         None => {
             let cleanup = terminate_process_domain(&mut child, domain);
             return Err(BoundedCommandError::new(BoundedCommandErrorKind::Capture(
@@ -910,7 +931,7 @@ fn run_prepared_bounded_command_unix(
             .with_cleanup_failures(cleanup));
         }
     };
-    if let Err(source) = set_nonblocking(&stdout) {
+    if let Err(source) = stdout.as_ref().map(set_nonblocking).transpose() {
         drop(stdout);
         drop(stderr);
         let cleanup = terminate_process_domain(&mut child, domain);
@@ -943,9 +964,15 @@ fn run_prepared_bounded_command_unix(
         if cancelled.load(Ordering::Acquire) {
             break Some(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
         }
-        if !stdout_closed {
+        #[cfg(target_os = "linux")]
+        if let Some(file) = &stdout_file {
+            if let Err(error) = public_file_stdout::check_size(file, output_limit) {
+                break Some(error);
+            }
+        }
+        if let Some(stdout) = stdout.as_mut().filter(|_| !stdout_closed) {
             match drain_available(
-                &mut stdout,
+                stdout,
                 &mut stdout_buffer,
                 output_limit,
                 BoundedCommandStream::Stdout,
@@ -978,7 +1005,7 @@ fn run_prepared_bounded_command_unix(
                 }
             }
         }
-        if leader_exited && stdout_closed && stderr_closed {
+        if leader_exited && (stdout_closed || has_file) && stderr_closed {
             break None;
         }
 
@@ -1004,6 +1031,10 @@ fn run_prepared_bounded_command_unix(
             .with_cleanup_failures(cleanup));
     }
     let status = status.ok_or_else(|| BoundedCommandError::new(BoundedCommandErrorKind::Wait))?;
+    #[cfg(target_os = "linux")]
+    if let Some(file) = stdout_file {
+        stdout_buffer = public_file_stdout::finish(file, output_limit)?;
+    }
     Ok(BoundedCommandOutput {
         status,
         stdout: stdout_buffer.into_vec(),
