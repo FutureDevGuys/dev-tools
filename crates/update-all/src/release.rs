@@ -306,7 +306,7 @@ fn check_after_runtime_gate(product: Product) -> Result<Check> {
     let paths = Paths::resolve(product)?;
     load_state(&paths)?;
     let (writer, mut state) = ReleaseStateWriter::begin(&paths)?;
-    let verified = fetch_verified_manifest(product, &paths, &state)?;
+    let verified = fetch_verified_manifest(product, &paths, &writer)?;
     accept_manifest_metadata(&mut state, &verified)?;
     state.last_successful_check_unix = Some(now_unix());
     writer.save(&state)?;
@@ -343,7 +343,7 @@ fn update_managed_with_sources<FetchManifest, FetchArtifact>(
     fetch_release_artifact: FetchArtifact,
 ) -> Result<Activation>
 where
-    FetchManifest: FnOnce(Product, &Paths, &ReleaseState) -> Result<VerifiedManifest>,
+    FetchManifest: FnOnce(Product, &Paths, &ReleaseStateWriter<'_>) -> Result<VerifiedManifest>,
     FetchArtifact: FnOnce(&Artifact) -> Result<Vec<u8>>,
 {
     match load_state(paths) {
@@ -359,7 +359,7 @@ where
     let (writer, mut state) = ReleaseStateWriter::begin(paths)?;
     #[cfg(unix)]
     adopt_legacy_installation(product, paths, &mut state)?;
-    let verified = fetch_manifest(product, paths, &state)?;
+    let verified = fetch_manifest(product, paths, &writer)?;
     accept_manifest_metadata(&mut state, &verified)?;
     if activation_is_current(paths, &state, &verified)? {
         state.last_successful_check_unix = Some(now_unix());
@@ -656,21 +656,12 @@ fn check_due(state: &ReleaseState) -> bool {
 fn fetch_verified_manifest(
     product: Product,
     paths: &Paths,
-    state: &ReleaseState,
+    writer: &ReleaseStateWriter<'_>,
 ) -> Result<VerifiedManifest> {
     let (root_url, manifest_url) = resolve_release_urls(product)?;
-    let root_bytes = fetch_cached(
-        &root_url,
-        &paths.root_cache,
-        &paths.root_etag,
-        METADATA_LIMIT,
-    )?;
-    let manifest_bytes = fetch_cached(
-        &manifest_url,
-        &paths.manifest_cache,
-        &paths.manifest_etag,
-        METADATA_LIMIT,
-    )?;
+    let root_bytes = writer.fetch_cached(&root_url, &paths.root_cache, METADATA_LIMIT)?;
+    let manifest_bytes =
+        writer.fetch_cached(&manifest_url, &paths.manifest_cache, METADATA_LIMIT)?;
     verify_downloaded_manifest(
         product,
         &ReleaseMetadata {
@@ -1044,20 +1035,109 @@ fn prune_versions(paths: &Paths, state: &ReleaseState) -> Result<()> {
     Ok(())
 }
 
-fn fetch_cached(url: &str, cache: &Path, etag_path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let etag = fs::read_to_string(etag_path).ok();
-    match https_get(url, etag.as_deref().map(str::trim), limit) {
-        Ok(fetched) => {
-            atomic_write(cache, &fetched.bytes, false)?;
-            if let Some(etag) = fetched.etag {
-                atomic_write(etag_path, etag.as_bytes(), false)?;
+const HTTP_CACHE_SCHEMA: &str = "update-all-http-metadata-v1";
+const HTTP_CACHE_TEXT_LIMIT: usize = 8192;
+
+// Disposable transport observation only. Verification and accepted release
+// history remain mandatory, including after a conditional response.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataHttpCache {
+    schema: String,
+    url: String,
+    bytes: Vec<u8>,
+    etag: Option<String>,
+}
+
+impl MetadataHttpCache {
+    fn validate(&self, limit: u64) -> Result<()> {
+        if self.schema != HTTP_CACHE_SCHEMA
+            || self.url.is_empty()
+            || self.url.len() > HTTP_CACHE_TEXT_LIMIT
+            || self.bytes.is_empty()
+            || self.bytes.len() as u64 > limit
+            || self.etag.as_ref().is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > HTTP_CACHE_TEXT_LIMIT
+                    || value.bytes().any(|byte| !(32..=126).contains(&byte))
+            })
+        {
+            bail!("release metadata cache has an invalid contract");
+        }
+        Ok(())
+    }
+}
+
+impl ReleaseStateWriter<'_> {
+    fn fetch_cached(&self, url: &str, cache: &Path, limit: u64) -> Result<Vec<u8>> {
+        self.fetch_cached_with(url, cache, limit, https_get)
+    }
+
+    fn fetch_cached_with(
+        &self,
+        url: &str,
+        cache: &Path,
+        limit: u64,
+        fetch: impl FnOnce(&str, Option<&str>, u64) -> Result<FetchResult>,
+    ) -> Result<Vec<u8>> {
+        if limit == 0
+            || limit > METADATA_LIMIT
+            || url.is_empty()
+            || url.len() > HTTP_CACHE_TEXT_LIMIT
+        {
+            bail!("release metadata cache request exceeds its bounds");
+        }
+        // JSON byte arrays need at most four bytes per input byte; strings
+        // need at most six per byte. Bound the serialized document before read.
+        let authority = dev_tools_installation::DocumentAuthority {
+            owner_uid: self.authority.owner_uid,
+            mode: 0o600,
+            limit: 4 * limit + 12 * HTTP_CACHE_TEXT_LIMIT as u64 + 1024,
+        };
+        let original = dev_tools_installation::read_atomic_document(cache, &authority)?;
+        let cached = original
+            .as_ref()
+            .map(|document| -> Result<MetadataHttpCache> {
+                let cached: MetadataHttpCache =
+                    parse_json(&document.bytes, "release metadata cache")?;
+                cached.validate(limit)?;
+                Ok(cached)
+            })
+            .transpose()?;
+        let bound = cached.as_ref().filter(|cached| cached.url == url);
+        let validator = bound.and_then(|cached| cached.etag.as_deref());
+        let fetched = fetch(url, validator, limit);
+        match fetched {
+            Ok(fetched) => {
+                let next = MetadataHttpCache {
+                    schema: HTTP_CACHE_SCHEMA.into(),
+                    url: url.into(),
+                    bytes: fetched.bytes,
+                    etag: fetched.etag,
+                };
+                next.validate(limit)?;
+                let bytes =
+                    serde_json::to_vec(&next).context("serialize release metadata cache")?;
+                let current = dev_tools_installation::read_atomic_document(cache, &authority)?;
+                let expected = original.as_ref().map(|document| &document.identity);
+                if current.as_ref().map(|document| &document.identity) != expected {
+                    bail!("release metadata cache changed during retrieval");
+                }
+                dev_tools_installation::write_atomic_document(cache, &bytes, &authority, expected)?;
+                Ok(next.bytes)
             }
-            Ok(fetched.bytes)
+            Err(error) if error.downcast_ref::<MetadataNotModified>().is_some() => {
+                // Never re-read the file after 304: only the bounded exact bytes
+                // associated with the submitted validator can satisfy it.
+                if validator.is_none() {
+                    bail!("release metadata was not modified without a bound validator");
+                }
+                bound
+                    .map(|cached| cached.bytes.clone())
+                    .context("release metadata cache is absent")
+            }
+            Err(error) => Err(error),
         }
-        Err(err) if err.downcast_ref::<MetadataNotModified>().is_some() && cache.is_file() => {
-            fs::read(cache).with_context(|| format!("read cached metadata {}", cache.display()))
-        }
-        Err(err) => Err(err),
     }
 }
 
@@ -1808,9 +1888,7 @@ struct Paths {
     current: PathBuf,
     state: PathBuf,
     root_cache: PathBuf,
-    root_etag: PathBuf,
     manifest_cache: PathBuf,
-    manifest_etag: PathBuf,
     bin_dir: PathBuf,
     public_binary: PathBuf,
     executable_name: String,
@@ -1842,10 +1920,8 @@ impl Paths {
             versions: product_root.join("versions"),
             current: product_root.join("current"),
             state: product_root.join("state.json"),
-            root_cache: cache.join("root.json"),
-            root_etag: cache.join("root.etag"),
-            manifest_cache: cache.join("manifest.json"),
-            manifest_etag: cache.join("manifest.etag"),
+            root_cache: cache.join("root.http-v1.json"),
+            manifest_cache: cache.join("manifest.http-v1.json"),
             public_binary: bin_dir.join(&executable_name),
             bin_dir,
             product_root,
@@ -1859,16 +1935,311 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    #[test]
+    fn metadata_cache_does_not_replay_unbound_legacy_validator() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        create_private_dir(paths.root_cache.parent().unwrap())?;
+        let cache = paths.root_cache.with_file_name("root.json");
+        let etag = paths.root_cache.with_file_name("root.etag");
+        fs::write(&cache, b"old origin body")?;
+        fs::write(&etag, b"\"old-origin\"")?;
+        let bytes = writer.fetch_cached_with(
+            "https://github.com/new-origin",
+            &paths.root_cache,
+            100,
+            |_, validator, _| {
+                assert!(validator.is_none(), "unbound legacy validator was replayed");
+                Ok(FetchResult {
+                    bytes: b"new origin body".to_vec(),
+                    etag: None,
+                })
+            },
+        )?;
+        assert_eq!(bytes, b"new origin body");
+        assert_eq!(fs::read(cache)?, b"old origin body");
+        assert_eq!(fs::read(etag)?, b"\"old-origin\"");
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_cache_preserves_unmarked_temporary() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        create_private_dir(paths.root_cache.parent().unwrap())?;
+        let temporary = paths
+            .root_cache
+            .with_file_name(format!(".root.http-v1.json.{}.tmp", std::process::id()));
+        fs::write(&temporary, b"unrelated bytes")?;
+        writer.fetch_cached_with(
+            "https://github.com/root",
+            &paths.root_cache,
+            100,
+            |_, _, _| {
+                Ok(FetchResult {
+                    bytes: b"new body".to_vec(),
+                    etag: None,
+                })
+            },
+        )?;
+        assert_eq!(fs::read(temporary)?, b"unrelated bytes");
+        Ok(())
+    }
+
+    fn metadata_response(bytes: &[u8], etag: Option<&str>) -> Result<FetchResult> {
+        Ok(FetchResult {
+            bytes: bytes.to_vec(),
+            etag: etag.map(str::to_owned),
+        })
+    }
+
+    #[test]
+    fn metadata_cache_binds_validator_and_exact_bytes_to_url() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        let url = "https://github.com/first";
+        let body = b"original\xff\x00bytes";
+        assert_eq!(
+            writer.fetch_cached_with(url, &paths.root_cache, 100, |_, validator, limit| {
+                assert!(validator.is_none());
+                assert_eq!(limit, 100);
+                metadata_response(body, Some("W/\"first\""))
+            })?,
+            body
+        );
+        let original = fs::read(&paths.root_cache)?;
+        assert_eq!(
+            writer.fetch_cached_with(url, &paths.root_cache, 100, |actual_url, validator, _| {
+                assert_eq!(actual_url, url);
+                assert_eq!(validator, Some("W/\"first\""));
+                Err(MetadataNotModified.into())
+            })?,
+            body
+        );
+        assert_eq!(fs::read(&paths.root_cache)?, original);
+        assert!(writer
+            .fetch_cached_with(
+                "https://github.com/second",
+                &paths.root_cache,
+                100,
+                |_, validator, _| {
+                    assert!(validator.is_none());
+                    Err(MetadataNotModified.into())
+                }
+            )
+            .is_err());
+        assert_eq!(fs::read(&paths.root_cache)?, original);
+        assert_eq!(
+            writer.fetch_cached_with(
+                "https://github.com/second",
+                &paths.root_cache,
+                100,
+                |_, validator, _| {
+                    assert!(validator.is_none());
+                    metadata_response(b"second", None)
+                }
+            )?,
+            b"second"
+        );
+        assert!(writer
+            .fetch_cached_with(
+                "https://github.com/second",
+                &paths.root_cache,
+                100,
+                |_, validator, _| {
+                    assert!(
+                        validator.is_none(),
+                        "old validator survived replacement without ETag"
+                    );
+                    Err(MetadataNotModified.into())
+                }
+            )
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_cache_not_modified_uses_only_admitted_snapshot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        let url = "https://github.com/root";
+        writer.fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+            metadata_response(b"admitted", Some("\"root\""))
+        })?;
+        let bytes = writer.fetch_cached_with(url, &paths.root_cache, 100, |_, validator, _| {
+            assert_eq!(validator, Some("\"root\""));
+            fs::write(&paths.root_cache, b"unrelated intervening bytes")?;
+            Err(MetadataNotModified.into())
+        })?;
+        assert_eq!(bytes, b"admitted");
+        assert_eq!(fs::read(&paths.root_cache)?, b"unrelated intervening bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_cache_rejects_changed_publication_history() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        let url = "https://github.com/root";
+        writer.fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+            metadata_response(b"first", None)
+        })?;
+        let first = fs::read(&paths.root_cache)?;
+        writer.fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+            metadata_response(b"second", None)
+        })?;
+        let second = fs::read(&paths.root_cache)?;
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+                fs::write(&paths.root_cache, &first)?;
+                metadata_response(b"third", None)
+            })
+            .is_err());
+        assert_eq!(fs::read(&paths.root_cache)?, first);
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+                fs::remove_file(&paths.root_cache)?;
+                metadata_response(b"third", None)
+            })
+            .is_err());
+        assert!(!paths.root_cache.exists());
+        assert!(
+            writer
+                .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+                    atomic_write(&paths.root_cache, &second, false)?;
+                    metadata_response(b"second", None)
+                })
+                .is_err(),
+            "byte-identical unexpected creation must not grant authority"
+        );
+        assert_eq!(fs::read(&paths.root_cache)?, second);
+        assert!(ReleaseStateWriter::begin(&paths).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_cache_bounds_disk_body_and_transport_outcomes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        let url = "https://github.com/root";
+        for invalid in [Vec::new(), vec![0; 101]] {
+            assert!(writer
+                .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| metadata_response(
+                    &invalid, None
+                ))
+                .is_err());
+            assert!(!paths.root_cache.exists());
+        }
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| Err(
+                MetadataNotModified.into()
+            ))
+            .is_err());
+        for invalid in ["".to_owned(), "\r\n".into(), "x".repeat(8193)] {
+            assert!(writer
+                .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| metadata_response(
+                    b"body",
+                    Some(&invalid)
+                ))
+                .is_err());
+            assert!(!paths.root_cache.exists());
+        }
+        writer.fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+            metadata_response(&[255; 100], Some("\"root\""))
+        })?;
+        let original = fs::read(&paths.root_cache)?;
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 99, |_, _, _| panic!(
+                "oversized cached body must fail before network contact"
+            ))
+            .is_err());
+        assert_eq!(fs::read(&paths.root_cache)?, original);
+        let error = writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+                bail!("ordinary error: metadata not modified")
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ordinary error: metadata not modified");
+        assert_eq!(fs::read(&paths.root_cache)?, original);
+        for invalid in [b"unknown unmarked file".to_vec(), vec![b' '; 110_000]] {
+            fs::write(&paths.root_cache, &invalid)?;
+            assert!(writer
+                .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| panic!(
+                    "invalid disk cache must fail before network contact"
+                ))
+                .is_err());
+            assert_eq!(fs::read(&paths.root_cache)?, invalid);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_cache_rejects_linked_and_nonprivate_destinations() -> Result<()> {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir()?;
+        let paths = state_test_paths(directory.path());
+        let (writer, _) = ReleaseStateWriter::begin(&paths)?;
+        let url = "https://github.com/root";
+        writer.fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+            metadata_response(b"body", None)
+        })?;
+        let metadata = fs::metadata(&paths.root_cache)?;
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        writer.fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| {
+            metadata_response(b"body", None)
+        })?;
+        assert_eq!(fs::metadata(&paths.root_cache)?.ino(), metadata.ino());
+        assert_eq!(
+            fs::metadata(&paths.root_cache)?.modified()?,
+            metadata.modified()?
+        );
+        let original = fs::read(&paths.root_cache)?;
+        let target = paths.root_cache.with_file_name("unrelated");
+        fs::rename(&paths.root_cache, &target)?;
+        symlink(&target, &paths.root_cache)?;
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| panic!(
+                "symlink must fail before network contact"
+            ))
+            .is_err());
+        assert!(fs::symlink_metadata(&paths.root_cache)?.is_symlink());
+        fs::remove_file(&paths.root_cache)?;
+        fs::hard_link(&target, &paths.root_cache)?;
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| panic!(
+                "hardlink must fail before network contact"
+            ))
+            .is_err());
+        assert_eq!(fs::metadata(&target)?.nlink(), 2);
+        fs::remove_file(&paths.root_cache)?;
+        fs::rename(&target, &paths.root_cache)?;
+        fs::set_permissions(&paths.root_cache, fs::Permissions::from_mode(0o644))?;
+        assert!(writer
+            .fetch_cached_with(url, &paths.root_cache, 100, |_, _, _| panic!(
+                "nonprivate file must fail before network contact"
+            ))
+            .is_err());
+        assert_eq!(fs::metadata(&paths.root_cache)?.mode() & 0o777, 0o644);
+        assert_eq!(fs::read(&paths.root_cache)?, original);
+        Ok(())
+    }
+
     fn state_test_paths(root: &Path) -> Paths {
         let product_root = root.join("product");
         Paths {
             versions: product_root.join("versions"),
             current: product_root.join("current"),
             state: product_root.join("state.json"),
-            root_cache: product_root.join("cache/root.json"),
-            root_etag: product_root.join("cache/root.etag"),
-            manifest_cache: product_root.join("cache/manifest.json"),
-            manifest_etag: product_root.join("cache/manifest.etag"),
+            root_cache: product_root.join("cache/root.http-v1.json"),
+            manifest_cache: product_root.join("cache/manifest.http-v1.json"),
             bin_dir: root.join("bin"),
             public_binary: root.join("bin/update-all"),
             executable_name: "update-all".into(),
@@ -2935,10 +3306,8 @@ mod tests {
             versions: product_root.join("versions"),
             current: product_root.join("current"),
             state: product_root.join("state.json"),
-            root_cache: product_root.join("cache/root.json"),
-            root_etag: product_root.join("cache/root.etag"),
-            manifest_cache: product_root.join("cache/manifest.json"),
-            manifest_etag: product_root.join("cache/manifest.etag"),
+            root_cache: product_root.join("cache/root.http-v1.json"),
+            manifest_cache: product_root.join("cache/manifest.http-v1.json"),
             public_binary: bin_dir.join("update-all"),
             bin_dir,
             product_root,
@@ -2991,10 +3360,8 @@ mod tests {
             versions: product_root.join("versions"),
             current: product_root.join("current"),
             state: product_root.join("state.json"),
-            root_cache: product_root.join("cache/root.json"),
-            root_etag: product_root.join("cache/root.etag"),
-            manifest_cache: product_root.join("cache/manifest.json"),
-            manifest_etag: product_root.join("cache/manifest.etag"),
+            root_cache: product_root.join("cache/root.http-v1.json"),
+            manifest_cache: product_root.join("cache/manifest.http-v1.json"),
             public_binary: bin_dir.join("update-all"),
             bin_dir,
             product_root,
