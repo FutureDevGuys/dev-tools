@@ -2234,12 +2234,25 @@ pub fn write_atomic_document(
         bail!("atomic document content is empty or exceeds its size bound");
     }
     let parent = path.parent().context("atomic document has no parent")?;
+    #[cfg(target_os = "linux")]
+    open_durable_directory_chain(parent)?;
+    #[cfg(not(target_os = "linux"))]
     ensure_directory_chain(parent)?;
     let current = read_atomic_document(path, authority)?;
     if current
         .as_ref()
         .is_some_and(|current| current.bytes == bytes)
     {
+        #[cfg(target_os = "linux")]
+        {
+            // A previous attempt may have published these exact bytes and
+            // failed while syncing. Idempotence must not acknowledge that
+            // unsynchronized file or directory entry as durable.
+            open_read_nofollow(path)?
+                .sync_all()
+                .context("sync unchanged atomic document")?;
+            sync_directory(parent)?;
+        }
         return Ok(false);
     }
     match (&current, expected_current) {
@@ -2262,10 +2275,6 @@ pub fn write_atomic_document(
         .as_file_mut()
         .flush()
         .context("flush atomic document temporary")?;
-    temporary
-        .as_file()
-        .sync_all()
-        .context("sync atomic document temporary")?;
     #[cfg(unix)]
     {
         temporary
@@ -2277,6 +2286,10 @@ pub fn write_atomic_document(
                 .context("set atomic document owner")?;
         }
     }
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync atomic document temporary and final metadata")?;
     let staged = ArtifactIdentity::from_file(temporary.path(), authority.limit)?;
     let expected = ArtifactIdentity {
         length: bytes.len() as u64,

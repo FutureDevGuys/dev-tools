@@ -29,6 +29,7 @@ Read the applicable records before changing a public product contract or cross-p
 | [0018](0018-journal-owned-initial-directory-publication.md) | Journal-owned initial-directory publication | proposed | pending |
 | [0019](0019-truthful-common-update-mutation-results.md) | Truthful common update mutation results | proposed | pending |
 | [0020](0020-separate-update-artifact-preparation.md) | Separate update artifact preparation | proposed | pending |
+| [0021](0021-linux-atomic-document-durability.md) | Linux atomic-document durability | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 
