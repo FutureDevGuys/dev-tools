@@ -5,6 +5,7 @@
 - [Update All architecture decision records](../crates/update-all/docs/adr/README.md)
 - [update-all](update-all.md)
 - [artifact-update](artifact-update.md)
+- [Artifact Update source coverage](artifact-update-source-coverage.md)
 - [dev-auth](dev-auth.md)
 - [Dev Cache](dev-cache.md)
 - [sync-configs](sync-configs.md)
