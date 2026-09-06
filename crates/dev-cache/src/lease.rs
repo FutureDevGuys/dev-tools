@@ -11,7 +11,7 @@ use crate::util::{now_unix, write_json_atomic};
 
 pub struct RootLease {
     file: File,
-    record: Option<PathBuf>,
+    record: Option<(PathBuf, LeaseRecord)>,
 }
 
 pub struct ActiveLease {
@@ -38,21 +38,22 @@ impl RootLease {
     pub fn shared(root: &RootHandle, operation: &str) -> Result<Self> {
         let file = lock_file(root)?;
         FileExt::lock_shared(&file).context("acquire shared cache-root lease")?;
-        let id = format!("{}-{}", std::process::id(), now_unix());
+        let id = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
         let record = root.control().join("leases").join(format!("{id}.json"));
-        write_json_atomic(
-            &record,
-            &LeaseRecord {
-                schema_version: 1,
-                pid: std::process::id(),
-                started_unix: now_unix(),
-                operation: operation.to_owned(),
-                resource_ids: Vec::new(),
-            },
-        )?;
+        // The held root lock excludes collection throughout setup. Publish only
+        // the scoped activity record, durably, before releasing that lock.
         Ok(Self {
             file,
-            record: Some(record),
+            record: Some((
+                record,
+                LeaseRecord {
+                    schema_version: 1,
+                    pid: std::process::id(),
+                    started_unix: now_unix(),
+                    operation: operation.to_owned(),
+                    resource_ids: Vec::new(),
+                },
+            )),
         })
     }
 
@@ -60,20 +61,19 @@ impl RootLease {
         if resource_ids.is_empty() {
             bail!("an active routed lease requires at least one resource");
         }
-        let record_path = self
+        let (record_path, mut record) = self
             .record
-            .as_ref()
+            .take()
             .context("shared root lease has no activity record")?;
-        let mut record: LeaseRecord =
-            serde_json::from_slice(&fs::read(record_path)?).context("parse routed lease record")?;
         record.resource_ids = resource_ids.to_vec();
         record.resource_ids.sort();
         record.resource_ids.dedup();
-        write_json_atomic(record_path, &record)?;
+        write_json_atomic(&record_path, &record)?;
+        let active = ActiveLease {
+            record: Some(record_path),
+        };
         FileExt::unlock(&self.file).context("release cache-root setup lease")?;
-        Ok(ActiveLease {
-            record: self.record.take(),
-        })
+        Ok(active)
     }
 
     pub fn exclusive(root: &RootHandle) -> Result<Self> {
@@ -114,9 +114,6 @@ impl RootLease {
 
 impl Drop for RootLease {
     fn drop(&mut self) {
-        if let Some(path) = self.record.take() {
-            let _ = fs::remove_file(path);
-        }
         let _ = FileExt::unlock(&self.file);
     }
 }
