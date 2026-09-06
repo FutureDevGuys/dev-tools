@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "dev-tools-command"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rustix",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "dev-tools-installation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fs2",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "dev-tools-secret"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zeroize",
 ]

@@ -13,6 +13,7 @@
 - [Release trust](release-trust.md)
 - [Release Admin](release-admin.md)
 - [Shared Rust crates](shared-rust-crates.md)
+- [Shared-crate publication transactions](shared-crate-publication.md)
 - [Shared command execution](dev-tools-command.md)
 - [One-shot privilege authorization](dev-tools-privilege.md)
 - [Provider-neutral secret operations](dev-tools-secret.md)

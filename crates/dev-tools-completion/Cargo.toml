@@ -12,5 +12,5 @@ clap = { version = "4", default-features = false, features = ["std"] }
 clap_complete = { version = "4", default-features = false }
 
 [dev-dependencies]
-dev-tools-command = { version = "0.1.0", path = "../dev-tools-command" }
+dev-tools-command = { version = "0.1.1", path = "../dev-tools-command" }
 tempfile = "3"
