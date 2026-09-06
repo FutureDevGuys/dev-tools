@@ -40,6 +40,8 @@ The initial `cutover_retires_legacy_state_and_preserves_accepted_history` test r
 
 The product tests cover missing-proof interruption and retry, malformed captured history, unknown destination preservation, initialized authority loss, exact accepted-history preservation, receipt/proof mismatch, both retained identities, and product-writer contention. In particular, `missing_proof_retains_both_fences_and_explicit_retry_resumes` and `receipt_hashes_without_matching_signed_evidence_cannot_complete_cutover` protect the incomplete-cutover boundary. These are local source tests; the signed fixture establishes metadata authentication, while synthetic installation bytes are used only to demonstrate rejection. They do not establish signed installed-artifact acceptance or actual process-death recovery of this composition.
 
+The `interrupted_history_is_readable_without_resuming_retirement` regression protects metadata-only proof acquisition: the captured accepted version remains readable without finishing retirement or publishing product authority. The shared observation boundary is defined in workspace ADR 0027; captured origin history never replaces an initialized ledger.
+
 ## Runtime acceptance
 
 Before public cutover, integrate honest initial and pending-state observation, metadata-only proof acquisition, explicit resumption, common mutation-result reporting, new-ledger acceptance and receipt-owned activation/rollback. Preserve legacy entrypoint compatibility without letting retained binaries mutate the retired namespace. Run real source-bound releases outside a checkout through online/offline installation, repeat operation, retained rollback and process interruption. Native non-Linux backends remain separate gates.

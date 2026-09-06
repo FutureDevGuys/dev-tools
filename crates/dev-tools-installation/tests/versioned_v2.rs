@@ -40,6 +40,79 @@ fn assert_old_mutators_blocked(request: &VersionedInstallRequest) {
 }
 
 #[test]
+fn metadata_observation_does_not_recover_or_claim_artifact_custody() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = request(root.path(), "1.0.0");
+    let layout = &candidate.layout;
+    versioned_v2::initialize(layout, 1024, |_| Ok(())).unwrap();
+    let receipt = versioned_v2::apply_if_unchanged(&candidate, None, |_| Ok(()))
+        .unwrap()
+        .receipt;
+    let journal = layout.data_root.join("installation-transition-v1.json");
+    fs::write(&journal, b"unknown journal must remain untouched").unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let original = fs::read(layout.data_root.join("installation-receipt-v1.json")).unwrap();
+    assert!(versioned_v2::observe(layout, 1024).is_err());
+    let observed = versioned_v2::read_receipt_metadata(layout).unwrap();
+    assert!(versioned_v2::pending_recovery(layout).is_err());
+    assert_eq!(observed, Some(receipt.clone()));
+    assert_eq!(
+        fs::read(&journal).unwrap(),
+        b"unknown journal must remain untouched"
+    );
+    assert_eq!(
+        fs::read(layout.data_root.join("installation-receipt-v1.json")).unwrap(),
+        original
+    );
+    fs::remove_file(&journal).unwrap();
+    fs::write(
+        layout
+            .data_root
+            .join("versions/1.0.0")
+            .join(&layout.artifact_name),
+        b"corrupted",
+    )
+    .unwrap();
+    assert_eq!(
+        versioned_v2::read_receipt_metadata(layout).unwrap(),
+        Some(receipt)
+    );
+    assert!(versioned_v2::observe(layout, 1024).is_err());
+}
+
+#[test]
+fn metadata_read_requires_an_initialized_matching_bounded_receipt_without_creating_state() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = request(root.path(), "1.0.0");
+    let layout = &candidate.layout;
+    assert!(versioned_v2::read_receipt_metadata(layout).is_err());
+    assert!(!layout.data_root.exists());
+    assert_eq!(versioned_v2::pending_recovery(layout).unwrap(), None);
+    assert!(!layout.data_root.exists());
+    versioned_v2::initialize(layout, 1024, |_| Ok(())).unwrap();
+    assert_eq!(versioned_v2::read_receipt_metadata(layout).unwrap(), None);
+    let mut other = layout.clone();
+    other.product = "other".into();
+    assert!(versioned_v2::read_receipt_metadata(&other).is_err());
+    let path = layout.data_root.join("installation-receipt-v1.json");
+    let original = fs::read(&path).unwrap();
+    let mut oversized = original.clone();
+    oversized.resize(1024 * 1024 + 1, b' ');
+    fs::write(&path, &oversized).unwrap();
+    assert!(versioned_v2::read_receipt_metadata(layout).is_err());
+    assert_eq!(fs::metadata(&path).unwrap().len(), oversized.len() as u64);
+    fs::write(&path, &original).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    value["unknown"] = true.into();
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(versioned_v2::read_receipt_metadata(layout).is_err());
+    fs::write(&path, &original).unwrap();
+    fs::hard_link(&path, root.path().join("another-link")).unwrap();
+    assert!(versioned_v2::read_receipt_metadata(layout).is_err());
+    assert_eq!(fs::read(path).unwrap(), original);
+}
+
+#[test]
 fn initialized_empty_namespace_excludes_old_first_install_and_supports_new_lifecycle() {
     let root = tempfile::tempdir().unwrap();
     let first = request(root.path(), "1.0.0");
@@ -137,6 +210,13 @@ fn failed_product_cutover_stays_fenced_until_explicit_resume() {
         .is_err());
         let journal = layout.data_root.join("installation-transition-v1.json");
         let before = fs::read(&journal).unwrap();
+        assert_eq!(
+            versioned_v2::pending_recovery(layout).unwrap(),
+            Some(versioned_v2::PendingRecovery::ProtocolUpgrade)
+        );
+        let mut foreign = layout.clone();
+        foreign.product = "other".into();
+        assert!(versioned_v2::pending_recovery(&foreign).is_err());
         // An absent receipt is still absent, but the upgrade journal rejects
         // every v1 mutation before activation. With a receipt, its v1 read is
         // still allowed until the upgrade commits; it grants no write authority.
@@ -285,6 +365,11 @@ fn normal_recovery_authenticates_both_receipts_and_retains_the_protocol_fence() 
             fs::write(&receipt_path, prior_bytes).unwrap();
         }
         let journal_before = fs::read(&journal).unwrap();
+        assert_eq!(
+            versioned_v2::pending_recovery(layout).unwrap(),
+            Some(versioned_v2::PendingRecovery::Activation)
+        );
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
         assert!(versioned_v2::recover(layout, 1024, |_| anyhow::bail!("unauthenticated")).is_err());
         assert_eq!(fs::read(&journal).unwrap(), journal_before);
         let mut seen = Vec::new();

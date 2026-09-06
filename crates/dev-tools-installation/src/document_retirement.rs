@@ -33,7 +33,7 @@ struct Record {
     captured: Option<ArtifactIdentity>,
 }
 
-struct Retirement<'a> {
+struct Retirement<'a, Lease = InstallationLock> {
     path: &'a Path,
     authority: &'a DocumentAuthority,
     parent_path: PathBuf,
@@ -41,7 +41,78 @@ struct Retirement<'a> {
     key: String,
     record_path: PathBuf,
     record_authority: DocumentAuthority,
-    _lock: InstallationLock,
+    _lock: Lease,
+}
+
+/// Recognized fenced history, not a durability acknowledgement or product
+/// authentication. `captured: None` means explicitly retired empty history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredAtomicDocument {
+    pub captured: Option<AtomicDocument>,
+}
+
+/// Read captured history without creating, locking, syncing or recovering.
+/// `None` means the target has not reached a recognized retirement fence; it
+/// does not grant permission to initialize history. An invalid existing record,
+/// missing captured file, changed fence or changed recorded identity is an error.
+/// A post-exchange interruption is readable before the writer has acknowledged
+/// durability or recorded the captured digest. Callers must revalidate at their
+/// mutation boundary and independently authenticate the returned document.
+pub fn observe_retired_atomic_document(
+    path: &Path,
+    authority: &DocumentAuthority,
+) -> Result<Option<RetiredAtomicDocument>> {
+    validate_target(path, authority)?;
+    let context = match Retirement::<()>::context(path, authority, false) {
+        Ok(context) => context,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(original) =
+        crate::read_atomic_document(&context.record_path, &context.record_authority)?
+    else {
+        return Ok(None);
+    };
+    let record: Record = serde_json::from_slice(&original.bytes)?;
+    context.validate(&record, true)?;
+    let stage = context.parent_path.join(&record.stage);
+    let observed = if context.is_fence(path, &record)? {
+        context.inspect_fence(path, &record)?;
+        let captured = crate::read_atomic_document(&stage, authority)?;
+        match (&record.origin, &captured) {
+            (Origin::Existing, None) => bail!("captured retirement history is missing"),
+            (Origin::Absent, Some(_)) => bail!("unexpected retirement history"),
+            _ => {}
+        }
+        if record.captured.as_ref().is_some_and(|expected| {
+            captured.as_ref().map(|document| &document.identity) != Some(expected)
+        }) {
+            bail!("captured retirement history changed");
+        }
+        Some(RetiredAtomicDocument { captured })
+    } else {
+        if record.captured.is_some() {
+            bail!("completed retirement fence is missing");
+        }
+        context.inspect_fence(&stage, &record)?;
+        let current = crate::read_atomic_document(path, authority)?;
+        if record.origin == Origin::Existing && current.is_none() {
+            bail!("required retirement history is missing");
+        }
+        None
+    };
+    let current = crate::read_atomic_document(&context.record_path, &context.record_authority)?;
+    if current.as_ref().map(|document| &document.identity) != Some(&original.identity) {
+        bail!("retirement changed during observation");
+    }
+    context.verify_parent()?;
+    Ok(observed)
 }
 
 /// Retire an atomic-replacement document, retaining its final bytes for import.
@@ -83,17 +154,7 @@ fn retire_with(
     allow_absent: bool,
     mut boundary: impl FnMut(Phase) -> Result<()>,
 ) -> Result<(bool, Option<AtomicDocument>)> {
-    crate::validate_document_authority(authority)?;
-    if !path.is_absolute()
-        || path.file_name().is_none()
-        || path.as_os_str().len() > 4096
-        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
-        || path
-            .components()
-            .any(|p| matches!(p, Component::CurDir | Component::ParentDir))
-    {
-        bail!("document retirement requires a normalized absolute target");
-    }
+    validate_target(path, authority)?;
     let retirement = Retirement::open(path, authority)?;
     let existing =
         crate::read_atomic_document(&retirement.record_path, &retirement.record_authority)?;
@@ -218,13 +279,32 @@ fn retire_with(
     Ok((changed, captured))
 }
 
-impl<'a> Retirement<'a> {
-    fn open(path: &'a Path, authority: &'a DocumentAuthority) -> Result<Self> {
+fn validate_target(path: &Path, authority: &DocumentAuthority) -> Result<()> {
+    crate::validate_document_authority(authority)?;
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path.as_os_str().len() > 4096
+        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
+        || path
+            .components()
+            .any(|p| matches!(p, Component::CurDir | Component::ParentDir))
+    {
+        bail!("document retirement requires a normalized absolute target");
+    }
+    Ok(())
+}
+
+impl<'a> Retirement<'a, ()> {
+    fn context(path: &'a Path, authority: &'a DocumentAuthority, create: bool) -> Result<Self> {
         let parent_path = path
             .parent()
             .context("retirement target has no parent")?
             .to_owned();
-        let (parent, _) = crate::open_durable_directory_chain(&parent_path)?;
+        let (parent, _) = if create {
+            crate::open_durable_directory_chain(&parent_path)?
+        } else {
+            crate::open_directory_chain(&parent_path, false)?
+        };
         let parent = File::from(parent);
         let metadata = parent.metadata()?;
         if metadata.uid() != authority.owner_uid || metadata.mode() & 0o022 != 0 {
@@ -235,13 +315,6 @@ impl<'a> Retirement<'a> {
         hash.update(path.as_os_str().as_bytes());
         let key = format!("{:x}", hash.finalize());
         let stem = format!(".dev-tools-retired-document-{key}");
-        let lock = InstallationLock::open_with_owner(
-            &parent_path.join(format!("{stem}.lock")),
-            true,
-            Some(authority.owner_uid),
-            || {},
-        )?
-        .context("document retirement is busy")?;
         let retirement = Self {
             path,
             authority,
@@ -254,12 +327,13 @@ impl<'a> Retirement<'a> {
                 mode: 0o600,
                 limit: 4096,
             },
-            _lock: lock,
+            _lock: (),
         };
-        retirement.verify_parent()?;
         Ok(retirement)
     }
+}
 
+impl<Lease> Retirement<'_, Lease> {
     fn verify_parent(&self) -> Result<()> {
         let (named, _) = crate::open_directory_chain(&self.parent_path, false)?;
         let named = rustix::fs::fstat(&named)?;
@@ -303,7 +377,7 @@ impl<'a> Retirement<'a> {
             && metadata.ino() == record.fence_inode)
     }
 
-    fn require_fence(&self, path: &Path, record: &Record) -> Result<()> {
+    fn inspect_fence(&self, path: &Path, record: &Record) -> Result<File> {
         let directory = File::from(rustix::fs::openat(
             &self.parent,
             path.file_name().context("fence has no name")?,
@@ -322,7 +396,38 @@ impl<'a> Retirement<'a> {
         {
             bail!("retirement fence custody or inventory changed");
         }
-        directory.sync_all()?;
+        Ok(directory)
+    }
+}
+
+impl<'a> Retirement<'a> {
+    fn open(path: &'a Path, authority: &'a DocumentAuthority) -> Result<Self> {
+        let context = Retirement::<()>::context(path, authority, true)?;
+        let lock = InstallationLock::open_with_owner(
+            &context
+                .parent_path
+                .join(format!(".dev-tools-retired-document-{}.lock", context.key)),
+            true,
+            Some(authority.owner_uid),
+            || {},
+        )?
+        .context("document retirement is busy")?;
+        let retirement = Self {
+            path: context.path,
+            authority: context.authority,
+            parent_path: context.parent_path,
+            parent: context.parent,
+            key: context.key,
+            record_path: context.record_path,
+            record_authority: context.record_authority,
+            _lock: lock,
+        };
+        retirement.verify_parent()?;
+        Ok(retirement)
+    }
+
+    fn require_fence(&self, path: &Path, record: &Record) -> Result<()> {
+        self.inspect_fence(path, record)?.sync_all()?;
         Ok(())
     }
 
@@ -445,6 +550,18 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 };
                 assert_eq!(status.code(), Some(74));
+                let (record_path, _) = record(root.path());
+                let before = fs::read(&record_path).unwrap();
+                let observed = observe_retired_atomic_document(&source, &auth).unwrap();
+                if phase == "published" {
+                    assert_eq!(
+                        observed.unwrap().captured.map(|d| d.bytes),
+                        present.then(|| b"history".to_vec())
+                    );
+                } else {
+                    assert!(observed.is_none());
+                }
+                assert_eq!(fs::read(record_path).unwrap(), before);
                 let (_, captured) = retire_atomic_document(&source, &auth, true).unwrap();
                 assert_eq!(
                     captured.map(|d| d.bytes),
@@ -467,6 +584,35 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn observation_inside_writer_boundaries_never_finishes_the_record() {
+        for present in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let auth = authority(root.path());
+            let source = root.path().join("state");
+            if present {
+                crate::write_atomic_document(&source, b"history", &auth, None).unwrap();
+            }
+            retire_with(&source, &auth, true, |phase| {
+                let (path, saved) = record(root.path());
+                let before = fs::read(&path)?;
+                let observed = observe_retired_atomic_document(&source, &auth)?;
+                if phase == Phase::Published {
+                    assert!(saved.captured.is_none());
+                    assert_eq!(
+                        observed.unwrap().captured.map(|document| document.bytes),
+                        present.then(|| b"history".to_vec())
+                    );
+                } else {
+                    assert!(observed.is_none());
+                }
+                assert_eq!(fs::read(path)?, before);
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 
     fn record(root: &Path) -> (PathBuf, Record) {
@@ -565,6 +711,7 @@ mod tests {
             }
             assert!(retire_atomic_document(&source, &auth, true).is_err());
             assert_eq!(fs::read(record_path).unwrap(), before);
+            assert!(observe_retired_atomic_document(&source, &auth).is_err());
             assert!(source.is_dir());
         }
     }
@@ -582,6 +729,7 @@ mod tests {
         fs::remove_file(&source).unwrap();
         assert!(retire_atomic_document(&source, &auth, true).is_err());
         assert!(!source.exists());
+        assert!(observe_retired_atomic_document(&source, &auth).is_err());
     }
 
     #[test]
@@ -593,9 +741,11 @@ mod tests {
         let mut changed = auth.clone();
         changed.limit += 1;
         assert!(retire_atomic_document(&source, &changed, true).is_err());
+        assert!(observe_retired_atomic_document(&source, &changed).is_err());
         let unknown = source.join("unknown");
         fs::write(&unknown, b"keep").unwrap();
         assert!(retire_atomic_document(&source, &auth, true).is_err());
+        assert!(observe_retired_atomic_document(&source, &auth).is_err());
         assert_eq!(fs::read(unknown).unwrap(), b"keep");
     }
 
@@ -617,6 +767,7 @@ mod tests {
             let altered = serde_json::to_vec(&value).unwrap();
             fs::write(&record_path, &altered).unwrap();
             assert!(retire_atomic_document(&source, &auth, true).is_err());
+            assert!(observe_retired_atomic_document(&source, &auth).is_err());
             assert_eq!(fs::read(record_path).unwrap(), altered);
             assert!(source.is_dir());
         }
@@ -627,6 +778,7 @@ mod tests {
         fs::rename(&source, root.path().join("retained-fence")).unwrap();
         fs::create_dir(&source).unwrap();
         assert!(retire_atomic_document(&source, &auth, true).is_err());
+        assert!(observe_retired_atomic_document(&source, &auth).is_err());
         assert!(source.is_dir());
         assert!(root.path().join("retained-fence").is_dir());
     }

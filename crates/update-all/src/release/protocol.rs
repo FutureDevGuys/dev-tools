@@ -148,6 +148,19 @@ fn load(product: Product, paths: &Paths) -> Result<AcceptedAuthority> {
     AcceptedAuthority::validate(serde_json::from_slice(&document.bytes)?, product)
 }
 
+fn migration_history(paths: &Paths) -> Result<ReleaseState> {
+    match dev_tools_installation::observe_retired_atomic_document(
+        &paths.state,
+        &state_document_authority(paths)?,
+    )? {
+        Some(retired) => match retired.captured {
+            Some(document) => parse_json(&document.bytes, "captured release state"),
+            None => Ok(ReleaseState::default()),
+        },
+        None => load_state(paths),
+    }
+}
+
 /// Explicit local initialization/resumption only. The outer release lease is
 /// acquired before the installation lock, then the retirement lease. Missing
 /// proofs or an interrupted publication leave the upgrade journal in place;
@@ -289,6 +302,21 @@ mod tests {
         assert!(initialize(Product::UpdateAll, &paths, &[metadata()])?.0);
         assert!(versioned_v2::observe(&layout, ARTIFACT_LIMIT)?.is_none());
         assert!(!journal_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_history_is_readable_without_resuming_retirement() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(directory.path());
+        accepted_state(&paths)?;
+        assert!(initialize(Product::UpdateAll, &paths, &[]).is_err());
+        let journal_path = paths.product_root.join("installation-transition-v1.json");
+        let journal = fs::read(&journal_path)?;
+        let history = migration_history(&paths)?;
+        assert_eq!(history.accepted_version.as_deref(), Some("0.1.6"));
+        assert_eq!(fs::read(&journal_path)?, journal);
+        assert!(!paths.product_root.join(STATE_NAME).exists());
         Ok(())
     }
 

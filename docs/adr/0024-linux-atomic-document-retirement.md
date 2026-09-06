@@ -26,6 +26,8 @@ This cooperating-owner protocol excludes atomic replacement of this exact path, 
 
 Existing APIs remain unchanged. The additive interface remains in unpublished installation 0.2.1; frozen packages and released binaries retain their exact bytes. Linux acceptance does not establish macOS or Windows/WSL support. Failed product authentication/import leaves a fenced, recoverable cutover, never permission to reset history or restore old writers.
 
+[ADR 0027](0027-read-only-cutover-observations.md) adds separate nonmutating observation of recognized captured history. That reader does not invoke retirement, acknowledge durability or complete an interrupted record.
+
 ## Verification and remaining acceptance
 
 The public regression first demonstrated that reading history alone permits an already-prepared stale rename to overwrite the source. It now asserts preserved bytes, rejected rename, the fence and unchanged retry. Tests cover absent history, last-writer capture, the absent-path race, interruption before/after exchange, non-unwinding native process exits, lease exclusion, missing/changed archives, lost pre-exchange history, source links/modes/bounds, strict record binding, replaced fences and unknown inventory preservation. Existing installation suites remain required.

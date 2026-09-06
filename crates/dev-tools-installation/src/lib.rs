@@ -12,7 +12,9 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
 mod document_retirement;
 #[cfg(target_os = "linux")]
-pub use document_retirement::retire_atomic_document;
+pub use document_retirement::{
+    observe_retired_atomic_document, retire_atomic_document, RetiredAtomicDocument,
+};
 
 #[cfg(target_os = "linux")]
 mod directory_publication;

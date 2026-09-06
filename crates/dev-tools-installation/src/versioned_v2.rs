@@ -131,6 +131,54 @@ pub fn observe(layout: &VersionedLayout, artifact_limit: u64) -> Result<Option<V
     Ok(receipt)
 }
 
+/// Read only bounded v2 receipt metadata, including during a pending transition.
+/// This validates the outer schema, exact layout and inner receipt structure,
+/// but does not inspect journals, links or artifact bytes, acquire a lock, repair,
+/// authenticate a release, or authorize mutation. Use `observe` for complete
+/// installation custody and the explicit mutation APIs for recovery/activation.
+/// `None` is an initialized empty receipt; a missing receipt is an error.
+pub fn read_receipt_metadata(layout: &VersionedLayout) -> Result<Option<VersionedReceipt>> {
+    validate_layout(layout)?;
+    read_receipt(layout)
+}
+
+/// A recognized v2 journal's required explicit recovery boundary. Classification
+/// alone establishes neither receipt/artifact custody nor permission to mutate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingRecovery {
+    ProtocolUpgrade,
+    Activation,
+}
+
+/// Classify a bounded v2 journal without creating, locking or recovering.
+/// Unknown, malformed, foreign-layout and legacy journals are errors, not an
+/// empty journal or a reason to guess a recovery operation. The selected mutation
+/// API must independently revalidate the journal and all required custody.
+pub fn pending_recovery(layout: &VersionedLayout) -> Result<Option<PendingRecovery>> {
+    validate_layout(layout)?;
+    let Some(document) = read_atomic_document(&layout.journal_path(), &receipt_authority(layout))?
+    else {
+        return Ok(None);
+    };
+    if let Ok(upgrade) = serde_json::from_slice::<UpgradeJournal>(&document.bytes) {
+        if upgrade.schema != UPGRADE_SCHEMA || upgrade.layout != *layout {
+            bail!("installation protocol upgrade does not match its layout");
+        }
+        validate_optional(layout, upgrade.prior.as_ref())?;
+        return Ok(Some(PendingRecovery::ProtocolUpgrade));
+    }
+    let transition: TransitionJournal = serde_json::from_slice(&document.bytes)
+        .context("installation journal is not a recognized v2 transition")?;
+    if transition.schema != TRANSITION_SCHEMA || transition.layout != *layout {
+        bail!("installation transition does not match its layout");
+    }
+    validate_transition_journal(layout, &transition.transition)?;
+    if transition.transition.legacy.is_some() {
+        bail!("v2 transition cannot contain legacy adoption");
+    }
+    Ok(Some(PendingRecovery::Activation))
+}
+
 /// Apply only if the initialized receipt equals the caller's observation.
 /// Pending journals, link drift and receipt changes fail before candidate
 /// publication. Product authentication and candidate health remain caller-owned.

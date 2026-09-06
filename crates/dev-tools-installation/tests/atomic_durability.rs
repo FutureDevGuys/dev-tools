@@ -1,7 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::{bail, Context, Result};
-use dev_tools_installation::{read_atomic_document, write_atomic_document, DocumentAuthority};
+use dev_tools_installation::{
+    observe_retired_atomic_document, read_atomic_document, retire_atomic_document, versioned_v2,
+    write_atomic_document, DocumentAuthority, VersionedLayout,
+};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -11,6 +14,63 @@ use std::time::{Duration, Instant};
 
 const FIXTURE_ROOT: &str = "DEV_TOOLS_ATOMIC_DURABILITY_FIXTURE";
 const FIXTURE_PHASE: &str = "DEV_TOOLS_ATOMIC_DURABILITY_PHASE";
+
+#[test]
+#[ignore = "requires Linux strace acceptance"]
+fn cutover_observation_has_no_write_sync_or_lock_syscalls() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let authority = DocumentAuthority {
+        owner_uid: root.path().metadata()?.uid(),
+        mode: 0o700,
+        limit: 64,
+    };
+    let path = root.path().join("first/second/document.json");
+    write_atomic_document(&path, b"document", &authority, None)?;
+    retire_atomic_document(&path, &authority, false)?;
+    versioned_v2::initialize(&observation_layout(root.path())?, 1024, |_| Ok(()))?;
+    let trace = trace_fixture(root.path(), "retired-read")?;
+    for forbidden in [
+        "fsync(",
+        "fdatasync(",
+        "flock(",
+        "fchmod(",
+        "chmod(",
+        "fchown(",
+        "mkdir(",
+        "mkdirat(",
+        "rename(",
+        "renameat(",
+        "renameat2(",
+        "link(",
+        "linkat(",
+        "unlink(",
+        "unlinkat(",
+        "symlink(",
+        "symlinkat(",
+        "truncate(",
+        "ftruncate(",
+        "O_CREAT",
+        "O_TRUNC",
+    ] {
+        assert!(
+            !trace.contains(forbidden),
+            "read-only cutover observation used {forbidden}"
+        );
+    }
+    Ok(())
+}
+
+fn observation_layout(root: &Path) -> Result<VersionedLayout> {
+    Ok(VersionedLayout {
+        product: "fixture".into(),
+        data_root: root.join("installation"),
+        bin_dir: root.join("bin"),
+        artifact_name: "fixture".into(),
+        owner_uid: root.metadata()?.uid(),
+        directory_mode: 0o700,
+        bin_directory_mode: None,
+    })
+}
 
 // Explicit Linux acceptance: the trace observes the public implementation,
 // rather than a test hook that could omit the production durability boundary.
@@ -138,6 +198,16 @@ fn atomic_document_durability_fixture() -> Result<()> {
             assert!(write_atomic_document(&path, b"document", &authority, None).is_err());
         }
         "read" => {}
+        "retired-read" => {
+            let captured = observe_retired_atomic_document(&path, &authority)?
+                .context("retirement is absent")?
+                .captured
+                .context("captured document is absent")?;
+            assert_eq!(captured.bytes, b"document");
+            assert!(versioned_v2::read_receipt_metadata(&observation_layout(&root)?)?.is_none());
+            assert!(versioned_v2::pending_recovery(&observation_layout(&root)?)?.is_none());
+            return Ok(());
+        }
         _ => bail!("unsupported public durability fixture phase"),
     }
     let document = read_atomic_document(&path, &authority)?.context("document is absent")?;
@@ -166,7 +236,7 @@ fn trace_fixture_with_fault(
             "-s",
             "4096",
             "-e",
-            "trace=fsync,fchmod,fchown,mkdirat,rename,renameat,renameat2,link,linkat,unlink",
+            "trace=fsync,fdatasync,flock,fchmod,chmod,fchown,mkdir,mkdirat,rename,renameat,renameat2,link,linkat,unlink,unlinkat,symlink,symlinkat,truncate,ftruncate,open,openat",
             "-o",
         ])
         .arg(&trace);
