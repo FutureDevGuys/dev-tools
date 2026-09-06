@@ -26,6 +26,7 @@ Read the applicable records before changing a public product contract or cross-p
 | [0015](0015-dev-cache-read-only-root-observation.md) | Dev Cache read-only root observation | proposed | pending |
 | [0016](0016-artifact-update-common-doctor-result.md) | Artifact Update common doctor result | proposed | pending |
 | [0017](0017-binding-target-specific-resolution.md) | Binding target-specific resolution | proposed | pending |
+| [0018](0018-journal-owned-initial-directory-publication.md) | Journal-owned initial-directory publication | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

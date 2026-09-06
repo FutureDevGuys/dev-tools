@@ -66,7 +66,7 @@ impl Store {
             .map_err(|_| ERROR)?;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                area.initialize().map_err(|_| ERROR)?
+                area.initialize_recoverable().map_err(|_| ERROR)?
             }
             Err(_) => return Err(ERROR.into()),
             Ok(_) => {}

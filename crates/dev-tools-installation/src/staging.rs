@@ -79,6 +79,22 @@ impl StagingArea {
         publish_new_document_directory(&self.path, MARKER, &bytes, &self.authority(), 0o700)
     }
 
+    /// Explicit first use with journal-owned initial-directory recovery.
+    /// Requires the parent custody of
+    /// [`crate::publish_new_document_directory_recoverable`]. The older
+    /// initializer and all existing reservation bytes remain unchanged.
+    pub fn initialize_recoverable(&self) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(&self.reservation()).context("encode staging reservation")?;
+        crate::publish_new_document_directory_recoverable(
+            &self.path,
+            MARKER,
+            &bytes,
+            &self.authority(),
+            0o700,
+        )
+    }
+
     /// Nonblocking acquisition, followed by cleanup of a reserved abandoned
     /// payload and creation of an empty private payload. Busy returns `None`.
     /// Neither successful acquisition nor the reservation authenticates bytes.

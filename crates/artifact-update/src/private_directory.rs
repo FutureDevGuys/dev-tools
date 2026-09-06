@@ -47,7 +47,7 @@ impl PrivateDirectory {
         if self.inspect()? {
             return Err(());
         }
-        dev_tools_installation::publish_new_document_directory(
+        dev_tools_installation::publish_new_document_directory_recoverable(
             &self.path, name, bytes, authority, 0o700,
         )
         .map_err(|_| ())?;
@@ -96,7 +96,7 @@ impl PrivateDirectory {
         .map_err(|_| ())?;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                area.initialize().map_err(|_| ())?
+                area.initialize_recoverable().map_err(|_| ())?
             }
             Err(_) => return Err(()),
             Ok(_) => {}

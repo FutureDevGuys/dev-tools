@@ -10,7 +10,7 @@ description = "Standalone, configuration-driven artifact update client"
 [dependencies]
 clap = { version = "4", default-features = false, features = ["std", "help", "usage"] }
 dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
-dev-tools-installation = { version = "0.2.0", path = "../dev-tools-installation" }
+dev-tools-installation = { version = "0.2.1", path = "../dev-tools-installation" }
 sha2.workspace = true
 dev-tools-product = { version = "0.1.0", path = "../dev-tools-product" }
 dev-tools-update = { version = "0.1.0", path = "../dev-tools-update" }

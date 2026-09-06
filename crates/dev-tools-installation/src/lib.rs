@@ -10,7 +10,11 @@ use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(target_os = "linux")]
+mod directory_publication;
+#[cfg(target_os = "linux")]
 mod staging;
+#[cfg(target_os = "linux")]
+pub use directory_publication::publish_new_document_directory_recoverable;
 #[cfg(target_os = "linux")]
 pub use staging::{StagingArea, StagingLease};
 
@@ -50,6 +54,18 @@ impl InstallationLock {
         nonblocking: bool,
         before_lock: impl FnOnce(),
     ) -> Result<Option<Self>> {
+        Self::open_with_owner(path, nonblocking, None, before_lock)
+    }
+
+    // A protocol with independent parent custody may place a user-owned lock
+    // beneath a root-owned sticky directory. Ordinary lock callers retain the
+    // parent-owner rule; this does not admit that directory for other operations.
+    fn open_with_owner(
+        path: &Path,
+        nonblocking: bool,
+        owner: Option<u32>,
+        before_lock: impl FnOnce(),
+    ) -> Result<Option<Self>> {
         let parent = path.parent().context("installation lock has no parent")?;
         ensure_directory_chain(parent)?;
         let mut options = OpenOptions::new();
@@ -73,12 +89,14 @@ impl InstallationLock {
                 format!("inspect installation lock parent {}", parent.display())
             })?;
             if metadata.nlink() != 1
-                || metadata.uid() != parent_metadata.uid()
+                || metadata.uid() != owner.unwrap_or_else(|| parent_metadata.uid())
                 || metadata.mode() & 0o077 != 0
             {
                 bail!("installation lock has unsafe filesystem authority");
             }
         }
+        #[cfg(not(unix))]
+        let _ = owner;
         before_lock();
         if nonblocking {
             match file.try_lock_exclusive() {

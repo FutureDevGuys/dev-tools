@@ -47,7 +47,7 @@ fn staging_area(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Deliberate reservation of a product-owned target slot, never
             // adoption of an existing empty directory or retry after collision.
-            area.initialize()
+            area.initialize_recoverable()
                 .map_err(|_| ("staging-initialization-failed", 1))?;
         }
         Err(_) => return Err(("staging-unavailable", 4)),
@@ -481,6 +481,7 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(root)
             .unwrap()
             .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
             .collect();
         assert_eq!(entries.len(), 1);
         let reservation = &entries[0];

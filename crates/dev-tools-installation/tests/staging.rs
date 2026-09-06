@@ -6,6 +6,31 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 
 #[test]
+fn recoverable_initialization_preserves_reservation_format_and_live_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("stage");
+    let area =
+        StagingArea::new(root.clone(), temp.path().metadata().unwrap().uid(), [8; 32]).unwrap();
+    area.initialize_recoverable().unwrap();
+    let marker = fs::read(root.join("staging-reservation-v1.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+    assert_eq!(value["schema"], "dev-tools-staging-reservation-v1");
+    assert!(
+        area.initialize_recoverable().is_err(),
+        "never adopt a published reservation"
+    );
+    let mut live = area.try_acquire().unwrap().unwrap();
+    live.file_mut().write_all(b"owned").unwrap();
+    assert!(area.try_acquire().unwrap().is_none());
+    live.cleanup().unwrap();
+    assert_eq!(
+        fs::read(root.join("staging-reservation-v1.json")).unwrap(),
+        marker
+    );
+    assert!(!root.join("payload").exists());
+}
+
+#[test]
 fn reserved_document_publication_rejects_unexpected_targets_and_bounds() {
     use dev_tools_installation::ArtifactIdentity;
     use std::os::unix::fs::{symlink, PermissionsExt};
