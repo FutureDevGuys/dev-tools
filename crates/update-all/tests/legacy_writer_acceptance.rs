@@ -1,11 +1,14 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 
 use dev_tools_command::run_prepared_bounded_command_with_cancellation;
-use dev_tools_installation::InstallationLock;
+use dev_tools_installation::{
+    apply_versioned_installation, versioned_v2, ArtifactIdentity, InstallationLock,
+    VersionedInstallRequest, VersionedLayout,
+};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +33,109 @@ fn legacy_checker_overwrites_a_successor_document_despite_the_installation_lock(
 #[ignore = "requires explicitly selected signed 0.1.8 artifact, strace and public GitHub HTTPS"]
 fn legacy_checker_cannot_replace_a_retired_state_directory() {
     exercise_legacy_writer(true);
+}
+
+#[test]
+#[ignore = "requires explicitly selected signed 0.1.8 artifact; local-only"]
+fn legacy_installer_is_excluded_by_pending_and_committed_protocol_upgrade() {
+    let root = tempfile::tempdir().unwrap();
+    let staged = staged_legacy_binary(root.path());
+    let product = root.path().join("state/dev-tools/products/update-all");
+    let layout = VersionedLayout {
+        product: "update-all".into(),
+        data_root: product.clone(),
+        bin_dir: root.path().join(".local/bin"),
+        artifact_name: "update-all".into(),
+        owner_uid: fs::metadata(root.path()).unwrap().uid(),
+        directory_mode: 0o700,
+        bin_directory_mode: Some(0o755),
+    };
+    let old = VersionedInstallRequest {
+        layout: layout.clone(),
+        version: "0.1.8".into(),
+        source: staged.clone(),
+        identity: ArtifactIdentity {
+            length: LEGACY_LENGTH,
+            sha256: LEGACY_SHA256.into(),
+        },
+        aliases: vec!["update-all".into()],
+    };
+    apply_versioned_installation(&old, |_| Ok(())).unwrap();
+    // The synthetic current candidate gives the frozen engine a valid local
+    // rollback control. Only its health text is needed; it is not release evidence.
+    let source = root.path().join("synthetic-current");
+    fs::write(&source, b"#!/bin/sh\nprintf '%s\\n' 'update-all 0.1.9'\n").unwrap();
+    let current = VersionedInstallRequest {
+        layout: layout.clone(),
+        version: "0.1.9".into(),
+        identity: ArtifactIdentity::from_file(&source, 1024).unwrap(),
+        source,
+        aliases: vec!["update-all".into()],
+    };
+    apply_versioned_installation(&current, |_| Ok(())).unwrap();
+    let invoke = || {
+        let mut command = Command::new(&staged);
+        command
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("PATH", "/nonexistent")
+            .current_dir(root.path())
+            .args(["self", "rollback", "--json"]);
+        run_prepared_bounded_command_with_cancellation(
+            &mut command,
+            Duration::from_secs(15),
+            64 * 1024,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    };
+    let control = invoke();
+    assert!(
+        control.status.success(),
+        "rollback control failed: {control:?}"
+    );
+    assert_eq!(
+        fs::canonicalize(layout.bin_dir.join("update-all")).unwrap(),
+        product.join("versions/0.1.8/update-all")
+    );
+    let active = apply_versioned_installation(&current, |_| Ok(()))
+        .unwrap()
+        .receipt;
+    let state_before = fs::read(product.join("state.json")).unwrap();
+    assert!(versioned_v2::initialize(&layout, LEGACY_LENGTH, |_| {
+        anyhow::bail!("fixture product cutover interrupted")
+    })
+    .is_err());
+    for pending in [true, false] {
+        if !pending {
+            versioned_v2::initialize(&layout, LEGACY_LENGTH, |_| Ok(())).unwrap();
+        }
+        let receipt_before = fs::read(product.join("installation-receipt-v1.json")).unwrap();
+        let rejected = invoke();
+        assert!(
+            !rejected.status.success(),
+            "legacy rollback bypassed protocol fence"
+        );
+        let error_text = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            error_text.contains("unknown field") || error_text.contains("unsupported"),
+            "failure was not protocol rejection: {rejected:?}"
+        );
+        assert_eq!(fs::read(product.join("state.json")).unwrap(), state_before);
+        assert_eq!(
+            fs::read(product.join("installation-receipt-v1.json")).unwrap(),
+            receipt_before
+        );
+        assert_eq!(
+            fs::canonicalize(layout.bin_dir.join("update-all")).unwrap(),
+            product.join("versions/0.1.9/update-all")
+        );
+    }
+    assert_eq!(
+        versioned_v2::observe(&layout, LEGACY_LENGTH).unwrap(),
+        Some(active)
+    );
 }
 
 fn staged_legacy_binary(root: &Path) -> PathBuf {

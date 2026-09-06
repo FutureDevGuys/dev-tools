@@ -14,6 +14,8 @@ mod directory_publication;
 #[cfg(target_os = "linux")]
 mod staging;
 #[cfg(target_os = "linux")]
+pub mod versioned_v2;
+#[cfg(target_os = "linux")]
 pub use directory_publication::{
     publish_new_document_directory_recoverable, recover_new_document_directory_publication,
 };
@@ -817,21 +819,7 @@ pub fn observe_versioned_installation(
     if read_versioned_receipt_document(layout)?.is_none() {
         return Ok(None);
     }
-    let file = open_read_nofollow(&layout.lock_path())?;
-    let lock_metadata = file
-        .metadata()
-        .context("inspect existing installation lock")?;
-    if !lock_metadata.is_file()
-        || lock_metadata.nlink() != 1
-        || lock_metadata.uid() != layout.owner_uid
-        || lock_metadata.mode() & 0o777 != 0o600
-    {
-        bail!("existing installation lock has unsafe authority");
-    }
-    file.try_lock_exclusive()
-        .context("installation observation is busy")?;
-    let lock = InstallationLock { file };
-    verify_observation_lock(layout, &lock)?;
+    let lock = acquire_observation_lock(layout)?;
     inspect_owned_directory_read_only(&layout.data_root, layout)?;
     inspect_owned_directory_read_only(&layout.bin_dir, layout)?;
     require_path_absent(&layout.journal_path())
@@ -875,6 +863,26 @@ fn inspect_owned_directory_read_only(path: &Path, layout: &VersionedLayout) -> R
 #[cfg(target_os = "linux")]
 fn verify_observation_lock(layout: &VersionedLayout, lock: &InstallationLock) -> Result<()> {
     lock.verify_named_identity(&layout.lock_path())
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_observation_lock(layout: &VersionedLayout) -> Result<InstallationLock> {
+    let file = open_read_nofollow(&layout.lock_path())?;
+    let lock_metadata = file
+        .metadata()
+        .context("inspect existing installation lock")?;
+    if !lock_metadata.is_file()
+        || lock_metadata.nlink() != 1
+        || lock_metadata.uid() != layout.owner_uid
+        || lock_metadata.mode() & 0o777 != 0o600
+    {
+        bail!("existing installation lock has unsafe authority");
+    }
+    file.try_lock_exclusive()
+        .context("installation observation is busy")?;
+    let lock = InstallationLock { file };
+    verify_observation_lock(layout, &lock)?;
+    Ok(lock)
 }
 
 /// Recover a journaled installation after caller verification of its receipts.
@@ -1638,45 +1646,7 @@ fn commit_versioned_transition(
     write_transition_journal(layout, &journal)?;
 
     let result: Result<()> = (|| {
-        let prior_active = prior.map(|receipt| layout.version_artifact(&receipt.active_version));
-        let prior_previous = prior
-            .and_then(|receipt| receipt.previous_version.as_deref())
-            .map(|version| layout.version_artifact(version));
-        let next_active = layout.version_artifact(&next.active_version);
-        let next_previous = next
-            .previous_version
-            .as_deref()
-            .map(|version| layout.version_artifact(version));
-        replace_owned_symlink(
-            &layout.previous_pointer(),
-            next_previous.as_deref(),
-            prior_previous.as_deref(),
-        )?;
-        replace_owned_symlink(
-            &layout.active_pointer(),
-            Some(&next_active),
-            prior_active.as_deref(),
-        )?;
-        let prior_aliases = prior
-            .map(|receipt| receipt.aliases.iter().cloned().collect::<BTreeSet<_>>())
-            .unwrap_or_default();
-        for alias in &next.aliases {
-            replace_owned_symlink(
-                &layout.bin_dir.join(alias),
-                Some(&layout.active_pointer()),
-                prior_aliases
-                    .contains(alias)
-                    .then(|| layout.active_pointer())
-                    .as_deref(),
-            )?;
-        }
-        if let Some(prior) = prior {
-            for alias in &prior.aliases {
-                if !next.aliases.contains(alias) {
-                    remove_exact_symlink(&layout.bin_dir.join(alias), &layout.active_pointer())?;
-                }
-            }
-        }
+        publish_versioned_transition_links(layout, prior, next)?;
         write_versioned_receipt(layout, next)?;
         verify_versioned_receipt(layout, next)?;
         Ok(())
@@ -1687,6 +1657,55 @@ fn commit_versioned_transition(
         );
     }
     remove_transition_journal(layout)?;
+    Ok(())
+}
+
+// The enclosing protocol owns preflight, its durable journal and receipt commit.
+// This shared step changes only the preflighted receipt-owned pointers.
+fn publish_versioned_transition_links(
+    layout: &VersionedLayout,
+    prior: Option<&VersionedReceipt>,
+    next: &VersionedReceipt,
+) -> Result<()> {
+    let prior_active = prior.map(|receipt| layout.version_artifact(&receipt.active_version));
+    let prior_previous = prior
+        .and_then(|receipt| receipt.previous_version.as_deref())
+        .map(|version| layout.version_artifact(version));
+    let next_active = layout.version_artifact(&next.active_version);
+    let next_previous = next
+        .previous_version
+        .as_deref()
+        .map(|version| layout.version_artifact(version));
+    replace_owned_symlink(
+        &layout.previous_pointer(),
+        next_previous.as_deref(),
+        prior_previous.as_deref(),
+    )?;
+    replace_owned_symlink(
+        &layout.active_pointer(),
+        Some(&next_active),
+        prior_active.as_deref(),
+    )?;
+    let prior_aliases = prior
+        .map(|receipt| receipt.aliases.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    for alias in &next.aliases {
+        replace_owned_symlink(
+            &layout.bin_dir.join(alias),
+            Some(&layout.active_pointer()),
+            prior_aliases
+                .contains(alias)
+                .then(|| layout.active_pointer())
+                .as_deref(),
+        )?;
+    }
+    if let Some(prior) = prior {
+        for alias in &prior.aliases {
+            if !next.aliases.contains(alias) {
+                remove_exact_symlink(&layout.bin_dir.join(alias), &layout.active_pointer())?;
+            }
+        }
+    }
     Ok(())
 }
 
