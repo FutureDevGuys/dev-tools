@@ -168,6 +168,158 @@ fn migration_history(paths: &Paths) -> Result<ReleaseState> {
     }
 }
 
+/// Read the current acceptance authority without advancing or initializing it.
+/// Captured legacy history is only admissible before completed v2 cutover.
+pub(super) fn observation_ledger(paths: &Paths) -> Result<ManifestLedger> {
+    let layout = shared_installation_layout(Product::UpdateAll, paths)?;
+    if versioned_v2::read_receipt_metadata(&layout).is_ok() {
+        return Ok(load(Product::UpdateAll, paths)?.ledger);
+    }
+    let state = migration_history(paths)?;
+    legacy_ledger(&state)
+}
+
+fn legacy_ledger(state: &ReleaseState) -> Result<ManifestLedger> {
+    ManifestLedger::import_release_state(
+        &migration_authority(Product::UpdateAll),
+        SharedReleaseState {
+            accepted_root_generation: state.accepted_root_generation,
+            accepted_root_sha256: state.accepted_root_sha256.clone(),
+            accepted_generation: state.accepted_generation,
+            accepted_version: state.accepted_version.clone(),
+            accepted_manifest_sha256: state.accepted_manifest_sha256.clone(),
+            accepted_binary_sha256: state.accepted_binary_sha256.clone(),
+        },
+    )
+    .map_err(Into::into)
+}
+
+/// Metadata-only acceptance, under the caller's outer release lease. This does
+/// not initialize installation v2, retire legacy state or recover a journal.
+pub(super) struct MetadataAcceptance<'a> {
+    destination: PathBuf,
+    authority: DocumentAuthority,
+    expected: Option<ArtifactIdentity>,
+    state: MetadataState,
+    _lease: &'a dev_tools_installation::InstallationLock,
+}
+
+enum MetadataState {
+    Legacy(ReleaseState),
+    Initialized(AcceptedAuthority, Option<VersionedReceipt>),
+}
+
+impl<'a> MetadataAcceptance<'a> {
+    pub(super) fn begin(
+        paths: &'a Paths,
+        lease: &'a dev_tools_installation::InstallationLock,
+    ) -> Result<Self> {
+        let layout = shared_installation_layout(Product::UpdateAll, paths)?;
+        if path_entry_present(
+            &layout.data_root.join("installation-transition-v1.json"),
+            "inspect pending installation",
+        )? {
+            bail!("metadata acceptance cannot recover pending installation");
+        }
+        let initialized = versioned_v2::read_receipt_metadata(&layout).is_ok();
+        let (destination, authority) = if initialized {
+            (
+                paths.product_root.join(STATE_NAME),
+                document_authority(paths)?,
+            )
+        } else {
+            (paths.state.clone(), state_document_authority(paths)?)
+        };
+        let original = read_atomic_document(&destination, &authority)?;
+        let state = if initialized {
+            let document = original
+                .as_ref()
+                .context("initialized release authority is missing")?;
+            let accepted = AcceptedAuthority::validate(
+                serde_json::from_slice(&document.bytes)?,
+                Product::UpdateAll,
+            )?;
+            let receipt = versioned_v2::observe(&layout, ARTIFACT_LIMIT)?;
+            accepted.verify_receipt(receipt.as_ref())?;
+            MetadataState::Initialized(accepted, receipt)
+        } else {
+            let state = match &original {
+                Some(document) => parse_json(&document.bytes, "release state")?,
+                None => ReleaseState::default(),
+            };
+            // Validate complete legacy history before network and mutation.
+            legacy_ledger(&state)?;
+            dev_tools_installation::observe_versioned_installation(&layout, ARTIFACT_LIMIT)?;
+            MetadataState::Legacy(state)
+        };
+        Ok(Self {
+            destination,
+            authority,
+            expected: original.map(|document| document.identity),
+            state,
+            _lease: lease,
+        })
+    }
+
+    pub(super) fn accept(
+        self,
+        metadata: &ReleaseMetadata,
+        online: &ReleaseAuthority,
+    ) -> Result<SharedVerifiedRelease> {
+        let (verified, bytes) = match self.state {
+            MetadataState::Legacy(mut state) => {
+                let verified = verify_release_metadata(metadata, online)?;
+                let legacy = verify_downloaded_manifest(Product::UpdateAll, metadata)?;
+                accept_manifest_metadata(&mut state, &legacy)?;
+                (verified, serde_json::to_vec_pretty(&state)?)
+            }
+            MetadataState::Initialized(mut accepted, receipt) => {
+                let (verified, _) = accepted.ledger.accept_release_metadata(online, metadata)?;
+                let mut proofs = vec![Proof::from_metadata(metadata)?];
+                // Keep only receipt-owned releases plus the new exact accepted
+                // proof. Rebind retained manifests to the newly accepted root,
+                // enforcing its revocations before any publication.
+                for (proof, release) in accepted.document.proofs.iter().zip(&accepted.releases) {
+                    let retained = receipt.as_ref().is_some_and(|receipt| {
+                        release.version.to_string() == receipt.active_version
+                            || receipt.previous_version.as_deref()
+                                == Some(release.version.to_string().as_str())
+                    });
+                    if retained
+                        && !proofs
+                            .iter()
+                            .any(|existing| existing.manifest == proof.manifest)
+                    {
+                        proofs.push(Proof {
+                            root: String::from_utf8(metadata.root.clone())?,
+                            manifest: proof.manifest.clone(),
+                        });
+                    }
+                }
+                accepted.document.ledger = String::from_utf8(accepted.ledger.to_bytes()?)?;
+                accepted.document.proofs = proofs;
+                let next = AcceptedAuthority::validate(accepted.document, Product::UpdateAll)?;
+                next.verify_receipt(receipt.as_ref())?;
+                (verified, serde_json::to_vec(&next.document)?)
+            }
+        };
+        if !verified.version.pre.is_empty() {
+            bail!("metadata acceptance requires a stable release");
+        }
+        let current = read_atomic_document(&self.destination, &self.authority)?;
+        if current.as_ref().map(|document| &document.identity) != self.expected.as_ref() {
+            bail!("release authority changed during metadata retrieval");
+        }
+        write_atomic_document(
+            &self.destination,
+            &bytes,
+            &self.authority,
+            self.expected.as_ref(),
+        )?;
+        Ok(verified)
+    }
+}
+
 /// Explicit local initialization/resumption only. The outer release lease is
 /// acquired before the installation lock, then the retirement lease. Missing
 /// proofs or an interrupted publication leave the upgrade journal in place;

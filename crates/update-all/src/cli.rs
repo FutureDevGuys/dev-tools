@@ -1513,18 +1513,27 @@ enum CommonUpdateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Refresh authenticated release metadata without downloading or installing artifacts.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl CommonUpdateCli {
     fn run(self) -> Result<()> {
-        let CommonUpdateCommand::Status { json } = self.command;
-        let result = crate::release::common_status()?;
+        let (json, operation, result) = match self.command {
+            CommonUpdateCommand::Status { json } => {
+                (json, "status", crate::release::common_status()?)
+            }
+            CommonUpdateCommand::Check { json } => (json, "check", crate::release::common_check()?),
+        };
         if json {
             crate::ua_outln!("{}", serde_json::to_string(&result)?);
         } else {
-            crate::ua_outln!("update-all update status: {:?}", result.outcome);
+            crate::ua_outln!("update-all update {operation}: {:?}", result.outcome);
             if let Some(kind) = result.error_kind {
-                crate::ua_errln!("update status failed: {kind:?}");
+                crate::ua_errln!("update {operation} failed: {kind:?}");
             }
         }
         if result.exit_code != 0 {

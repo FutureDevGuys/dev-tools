@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(test)]
 use base64::Engine as _;
+pub(crate) use common::check as common_check;
 pub(crate) use common::status as common_status;
 #[cfg(unix)]
 use dev_tools_installation::{

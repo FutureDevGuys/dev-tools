@@ -40,6 +40,10 @@ COMP_WORDS=(update-all update status --j)
 COMP_CWORD=3
 "$function_name" update-all --j status
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(update-all update check --j)
+COMP_CWORD=3
+"$function_name" update-all --j check
+printf '%s\n' "${COMPREPLY[@]}"
 "#;
     Command::new("/usr/bin/bash")
         .env_clear()
@@ -51,5 +55,5 @@ printf '%s\n' "${COMPREPLY[@]}"
         .assert()
         .success()
         .stderr("")
-        .stdout("--json\n--json\n");
+        .stdout("--json\n--json\n--json\n");
 }

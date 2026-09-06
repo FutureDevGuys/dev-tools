@@ -8,6 +8,8 @@ owner: dev-tools
 status: proposed
 verification: pending
 
+Follow-up: [ADR 0023](0023-common-authenticated-metadata-refresh.md) extends this adapter with authenticated candidate caching and explicit metadata-only check; the original local-observation invariants remain in force.
+
 ## Context
 
 The legacy self-status document copies observational version and check-time fields from state.json. It cannot represent an interrupted product cutover or establish the common authenticated-cache freshness contract. The common operation loop needs a product-owned read-only entrypoint before mutation routing changes.

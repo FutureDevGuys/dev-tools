@@ -4,6 +4,24 @@ use assert_cmd::Command;
 use serde_json::Value;
 
 #[test]
+fn common_check_missing_home_emits_one_json_configuration_error() {
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("update-all"))
+        .env_clear()
+        .args(["update", "check", "--json"])
+        .timeout(std::time::Duration::from_secs(5))
+        .assert()
+        .code(2)
+        .stderr("")
+        .get_output()
+        .stdout
+        .clone();
+    let result: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["schema"], "dev-tools-operation-result-v2");
+    assert_eq!(result["operation"], "update_check");
+    assert_eq!(result["changed"], false);
+}
+
+#[test]
 fn common_status_observes_absence_without_initializing() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(assert_cmd::cargo::cargo_bin!("update-all"))
