@@ -20,6 +20,8 @@ Products supply their release authority, target identity, product-specific layou
 
 `update-all` migrates behind behavior-parity tests. Its CLI, stable-channel selection, update-only absence behavior, external-manager collision behavior, health checks, retained rollback, and reporting remain product-owned and unchanged.
 
+The shared-v2 online cutover and exact Skills Sync pre-cutover exception are defined in workspace ADR 0003. `online_reader_accepts_published_source_bound_update_all_metadata`, `online_reader_accepts_published_product_cutover_and_bounded_legacy_metadata`, and `online_legacy_window_cannot_authorize_another_product_version_or_generation` exercise the product reader boundary in addition to the shared verifier tests. The signed fixtures are public release metadata; they do not contain a signing credential or require network access.
+
 ## Invariants
 
 - A caller selects an accepted manifest schema and whether source-commit binding is mandatory; metadata cannot weaken that authority, and shared v2 always requires source binding.

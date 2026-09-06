@@ -24,6 +24,8 @@ Binary releases use one canonical `dev-tools-product-v2` manifest per product ve
 
 ## Invariants
 
+Update All's online product reader requires shared `dev-tools-product-v2` for Update All, Dev Cache and Sync Configs and retains the verified source commit in its product metadata projection. Skills Sync's exact pre-cutover `0.1.4` generation `5` may still be read online in v1 until its successor ships; no other legacy Skills Sync version or generation is admitted. Shared v2 always requires source binding, including for Skills Sync. Normal anti-rollback and same-version equivocation checks remain mandatory, so this exception cannot reopen an older release after a successor is accepted. Remove the online exception when Skills Sync's source-bound successor is available; receipt-owned rollback remains independent.
+
 The published signer-bootstrap release has one version-bound verification exception: exact Dev Auth `0.3.11` uses source-bound `dev-auth-product-v2` with one target. Authenticated verification and idempotent publication of that existing release remain available through its compatibility window, but construction always emits shared product v2. The exception does not apply to another product or version, including build-metadata variants. Dev Auth permits that exact release at bundle/online intake while preserving exact accepted predecessor bytes for offline use and rollback. All later releases require shared product v2. This reader compatibility does not relax source binding, reproducibility, native approval, anti-rollback, or equivocation protection, and it does not authorize reissuing an accepted version with new bytes.
 
 - Build, root, signing, publication, and privileged installation remain independently authorized.

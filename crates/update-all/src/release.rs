@@ -164,6 +164,8 @@ pub(crate) struct ProductManifest {
     pub generation: u64,
     pub version: String,
     pub engine_protocol: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
     pub artifacts: BTreeMap<String, Artifact>,
 }
 
@@ -628,27 +630,42 @@ fn fetch_verified_manifest(
         &paths.manifest_etag,
         METADATA_LIMIT,
     )?;
-    let verified = verify_release_metadata(
+    verify_downloaded_manifest(
+        product,
         &ReleaseMetadata {
             root: root_bytes,
             manifest: manifest_bytes,
         },
+    )
+}
+
+fn verify_downloaded_manifest(
+    product: Product,
+    metadata: &ReleaseMetadata,
+) -> Result<VerifiedManifest> {
+    let verified = verify_release_metadata(
+        metadata,
         &ReleaseAuthority {
             trusted_root_key: env!("UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY").into(),
             product: product.id().into(),
-            accepted_manifest_schemas: vec!["dev-tools-product-v1".into()],
+            accepted_manifest_schemas: if product == Product::SkillsSync {
+                vec!["dev-tools-product-v2".into(), "dev-tools-product-v1".into()]
+            } else {
+                vec!["dev-tools-product-v2".into()]
+            },
             target: target_id(),
             artifact_url: ArtifactUrlPolicy::GitHubRelease {
                 owner: "FutureDevGuys".into(),
                 repository: "dev-tools".into(),
             },
-            require_source_commit: false,
+            require_source_commit: product != Product::SkillsSync,
             engine_protocol: ENGINE_PROTOCOL,
         },
     )
     .map_err(|error| {
         IntegrityFailure(format!("authenticated release metadata failed: {error:#}"))
     })?;
+    validate_online_migration_window(product, &verified)?;
     let artifact = Artifact {
         url: verified.artifact_url,
         length: verified.artifact_length,
@@ -660,6 +677,7 @@ fn fetch_verified_manifest(
         generation: verified.manifest_generation,
         version: verified.version.to_string(),
         engine_protocol: ENGINE_PROTOCOL,
+        source_commit: verified.source_commit,
         artifacts: BTreeMap::from([(target_id(), artifact.clone())]),
     };
     Ok(VerifiedManifest {
@@ -669,6 +687,20 @@ fn fetch_verified_manifest(
         artifact,
         manifest_sha256: verified.manifest_sha256,
     })
+}
+
+fn validate_online_migration_window(
+    product: Product,
+    verified: &SharedVerifiedRelease,
+) -> Result<()> {
+    if verified.manifest_schema == "dev-tools-product-v1"
+        && (product != Product::SkillsSync
+            || verified.version != Version::new(0, 1, 4)
+            || verified.manifest_generation != 5)
+    {
+        return integrity("legacy online manifest is outside its migration window");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -770,7 +802,7 @@ fn accept_manifest_metadata(state: &mut ReleaseState, verified: &VerifiedManifes
             product: verified.manifest.product.clone(),
             version: Version::parse(&verified.manifest.version)
                 .context("parse offered release version")?,
-            source_commit: None,
+            source_commit: verified.manifest.source_commit.clone(),
             target: target_id(),
             artifact_url: verified.artifact.url.clone(),
             artifact_length: verified.artifact.length,
@@ -2156,6 +2188,107 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn online_reader_accepts_published_source_bound_update_all_metadata() {
+        let metadata = ReleaseMetadata {
+            root: include_bytes!("../../../release-trust/dev-tools-root.json").to_vec(),
+            manifest: include_bytes!("../../../tests/fixtures/releases/update-all-0.1.6-v2.json")
+                .to_vec(),
+        };
+        let verified = verify_downloaded_manifest(Product::UpdateAll, &metadata).unwrap();
+        assert_eq!(verified.manifest.schema, "dev-tools-product-v2");
+        assert_eq!(verified.manifest.version, "0.1.6");
+        assert_eq!(
+            verified.manifest.source_commit.as_deref(),
+            Some("412390a6a954f1eecbcc928e7646d8c3654aded7")
+        );
+        assert_eq!(
+            verified.artifact.sha256,
+            "bad5f21e0ffde67cec0483eabc4fb2acac519f80233999a04b728d504e5cb777"
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn online_reader_accepts_published_product_cutover_and_bounded_legacy_metadata() {
+        for (product, manifest, schema, version) in [
+            (
+                Product::DevCache,
+                include_bytes!("../../../tests/fixtures/releases/dev-cache-0.1.7-v2.json")
+                    .as_slice(),
+                "dev-tools-product-v2",
+                "0.1.7",
+            ),
+            (
+                Product::SyncConfigs,
+                include_bytes!("../../../tests/fixtures/releases/sync-configs-0.2.0-v2.json")
+                    .as_slice(),
+                "dev-tools-product-v2",
+                "0.2.0",
+            ),
+            (
+                Product::SkillsSync,
+                include_bytes!("../../../tests/fixtures/releases/skills-sync-0.1.4-v1.json")
+                    .as_slice(),
+                "dev-tools-product-v1",
+                "0.1.4",
+            ),
+        ] {
+            let metadata = ReleaseMetadata {
+                root: include_bytes!("../../../release-trust/dev-tools-root.json").to_vec(),
+                manifest: manifest.to_vec(),
+            };
+            let verified = verify_downloaded_manifest(product, &metadata).unwrap();
+            assert_eq!(verified.manifest.schema, schema);
+            assert_eq!(verified.manifest.version, version);
+            assert_eq!(
+                verified.manifest.source_commit.is_some(),
+                product != Product::SkillsSync
+            );
+            for other in Product::ALL.into_iter().filter(|other| *other != product) {
+                assert!(verify_downloaded_manifest(other, &metadata).is_err());
+            }
+            let mut tampered = ReleaseMetadata {
+                root: metadata.root.clone(),
+                manifest: metadata.manifest.clone(),
+            };
+            let mut value: serde_json::Value = serde_json::from_slice(&tampered.manifest).unwrap();
+            value["signed"]["version"] = serde_json::json!("9.9.9");
+            tampered.manifest = serde_json::to_vec(&value).unwrap();
+            assert!(verify_downloaded_manifest(product, &tampered).is_err());
+        }
+    }
+
+    #[test]
+    fn online_legacy_window_cannot_authorize_another_product_version_or_generation() {
+        let mut verified = SharedVerifiedRelease {
+            root_generation: 1,
+            root_sha256: "00".repeat(32),
+            manifest_generation: 5,
+            manifest_sha256: "11".repeat(32),
+            manifest_schema: "dev-tools-product-v1".into(),
+            product: "skills-sync".into(),
+            version: Version::new(0, 1, 4),
+            source_commit: None,
+            target: "linux-x86_64".into(),
+            artifact_url: "https://github.com/example".into(),
+            artifact_length: 1,
+            artifact_sha256: "22".repeat(32),
+        };
+        assert!(validate_online_migration_window(Product::SkillsSync, &verified).is_ok());
+        for product in [Product::UpdateAll, Product::DevCache, Product::SyncConfigs] {
+            assert!(validate_online_migration_window(product, &verified).is_err());
+        }
+        verified.version = Version::new(0, 1, 5);
+        assert!(validate_online_migration_window(Product::SkillsSync, &verified).is_err());
+        verified.version = Version::parse("0.1.4+replacement").unwrap();
+        assert!(validate_online_migration_window(Product::SkillsSync, &verified).is_err());
+        verified.version = Version::new(0, 1, 4);
+        verified.manifest_generation = 6;
+        assert!(validate_online_migration_window(Product::SkillsSync, &verified).is_err());
+    }
+
+    #[test]
     fn authorized_manifest_signature_is_accepted() {
         let release = SigningKey::from_bytes(&[7_u8; 32]);
         let root = RootDocument {
@@ -2178,6 +2311,7 @@ mod tests {
             generation: 4,
             version: "1.2.3".into(),
             engine_protocol: ENGINE_PROTOCOL,
+            source_commit: None,
             artifacts: BTreeMap::new(),
         };
         verify_product_manifest(&envelope(manifest, "release-1", &release), &root).unwrap();
@@ -2231,6 +2365,7 @@ mod tests {
             generation: 4,
             version: "1.2.3".into(),
             engine_protocol: ENGINE_PROTOCOL,
+            source_commit: None,
             artifacts: BTreeMap::new(),
         };
         let err =
@@ -2249,6 +2384,7 @@ mod tests {
                 generation,
                 version: version.into(),
                 engine_protocol: ENGINE_PROTOCOL,
+                source_commit: None,
                 artifacts: BTreeMap::new(),
             },
             artifact: Artifact {
@@ -2326,6 +2462,7 @@ mod tests {
                 generation: 1,
                 version: version.into(),
                 engine_protocol: ENGINE_PROTOCOL,
+                source_commit: None,
                 artifacts: BTreeMap::new(),
             },
             artifact: Artifact {
@@ -2540,6 +2677,7 @@ mod tests {
                 generation: 2,
                 version: native_version.into(),
                 engine_protocol: ENGINE_PROTOCOL,
+                source_commit: None,
                 artifacts: BTreeMap::new(),
             },
             artifact: Artifact {
