@@ -19,7 +19,7 @@ Dev Tools is a product workspace, not a package manager and not a workstation co
 
 Verified release artifacts are the supported installation path. Every product uses its own nested release tag, such as `update-all/v1.2.3`. A one-time Update All seed establishes the embedded trust root; authenticated native HTTPS then resolves and installs current stable products without Git, GitHub CLI, curl, wget, authentication, or a source checkout. The seed is not desired-version state and never needs to be refreshed.
 
-After `update-all` 0.1.8 and native `sync-configs` 0.2.0 complete installation acceptance, a native Linux x86-64 host can download `update-all-0.1.8-linux-x86_64` from the [`update-all/v0.1.8` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.8), make it executable, and run:
+A native Linux x86-64 host can download `update-all-0.1.8-linux-x86_64` from the [`update-all/v0.1.8` release](https://github.com/FutureDevGuys/dev-tools/releases/tag/update-all%2Fv0.1.8), make it executable, and run:
 
 ```sh
 ./update-all-0.1.8-linux-x86_64 self install
@@ -34,7 +34,7 @@ After that, `update-all` checks its authenticated stable manifest automatically 
 
 | Platform | Status | Notes |
 |---|---|---|
-| Linux x86-64 | Cutover pending | The native implementation and release boundary are ready; support is claimed only after the signed generation is installed and passes installation, rollback, and fresh-shell runtime acceptance. |
+| Linux x86-64 | Installation accepted; broader acceptance pending | Signed native installation, repeat operation and offline rollback passed for Update All, Dev Cache and Sync Configs. Full product-standard and consumer runtime acceptance remain separate gates. |
 | Windows | Acceptance pending | Artifacts may be built, but runtime support is not claimed until native Windows acceptance passes. |
 | WSL | Acceptance pending | Runtime support is not claimed until the WSL acceptance harness passes. |
 | macOS | Unclaimed | Some updater definitions are portable, but product runtime acceptance is not complete. |
