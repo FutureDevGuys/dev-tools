@@ -138,6 +138,122 @@ fn legacy_installer_is_excluded_by_pending_and_committed_protocol_upgrade() {
     );
 }
 
+#[test]
+#[ignore = "requires explicitly selected signed 0.1.8 artifact and strace; local-only"]
+fn retained_legacy_ordinary_run_survives_pending_and_committed_cutover() {
+    let root = tempfile::tempdir().unwrap();
+    let staged = staged_legacy_binary(root.path());
+    let product = root.path().join("state/dev-tools/products/update-all");
+    let layout = VersionedLayout {
+        product: "update-all".into(),
+        data_root: product.clone(),
+        bin_dir: root.path().join(".local/bin"),
+        artifact_name: "update-all".into(),
+        owner_uid: fs::metadata(root.path()).unwrap().uid(),
+        directory_mode: 0o700,
+        bin_directory_mode: Some(0o755),
+    };
+    apply_versioned_installation(
+        &VersionedInstallRequest {
+            layout: layout.clone(),
+            version: "0.1.8".into(),
+            source: staged,
+            identity: ArtifactIdentity {
+                length: LEGACY_LENGTH,
+                sha256: LEGACY_SHA256.into(),
+            },
+            aliases: vec!["update-all".into()],
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    let config = root.path().join("config/update-all");
+    fs::create_dir_all(config.join("catalog.d/local")).unwrap();
+    // Omission deliberately retains the frozen product's default auto_update=true.
+    fs::write(config.join("config.toml"), "[ui]\nmode = \"plain\"\n").unwrap();
+    fs::write(
+        config.join("catalog.d/local/probe.toml"),
+        r#"
+[tasks."local/probe"]
+label = "Retained ordinary operation"
+os = ["linux"]
+detect_mode = "command_available"
+category = "maintenance"
+command = "/usr/bin/true"
+policy_key = "tool_update"
+"#,
+    )
+    .unwrap();
+    let authority = DocumentAuthority {
+        owner_uid: layout.owner_uid,
+        mode: 0o600,
+        limit: 64 * 1024,
+    };
+    let state = product.join("state.json");
+    dev_tools_installation::write_atomic_document(&state, b"{}", &authority, None).unwrap();
+    assert!(versioned_v2::initialize(&layout, LEGACY_LENGTH, |_| {
+        dev_tools_installation::retire_atomic_document(&state, &authority, false)?;
+        anyhow::bail!("fixture interruption after product-state retirement")
+    })
+    .is_err());
+    for pending in [true, false] {
+        if !pending {
+            versioned_v2::initialize(&layout, LEGACY_LENGTH, |_| Ok(())).unwrap();
+        }
+        let receipt = product.join("installation-receipt-v1.json");
+        let journal = product.join("installation-transition-v1.json");
+        let before = (fs::read(&receipt).unwrap(), fs::read(&journal).ok());
+        let trace = root.path().join("ordinary.trace");
+        let mut command = Command::new("/usr/bin/strace");
+        command
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("PATH", "/nonexistent")
+            .current_dir(root.path())
+            .args(["--kill-on-exit", "-f", "--trace=network,execve", "-o"])
+            .arg(&trace)
+            .arg(layout.bin_dir.join("update-all"))
+            .args(["--plain", "--only", "local/probe", "--completions", "off"]);
+        let output = run_prepared_bounded_command_with_cancellation(
+            &mut command,
+            Duration::from_secs(30),
+            64 * 1024,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "ordinary operation failed: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("warning: automatic update check unavailable:"));
+        assert!(fs::metadata(&trace).unwrap().len() <= 1024 * 1024);
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(
+            trace.contains("execve(\"/usr/bin/true\""),
+            "task was not executed: {trace}"
+        );
+        assert!(
+            !trace.contains("AF_INET"),
+            "ordinary operation attempted IP networking: {trace}"
+        );
+        assert_eq!(
+            (fs::read(&receipt).unwrap(), fs::read(&journal).ok()),
+            before
+        );
+        assert_eq!(
+            fs::canonicalize(layout.bin_dir.join("update-all")).unwrap(),
+            product.join("versions/0.1.8/update-all")
+        );
+        let retired = dev_tools_installation::observe_retired_atomic_document(&state, &authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.captured.unwrap().bytes, b"{}");
+    }
+}
+
 fn staged_legacy_binary(root: &Path) -> PathBuf {
     let selected = PathBuf::from(
         std::env::var_os("DEV_TOOLS_LEGACY_UPDATE_ALL")
