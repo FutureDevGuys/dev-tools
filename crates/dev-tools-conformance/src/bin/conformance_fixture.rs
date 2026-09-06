@@ -59,7 +59,7 @@ fn main() {
 
 fn operation(operation: &str, outcome: &str) -> Result<(), ()> {
     print_json(json!({
-        "schema": "dev-tools-operation-result-v1",
+        "schema": if operation == "doctor" { "dev-tools-operation-result-v1" } else { "dev-tools-operation-result-v2" },
         "product": PRODUCT,
         "operation": operation,
         "outcome": outcome,

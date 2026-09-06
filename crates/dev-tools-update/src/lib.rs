@@ -6,7 +6,8 @@
 
 use dev_tools_product::{
     CacheFreshness, CommonOperation, ErrorKind, ExitCategory, InstallationState, OperationOutcome,
-    OperationResult, ProductId, OPERATION_RESULT_SCHEMA,
+    OperationResultV2 as OperationResult, ProductId,
+    OPERATION_RESULT_V2_SCHEMA as OPERATION_RESULT_SCHEMA,
 };
 use dev_tools_release::VerifiedRelease;
 use semver::Version;
@@ -218,11 +219,23 @@ pub enum UpdateErrorKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpdateError {
     kind: UpdateErrorKind,
+    changed: Option<bool>,
 }
 
 impl UpdateError {
     pub const fn new(kind: UpdateErrorKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            changed: None,
+        }
+    }
+
+    /// Supplies an established change fact for a failed installation mutation.
+    /// Omit this when partial progress is uncertain. Metadata/preflight failures
+    /// cannot change installation state and the orchestrator ignores this field there.
+    pub const fn with_changed(mut self, changed: bool) -> Self {
+        self.changed = Some(changed);
+        self
     }
 
     pub const fn kind(self) -> UpdateErrorKind {
@@ -251,6 +264,8 @@ impl fmt::Display for UpdateError {
 impl Error for UpdateError {}
 
 pub trait UpdateAdapter {
+    /// Read-only, network-free observation. Called again after every entered mutation,
+    /// including failed mutations; never implicitly recovers an installation.
     fn inspect(&mut self) -> Result<InstallationSnapshot, UpdateError>;
 
     /// Loads locally cached release evidence and never accesses the network.
@@ -261,6 +276,8 @@ pub trait UpdateAdapter {
     /// Performs the explicit product-owned network discovery and authentication step.
     fn refresh_authenticated_candidate(&mut self) -> Result<AuthenticatedCandidate, UpdateError>;
 
+    /// Returns an established installation change fact. Errors default to unknown
+    /// progress; use `UpdateError::with_changed` only with independent evidence.
     fn install(&mut self, candidate: &AuthenticatedCandidate) -> Result<bool, UpdateError>;
     fn apply(&mut self, candidate: &AuthenticatedCandidate) -> Result<bool, UpdateError>;
     fn rollback(&mut self) -> Result<bool, UpdateError>;
@@ -322,23 +339,36 @@ pub fn execute<A: UpdateAdapter>(
             if installation.state != InstallationState::Managed {
                 return blocked_state(policy, request.operation, &installation);
             }
-            match adapter.rollback() {
-                Ok(changed) => operation_result(
+            let mutation = adapter.rollback();
+            match mutation {
+                Ok(changed) => finish_mutation(
+                    adapter,
+                    operation_result(
+                        policy,
+                        request.operation,
+                        if changed {
+                            OperationOutcome::RolledBack
+                        } else {
+                            OperationOutcome::NoOp
+                        },
+                        changed,
+                        ExitCategory::Completed,
+                        None,
+                        &installation,
+                        None,
+                        Some(CacheFreshness::NotApplicable),
+                    ),
                     policy,
                     request.operation,
-                    if changed {
-                        OperationOutcome::RolledBack
-                    } else {
-                        OperationOutcome::NoOp
-                    },
-                    changed,
-                    ExitCategory::Completed,
                     None,
-                    &installation,
-                    None,
-                    Some(CacheFreshness::NotApplicable),
                 ),
-                Err(error) => error_result(policy, request.operation, Some(&installation), error),
+                Err(error) => finish_mutation(
+                    adapter,
+                    error_result(policy, request.operation, None, error),
+                    policy,
+                    request.operation,
+                    Some(error),
+                ),
             }
         }
         CommonOperation::Doctor => error_result(
@@ -482,27 +512,71 @@ fn mutate<A: UpdateAdapter>(
         adapter.apply(&candidate)
     };
     match changed {
-        Ok(changed) => operation_result(
+        Ok(changed) => finish_mutation(
+            adapter,
+            operation_result(
+                policy,
+                request.operation,
+                if changed {
+                    if install {
+                        OperationOutcome::Installed
+                    } else {
+                        OperationOutcome::Updated
+                    }
+                } else {
+                    OperationOutcome::NoOp
+                },
+                changed,
+                ExitCategory::Completed,
+                None,
+                &installation,
+                Some(&candidate),
+                Some(cache_freshness(policy, &candidate, now_unix)),
+            ),
             policy,
             request.operation,
-            if changed {
-                if install {
-                    OperationOutcome::Installed
-                } else {
-                    OperationOutcome::Updated
-                }
-            } else {
-                OperationOutcome::NoOp
-            },
-            changed,
-            ExitCategory::Completed,
             None,
-            &installation,
-            Some(&candidate),
-            Some(cache_freshness(policy, &candidate, now_unix)),
         ),
-        Err(error) => error_result(policy, request.operation, Some(&installation), error),
+        Err(error) => finish_mutation(
+            adapter,
+            error_result(policy, request.operation, None, error),
+            policy,
+            request.operation,
+            Some(error),
+        ),
     }
+}
+
+fn finish_mutation<A: UpdateAdapter>(
+    adapter: &mut A,
+    mut result: OperationResult,
+    policy: &UpdatePolicy,
+    operation: CommonOperation,
+    mutation_error: Option<UpdateError>,
+) -> OperationResult {
+    if let Some(error) = mutation_error {
+        result.changed = error.changed;
+    }
+    match adapter.inspect() {
+        Ok(observed) => {
+            result.installed_version = observed.version.map(|version| version.to_string());
+            result.installation_state = Some(observed.state);
+        }
+        Err(error) => {
+            if mutation_error.is_none() {
+                let changed = result.changed;
+                let available_version = result.available_version;
+                let cache_freshness = result.cache_freshness;
+                result = error_result(policy, operation, None, error);
+                result.changed = changed;
+                result.available_version = available_version;
+                result.cache_freshness = cache_freshness;
+            }
+            result.installed_version = None;
+            result.installation_state = Some(InstallationState::Unknown);
+        }
+    }
+    result
 }
 
 fn validate_candidate(
@@ -651,7 +725,7 @@ fn operation_result(
         product: policy.product.clone(),
         operation,
         outcome,
-        changed,
+        changed: Some(changed),
         installed_version: installation.version.as_ref().map(ToString::to_string),
         available_version: candidate.map(|candidate| candidate.verified.version.to_string()),
         cache_freshness,

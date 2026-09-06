@@ -19,11 +19,19 @@ struct FakeAdapter {
     install_calls: usize,
     apply_calls: usize,
     rollback_calls: usize,
+    mutation_error: Option<UpdateError>,
+    post_inspection_error: Option<UpdateError>,
+    suppress_mutation: bool,
 }
 
 impl UpdateAdapter for FakeAdapter {
     fn inspect(&mut self) -> Result<InstallationSnapshot, UpdateError> {
         self.inspect_calls += 1;
+        if self.inspect_calls > 1 {
+            if let Some(error) = self.post_inspection_error {
+                return Err(error);
+            }
+        }
         self.installation
             .clone()
             .ok_or(UpdateError::new(UpdateErrorKind::Operational))
@@ -43,19 +51,32 @@ impl UpdateAdapter for FakeAdapter {
             .ok_or(UpdateError::new(UpdateErrorKind::Network))
     }
 
-    fn install(&mut self, _: &AuthenticatedCandidate) -> Result<bool, UpdateError> {
+    fn install(&mut self, candidate: &AuthenticatedCandidate) -> Result<bool, UpdateError> {
         self.install_calls += 1;
-        Ok(true)
+        if !self.suppress_mutation {
+            self.installation = Some(InstallationSnapshot::managed(Some(
+                candidate.verified().version.clone(),
+            )));
+        }
+        self.mutation_error.map_or(Ok(true), Err)
     }
 
-    fn apply(&mut self, _: &AuthenticatedCandidate) -> Result<bool, UpdateError> {
+    fn apply(&mut self, candidate: &AuthenticatedCandidate) -> Result<bool, UpdateError> {
         self.apply_calls += 1;
-        Ok(true)
+        if !self.suppress_mutation {
+            self.installation = Some(InstallationSnapshot::managed(Some(
+                candidate.verified().version.clone(),
+            )));
+        }
+        self.mutation_error.map_or(Ok(true), Err)
     }
 
     fn rollback(&mut self) -> Result<bool, UpdateError> {
         self.rollback_calls += 1;
-        Ok(true)
+        if !self.suppress_mutation {
+            self.installation = Some(managed("0.9.0"));
+        }
+        self.mutation_error.map_or(Ok(true), Err)
     }
 }
 
@@ -167,7 +188,7 @@ fn offline_apply_uses_only_a_cached_authenticated_artifact() {
     );
 
     assert_eq!(result.outcome, OperationOutcome::Updated);
-    assert!(result.changed);
+    assert_eq!(result.changed, Some(true));
     assert_eq!(adapter.cache_calls, 1);
     assert_eq!(adapter.refresh_calls, 0);
     assert_eq!(adapter.apply_calls, 1);
@@ -187,7 +208,7 @@ fn check_cannot_claim_currentness_from_expired_or_future_evidence() {
             assert_eq!(result.cache_freshness, Some(CacheFreshness::Expired));
             assert_eq!(result.available_version.as_deref(), Some("1.1.0"));
             assert_eq!(result.exit_code, 0);
-            assert!(!result.changed);
+            assert_eq!(result.changed, Some(false));
             assert_eq!(adapter.refresh_calls, 1);
             assert_eq!(
                 adapter.cache_calls + adapter.install_calls + adapter.apply_calls,
@@ -359,4 +380,120 @@ fn post_inspection_failures_preserve_known_installation_context() {
     assert_eq!(result.error_kind, Some(ErrorKind::Network));
     assert_eq!(result.installation_state, Some(InstallationState::Managed));
     assert_eq!(result.installed_version.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn late_mutation_failure_does_not_claim_unchanged() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.0.0")),
+        cached: Some(candidate("1.1.0", 10, true)),
+        mutation_error: Some(UpdateError::new(UpdateErrorKind::Operational)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(&policy(), OperationRequest::apply(true), 20, &mut adapter);
+    assert_eq!(
+        adapter.installation.as_ref().unwrap().version(),
+        Some(&Version::new(1, 1, 0))
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap()["changed"],
+        serde_json::Value::Null
+    );
+    assert_eq!(result.installed_version.as_deref(), Some("1.1.0"));
+}
+
+#[test]
+fn successful_mutation_reports_post_operation_version() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.0.0")),
+        cached: Some(candidate("1.1.0", 10, true)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(&policy(), OperationRequest::apply(true), 20, &mut adapter);
+    assert_eq!(result.installed_version.as_deref(), Some("1.1.0"));
+}
+
+#[test]
+fn every_mutation_preserves_change_evidence_and_post_observation_failure() {
+    for request in [
+        OperationRequest::install(true),
+        OperationRequest::apply(true),
+        OperationRequest::rollback(),
+    ] {
+        for changed in [None, Some(false), Some(true)] {
+            for observation_fails in [false, true] {
+                let mut error = UpdateError::new(UpdateErrorKind::Interrupted);
+                if let Some(changed) = changed {
+                    error = error.with_changed(changed);
+                }
+                let mut adapter = FakeAdapter {
+                    installation: Some(if request.operation() == CommonOperation::UpdateInstall {
+                        InstallationSnapshot::absent()
+                    } else {
+                        managed("1.0.0")
+                    }),
+                    cached: Some(candidate("1.1.0", 10, true)),
+                    mutation_error: Some(error),
+                    suppress_mutation: changed == Some(false),
+                    post_inspection_error: observation_fails
+                        .then(|| UpdateError::new(UpdateErrorKind::Operational)),
+                    ..FakeAdapter::default()
+                };
+                let result = execute(&policy(), request, 20, &mut adapter);
+                assert_eq!(result.schema, "dev-tools-operation-result-v2");
+                assert_eq!(result.changed, changed);
+                assert_eq!(result.exit_code, 130);
+                assert_eq!(result.error_kind, Some(ErrorKind::Interrupted));
+                assert_eq!(adapter.inspect_calls, 2);
+                if observation_fails {
+                    assert_eq!(result.installed_version, None);
+                    assert_eq!(result.installation_state, Some(InstallationState::Unknown));
+                } else if changed == Some(false) {
+                    assert_eq!(
+                        result.installed_version.as_deref(),
+                        if request.operation() == CommonOperation::UpdateInstall {
+                            None
+                        } else {
+                            Some("1.0.0")
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        result.installed_version.as_deref(),
+                        Some(if request.operation() == CommonOperation::UpdateRollback {
+                            "0.9.0"
+                        } else {
+                            "1.1.0"
+                        })
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn successful_mutation_followed_by_failed_observation_retains_known_progress() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.0.0")),
+        cached: Some(candidate("1.1.0", 10, true)),
+        post_inspection_error: Some(UpdateError::new(UpdateErrorKind::Integrity)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(&policy(), OperationRequest::apply(true), 20, &mut adapter);
+    assert_eq!(result.changed, Some(true));
+    assert_eq!(result.exit_code, 4);
+    assert_eq!(result.error_kind, Some(ErrorKind::Integrity));
+    assert_eq!(result.installed_version, None);
+    assert_eq!(result.installation_state, Some(InstallationState::Unknown));
+    assert_eq!(result.available_version.as_deref(), Some("1.1.0"));
+}
+
+#[test]
+fn preflight_failure_establishes_no_installation_change() {
+    let mut adapter = FakeAdapter::default();
+    let result = execute(&policy(), OperationRequest::apply(false), 20, &mut adapter);
+    assert_eq!(result.changed, Some(false));
+    assert_eq!(adapter.inspect_calls, 1);
+    assert_eq!(adapter.apply_calls, 0);
 }

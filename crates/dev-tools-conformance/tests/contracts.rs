@@ -181,7 +181,8 @@ fn downstream_shared_crates_are_registry_publishable_with_versioned_internal_edg
             .iter()
             .find(|package| package["name"] == name)
             .expect("shared package");
-        assert_eq!(package["version"], "0.1.0", "{name} version authority");
+        semver::Version::parse(package["version"].as_str().expect("package version"))
+            .expect("valid package version");
         assert_eq!(
             package["publish"],
             serde_json::json!(["crates-io"]),
@@ -193,10 +194,22 @@ fn downstream_shared_crates_are_registry_publishable_with_versioned_internal_edg
         {
             let dependency_name = dependency["name"].as_str().expect("dependency name");
             if shared.contains(&dependency_name) {
-                assert_eq!(
-                    dependency["req"], "^0.1.0",
-                    "{name} -> {dependency_name} version authority"
+                let requirement = semver::VersionReq::parse(
+                    dependency["req"].as_str().expect("version requirement"),
+                )
+                .expect("valid version requirement");
+                assert!(
+                    !requirement.comparators.is_empty(),
+                    "{name} -> {dependency_name} must not use a wildcard registry edge"
                 );
+                let target = packages
+                    .iter()
+                    .find(|package| package["name"] == dependency_name)
+                    .expect("dependency package");
+                let target_version =
+                    semver::Version::parse(target["version"].as_str().expect("target version"))
+                        .expect("valid target version");
+                assert!(requirement.matches(&target_version), "{name} -> {dependency_name} registry requirement must admit its tested workspace version");
             }
         }
     }

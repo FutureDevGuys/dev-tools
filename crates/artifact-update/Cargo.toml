@@ -13,7 +13,7 @@ dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-installation = { version = "0.2.1", path = "../dev-tools-installation" }
 sha2.workspace = true
 dev-tools-product = { version = "0.1.0", path = "../dev-tools-product" }
-dev-tools-update = { version = "0.1.0", path = "../dev-tools-update" }
+dev-tools-update = { version = "0.2.0", path = "../dev-tools-update" }
 directories = "6"
 serde = "1"
 serde_json = "1"

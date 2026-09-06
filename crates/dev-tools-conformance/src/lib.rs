@@ -1,5 +1,7 @@
 use dev_tools_command::{run_bounded_command, BoundedCommand};
-use dev_tools_product::{ProductId, BUILD_INFO_SCHEMA, OPERATION_RESULT_SCHEMA};
+use dev_tools_product::{
+    ProductId, BUILD_INFO_SCHEMA, OPERATION_RESULT_SCHEMA, OPERATION_RESULT_V2_SCHEMA,
+};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -338,7 +340,7 @@ pub fn inspect_product(subject: &ProductUnderTest) -> Result<ConformanceReport, 
         subject,
         &["update", "status", "--json"],
         "update_status",
-        OPERATION_RESULT_SCHEMA,
+        OPERATION_RESULT_V2_SCHEMA,
         None,
         &mut checks,
     );
@@ -456,6 +458,14 @@ fn inspect_json_identity(
         }
     };
     if value.get("schema").and_then(Value::as_str) != Some(schema) {
+        checks.push(ConformanceCheck::failed(name, ConformanceFailure::Schema));
+        return;
+    }
+    if schema == OPERATION_RESULT_V2_SCHEMA
+        && (value.get("operation").and_then(Value::as_str) != Some(name)
+            || value.get("changed").and_then(Value::as_bool) != Some(false)
+            || value.get("exit_code").and_then(Value::as_i64) != Some(0))
+    {
         checks.push(ConformanceCheck::failed(name, ConformanceFailure::Schema));
         return;
     }

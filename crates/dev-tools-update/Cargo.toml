@@ -1,6 +1,6 @@
 [package]
 name = "dev-tools-update"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ description = "Product-neutral authenticated update orchestration for Dev Tools 
 [dependencies]
 base64.workspace = true
 http = "1"
-dev-tools-product = { version = "0.1.0", path = "../dev-tools-product" }
+dev-tools-product = { version = "0.1.1", path = "../dev-tools-product" }
 dev-tools-release = { version = "0.1.0", path = "../dev-tools-release" }
 semver = "1"
 sha2.workspace = true

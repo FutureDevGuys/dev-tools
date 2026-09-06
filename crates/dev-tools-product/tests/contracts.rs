@@ -179,10 +179,45 @@ fn embedded_public_schemas_are_valid_and_observationally_extensible() {
     for (document, schema_name) in [
         (OPERATION_RESULT_JSON_SCHEMA, OPERATION_RESULT_SCHEMA),
         (BUILD_INFO_JSON_SCHEMA, BUILD_INFO_SCHEMA),
+        (
+            dev_tools_product::OPERATION_RESULT_V2_JSON_SCHEMA,
+            dev_tools_product::OPERATION_RESULT_V2_SCHEMA,
+        ),
     ] {
         let schema: serde_json::Value =
             serde_json::from_str(document).expect("public schema is valid JSON");
         assert_eq!(schema["properties"]["schema"]["const"], schema_name);
         assert_eq!(schema["additionalProperties"], true);
     }
+}
+
+#[test]
+fn v2_serializes_unknown_changes_without_weakening_v1() {
+    for changed in [None, Some(false), Some(true)] {
+        let result = dev_tools_product::OperationResultV2 {
+            schema: dev_tools_product::OPERATION_RESULT_V2_SCHEMA,
+            product: ProductId::parse("demo-tool").unwrap(),
+            operation: CommonOperation::UpdateApply,
+            outcome: OperationOutcome::Failed,
+            changed,
+            installed_version: None,
+            available_version: None,
+            cache_freshness: None,
+            installation_state: Some(InstallationState::Unknown),
+            exit_code: 1,
+            error_kind: Some(ErrorKind::Operational),
+        };
+        let value = serde_json::to_value(result).unwrap();
+        assert!(value.get("changed").is_some());
+        assert_eq!(value["changed"], serde_json::to_value(changed).unwrap());
+        assert!(value.get("installed_version").is_none());
+    }
+    let v1: serde_json::Value = serde_json::from_str(OPERATION_RESULT_JSON_SCHEMA).unwrap();
+    let v2: serde_json::Value =
+        serde_json::from_str(dev_tools_product::OPERATION_RESULT_V2_JSON_SCHEMA).unwrap();
+    assert_eq!(v1["properties"]["changed"]["type"], "boolean");
+    assert_eq!(
+        v2["properties"]["changed"]["type"],
+        serde_json::json!(["boolean", "null"])
+    );
 }

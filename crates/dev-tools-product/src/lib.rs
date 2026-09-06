@@ -3,6 +3,9 @@ use std::error::Error;
 use std::fmt;
 
 pub const OPERATION_RESULT_SCHEMA: &str = "dev-tools-operation-result-v1";
+pub const OPERATION_RESULT_V2_SCHEMA: &str = "dev-tools-operation-result-v2";
+pub const OPERATION_RESULT_V2_JSON_SCHEMA: &str =
+    include_str!("../schema/dev-tools-operation-result-v2.schema.json");
 pub const BUILD_INFO_SCHEMA: &str = "dev-tools-build-info-v1";
 pub const OPERATION_RESULT_JSON_SCHEMA: &str =
     include_str!("../schema/dev-tools-operation-result-v1.schema.json");
@@ -312,6 +315,33 @@ impl OperationResult {
             error_kind,
         }
     }
+}
+
+/// Common result with explicit mutation uncertainty. The v1 type remains unchanged.
+///
+/// For update operations, `changed` concerns durable managed installation state,
+/// including recovery records, not disposable caches or release observations.
+/// `None` serializes as null: mutation may have happened but is not established.
+/// Installed identity describes a post-operation observation after mutation, never
+/// a pre-operation snapshot presented as the resulting state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OperationResultV2 {
+    pub schema: &'static str,
+    pub product: ProductId,
+    pub operation: CommonOperation,
+    pub outcome: OperationOutcome,
+    pub changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_freshness: Option<CacheFreshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation_state: Option<InstallationState>,
+    pub exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ErrorKind>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
