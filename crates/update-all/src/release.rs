@@ -295,12 +295,11 @@ fn check_for_runtime(product: Product, runtime: &RuntimeObservation) -> Result<C
 fn check_after_runtime_gate(product: Product) -> Result<Check> {
     let paths = Paths::resolve(product)?;
     load_state(&paths)?;
-    let _release_lock = acquire_release_writer(&paths)?;
-    let mut state = load_state(&paths)?;
+    let (writer, mut state) = ReleaseStateWriter::begin(&paths)?;
     let verified = fetch_verified_manifest(product, &paths, &state)?;
     accept_manifest_metadata(&mut state, &verified)?;
     state.last_successful_check_unix = Some(now_unix());
-    save_state(&paths, &state)?;
+    writer.save(&state)?;
     check_from_verified(product, &state, &verified)
 }
 
@@ -347,15 +346,14 @@ where
             return Err(error);
         }
     }
-    let _release_lock = acquire_release_writer(paths)?;
-    let mut state = load_state(paths)?;
+    let (writer, mut state) = ReleaseStateWriter::begin(paths)?;
     #[cfg(unix)]
     adopt_legacy_installation(product, paths, &mut state)?;
     let verified = fetch_manifest(product, paths, &state)?;
     accept_manifest_metadata(&mut state, &verified)?;
     if activation_is_current(paths, &state, &verified)? {
         state.last_successful_check_unix = Some(now_unix());
-        save_state(paths, &state)?;
+        writer.save(&state)?;
         return Ok(Activation {
             product,
             version: Some(verified.manifest.version.clone()),
@@ -367,7 +365,7 @@ where
     }
     if activate_retained_verified(product, paths, &mut state, &verified)? {
         state.last_successful_check_unix = Some(now_unix());
-        save_state(paths, &state)?;
+        writer.save(&state)?;
         return Ok(Activation {
             product,
             version: Some(verified.manifest.version.clone()),
@@ -381,7 +379,7 @@ where
     verify_artifact(&bytes, &verified.artifact)?;
     let activation = activate(product, paths, &mut state, &verified, &bytes)?;
     state.last_successful_check_unix = Some(now_unix());
-    save_state(paths, &state)?;
+    writer.save(&state)?;
     Ok(activation)
 }
 
@@ -497,8 +495,7 @@ fn rollback_with_runtime_policy(
     {
         preflight_restricted_rollback(product, &paths, runtime)?;
     }
-    let _release_lock = acquire_release_writer(&paths)?;
-    let mut state = load_state(&paths)?;
+    let (writer, mut state) = ReleaseStateWriter::begin(&paths)?;
     #[cfg(unix)]
     {
         let layout = shared_installation_layout(product, &paths)?;
@@ -532,7 +529,7 @@ fn rollback_with_runtime_policy(
             Err(error) => return Err(error),
         };
         synchronize_installation_state(&mut state, &report.receipt);
-        save_state(&paths, &state)?;
+        writer.save(&state)?;
         return Ok(Activation {
             product,
             version: Some(report.receipt.active_version.clone()),
@@ -558,7 +555,7 @@ fn rollback_with_runtime_policy(
         activate_link(product, &paths, &previous)?;
         let old_active = state.active_version.replace(previous.clone());
         state.previous_version = old_active;
-        save_state(&paths, &state)?;
+        writer.save(&state)?;
         Ok(Activation {
             product,
             version: Some(previous),
@@ -1659,9 +1656,58 @@ fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::Doc
     })
 }
 
+struct ReleaseStateWriter<'a> {
+    path: &'a Path,
+    authority: dev_tools_installation::DocumentAuthority,
+    expected: Option<dev_tools_installation::ArtifactIdentity>,
+    _lease: dev_tools_installation::InstallationLock,
+}
+
+impl<'a> ReleaseStateWriter<'a> {
+    fn begin(paths: &'a Paths) -> Result<(Self, ReleaseState)> {
+        let lease = acquire_release_writer(paths)?;
+        let authority = state_document_authority(paths)?;
+        let document = dev_tools_installation::read_atomic_document(&paths.state, &authority)?;
+        let (state, expected) = match document {
+            Some(document) => (
+                parse_json(&document.bytes, "release state")?,
+                Some(document.identity),
+            ),
+            None => (ReleaseState::default(), None),
+        };
+        Ok((
+            Self {
+                path: &paths.state,
+                authority,
+                expected,
+                _lease: lease,
+            },
+            state,
+        ))
+    }
+
+    // Consume the transaction: an uncertain publication cannot be retried with
+    // a newly observed identity and accidentally bless intervening history.
+    fn save(self, state: &ReleaseState) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(state).context("serialize release state")?;
+        let current = dev_tools_installation::read_atomic_document(self.path, &self.authority)?;
+        if current.as_ref().map(|document| &document.identity) != self.expected.as_ref() {
+            bail!("release state changed during the admitted mutation");
+        }
+        dev_tools_installation::write_atomic_document(
+            self.path,
+            &bytes,
+            &self.authority,
+            self.expected.as_ref(),
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn save_state(paths: &Paths, state: &ReleaseState) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(state).context("serialize release state")?;
-    atomic_write(&paths.state, &bytes, false)
+    let (writer, _) = ReleaseStateWriter::begin(paths)?;
+    writer.save(state)
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], label: &str) -> Result<T> {
@@ -1860,6 +1906,96 @@ mod tests {
             "a competing release mutation must not enter discovery"
         );
         assert!(!paths.state.exists());
+    }
+
+    #[test]
+    fn release_state_writer_preserves_unmarked_temporary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = state_test_paths(temp.path());
+        create_private_dir(&paths.product_root)?;
+        let unrelated = paths
+            .product_root
+            .join(format!(".state.json.{}.tmp", std::process::id()));
+        fs::write(&unrelated, b"unmarked user bytes")?;
+        save_state(&paths, &ReleaseState::default())?;
+        assert_eq!(fs::read(&unrelated)?, b"unmarked user bytes");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_state_writer_preserves_linked_destination() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = state_test_paths(temp.path());
+        create_private_dir(&paths.product_root)?;
+        let target = temp.path().join("unrelated");
+        fs::write(&target, b"unmarked user bytes")?;
+        std::os::unix::fs::symlink(&target, &paths.state)?;
+        assert!(save_state(&paths, &ReleaseState::default()).is_err());
+        assert_eq!(fs::read_link(&paths.state)?, target);
+        assert_eq!(fs::read(&target)?, b"unmarked user bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn release_state_writer_rejects_intervening_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = state_test_paths(temp.path());
+        save_state(&paths, &ReleaseState::default())?;
+        let (writer, state) = ReleaseStateWriter::begin(&paths)?;
+        let intervening = ReleaseState {
+            accepted_version: Some("9.0.0".into()),
+            ..ReleaseState::default()
+        };
+        let bytes = serde_json::to_vec_pretty(&intervening)?;
+        atomic_write(&paths.state, &bytes, false)?;
+        assert!(writer.save(&state).is_err());
+        assert_eq!(fs::read(&paths.state)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn release_state_writer_rejects_unexpected_creation_and_removal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = state_test_paths(temp.path());
+        let (writer, state) = ReleaseStateWriter::begin(&paths)?;
+        // Even byte-identical external publication is not this transaction's
+        // observed absence. Reject it before the shared equality no-op path.
+        let bytes = serde_json::to_vec_pretty(&state)?;
+        atomic_write(&paths.state, &bytes, false)?;
+        assert!(writer.save(&state).is_err());
+        assert_eq!(fs::read(&paths.state)?, bytes);
+        let (writer, state) = ReleaseStateWriter::begin(&paths)?;
+        fs::remove_file(&paths.state)?;
+        assert!(writer.save(&state).is_err());
+        assert!(!paths.state.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn release_state_writer_bounds_publication_and_retains_lease() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = state_test_paths(temp.path());
+        let (writer, mut state) = ReleaseStateWriter::begin(&paths)?;
+        assert!(ReleaseStateWriter::begin(&paths).is_err());
+        state.accepted_version = Some("x".repeat(RELEASE_STATE_LIMIT as usize));
+        assert!(writer.save(&state).is_err());
+        assert!(!paths.state.exists());
+        let (writer, state) = ReleaseStateWriter::begin(&paths)?;
+        writer.save(&state)?;
+        let (writer, state) = ReleaseStateWriter::begin(&paths)?;
+        let before = fs::metadata(&paths.state)?;
+        writer.save(&state)?;
+        let after = fs::metadata(&paths.state)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(after.mode() & 0o777, 0o600);
+            assert_eq!(after.nlink(), 1);
+        }
+        Ok(())
     }
 
     #[test]
