@@ -57,6 +57,19 @@ impl PrivateDirectory {
         Ok(())
     }
 
+    // Explicit initial-publication recovery never modifies the final directory.
+    pub fn recover_publication(
+        &self,
+        name: &str,
+        authority: &dev_tools_installation::DocumentAuthority,
+    ) -> Result<bool, ()> {
+        self.inspect()?;
+        dev_tools_installation::recover_new_document_directory_publication(
+            &self.path, name, authority,
+        )
+        .map_err(|_| ())
+    }
+
     // The caller holds this cache's stable writer lock throughout publication.
     pub fn publish_cache_entry(
         &self,
@@ -94,6 +107,7 @@ impl PrivateDirectory {
             digest.finalize().into(),
         )
         .map_err(|_| ())?;
+        area.recover_initial_publication().map_err(|_| ())?;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 area.initialize_recoverable().map_err(|_| ())?

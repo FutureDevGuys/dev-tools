@@ -64,6 +64,7 @@ impl Store {
         digest.update(identity.length.to_be_bytes());
         let area = StagingArea::new(path.clone(), self.directory.owner, digest.finalize().into())
             .map_err(|_| ERROR)?;
+        area.recover_initial_publication().map_err(|_| ERROR)?;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 area.initialize_recoverable().map_err(|_| ERROR)?

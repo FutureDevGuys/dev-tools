@@ -59,8 +59,8 @@ pub(super) fn run(arguments: &[String]) -> Result<i32, String> {
 fn parse_options(arguments: &[String]) -> Result<Options, String> {
     let operation = arguments
         .first()
-        .filter(|operation| matches!(operation.as_str(), "inspect" | "apply"))
-        .ok_or("config requires inspect|apply [--config PATH] [--json]")?;
+        .filter(|operation| matches!(operation.as_str(), "inspect" | "apply" | "recover"))
+        .ok_or("config requires inspect|apply|recover [--config PATH] [--json]")?;
     let mut source = None;
     let mut expected = None;
     let mut catalog_options = Vec::new();
@@ -162,6 +162,15 @@ fn execute(options: &Options, row: &mut serde_json::Value) -> Result<i32, (&'sta
         limit: super::CONFIG_LIMIT,
     };
     let present = directory.inspect().map_err(|_| CUSTODY)?;
+    if options.operation == "recover" {
+        row["changed"] = serde_json::Value::Null;
+        let changed = directory
+            .recover_publication(name, &authority)
+            .map_err(|_| ("recovery-failed", 4))?;
+        row["changed"] = serde_json::json!(changed);
+        row["outcome"] = serde_json::json!(if changed { "recovered" } else { "unchanged" });
+        return Ok(0);
+    }
     if options.operation == "inspect" {
         let current = if present {
             read_atomic_document(&options.config, &authority).map_err(|_| CUSTODY)?

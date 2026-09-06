@@ -95,6 +95,13 @@ impl StagingArea {
         )
     }
 
+    /// Explicit cleanup of this reservation's initial-publication journal.
+    /// Does not acquire a payload lease, create a reservation, modify its final
+    /// directory or authenticate any bytes. An absent journal is a no-op.
+    pub fn recover_initial_publication(&self) -> Result<bool> {
+        crate::recover_new_document_directory_publication(&self.path, MARKER, &self.authority())
+    }
+
     /// Nonblocking acquisition, followed by cleanup of a reserved abandoned
     /// payload and creation of an empty private payload. Busy returns `None`.
     /// Neither successful acquisition nor the reservation authenticates bytes.

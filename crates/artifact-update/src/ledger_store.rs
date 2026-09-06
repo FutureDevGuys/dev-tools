@@ -90,6 +90,12 @@ impl LedgerStore {
         Ok(Some((ledger, document.identity)))
     }
 
+    pub fn recover_initial_publication(&self) -> Result<bool, String> {
+        self.directory
+            .recover_publication("ledger.json", &self.authority())
+            .map_err(|_| ERROR.into())
+    }
+
     /// The callback performs only in-memory verification/state changes, never
     /// network I/O. Success is returned only after the atomic document commits.
     pub fn transaction<T>(

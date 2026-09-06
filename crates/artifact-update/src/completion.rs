@@ -91,11 +91,13 @@ fn specification() -> Command {
     root.subcommand(
         command("trust")
             .subcommand(catalog_options(command("initialize")).arg(id().required(true)))
-            .subcommand(catalog_options(command("status")).arg(id().required(true))),
+            .subcommand(catalog_options(command("status")).arg(id().required(true)))
+            .subcommand(catalog_options(command("recover")).arg(id().required(true))),
     )
     .subcommand(
         command("config")
             .subcommand(catalog_options(command("inspect")))
+            .subcommand(catalog_options(command("recover")))
             .subcommand(
                 catalog_options(command("apply"))
                     .arg(
@@ -154,6 +156,8 @@ mod tests {
             ],
             vec!["install", "example", "--offline", "--json"],
             vec!["trust", "initialize", "example", "--config", "/config.toml"],
+            vec!["trust", "recover", "example", "--json"],
+            vec!["config", "recover", "--config", "/config.toml"],
             vec![
                 "config",
                 "apply",
@@ -171,6 +175,7 @@ mod tests {
             vec!["rollback", "example", "--offline"],
             vec!["list", "--help"],
             vec!["update"],
+            vec!["config", "recover", "--expect", "absent"],
         ] {
             assert!(specification()
                 .try_get_matches_from(std::iter::once("artifact-update").chain(arguments))

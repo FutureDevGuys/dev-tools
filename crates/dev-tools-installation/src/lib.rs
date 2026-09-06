@@ -14,7 +14,9 @@ mod directory_publication;
 #[cfg(target_os = "linux")]
 mod staging;
 #[cfg(target_os = "linux")]
-pub use directory_publication::publish_new_document_directory_recoverable;
+pub use directory_publication::{
+    publish_new_document_directory_recoverable, recover_new_document_directory_publication,
+};
 #[cfg(target_os = "linux")]
 pub use staging::{StagingArea, StagingLease};
 

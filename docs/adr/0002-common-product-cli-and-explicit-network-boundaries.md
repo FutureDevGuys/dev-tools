@@ -124,7 +124,7 @@ Dev Auth adds the stable `--version` line and `build-info --json` common identit
 
 ## Invariants
 
-[ADR 0018](0018-journal-owned-initial-directory-publication.md) adds journal-owned recovery for Artifact Update's first-use directory publication and staging-reservation initialization. Its narrower ownership and compatibility contract supersedes the corresponding unpublished-initial-directory limitation above; unmarked legacy entries, post-publication product reconciliation and reservation retirement remain explicitly separate.
+[ADR 0018](0018-journal-owned-initial-directory-publication.md) adds journal-owned recovery for Artifact Update's first-use directory publication and staging-reservation initialization, including explicit post-publication reconciliation without final-document changes. Its narrower ownership and compatibility contract supersedes the corresponding initial-directory limitation above; unmarked legacy entries and reservation retirement remain explicitly separate.
 
 - Ordinary commands, `--version`, `build-info`, `doctor`, status, and rollback are network-free.
 - Expired or absent release evidence produces `unknown`, not `current`.

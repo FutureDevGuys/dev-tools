@@ -257,10 +257,10 @@ fn install_command(arguments: &[String]) -> Result<i32, String> {
 fn trust_command(arguments: &[String]) -> Result<i32, String> {
     if !matches!(
         arguments.first().map(String::as_str),
-        Some("initialize" | "status")
+        Some("initialize" | "status" | "recover")
     ) || arguments.get(1).is_none_or(|id| id.starts_with('-'))
     {
-        return Err("trust requires initialize|status ID [--config PATH] [--json]".into());
+        return Err("trust requires initialize|status|recover ID [--config PATH] [--json]".into());
     }
     let operation = arguments[0].as_str();
     let id = &arguments[1];
@@ -280,6 +280,14 @@ fn trust_command(arguments: &[String]) -> Result<i32, String> {
     let (outcome, code, changed) = {
         let initialize = || -> Result<(&str, i32, Option<bool>), String> {
             let store = ledger_store::LedgerStore::for_record(record)?;
+            if operation == "recover" {
+                let changed = store.recover_initial_publication()?;
+                return Ok((
+                    if changed { "recovered" } else { "unchanged" },
+                    0,
+                    Some(changed),
+                ));
+            }
             let present = store.load(record)?.is_some();
             if operation == "status" {
                 return Ok((if present { "present" } else { "absent" }, 0, Some(false)));
@@ -928,5 +936,5 @@ fn write_json(value: &impl serde::Serialize) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: artifact-update --version\n       artifact-update build-info --json\n       artifact-update completion bash|zsh|fish|elvish|powershell\n       artifact-update list [--config PATH] [--json]\n       artifact-update status [--config PATH] [--json]\n       artifact-update doctor [--config PATH] [--json]\n       artifact-update check [ID|--all] [--config PATH] [--os OS] [--architecture ARCH] [--json]\n       artifact-update install ID [--config PATH] [--json] [--offline]\n       artifact-update rollback ID [--config PATH] [--json]\n       artifact-update recover ID [--config PATH] [--json]\n       artifact-update trust initialize|status ID [--config PATH] [--json]\n       artifact-update config inspect [--config PATH] [--json]\n       artifact-update config apply --from PATH --expect absent|SHA256 [--config PATH] [--json]"
+    "usage: artifact-update --version\n       artifact-update build-info --json\n       artifact-update completion bash|zsh|fish|elvish|powershell\n       artifact-update list [--config PATH] [--json]\n       artifact-update status [--config PATH] [--json]\n       artifact-update doctor [--config PATH] [--json]\n       artifact-update check [ID|--all] [--config PATH] [--os OS] [--architecture ARCH] [--json]\n       artifact-update install ID [--config PATH] [--json] [--offline]\n       artifact-update rollback ID [--config PATH] [--json]\n       artifact-update recover ID [--config PATH] [--json]\n       artifact-update trust initialize|status|recover ID [--config PATH] [--json]\n       artifact-update config inspect|recover [--config PATH] [--json]\n       artifact-update config apply --from PATH --expect absent|SHA256 [--config PATH] [--json]"
 }

@@ -43,6 +43,8 @@ fn staging_area(
     let path = root.join(key);
     let area = StagingArea::new(path.clone(), layout.owner_uid, target)
         .map_err(|_| ("staging-unavailable", 4))?;
+    area.recover_initial_publication()
+        .map_err(|_| ("staging-recovery-failed", 4))?;
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Deliberate reservation of a product-owned target slot, never

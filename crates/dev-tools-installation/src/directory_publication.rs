@@ -71,6 +71,36 @@ pub fn publish_new_document_directory_recoverable(
     publish_with(path, document_name, bytes, authority, mode, |_, _| Ok(()))
 }
 
+/// Recover only journal-owned initial publication state, never the final directory.
+///
+/// This explicitly mutating operation uses the publisher's exact authority and
+/// custody contract. An absent journal returns false without creating a parent
+/// or lock. A present journal is rechecked under the same nonblocking lock and
+/// may be cleared after final publication without reading or modifying the final
+/// directory. Success reports whether journal-owned cleanup occurred; it does
+/// not report installation, configuration validity or release authenticity.
+/// Errors may follow cleanup and do not promise unchanged state.
+pub fn recover_new_document_directory_publication(
+    path: &Path,
+    document_name: &str,
+    authority: &DocumentAuthority,
+) -> Result<bool> {
+    validate_request(path, document_name, authority, 0o700)?;
+    let journal = path
+        .parent()
+        .context("publication target has no parent")?
+        .join(format!(".dev-tools-initial-{}.json", target_key(path)));
+    let journal_authority = DocumentAuthority {
+        owner_uid: authority.owner_uid,
+        mode: 0o600,
+        limit: 4096,
+    };
+    if crate::read_atomic_document(&journal, &journal_authority)?.is_none() {
+        return Ok(false);
+    }
+    Publication::open(path, authority)?.recover(document_name, authority.limit)
+}
+
 fn publish_with(
     path: &Path,
     document_name: &str,
@@ -79,20 +109,9 @@ fn publish_with(
     mode: u32,
     mut boundary: impl FnMut(&Path, Phase) -> Result<()>,
 ) -> Result<()> {
-    crate::validate_document_authority(authority)?;
-    if mode != 0o700
-        || authority.mode != 0o600
-        || bytes.is_empty()
-        || bytes.len() as u64 > authority.limit
-        || !path.is_absolute()
-        || path.as_os_str().len() > 4096
-        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
-        || path
-            .components()
-            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-        || !single_name(document_name)
-    {
-        bail!("initial private directory publication has invalid authority or bounds");
+    validate_request(path, document_name, authority, mode)?;
+    if bytes.is_empty() || bytes.len() as u64 > authority.limit {
+        bail!("initial private directory publication has invalid content bounds");
     }
     let publication = Publication::open(path, authority)?;
     publication.recover(document_name, authority.limit)?;
@@ -163,6 +182,35 @@ fn publish_with(
     Ok(())
 }
 
+fn validate_request(
+    path: &Path,
+    document_name: &str,
+    authority: &DocumentAuthority,
+    mode: u32,
+) -> Result<()> {
+    crate::validate_document_authority(authority)?;
+    if mode != 0o700
+        || authority.mode != 0o600
+        || !path.is_absolute()
+        || path.as_os_str().len() > 4096
+        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        || !single_name(document_name)
+    {
+        bail!("initial private directory publication has invalid authority or bounds");
+    }
+    Ok(())
+}
+
+fn target_key(path: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"dev-tools-initial-directory-target-v1\0");
+    digest.update(path.as_os_str().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
 fn single_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255
@@ -182,10 +230,7 @@ impl Publication {
         if !parent_custody(metadata.uid(), metadata.mode(), authority.owner_uid) {
             bail!("initial publication parent has unsafe custody");
         }
-        let mut digest = Sha256::new();
-        digest.update(b"dev-tools-initial-directory-target-v1\0");
-        digest.update(path.as_os_str().as_bytes());
-        let target_key = format!("{:x}", digest.finalize());
+        let target_key = target_key(path);
         let stem = format!(".dev-tools-initial-{target_key}");
         let lock = InstallationLock::open_with_owner(
             &parent_path.join(format!("{stem}.lock")),
@@ -245,10 +290,10 @@ impl Publication {
         Ok(directory)
     }
 
-    fn recover(&self, document_name: &str, limit: u64) -> Result<()> {
+    fn recover(&self, document_name: &str, limit: u64) -> Result<bool> {
         let Some(document) = crate::read_atomic_document(&self.journal_path, &self.authority)?
         else {
-            return Ok(());
+            return Ok(false);
         };
         let journal: Journal = serde_json::from_slice(&document.bytes)?;
         let parent = self.parent.metadata()?;
@@ -269,7 +314,7 @@ impl Publication {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // It may already have been renamed to the final directory. No
                 // final entry is modified or treated as a successful new install.
-                return self.clear_journal();
+                return self.clear_journal().map(|()| true);
             }
             Err(error) => return Err(error.into()),
             Ok(_) => {}
@@ -303,7 +348,7 @@ impl Publication {
             rustix::fs::AtFlags::REMOVEDIR,
         )?;
         self.parent.sync_all()?;
-        self.clear_journal()
+        self.clear_journal().map(|()| true)
     }
 
     fn clear_journal(&self) -> Result<()> {
@@ -474,6 +519,27 @@ mod tests {
                 .extension()
                 .is_some_and(|extension| extension == "json")));
         }
+    }
+
+    #[test]
+    fn explicit_recovery_clears_published_journal_without_touching_final_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        crash(temp.path(), "published");
+        let path = temp.path().join("target");
+        let original = fs::read(path.join("document.json")).unwrap();
+        assert!(recover_new_document_directory_publication(
+            &path,
+            "document.json",
+            &authority(temp.path())
+        )
+        .unwrap());
+        assert_eq!(fs::read(path.join("document.json")).unwrap(), original);
+        assert!(!recover_new_document_directory_publication(
+            &path,
+            "document.json",
+            &authority(temp.path())
+        )
+        .unwrap());
     }
 
     #[test]
