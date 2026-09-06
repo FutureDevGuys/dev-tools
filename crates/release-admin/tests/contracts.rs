@@ -228,7 +228,7 @@ fn set_build_constructs_one_exact_source_bound_release_without_python() {
     let fake_cargo = root.path().join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nset -eu\nmkdir -p \"$CARGO_TARGET_DIR/release/deps\"\nprintf 'native release\\n' >\"$CARGO_TARGET_DIR/release/deps/update-all-build\"\nln \"$CARGO_TARGET_DIR/release/deps/update-all-build\" \"$CARGO_TARGET_DIR/release/update-all\"\n",
+        "#!/bin/sh\nset -eu\n[ \"$*\" = 'build --release --locked --offline --color never --bin update-all' ]\n[ \"$CARGO_NET_OFFLINE\" = true ]\n[ \"$DEV_TOOLS_GIT_DIRTY\" = 0 ]\n[ \"$DEV_TOOLS_GIT_COMMIT\" = \"$DEV_AUTH_SOURCE_COMMIT\" ]\nmkdir -p \"$CARGO_TARGET_DIR/release/deps\"\nprintf 'native release\\n' >\"$CARGO_TARGET_DIR/release/deps/update-all-build\"\nln \"$CARGO_TARGET_DIR/release/deps/update-all-build\" \"$CARGO_TARGET_DIR/release/update-all\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();

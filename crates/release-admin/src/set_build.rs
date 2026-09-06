@@ -599,8 +599,8 @@ fn set_executable_file(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encoded_remap_flags, native_binary_name, parse_manifest_generations, public_artifact_name,
-        selected_products,
+        encoded_remap_flags, native_binary_name, parse_manifest_generations, product_versions,
+        public_artifact_name, selected_products,
     };
     use std::path::Path;
 
@@ -648,6 +648,38 @@ mod tests {
         assert_eq!(
             public_artifact_name("sync-configs", "1.2.3", "windows-x86_64"),
             "sync-configs-1.2.3-windows-x86_64.exe"
+        );
+    }
+
+    #[test]
+    fn selected_products_keep_independent_versions_without_loading_other_products() {
+        let root = tempfile::tempdir().unwrap();
+        for (product, version) in [("update-all", "1.2.3"), ("sync-configs", "2.3.4")] {
+            let directory = root.path().join("crates").join(product);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("Cargo.toml"),
+                format!("[package]\nname = \"{product}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            product_versions(root.path(), &["update-all", "sync-configs"]).unwrap(),
+            [
+                ("update-all".into(), "1.2.3".into()),
+                ("sync-configs".into(), "2.3.4".into()),
+            ]
+            .into()
+        );
+        std::fs::write(
+            root.path().join("crates/sync-configs/Cargo.toml"),
+            "[package]\nname = \"different-product\"\nversion = \"2.3.4\"\n",
+        )
+        .unwrap();
+        assert!(product_versions(root.path(), &["sync-configs"]).is_err());
+        assert_eq!(
+            product_versions(root.path(), &["update-all"]).unwrap(),
+            [("update-all".into(), "1.2.3".into())].into()
         );
     }
 

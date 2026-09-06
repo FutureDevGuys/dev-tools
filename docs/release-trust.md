@@ -11,10 +11,10 @@ For one product and target's acceptance state, an already accepted exact version
 Root authorization is a one-time or rotation-only operation. It consumes the root private key and the release public key, then emits a signed public document:
 
 ```sh
-python scripts/build-root-document.py \
+release-admin root build \
   --root-private-key /run/user/$(id -u)/dev-tools-signing/root.key \
   --release-public-key /run/user/$(id -u)/dev-tools-signing/release.pub \
-  --trusted-root-public-key crates/update-all/trust/root-public-key.txt \
+  --trusted-root-public-key "$PWD/crates/update-all/trust/root-public-key.txt" \
   --generation 1 \
   --output /run/user/$(id -u)/dev-tools-signing/dev-tools-root.json
 ```
@@ -78,7 +78,7 @@ Legacy `dev-tools-product-v1` does not cryptographically bind artifact provenanc
 
 The signed public root document is tracked at `release-trust/dev-tools-root.json`; `--root-document` exists only for rotation rehearsal and verification. The recipe refuses a dirty or mismatched checkout, derives each selected product's version from its package manifest, uses the exact commit timestamp as `SOURCE_DATE_EPOCH`, and builds the selected products from scratch without invoking Python or a sibling product. The signer verifies the root document against the compiled public trust root, requires the selected release public key to be authorized and unrevoked, and independently verifies every external signature before the builder produces deterministic canonical signed JSON. Private keys never belong in the repository, build logs, command output, or release archives.
 
-Repeat `--product` to construct more than one product from the same exact source revision. Omit it to select all five only on `linux-x86_64`: `sync-configs` is presently accepted solely for that release target, so an all-products build on any other target fails closed before compilation and must instead name only the accepted products explicitly. For multiple products, repeat the generation option as `--manifest-generation update-all=7` and `--manifest-generation dev-cache=9`; every selected product must be named exactly once. Each product therefore keeps its own version and manifest generation, and independent nested release lines never need to be artificially synchronized. The output path should live on persistent owner-controlled storage rather than a memory-backed temporary filesystem.
+Repeat `--product` to construct more than one product from the same exact source revision. Omit it to select all five. The current native constructor is accepted only on its Linux x86-64 build host and fails closed for other targets; naming a smaller product subset does not bypass the host gate. For multiple products, repeat the generation option as `--manifest-generation update-all=7` and `--manifest-generation dev-cache=9`; every selected product must be named exactly once. Each product therefore keeps its own version and manifest generation, and independent nested release lines never need to be artificially synchronized. The output path should live on persistent owner-controlled storage rather than a memory-backed temporary filesystem. [Native cutover evidence](native-release-parity.md) records the retired Python implementation's acceptance mapping and intentional interface changes.
 
 Each product uses independent nested tags: `update-all/vX.Y.Z`, `dev-auth/vX.Y.Z`, `dev-cache/vX.Y.Z`, `sync-configs/vX.Y.Z`, and `skills-sync/vX.Y.Z`.
 

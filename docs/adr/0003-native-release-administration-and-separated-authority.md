@@ -35,7 +35,7 @@ The published signer-bootstrap release has one version-bound verification except
 - The manual crates.io bootstrap is accepted only on Linux, handles one explicit stdin credential without persistence, publishes only Cargo-produced bytes whose checksum is already signed, and is retired after Trusted Publishing is configured.
 - A selected target is verified as one projection of the complete signed target set; accepting one target never permits unsigned additions or substitutions.
 - Remote metadata cannot select commands or privileged effects.
-- During migration, the incumbent release tooling remains authoritative until native parity and rollback acceptance pass. Cutover removes the incumbent implementation rather than retaining a second authority.
+- Native release administration is the sole implementation after parity and Linux release/rollback acceptance. The retired Python construction, signing and publication paths are recoverable only from Git history, not retained as a second authority; [cutover evidence](../native-release-parity.md) records the mapping and deliberate compatibility changes.
 
 ## Verification
 

@@ -1,6 +1,6 @@
 # Development and validation
 
-Rust validation uses formatting, Clippy with warnings denied, workspace tests, and the product integration tests. Python validation remains for release tooling and support scripts. Release validation additionally audits source and Git objects, dependencies and licenses, fixtures, metadata, documentation, archives, signatures, links, and platform claims.
+Rust validation uses formatting, Clippy with warnings denied, workspace tests, and the product integration tests. Python validation remains for support scripts and the retained Python compatibility surfaces, not release administration. Release validation additionally audits source and Git objects, dependencies and licenses, fixtures, metadata, documentation, archives, signatures, links, and platform claims. Native release parity and the retired implementation's test mapping are recorded in [the cutover evidence](native-release-parity.md).
 
 Cross-product work follows the [Dev Tools product standard](product-standard.md) and the applicable [repository architecture decisions](adr/README.md). The complete public gate must succeed from an isolated source tree with private downstream repositories unavailable; public fixtures are synthetic and public product code never discovers a neighboring checkout.
 

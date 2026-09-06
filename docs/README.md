@@ -12,6 +12,7 @@
 - [Catalogs](catalogs.md)
 - [Release trust](release-trust.md)
 - [Release Admin](release-admin.md)
+- [Native release administration cutover](native-release-parity.md)
 - [Shared Rust crates](shared-rust-crates.md)
 - [Shared-crate publication transactions](shared-crate-publication.md)
 - [Shared command execution](dev-tools-command.md)

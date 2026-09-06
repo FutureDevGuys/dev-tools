@@ -1289,6 +1289,20 @@ mod tests {
         }));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_launchers_reject_user_owned_paths_even_when_the_target_is_native() {
+        let temporary = tempfile::tempdir().unwrap();
+        let launcher = temporary.path().join("git");
+        std::os::unix::fs::symlink("/usr/bin/git", &launcher).unwrap();
+        assert!(ExactCommand::open(&launcher, "git").is_err());
+        assert!(ExactCommand::open(Path::new("git"), "git").is_err());
+        assert!(ExactCommand::open(Path::new("/usr/bin/git"), "gh").is_err());
+        // This verifies the path custody boundary; actual execution admission
+        // remains covered independently and is never inferred from root ownership.
+        ExactCommand::open(Path::new("/usr/bin/git"), "git").unwrap();
+    }
+
     #[test]
     fn ambiguous_release_creation_is_resolved_from_exact_final_state() {
         let fixture = fixture("update-all", "linux-x86_64", "dev-tools-product-v2");
