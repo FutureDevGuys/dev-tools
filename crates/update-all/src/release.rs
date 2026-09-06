@@ -37,6 +37,7 @@ const ENGINE_PROTOCOL: u32 = 1;
 const RELEASES_URL: &str =
     "https://api.github.com/repos/FutureDevGuys/dev-tools/releases?per_page=100";
 const METADATA_LIMIT: u64 = 512 * 1024;
+const RELEASE_STATE_LIMIT: u64 = 64 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const MAX_JITTER_SECS: u64 = 30 * 60;
@@ -1573,11 +1574,45 @@ fn synchronize_installation_state(state: &mut ReleaseState, receipt: &VersionedR
 }
 
 fn load_state(paths: &Paths) -> Result<ReleaseState> {
-    if !paths.state.is_file() {
-        return Ok(ReleaseState::default());
+    let authority = state_document_authority(paths)?;
+    match dev_tools_installation::read_atomic_document(&paths.state, &authority)? {
+        None => Ok(ReleaseState::default()),
+        Some(document) => parse_json(&document.bytes, "release state"),
     }
-    let bytes = fs::read(&paths.state).context("read update-all release state")?;
-    parse_json(&bytes, "release state")
+}
+
+fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::DocumentAuthority> {
+    if !paths.state.is_absolute() || !paths.product_root.is_absolute() {
+        bail!("release-state authority must be absolute");
+    }
+    #[cfg(unix)]
+    let owner_uid = {
+        use std::os::unix::fs::MetadataExt;
+        let mut ancestor = paths.product_root.as_path();
+        loop {
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
+                        bail!("release-state parent has unsafe filesystem authority");
+                    }
+                    break metadata.uid();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ancestor = ancestor
+                        .parent()
+                        .context("release state has no authority ancestor")?;
+                }
+                Err(error) => return Err(error).context("inspect release-state authority"),
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let owner_uid = 0;
+    Ok(dev_tools_installation::DocumentAuthority {
+        owner_uid,
+        mode: 0o600,
+        limit: RELEASE_STATE_LIMIT,
+    })
 }
 
 fn save_state(paths: &Paths, state: &ReleaseState) -> Result<()> {
@@ -1735,6 +1770,144 @@ impl Paths {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    fn state_test_paths(root: &Path) -> Paths {
+        let product_root = root.join("product");
+        Paths {
+            versions: product_root.join("versions"),
+            current: product_root.join("current"),
+            state: product_root.join("state.json"),
+            root_cache: product_root.join("cache/root.json"),
+            root_etag: product_root.join("cache/root.etag"),
+            manifest_cache: product_root.join("cache/manifest.json"),
+            manifest_etag: product_root.join("cache/manifest.etag"),
+            bin_dir: root.join("bin"),
+            public_binary: root.join("bin/update-all"),
+            executable_name: "update-all".into(),
+            product_root,
+        }
+    }
+
+    #[test]
+    fn release_state_directory_is_not_missing_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::create_dir_all(&paths.state).unwrap();
+        assert!(
+            load_state(&paths).is_err(),
+            "present non-file state must not reset release authority"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_state_symlink_is_not_missing_or_accepted_authority() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        create_private_dir(&paths.product_root).unwrap();
+        let target = temp.path().join("target.json");
+        symlink(&target, &paths.state).unwrap();
+        assert!(
+            load_state(&paths).is_err(),
+            "dangling state link is not absent authority"
+        );
+        fs::write(
+            &target,
+            serde_json::to_vec(&ReleaseState::default()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_state(&paths).is_err(),
+            "state links must not be followed"
+        );
+    }
+
+    #[test]
+    fn release_state_oversized_document_is_not_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        create_private_dir(&paths.product_root).unwrap();
+        let mut bytes = serde_json::to_vec(&ReleaseState::default()).unwrap();
+        bytes.resize(65_537, b' ');
+        atomic_write(&paths.state, &bytes, false).unwrap();
+        assert!(
+            load_state(&paths).is_err(),
+            "release-state reads must be bounded"
+        );
+    }
+
+    #[test]
+    fn release_state_absence_and_valid_boundary_reads_are_nonmutating() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        assert!(load_state(&paths).unwrap().accepted_version.is_none());
+        assert!(!paths.product_root.exists());
+        create_private_dir(&paths.product_root).unwrap();
+        let mut state = ReleaseState::default();
+        state.accepted_version = Some("1.2.3".into());
+        let mut bytes = serde_json::to_vec(&state).unwrap();
+        bytes.resize(65_536, b' ');
+        atomic_write(&paths.state, &bytes, false).unwrap();
+        assert_eq!(
+            load_state(&paths).unwrap().accepted_version.as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(fs::read(&paths.state).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&paths.product_root).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_state_rejects_hardlinks_modes_and_socket_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        create_private_dir(&paths.product_root).unwrap();
+        let bytes = serde_json::to_vec(&ReleaseState::default()).unwrap();
+        atomic_write(&paths.state, &bytes, false).unwrap();
+        for mode in [0o644, 0o700] {
+            fs::set_permissions(&paths.state, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(load_state(&paths).is_err());
+            assert_eq!(
+                fs::metadata(&paths.state).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        fs::set_permissions(&paths.state, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&paths.state, temp.path().join("retained-link")).unwrap();
+        assert!(load_state(&paths).is_err());
+        assert_eq!(fs::read(&paths.state).unwrap(), bytes);
+        fs::remove_file(&paths.state).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(&paths.state).unwrap();
+        assert!(load_state(&paths).is_err());
+        assert!(fs::symlink_metadata(&paths.state).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_state_rejects_linked_and_writable_authority_parent() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        let actual = temp.path().join("actual");
+        create_private_dir(&actual).unwrap();
+        symlink(&actual, &paths.product_root).unwrap();
+        assert!(load_state(&paths).is_err());
+        assert_eq!(fs::read_dir(&actual).unwrap().count(), 0);
+        fs::remove_file(&paths.product_root).unwrap();
+        create_private_dir(&paths.product_root).unwrap();
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(load_state(&paths).is_err());
+        assert_eq!(
+            fs::metadata(&paths.product_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o770
+        );
+    }
 
     struct EnvRestore {
         name: &'static str,
