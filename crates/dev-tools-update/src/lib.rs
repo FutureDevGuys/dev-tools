@@ -273,8 +273,21 @@ pub trait UpdateAdapter {
         &mut self,
     ) -> Result<Option<AuthenticatedCandidate>, UpdateError>;
 
-    /// Performs the explicit product-owned network discovery and authentication step.
+    /// Performs metadata-only product-owned discovery and authentication. May
+    /// refresh release evidence, but never downloads artifacts or changes installation state.
     fn refresh_authenticated_candidate(&mut self) -> Result<AuthenticatedCandidate, UpdateError>;
+
+    /// Prepares authenticated payload bytes for the exact supplied candidate.
+    /// Called only by online install/apply when a newer payload is unavailable.
+    /// May use the network and private quarantine/cache storage, but never changes
+    /// managed installation state. Return the same release and check time with
+    /// artifact availability established; activation rechecks custody and authority.
+    fn prepare_artifact(
+        &mut self,
+        _candidate: &AuthenticatedCandidate,
+    ) -> Result<AuthenticatedCandidate, UpdateError> {
+        Err(UpdateError::new(UpdateErrorKind::Unsupported))
+    }
 
     /// Returns an established installation change fact. Errors default to unknown
     /// progress; use `UpdateError::with_changed` only with independent evidence.
@@ -467,7 +480,7 @@ fn mutate<A: UpdateAdapter>(
     installation: InstallationSnapshot,
     install: bool,
 ) -> OperationResult {
-    let candidate = if request.offline {
+    let mut candidate = if request.offline {
         match adapter.load_authenticated_candidate() {
             Ok(Some(candidate)) => candidate,
             Ok(None) => return blocked_state(policy, request.operation, &installation),
@@ -486,9 +499,6 @@ fn mutate<A: UpdateAdapter>(
     if let Err(error) = validate_candidate(policy, &candidate) {
         return error_result(policy, request.operation, Some(&installation), error);
     }
-    if !candidate.artifact_available {
-        return blocked_state(policy, request.operation, &installation);
-    }
     if installation
         .version
         .as_ref()
@@ -505,6 +515,31 @@ fn mutate<A: UpdateAdapter>(
             Some(&candidate),
             Some(cache_freshness(policy, &candidate, now_unix)),
         );
+    }
+    if !candidate.artifact_available {
+        if request.offline {
+            return blocked_state(policy, request.operation, &installation);
+        }
+        let prepared = match adapter.prepare_artifact(&candidate) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return error_result(policy, request.operation, Some(&installation), error)
+            }
+        };
+        if prepared.verified != candidate.verified
+            || prepared.checked_at_unix != candidate.checked_at_unix
+        {
+            return error_result(
+                policy,
+                request.operation,
+                Some(&installation),
+                UpdateError::new(UpdateErrorKind::Authority),
+            );
+        }
+        if !prepared.artifact_available {
+            return blocked_state(policy, request.operation, &installation);
+        }
+        candidate = prepared;
     }
     let changed = if install {
         adapter.install(&candidate)

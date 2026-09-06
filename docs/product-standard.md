@@ -38,6 +38,8 @@ Every public product provides the following canonical interface:
 
 `update status` is local-only and evaluates authenticated cached release evidence. Evidence older than 24 hours produces `unknown`, never `current`. `update check` is the explicit network boundary and refreshes authenticated cache state. `update install` opts an explicitly downloaded product into its supported managed layout. `update apply` updates an existing managed installation. `update rollback` is network-free and activates only an authenticated receipt-owned retained version. `--offline` prohibits network access and accepts only authenticated cached artifacts.
 
+Metadata refresh does not retrieve artifact payloads. Online install/apply prepares unavailable authenticated bytes through a separate product-owned boundary only when activation is needed; status, check, rollback and offline operations cannot enter that boundary. An already-satisfied version request can be a clean no-op without cached payload bytes, but expired evidence never establishes fresh currentness. Preparation cannot replace the verified release identity or reset its freshness timestamp, and installation still rechecks custody and authority.
+
 An externally managed public command is reported as `external` and is never overwritten implicitly. A product whose first installation requires product-owned policy or enrollment may return `requires_setup`; the common update layer must not create policy, enroll credentials, or weaken the product's approval contract.
 
 Ordinary product operations and `--version` never access the network. Remote release metadata may describe product identity and artifacts, but it may not provide executable commands, arbitrary destinations, shell programs, or privileged effects.

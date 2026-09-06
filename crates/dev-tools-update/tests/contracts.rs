@@ -22,6 +22,9 @@ struct FakeAdapter {
     mutation_error: Option<UpdateError>,
     post_inspection_error: Option<UpdateError>,
     suppress_mutation: bool,
+    prepare_calls: usize,
+    prepared: Option<AuthenticatedCandidate>,
+    prepare_error: Option<UpdateError>,
 }
 
 impl UpdateAdapter for FakeAdapter {
@@ -49,6 +52,24 @@ impl UpdateAdapter for FakeAdapter {
         self.refreshed
             .clone()
             .ok_or(UpdateError::new(UpdateErrorKind::Network))
+    }
+
+    fn prepare_artifact(
+        &mut self,
+        candidate: &AuthenticatedCandidate,
+    ) -> Result<AuthenticatedCandidate, UpdateError> {
+        self.prepare_calls += 1;
+        if let Some(error) = self.prepare_error {
+            return Err(error);
+        }
+        Ok(self.prepared.clone().unwrap_or_else(|| {
+            AuthenticatedCandidate::new(
+                candidate.verified().clone(),
+                candidate.checked_at_unix(),
+                true,
+            )
+            .unwrap()
+        }))
     }
 
     fn install(&mut self, candidate: &AuthenticatedCandidate) -> Result<bool, UpdateError> {
@@ -496,4 +517,115 @@ fn preflight_failure_establishes_no_installation_change() {
     assert_eq!(result.changed, Some(false));
     assert_eq!(adapter.inspect_calls, 1);
     assert_eq!(adapter.apply_calls, 0);
+}
+
+#[test]
+fn current_offline_apply_needs_no_artifact_payload() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.1.0")),
+        cached: Some(candidate("1.1.0", 10, false)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(
+        &policy(),
+        OperationRequest::apply(true),
+        100_000,
+        &mut adapter,
+    );
+    assert_eq!(result.outcome, OperationOutcome::NoOp);
+    assert_eq!(result.changed, Some(false));
+    assert_eq!(adapter.refresh_calls + adapter.apply_calls, 0);
+}
+
+#[test]
+fn online_mutation_has_a_separate_artifact_preparation_boundary() {
+    let mut adapter = FakeAdapter {
+        installation: Some(managed("1.0.0")),
+        refreshed: Some(candidate("1.1.0", 20, false)),
+        ..FakeAdapter::default()
+    };
+    let result = execute(&policy(), OperationRequest::apply(false), 20, &mut adapter);
+    assert_eq!(result.outcome, OperationOutcome::Updated);
+    assert_eq!(result.installed_version.as_deref(), Some("1.1.0"));
+    assert_eq!(adapter.prepare_calls, 1);
+}
+
+#[test]
+fn local_and_metadata_only_operations_never_prepare_artifacts() {
+    for request in [
+        OperationRequest::status(),
+        OperationRequest::check(),
+        OperationRequest::apply(true),
+        OperationRequest::rollback(),
+    ] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed("1.0.0")),
+            cached: Some(candidate("1.1.0", 10, false)),
+            refreshed: Some(candidate("1.1.0", 20, false)),
+            ..FakeAdapter::default()
+        };
+        execute(&policy(), request, 20, &mut adapter);
+        assert_eq!(adapter.prepare_calls, 0);
+    }
+    for (installed, available) in [("1.1.0", false), ("1.0.0", true)] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed(installed)),
+            refreshed: Some(candidate("1.1.0", 20, available)),
+            ..FakeAdapter::default()
+        };
+        execute(&policy(), OperationRequest::apply(false), 20, &mut adapter);
+        assert_eq!(adapter.prepare_calls, 0);
+    }
+}
+
+#[test]
+fn preparation_cannot_replace_authenticated_release_or_freshness() {
+    let original = candidate("1.1.0", 20, false);
+    let mut changed_target = original.verified().clone();
+    changed_target.target = "different-target".into();
+    let mut changed_digest = original.verified().clone();
+    changed_digest.artifact_sha256 = "d".repeat(64);
+    for prepared in [
+        candidate("1.2.0", 20, true),
+        candidate("1.1.0", 21, true),
+        AuthenticatedCandidate::new(changed_target, 20, true).unwrap(),
+        AuthenticatedCandidate::new(changed_digest, 20, true).unwrap(),
+    ] {
+        let mut adapter = FakeAdapter {
+            installation: Some(managed("1.0.0")),
+            refreshed: Some(original.clone()),
+            prepared: Some(prepared),
+            ..FakeAdapter::default()
+        };
+        let result = execute(&policy(), OperationRequest::apply(false), 20, &mut adapter);
+        assert_eq!(result.error_kind, Some(ErrorKind::Authority));
+        assert_eq!(result.changed, Some(false));
+        assert_eq!(adapter.apply_calls, 0);
+    }
+}
+
+#[test]
+fn failed_or_incomplete_preparation_never_enters_installation_mutation() {
+    for error in [
+        None,
+        Some(UpdateError::new(UpdateErrorKind::Network).with_changed(true)),
+    ] {
+        let mut adapter = FakeAdapter {
+            installation: Some(InstallationSnapshot::absent()),
+            refreshed: Some(candidate("1.1.0", 20, false)),
+            prepared: Some(candidate("1.1.0", 20, false)),
+            prepare_error: error,
+            ..FakeAdapter::default()
+        };
+        let result = execute(
+            &policy(),
+            OperationRequest::install(false),
+            20,
+            &mut adapter,
+        );
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.changed, Some(false));
+        assert_eq!(adapter.install_calls, 0);
+        assert_eq!(adapter.prepare_calls, 1);
+    }
 }
