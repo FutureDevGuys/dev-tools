@@ -6,6 +6,8 @@ Each provider call has a 300-second timeout, adjustable with `--command-timeout 
 
 The opt-in real-provider acceptance test runs with `SKILLS_SYNC_ACCEPTANCE_NODE=/absolute/node SKILLS_SYNC_ACCEPTANCE_CLI=/absolute/skills/bin/cli.mjs cargo test -p skills-sync --test upstream_acceptance -- --ignored`. It requires the pinned released upstream 1.5.25 and uses an isolated home/project plus a loopback synthetic source; it never changes normal installed skills.
 
+Set `SKILLS_SYNC_ACCEPTANCE_BINARY=/absolute/skills-sync` as well to exercise an explicitly selected installed release instead of Cargo's build. [Linux release acceptance](skills-sync-sync-configs-acceptance.md) records the source-bound Skills Sync 0.2.0 and SyncConfigs 0.2.1 artifacts and rollback evidence.
+
 `skills-sync` reconciles agent skill discovery, locking, linking, adoption, dry-run, and JSON output from explicit public provider definitions. Personal source manifests, agent selection, and managed-lock policy belong to the caller.
 
 Use `skills-sync repair` for the broad repair workflow; preview with `skills-sync repair --dry-run` and retain your existing scope and provider arguments. `doctor` currently remains an equivalent mutating compatibility spelling, and both emit the legacy JSON `command: "doctor"` value. This expansion does not change existing workflows or implement the common read-only doctor. [ADR 0014](adr/0014-skills-sync-explicit-repair-transition.md) defines the release and consumer-migration gates before that later change. Repair can run the selected upstream provider; it is not a network-free diagnostic command.

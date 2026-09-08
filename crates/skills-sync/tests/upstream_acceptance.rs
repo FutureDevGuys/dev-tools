@@ -123,6 +123,13 @@ fn run(program: &str, prefix: &[&str], home: &Path, cwd: &Path, args: &[&str]) -
 fn real_upstream_updates_restores_and_repairs_without_expanding_selection() {
     let node = std::env::var("SKILLS_SYNC_ACCEPTANCE_NODE").expect("explicit Node executable");
     let cli = std::env::var("SKILLS_SYNC_ACCEPTANCE_CLI").expect("explicit upstream cli.mjs");
+    let binary = std::env::var_os("SKILLS_SYNC_ACCEPTANCE_BINARY")
+        .map(|path| path.into_string().expect("UTF-8 product executable"))
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_skills-sync").to_owned());
+    assert!(
+        Path::new(&binary).is_absolute(),
+        "absolute product executable"
+    );
     let server = Server::new();
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path();
@@ -186,7 +193,7 @@ fn real_upstream_updates_restores_and_repairs_without_expanding_selection() {
     ];
     server.revision.store(2, Ordering::Release);
     let preview = run(
-        env!("CARGO_BIN_EXE_skills-sync"),
+        &binary,
         &[],
         home,
         &cwd,
@@ -199,13 +206,7 @@ fn real_upstream_updates_restores_and_repairs_without_expanding_selection() {
         .iter()
         .any(|plan| plan["reason"] == "update"));
     assert!(fs::read_to_string(&tracked).unwrap().contains("revision 1"));
-    run(
-        env!("CARGO_BIN_EXE_skills-sync"),
-        &[],
-        home,
-        &cwd,
-        &[&["sync"][..], &base].concat(),
-    );
+    run(&binary, &[], home, &cwd, &[&["sync"][..], &base].concat());
     assert!(fs::read_to_string(&tracked).unwrap().contains("revision 2"));
     assert!(fs::read_to_string(canonical.join("missing/SKILL.md"))
         .unwrap()
@@ -223,13 +224,7 @@ fn real_upstream_updates_restores_and_repairs_without_expanding_selection() {
     fs::remove_file(home.join(".claude/skills/tracked")).unwrap();
     server.revision.store(3, Ordering::Release);
     for _ in 0..2 {
-        let repaired = run(
-            env!("CARGO_BIN_EXE_skills-sync"),
-            &[],
-            home,
-            &cwd,
-            &[&["repair"][..], &base].concat(),
-        );
+        let repaired = run(&binary, &[], home, &cwd, &[&["repair"][..], &base].concat());
         let repaired: Value = serde_json::from_slice(&repaired).unwrap();
         assert!(repaired["planned_commands"].as_array().unwrap().is_empty());
         assert!(fs::read_to_string(&tracked).unwrap().contains("revision 2"));
@@ -257,7 +252,7 @@ fn real_upstream_updates_restores_and_repairs_without_expanding_selection() {
         .contains("revision 3"));
     server.revision.store(4, Ordering::Release);
     run(
-        env!("CARGO_BIN_EXE_skills-sync"),
+        &binary,
         &[],
         home,
         &cwd,

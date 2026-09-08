@@ -1,7 +1,7 @@
 # ADR 0001: Tracked upstream updates and local global-link repair
 
-status: proposed
-verification: pending
+status: accepted
+verification: verified
 
 ## Decision
 
@@ -21,4 +21,4 @@ Linux public inventory capture uses the anonymous regular-file stdout mode of gl
 
 Public CLI fixtures cover selected updates, restoration, unrelated ownership, local/repeat/broken-link repair, lock mismatch, provider version rejection, ambiguous names, preview/status preservation, timeout and running interruption. Opt-in acceptance uses an independently installed pinned `skills` 1.5.25 release and a public synthetic loopback well-known source, checking actual payload changes, restoration, source non-expansion, update-free repeated global repair and project/global isolation. No downstream consumer data or checkout is used.
 
-Signed source-bound release and installed-artifact acceptance remain required before consumer cutover. These changes do not claim common read-only doctor/update conformance or native Windows/macOS support. Binary rollback restores old sync behavior but does not revert upstream changes already applied.
+[Linux release acceptance](../../../../docs/skills-sync-sync-configs-acceptance.md) records the signed source-bound release, installed-artifact real-upstream acceptance and offline retained rollback. These changes do not claim common read-only doctor/update conformance or native Windows/macOS support. Binary rollback restores old sync behavior but does not revert upstream changes already applied.

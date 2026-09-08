@@ -1,7 +1,7 @@
 # ADR 0001: Preserve TOML suppression through key retirement
 
-status: proposed
-verification: pending
+status: accepted
+verification: verified
 
 ## Decision
 
@@ -15,4 +15,4 @@ The directive scanner uses parser-provided string spans to exclude comment/heade
 
 Public overlay tests cover nested/array/signed NaN, genuine finite/infinity conflicts, retired root/nested keys, empty-table retirement, future-source directives, multiline-string counterexamples and repeat convergence. Public CLI tests exercise receipt-backed retirement with NaN and suppression in one target. The original semantic error, lost directive and false multiline-string suppression each had a failing regression before correction.
 
-Signed source-bound release and installed-artifact acceptance remain pending; source tests do not authorize downstream artifact cutover. Binary rollback does not reverse an already-applied configuration merge.
+[Linux release acceptance](../../../../docs/skills-sync-sync-configs-acceptance.md) records the signed source-bound release, authenticated installation and offline retained rollback. Binary rollback does not reverse an already-applied configuration merge.
