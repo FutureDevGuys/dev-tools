@@ -75,10 +75,31 @@ fn repair_restores_explicit_agent_links_without_reinstalling_payloads() {
     let fixture = Fixture::new();
     fs::write(fixture.home().join("reject-add"), "").unwrap();
     let before = fs::read(fixture.home().join(".agents/skills/tracked/SKILL.md")).unwrap();
+    let disabled = fixture.payload(&[
+        "repair",
+        "--adopt-policy",
+        "off",
+        "--link-policy",
+        "off",
+        "--agent-link-policy",
+        "off",
+        "--agent",
+        "claude-code",
+        "--dry-run",
+    ]);
+    assert!(disabled["planned_commands"].as_array().unwrap().is_empty());
+    assert!(disabled["planned_agent_repairs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let args = [
         "repair",
         "--adopt-policy",
         "off",
+        "--link-policy",
+        "off",
+        "--agent-link-policy",
+        "reconcile",
         "--agent",
         "codex",
         "--agent",

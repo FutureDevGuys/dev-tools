@@ -13,6 +13,8 @@ Only installed names present in the initially selected lock and physically under
 
 Provider calls use shared `dev-tools-command` 0.1.2, direct native argv, captured caller environment and working directory, closed stdin, 16 MiB per-stream output bounds, a timeout (300 seconds by default, configurable from 1 through 86400), and Ctrl-C cancellation. Provider failure stops later restoration/link actions. Interruption exits 130 and preserves already-entered upstream effects; this is not rollback. Primary and cleanup categories are retained without captured provider diagnostics. The existing MIT/Apache-2.0 shared runner and already-locked MIT/Apache-2.0 `ctrlc` dependency supply these mechanisms without another runtime or supervisor. Legacy optional Git source inference is outside this provider-runtime increment.
 
+Explicit `--agent-link-policy reconcile` permits these canonical local link repairs even with `--link-policy off`; the latter still disables upstream link-registration calls. This separation lets callers request local repair without reinstalling an existing payload.
+
 Linux public inventory capture uses the anonymous regular-file stdout mode of global ADR 0022 to avoid Node early-exit pipe truncation. Its child-wide file-size limit also affects incidental cache writes, so the provider must already be installed and listing must tolerate the bound. Mutation/version calls use bounded pipes. Other targets retain bounded pipe capture but gain no native qualification claim from Linux tests.
 
 ## Verification and release

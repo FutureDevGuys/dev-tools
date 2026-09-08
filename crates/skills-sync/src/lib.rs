@@ -1134,7 +1134,7 @@ impl App {
                 } else {
                     self.payload.project_unlinked.push(installed_entry);
                 }
-                if self.options.link_policy != LinkPolicy::Off {
+                if local_repair || self.options.link_policy != LinkPolicy::Off {
                     to_link.push(desired_entry.clone());
                     if !local_repair {
                         link_batches
