@@ -76,6 +76,7 @@ fn completion_is_static_despite_invalid_operational_environment() {
             "doctor",
             "repair",
             "agent-link-policy",
+            "command-timeout",
         ] {
             assert!(script.contains(token), "{shell}: missing {token}");
         }

@@ -149,6 +149,49 @@ fn standalone_overlay_commands_preserve_check_and_dry_run_semantics() {
 }
 
 #[test]
+fn standalone_toml_retirement_keeps_nan_and_disabled_settings_on_repeat() {
+    let root = TempDir::new().unwrap();
+    let source = root.path().join("source.toml");
+    let target = root.path().join("target.toml");
+    let state = root.path().join("state");
+    fs::write(&source, "old = true\noptional = true\n").unwrap();
+    fs::write(&target, "# optional = false\nold = true\nlocal = nan\n").unwrap();
+    let run = || {
+        sync_configs()
+            .arg("toml-overlay")
+            .arg(&source)
+            .arg(&target)
+            .arg("--reconcile-removed-keys")
+            .args(["--managed-overlay-id", "standalone-retirement"])
+            .arg("--state-root")
+            .arg(&state)
+            .output()
+            .unwrap()
+    };
+    let initial = run();
+    assert!(initial.status.success(), "{:?}", initial);
+    fs::write(&source, "optional = true\n").unwrap();
+    let retired = run();
+    assert!(retired.status.success(), "{:?}", retired);
+    let stable = fs::read(&target).unwrap();
+    let receipt = fs::read(state.join("overlays/standalone-retirement.json")).unwrap();
+    let repeated = run();
+    assert!(repeated.status.success(), "{:?}", repeated);
+    assert_eq!(fs::read(&target).unwrap(), stable);
+    assert_eq!(
+        fs::read(state.join("overlays/standalone-retirement.json")).unwrap(),
+        receipt
+    );
+    assert!(String::from_utf8_lossy(&repeated.stdout).starts_with("up-to-date "));
+    let text = String::from_utf8(stable).unwrap();
+    assert!(text.contains("# optional = false"));
+    let parsed: toml_edit::DocumentMut = text.parse().unwrap();
+    assert!(parsed["local"].as_float().unwrap().is_nan());
+    assert!(parsed.get("optional").is_none());
+    assert!(parsed.get("old").is_none());
+}
+
+#[test]
 fn standalone_overlay_commands_expand_home_paths_and_keep_inactive_receipt_flags_nonmutating() {
     let root = TempDir::new().expect("tempdir");
     let home = root.path().join("home");

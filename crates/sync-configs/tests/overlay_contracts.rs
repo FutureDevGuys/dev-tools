@@ -682,3 +682,116 @@ fn target_wins_toml_mode_only_adds_missing_values() {
     assert_eq!(result.added, 1);
     assert_eq!(result.overwritten, 0);
 }
+
+#[test]
+fn toml_nonfinite_values_survive_overlay_and_repeat() {
+    for conflict_policy in [TomlConflictPolicy::Source, TomlConflictPolicy::Target] {
+        let options = TomlOverlayOptions {
+            conflict_policy,
+            preserve_target_layout: true,
+            ..TomlOverlayOptions::default()
+        };
+        let source = "managed = true\nshared = nan\n";
+        let target = "shared = nan\nlocal = [nan, +nan, -nan, inf, -inf]\n[nested]\nvalue = nan\n";
+        let first = toml::overlay_toml_text(source, target, &options, &BTreeSet::new())
+            .expect("TOML nonfinite values have stable document semantics");
+        assert!(first.text.contains("local = [nan, +nan, -nan, inf, -inf]"));
+        assert!(first.text.contains("value = nan"));
+        assert_eq!(first.overwritten, 0);
+        let second = toml::overlay_toml_text(source, &first.text, &options, &BTreeSet::new())
+            .expect("repeat nonfinite overlay");
+        assert!(!second.changed);
+        assert_eq!(second.overwritten, 0);
+    }
+}
+
+#[test]
+fn toml_retirement_preserves_suppression_on_following_runs() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.toml");
+    let target = directory.path().join("target.toml");
+    let options = TomlOverlayOptions {
+        reconcile_removed_keys: true,
+        managed_overlay_id: Some("retirement-comments".into()),
+        state_root: Some(directory.path().join("state")),
+        preserve_target_layout: true,
+        ..TomlOverlayOptions::default()
+    };
+    fs::write(&source, "retired = true\noptional = true\n").unwrap();
+    fs::write(&target, "# optional = false\nretired = true\nlocal = 7\n").unwrap();
+    toml::overlay_toml_file(&source, &target, &options).unwrap();
+    fs::write(&source, "optional = true\n").unwrap();
+    let retirement = toml::overlay_toml_file(&source, &target, &options).unwrap();
+    assert_eq!(retirement.removed, 1);
+    assert!(retirement.text.contains("# optional = false"));
+    let repeat = toml::overlay_toml_file(&source, &target, &options).unwrap();
+    assert_eq!(repeat.suppressed, vec![key(&["optional"])]);
+    assert!(!repeat.changed);
+    assert!(!repeat.ownership_changed);
+}
+
+#[test]
+fn toml_retirement_keeps_scoped_and_table_directives_after_their_anchors_disappear() {
+    for preserve_target_layout in [false, true] {
+        let options = TomlOverlayOptions {
+            preserve_target_layout,
+            ..TomlOverlayOptions::default()
+        };
+        let source = "unrelated = true\n";
+        let target = "# [disabled]\nroot_retired = 1\n[section]\n# \"option.with.dot\" = false\nretired = 2\n[other]\nlocal = 3\n";
+        let retired = BTreeSet::from([key(&["root_retired"]), key(&["section", "retired"])]);
+        let first = toml::overlay_toml_text(source, target, &options, &retired).unwrap();
+        assert_eq!(first.removed, 2);
+        // These directives must survive even though neither setting is yet in
+        // the source. Losing them would silently activate a later addition.
+        let next_source =
+            "unrelated = true\n[section]\n\"option.with.dot\" = true\n[disabled]\nadded = true\n";
+        let second =
+            toml::overlay_toml_text(next_source, &first.text, &options, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            second.suppressed,
+            vec![
+                key(&["disabled", "added"]),
+                key(&["section", "option.with.dot"])
+            ]
+        );
+        let parsed: toml_edit::DocumentMut = second.text.parse().unwrap();
+        assert!(parsed.get("section").is_none());
+        assert!(parsed.get("disabled").is_none());
+        assert_eq!(parsed["other"]["local"].as_integer(), Some(3));
+        let repeat =
+            toml::overlay_toml_text(next_source, &second.text, &options, &BTreeSet::new()).unwrap();
+        assert!(!repeat.changed);
+    }
+}
+
+#[test]
+fn toml_nonfinite_equality_does_not_hide_a_real_conflict() {
+    for (source, target) in [("1.5", "nan"), ("nan", "1.5"), ("inf", "-inf")] {
+        let result = toml::overlay_toml_text(
+            &format!("value = {source}\n"),
+            &format!("value = {target}\n"),
+            &TomlOverlayOptions::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(result.overwritten, 1);
+        assert_eq!(result.text, format!("value = {source}\n"));
+    }
+}
+
+#[test]
+fn toml_comment_directives_exclude_multiline_string_contents() {
+    let target = "description = '''\n[not_a_table]\n# optional = false\n# [disabled]\n'''\n# root_option = false\nlocal = 1\n";
+    let source = "root_option = true\n[not_a_table]\noptional = true\n[disabled]\nenabled = true\n";
+    let options = TomlOverlayOptions {
+        preserve_target_layout: true,
+        ..TomlOverlayOptions::default()
+    };
+    let result = toml::overlay_toml_text(source, target, &options, &BTreeSet::new()).unwrap();
+    assert_eq!(result.suppressed, vec![key(&["root_option"])]);
+    let parsed: toml_edit::DocumentMut = result.text.parse().unwrap();
+    assert_eq!(parsed["not_a_table"]["optional"].as_bool(), Some(true));
+    assert_eq!(parsed["disabled"]["enabled"].as_bool(), Some(true));
+    assert!(parsed.get("root_option").is_none());
+}

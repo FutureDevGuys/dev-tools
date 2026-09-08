@@ -1,5 +1,7 @@
 # sync-configs
 
+The [TOML retirement ADR](../crates/sync-configs/docs/adr/0001-toml-suppression-retirement-and-nan.md) records NaN comparison and preservation of disabling comments when receipt-owned keys retire.
+
 `sync-configs` is a config-only convergence engine. It consumes an explicit trusted manifest and supports symlink and copy realization, recursive expansion and filters, permissions, JSON and TOML overlays, ownership receipts, removed-key reconciliation, trusted hooks, bounded native-sudo hooks and regular-file targets, profiles, external profile maps, dry-run, validation, and structured value-free output.
 
 Results remain buffered into deterministic status groups. Informational records join their own group instead of appearing before the report, and captured hook output uses the same colored, aligned group/name columns as entry results. An interactive terminal receives one immediate value-free line in those same colored, aligned columns before each selected pre- or post-script so a long native or network hook cannot look frozen; the line contains only the phase and declared entry labels. Noninteractive and JSON consumers remain quiet until their normal result, and JSON stdout contains exactly one JSON document.
@@ -53,6 +55,8 @@ The same native executable exposes focused operations for trusted callers that d
 ## Comment-aware TOML overlays
 
 TOML overlays default to `commented_target_policy: respect`. When the target already contains a recognizable commented assignment, or a commented table header covering a source assignment, that source path stays inactive. The final plain report lists only dotted paths under `Suppressed by comments`; it never includes their values. Leading whitespace before `#` is supported. Use `activate` only when comments are documentation rather than an intentional disabled state, or `error` when any suppression must block the run.
+
+Retiring a key or an empty table does not retire its surrounding suppression directives. If the TOML editor drops a directive with its former formatting anchor, the overlay retains it at the document's beginning, fully qualifying a formerly table-scoped assignment. This also protects settings added by a later source revision. Comment-shaped text inside a multiline string is data, not a suppression directive. TOML `nan`, signed NaN spellings, and infinities remain valid overlay values; semantic verification treats NaN as equivalent to NaN without hiding finite-value or opposite-infinity conflicts.
 
 ```yaml
 entries:

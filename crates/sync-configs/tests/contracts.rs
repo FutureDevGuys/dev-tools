@@ -7,7 +7,10 @@ fn sync_configs_has_one_canonical_binary_name() {
         .output()
         .expect("run canonical command name");
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).starts_with("sync-configs 0.2.0"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("sync-configs ", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

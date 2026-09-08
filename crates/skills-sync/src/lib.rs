@@ -1,6 +1,8 @@
 //! Native implementation of the `skills-sync` command.
 
 mod completion;
+mod runtime;
+mod sync;
 
 mod build_info {
     include!("../../build_info_runtime.rs");
@@ -12,15 +14,11 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EXIT_USAGE: i32 = 1;
 const EXIT_SCHEMA: i32 = 2;
@@ -189,6 +187,7 @@ struct Options {
     project_lock_file: PathBuf,
     ignore_project_lock: bool,
     skills_command: Vec<String>,
+    command_timeout: Duration,
     json_output: bool,
     dry_run: bool,
     apply: bool,
@@ -487,7 +486,10 @@ pub fn main_entry(args: Vec<String>) -> i32 {
             print_help();
             0
         }
-        Ok(options) => match App::new(options).and_then(App::run) {
+        Ok(options) => match runtime::install_cancellation()
+            .and_then(|()| App::new(options))
+            .and_then(App::run)
+        {
             Ok(code) => code,
             Err(err) => {
                 eprintln!("skills-sync: {err:#}");
@@ -554,6 +556,7 @@ impl Options {
                     .join("skills-lock.json")
             }),
             ignore_project_lock: env_bool("SKILLS_SYNC_NO_PROJECT_LOCK")?,
+            command_timeout: Duration::from_secs(300),
             skills_command: shell_words(
                 &env_string("SKILLS_SYNC_SKILLS_CMD")
                     .unwrap_or_else(|| "npx skills@latest".to_string()),
@@ -688,6 +691,17 @@ impl Options {
                 "-c" | "--skills-cmd" => {
                     let value = required_value(&args, index, "--skills-cmd")?;
                     options.skills_command = shell_words(value)?;
+                    index += 2;
+                }
+                "--command-timeout" => {
+                    let seconds = required_value(&args, index, "--command-timeout")?
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|seconds| (1..=86400).contains(seconds))
+                        .ok_or_else(|| {
+                            anyhow!("--command-timeout requires seconds from 1 through 86400")
+                        })?;
+                    options.command_timeout = Duration::from_secs(seconds);
                     index += 2;
                 }
                 "-a" | "--agent" => {
@@ -857,6 +871,9 @@ impl App {
     }
 
     fn run(mut self) -> Result<i32> {
+        if runtime::cancelled() {
+            return Ok(self.fail(130, "operation cancelled"));
+        }
         match self.options.mode {
             CommandMode::Lock => {
                 if self.options.lock_action == Some(LockAction::Repair) {
@@ -942,13 +959,22 @@ impl App {
                 Ok(installed) => installed,
                 Err(code) => return Ok(code),
             };
-            self.build_scope_plans("global");
         }
         if self.include_project {
             self.payload.project_installed = match self.list_installed("project") {
                 Ok(installed) => installed,
                 Err(code) => return Ok(code),
             };
+        }
+        if self.options.mode == CommandMode::Sync {
+            if let Err(code) = self.prepare_updates() {
+                return Ok(code);
+            }
+        }
+        if self.include_global {
+            self.build_scope_plans("global");
+        }
+        if self.include_project {
             self.build_scope_plans("project");
         }
         if self.include_global {
@@ -1068,6 +1094,13 @@ impl App {
                 self.payload.planned_commands.push(plan);
                 continue;
             };
+            if self.options.mode == CommandMode::Sync
+                && !self.is_canonical_scope_skill(scope, installed_entry)
+            {
+                // App-owned and externally placed installations do not become
+                // standalone managed payloads just by sharing a lock name.
+                continue;
+            }
             let missing_agents = if explicit_agents {
                 let installed_agents = installed_entry.agents.iter().collect::<BTreeSet<_>>();
                 agents
@@ -1094,6 +1127,7 @@ impl App {
                 installed_entry.agents.is_empty()
             };
             if needs_link {
+                let local_repair = self.repair_links_locally(scope, installed_entry);
                 let installed_entry = (*installed_entry).clone();
                 if scope == "global" {
                     self.payload.global_unlinked.push(installed_entry);
@@ -1102,7 +1136,7 @@ impl App {
                 }
                 if self.options.link_policy != LinkPolicy::Off {
                     to_link.push(desired_entry.clone());
-                    if explicit_agents || !self.repair_links_locally(scope) {
+                    if !local_repair {
                         link_batches
                             .entry((desired_entry.repair_source(), missing_agents))
                             .or_default()
@@ -1216,6 +1250,16 @@ impl App {
             if installed.path.is_empty() {
                 continue;
             }
+            if self.options.mode == CommandMode::Sync
+                && (!self
+                    .payload
+                    .global_desired
+                    .iter()
+                    .any(|desired| desired.slug == installed.slug)
+                    || !self.is_canonical_scope_skill("global", installed))
+            {
+                continue;
+            }
             let path = PathBuf::from(&installed.path);
             canonical.insert(
                 installed.slug.clone(),
@@ -1255,6 +1299,9 @@ impl App {
             let path = entry.path();
             let slug = sanitize_name(&name);
             let canonical_skill = canonical.get(&slug);
+            if self.options.mode == CommandMode::Sync && canonical_skill.is_none() {
+                continue;
+            }
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -1609,6 +1656,28 @@ impl App {
                 }
                 let link_path = agent_dir.path.join(&desired.slug);
                 if fs::symlink_metadata(&link_path).is_ok() {
+                    if policy.creates_missing_links() {
+                        for repair in &mut self.payload.planned_agent_repairs {
+                            let old_target = match repair {
+                                AgentLinkRepair::RemoveBrokenSymlink { path, target, .. }
+                                | AgentLinkRepair::RemoveInvalidSymlink { path, target, .. }
+                                    if Path::new(path) == link_path =>
+                                {
+                                    Some(target.clone())
+                                }
+                                _ => None,
+                            };
+                            if let Some(old_target) = old_target {
+                                *repair = AgentLinkRepair::ReplaceNoncanonicalSymlink {
+                                    name: desired.name.clone(),
+                                    agent_dir: path_string(&agent_dir.path),
+                                    path: path_string(&link_path),
+                                    old_target,
+                                    target: path_string(&canonical_skill.path),
+                                };
+                            }
+                        }
+                    }
                     continue;
                 }
                 let issue = AgentLinkIssue {
@@ -1636,19 +1705,23 @@ impl App {
         }
     }
 
-    fn repair_links_locally(&self, scope: &str) -> bool {
+    fn repair_links_locally(&self, scope: &str, installed: &InstalledSkill) -> bool {
         if scope != "global" || !effective_agent_link_policy(&self.options).creates_missing_links()
         {
             return false;
         }
         let home = home_dir();
-        let canonical_global_dir = home.join(".agents/skills");
+        let canonical_skill = home.join(".agents/skills").join(&installed.slug);
+        if !same_path(Path::new(&installed.path), &canonical_skill)
+            || !canonical_skill.join("SKILL.md").is_file()
+        {
+            return false;
+        }
         let agents = self.resolve_target_agents(scope);
         !agents.is_empty()
-            && agents.iter().all(|agent| {
-                agent_skill_dir(&home, agent)
-                    .is_some_and(|agent_dir| !same_path(&agent_dir.path, &canonical_global_dir))
-            })
+            && agents
+                .iter()
+                .all(|agent| agent_skill_dir(&home, agent).is_some())
     }
 
     fn effective_adopt_policy(&self) -> AdoptPolicy {
@@ -1711,7 +1784,6 @@ impl App {
                 "skills list {}--json failed",
                 if scope == "global" { "-g " } else { "" }
             );
-            self.payload.stderr = Some(result.stderr.trim().to_string());
             return Err(self.fail(EXIT_USAGE, &message));
         }
         let parsed: Value = match serde_json::from_str(&result.stdout) {
@@ -1820,24 +1892,18 @@ impl App {
             return Err(anyhow!("empty skills command"));
         };
         let command_program = resolve_command_program(program);
-        let (capture, stdout_file) = TemporaryCapture::create("list")?;
-        let output = Command::new(&command_program)
+        let mut command = Command::new(&command_program);
+        command
             .args(self.options.skills_command.iter().skip(1))
-            .args(args)
-            .env_remove("XDG_STATE_HOME")
-            .stdout(Stdio::from(stdout_file))
-            .output()
-            .map_err(|err| {
-                anyhow!(
-                    "failed to run {}: {err}",
-                    command_to_string(&self.options.skills_command)
-                )
-            })?;
-        let stdout = capture.read_and_remove()?;
+            .args(args);
+        let output = runtime::execute(
+            command,
+            self.options.command_timeout,
+            args.first().is_some_and(|arg| arg == "list"),
+        )?;
         Ok(ChildResult {
             status: output.status.code().unwrap_or(EXIT_USAGE),
-            stdout,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         })
     }
 
@@ -1848,31 +1914,24 @@ impl App {
         self.dedupe_plans();
         let commands = self.payload.planned_commands.clone();
         for planned in commands {
-            let Some(program) = planned.argv.first() else {
-                return self.fail(EXIT_USAGE, "empty planned command");
-            };
-            let command_program = resolve_command_program(program);
-            let child = Command::new(&command_program)
-                .args(planned.argv.iter().skip(1))
-                .env_remove("XDG_STATE_HOME")
-                .output();
+            if planned.reason == "update" {
+                // Updates ran before the fresh restore/link observation.
+                continue;
+            }
+            let child = self.run_skills(&planned.argv[self.options.skills_command.len()..]);
             let output = match child {
                 Ok(output) => output,
                 Err(err) => {
-                    let message = format!("failed to run {}: {err}", planned.command);
+                    let message = err.to_string();
                     return self.fail(EXIT_USAGE, &message);
                 }
             };
-            if !output.status.success() {
+            if output.status != 0 {
                 let mut message = format!("command failed: {}", planned.command);
                 if let Err(err) = self.apply_post_command_agent_cleanup() {
                     message.push_str(&format!("; post-command cleanup failed: {err}"));
                 }
                 self.drop_resolved_agent_link_issues();
-                if self.options.json_output {
-                    self.payload.stderr =
-                        Some(String::from_utf8_lossy(&output.stderr).into_owned());
-                }
                 return self.fail(EXIT_USAGE, &message);
             }
             self.payload.applied.push(AppliedPlan {
@@ -1884,12 +1943,15 @@ impl App {
                 command: planned.command,
             });
             if !self.options.quiet && self.options.verbose && !output.stdout.is_empty() {
-                print!("{}", String::from_utf8_lossy(&output.stdout));
+                print!("{}", output.stdout);
             }
         }
         let repairs = self.payload.planned_agent_repairs.clone();
         self.payload.planned_agent_repairs.clear();
         for repair in repairs {
+            if runtime::cancelled() {
+                return self.fail(130, "operation cancelled");
+            }
             if !agent_link_repair_still_applies(&repair) {
                 continue;
             }
@@ -1910,7 +1972,7 @@ impl App {
     }
 
     fn verify_post_apply_agent_visibility(&mut self) -> std::result::Result<(), i32> {
-        if self.payload.applied.is_empty()
+        if (self.payload.applied.is_empty() && self.payload.applied_agent_repairs.is_empty())
             || self.options.all_agents
             || self.options.forced_agents.is_empty()
         {
@@ -1919,7 +1981,9 @@ impl App {
         let required_agents = self.options.forced_agents.clone();
         let mut failures = Vec::new();
         for scope in ["global", "project"] {
-            if !self.payload.applied.iter().any(|plan| plan.scope == scope) {
+            if !self.payload.applied.iter().any(|plan| plan.scope == scope)
+                && !(scope == "global" && !self.payload.applied_agent_repairs.is_empty())
+            {
                 continue;
             }
             let installed = self.list_installed(scope)?;
@@ -2274,6 +2338,7 @@ impl App {
     }
 
     fn fail(&mut self, code: i32, message: &str) -> i32 {
+        let code = if runtime::cancelled() { 130 } else { code };
         push_unique(&mut self.payload.errors, message.to_string());
         if self.options.json_output {
             self.render_json_and_return(code)
@@ -2582,63 +2647,6 @@ impl Style {
 struct ChildResult {
     status: i32,
     stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug)]
-struct TemporaryCapture {
-    path: PathBuf,
-}
-
-impl TemporaryCapture {
-    fn create(label: &str) -> Result<(Self, File)> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let process_id = std::process::id();
-        for attempt in 0..64 {
-            let path = std::env::temp_dir().join(format!(
-                "skills-sync-{label}-{process_id}-{timestamp}-{attempt}.json"
-            ));
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            match options.open(&path) {
-                Ok(file) => return Ok((Self { path }, file)),
-                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(anyhow!("failed to create temporary {label} capture: {err}"));
-                }
-            }
-        }
-        Err(anyhow!(
-            "failed to create temporary {label} capture: unique path unavailable"
-        ))
-    }
-
-    fn read_and_remove(self) -> Result<String> {
-        let contents = fs::read_to_string(&self.path).with_context(|| {
-            format!(
-                "failed to read temporary skills output from {}",
-                self.path.display()
-            )
-        })?;
-        fs::remove_file(&self.path).with_context(|| {
-            format!(
-                "failed to remove temporary skills output {}",
-                self.path.display()
-            )
-        })?;
-        Ok(contents)
-    }
-}
-
-impl Drop for TemporaryCapture {
-    fn drop(&mut self) {
-        let _cleanup_result = fs::remove_file(&self.path);
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2814,10 +2822,8 @@ fn effective_agent_link_policy(options: &Options) -> AgentLinkPolicy {
         return policy;
     }
     match options.mode {
-        CommandMode::Doctor | CommandMode::Status => AgentLinkPolicy::Reconcile,
-        CommandMode::Sync | CommandMode::Lock | CommandMode::Adopt | CommandMode::Help => {
-            AgentLinkPolicy::Off
-        }
+        CommandMode::Doctor | CommandMode::Status | CommandMode::Sync => AgentLinkPolicy::Reconcile,
+        CommandMode::Lock | CommandMode::Adopt | CommandMode::Help => AgentLinkPolicy::Off,
     }
 }
 
@@ -3283,6 +3289,12 @@ fn build_install_source(entry: &Value) -> String {
     let Some(entry) = entry.as_object() else {
         return String::new();
     };
+    if json_string(entry, "sourceType") == "well-known" {
+        let source_base = json_string(entry, "sourceBaseUrl");
+        if !source_base.is_empty() {
+            return source_base;
+        }
+    }
     let ref_value = json_string(entry, "ref");
     let source = json_string(entry, "source");
     let source_url = json_string(entry, "sourceUrl");
@@ -3629,6 +3641,7 @@ fn should_skip_skill_tree_dir(name: &str) -> bool {
 }
 
 fn write_json_following_useful_symlink(path: &Path, value: &Value) -> Result<()> {
+    runtime::check_cancellation()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create lock directory {}", parent.display()))?;
@@ -3652,6 +3665,7 @@ fn write_json_following_useful_symlink(path: &Path, value: &Value) -> Result<()>
 }
 
 fn apply_agent_link_repair(repair: &AgentLinkRepair) -> Result<()> {
+    runtime::check_cancellation()?;
     match repair {
         AgentLinkRepair::CreateMissingSymlink { path, target, .. } => {
             let path = PathBuf::from(path);
@@ -4182,8 +4196,11 @@ COMMANDS
         Emit checkout-independent common product build information.
 
     sync
-        Restore skills from the selected lock files and repair installed skills
-        that have no agent links. This is the default command.
+        Update explicitly tracked canonical installations through upstream, then
+        restore missing locked skills and repair agent links. Does not expand
+        sources or update untracked/app-owned skills. This is the default command.
+        Updates require skills 1.5.25+ in the 1.x series and the selected lock
+        must be the upstream runtime lock. Use repair for update-free setup.
 
     status
         Show what sync would do without making changes.
@@ -4300,6 +4317,10 @@ OPTIONS
         Command used to call the upstream skills CLI. Use --skills-cmd skills
         when `skills` is already installed. Default: npx skills@latest.
 
+    --command-timeout SECONDS
+        Bound each upstream invocation to 1..86400 seconds (default: 300).
+        Ctrl-C stops the owned provider and prevents later planned mutations.
+
     -a, --agent NAME
         Force one explicit upstream --agent target. Repeat this flag for
         multiple agents.
@@ -4324,7 +4345,7 @@ OPTIONS
 
     --agent-link-policy off|warn|safe|reconcile
         Choose whether existing per-agent skill directories are audited and
-        repaired. doctor and status default to reconcile; sync defaults to off.
+        repaired. doctor, status, and sync default to reconcile.
 
     --agent-dir PATH
         Add one extra existing agent skill directory to the audit set. Repeat

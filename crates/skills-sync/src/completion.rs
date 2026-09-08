@@ -55,6 +55,7 @@ fn operational_options(mut command: Command) -> Command {
         ("global-lock-file", Some('G'), ValueHint::FilePath),
         ("project-lock-file", Some('P'), ValueHint::FilePath),
         ("skills-cmd", Some('c'), ValueHint::Other),
+        ("command-timeout", None, ValueHint::Other),
         ("agent", Some('a'), ValueHint::Other),
         ("agent-dir", None, ValueHint::DirPath),
         ("source", None, ValueHint::Other),

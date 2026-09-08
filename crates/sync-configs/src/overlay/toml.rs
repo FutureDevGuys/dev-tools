@@ -53,7 +53,7 @@ pub fn overlay_toml_text(
     let mut source_document = parse_document(source_text, "source")?;
     let original_target = parse_document(target_text, "target")?;
     let source_paths = assignment_paths(&source_document);
-    let (commented_assignments, commented_tables) = commented_target_paths(target_text);
+    let (commented_assignments, commented_tables) = commented_target_paths(target_text)?;
     let mut suppressed = source_paths
         .iter()
         .filter(|path| {
@@ -133,7 +133,7 @@ pub fn overlay_toml_text(
     };
 
     // Materialize decor and key ordering into a stable owned string before validating.
-    let rendered = merged.to_string();
+    let rendered = preserve_suppression_directives(target_text, merged.to_string())?;
     merged = parse_document(&rendered, "merged output")?;
     let merged_semantic = SemanticValue::Object(table_semantic(merged.as_table()));
     let expected = match options.conflict_policy {
@@ -355,11 +355,71 @@ fn collect_assignment_paths(
     }
 }
 
-fn commented_target_paths(text: &str) -> (BTreeSet<PathKey>, BTreeSet<PathKey>) {
+fn commented_target_paths(text: &str) -> Result<(BTreeSet<PathKey>, BTreeSet<PathKey>)> {
     let mut assignments = BTreeSet::new();
     let mut tables = BTreeSet::new();
+    for (path, is_table, _) in commented_target_directives(text)? {
+        if is_table {
+            tables.insert(path);
+        } else {
+            assignments.insert(path);
+        }
+    }
+    Ok((assignments, tables))
+}
+
+// A comment can be parser decor on a key or header which is about to retire.
+// Preserve its disabling meaning independently of that incidental attachment.
+// Missing directives are moved before the first active table; scoped keys are
+// fully qualified there so retiring an empty table cannot change their scope.
+fn preserve_suppression_directives(original: &str, rendered: String) -> Result<String> {
+    let (mut assignments, mut tables) = commented_target_paths(&rendered)?;
+    let mut prefix = String::new();
+    for (path, is_table, line) in commented_target_directives(original)? {
+        let present = if is_table {
+            &mut tables
+        } else {
+            &mut assignments
+        };
+        if present.insert(path) {
+            prefix.push_str(&line);
+            prefix.push('\n');
+        }
+    }
+    if prefix.is_empty() {
+        Ok(rendered)
+    } else {
+        prefix.push_str(&rendered);
+        Ok(prefix)
+    }
+}
+
+fn commented_target_directives(text: &str) -> Result<Vec<(PathKey, bool, String)>> {
+    let parsed = toml_edit::Document::parse(text)
+        .map_err(|_| anyhow!("failed to parse TOML comment context"))?;
+    let mut strings = Vec::new();
+    collect_string_spans(parsed.as_item(), &mut strings);
+    strings.sort_by_key(|span| span.start);
+    let mut string_index = 0;
+    let mut offset = 0;
+    let mut directives = Vec::new();
     let mut active_table = Vec::new();
-    for line in text.lines() {
+    for raw_line in text.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        let position = offset + line.len() - line.trim_start().len();
+        offset += raw_line.len();
+        while strings
+            .get(string_index)
+            .is_some_and(|span| span.end <= position)
+        {
+            string_index += 1;
+        }
+        if strings
+            .get(string_index)
+            .is_some_and(|span| span.contains(&position))
+        {
+            continue;
+        }
         if let Some(path) = extract_table_header_path(line) {
             active_table = path;
             continue;
@@ -370,7 +430,7 @@ fn commented_target_paths(text: &str) -> (BTreeSet<PathKey>, BTreeSet<PathKey>) 
         };
         let candidate = candidate.trim_start();
         if let Some(path) = extract_table_header_path(candidate) {
-            tables.insert(path);
+            directives.push((path, true, line.to_owned()));
             continue;
         }
         let Some(separator) = assignment_separator(candidate) else {
@@ -383,10 +443,55 @@ fn commented_target_paths(text: &str) -> (BTreeSet<PathKey>, BTreeSet<PathKey>) 
         if let Ok(mut path) = parse_toml_key_path(raw_key) {
             let mut full = active_table.clone();
             full.append(&mut path);
-            assignments.insert(full);
+            let relocated = if active_table.is_empty() {
+                line.to_owned()
+            } else {
+                format!(
+                    "# {} {}",
+                    render_toml_key_path(&full),
+                    &candidate[separator..]
+                )
+            };
+            directives.push((full, false, relocated));
         }
     }
-    (assignments, tables)
+    Ok(directives)
+}
+
+fn collect_string_spans(item: &Item, spans: &mut Vec<std::ops::Range<usize>>) {
+    match item {
+        Item::Value(value) => collect_value_string_spans(value, spans),
+        Item::Table(table) => {
+            for (_, child) in table.iter() {
+                collect_string_spans(child, spans);
+            }
+        }
+        Item::ArrayOfTables(tables) => {
+            for table in tables.iter() {
+                for (_, child) in table.iter() {
+                    collect_string_spans(child, spans);
+                }
+            }
+        }
+        Item::None => {}
+    }
+}
+
+fn collect_value_string_spans(value: &Value, spans: &mut Vec<std::ops::Range<usize>>) {
+    match value {
+        Value::String(_) => spans.extend(value.span()),
+        Value::Array(array) => {
+            for child in array.iter() {
+                collect_value_string_spans(child, spans);
+            }
+        }
+        Value::InlineTable(table) => {
+            for (_, child) in table.iter() {
+                collect_value_string_spans(child, spans);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn extract_table_header_path(line: &str) -> Option<PathKey> {
@@ -593,7 +698,7 @@ impl PartialEq for SemanticValue {
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Integer(left), Self::Integer(right)) => left == right,
             (Self::Float(left), Self::Float(right)) => {
-                left.partial_cmp(right) == Some(std::cmp::Ordering::Equal)
+                left == right || (left.is_nan() && right.is_nan())
             }
             (Self::Boolean(left), Self::Boolean(right)) => left == right,
             (Self::Datetime(left), Self::Datetime(right)) => left == right,

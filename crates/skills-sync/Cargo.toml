@@ -1,6 +1,6 @@
 [package]
 name = "skills-sync"
-version = "0.1.4"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,6 +9,8 @@ description = "Reconcile agent skills from explicit sources and locks"
 
 [dependencies]
 anyhow = "1"
+ctrlc = "3"
+dev-tools-command = { version = "0.1.2", path = "../dev-tools-command" }
 clap = { version = "4", default-features = false, features = ["std"] }
 dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-product = { path = "../dev-tools-product" }
