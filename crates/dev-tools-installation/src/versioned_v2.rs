@@ -9,6 +9,8 @@
 
 use super::*;
 
+pub mod legacy_adoption;
+
 const RECEIPT_SCHEMA: &str = "dev-tools-versioned-protocol-v2";
 const UPGRADE_SCHEMA: &str = "dev-tools-versioned-protocol-upgrade-v2";
 const TRANSITION_SCHEMA: &str = "dev-tools-versioned-protocol-transition-v2";
@@ -60,13 +62,120 @@ pub fn initialize<F>(
 where
     F: FnOnce(Option<&VersionedReceipt>) -> Result<()>,
 {
+    initialize_inner(
+        layout,
+        artifact_limit,
+        InitializationMode::Explicit,
+        commit_product_state,
+    )
+}
+
+/// Initialize only an absent receipt/journal namespace. Admission is checked
+/// under the installation lock before publishing an upgrade journal or calling
+/// product cutover. Existing or interrupted installations require explicit
+/// observation and the ordinary initialization/recovery interfaces instead.
+/// Directory and lock admission still occur; errors do not promise no writes.
+pub fn initialize_if_absent<F>(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+    commit_product_state: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnOnce(Option<&VersionedReceipt>) -> Result<()>,
+{
+    initialize_inner(
+        layout,
+        artifact_limit,
+        InitializationMode::Absent,
+        commit_product_state,
+    )
+}
+
+/// Start a legacy-to-v2 cutover only while the complete v1 receipt still equals
+/// `expected`, checked under the installation lock before any upgrade journal or
+/// product callback. Pending journals, absent receipts and v2 receipts are not
+/// fresh legacy migration; use their explicit initialization/recovery routes.
+/// Artifact/link custody is independently verified before fencing. The callback
+/// retains `initialize`'s bounded local authentication and durability contract.
+/// Errors after admission may retain a journal and require explicit resumption.
+pub fn initialize_legacy_if_unchanged<F>(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+    expected: &VersionedReceipt,
+    commit_product_state: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnOnce(Option<&VersionedReceipt>) -> Result<()>,
+{
+    initialize_inner(
+        layout,
+        artifact_limit,
+        InitializationMode::Legacy(expected),
+        commit_product_state,
+    )
+}
+
+/// Resume only an existing protocol-upgrade journal, checked under the
+/// installation lock. Never starts an upgrade or recreates a missing data root.
+/// Missing journals (including completed repeats) are errors. The callback has
+/// the same local, idempotent authentication contract as `initialize`.
+pub fn resume_initialization<F>(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+    commit_product_state: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnOnce(Option<&VersionedReceipt>) -> Result<()>,
+{
+    initialize_inner(
+        layout,
+        artifact_limit,
+        InitializationMode::Pending,
+        commit_product_state,
+    )
+}
+
+enum InitializationMode<'a> {
+    Explicit,
+    Absent,
+    Pending,
+    Legacy(&'a VersionedReceipt),
+}
+
+fn initialize_inner<F>(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+    mode: InitializationMode<'_>,
+    commit_product_state: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnOnce(Option<&VersionedReceipt>) -> Result<()>,
+{
     validate_layout(layout)?;
     require_bound(artifact_limit)?;
-    ensure_owned_directory(&layout.data_root, layout.owner_uid, layout.directory_mode)?;
+    if matches!(
+        mode,
+        InitializationMode::Pending | InitializationMode::Legacy(_)
+    ) {
+        inspect_owned_directory_read_only(&layout.data_root, layout)?;
+    } else {
+        ensure_owned_directory(&layout.data_root, layout.owner_uid, layout.directory_mode)?;
+    }
     let lock = InstallationLock::acquire(&layout.lock_path())?;
     inspect_owned_directory_read_only(&layout.data_root, layout)?;
     let journal = read_atomic_document(&layout.journal_path(), &receipt_authority(layout))?;
     let current = read_versioned_receipt_document(layout)?;
+    if matches!(mode, InitializationMode::Absent) && (journal.is_some() || current.is_some()) {
+        bail!("installation is no longer absent");
+    }
+    if matches!(mode, InitializationMode::Pending) && journal.is_none() {
+        bail!("installation has no protocol upgrade to resume");
+    }
+    if let InitializationMode::Legacy(expected) = mode {
+        if journal.is_some() || read_versioned_receipt(layout)?.as_ref() != Some(expected) {
+            bail!("legacy installation changed before protocol cutover");
+        }
+    }
     if journal.is_none() && current.is_none() {
         prepare_layout(layout, None)?;
     }
@@ -148,10 +257,11 @@ pub fn read_receipt_metadata(layout: &VersionedLayout) -> Result<Option<Versione
 pub enum PendingRecovery {
     ProtocolUpgrade,
     Activation,
+    LegacyAdoption,
 }
 
 /// Classify a bounded v2 journal without creating, locking or recovering.
-/// Unknown, malformed, foreign-layout and legacy journals are errors, not an
+/// Unknown, malformed, foreign-layout and v1 legacy journals are errors, not an
 /// empty journal or a reason to guess a recovery operation. The selected mutation
 /// API must independently revalidate the journal and all required custody.
 pub fn pending_recovery(layout: &VersionedLayout) -> Result<Option<PendingRecovery>> {
@@ -160,6 +270,9 @@ pub fn pending_recovery(layout: &VersionedLayout) -> Result<Option<PendingRecove
     else {
         return Ok(None);
     };
+    if legacy_adoption::recognizes(layout, &document.bytes)? {
+        return Ok(Some(PendingRecovery::LegacyAdoption));
+    }
     if let Ok(upgrade) = serde_json::from_slice::<UpgradeJournal>(&document.bytes) {
         if upgrade.schema != UPGRADE_SCHEMA || upgrade.layout != *layout {
             bail!("installation protocol upgrade does not match its layout");
@@ -279,8 +392,9 @@ where
     })
 }
 
-/// Authenticate and recover a normal v2 transition. A protocol upgrade requires
-/// `initialize` instead; it can never be undone by ordinary recovery. The verifier
+/// Authenticate and recover a normal v2 transition. Protocol upgrades and legacy
+/// adoptions require their explicit resumption APIs; ordinary recovery never
+/// undoes their fences. The verifier
 /// may run for both receipts, including a candidate whose links are not active.
 pub fn recover<F>(
     layout: &VersionedLayout,

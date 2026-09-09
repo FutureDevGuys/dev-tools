@@ -40,6 +40,303 @@ fn assert_old_mutators_blocked(request: &VersionedInstallRequest) {
 }
 
 #[test]
+fn resume_only_never_starts_an_upgrade_or_repairs_a_missing_root() {
+    for state in ["absent", "legacy", "initialized"] {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = request(root.path(), "1.0.0");
+        let layout = &candidate.layout;
+        match state {
+            "legacy" => {
+                apply_versioned_installation(&candidate, |_| Ok(())).unwrap();
+            }
+            "initialized" => {
+                versioned_v2::initialize(layout, 1024, |_| Ok(())).unwrap();
+            }
+            _ => {}
+        }
+        let receipt_path = layout.data_root.join("installation-receipt-v1.json");
+        let original = fs::read(&receipt_path).ok();
+        assert!(
+            versioned_v2::resume_initialization(layout, 1024, |_| panic!("no upgrade to resume"))
+                .is_err()
+        );
+        assert_eq!(fs::read(&receipt_path).ok(), original);
+        assert!(!layout
+            .data_root
+            .join("installation-transition-v1.json")
+            .exists());
+        if state == "absent" {
+            assert!(!layout.data_root.exists());
+            assert!(!layout.bin_dir.exists());
+        }
+    }
+}
+
+#[test]
+fn resume_only_authenticates_pending_upgrade_before_and_after_receipt_commit() {
+    for committed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = request(root.path(), "1.0.0");
+        let layout = &candidate.layout;
+        let prior = apply_versioned_installation(&candidate, |_| Ok(()))
+            .unwrap()
+            .receipt;
+        let receipt_path = layout.data_root.join("installation-receipt-v1.json");
+        let legacy_receipt = fs::read(&receipt_path).unwrap();
+        versioned_v2::initialize(layout, 1024, |_| Ok(())).unwrap();
+        if !committed {
+            fs::write(&receipt_path, legacy_receipt).unwrap();
+        }
+        let journal = layout.data_root.join("installation-transition-v1.json");
+        write_json(
+            &journal,
+            serde_json::json!({
+                "schema": "dev-tools-versioned-protocol-upgrade-v2", "layout": layout, "prior": prior
+            }),
+        );
+        let original = fs::read(&journal).unwrap();
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        assert!(
+            versioned_v2::resume_initialization(layout, 1024, |_| anyhow::bail!(
+                "rejected authority"
+            ))
+            .is_err()
+        );
+        assert_eq!(fs::read(&journal).unwrap(), original);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert_eq!(
+            versioned_v2::resume_initialization(layout, 1024, |observed| {
+                assert_eq!(observed, Some(&prior));
+                Ok(())
+            })
+            .unwrap(),
+            (true, Some(prior.clone()))
+        );
+        assert!(!journal.exists());
+        assert_eq!(versioned_v2::observe(layout, 1024).unwrap(), Some(prior));
+        assert!(
+            versioned_v2::resume_initialization(layout, 1024, |_| panic!("repeat is not pending"))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn conditional_legacy_cutover_rejects_an_intervening_receipt_before_fencing() {
+    let root = tempfile::tempdir().unwrap();
+    let first = request(root.path(), "1.0.0");
+    let observed = apply_versioned_installation(&first, |_| Ok(()))
+        .unwrap()
+        .receipt;
+    let second = request(root.path(), "2.0.0");
+    apply_versioned_installation(&second, |_| Ok(())).unwrap();
+    let layout = &first.layout;
+    let receipt_path = layout.data_root.join("installation-receipt-v1.json");
+    let before = fs::read(&receipt_path).unwrap();
+    let called = std::cell::Cell::new(false);
+    let result = versioned_v2::initialize_legacy_if_unchanged(layout, 1024, &observed, |_| {
+        called.set(true);
+        anyhow::bail!("unexpected product cutover")
+    });
+    assert!(result.is_err());
+    assert!(!called.get(), "changed receipt reached product cutover");
+    assert_eq!(fs::read(receipt_path).unwrap(), before);
+    assert!(!layout
+        .data_root
+        .join("installation-transition-v1.json")
+        .exists());
+}
+
+#[test]
+fn conditional_legacy_cutover_preserves_ownership_and_requires_explicit_resume() {
+    for interrupted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let first = request(root.path(), "1.0.0");
+        apply_versioned_installation(&first, |_| Ok(())).unwrap();
+        let second = request(root.path(), "2.0.0");
+        let expected = apply_versioned_installation(&second, |_| Ok(()))
+            .unwrap()
+            .receipt;
+        let layout = &first.layout;
+        let active = fs::read_link(layout.data_root.join("active")).unwrap();
+        let previous = fs::read_link(layout.data_root.join("previous")).unwrap();
+        let result =
+            versioned_v2::initialize_legacy_if_unchanged(layout, 1024, &expected, |prior| {
+                assert_eq!(prior, Some(&expected));
+                assert!(
+                    InstallationLock::try_acquire(&layout.data_root.join("installation.lock"))
+                        .unwrap()
+                        .is_none()
+                );
+                if interrupted {
+                    anyhow::bail!("interrupted product cutover");
+                }
+                Ok(())
+            });
+        assert_eq!(result.is_err(), interrupted);
+        if !interrupted {
+            assert_eq!(result.unwrap(), (true, Some(expected.clone())));
+        }
+        let receipt_path = layout.data_root.join("installation-receipt-v1.json");
+        let journal_path = layout.data_root.join("installation-transition-v1.json");
+        let receipt = fs::read(&receipt_path).unwrap();
+        let journal = fs::read(&journal_path).ok();
+        assert!(
+            versioned_v2::initialize_legacy_if_unchanged(layout, 1024, &expected, |_| panic!(
+                "pending or initialized state is not fresh migration"
+            ))
+            .is_err()
+        );
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
+        assert_eq!(fs::read(&journal_path).ok(), journal);
+        if interrupted {
+            assert!(
+                apply_versioned_installation(&second, |_| panic!("legacy writer is fenced"))
+                    .is_err()
+            );
+            assert_eq!(
+                versioned_v2::resume_initialization(layout, 1024, |prior| {
+                    assert_eq!(prior, Some(&expected));
+                    Ok(())
+                })
+                .unwrap(),
+                (true, Some(expected.clone()))
+            );
+        }
+        assert_eq!(versioned_v2::observe(layout, 1024).unwrap(), Some(expected));
+        assert_eq!(
+            fs::read_link(layout.data_root.join("active")).unwrap(),
+            active
+        );
+        assert_eq!(
+            fs::read_link(layout.data_root.join("previous")).unwrap(),
+            previous
+        );
+        assert_old_mutators_blocked(&second);
+    }
+}
+
+#[test]
+fn conditional_legacy_cutover_rejects_absence_journals_and_custody_drift() {
+    for change in [
+        "absent",
+        "missing-root",
+        "journal",
+        "artifact",
+        "link",
+        "aliases",
+        "previous",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let first = request(root.path(), "1.0.0");
+        apply_versioned_installation(&first, |_| Ok(())).unwrap();
+        let second = request(root.path(), "2.0.0");
+        let mut expected = apply_versioned_installation(&second, |_| Ok(()))
+            .unwrap()
+            .receipt;
+        let layout = &first.layout;
+        let receipt_path = layout.data_root.join("installation-receipt-v1.json");
+        let journal_path = layout.data_root.join("installation-transition-v1.json");
+        match change {
+            "absent" => {
+                fs::remove_file(&receipt_path).unwrap();
+            }
+            "missing-root" => {
+                fs::rename(&layout.data_root, root.path().join("retained-data")).unwrap();
+            }
+            "journal" => {
+                write_json(&journal_path, serde_json::json!({"unknown": true}));
+            }
+            "artifact" => {
+                fs::write(layout.data_root.join("versions/1.0.0/fixture"), b"corrupt").unwrap();
+            }
+            "link" => {
+                fs::remove_file(layout.data_root.join("previous")).unwrap();
+            }
+            "aliases" => {
+                expected.aliases.push("unobserved-alias".into());
+            }
+            "previous" => {
+                expected.previous_version = None;
+            }
+            _ => unreachable!(),
+        }
+        let receipt = fs::read(&receipt_path).ok();
+        let journal = fs::read(&journal_path).ok();
+        assert!(
+            versioned_v2::initialize_legacy_if_unchanged(layout, 1024, &expected, |_| panic!(
+                "invalid observation must not fence product state"
+            ))
+            .is_err(),
+            "{change}"
+        );
+        assert_eq!(fs::read(&receipt_path).ok(), receipt, "{change}");
+        assert_eq!(fs::read(&journal_path).ok(), journal, "{change}");
+        if change == "missing-root" {
+            assert!(!layout.data_root.exists());
+        }
+    }
+}
+
+#[test]
+fn absent_initialization_rejects_intervening_installation_before_cutover() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = request(root.path(), "1.0.0");
+    let layout = &candidate.layout;
+    assert!(!layout.data_root.exists());
+    // Represents an old installer winning the gap after product observation.
+    apply_versioned_installation(&candidate, |_| Ok(())).unwrap();
+    let path = layout.data_root.join("installation-receipt-v1.json");
+    let original = fs::read(&path).unwrap();
+    assert!(versioned_v2::initialize_if_absent(layout, 1024, |_| panic!(
+        "must not retire product state after an installation collision"
+    ))
+    .is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!layout
+        .data_root
+        .join("installation-transition-v1.json")
+        .exists());
+    assert_eq!(
+        read_versioned_installation_receipt(layout)
+            .unwrap()
+            .unwrap()
+            .active_version,
+        "1.0.0"
+    );
+}
+
+#[test]
+fn absent_initialization_preserves_initialized_and_pending_namespaces() {
+    for interrupted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = request(root.path(), "1.0.0");
+        let layout = &candidate.layout;
+        let initial = versioned_v2::initialize_if_absent(layout, 1024, |prior| {
+            assert!(prior.is_none());
+            if interrupted {
+                anyhow::bail!("incomplete product cutover");
+            }
+            Ok(())
+        });
+        assert_eq!(initial.is_err(), interrupted);
+        let path = layout.data_root.join(if interrupted {
+            "installation-transition-v1.json"
+        } else {
+            "installation-receipt-v1.json"
+        });
+        let original = fs::read(&path).unwrap();
+        assert!(versioned_v2::initialize_if_absent(layout, 1024, |_| panic!(
+            "repeat needs explicit observation or recovery"
+        ))
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let resumed = versioned_v2::initialize(layout, 1024, |_| Ok(())).unwrap();
+        assert_eq!(resumed, (interrupted, None));
+    }
+}
+
+#[test]
 fn metadata_observation_does_not_recover_or_claim_artifact_custody() {
     let root = tempfile::tempdir().unwrap();
     let candidate = request(root.path(), "1.0.0");

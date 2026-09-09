@@ -42,6 +42,9 @@ impl BrokerTimeouts {
             | BrokerRequest::ActivateSession { .. }
             | BrokerRequest::RenewSession { .. } => self.local_io,
             BrokerRequest::EndSession { .. }
+            | BrokerRequest::ValidateProviders
+            | BrokerRequest::SecretRead { .. }
+            | BrokerRequest::SecretPublic { .. }
             | BrokerRequest::GitCredential { .. }
             | BrokerRequest::InvalidateGitCredential { .. }
             | BrokerRequest::GhExecutionToken
@@ -216,6 +219,8 @@ pub fn probe_at(socket: &Path) -> Result<BrokerSessionProbe> {
             reason: format!("{code}: {message}"),
         }),
         BrokerResponse::Accepted
+        | BrokerResponse::ProviderValidation { .. }
+        | BrokerResponse::SecretMaterial { .. }
         | BrokerResponse::GitCredential { .. }
         | BrokerResponse::GhExecutionToken { .. }
         | BrokerResponse::Signature { .. } => {
@@ -267,12 +272,12 @@ fn exchange_at_with_timeouts(
         "broker",
         Instant::now,
     )?;
-    let response = read_frame_with_clock(
+    let response = zeroize::Zeroizing::new(read_frame_with_clock(
         &mut stream,
         timeouts.response_timeout(&request.request),
         "broker",
         Instant::now,
-    )?;
+    )?);
     decode_response_frame(&response)
 }
 
@@ -346,13 +351,13 @@ where
     read_exact_before_deadline(stream, &mut length_bytes, deadline, &mut now)
         .with_context(|| format!("read {description} response length"))?;
     let response_length = u32::from_be_bytes(length_bytes) as usize;
-    if response_length > MAX_BROKER_FRAME_BYTES {
+    if response_length > crate::broker_protocol::MAX_BROKER_RESPONSE_FRAME_BYTES {
         bail!("{description} response exceeds the frame limit");
     }
-    let mut response = vec![0_u8; response_length];
+    let mut response = zeroize::Zeroizing::new(vec![0_u8; response_length]);
     read_exact_before_deadline(stream, &mut response, deadline, &mut now)
         .with_context(|| format!("read {description} response"))?;
-    Ok(response)
+    Ok(std::mem::take(&mut *response))
 }
 
 fn write_all_before_deadline<S, C>(
@@ -439,7 +444,7 @@ pub fn control_request_at(
     };
     let request_id = request_id();
     let envelope = ControlEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: crate::control_protocol::CONTROL_PROTOCOL_VERSION,
         request_id: request_id.clone(),
         request,
     };
@@ -469,21 +474,78 @@ fn exchange_raw_at(
     if payload.len() > MAX_BROKER_FRAME_BYTES {
         bail!("{description} request exceeds the frame limit");
     }
+    // Root validates the private generation while acquiring the lease. The
+    // dedicated broker receives only that lease, not access to the private state.
+    let lease = if matches!(
+        control_request,
+        crate::control_protocol::ControlRequest::Prepare { .. }
+            | crate::control_protocol::ControlRequest::Register { .. }
+    ) {
+        Some(crate::setup_transition::admit(
+            crate::setup::InstallMode::Strong,
+        )?)
+    } else {
+        None
+    };
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to {description} at {}", socket.display()))?;
-    write_frame_with_clock(
-        &mut stream,
-        payload,
-        timeouts.local_io,
-        description,
-        Instant::now,
-    )?;
+    if let Some(lease) = &lease {
+        write_control_frame_with_lease(
+            &mut stream,
+            payload,
+            lease.shared_descriptor()?,
+            timeouts.local_io,
+        )?;
+    } else {
+        write_frame_with_clock(
+            &mut stream,
+            payload,
+            timeouts.local_io,
+            description,
+            Instant::now,
+        )?;
+    }
     read_frame_with_clock(
         &mut stream,
         timeouts.control_response_timeout(control_request),
         description,
         Instant::now,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn write_control_frame_with_lease(
+    stream: &mut UnixStream,
+    payload: &[u8],
+    lease: std::os::fd::BorrowedFd<'_>,
+    timeout: Duration,
+) -> Result<()> {
+    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    let deadline = AbsoluteDeadline::new(Instant::now(), timeout);
+    let length = u32::try_from(payload.len())?.to_be_bytes();
+    let descriptors = [lease];
+    let mut storage = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut storage);
+    if !ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        bail!("control lease exceeds ancillary bounds");
+    }
+    loop {
+        stream.set_write_timeout(Some(deadline.remaining(Instant::now())?))?;
+        match sendmsg(
+            &*stream,
+            &[std::io::IoSlice::new(&length[..1])],
+            &mut ancillary,
+            SendFlags::NOSIGNAL,
+        ) {
+            Ok(1) => break,
+            Err(rustix::io::Errno::INTR) => continue,
+            _ => bail!("control lease transfer failed"),
+        }
+    }
+    write_all_before_deadline(stream, &length[1..], deadline, &mut Instant::now)?;
+    write_all_before_deadline(stream, payload, deadline, &mut Instant::now)?;
+    flush_before_deadline(stream, deadline, &mut Instant::now)?;
+    Ok(())
 }
 
 fn request_id() -> String {

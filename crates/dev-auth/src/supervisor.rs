@@ -1,5 +1,5 @@
 use crate::control_protocol::{ControlRequest, ControlResponse};
-use crate::linux_admission::session_authority_from_resolved;
+use crate::linux_admission::session_authority_for_workload;
 use crate::policy_v2::{
     ResolvedAuthorityProfile, ResolvedPolicy, ResolvedWorkload, SandboxMode,
     SandboxNetworkNamespace, SystemMode,
@@ -26,10 +26,34 @@ const ENVIRONMENT_LIMIT: u64 = 1024 * 1024;
 const ENVIRONMENT_MAGIC: &[u8] = b"DEV-AUTH-ENV-V1\0";
 const ENVIRONMENT_ENTRY_LIMIT: usize = 4096;
 const SESSION_LEASE_SECONDS: i64 = 15 * 60;
-const SESSION_RENEW_SECONDS: u64 = 10 * 60;
+// This local-only renewal also bounds revocation detection. It never extends
+// the separately retained, approval-time hard deadline.
+const SESSION_RENEW_SECONDS: u64 = 5;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ENVIRONMENT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_MAGIC: &[u8; 4] = b"DAT1";
+
+#[derive(Debug, PartialEq, Eq)]
+enum OuterAdmission {
+    Enrolled,
+    Interactive,
+    ApprovalRequired,
+}
+
+fn outer_admission(
+    mode: crate::setup::InstallMode,
+    admission: Option<crate::policy_v3::Admission>,
+    noninteractive: bool,
+) -> OuterAdmission {
+    if admission == Some(crate::policy_v3::Admission::EnrolledNoninteractive) {
+        return OuterAdmission::Enrolled;
+    }
+    match (mode, noninteractive) {
+        (crate::setup::InstallMode::Strong, true) => OuterAdmission::ApprovalRequired,
+        (crate::setup::InstallMode::UserOnly, true) => OuterAdmission::ApprovalRequired,
+        _ => OuterAdmission::Interactive,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkloadTermination {
@@ -47,6 +71,7 @@ struct TransientServiceRequest<'a> {
     executable: &'a Path,
     tool_bin: &'a Path,
     arguments: &'a [OsString],
+    duration_seconds: Option<u64>,
 }
 
 struct GatedChildRequest<'a> {
@@ -490,6 +515,8 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
         OsString::from("--property=KillMode=control-group"),
         OsString::from("--property=SendSIGKILL=yes"),
         OsString::from("--property=TimeoutStopSec=10s"),
+        OsString::from("--property=BindsTo=dev-auth-broker.service"),
+        OsString::from("--property=After=dev-auth-broker.service"),
         OsString::from("--property=Delegate=no"),
         OsString::from("--property=CollectMode=inactive-or-failed"),
         OsString::from("--property=PrivateUsers=full"),
@@ -519,6 +546,15 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
         request.boundary_socket.as_os_str().to_os_string(),
         OsString::from("--"),
     ];
+    if let Some(seconds) = request.duration_seconds {
+        if seconds == 0 {
+            bail!("transient workload duration must be positive");
+        }
+        command.insert(
+            0,
+            OsString::from(format!("--property=RuntimeMaxSec={seconds}s")),
+        );
+    }
     command.extend_from_slice(request.arguments);
     Ok(command)
 }
@@ -893,6 +929,14 @@ fn select_sandbox_launch(
 }
 
 pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitStatus> {
+    launch_via_native_helper(workload, arguments, false)
+}
+
+fn launch_via_native_helper(
+    workload: &str,
+    arguments: &[OsString],
+    enrolled: bool,
+) -> Result<ExitStatus> {
     validate_identifier(workload, "workload")?;
     if nix::unistd::Uid::effective().is_root() {
         bail!("workload launcher must be invoked by the native user");
@@ -906,9 +950,14 @@ pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitS
     let (listener, environment_socket, environment_frame) = create_environment_listener(owner_uid)?;
     let uid = owner_uid.to_string();
     let launcher_pid = std::process::id().to_string();
-    let mut command = Command::new("/usr/bin/pkexec");
+    let mut command = if enrolled {
+        Command::new(crate::setup::privileged_launcher_path())
+    } else {
+        let mut command = Command::new("/usr/bin/pkexec");
+        command.arg(crate::setup::privileged_launcher_path());
+        command
+    };
     command
-        .arg(crate::setup::privileged_launcher_path())
         .args(["--uid", &uid, "--workload", workload])
         .arg("--cwd")
         .arg(cwd)
@@ -945,23 +994,83 @@ pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitS
 }
 
 pub fn run_workload_alias(workload: &str, arguments: &[OsString]) -> Result<ExitStatus> {
+    match run_workload_alias_request(workload, arguments, false, false)? {
+        WorkloadLaunchOutcome::Exited(status) | WorkloadLaunchOutcome::ChildExited(status) => {
+            Ok(status)
+        }
+        WorkloadLaunchOutcome::ApprovalRequired
+        | WorkloadLaunchOutcome::NoninteractiveStoreUnsupported
+        | WorkloadLaunchOutcome::EnrollmentUnavailable => {
+            bail!("workload launch requires a different interaction mode")
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WorkloadLaunchOutcome {
+    Exited(ExitStatus),
+    ChildExited(ExitStatus),
+    ApprovalRequired,
+    NoninteractiveStoreUnsupported,
+    EnrollmentUnavailable,
+}
+
+/// Noninteractive launch never enters pkexec or the potentially interactive
+/// native user credential store. Existing verified admission may be reused.
+/// Enrollment-authorized outer launch requires the separately qualified policy
+/// and native admission implementation, not a missing-prompt heuristic.
+pub fn run_workload_alias_request(
+    workload: &str,
+    arguments: &[OsString],
+    noninteractive: bool,
+    record_result: bool,
+) -> Result<WorkloadLaunchOutcome> {
     let resolved = crate::setup::resolve_current_workload_alias(workload)?;
     let (_, receipt) = crate::setup::current_runtime_installation()?;
     let (claim, probe) = crate::broker_client::active_claim_and_probe()?;
     match claim {
-        crate::broker_protocol::LocalSessionClaim::Absent => match receipt.mode {
-            crate::setup::InstallMode::Strong => launch_via_pkexec(workload, arguments),
-            crate::setup::InstallMode::UserOnly => launch_user_only(workload, arguments),
-        },
+        crate::broker_protocol::LocalSessionClaim::Absent => {
+            match outer_admission(receipt.mode, resolved.admission, noninteractive) {
+                OuterAdmission::ApprovalRequired => Ok(WorkloadLaunchOutcome::ApprovalRequired),
+                OuterAdmission::Enrolled if receipt.mode == crate::setup::InstallMode::Strong => {
+                    launch_via_native_helper(workload, arguments, true)
+                        .map(WorkloadLaunchOutcome::Exited)
+                }
+                OuterAdmission::Enrolled => match launch_user_only(
+                    workload,
+                    arguments,
+                    crate::runtime::CredentialInteraction::NoPrompt,
+                ) {
+                    Ok(status) => Ok(WorkloadLaunchOutcome::Exited(status)),
+                    Err(error) if error.is::<crate::runtime::CredentialUnavailable>() => {
+                        Ok(WorkloadLaunchOutcome::EnrollmentUnavailable)
+                    }
+                    Err(error) => Err(error),
+                },
+                OuterAdmission::Interactive
+                    if receipt.mode == crate::setup::InstallMode::Strong =>
+                {
+                    launch_via_pkexec(workload, arguments).map(WorkloadLaunchOutcome::Exited)
+                }
+                OuterAdmission::Interactive => launch_user_only(
+                    workload,
+                    arguments,
+                    crate::runtime::CredentialInteraction::AllowPrompt,
+                )
+                .map(WorkloadLaunchOutcome::Exited),
+            }
+        }
         crate::broker_protocol::LocalSessionClaim::Present { .. } => {
-            match probe {
-                crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {}
+            let verified_session = match probe {
+                crate::broker_protocol::BrokerSessionProbe::Verified { session_id, .. } => {
+                    session_id
+                }
                 crate::broker_protocol::BrokerSessionProbe::NoSession
                 | crate::broker_protocol::BrokerSessionProbe::Invalid { .. }
                 | crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
                     bail!("existing workload admission is invalid or unavailable")
                 }
-            }
+            };
             match receipt.mode {
                 crate::setup::InstallMode::Strong => {
                     validate_root_owned_launcher(Path::new(&resolved.launcher_path))?
@@ -971,13 +1080,43 @@ pub fn run_workload_alias(workload: &str, arguments: &[OsString]) -> Result<Exit
                     nix::unistd::Uid::effective().as_raw(),
                 )?,
             }
+            if record_result {
+                let deadline = match crate::broker_client::request_active(
+                    crate::broker_protocol::BrokerRequest::Probe,
+                )? {
+                    crate::broker_protocol::BrokerResponse::Ready {
+                        session_id,
+                        hard_deadline_boot_ms,
+                        ..
+                    } if session_id == verified_session => hard_deadline_boot_ms,
+                    _ => bail!("nested workload admission changed before execution"),
+                };
+                let output = dev_tools_command::run_prepared_inherited_command(
+                    Command::new(&resolved.launcher_path).args(arguments),
+                    || {
+                        deadline.is_none_or(|deadline| {
+                            crate::linux_platform::boot_time_millis()
+                                .is_ok_and(|now| now < deadline)
+                        })
+                    },
+                )?;
+                if output.cancelled {
+                    bail!("nested workload authority expired");
+                }
+                return Ok(WorkloadLaunchOutcome::ChildExited(output.status));
+            }
             let error = Command::new(&resolved.launcher_path).args(arguments).exec();
             Err(error).context("replace nested workload alias with its configured launcher")
         }
     }
 }
 
-fn launch_user_only(workload_name: &str, arguments: &[OsString]) -> Result<ExitStatus> {
+fn launch_user_only(
+    workload_name: &str,
+    arguments: &[OsString],
+    interaction: crate::runtime::CredentialInteraction,
+) -> Result<ExitStatus> {
+    let _admission = crate::setup_transition::admit(crate::setup::InstallMode::UserOnly)?;
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
         bail!("user-only workload launch requires a native non-root user");
@@ -987,6 +1126,11 @@ fn launch_user_only(workload_name: &str, arguments: &[OsString]) -> Result<ExitS
         .workloads
         .get(workload_name)
         .with_context(|| format!("workload {workload_name} is not configured"))?;
+    if interaction == crate::runtime::CredentialInteraction::NoPrompt
+        && workload.admission != Some(crate::policy_v3::Admission::EnrolledNoninteractive)
+    {
+        bail!("user-only workload no longer authorizes enrolled noninteractive admission");
+    }
     let profile = policy
         .authority_profiles
         .get(&workload.authority_profile)
@@ -997,21 +1141,24 @@ fn launch_user_only(workload_name: &str, arguments: &[OsString]) -> Result<ExitS
     validate_workload_cwd(&cwd, owner_uid)?;
     validate_workload_root_scope(&cwd, &workload.workspace_roots)?;
     let session_id = random_session_id()?;
-    let (listener, socket, session_directory) =
-        create_user_broker_listener(owner_uid, &session_id)?;
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective user account does not exist")?;
     let backend = crate::broker_backend::SystemCapabilityBackend::load_user(
-        &crate::policy_store::user_policy_path(&user),
+        &crate::policy_store::runtime_user_policy_path(&user)?,
         owner_uid,
+        interaction,
     )?;
+    let authority = session_authority_for_workload(profile, workload)?;
+    let (listener, socket, session_directory) =
+        create_user_broker_listener(owner_uid, &session_id)?;
+    let hard_deadline = authority.hard_deadline_boot_ms;
     let session = crate::linux_admission::VerifiedLinuxSession {
         session_id: session_id.clone(),
         owner_uid,
         execution_uid: owner_uid,
         workload: workload_name.to_owned(),
         profile: workload.authority_profile.clone(),
-        authority: session_authority_from_resolved(profile),
+        authority,
         cgroup: PathBuf::new(),
         expires_at_unix: lease_expiry(),
     };
@@ -1020,7 +1167,14 @@ fn launch_user_only(workload_name: &str, arguments: &[OsString]) -> Result<ExitS
     let broker = thread::Builder::new()
         .name(format!("dev-auth-user-{session_id}"))
         .spawn(move || {
-            crate::broker_server::serve_user_session_broker(listener, session, backend, server_stop)
+            let result = crate::broker_server::serve_user_session_broker(
+                listener,
+                session,
+                backend,
+                std::sync::Arc::clone(&server_stop),
+            );
+            server_stop.store(true, std::sync::atomic::Ordering::Release);
+            result
         })
         .context("start user-only workload broker")?;
 
@@ -1093,15 +1247,31 @@ fn launch_user_only(workload_name: &str, arguments: &[OsString]) -> Result<ExitS
             command.args(arguments);
             command
         };
-        command
+        let mut child = command
             .env_clear()
             .envs(environment)
             .current_dir(cwd)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
-            .status()
-            .context("run user-only admitted workload")
+            .spawn()
+            .context("run user-only admitted workload")?;
+        loop {
+            if let Some(status) = child.try_wait().context("poll user-only workload")? {
+                break Ok(status);
+            }
+            let expired = hard_deadline.is_some_and(|deadline| {
+                crate::linux_platform::boot_time_millis().map_or(true, |now| now >= deadline)
+            });
+            if expired || stop.load(std::sync::atomic::Ordering::Acquire) {
+                let kill = child.kill();
+                let wait = child.wait();
+                kill.context("stop user-only workload after authority loss")?;
+                wait.context("settle stopped user-only workload")?;
+                bail!("user-only workload authority ended");
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
     })();
 
     stop_agent_proxies(&mut agent_proxies);
@@ -1126,12 +1296,57 @@ pub fn run_root_dispatcher(
     environment_socket: &Path,
     arguments: &[OsString],
 ) -> Result<ExitStatus> {
+    run_authorized_dispatcher(
+        owner_uid,
+        workload_name,
+        cwd,
+        launcher_pid,
+        environment_socket,
+        arguments,
+        false,
+    )
+}
+
+pub fn run_enrolled_dispatcher(
+    owner_uid: u32,
+    workload_name: &str,
+    cwd: &Path,
+    launcher_pid: u32,
+    environment_socket: &Path,
+    arguments: &[OsString],
+) -> Result<ExitStatus> {
+    if nix::unistd::getuid().as_raw() != owner_uid || owner_uid == 0 {
+        bail!("native enrolled launcher caller does not match workload owner");
+    }
+    run_authorized_dispatcher(
+        owner_uid,
+        workload_name,
+        cwd,
+        launcher_pid,
+        environment_socket,
+        arguments,
+        true,
+    )
+}
+
+fn run_authorized_dispatcher(
+    owner_uid: u32,
+    workload_name: &str,
+    cwd: &Path,
+    launcher_pid: u32,
+    environment_socket: &Path,
+    arguments: &[OsString],
+    enrolled: bool,
+) -> Result<ExitStatus> {
     if !nix::unistd::Uid::effective().is_root() {
         bail!("strong workload dispatch requires root");
     }
+    let _admission = crate::setup_transition::admit(crate::setup::InstallMode::Strong)?;
     let executable = crate::setup::validate_running_privileged_launcher()?;
     validate_identifier(workload_name, "workload")?;
-    validate_pkexec_caller(owner_uid)?;
+    if !enrolled {
+        validate_pkexec_caller(owner_uid)?;
+    }
     let policy = validate_dispatch_request(
         owner_uid,
         workload_name,
@@ -1143,10 +1358,30 @@ pub fn run_root_dispatcher(
         .workloads
         .get(workload_name)
         .context("validated workload is no longer resolved")?;
+    if enrolled && workload.admission != Some(crate::policy_v3::Admission::EnrolledNoninteractive) {
+        bail!("workload requires interactive launch approval");
+    }
+    if enrolled {
+        // The originating account remains the explicit native owner above.
+        // Normalize this narrow dispatcher's identity before invoking pinned
+        // root infrastructure; no child workload runs under this identity.
+        nix::unistd::setgroups(&[])?;
+        nix::unistd::setresgid(
+            nix::unistd::Gid::from_raw(0),
+            nix::unistd::Gid::from_raw(0),
+            nix::unistd::Gid::from_raw(0),
+        )?;
+        nix::unistd::setresuid(
+            nix::unistd::Uid::from_raw(0),
+            nix::unistd::Uid::from_raw(0),
+            nix::unistd::Uid::from_raw(0),
+        )?;
+    }
     let profile = policy
         .authority_profiles
         .get(&workload.authority_profile)
         .context("workload authority profile is unresolved")?;
+    let authority = session_authority_for_workload(profile, workload)?;
     let owner = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
         .context("workload owner account does not exist")?;
     let (environment, mut native_handoff) =
@@ -1168,6 +1403,7 @@ pub fn run_root_dispatcher(
         executable: &executable,
         tool_bin: &tool_bin,
         arguments,
+        duration_seconds: workload.duration_seconds,
     }) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -1208,7 +1444,7 @@ pub fn run_root_dispatcher(
         execution_pid: boundary_peer.pid,
         workload: workload_name.to_owned(),
         profile: workload.authority_profile.clone(),
-        authority: session_authority_from_resolved(profile),
+        authority,
         cgroup: cgroup.clone(),
         expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 60,
     }) {
@@ -1273,6 +1509,8 @@ pub fn run_root_supervisor(
         .context("workload authority profile is unresolved")?;
     let (mut environment, mut boundary_handoff) =
         connect_strong_boundary(session_id, boundary_socket)?;
+    let dispatcher_pidfd = getsockopt(&boundary_handoff, sockopt::PeerPidfd)
+        .context("retain the authenticated workload dispatcher identity")?;
     let cgroup = crate::linux_admission::current_workload_cgroup(session_id)?;
     let sandbox = select_sandbox_launch(&policy, workload)?;
     let executable = fs::canonicalize(std::env::current_exe()?)
@@ -1291,7 +1529,7 @@ pub fn run_root_supervisor(
         bail!("strong workload private runtime has unsafe authority");
     }
     let tool_plane = WorkloadToolPlane::create(&runtime, &executable, owner_uid, 0o700)?;
-    activate_session(
+    let hard_deadline = activate_session(
         session_id,
         owner_uid,
         execution_uid,
@@ -1344,11 +1582,19 @@ pub fn run_root_supervisor(
     }
     drop(gated.release);
 
-    let result = supervise_active_child(&mut gated.child, session_id);
+    let result = supervise_active_child(
+        &mut gated.child,
+        session_id,
+        hard_deadline,
+        &dispatcher_pidfd,
+    );
     stop_agent_proxies(&mut agent_proxies);
-    let revoke_result = end_active_session(session_id);
+    // Failure must let systemd terminalize the native domain immediately, not
+    // keep descendants alive while remote token cleanup waits. The broker owns
+    // the retained lease and reaps this supervisor's pidfd through its existing
+    // retryable cleanup path. Successful execution still awaits revocation.
     let status = result?;
-    revoke_result?;
+    end_active_session(session_id)?;
     send_workload_termination(&mut boundary_handoff, termination_from_status(status)?)?;
     Ok(status)
 }
@@ -2257,13 +2503,14 @@ fn environment_name_is_safe(name: &OsStr) -> bool {
         || name.starts_with(b"DEV_AUTH_")
         || name.starts_with(b"LD_")
         || name.starts_with(b"DYLD_")
+        || crate::runtime::GITHUB_AUTH_ENVIRONMENT
+            .iter()
+            .any(|variable| name == variable.as_bytes())
     {
         return false;
     }
     ![
-        b"GH_TOKEN".as_slice(),
-        b"GITHUB_TOKEN",
-        b"OP_SERVICE_ACCOUNT_TOKEN",
+        b"OP_SERVICE_ACCOUNT_TOKEN".as_slice(),
         b"SSH_AUTH_SOCK",
         b"GIT_ASKPASS",
         b"SSH_ASKPASS",
@@ -2294,7 +2541,7 @@ fn activate_session(
     execution_uid: u32,
     workload: &str,
     profile: &str,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     match crate::broker_client::request_system(
         crate::broker_protocol::BrokerRequest::ActivateSession {
             session_id: session_id.to_owned(),
@@ -2306,6 +2553,7 @@ fn activate_session(
             execution_uid: admitted_execution,
             workload: admitted_workload,
             profile: admitted_profile,
+            hard_deadline_boot_ms,
             ..
         } if admitted == session_id
             && admitted_owner == owner_uid
@@ -2313,7 +2561,7 @@ fn activate_session(
             && admitted_workload == workload
             && admitted_profile == profile =>
         {
-            Ok(())
+            Ok(hard_deadline_boot_ms)
         }
         crate::broker_protocol::BrokerResponse::Denied { code, message } => {
             bail!("{code}: {message}")
@@ -2348,11 +2596,32 @@ fn end_active_session(session_id: &str) -> Result<()> {
     }
 }
 
-fn supervise_active_child(child: &mut Child, session_id: &str) -> Result<ExitStatus> {
+fn supervise_active_child(
+    child: &mut Child,
+    session_id: &str,
+    hard_deadline: Option<u64>,
+    dispatcher_pidfd: &OwnedFd,
+) -> Result<ExitStatus> {
     let mut next_renewal = Instant::now() + Duration::from_secs(SESSION_RENEW_SECONDS);
     loop {
         if let Some(status) = child.try_wait().context("poll supervised workload")? {
             return Ok(status);
+        }
+        if !crate::linux_admission::pidfd_process_is_alive(dispatcher_pidfd).unwrap_or(false) {
+            let kill = child.kill();
+            let wait = child.wait();
+            kill.context("stop workload after dispatcher loss")?;
+            wait.context("settle workload after dispatcher loss")?;
+            bail!("workload dispatcher exited");
+        }
+        if hard_deadline.is_some_and(|deadline| {
+            crate::linux_platform::boot_time_millis().map_or(true, |now| now >= deadline)
+        }) {
+            let kill = child.kill();
+            let wait = child.wait();
+            kill.context("stop workload at its approved hard deadline")?;
+            wait.context("settle workload at its approved hard deadline")?;
+            bail!("workload approved hard deadline expired");
         }
         if Instant::now() >= next_renewal {
             if let Err(error) = renew_active_session(session_id) {
@@ -2395,6 +2664,54 @@ fn validate_identifier(value: &str, description: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_explicit_enrollment_authority_selects_prompt_free_outer_admission() {
+        use super::{outer_admission, OuterAdmission};
+        use crate::policy_v3::Admission;
+        use crate::setup::InstallMode;
+        for noninteractive in [true, false] {
+            assert_eq!(
+                outer_admission(
+                    InstallMode::Strong,
+                    Some(Admission::EnrolledNoninteractive),
+                    noninteractive
+                ),
+                OuterAdmission::Enrolled
+            );
+        }
+        assert_eq!(
+            outer_admission(InstallMode::Strong, Some(Admission::ApprovalRequired), true),
+            OuterAdmission::ApprovalRequired
+        );
+        assert_eq!(
+            outer_admission(InstallMode::Strong, None, true),
+            OuterAdmission::ApprovalRequired
+        );
+        assert_eq!(
+            outer_admission(
+                InstallMode::Strong,
+                Some(Admission::ApprovalRequired),
+                false
+            ),
+            OuterAdmission::Interactive
+        );
+        for noninteractive in [true, false] {
+            assert_eq!(
+                outer_admission(
+                    InstallMode::UserOnly,
+                    Some(Admission::EnrolledNoninteractive),
+                    noninteractive
+                ),
+                OuterAdmission::Enrolled
+            );
+        }
+        for admission in [None, Some(Admission::ApprovalRequired)] {
+            assert_eq!(
+                outer_admission(InstallMode::UserOnly, admission, true),
+                OuterAdmission::ApprovalRequired
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -2447,6 +2764,8 @@ mod tests {
             "DYLD_INSERT_LIBRARIES",
             "GH_TOKEN",
             "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
             "OP_SERVICE_ACCOUNT_TOKEN",
             "SSH_AUTH_SOCK",
             "GIT_ASKPASS",
@@ -2749,6 +3068,7 @@ mod tests {
     #[test]
     fn transient_systemd_boundary_is_exact_and_kills_the_whole_workload_on_supervisor_exit() {
         let arguments = transient_service_arguments(&TransientServiceRequest {
+            duration_seconds: None,
             session_id: "0123456789abcdef0123456789abcdef",
             owner_uid: 1000,
             owner_gid: 1001,

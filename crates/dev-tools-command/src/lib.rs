@@ -1,5 +1,8 @@
 //! Product-neutral executable discovery, PATH composition, and bounded execution.
 
+mod inherited;
+pub use inherited::{run_prepared_inherited_command, InheritedCommandOutput};
+
 #[cfg(target_os = "linux")]
 mod public_file_stdout;
 #[cfg(target_os = "linux")]
@@ -25,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result as AnyhowResult};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use wait_timeout::ChildExt;
 use zeroize::Zeroize;
 #[cfg(all(
@@ -82,6 +85,21 @@ pub struct HeldExecutable {
 #[cfg(not(target_os = "linux"))]
 pub struct HeldExecutable;
 
+/// The role of a retained source-path component presented to product validation.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldComponentKind {
+    Directory,
+    Executable,
+}
+
+#[cfg(target_os = "linux")]
+impl AsFd for HeldExecutable {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.executable.as_fd()
+    }
+}
+
 pub struct HeldCommand<'a> {
     command: Command,
     _held: &'a HeldExecutable,
@@ -104,7 +122,21 @@ impl std::ops::DerefMut for HeldCommand<'_> {
 #[cfg(target_os = "linux")]
 impl HeldExecutable {
     pub fn open(path: &Path) -> AnyhowResult<Self> {
-        hold_linux_executable(path)
+        Self::open_with_validation(path, |_, _| Ok(()))
+    }
+
+    /// Apply additional product policy to each retained source-path descriptor.
+    ///
+    /// The callback runs once for the root, each ancestor and the executable,
+    /// after that component passes the shared ownership/type/mode baseline.
+    /// Rejection aborts construction; acceptance cannot bypass the baseline.
+    /// Descriptors refer to the opened objects, never a later pathname lookup.
+    /// This does not freeze metadata or bytes against an authorized writer.
+    pub fn open_with_validation(
+        path: &Path,
+        validate: impl FnMut(BorrowedFd<'_>, HeldComponentKind) -> AnyhowResult<()>,
+    ) -> AnyhowResult<Self> {
+        hold_linux_executable(path, validate)
     }
 
     /// Open an independent read-only handle to the retained executable inode.
@@ -767,7 +799,10 @@ fn validate_bounded_command(
 }
 
 #[cfg(target_os = "linux")]
-fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
+fn hold_linux_executable(
+    path: &Path,
+    mut validate: impl FnMut(BorrowedFd<'_>, HeldComponentKind) -> AnyhowResult<()>,
+) -> AnyhowResult<HeldExecutable> {
     use std::path::Component;
 
     let mut components = path.components();
@@ -796,6 +831,7 @@ fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
         current_uid,
         true,
     )?;
+    validate(root.as_fd(), HeldComponentKind::Directory)?;
     let mut ancestors = vec![root];
     for name in directory_names {
         let directory = rustix::fs::openat(
@@ -813,6 +849,7 @@ fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
             current_uid,
             true,
         )?;
+        validate(directory.as_fd(), HeldComponentKind::Directory)?;
         ancestors.push(directory);
     }
     let executable = rustix::fs::openat(
@@ -835,6 +872,7 @@ fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
     if executable_metadata.st_mode & 0o111 == 0 {
         bail!("held executable is not executable");
     }
+    validate(executable.as_fd(), HeldComponentKind::Executable)?;
     let proc_fd_directory =
         rustix::fs::open("/proc/self/fd", directory_flags, rustix::fs::Mode::empty())
             .context("open process file-descriptor directory")?;

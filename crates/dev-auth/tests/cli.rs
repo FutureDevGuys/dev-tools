@@ -19,8 +19,283 @@ use std::time::Duration;
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
+#[cfg(target_os = "linux")]
+#[path = "support/enrolled_store.rs"]
+mod enrolled_store;
+
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+#[test]
+fn logical_secret_commands_fail_closed_without_admission_and_keep_stdout_clean() {
+    for operation in ["read", "public"] {
+        let root = private_runtime();
+        let result = root.path().join("result.json");
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .env("HOME", root.path())
+                .env("PATH", "/missing")
+                .args([
+                    "secret",
+                    operation,
+                    "build-token",
+                    "--non-interactive",
+                    "--result-file",
+                ])
+                .arg(&result),
+        );
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+        assert_eq!(report["schema"], "dev-auth-execution-result-v1");
+        assert_eq!(report["operation"], format!("secret_{operation}"));
+        assert_eq!(report["outcome"], "admission_required");
+        assert_eq!(report["started"], false);
+    }
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["secret", "read", "op://private-sentinel/item/value"]),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-sentinel"));
+}
+
+#[test]
+fn secret_exec_requires_admission_before_projecting_or_starting() {
+    let root = private_runtime();
+    let result = root.path().join("result.json");
+    let marker = root.path().join("must-not-exist");
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", "/missing")
+            .args([
+                "secret",
+                "exec",
+                "--stdin",
+                "build-token",
+                "--non-interactive",
+                "--result-file",
+            ])
+            .arg(&result)
+            .args(["--", "/usr/bin/touch"])
+            .arg(&marker),
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists());
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(report["operation"], "secret_exec");
+    assert_eq!(report["outcome"], "admission_required");
+    assert_eq!(report["started"], false);
+}
+
+#[test]
+fn uninstalled_doctor_reports_external_without_loading_credentials_or_installing() {
+    let root = private_runtime();
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", "/path-that-does-not-exist")
+            .current_dir(root.path())
+            .args(["doctor", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-tools-operation-result-v1");
+    assert_eq!(report["product"], "dev-auth");
+    assert_eq!(report["operation"], "doctor");
+    assert_eq!(report["outcome"], "external");
+    assert_eq!(report["installation_state"], "external");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["invoked_version"], env!("CARGO_PKG_VERSION"));
+    assert!(report.get("details").is_none());
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn doctor_invalid_arguments_are_one_value_free_json_result() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["doctor", "--json", "private-input-must-not-be-echoed"]),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error_kind"], "invalid_invocation");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-input-must-not-be-echoed"));
+}
+
+#[test]
+fn noninteractive_workload_launch_reports_setup_requirement_without_prompting() {
+    let root = private_runtime();
+    let result_file = root.path().join("result.json");
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("PATH", "/missing")
+            .current_dir(root.path())
+            .args([
+                "workload",
+                "launch",
+                "generic-worker",
+                "--non-interactive",
+                "--result-file",
+            ])
+            .arg(&result_file)
+            .arg("--")
+            .arg("literal caller input"),
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&result_file).unwrap()).unwrap();
+    assert_eq!(report["schema"], "dev-auth-execution-result-v1");
+    assert_eq!(report["operation"], "workload_launch");
+    assert_eq!(report["outcome"], "requires_setup");
+    assert_eq!(report["started"], false);
+    assert_eq!(report["exit_code"], 3);
+    assert_eq!(
+        fs::metadata(&result_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let text = fs::read_to_string(&result_file).unwrap();
+    assert!(!text.contains("literal caller input"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("literal caller input"));
+}
+
+#[test]
+fn workload_result_destination_cannot_overwrite_an_existing_document() {
+    let root = private_runtime();
+    let result_file = root.path().join("result.json");
+    fs::write(&result_file, b"existing user document").unwrap();
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args([
+                "workload",
+                "launch",
+                "generic-worker",
+                "--non-interactive",
+                "--result-file",
+            ])
+            .arg(&result_file)
+            .arg("--"),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read(&result_file).unwrap(), b"existing user document");
+}
+
+#[test]
+fn workload_launch_help_names_noninteractive_and_separate_result_controls() {
+    let output = bounded_output(Command::new(env!("CARGO_BIN_EXE_dev-auth")).arg("--help"));
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("dev-auth doctor"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("dev-auth workload launch"));
+    assert!(help.contains("--non-interactive"));
+    assert!(help.contains("--result-file"));
+}
+
+#[test]
+fn workload_launch_help_is_available_without_a_workload_or_separator() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth")).args(["workload", "launch", "--help"]),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--non-interactive"));
+    assert!(help.contains("--result-file"));
+}
+
+#[test]
+fn workload_launch_invalid_input_never_reserves_a_result() {
+    let root = private_runtime();
+    for extra in [
+        vec!["--non-interactive", "--non-interactive", "--"],
+        vec!["--unknown", "--"],
+        vec![],
+    ] {
+        let result = root.path().join("result.json");
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .args(["workload", "launch", "generic-worker", "--result-file"])
+                .arg(&result)
+                .args(extra),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!result.exists());
+    }
+}
+
+#[test]
+fn workload_launch_native_arguments_are_not_decoded_or_exposed() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = private_runtime();
+    let result = root.path().join("result.json");
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args([
+                "workload",
+                "launch",
+                "generic-worker",
+                "--non-interactive",
+                "--result-file",
+            ])
+            .arg(&result)
+            .arg("--")
+            .arg(std::ffi::OsString::from_vec(
+                b"caller-\xff-private".to_vec(),
+            )),
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("caller-"));
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(report["started"], false);
+}
+
+#[test]
+fn workload_result_destination_rejects_links_and_nonprivate_parents() {
+    let root = private_runtime();
+    let target = root.path().join("existing");
+    fs::write(&target, "preserve").unwrap();
+    let linked_file = root.path().join("linked-file");
+    symlink(&target, &linked_file).unwrap();
+    let linked_parent = root.path().join("linked-parent");
+    symlink(root.path(), &linked_parent).unwrap();
+    let public = root.path().join("public");
+    fs::create_dir(&public).unwrap();
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+    for result in [
+        linked_file,
+        linked_parent.join("new.json"),
+        public.join("new.json"),
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .args(["workload", "launch", "generic-worker", "--result-file"])
+                .arg(result)
+                .arg("--"),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(fs::read_to_string(target).unwrap(), "preserve");
+    assert!(!root.path().join("new.json").exists());
+    assert!(!public.join("new.json").exists());
+}
 
 #[test]
 fn standard_identity_is_local_and_preserves_legacy_release_build_info() {
@@ -100,6 +375,7 @@ fn static_output_write_failure_is_operational_not_a_panic() {
         vec!["--version"],
         vec!["build-info", "--json"],
         vec!["completion", "bash"],
+        vec!["doctor", "--json"],
     ] {
         let full = fs::OpenOptions::new()
             .write(true)
@@ -139,12 +415,20 @@ fn static_completion_does_not_load_configuration_or_change_private_dispatch() {
             "dev-auth",
             "completion",
             "setup",
+            "doctor",
             "workload",
             "ssh-public",
             "credential-stdin",
+            "restore",
             "caller-argument-index",
+            "component",
         ] {
             assert!(script.contains(token), "{shell}: missing {token}");
+        }
+        // The retained upstream PowerShell renderer emits option names but
+        // does not implement possible-value completion (ADR 0012).
+        if shell != "powershell" {
+            assert!(script.contains("providers"), "{shell}: missing providers");
         }
         for hidden in ["supervisor-child", "sandbox-child", "provider-exec"] {
             assert!(
@@ -222,6 +506,14 @@ COMP_WORDS=(dev-auth setup apply --credential-s)
 COMP_CWORD=3
 "$function_name" dev-auth --credential-s apply
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth setup recover --credential-fd)
+COMP_CWORD=3
+"$function_name" dev-auth --credential-fd recover
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth setup restore --mode user-)
+COMP_CWORD=4
+"$function_name" dev-auth user- --mode
+printf '%s\n' "${COMPREPLY[@]}"
 COMP_WORDS=(dev-auth setup plan --channel st)
 COMP_CWORD=4
 "$function_name" dev-auth st --channel
@@ -237,6 +529,10 @@ printf '%s\n' "${COMPREPLY[@]}"
 COMP_WORDS=(dev-auth workload bind plan --arg structured --caller-a)
 COMP_CWORD=6
 "$function_name" dev-auth --caller-a structured
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth validate --component pro)
+COMP_CWORD=3
+"$function_name" dev-auth pro --component
 printf '%s\n' "${COMPREPLY[@]}"
 "#;
     let output = bounded_output(
@@ -254,8 +550,44 @@ printf '%s\n' "${COMPREPLY[@]}"
     );
     assert_eq!(
         output.stdout,
-        b"--json\n--purpose\n--credential-stdin\nstable\n--command-name\nstructured\n--caller-argument-index\n"
+        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--command-name\nstructured\n--caller-argument-index\nproviders\n"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_restoration_has_closed_arguments_and_value_free_native_gates() {
+    let help = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["setup", "restore", "--help"])
+            .env_clear(),
+    );
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("dev-auth setup restore"));
+    let invalid = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["setup", "restore", "--credential-stdin", "unexpected"])
+            .env_clear(),
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    // Never invoke a mutating root restoration against the test host. The
+    // explicit disposable-systemd fixture qualifies the native owner path.
+    if nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+    let blocked = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["setup", "restore", "--mode", "strong", "--format", "json"])
+            .env_clear(),
+    );
+    assert_eq!(blocked.status.code(), Some(4));
+    assert!(blocked.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-auth-setup-restore-v1");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["error_kind"], "setup_restoration_authority");
+    assert_eq!(report["next_action"], "run_as_installation_owner");
 }
 
 #[cfg(target_os = "linux")]
@@ -268,10 +600,11 @@ fn internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider
     fs::write(
         &provider,
         b"#!/bin/sh\n\
-[ \"$#\" -eq 3 ] || exit 90\n\
-[ \"$1\" = read ] || exit 91\n\
-[ \"$2\" = --no-newline ] || exit 92\n\
-[ \"$3\" = op://Automation/provider/private-key ] || exit 93\n\
+case \"$1\" in\n\
+  read) [ \"$#\" -eq 3 ] && [ \"$2\" = --no-newline ] && [ \"$3\" = op://Automation/provider/private-key ] || exit 90 ;;\n\
+  user) [ \"$#\" -eq 5 ] && [ \"$2\" = get ] && [ \"$3\" = --me ] && [ \"$4\" = --format ] && [ \"$5\" = json ] || exit 91 ;;\n\
+  *) exit 92 ;;\n\
+esac\n\
 [ \"${OP_SERVICE_ACCOUNT_TOKEN-}\" = transport-test-token ] || exit 94\n\
 for descriptor in /proc/$$/fd/*; do\n\
   case \"$(/usr/bin/readlink \"$descriptor\")\" in\n\
@@ -317,46 +650,69 @@ printf provider-secret",
     let child_fd = child_guard.as_raw_fd();
     let provider_fd = provider_guard.as_raw_fd();
     let token_fd = token.as_raw_fd();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
-    command
-        .arg0("dev-auth-provider-exec")
-        .args([
-            "--child-fd".into(),
-            child_fd.to_string(),
-            "--provider-fd".into(),
-            provider_fd.to_string(),
-            "--token-fd".into(),
-            token_fd.to_string(),
-            "--provider-argv0".into(),
-            provider.to_string_lossy().into_owned(),
-            "--reference".into(),
-            "op://Automation/provider/private-key".into(),
-        ])
-        .env_clear();
-    // SAFETY: all three File owners remain live until bounded_output completes.
-    // Clearing FD_CLOEXEC is async-signal-safe and occurs only in the child.
-    unsafe {
-        command.pre_exec(move || {
-            for descriptor in [child_fd, provider_fd, token_fd] {
-                // SAFETY: the File owners above retain these exact descriptors
-                // through the pre-exec callback.
-                let descriptor = BorrowedFd::borrow_raw(descriptor);
-                rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())?;
-            }
-            Ok(())
-        });
+    for (arguments, permitted) in [
+        (
+            vec!["--reference", "op://Automation/provider/private-key"],
+            true,
+        ),
+        (vec!["--current-account"], true),
+        (vec!["--current-account", "--user", "other"], false),
+        (
+            vec![
+                "--current-account",
+                "--reference",
+                "op://Automation/provider/private-key",
+            ],
+            false,
+        ),
+        (vec!["--operation", "arbitrary"], false),
+    ] {
+        token.seek(SeekFrom::Start(0)).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
+        command
+            .arg0("dev-auth-provider-exec")
+            .args([
+                "--child-fd".into(),
+                child_fd.to_string(),
+                "--provider-fd".into(),
+                provider_fd.to_string(),
+                "--token-fd".into(),
+                token_fd.to_string(),
+                "--provider-argv0".into(),
+                provider.to_string_lossy().into_owned(),
+            ])
+            .args(arguments)
+            .env_clear();
+        // SAFETY: all three File owners remain live until bounded_output completes.
+        // Clearing FD_CLOEXEC is async-signal-safe and occurs only in the child.
+        unsafe {
+            command.pre_exec(move || {
+                for descriptor in [child_fd, provider_fd, token_fd] {
+                    // SAFETY: the File owners above retain these exact descriptors
+                    // through the pre-exec callback.
+                    let descriptor = BorrowedFd::borrow_raw(descriptor);
+                    rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())?;
+                }
+                Ok(())
+            });
+        }
+        let output = bounded_output(&mut command);
+        assert_eq!(
+            output.status.success(),
+            permitted,
+            "provider child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if permitted {
+            assert_eq!(output.stdout, b"provider-secret");
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+        assert!(!output
+            .stderr
+            .windows(b"transport-test-token".len())
+            .any(|window| { window == b"transport-test-token" }));
     }
-    let output = bounded_output(&mut command);
-    assert!(
-        output.status.success(),
-        "provider child failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, b"provider-secret");
-    assert!(!output
-        .stderr
-        .windows(b"transport-test-token".len())
-        .any(|window| { window == b"transport-test-token" }));
 }
 
 #[cfg(target_os = "linux")]
@@ -900,8 +1256,6 @@ impl NativeUserSandbox {
             .args(["--symlink", "usr/bin", "/bin"])
             .args(["--symlink", "usr/lib", "/lib"])
             .args(["--symlink", "usr/lib", "/lib64"])
-            .args(["--dir", "/storage"])
-            .args(["--ro-bind", "/storage", "/storage"])
             .args(["--dev", "/dev"])
             .args(["--proc", "/proc"])
             .args(["--dir", "/etc"])
@@ -957,11 +1311,13 @@ impl NativeUserSandbox {
 }
 
 #[cfg(target_os = "linux")]
-fn run_standalone_user_only_setup_child() {
+fn run_standalone_user_only_setup_child(trace_doctor: bool) {
     use dev_auth::deployment::{
         normalize_deployment, parse_deployment_document, DeploymentCliInput,
     };
-    use dev_auth::setup::{build_plan, rollback_at, InstallMode, InstallRequest, SetupPaths};
+    use dev_auth::setup::{
+        build_plan, deactivate_transparent_launchers_at, InstallMode, InstallRequest, SetupPaths,
+    };
     use dev_auth::setup_v3::{build_setup_plan_v3_at, write_setup_plan_v3_at};
     use std::os::unix::process::CommandExt;
 
@@ -1094,6 +1450,73 @@ config = "{}"
     assert_eq!(first["changed"], true);
     assert_eq!(first["verified"], true);
 
+    let trace_path = root.path().join("doctor.trace");
+    let mut doctor_command = if trace_doctor {
+        let mut command = Command::new("/usr/bin/strace");
+        command
+            .args([
+                "--kill-on-exit", "-f", "-qq", "-s", "64", "-e",
+                "trace=network,process,openat,unlink,unlinkat,rename,renameat,renameat2,flock,fsync,fdatasync",
+                "-o",
+            ])
+            .arg(&trace_path)
+            .arg(user.dir.join(".local/bin/dev-auth"));
+        command
+    } else {
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+    };
+    let doctor = bounded_output(
+        doctor_command
+            .args(["doctor", "--json"])
+            .env_clear()
+            .env("PATH", "/missing")
+            .current_dir(&user.dir),
+    );
+    assert_eq!(doctor.status.code(), Some(0));
+    assert!(doctor.stderr.is_empty());
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["operation"], "doctor");
+    assert_eq!(doctor["changed"], false);
+    assert_eq!(doctor["installation_state"], "managed");
+    assert_eq!(doctor["details"]["broker_state"], "not_probed");
+    assert_eq!(doctor["details"]["credential_observation"], "not_required");
+    assert_eq!(doctor["details"]["provider_use_observation"], "not_checked");
+    if trace_doctor {
+        assert!(fs::metadata(&trace_path).unwrap().len() <= PUBLIC_SUBPROCESS_OUTPUT_LIMIT);
+        let trace = fs::read_to_string(&trace_path).unwrap();
+        assert_eq!(trace.matches("execve(").count(), 1);
+        for forbidden in [
+            "socket(",
+            "connect(",
+            "sendto(",
+            "sendmsg(",
+            "recvfrom(",
+            "recvmsg(",
+            "clone(",
+            "clone3(",
+            "fork(",
+            "vfork(",
+            "O_WRONLY",
+            "O_RDWR",
+            "O_CREAT",
+            "O_TRUNC",
+            "O_APPEND",
+            "unlink(",
+            "unlinkat(",
+            "rename(",
+            "renameat(",
+            "renameat2(",
+            "flock(",
+            "fsync(",
+            "fdatasync(",
+        ] {
+            assert!(
+                !trace.contains(forbidden),
+                "doctor crossed local observation boundary: {forbidden}"
+            );
+        }
+    }
+
     let second = Command::new(user.dir.join(".local/bin/dev-auth"))
         .args([
             "setup",
@@ -1158,6 +1581,10 @@ config = "{}"
     fs::remove_file(reconcile_plan).unwrap();
 
     let unresolved_workload = user.dir.join(".local/bin/future-agent");
+    assert!(!user
+        .dir
+        .join(".local/share/dev-auth/workload-aliases-v1.json")
+        .exists());
     symlink(
         paths
             .data_root
@@ -1173,9 +1600,10 @@ config = "{}"
         .output()
         .unwrap();
     assert!(!workload.status.success());
+    assert!(workload.stdout.is_empty());
     let workload_error = String::from_utf8(workload.stderr).unwrap();
     assert!(
-        workload_error.contains("workload launcher is outside the installed alias set"),
+        workload_error.contains("workload launcher receipt is not installed"),
         "{workload_error}"
     );
     assert!(!workload_error.contains("installation lock"));
@@ -1195,19 +1623,137 @@ config = "{}"
     assert!(log.contains("arg=--new-option"));
     assert!(log.contains("arg=value"));
 
-    let rollback = rollback_at(&paths).unwrap();
-    assert!(!rollback.transparent_launchers_active);
+    let receipt_before = fs::read(paths.data_root.join("install-v2.json")).unwrap();
+    let admission_lock = std::path::PathBuf::from(format!(
+        "/run/user/{}/dev-auth-setup-v3.lock",
+        user.uid.as_raw()
+    ));
+    let workload_lease =
+        dev_tools_installation::InstallationLock::try_acquire_shared(&admission_lock)
+            .unwrap()
+            .unwrap();
+    let check_configuration_refusal = |expected: &str| {
+        use sha2::Digest;
+        for (operation, source) in [
+            ("install-user-policy", &policy),
+            ("update-user-policy", &policy),
+            ("install-user-config", &config),
+            ("update-user-config", &config),
+        ] {
+            let digest = format!("{:x}", sha2::Sha256::digest(fs::read(source).unwrap()));
+            let mut command = Command::new(user.dir.join(".local/bin/dev-auth"));
+            command
+                .env_clear()
+                .args(["setup", operation, "--source"])
+                .arg(source)
+                .args(["--sha256", &digest]);
+            if operation.starts_with("update-") {
+                command.args(["--current-sha256", &digest]);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                !output.status.success(),
+                "{operation} bypassed coordinated setup authority"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{operation}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
+    check_configuration_refusal("requires active workloads and setup to finish");
+    let busy_rollback = Command::new(user.dir.join(".local/bin/dev-auth"))
+        .args(["setup", "rollback", "--mode", "user-only"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!busy_rollback.status.success());
+    assert!(String::from_utf8_lossy(&busy_rollback.stderr)
+        .contains("rollback requires active workloads and setup to finish"));
+    assert_eq!(
+        fs::read(paths.data_root.join("install-v2.json")).unwrap(),
+        receipt_before
+    );
+    for operation in ["repair", "uninstall"] {
+        let busy = Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["setup", operation, "--mode", "user-only"])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(
+            !busy.status.success(),
+            "{operation} bypassed an admitted workload"
+        );
+        assert!(String::from_utf8_lossy(&busy.stderr)
+            .contains("requires active workloads and setup to finish"));
+        assert_eq!(
+            fs::read(paths.data_root.join("install-v2.json")).unwrap(),
+            receipt_before
+        );
+    }
+    drop(workload_lease);
+    check_configuration_refusal("full setup generation requires transaction-aware maintenance");
+    let rollback = Command::new(user.dir.join(".local/bin/dev-auth"))
+        .args(["setup", "rollback", "--mode", "user-only"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!rollback.status.success());
+    assert!(String::from_utf8_lossy(&rollback.stderr)
+        .contains("binary-only rollback cannot restore a full setup generation"));
+    assert_eq!(
+        fs::read(paths.data_root.join("install-v2.json")).unwrap(),
+        receipt_before
+    );
+    for operation in ["repair", "uninstall"] {
+        let refused = Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["setup", operation, "--mode", "user-only"])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{operation} bypassed retained setup"
+        );
+        assert!(String::from_utf8_lossy(&refused.stderr)
+            .contains("full setup generation requires transaction-aware maintenance"));
+        assert_eq!(
+            fs::read(paths.data_root.join("install-v2.json")).unwrap(),
+            receipt_before
+        );
+    }
+    assert!(user.dir.join(".local/bin/git").exists());
+    let deactivated = deactivate_transparent_launchers_at(&paths).unwrap();
+    assert!(!deactivated.transparent_launchers_active);
     assert!(!user.dir.join(".local/bin/git").exists());
     assert!(!user.dir.join(".local/bin/gh").exists());
 }
 
 #[cfg(target_os = "linux")]
-fn run_missing_credential_stages_no_workload_launchers_child() {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupRecoveryFixture {
+    PriorInstallation,
+    InitialAbsence,
+    InitialProcessDeath,
+    MissingInitialReceipt,
+    InitialUncommittedBinary,
+    CommittedUpgradeReceipt,
+    UncommittedUpgradeBinary,
+    UnstagedUpgradeBinary,
+    UnstagedInitialBinary,
+}
+
+fn run_missing_credential_stages_no_workload_launchers_child(
+    logical: bool,
+    recovery: Option<SetupRecoveryFixture>,
+) {
     use dev_auth::deployment::{
         normalize_deployment, parse_deployment_document, DeploymentCliInput,
     };
     use dev_auth::setup::{build_plan, InstallMode, InstallRequest, SetupPaths};
     use dev_auth::setup_v3::{apply_setup_plan_v3, build_setup_plan_v3_at, render_setup_plan_v3};
+    use std::os::unix::process::CommandExt;
 
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .unwrap()
@@ -1292,6 +1838,117 @@ mode = "none"
 "#,
     )
     .unwrap();
+    let prior_policy = fs::read(&policy).unwrap();
+    let prior_config = fs::read(&config).unwrap();
+    if matches!(
+        recovery,
+        Some(
+            SetupRecoveryFixture::PriorInstallation
+                | SetupRecoveryFixture::CommittedUpgradeReceipt
+                | SetupRecoveryFixture::UncommittedUpgradeBinary
+                | SetupRecoveryFixture::UnstagedUpgradeBinary
+        )
+    ) {
+        let directory = user.dir.join(".config/dev-auth");
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(user.dir.join(".config"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        for (name, bytes) in [
+            ("policy-v2.toml", &prior_policy),
+            ("config-v2.toml", &prior_config),
+        ] {
+            let path = directory.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let prior_source = root.path().join("prior-product");
+        fs::copy(&candidate, &prior_source).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&prior_source)
+            .unwrap()
+            .write_all(b"retained fixture identity")
+            .unwrap();
+        dev_auth::setup::install_at(
+            &SetupPaths::user_only(&user.dir),
+            &InstallRequest {
+                mode: InstallMode::UserOnly,
+                version: "0.3.11".into(),
+                source_executable: prior_source,
+                native_git: native_git.clone(),
+                native_gh: native_gh.clone(),
+                activate_transparent_launchers: false,
+            },
+        )
+        .unwrap();
+    }
+    if logical {
+        fs::write(
+            &policy,
+            format!(
+                r#"schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["{user}"]
+[programs]
+git = "{git}"
+gh = "{gh}"
+ssh = "{ssh}"
+ssh_keygen = "{keygen}"
+[trusted_launchers]
+future-agent = "{launcher}"
+[credentials.providers.primary]
+kind = "one_password"
+executable = "{op}"
+[credentials.credential_slots.automation]
+provider = "primary"
+users = ["{user}"]
+[credentials.resources.token]
+credential_slot = "automation"
+reference = "op://Fixture/Agent/token"
+kind = "exportable"
+purposes = ["read"]
+[credentials.resource_caps.automation]
+users = ["{user}"]
+[credentials.resource_caps.automation.resources.token]
+purposes = ["read"]
+[workload_caps.automation]
+users = ["{user}"]
+resource_cap = "automation"
+launchers = ["future-agent"]
+admission = ["approval_required"]
+max_duration_seconds = 86400
+"#,
+                user = user.name,
+                git = native_git.display(),
+                gh = native_gh.display(),
+                ssh = ssh.display(),
+                keygen = ssh_keygen.display(),
+                launcher = future_agent.display(),
+                op = op.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            r#"schema = "dev-auth-user-config-v3"
+[authority_profiles.automation]
+cap = "automation"
+[authority_profiles.automation.resources.token]
+purposes = ["read"]
+[[workloads]]
+name = "future-agent"
+launcher = "future-agent"
+profile = "automation"
+admission = "approval_required"
+duration_seconds = 43200
+[workloads.resources.token]
+purposes = ["read"]
+[workloads.desktop]
+display_name = "Retained Candidate Fixture"
+"#,
+        )
+        .unwrap();
+    }
     for path in [&policy, &config] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
@@ -1325,7 +1982,12 @@ intent = "enroll-if-absent"
         &paths,
         &InstallRequest {
             mode: InstallMode::UserOnly,
-            version: "0.3.0-inactive-test".into(),
+            version: if logical {
+                "0.4.0"
+            } else {
+                "0.3.0-inactive-test"
+            }
+            .into(),
             source_executable: candidate,
             native_git,
             native_gh,
@@ -1335,8 +1997,733 @@ intent = "enroll-if-absent"
     .unwrap();
     let plan = build_setup_plan_v3_at(intent, installation, false).unwrap();
     let (_, digest) = render_setup_plan_v3(&plan).unwrap();
+    let prior_binary_receipts = matches!(
+        recovery,
+        Some(
+            SetupRecoveryFixture::CommittedUpgradeReceipt
+                | SetupRecoveryFixture::UncommittedUpgradeBinary
+                | SetupRecoveryFixture::UnstagedUpgradeBinary
+        )
+    )
+    .then(|| {
+        let product = fs::read(paths.data_root.join("install-v2.json")).unwrap();
+        let shared: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.data_root.join("installation-receipt-v1.json")).unwrap(),
+        )
+        .unwrap();
+        (product, shared)
+    });
     let report = apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
     assert_eq!(report.input_required, ["automation"]);
+    if matches!(
+        recovery,
+        Some(
+            SetupRecoveryFixture::MissingInitialReceipt
+                | SetupRecoveryFixture::InitialUncommittedBinary
+                | SetupRecoveryFixture::UnstagedInitialBinary
+                | SetupRecoveryFixture::CommittedUpgradeReceipt
+                | SetupRecoveryFixture::UncommittedUpgradeBinary
+                | SetupRecoveryFixture::UnstagedUpgradeBinary
+        )
+    ) {
+        let uncommitted = matches!(
+            recovery,
+            Some(
+                SetupRecoveryFixture::InitialUncommittedBinary
+                    | SetupRecoveryFixture::UnstagedInitialBinary
+                    | SetupRecoveryFixture::UncommittedUpgradeBinary
+                    | SetupRecoveryFixture::UnstagedUpgradeBinary
+            )
+        );
+        let receipt_path = paths.data_root.join("install-v2.json");
+        let expected_receipt = fs::read(&receipt_path).unwrap();
+        let candidate_receipt: serde_json::Value =
+            serde_json::from_slice(&expected_receipt).unwrap();
+        let mut recovery_executable =
+            PathBuf::from(candidate_receipt["executable"].as_str().unwrap());
+        let transition_path = paths.data_root.join("setup-transition-v1.json");
+        let retained = fs::read(&transition_path).unwrap();
+        let snapshot_path = paths
+            .data_root
+            .join("setup-generations")
+            .join(format!("{digest}.json"));
+        let snapshot = fs::read(&snapshot_path).unwrap();
+        let shared: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.data_root.join("installation-receipt-v1.json")).unwrap(),
+        )
+        .unwrap();
+        let journal_path = paths.data_root.join("installation-transition-v1.json");
+        let journal = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-tools-versioned-transition-v1", "prior": prior_binary_receipts.as_ref().map(|(_, shared)| shared), "next": shared,
+        }))
+        .unwrap();
+        fs::write(&journal_path, &journal).unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        if let Some((prior_product, _)) = &prior_binary_receipts {
+            fs::write(&receipt_path, prior_product).unwrap();
+        } else {
+            fs::remove_file(&receipt_path).unwrap();
+        }
+        if uncommitted {
+            let shared_path = paths.data_root.join("installation-receipt-v1.json");
+            if let Some((_, prior_shared)) = &prior_binary_receipts {
+                fs::write(&shared_path, serde_json::to_vec(prior_shared).unwrap()).unwrap();
+            } else {
+                fs::remove_file(&shared_path).unwrap();
+            }
+            fs::remove_file(paths.bin_dir.join("dev-auth")).unwrap();
+            fs::remove_file(paths.data_root.join("active")).unwrap();
+        }
+        if matches!(
+            recovery,
+            Some(
+                SetupRecoveryFixture::UnstagedUpgradeBinary
+                    | SetupRecoveryFixture::UnstagedInitialBinary
+            )
+        ) {
+            let layout = dev_tools_installation::VersionedLayout {
+                product: "dev-auth".into(),
+                data_root: paths.data_root.clone(),
+                bin_dir: paths.bin_dir.clone(),
+                artifact_name: "dev-auth".into(),
+                owner_uid: user.uid.as_raw(),
+                directory_mode: 0o755,
+                bin_directory_mode: None,
+            };
+            let prior = prior_binary_receipts
+                .as_ref()
+                .map(|(_, shared)| serde_json::from_value(shared.clone()).unwrap());
+            let next = serde_json::from_value(shared).unwrap();
+            dev_tools_installation::recover_versioned_installation_transition(
+                &layout,
+                prior.as_ref(),
+                &next,
+                256 * 1024 * 1024,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let recovery_directory = root.path().join("recovery");
+            fs::create_dir(&recovery_directory).unwrap();
+            let external_candidate = recovery_directory.join("dev-auth");
+            fs::copy(&recovery_executable, &external_candidate).unwrap();
+            fs::remove_file(&recovery_executable).unwrap();
+            fs::remove_dir(recovery_executable.parent().unwrap()).unwrap();
+            if prior.is_none() {
+                fs::remove_dir(paths.data_root.join("versions")).unwrap();
+                fs::remove_file(paths.data_root.join("installation.lock")).unwrap();
+                fs::remove_dir(&paths.bin_dir).unwrap();
+            }
+            recovery_executable = external_candidate;
+        }
+        let expected_journal = fs::read(&journal_path).ok();
+        for source in plan
+            .source_documents
+            .iter()
+            .map(|document| &document.path)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            fs::remove_file(source).unwrap();
+        }
+        fs::remove_file(&plan.installation.request.source_executable).unwrap();
+        if prior_binary_receipts.is_some() {
+            fs::remove_file(root.path().join("prior-product")).unwrap();
+        }
+        let run = |stage: &'static str, timeout: Duration| {
+            bounded_output_with_timeout(
+                Command::new(&recovery_executable)
+                    .args([
+                        "setup",
+                        "recover",
+                        "--mode",
+                        "user-only",
+                        "--format",
+                        "json",
+                    ])
+                    .env_clear()
+                    .env("HOME", &user.dir)
+                    .env("PATH", "/usr/bin:/bin"),
+                timeout,
+                stage,
+            )
+        };
+        let mut accepted: serde_json::Value = serde_json::from_slice(&retained).unwrap();
+        accepted["phase"] = serde_json::json!("accepted");
+        fs::write(&transition_path, serde_json::to_vec(&accepted).unwrap()).unwrap();
+        let rejected = run(
+            "reject accepted binary recovery replay",
+            Duration::from_secs(20),
+        );
+        assert_eq!(
+            rejected.status.code(),
+            Some(3),
+            "stderr={}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(rejected["changed"], false);
+        if let Some((prior_product, _)) = &prior_binary_receipts {
+            assert_eq!(fs::read(&receipt_path).unwrap(), *prior_product);
+        } else {
+            assert!(!receipt_path.exists());
+        }
+        assert_eq!(fs::read(&journal_path).ok(), expected_journal);
+        fs::write(&transition_path, &retained).unwrap();
+        // This new upgrade path restores and verifies the prior installation,
+        // then verifies and activates a distinct candidate. Each binary stage
+        // retains the fixture's 20-second budget; other recovery paths do not
+        // acquire this extra allowance. Release performance is a separate gate.
+        let forward_budget = if uncommitted && prior_binary_receipts.is_some() {
+            Duration::from_secs(40)
+        } else {
+            Duration::from_secs(20)
+        };
+        let recovered = run("complete pending binary recovery", forward_budget);
+        assert_eq!(
+            recovered.status.code(),
+            Some(3),
+            "stderr={}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert!(recovered.stderr.is_empty());
+        let recovered: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+        assert_eq!(recovered["changed"], true);
+        assert_eq!(
+            recovered["input_required"],
+            serde_json::json!(["automation"])
+        );
+        assert!(recovered["actions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(if uncommitted {
+                if prior_binary_receipts.is_some() {
+                    "complete_upgrade_binary_installation"
+                } else {
+                    "complete_initial_binary_installation"
+                }
+            } else if prior_binary_receipts.is_some() {
+                "complete_upgrade_binary_receipt"
+            } else {
+                "complete_initial_binary_receipt"
+            })));
+        assert_eq!(fs::read(&receipt_path).unwrap(), expected_receipt);
+        assert!(!journal_path.exists());
+        let repeated = run("repeat completed binary recovery", Duration::from_secs(20));
+        assert_eq!(repeated.status.code(), Some(3));
+        let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+        assert_eq!(repeated["changed"], false);
+        assert_eq!(fs::read(&transition_path).unwrap(), retained);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        return;
+    }
+    if let Some(restoration) = recovery {
+        let prior_installation = restoration == SetupRecoveryFixture::PriorInstallation;
+        let transition_path = paths.data_root.join("setup-transition-v1.json");
+        let snapshot_path = paths
+            .data_root
+            .join("setup-generations")
+            .join(format!("{digest}.json"));
+        let snapshot = fs::read(&snapshot_path).unwrap();
+        let credential_receipt_path = paths.data_root.join("credential-actions-v2.json");
+        let credential_receipt = fs::read(&credential_receipt_path).ok();
+        let immutable_candidate = paths.data_root.join("versions/0.4.0/dev-auth");
+        // Model interrupted publication before either integration receipt was
+        // written. Retained candidate policy must still bound their retirement.
+        // Keep the process-death fixture's first unlink at its existing
+        // configuration boundary; it has a separate interruption oracle.
+        let candidate_desktop = user
+            .dir
+            .join(".local/share/applications/dev-auth-future-agent.desktop");
+        let unrelated_link = user.dir.join(".local/bin/unrelated-candidate-link");
+        let publish_candidate_integrations = || {
+            std::os::unix::fs::symlink(
+                &immutable_candidate,
+                user.dir.join(".local/bin/future-agent"),
+            )
+            .unwrap();
+            fs::create_dir_all(candidate_desktop.parent().unwrap()).unwrap();
+            let content = format!("[Desktop Entry]\nType=Application\nVersion=1.0\nName=Retained Candidate Fixture\nExec=\"{}\"\nTerminal=false\nCategories=Development;\nX-Dev-Auth-Workload=future-agent\n", user.dir.join(".local/bin/future-agent").display());
+            fs::write(&candidate_desktop, content).unwrap();
+            fs::set_permissions(&candidate_desktop, fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        if restoration != SetupRecoveryFixture::InitialProcessDeath {
+            publish_candidate_integrations();
+            std::os::unix::fs::symlink(&immutable_candidate, &unrelated_link).unwrap();
+        }
+        for source in [
+            &policy,
+            &config,
+            &plan.installation.request.source_executable,
+        ] {
+            fs::remove_file(source).unwrap();
+        }
+        if restoration != SetupRecoveryFixture::InitialProcessDeath {
+            let recovered = bounded_output_with_timeout(
+                Command::new(&immutable_candidate)
+                    .args([
+                        "setup",
+                        "recover",
+                        "--mode",
+                        "user-only",
+                        "--format",
+                        "json",
+                    ])
+                    .env_clear(),
+                Duration::from_secs(120),
+                "forward recovery retires partially published candidate integrations",
+            );
+            assert_eq!(
+                recovered.status.code(),
+                Some(3),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&recovered.stdout),
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            let recovered: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+            assert_eq!(
+                recovered["input_required"],
+                serde_json::json!(["automation"])
+            );
+            assert!(
+                fs::symlink_metadata(user.dir.join(".local/bin/future-agent")).is_err(),
+                "forward recovery left an unreceipted candidate launcher active"
+            );
+            assert!(
+                fs::symlink_metadata(&candidate_desktop).is_err(),
+                "forward recovery left an unreceipted candidate desktop entry active"
+            );
+            assert_eq!(
+                recovered["changed"], true,
+                "retirement must report established progress"
+            );
+            assert_eq!(fs::read_link(&unrelated_link).unwrap(), immutable_candidate);
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+            publish_candidate_integrations();
+        }
+        // Drift must be rejected before selecting restoration direction.
+        let active_config = user.dir.join(".config/dev-auth/config-v3.toml");
+        let candidate_config = fs::read(&active_config).unwrap();
+        fs::write(&active_config, b"unrelated owner edit").unwrap();
+        let before = fs::read(&transition_path).unwrap();
+        let invoke = || {
+            bounded_output_with_timeout(
+                Command::new(&immutable_candidate)
+                    .args([
+                        "setup",
+                        "restore",
+                        "--mode",
+                        "user-only",
+                        "--format",
+                        "json",
+                    ])
+                    .env_clear(),
+                Duration::from_secs(120),
+                "retained native restoration",
+            )
+        };
+        let rejected = invoke();
+        assert_eq!(
+            rejected.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(rejected["changed"], false);
+        assert_eq!(fs::read(&transition_path).unwrap(), before);
+        fs::write(&active_config, &candidate_config).unwrap();
+        if restoration == SetupRecoveryFixture::InitialProcessDeath {
+            let trace = root.path().join("restoration-process-death.trace");
+            let killed = bounded_output_with_timeout(
+                Command::new("/usr/bin/strace")
+                    .args([
+                        "--kill-on-exit",
+                        "-f",
+                        "-qq",
+                        "-e",
+                        "trace=unlinkat",
+                        "-e",
+                        "inject=unlinkat:signal=SIGKILL:when=1",
+                        "-o",
+                    ])
+                    .arg(&trace)
+                    .arg(&immutable_candidate)
+                    .args([
+                        "setup",
+                        "restore",
+                        "--mode",
+                        "user-only",
+                        "--format",
+                        "json",
+                    ])
+                    .env_clear(),
+                Duration::from_secs(120),
+                "initial restoration process-death boundary",
+            );
+            assert!(!killed.status.success());
+            let trace = fs::read_to_string(trace).unwrap();
+            assert!(trace.contains("SIGKILL"), "{trace}");
+            assert!(
+                trace.contains("policy-v3.toml") || trace.contains("config-v3.toml"),
+                "{trace}"
+            );
+            let marker: serde_json::Value =
+                serde_json::from_slice(&fs::read(&transition_path).unwrap()).unwrap();
+            assert_eq!(marker["phase"], "restoring");
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+            assert!(paths.data_root.join("install-v2.json").is_file());
+        }
+        for expected_changed in [true, false] {
+            let output = invoke();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema"], "dev-auth-setup-restore-v1");
+            assert_eq!(report["changed"], expected_changed);
+            assert_eq!(report["verified"], true);
+            assert_eq!(report["next_action"], "create_setup_plan");
+        }
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&transition_path).unwrap()).unwrap();
+        assert_eq!(marker["phase"], "restored_inactive");
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        assert_eq!(fs::read(&credential_receipt_path).ok(), credential_receipt);
+        if prior_installation {
+            assert_eq!(
+                fs::read(user.dir.join(".config/dev-auth/policy-v2.toml")).unwrap(),
+                prior_policy
+            );
+            assert_eq!(
+                fs::read(user.dir.join(".config/dev-auth/config-v2.toml")).unwrap(),
+                prior_config
+            );
+            let installed = dev_auth::setup::verify_at_read_only(&paths).unwrap();
+            assert_eq!(installed.version, "0.3.11");
+            assert!(!installed.transparent_launchers_active);
+        } else {
+            for path in [
+                user.dir.join(".config/dev-auth/policy-v2.toml"),
+                user.dir.join(".config/dev-auth/config-v2.toml"),
+                paths.data_root.join("install-v2.json"),
+                paths.data_root.join("installation-receipt-v1.json"),
+                paths.data_root.join("active"),
+                paths.data_root.join("previous"),
+                paths.bin_dir.join("dev-auth"),
+                paths.bin_dir.join("git-dev-auth"),
+                paths.bin_dir.join("gh-dev-auth"),
+                paths.bin_dir.join("git-credential-dev-auth"),
+                paths.bin_dir.join("git"),
+                paths.bin_dir.join("gh"),
+            ] {
+                assert!(fs::symlink_metadata(&path).is_err(), "{}", path.display());
+            }
+            assert!(immutable_candidate.is_file());
+        }
+        assert!(!active_config.exists());
+        assert!(!user.dir.join(".config/dev-auth/policy-v3.toml").exists());
+        assert!(!user.dir.join(".local/bin/future-agent").exists());
+        assert!(fs::symlink_metadata(&candidate_desktop).is_err());
+        if restoration != SetupRecoveryFixture::InitialProcessDeath {
+            assert_eq!(fs::read_link(&unrelated_link).unwrap(), immutable_candidate);
+        }
+        let forward = bounded_output_with_timeout(
+            Command::new(&immutable_candidate)
+                .args([
+                    "setup",
+                    "recover",
+                    "--mode",
+                    "user-only",
+                    "--format",
+                    "json",
+                ])
+                .env_clear(),
+            Duration::from_secs(15),
+            "restored generation rejects forward recovery",
+        );
+        assert_eq!(forward.status.code(), Some(3));
+        return;
+    }
+    if logical {
+        let transition_path = paths.data_root.join("setup-transition-v1.json");
+        assert!(
+            transition_path.is_file(),
+            "staging must durably close workload admission"
+        );
+        let retained = fs::read(&transition_path).unwrap();
+        let transition: serde_json::Value = serde_json::from_slice(&retained).unwrap();
+        assert_eq!(transition["phase"], "pending");
+        assert_eq!(transition["plan_sha256"], digest);
+        let snapshot_path = paths
+            .data_root
+            .join("setup-generations")
+            .join(format!("{digest}.json"));
+        assert!(
+            snapshot_path.is_file(),
+            "setup must retain the prior generation before mutation"
+        );
+        let snapshot = fs::read(&snapshot_path).unwrap();
+        let generation: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        let sources = generation["candidate_documents"].as_array().expect(
+            "recovery must retain approved candidate documents independently of source paths",
+        );
+        assert_eq!(sources.len(), plan.source_documents.len());
+        for (source, expected) in sources.iter().zip(&plan.source_documents) {
+            assert_eq!(source["identity"], serde_json::to_value(expected).unwrap());
+            let bytes: Vec<u8> = serde_json::from_value(source["bytes"].clone()).unwrap();
+            assert_eq!(bytes, fs::read(&expected.path).unwrap());
+        }
+        assert!(user.dir.join(".config/dev-auth/policy-v3.toml").is_file());
+        assert!(user.dir.join(".config/dev-auth/config-v3.toml").is_file());
+        assert!(!user.dir.join(".config/dev-auth/policy-v2.toml").exists());
+        assert!(!user.dir.join(".config/dev-auth/config-v2.toml").exists());
+        for source in plan
+            .source_documents
+            .iter()
+            .map(|document| &document.path)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            fs::remove_file(source).unwrap();
+        }
+        let repeated =
+            apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).unwrap();
+        assert!(!repeated.changed);
+        assert_eq!(repeated.input_required, ["automation"]);
+        assert_eq!(fs::read(&transition_path).unwrap(), retained);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        let wrong_candidate = root.path().join("wrong-recovery-candidate");
+        fs::copy(paths.bin_dir.join("dev-auth"), &wrong_candidate).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&wrong_candidate)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        let binary_journal_path = paths.data_root.join("installation-transition-v1.json");
+        let shared_receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.data_root.join("installation-receipt-v1.json")).unwrap(),
+        )
+        .unwrap();
+        let binary_journal = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-tools-versioned-transition-v1",
+            "prior": null,
+            "next": shared_receipt,
+        }))
+        .unwrap();
+        fs::write(&binary_journal_path, &binary_journal).unwrap();
+        fs::set_permissions(&binary_journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            apply_setup_plan_v3(&plan, &digest, &std::collections::BTreeMap::new()).is_err(),
+            "ordinary setup retry must not implicitly recover a binary journal"
+        );
+        assert_eq!(fs::read(&binary_journal_path).unwrap(), binary_journal);
+        assert_eq!(fs::read(&transition_path).unwrap(), retained);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        let observation = bounded_output_with_timeout(
+            Command::new(paths.bin_dir.join("dev-auth"))
+                .args(["setup", "verify", "--mode", "user-only"])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+            Duration::from_secs(20),
+            "setup verification must not recover a binary journal",
+        );
+        assert!(!observation.status.success());
+        assert_eq!(fs::read(&binary_journal_path).unwrap(), binary_journal);
+        let wrong = bounded_output_with_timeout(
+            Command::new(&wrong_candidate)
+                .arg0("dev-auth")
+                .args([
+                    "setup",
+                    "recover",
+                    "--mode",
+                    "user-only",
+                    "--format",
+                    "json",
+                ])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+            Duration::from_secs(20),
+            "reject differently hashed recovery executable",
+        );
+        assert_eq!(wrong.status.code(), Some(4));
+        assert!(wrong.stderr.is_empty());
+        let wrong: serde_json::Value = serde_json::from_slice(&wrong.stdout).unwrap();
+        assert_eq!(wrong["schema"], "dev-auth-setup-recover-v1");
+        assert_eq!(wrong["changed"], false);
+        assert_eq!(wrong["error_kind"], "setup_recovery_authority");
+        assert_eq!(
+            fs::read(&binary_journal_path)
+                .expect("authority rejection must not recover the binary journal"),
+            binary_journal
+        );
+        let noninitial_journal = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-tools-versioned-transition-v1",
+            "prior": shared_receipt,
+            "next": shared_receipt,
+        }))
+        .unwrap();
+        fs::write(&binary_journal_path, &noninitial_journal).unwrap();
+        let rejected_journal = bounded_output_with_timeout(
+            Command::new(paths.bin_dir.join("dev-auth"))
+                .args([
+                    "setup",
+                    "recover",
+                    "--mode",
+                    "user-only",
+                    "--format",
+                    "json",
+                ])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+            Duration::from_secs(20),
+            "recovery rejects an unapproved prior endpoint before mutation",
+        );
+        assert_eq!(rejected_journal.status.code(), Some(4));
+        assert!(rejected_journal.stderr.is_empty());
+        let rejected_journal: serde_json::Value =
+            serde_json::from_slice(&rejected_journal.stdout).unwrap();
+        assert_eq!(rejected_journal["changed"], false);
+        assert_eq!(fs::read(&binary_journal_path).unwrap(), noninitial_journal);
+        assert_eq!(fs::read(&transition_path).unwrap(), retained);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        fs::write(&binary_journal_path, &binary_journal).unwrap();
+        fs::remove_file(&plan.installation.request.source_executable).unwrap();
+        let recovered_journal = bounded_output_with_timeout(
+            Command::new(paths.bin_dir.join("dev-auth"))
+                .args([
+                    "setup",
+                    "recover",
+                    "--mode",
+                    "user-only",
+                    "--format",
+                    "json",
+                ])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+            Duration::from_secs(20),
+            "explicit recovery settles the retained candidate's committed binary journal",
+        );
+        assert_eq!(recovered_journal.status.code(), Some(3));
+        assert!(recovered_journal.stderr.is_empty());
+        let recovered_journal: serde_json::Value =
+            serde_json::from_slice(&recovered_journal.stdout).unwrap();
+        assert_eq!(recovered_journal["changed"], true);
+        assert_eq!(
+            recovered_journal["input_required"],
+            serde_json::json!(["automation"])
+        );
+        assert!(!binary_journal_path.exists());
+        assert_eq!(fs::read(&transition_path).unwrap(), retained);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        let recovered = bounded_output_with_timeout(
+            Command::new(paths.bin_dir.join("dev-auth"))
+                .args([
+                    "setup",
+                    "recover",
+                    "--mode",
+                    "user-only",
+                    "--format",
+                    "json",
+                ])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+            Duration::from_secs(45),
+            "candidate-independent setup recovery",
+        );
+        assert_eq!(
+            recovered.status.code(),
+            Some(3),
+            "recovery must report missing input, not depend on discarded candidates: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        let recovered: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+        assert_eq!(recovered["schema"], "dev-auth-setup-recover-v1");
+        assert_eq!(recovered["changed"], false);
+        assert_eq!(recovered["verified"], false);
+        assert_eq!(
+            recovered["input_required"],
+            serde_json::json!(["automation"])
+        );
+        assert_eq!(fs::read(&transition_path).unwrap(), retained);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        for (slot, exit, changed, error_kind) in [
+            (
+                "outside",
+                2,
+                serde_json::json!(false),
+                "setup_recovery_input",
+            ),
+            (
+                "automation",
+                1,
+                serde_json::Value::Null,
+                "setup_recovery_failed",
+            ),
+        ] {
+            let failed = bounded_output_with_timeout(
+                Command::new(paths.bin_dir.join("dev-auth"))
+                    .args([
+                        "setup",
+                        "recover",
+                        "--mode",
+                        "user-only",
+                        "--format",
+                        "json",
+                        "--credential-fd",
+                    ])
+                    .arg(format!("{slot}=999999"))
+                    .env_clear()
+                    .env("HOME", &user.dir)
+                    .env("PATH", "/usr/bin:/bin"),
+                Duration::from_secs(30),
+                "recovery failure progress boundary",
+            );
+            assert_eq!(failed.status.code(), Some(exit));
+            assert!(failed.stderr.is_empty());
+            let failed: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+            assert_eq!(failed["changed"], changed);
+            assert_eq!(failed["error_kind"], error_kind);
+            assert_eq!(fs::read(&transition_path).unwrap(), retained);
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        }
+        for phase in ["restoring", "restored_inactive"] {
+            let mut marker = transition.clone();
+            marker["phase"] = phase.into();
+            let marker = serde_json::to_vec(&marker).unwrap();
+            fs::write(&transition_path, &marker).unwrap();
+            let output = bounded_output_with_timeout(
+                Command::new(paths.bin_dir.join("dev-auth"))
+                    .args([
+                        "setup",
+                        "recover",
+                        "--mode",
+                        "user-only",
+                        "--format",
+                        "json",
+                    ])
+                    .env_clear(),
+                Duration::from_secs(15),
+                "restoration direction must reject forward recovery",
+            );
+            assert_eq!(output.status.code(), Some(3));
+            assert!(output.stderr.is_empty());
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["changed"], false);
+            assert_eq!(report["error_kind"], "setup_recovery_blocked");
+            assert_eq!(fs::read(&transition_path).unwrap(), marker);
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+        }
+        fs::write(&transition_path, &retained).unwrap();
+    }
     assert!(!report.verified);
     assert!(!user.dir.join(".local/bin/future-agent").exists());
     assert!(!user
@@ -1347,12 +2734,125 @@ intent = "enroll-if-absent"
 
 #[cfg(target_os = "linux")]
 #[test]
-fn standalone_user_only_setup_is_idempotent_transparent_and_reversible() {
+fn standalone_legacy_setup_keeps_native_repair_rollback_and_uninstall() {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .unwrap()
         .unwrap();
     if user.name == "dev-auth-test" {
-        run_standalone_user_only_setup_child();
+        use dev_auth::setup::{install_at, InstallMode, InstallRequest, SetupPaths};
+        let paths = SetupPaths::user_only(&user.dir);
+        let native_git = user.dir.join("native-git");
+        let native_gh = user.dir.join("native-gh");
+        for program in [&native_git, &native_gh] {
+            fs::write(program, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        install_at(
+            &paths,
+            &InstallRequest {
+                mode: InstallMode::UserOnly,
+                version: env!("CARGO_PKG_VERSION").into(),
+                source_executable: user.dir.parent().unwrap().join("artifact"),
+                native_git,
+                native_gh,
+                activate_transparent_launchers: false,
+            },
+        )
+        .unwrap();
+        assert!(!paths.data_root.join("setup-transition-v1.json").exists());
+        // Legacy direct configuration remains usable when no full generation
+        // owns it. The public commands must release their leases on return.
+        let policy_source = user.dir.join("legacy-policy.toml");
+        let config_source = user.dir.join("legacy-config.toml");
+        fs::write(&policy_source, format!(
+            "schema = \"dev-auth-administrator-policy-v3\"\nmode = \"user_only\"\nallowed_users = [\"{}\"]\n[programs]\ngit = \"{git_path}\"\ngh = \"{gh_path}\"\nssh = \"{git_path}\"\nssh_keygen = \"{git_path}\"\n[trusted_launchers]\n[credentials.providers]\n[credentials.credential_slots]\n[credentials.resources]\n[credentials.resource_caps]\n[workload_caps]\n",
+            user.name, git_path = user.dir.join("native-git").display(), gh_path = user.dir.join("native-gh").display()
+        )).unwrap();
+        fs::write(
+            &config_source,
+            b"schema = \"dev-auth-user-config-v3\"\nworkloads = []\n[authority_profiles]\n",
+        )
+        .unwrap();
+        for action in ["install", "update"] {
+            for (kind, source) in [
+                ("user-policy", &policy_source),
+                ("user-config", &config_source),
+            ] {
+                use sha2::Digest;
+                fs::set_permissions(source, fs::Permissions::from_mode(0o600)).unwrap();
+                let digest = format!("{:x}", sha2::Sha256::digest(fs::read(source).unwrap()));
+                let operation = format!("{action}-{kind}");
+                let mut command = Command::new(paths.bin_dir.join("dev-auth"));
+                command
+                    .env_clear()
+                    .args(["setup", &operation, "--source"])
+                    .arg(source)
+                    .args(["--sha256", &digest]);
+                if action == "update" {
+                    command.args(["--current-sha256", &digest]);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{operation}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let alias = paths.bin_dir.join("git-dev-auth");
+        fs::remove_file(&alias).unwrap();
+        for operation in ["repair", "rollback", "uninstall"] {
+            let output = Command::new(paths.bin_dir.join("dev-auth"))
+                .args(["setup", operation, "--mode", "user-only"])
+                .env_clear()
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{operation}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if operation == "repair" {
+                assert!(fs::symlink_metadata(&alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+        }
+        assert!(!paths.data_root.join("install-v2.json").exists());
+        assert!(!paths.bin_dir.join("dev-auth").exists());
+        assert!(user.dir.join("native-git").is_file());
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    sandbox.install_binary(&sandbox.root.join("artifact"));
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "standalone_legacy_setup_keeps_native_repair_rollback_and_uninstall",
+            "--nocapture",
+        ]),
+        Duration::from_secs(90),
+        "standalone legacy maintenance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn standalone_user_only_setup_is_idempotent_transparent_and_deactivatable() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_standalone_user_only_setup_child(false);
         return;
     }
     let sandbox = NativeUserSandbox::new();
@@ -1370,11 +2870,54 @@ fn standalone_user_only_setup_is_idempotent_transparent_and_reversible() {
     let output = bounded_output_with_timeout(
         sandbox.command(&current, &sandbox.home).args([
             "--exact",
-            "standalone_user_only_setup_is_idempotent_transparent_and_reversible",
+            "standalone_user_only_setup_is_idempotent_transparent_and_deactivatable",
             "--nocapture",
         ]),
         Duration::from_secs(90),
         "standalone setup acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires native Bubblewrap and strace; exercises a disposable installed public binary"]
+fn standalone_doctor_has_no_network_helpers_or_mutation() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_standalone_user_only_setup_child(true);
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("artifact");
+    let bootstrap = sandbox.root.join("dev-auth-bootstrap");
+    sandbox.install_binary(&product);
+    sandbox.install_binary(&bootstrap);
+    assert!(Command::new("/usr/bin/strip")
+        .args(["--strip-debug"])
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "standalone_doctor_has_no_network_helpers_or_mutation",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ]),
+        Duration::from_secs(150),
+        "standalone doctor native boundary acceptance",
     );
     assert!(
         output.status.success(),
@@ -1391,7 +2934,7 @@ fn missing_credential_stages_no_workload_launchers() {
         .unwrap()
         .unwrap();
     if user.name == "dev-auth-test" {
-        run_missing_credential_stages_no_workload_launchers_child();
+        run_missing_credential_stages_no_workload_launchers_child(false, None);
         return;
     }
     let sandbox = NativeUserSandbox::new();
@@ -1413,6 +2956,565 @@ fn missing_credential_stages_no_workload_launchers() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_user_only_workload_validates_selected_slots_without_key_export() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_installed_user_only_validation_child();
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-debug")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let store = enrolled_store::EnrolledStore::start(
+        &sandbox.runtime,
+        std::collections::BTreeMap::from([
+            ("automation".into(), "fixture-enrollment-one".into()),
+            ("secondary".into(), "fixture-enrollment-two".into()),
+        ]),
+    );
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "installed_user_only_workload_validates_selected_slots_without_key_export",
+            "--nocapture",
+        ]),
+        Duration::from_secs(120),
+        "installed user-only validation fixture",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observations = store.observations.lock().unwrap();
+    assert_eq!(observations.reads, ["automation", "secondary"]);
+    assert_eq!(observations.searches.len(), 2);
+}
+
+#[cfg(target_os = "linux")]
+fn run_installed_user_only_validation_child() {
+    use dev_auth::setup::{
+        install_at, reconcile_workload_launchers_at, InstallMode, InstallRequest, SetupPaths,
+    };
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let paths = SetupPaths::user_only(&user.dir);
+    let root = user.dir.join("acceptance");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let native = root.join("native-tool");
+    let native_gh = root.join("native-gh");
+    fs::write(&native, b"#!/bin/sh\nexit 91\n").unwrap();
+    fs::set_permissions(&native, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::copy(&native, &native_gh).unwrap();
+    let primary = root.join("op-primary");
+    let secondary = root.join("op-secondary");
+    for (path, token, reference, value) in [
+        (
+            &primary,
+            "fixture-enrollment-one",
+            "op://Fixture/Token/value",
+            "fixture-export".to_owned(),
+        ),
+        (
+            &secondary,
+            "fixture-enrollment-two",
+            "op://Fixture/Release/value",
+            "09".repeat(32),
+        ),
+    ] {
+        fs::write(path, format!(
+            "#!/bin/sh\n[ \"$OP_SERVICE_ACCOUNT_TOKEN\" = '{token}' ] || exit 90\nprintf '%s\\n' \"$1\" >> '{}.calls'\ncase \"$*\" in\n'user get --me --format json') printf '%s' '{{\"id\":\"fixture\",\"state\":\"ACTIVE\",\"type\":\"SERVICE_ACCOUNT\"}}' ;;\n'read --no-newline {reference}') printf '%s' '{value}' ;;\n*) exit 92 ;;\nesac\n", path.display()
+        )).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let installed = paths.bin_dir.join("dev-auth");
+    let launcher = root.join("generic-worker");
+    let exported = root.join("exported");
+    let denied_key = root.join("denied-key");
+    let hint = root.join("session-hint");
+    fs::write(&launcher, format!(
+        "#!/bin/sh\nset -eu\n[ -z \"${{GH_ENTERPRISE_TOKEN+x}}${{GITHUB_ENTERPRISE_TOKEN+x}}\" ] || exit 94\nprintf '%s\\n%s\\n' \"$DEV_AUTH_USER_BROKER_SOCKET\" \"$DEV_AUTH_USER_SESSION\" > '{}'\n'{}' validate --component providers --online --non-interactive --json\n'{}' secret read token --non-interactive > '{}'\nif '{}' secret read release --non-interactive > '{}' 2>/dev/null; then exit 93; fi\n",
+        hint.display(), installed.display(), installed.display(), exported.display(), installed.display(), denied_key.display()
+    )).unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_root = user.dir.join(".config/dev-auth");
+    fs::create_dir_all(&config_root).unwrap();
+    fs::set_permissions(user.dir.join(".config"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&config_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let public_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let policy = format!(
+        r#"schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["{user}"]
+[programs]
+git = "{native}"
+gh = "{native_gh}"
+ssh = "{native}"
+ssh_keygen = "{native}"
+[trusted_launchers]
+generic-worker = "{launcher}"
+[credentials.providers.primary]
+kind = "one_password"
+executable = "{primary}"
+[credentials.providers.secondary]
+kind = "one_password"
+executable = "{secondary}"
+[credentials.credential_slots.automation]
+provider = "primary"
+users = ["{user}"]
+[credentials.credential_slots.secondary]
+provider = "secondary"
+users = ["{user}"]
+[credentials.resources.token]
+credential_slot = "automation"
+reference = "op://Fixture/Token/value"
+kind = "exportable"
+purposes = ["read"]
+[credentials.resources.release]
+credential_slot = "secondary"
+reference = "op://Fixture/Release/value"
+kind = "operation_only"
+purposes = ["release_signing"]
+[credentials.resource_caps.worker]
+users = ["{user}"]
+[credentials.resource_caps.worker.resources.token]
+purposes = ["read"]
+[credentials.resource_caps.worker.resources.release]
+purposes = ["release_signing"]
+[workload_caps.worker]
+users = ["{user}"]
+resource_cap = "worker"
+launchers = ["generic-worker"]
+admission = ["enrolled_noninteractive"]
+max_duration_seconds = 120
+[workload_caps.worker.operations.release_signing.release]
+public_key = "{public_key}"
+products = ["fixture"]
+"#,
+        user = user.name,
+        native = native.display(),
+        native_gh = native_gh.display(),
+        launcher = launcher.display(),
+        primary = primary.display(),
+        secondary = secondary.display()
+    );
+    let config = r#"schema = "dev-auth-user-config-v3"
+[authority_profiles.worker]
+cap = "worker"
+[authority_profiles.worker.resources.token]
+purposes = ["read"]
+[authority_profiles.worker.resources.release]
+purposes = ["release_signing"]
+[[workloads]]
+name = "generic-worker"
+launcher = "generic-worker"
+profile = "worker"
+admission = "enrolled_noninteractive"
+duration_seconds = 120
+[workloads.resources.token]
+purposes = ["read"]
+[workloads.resources.release]
+purposes = ["release_signing"]
+[workloads.operations.release_signing]
+resource = "release"
+products = ["fixture"]
+"#;
+    for (name, bytes) in [
+        ("policy-v3.toml", policy.as_bytes()),
+        ("config-v3.toml", config.as_bytes()),
+    ] {
+        let path = config_root.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // Construct the installed-runtime fixture with public installation primitives.
+    // This is not signed-release or journaled setup-v3 acceptance.
+    let receipt = install_at(
+        &paths,
+        &InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.4.0".into(),
+            source_executable: user.dir.parent().unwrap().join("product"),
+            native_git: native.clone(),
+            native_gh,
+            activate_transparent_launchers: false,
+        },
+    )
+    .unwrap();
+    reconcile_workload_launchers_at(
+        &user.dir,
+        Path::new(&receipt.executable),
+        &["generic-worker".into()],
+        user.uid.as_raw(),
+    )
+    .unwrap();
+    let output = bounded_output(
+        Command::new(&installed)
+            .args([
+                "workload",
+                "launch",
+                "generic-worker",
+                "--non-interactive",
+                "--",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GH_ENTERPRISE_TOKEN", "synthetic-human-token")
+            .env("GITHUB_ENTERPRISE_TOKEN", "synthetic-human-token")
+            .current_dir(&root),
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["authority"], "installed_broker");
+    assert_eq!(report["exit_code"], 0);
+    let json = String::from_utf8(output.stdout.clone()).unwrap();
+    for forbidden in [
+        "09".repeat(32),
+        "fixture-enrollment-one".into(),
+        "fixture-enrollment-two".into(),
+        "op://".into(),
+    ] {
+        assert!(!json.contains(&forbidden));
+    }
+    for (component, count) in [
+        ("provider_authentication", 2),
+        ("provider_resources", 2),
+        ("key_material", 1),
+    ] {
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["component"] == component)
+            .unwrap();
+        assert_eq!(check["status"], "passed");
+        assert_eq!(check["checked"], count);
+        assert_eq!(check["total"], count);
+    }
+    assert_eq!(fs::read(&exported).unwrap(), b"fixture-export");
+    assert!(fs::read(denied_key).unwrap().is_empty());
+    assert_eq!(
+        fs::read_to_string(primary.with_extension("calls")).unwrap(),
+        "user\nread\nread\n"
+    );
+    assert_eq!(
+        fs::read_to_string(secondary.with_extension("calls")).unwrap(),
+        "user\nread\n"
+    );
+    let hint = fs::read_to_string(hint).unwrap();
+    let mut lines = hint.lines();
+    let socket = lines.next().unwrap();
+    let session = lines.next().unwrap();
+    assert!(!Path::new(socket).exists());
+    assert!(!Path::new(socket).parent().unwrap().exists());
+    let stale = bounded_output(
+        Command::new(&installed)
+            .args([
+                "validate",
+                "--component",
+                "providers",
+                "--online",
+                "--non-interactive",
+                "--json",
+            ])
+            .env_clear()
+            .env("DEV_AUTH_USER_BROKER_SOCKET", socket)
+            .env("DEV_AUTH_USER_SESSION", session),
+    );
+    assert!(!stale.status.success());
+    assert_eq!(
+        fs::read_to_string(primary.with_extension("calls")).unwrap(),
+        "user\nread\nread\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_stages_versioned_authority_and_resumes_without_activation() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_missing_credential_stages_no_workload_launchers_child(true, None);
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-debug")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "logical_setup_stages_versioned_authority_and_resumes_without_activation",
+            "--nocapture",
+        ]),
+        Duration::from_secs(90),
+        "logical setup native subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_recovers_a_committed_initial_binary_without_its_product_receipt() {
+    run_binary_receipt_recovery_test(
+        SetupRecoveryFixture::MissingInitialReceipt,
+        "logical_setup_recovers_a_committed_initial_binary_without_its_product_receipt",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_recovers_an_uncommitted_initial_binary_without_original_sources() {
+    run_binary_receipt_recovery_test(
+        SetupRecoveryFixture::InitialUncommittedBinary,
+        "logical_setup_recovers_an_uncommitted_initial_binary_without_original_sources",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_completes_a_committed_upgrade_with_the_retained_prior_product_receipt() {
+    run_binary_receipt_recovery_test(
+        SetupRecoveryFixture::CommittedUpgradeReceipt,
+        "logical_setup_completes_a_committed_upgrade_with_the_retained_prior_product_receipt",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_recovers_an_uncommitted_upgrade_from_the_retained_prior_receipts() {
+    run_binary_receipt_recovery_test(
+        SetupRecoveryFixture::UncommittedUpgradeBinary,
+        "logical_setup_recovers_an_uncommitted_upgrade_from_the_retained_prior_receipts",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_recovers_an_unstaged_upgrade_from_the_approved_running_candidate() {
+    run_binary_receipt_recovery_test(
+        SetupRecoveryFixture::UnstagedUpgradeBinary,
+        "logical_setup_recovers_an_unstaged_upgrade_from_the_approved_running_candidate",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn logical_setup_recovers_an_unstaged_initial_binary_without_installation_layout() {
+    run_binary_receipt_recovery_test(
+        SetupRecoveryFixture::UnstagedInitialBinary,
+        "logical_setup_recovers_an_unstaged_initial_binary_without_installation_layout",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn run_binary_receipt_recovery_test(recovery: SetupRecoveryFixture, test_name: &'static str) {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_missing_credential_stages_no_workload_launchers_child(true, Some(recovery));
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    // Native CLI behavior does not require debug or static symbol tables. Keep
+    // custody hashing focused on the executable artifact, as in distribution.
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-all")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let output = bounded_output_with_timeout(
+        sandbox
+            .command(&std::env::current_exe().unwrap(), &sandbox.home)
+            .args(["--exact", test_name, "--nocapture"]),
+        if matches!(
+            recovery,
+            SetupRecoveryFixture::UncommittedUpgradeBinary
+                | SetupRecoveryFixture::UnstagedUpgradeBinary
+        ) {
+            Duration::from_secs(120)
+        } else {
+            Duration::from_secs(90)
+        },
+        "product receipt recovery native subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_user_setup_restores_retained_generation_inactive() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_missing_credential_stages_no_workload_launchers_child(
+            true,
+            Some(SetupRecoveryFixture::PriorInstallation),
+        );
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-debug")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    // This fixture installs two distinct source-binary identities and invokes
+    // rejection, full restore, repeat and forward rejection. Its debug-build
+    // liveness bound is not a released-product latency acceptance threshold.
+    let output = bounded_output_with_timeout(
+        sandbox
+            .command(&std::env::current_exe().unwrap(), &sandbox.home)
+            .args([
+                "--exact",
+                "native_user_setup_restores_retained_generation_inactive",
+                "--nocapture",
+            ]),
+        Duration::from_secs(240),
+        "retained generation restoration native subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+}
+
+#[test]
+fn native_user_setup_restores_initial_installation_absence() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_missing_credential_stages_no_workload_launchers_child(
+            true,
+            Some(SetupRecoveryFixture::InitialAbsence),
+        );
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-debug")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let output = bounded_output_with_timeout(
+        sandbox
+            .command(&std::env::current_exe().unwrap(), &sandbox.home)
+            .args([
+                "--exact",
+                "native_user_setup_restores_initial_installation_absence",
+                "--nocapture",
+            ]),
+        Duration::from_secs(240),
+        "initial absence restoration native subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+}
+
+#[test]
+#[ignore = "requires native Linux strace process-death acceptance"]
+fn native_user_setup_restoration_resumes_after_process_death() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_missing_credential_stages_no_workload_launchers_child(
+            true,
+            Some(SetupRecoveryFixture::InitialProcessDeath),
+        );
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-debug")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let output = bounded_output_with_timeout(
+        sandbox
+            .command(&std::env::current_exe().unwrap(), &sandbox.home)
+            .args([
+                "--exact",
+                "native_user_setup_restoration_resumes_after_process_death",
+                "--ignored",
+                "--nocapture",
+            ]),
+        Duration::from_secs(240),
+        "initial restoration process-death native subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
 }
 
 fn credential_helper(operation: &str, input: &str) -> std::process::Output {
@@ -1690,6 +3792,111 @@ permissions = { actions = "read", checks = "read", contents = "write", metadata 
 
 #[cfg(target_os = "linux")]
 #[test]
+fn provider_validation_is_independent_of_github_cli_and_does_not_prompt() {
+    let sandbox = NativeUserSandbox::new();
+    let binary = sandbox.home.join("dev-auth");
+    sandbox.install_binary(&binary);
+    let marker = sandbox.home.join("gh-was-executed");
+    let gh = sandbox.home.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexit 99\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_dir = sandbox.home.join(".config/dev-auth");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = format!(
+        r#"version = 1
+[programs]
+op = "{}"
+gh = "{}"
+git = "/nonexistent/git"
+ssh_add = "/nonexistent/ssh-add"
+ssh_keygen = "/nonexistent/ssh-keygen"
+[github]
+app_id = 42
+private_key_ref = "op://private-metadata-sentinel/app/key"
+repository_selection = "all"
+discover_installations = true
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
+"#,
+        gh.display(),
+        gh.display()
+    );
+    let path = config_dir.join("config.toml");
+    fs::write(&path, config).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    for online in [false, true] {
+        let mut command = sandbox.command(&binary, &sandbox.home);
+        command.args([
+            "validate",
+            "--component",
+            "providers",
+            "--non-interactive",
+            "--json",
+        ]);
+        if online {
+            command.arg("--online");
+        }
+        let output = bounded_output(&mut command);
+        assert_eq!(output.status.code(), Some(if online { 3 } else { 0 }));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-auth-validation-v1");
+        assert_eq!(report["authority"], "legacy_v1");
+        let checks = report["checks"].as_array().unwrap();
+        let check = |name| {
+            checks
+                .iter()
+                .find(|check| check["component"] == name)
+                .unwrap()
+        };
+        assert_eq!(check("configuration")["status"], "passed");
+        assert_eq!(check("github_cli")["status"], "not_checked");
+        assert_eq!(check("git")["status"], "not_checked");
+        assert_eq!(
+            check("enrollment")["status"],
+            if online { "blocked" } else { "not_checked" }
+        );
+        assert_eq!(check("provider_resources")["checked"], 0);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-metadata-sentinel"));
+        assert!(!marker.exists());
+        assert!(!sandbox.runtime.join("dev-auth").exists());
+    }
+}
+
+#[test]
+fn validation_invalid_arguments_return_one_value_free_json_result() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args([
+                "validate",
+                "--json",
+                "--component",
+                "private-invalid-component",
+            ]),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-auth-validation-v1");
+    assert_eq!(report["error_kind"], "invalid_invocation");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-invalid-component"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
     let sandbox = NativeUserSandbox::new();
     let home = &sandbox.home;
@@ -1718,7 +3925,7 @@ fn offline_validation_is_value_free_and_pins_the_gh_protocol() {
     let config = format!(
         r#"version = 1
 [programs]
-op = "/usr/bin/false"
+op = "{}"
 gh = "{}"
 git = "/usr/bin/false"
 ssh_add = "/usr/bin/false"
@@ -1741,6 +3948,7 @@ purpose = "signing"
 private_key_ref = "op://Example Vault/signing/private-key"
 fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 "#,
+        gh.display(),
         gh.display()
     );
     let config_path = config_dir.join("config.toml");
@@ -1768,8 +3976,33 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     assert!(!rejected.status.success());
     assert!(rejected.stdout.is_empty());
     let error = String::from_utf8(rejected.stderr).unwrap();
-    assert!(error.contains("supported 2.98.0 protocol"));
+    assert!(error.contains("legacy_gh_protocol_unsupported"));
     assert!(!error.contains("2.99.0"));
+
+    let aggregate = bounded_output(sandbox.command(&binary, home).args([
+        "validate",
+        "--online",
+        "--non-interactive",
+        "--json",
+    ]));
+    assert_eq!(aggregate.status.code(), Some(3));
+    assert!(aggregate.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&aggregate.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let check = |name| {
+        checks
+            .iter()
+            .find(|check| check["component"] == name)
+            .unwrap()
+    };
+    assert_eq!(
+        check("github_cli")["error_kind"],
+        "legacy_gh_protocol_unsupported"
+    );
+    assert_eq!(check("enrollment")["status"], "blocked");
+    assert_eq!(check("enrollment")["error_kind"], "enrollment_unavailable");
+    assert_eq!(check("provider_resources")["checked"], 0);
+    assert!(!String::from_utf8_lossy(&aggregate.stdout).contains("Example Vault"));
 }
 
 #[test]
@@ -1955,7 +4188,7 @@ esac
     let config = format!(
         r#"version = 1
 [programs]
-op = "/usr/bin/false"
+op = "{}"
 gh = "{}"
 git = "{}"
 ssh_add = "/usr/bin/false"
@@ -1980,6 +4213,7 @@ purpose = "signing"
 private_key_ref = "op://Automation/signing/private-key"
 fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 "#,
+        fake_gh.display(),
         fake_gh.display(),
         fake_git.display(),
     );

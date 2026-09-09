@@ -17,9 +17,17 @@ pub use document_retirement::{
 };
 
 #[cfg(target_os = "linux")]
+mod activation_withdrawal;
+#[cfg(target_os = "linux")]
+mod existing_document_directory;
+#[cfg(target_os = "linux")]
+pub use existing_document_directory::{DocumentDirectoryPreparation, ExistingDocumentDirectory};
+#[cfg(target_os = "linux")]
 mod directory_publication;
 #[cfg(target_os = "linux")]
 mod staging;
+#[cfg(target_os = "linux")]
+pub use activation_withdrawal::withdraw_versioned_installation_activation;
 #[cfg(target_os = "linux")]
 pub mod versioned_v2;
 #[cfg(target_os = "linux")]
@@ -45,6 +53,7 @@ pub struct AtomicDocument {
 #[derive(Debug)]
 pub struct InstallationLock {
     file: File,
+    shared: bool,
 }
 
 impl InstallationLock {
@@ -54,6 +63,13 @@ impl InstallationLock {
 
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         Self::open(path, true)
+    }
+
+    /// Retain a nonblocking shared lease with the same custody checks as an
+    /// exclusive installation lock. All participants must use the same stable
+    /// pathname; callers must not unlink it while readers or writers can run.
+    pub fn try_acquire_shared(path: &Path) -> Result<Option<Self>> {
+        Self::open_with_lock_mode(path, true, None, true, || {})
     }
 
     fn open(path: &Path, nonblocking: bool) -> Result<Option<Self>> {
@@ -75,6 +91,16 @@ impl InstallationLock {
         path: &Path,
         nonblocking: bool,
         owner: Option<u32>,
+        before_lock: impl FnOnce(),
+    ) -> Result<Option<Self>> {
+        Self::open_with_lock_mode(path, nonblocking, owner, false, before_lock)
+    }
+
+    fn open_with_lock_mode(
+        path: &Path,
+        nonblocking: bool,
+        owner: Option<u32>,
+        shared: bool,
         before_lock: impl FnOnce(),
     ) -> Result<Option<Self>> {
         let parent = path.parent().context("installation lock has no parent")?;
@@ -110,15 +136,25 @@ impl InstallationLock {
         let _ = owner;
         before_lock();
         if nonblocking {
-            match file.try_lock_exclusive() {
+            let result = if shared {
+                FileExt::try_lock_shared(&file)
+            } else {
+                file.try_lock_exclusive()
+            };
+            match result {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(error) => return Err(error).context("acquire installation lock"),
             }
         } else {
-            file.lock_exclusive().context("acquire installation lock")?;
+            if shared {
+                FileExt::lock_shared(&file)
+            } else {
+                file.lock_exclusive()
+            }
+            .context("acquire installation lock")?;
         }
-        let lock = Self { file };
+        let lock = Self { file, shared };
         #[cfg(unix)]
         lock.verify_named_identity(path)?;
         Ok(Some(lock))
@@ -142,10 +178,56 @@ impl InstallationLock {
         }
         Ok(())
     }
+
+    /// Borrow a Linux shared lease for authenticated descriptor transfer.
+    /// Every receiver must keep the open description until its work is terminal.
+    #[cfg(target_os = "linux")]
+    pub fn shared_descriptor(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        if !self.shared {
+            bail!("only shared installation leases may be transferred");
+        }
+        Ok(self.file.as_fd())
+    }
+
+    /// Accept a shared lease from an independently authenticated writer. This
+    /// validates fixed native custody, named identity and shared exclusion, not
+    /// the sender's product policy. It neither reopens the file nor grants access
+    /// to a private transaction document. The caller owns sender authorization.
+    #[cfg(target_os = "linux")]
+    pub fn from_shared_descriptor(
+        descriptor: std::os::fd::OwnedFd,
+        path: &Path,
+        owner_uid: u32,
+    ) -> Result<Self> {
+        let file = File::from(descriptor);
+        let metadata = file.metadata()?;
+        if !path.is_absolute()
+            || !metadata.is_file()
+            || metadata.uid() != owner_uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            bail!("transferred installation lease has unsafe custody");
+        }
+        let parent = path.parent().context("transferred lease has no parent")?;
+        open_directory_chain(parent, false)?;
+        let lock = Self { file, shared: true };
+        lock.verify_named_identity(path)?;
+        FileExt::try_lock_shared(&lock.file).context("retain transferred shared exclusion")?;
+        lock.verify_named_identity(path)?;
+        Ok(lock)
+    }
 }
 
 impl Drop for InstallationLock {
     fn drop(&mut self) {
+        // On Linux transferred shared descriptors refer to one open file
+        // description. LOCK_UN here would also unlock the receiver's lease.
+        // Closing releases it only after the last participant closes its copy.
+        if cfg!(target_os = "linux") && self.shared {
+            return;
+        }
         let _ = self.file.unlock();
     }
 }
@@ -270,39 +352,108 @@ const VERSIONED_DOCUMENT_LIMIT: u64 = 1024 * 1024;
 impl ArtifactIdentity {
     pub fn from_file(path: &Path, limit: u64) -> Result<Self> {
         let mut file = open_read_nofollow(path)?;
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("inspect opened artifact {}", path.display()))?;
-        if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > limit {
+        #[cfg(unix)]
+        {
+            Self::from_open_unix_file(&mut file, limit, |metadata| {
+                if metadata.len() == 0 || metadata.nlink() != 1 {
+                    bail!("artifact must be nonempty and have exactly one filesystem link");
+                }
+                Ok(())
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect opened artifact {}", path.display()))?;
+            if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > limit {
+                bail!("artifact has unsafe filesystem authority");
+            }
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut length = 0_u64;
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("read artifact {}", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                length = length
+                    .checked_add(read as u64)
+                    .context("artifact length overflow")?;
+                if length > limit {
+                    bail!("artifact exceeded its size bound while being read");
+                }
+                hasher.update(&buffer[..read]);
+            }
+            if length != metadata.len() {
+                bail!("artifact changed while being read");
+            }
+            Ok(Self {
+                length,
+                sha256: format!("{:x}", hasher.finalize()),
+            })
+        }
+    }
+
+    /// Measure a caller-opened Unix regular file from offset zero with bounded I/O.
+    ///
+    /// The caller owns path traversal, permissions, ownership and link policy;
+    /// validation receives metadata from the opened descriptor before hashing.
+    /// Content length, inode, ownership, mode, link count and change timestamps
+    /// must remain stable through the read. This is an observation, not immutable
+    /// custody or release authentication. The file cursor is changed, including
+    /// on failure; callers must not concurrently use a duplicated file cursor.
+    #[cfg(unix)]
+    pub fn from_open_unix_file(
+        file: &mut File,
+        limit: u64,
+        validate: impl FnOnce(&fs::Metadata) -> Result<()>,
+    ) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let before = file.metadata().context("inspect opened artifact")?;
+        if !before.is_file() || before.len() > limit {
             bail!("artifact has unsafe filesystem authority");
         }
-        #[cfg(unix)]
-        if metadata.nlink() != 1 {
-            bail!("artifact must have exactly one filesystem link");
-        }
+        validate(&before)?;
+        file.seek(SeekFrom::Start(0)).context("rewind artifact")?;
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
-        let mut length = 0_u64;
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .with_context(|| format!("read artifact {}", path.display()))?;
-            if read == 0 {
-                break;
+        let mut remaining = before.len();
+        while remaining != 0 {
+            let bound = remaining.min(buffer.len() as u64) as usize;
+            let count = file.read(&mut buffer[..bound]).context("read artifact")?;
+            if count == 0 {
+                bail!("artifact was truncated while being read");
             }
-            length = length
-                .checked_add(read as u64)
-                .context("artifact length overflow")?;
-            if length > limit {
-                bail!("artifact exceeded its size bound while being read");
-            }
-            hasher.update(&buffer[..read]);
+            hasher.update(&buffer[..count]);
+            remaining -= count as u64;
         }
-        if length != metadata.len() {
+        if file
+            .read(&mut buffer[..1])
+            .context("inspect artifact end")?
+            != 0
+        {
+            bail!("artifact grew while being read");
+        }
+        let after = file.metadata().context("reinspect opened artifact")?;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.mode() != after.mode()
+            || before.uid() != after.uid()
+            || before.gid() != after.gid()
+            || before.nlink() != after.nlink()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
             bail!("artifact changed while being read");
         }
         Ok(Self {
-            length,
+            length: before.len(),
             sha256: format!("{:x}", hasher.finalize()),
         })
     }
@@ -505,6 +656,70 @@ where
         post_install_verify,
         |_| Ok(()),
     )
+}
+
+/// Check a receipt-less two-level legacy adoption without changing permissions,
+/// creating or locking files, recovering state, executing the artifact, or
+/// publishing ownership. The caller authenticates the supplied identity and owns
+/// ancestor trust. Existing directories must be owned and not group/other writable;
+/// their eventual managed modes are not applied by this observation.
+///
+/// Missing legacy aliases and `current` are admissible, as in the explicit adopter;
+/// present pointers must match exactly. Existing receipts, journals, or shared
+/// active/previous pointers require their own observation/recovery route.
+/// This is not a transactional snapshot or mutation authorization: an explicit
+/// adopter must independently revalidate custody under its writer boundary.
+#[cfg(target_os = "linux")]
+pub fn verify_two_level_versioned_adoption(
+    request: &VersionedTwoLevelAdoption,
+    artifact_limit: u64,
+) -> Result<()> {
+    let adoption = &request.adoption;
+    let layout = &adoption.layout;
+    validate_version_and_aliases(
+        layout,
+        &adoption.version,
+        &adoption.identity,
+        &adoption.aliases,
+    )?;
+    validate_legacy_version_pointer(layout, &request.version_pointer)?;
+    if artifact_limit == 0 || adoption.identity.length > artifact_limit {
+        bail!("legacy adoption observation exceeds its artifact bound");
+    }
+    let artifact = layout.version_artifact(&adoption.version);
+    for path in [
+        &layout.data_root,
+        &layout.bin_dir,
+        &layout.versions_dir(),
+        &layout.versions_dir().join(&adoption.version),
+    ] {
+        inspect_legacy_adoption_directory_read_only(path, layout.owner_uid)?;
+    }
+    let require_legacy_namespace = || -> Result<()> {
+        for path in [
+            layout.receipt_path(),
+            layout.journal_path(),
+            layout.active_pointer(),
+            layout.previous_pointer(),
+        ] {
+            require_path_absent(&path)?;
+        }
+        Ok(())
+    };
+    require_legacy_namespace()?;
+    verify_versioned_artifact_authority(&artifact, layout.owner_uid, &adoption.identity)?;
+    inspect_legacy_transition(adoption, Some(&request.version_pointer), &artifact)?;
+    require_legacy_namespace()
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_legacy_adoption_directory_read_only(path: &Path, owner_uid: u32) -> Result<()> {
+    let (directory, _) = open_directory_chain(path, false)?;
+    let metadata = rustix::fs::fstat(&directory).context("inspect legacy adoption directory")?;
+    if metadata.st_uid != owner_uid || metadata.st_mode & 0o022 != 0 {
+        bail!("legacy adoption directory has unsafe filesystem authority");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -887,7 +1102,10 @@ fn acquire_observation_lock(layout: &VersionedLayout) -> Result<InstallationLock
     }
     file.try_lock_exclusive()
         .context("installation observation is busy")?;
-    let lock = InstallationLock { file };
+    let lock = InstallationLock {
+        file,
+        shared: false,
+    };
     verify_observation_lock(layout, &lock)?;
     Ok(lock)
 }
@@ -906,6 +1124,107 @@ fn acquire_observation_lock(layout: &VersionedLayout) -> Result<InstallationLock
 pub fn recover_versioned_installation_with_verification<F>(
     layout: &VersionedLayout,
     artifact_limit: u64,
+    verify: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnMut(&VersionedReceipt) -> Result<()>,
+{
+    recover_versioned_installation_verified_inner(
+        layout,
+        artifact_limit,
+        None,
+        RecoveryAccess::Mutating,
+        verify,
+    )
+}
+
+/// Read-only evidence about an explicitly selected binary transition.
+/// This is not release authentication or a lock retained across later mutation.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionedRecoveryObservation {
+    pub receipt: Option<VersionedReceipt>,
+    pub journal_pending: bool,
+}
+
+/// Check exact transition endpoints and bounded artifact custody without
+/// creating files, restoring links, removing journals or synchronizing storage.
+/// Requires the existing installation lock and acquires it nonblockingly.
+/// The caller owns receipt authentication and ancestor trust; its verifier must
+/// be bounded, local, read-only and must not reacquire this installation lock.
+/// An uncommitted journal may have partial links; observation does not establish
+/// that later recovery can succeed. Mutation revalidates all state under its lock.
+#[cfg(target_os = "linux")]
+pub fn observe_versioned_installation_transition<F>(
+    layout: &VersionedLayout,
+    prior: Option<&VersionedReceipt>,
+    next: &VersionedReceipt,
+    artifact_limit: u64,
+    verify: F,
+) -> Result<VersionedRecoveryObservation>
+where
+    F: FnMut(&VersionedReceipt) -> Result<()>,
+{
+    validate_versioned_receipt(layout, next)?;
+    if let Some(prior) = prior {
+        validate_versioned_receipt(layout, prior)?;
+    }
+    let (journal_pending, receipt) = recover_versioned_installation_verified_inner(
+        layout,
+        artifact_limit,
+        Some((prior, next)),
+        RecoveryAccess::ReadOnly,
+        verify,
+    )?;
+    Ok(VersionedRecoveryObservation {
+        receipt,
+        journal_pending,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryAccess {
+    ReadOnly,
+    Mutating,
+}
+
+/// Recover only the exact caller-authorized prior-to-next binary transition.
+/// A journal must match both receipts in their original roles, not merely name
+/// members of an allowed set. Without a journal, only either endpoint is admitted.
+/// The caller authenticates the supplied receipts and owns ancestor trust.
+/// Verification and mutation have the same bounds, locking and partial-failure
+/// contract as `recover_versioned_installation_with_verification`.
+#[cfg(target_os = "linux")]
+pub fn recover_versioned_installation_transition<F>(
+    layout: &VersionedLayout,
+    prior: Option<&VersionedReceipt>,
+    next: &VersionedReceipt,
+    artifact_limit: u64,
+    verify: F,
+) -> Result<(bool, Option<VersionedReceipt>)>
+where
+    F: FnMut(&VersionedReceipt) -> Result<()>,
+{
+    validate_versioned_receipt(layout, next)?;
+    if let Some(prior) = prior {
+        validate_versioned_receipt(layout, prior)?;
+    }
+    recover_versioned_installation_verified_inner(
+        layout,
+        artifact_limit,
+        Some((prior, next)),
+        RecoveryAccess::Mutating,
+        verify,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn recover_versioned_installation_verified_inner<F>(
+    layout: &VersionedLayout,
+    artifact_limit: u64,
+    expected: Option<(Option<&VersionedReceipt>, &VersionedReceipt)>,
+    access: RecoveryAccess,
     mut verify: F,
 ) -> Result<(bool, Option<VersionedReceipt>)>
 where
@@ -916,17 +1235,32 @@ where
         bail!("installation recovery requires an artifact bound");
     }
     inspect_owned_directory_read_only(&layout.data_root, layout)?;
-    let lock = InstallationLock::acquire(&layout.lock_path())?;
+    let lock = match access {
+        RecoveryAccess::ReadOnly => acquire_observation_lock(layout)?,
+        RecoveryAccess::Mutating => InstallationLock::acquire(&layout.lock_path())?,
+    };
     inspect_owned_directory_read_only(&layout.data_root, layout)?;
     inspect_owned_directory_read_only(&layout.bin_dir, layout)?;
     let journal = read_transition_journal(layout)?;
     let installed = read_versioned_receipt(layout)?;
+    if let Some((prior, next)) = expected {
+        match &journal {
+            Some(journal) if journal.prior.as_ref() != prior || &journal.next != next => {
+                bail!("installation journal differs from the authorized transition");
+            }
+            None if installed.as_ref() != prior && installed.as_ref() != Some(next) => {
+                bail!("installation is outside the authorized transition endpoints");
+            }
+            _ => {}
+        }
+    }
     let Some(journal) = journal else {
         if let Some(receipt) = &installed {
             verify(receipt)?;
-            verify_recovery_artifacts(layout, receipt, artifact_limit)?;
+            inspect_recovery_artifact_directories(layout, receipt, artifact_limit)?;
             verify_versioned_receipt(layout, receipt)?;
         }
+        verify_observation_lock(layout, &lock)?;
         return Ok((false, installed));
     };
     if journal.legacy.is_some() {
@@ -940,14 +1274,20 @@ where
     if let Some(prior) = &journal.prior {
         verify(prior)?;
     }
-    verify_recovery_artifacts(layout, &journal.next, artifact_limit)?;
+    if committed {
+        inspect_recovery_artifact_directories(layout, &journal.next, artifact_limit)?;
+        verify_versioned_receipt(layout, &journal.next)?;
+    } else {
+        verify_recovery_artifacts(layout, &journal.next, artifact_limit)?;
+    }
     if let Some(prior) = &journal.prior {
         verify_recovery_artifacts(layout, prior, artifact_limit)?;
     }
     verify_observation_lock(layout, &lock)?;
-    if committed {
-        verify_versioned_receipt(layout, &journal.next)?;
-    } else {
+    if access == RecoveryAccess::ReadOnly {
+        return Ok((true, installed));
+    }
+    if !committed {
         restore_transition_prior(layout, &journal)?;
     }
     remove_transition_journal(layout)?;
@@ -956,6 +1296,30 @@ where
 
 #[cfg(target_os = "linux")]
 fn verify_recovery_artifacts(
+    layout: &VersionedLayout,
+    receipt: &VersionedReceipt,
+    artifact_limit: u64,
+) -> Result<()> {
+    inspect_recovery_artifact_directories(layout, receipt, artifact_limit)?;
+    for (version, identity) in std::iter::once((&receipt.active_version, &receipt.active_identity))
+        .chain(
+            receipt
+                .previous_version
+                .as_ref()
+                .zip(receipt.previous_identity.as_ref()),
+        )
+    {
+        verify_versioned_artifact_authority(
+            &layout.version_artifact(version),
+            layout.owner_uid,
+            identity,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_recovery_artifact_directories(
     layout: &VersionedLayout,
     receipt: &VersionedReceipt,
     artifact_limit: u64,
@@ -969,20 +1333,9 @@ fn verify_recovery_artifacts(
         bail!("installation recovery exceeds its artifact bound");
     }
     inspect_owned_directory_read_only(&layout.versions_dir(), layout)?;
-    for (version, identity) in std::iter::once((&receipt.active_version, &receipt.active_identity))
-        .chain(
-            receipt
-                .previous_version
-                .as_ref()
-                .zip(receipt.previous_identity.as_ref()),
-        )
+    for version in std::iter::once(&receipt.active_version).chain(receipt.previous_version.as_ref())
     {
         inspect_owned_directory_read_only(&layout.versions_dir().join(version), layout)?;
-        verify_versioned_artifact_authority(
-            &layout.version_artifact(version),
-            layout.owner_uid,
-            identity,
-        )?;
     }
     Ok(())
 }
@@ -2198,7 +2551,7 @@ pub fn read_atomic_document(
     authority: &DocumentAuthority,
 ) -> Result<Option<AtomicDocument>> {
     validate_document_authority(authority)?;
-    let mut file = match open_read_nofollow(path) {
+    let file = match open_read_nofollow(path) {
         Ok(file) => file,
         Err(error)
             if error
@@ -2209,6 +2562,14 @@ pub fn read_atomic_document(
         }
         Err(error) => return Err(error),
     };
+    read_atomic_document_file(file, path, authority).map(Some)
+}
+
+fn read_atomic_document_file(
+    mut file: File,
+    path: &Path,
+    authority: &DocumentAuthority,
+) -> Result<AtomicDocument> {
     let before = file
         .metadata()
         .with_context(|| format!("inspect atomic document {}", path.display()))?;
@@ -2248,13 +2609,13 @@ pub fn read_atomic_document(
     if bytes.len() as u64 != before.len() || before.len() != after.len() {
         bail!("atomic document changed while being read");
     }
-    Ok(Some(AtomicDocument {
+    Ok(AtomicDocument {
         identity: ArtifactIdentity {
             length: bytes.len() as u64,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
         },
         bytes,
-    }))
+    })
 }
 
 pub fn write_atomic_document(
@@ -2344,6 +2705,73 @@ pub fn write_atomic_document(
             .context("publish atomic document")?;
     }
     sync_directory(parent)?;
+    Ok(true)
+}
+
+/// Remove one bounded document only when its custody and content still match.
+/// The caller owns writer serialization and ancestor trust. This is not a
+/// permanent legacy-writer fence. The parent must already exist; no directory
+/// is created or removed. An absent leaf is an idempotent retry and still syncs
+/// its parent. A sync failure after unlink is entered, uncertain progress.
+#[cfg(target_os = "linux")]
+pub fn remove_atomic_document_if_unchanged(
+    path: &Path,
+    authority: &DocumentAuthority,
+    expected: &ArtifactIdentity,
+) -> Result<bool> {
+    validate_document_authority(authority)?;
+    if expected.length == 0
+        || expected.length > authority.limit
+        || expected.sha256.len() != 64
+        || !expected
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("atomic document removal identity is invalid");
+    }
+    let parent = path.parent().context("atomic document has no parent")?;
+    let name = path.file_name().context("atomic document has no name")?;
+    let (directory, _) = open_directory_chain(parent, false)?;
+    let file = match rustix::fs::openat(
+        &directory,
+        name,
+        rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(file) => File::from(file),
+        Err(rustix::io::Errno::NOENT) => {
+            rustix::fs::fsync(&directory).context("sync absent atomic document parent")?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error).context("inspect atomic document before removal"),
+    };
+    let before = file
+        .metadata()
+        .context("inspect held atomic document before removal")?;
+    let current = read_atomic_document_file(file, path, authority)?;
+    if current.identity != *expected {
+        bail!("atomic document changed before removal");
+    }
+    let after = rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .context("reinspect atomic document before removal")?;
+    if before.dev() != after.st_dev
+        || before.ino() != after.st_ino
+        || before.mode() != after.st_mode
+        || before.uid() != after.st_uid
+        // Native stat link counts have different widths across Linux targets.
+        || u128::from(before.nlink()) != u128::from(after.st_nlink)
+        || before.len() != u64::try_from(after.st_size)?
+        || before.mtime() != after.st_mtime
+        || before.mtime_nsec() != i64::try_from(after.st_mtime_nsec)?
+        || before.ctime() != after.st_ctime
+        || before.ctime_nsec() != i64::try_from(after.st_ctime_nsec)?
+    {
+        bail!("atomic document identity changed before removal");
+    }
+    rustix::fs::unlinkat(&directory, name, rustix::fs::AtFlags::empty())
+        .context("remove exact atomic document")?;
+    rustix::fs::fsync(&directory).context("sync removed atomic document parent")?;
     Ok(true)
 }
 
@@ -2518,6 +2946,16 @@ fn open_durable_directory_chain(path: &Path) -> Result<(std::os::fd::OwnedFd, bo
 fn open_directory_chain_with_sync(
     path: &Path,
     create: bool,
+    sync_parent: impl FnMut(&std::os::fd::OwnedFd) -> Result<()>,
+) -> Result<(std::os::fd::OwnedFd, bool)> {
+    open_directory_chain_with_durability(path, create, create, sync_parent)
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_chain_with_durability(
+    path: &Path,
+    create: bool,
+    synchronize: bool,
     mut sync_parent: impl FnMut(&std::os::fd::OwnedFd) -> Result<()>,
 ) -> Result<(std::os::fd::OwnedFd, bool)> {
     if !path.is_absolute() {
@@ -2571,7 +3009,7 @@ fn open_directory_chain_with_sync(
         {
             bail!("installation directory chain contains a non-directory");
         }
-        if create {
+        if synchronize {
             // A prior attempt may have created this entry but failed to sync
             // its parent. Sync existing links too so retries cannot acknowledge
             // a descendant while its ancestor remains uncommitted.
@@ -2681,6 +3119,50 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 #[cfg(all(test, unix))]
 mod versioned_tests {
+    #[test]
+    fn shared_leases_exclude_mutation_until_every_reader_releases() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("installation.lock");
+        let first = InstallationLock::try_acquire_shared(&path)
+            .unwrap()
+            .unwrap();
+        let second = InstallationLock::try_acquire_shared(&path)
+            .unwrap()
+            .unwrap();
+        assert!(InstallationLock::try_acquire(&path).unwrap().is_none());
+        drop(first);
+        assert!(InstallationLock::try_acquire(&path).unwrap().is_none());
+        drop(second);
+        let writer = InstallationLock::try_acquire(&path).unwrap().unwrap();
+        assert!(InstallationLock::try_acquire_shared(&path)
+            .unwrap()
+            .is_none());
+        assert!(InstallationLock::try_acquire(&path).unwrap().is_none());
+        drop(writer);
+        assert!(InstallationLock::try_acquire_shared(&path)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn shared_lease_rejects_detached_inode_after_open() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("installation.lock");
+        let mut replacement = None;
+        let result = InstallationLock::open_with_lock_mode(&path, true, None, true, || {
+            fs::remove_file(&path).unwrap();
+            replacement = Some(
+                InstallationLock::try_acquire_shared(&path)
+                    .unwrap()
+                    .unwrap(),
+            );
+        });
+        assert!(result.is_err());
+        drop(replacement);
+    }
+
     #[test]
     fn nonblocking_lock_rejects_replaced_name_after_open() {
         use super::*;
@@ -2820,7 +3302,7 @@ mod versioned_tests {
         }
     }
 
-    fn two_level_adoption(root: &Path) -> VersionedTwoLevelAdoption {
+    pub(super) fn two_level_adoption(root: &Path) -> VersionedTwoLevelAdoption {
         let mut fixture = request(root, "1.0.0", b"legacy");
         fixture.aliases.push("fixture-helper".into());
         let artifact = fixture.layout.version_artifact(&fixture.version);

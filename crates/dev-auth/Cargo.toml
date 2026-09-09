@@ -1,15 +1,15 @@
 [package]
 name = "dev-auth"
-version = "0.3.11"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Transparent workload-identity broker for Git and GitHub CLI"
+description = "Policy-authorized workload credentials and native execution"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", default-features = false, features = ["std"] }
+clap = { version = "4", default-features = false, features = ["std", "help", "usage"] }
 dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 base64.workspace = true
 directories = "6"
@@ -24,7 +24,8 @@ ed25519-dalek.workspace = true
 fs2 = "0.4"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 keyring = "4.1.6"
-rustix = { version = "1", features = ["fs", "process"] }
+rsa = { version = "0.9.10", default-features = false, features = ["pem", "std"] }
+rustix = { version = "1", features = ["fs", "process", "net"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,10 +36,15 @@ ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "net"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
 toml = "0.9"
 ureq = { version = "3.4", features = ["json"] }
 zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util = "0.3"
+secret-service = { version = "5.1.0", default-features = false, features = ["rt-async-io-crypto-rust"] }
+zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -56,6 +62,11 @@ nix = { version = "0.31", default-features = false, features = ["fs", "poll", "p
 
 [dev-dependencies]
 wait-timeout = "0.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hkdf = "0.12"
 
 [[bin]]
 name = "dev-auth"

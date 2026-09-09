@@ -236,7 +236,10 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
 
     let profile = &resolved.authority_profiles["publish"];
     assert_eq!(profile.system_cap, "release");
-    assert_eq!(profile.credential_slot, "automation");
+    assert_eq!(
+        profile.credential_slots,
+        std::collections::BTreeSet::from(["automation".to_owned()])
+    );
     let github = profile.github.as_ref().unwrap();
     assert_eq!(github.owners, BTreeSet::from(["exampleorg".to_owned()]));
     assert_eq!(github.repositories, BTreeSet::from(["api".to_owned()]));

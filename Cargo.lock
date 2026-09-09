@@ -925,10 +925,12 @@ dependencies = [
 
 [[package]]
 name = "dev-auth"
-version = "0.3.11"
+version = "0.4.0"
 dependencies = [
+ "aes",
  "anyhow",
  "base64 0.22.1",
+ "cbc",
  "clap",
  "dev-tools-command",
  "dev-tools-completion",
@@ -941,10 +943,14 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "fs2",
+ "futures-util",
+ "hkdf",
  "jsonwebtoken",
  "keyring",
  "nix 0.31.3",
+ "rsa",
  "rustix",
+ "secret-service",
  "semver",
  "serde",
  "serde_jcs",
@@ -960,6 +966,7 @@ dependencies = [
  "ureq",
  "wait-timeout",
  "windows-sys 0.61.2",
+ "zbus",
  "zeroize",
 ]
 
@@ -989,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "dev-tools-command"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "libc",

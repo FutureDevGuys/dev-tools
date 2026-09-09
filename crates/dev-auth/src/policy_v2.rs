@@ -320,6 +320,7 @@ pub struct ResolvedRouting {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedGitHubAuthority {
+    pub credential_slot: String,
     pub app_cap: String,
     pub app_id: u64,
     pub repository_selection: crate::RepositorySelection,
@@ -331,18 +332,45 @@ pub struct ResolvedGitHubAuthority {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedOperationKey {
+    pub credential_slot: String,
+    pub key: OperationKeyConfig,
+}
+
+impl std::ops::Deref for ResolvedOperationKey {
+    type Target = OperationKeyConfig;
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedReleaseSigningKey {
+    pub credential_slot: String,
+    pub key: ReleaseSigningKeyConfig,
+}
+
+impl std::ops::Deref for ResolvedReleaseSigningKey {
+    type Target = ReleaseSigningKeyConfig;
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAuthorityProfile {
     pub system_cap: String,
-    pub credential_slot: String,
+    pub credential_slots: BTreeSet<String>,
     pub github: Option<ResolvedGitHubAuthority>,
     pub signing: bool,
-    pub signing_key: Option<OperationKeyConfig>,
+    pub signing_key: Option<ResolvedOperationKey>,
     pub release_signing_products: BTreeSet<String>,
-    pub release_signing_key: Option<ReleaseSigningKeyConfig>,
+    pub release_signing_key: Option<ResolvedReleaseSigningKey>,
     pub ssh: bool,
-    pub ssh_keys: Vec<OperationKeyConfig>,
+    pub ssh_keys: Vec<ResolvedOperationKey>,
     pub git_identity: Option<GitIdentityConfig>,
     pub secret_references: BTreeSet<String>,
+    pub logical_authority: Option<crate::policy_v3::LogicalSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +395,8 @@ pub struct ResolvedWorkload {
     pub workspace_roots: Vec<ResolvedWorkspaceRoot>,
     pub sandbox: ResolvedSandbox,
     pub desktop: Option<DesktopWorkloadConfig>,
+    pub admission: Option<crate::policy_v3::Admission>,
+    pub duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -777,7 +807,10 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
     Ok(())
 }
 
-fn validate_sandbox_mount_arguments(arguments: &[String], description: &str) -> Result<()> {
+pub(crate) fn validate_sandbox_mount_arguments(
+    arguments: &[String],
+    description: &str,
+) -> Result<()> {
     if arguments.is_empty()
         || arguments.len() > 32
         || arguments.iter().any(|argument| {
@@ -980,11 +1013,14 @@ fn resolve_policy_inner(
         }) {
             bail!("authority profile {name} credential slot denies the native user");
         }
-        let github = requested
+        let mut github = requested
             .github
             .as_ref()
             .map(|github| resolve_github_authority(system, cap, name, github))
             .transpose()?;
+        if let Some(github) = &mut github {
+            github.credential_slot = credential_slot.clone();
+        }
         if requested.signing && !cap.signing {
             bail!("authority profile {name} widens the system signing cap");
         }
@@ -1021,20 +1057,40 @@ fn resolve_policy_inner(
             name.clone(),
             ResolvedAuthorityProfile {
                 system_cap: requested.cap.clone(),
-                credential_slot: credential_slot.clone(),
+                credential_slots: BTreeSet::from([credential_slot.clone()]),
                 github,
                 signing: requested.signing,
-                signing_key: requested.signing_key.clone(),
+                signing_key: requested
+                    .signing_key
+                    .clone()
+                    .map(|key| ResolvedOperationKey {
+                        credential_slot: credential_slot.clone(),
+                        key,
+                    }),
                 release_signing_products: requested
                     .release_signing_products
                     .iter()
                     .cloned()
                     .collect(),
-                release_signing_key: requested.release_signing_key.clone(),
+                release_signing_key: requested.release_signing_key.clone().map(|key| {
+                    ResolvedReleaseSigningKey {
+                        credential_slot: credential_slot.clone(),
+                        key,
+                    }
+                }),
                 ssh: requested.ssh,
-                ssh_keys: requested.ssh_keys.clone(),
+                ssh_keys: requested
+                    .ssh_keys
+                    .iter()
+                    .cloned()
+                    .map(|key| ResolvedOperationKey {
+                        credential_slot: credential_slot.clone(),
+                        key,
+                    })
+                    .collect(),
                 git_identity: requested.git_identity.clone(),
                 secret_references,
+                logical_authority: None,
             },
         );
     }
@@ -1114,6 +1170,8 @@ fn resolve_policy_inner(
                     adapters: workload.sandbox.adapters.clone(),
                 },
                 desktop: workload.desktop.clone(),
+                admission: None,
+                duration_seconds: None,
             },
         );
     }
@@ -1200,6 +1258,7 @@ fn resolve_github_authority(
         }
     }
     Ok(ResolvedGitHubAuthority {
+        credential_slot: String::new(),
         app_cap: requested.app_cap.clone(),
         app_id: app.app_id,
         repository_selection: app.repository_selection,
@@ -1211,7 +1270,7 @@ fn resolve_github_authority(
     })
 }
 
-fn validate_github_scope(
+pub(crate) fn validate_github_scope(
     owners: &[String],
     repositories: &[String],
     permissions: &BTreeMap<String, Permission>,
@@ -1313,7 +1372,7 @@ fn validate_permission_name(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_absolute_executable(value: &str, description: &str) -> Result<()> {
+pub(crate) fn validate_absolute_executable(value: &str, description: &str) -> Result<()> {
     super::validate_program(value, description)?;
     if value.starts_with("//")
         || value.starts_with("\\\\")
@@ -1325,7 +1384,7 @@ fn validate_absolute_executable(value: &str, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_canonical_absolute_path(value: &str, description: &str) -> Result<()> {
+pub(crate) fn validate_canonical_absolute_path(value: &str, description: &str) -> Result<()> {
     super::validate_program(value, description)?;
     if value.starts_with("//")
         || value.starts_with("\\\\")
@@ -1373,7 +1432,9 @@ fn ensure_unique_map_paths(paths: &BTreeMap<String, String>, description: &str) 
     Ok(())
 }
 
-fn ensure_unique_workspace_cap_paths(paths: &BTreeMap<String, WorkspaceCap>) -> Result<()> {
+pub(crate) fn ensure_unique_workspace_cap_paths(
+    paths: &BTreeMap<String, WorkspaceCap>,
+) -> Result<()> {
     let mut seen = BTreeSet::new();
     for cap in paths.values() {
         if !seen.insert(normalize_path_for_comparison(&cap.path)) {
@@ -1383,7 +1444,7 @@ fn ensure_unique_workspace_cap_paths(paths: &BTreeMap<String, WorkspaceCap>) -> 
     Ok(())
 }
 
-fn path_is_within(path: &str, root: &str) -> bool {
+pub(crate) fn path_is_within(path: &str, root: &str) -> bool {
     let path = normalize_path_for_comparison(path);
     let root = normalize_path_for_comparison(root);
     path == root

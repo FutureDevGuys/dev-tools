@@ -1,0 +1,27 @@
+---
+authority: canonical
+owner: dev-auth
+---
+
+# ADR 0079: Retained strong helper completion
+
+status: proposed
+verification: pending
+
+## Decision
+
+[ADR 0080](0080-retained-strong-system-definition-completion.md) extends this boundary to fixed system-definition completion and a stopped-state manager reload; the privileged launcher must still already verify.
+
+Retained strong setup recovery may complete the ordinary setup helper and sidecar before publishing the product receipt. This extends ADR 0078 only when the exact approved shared candidate is already committed and its privileged launcher and all compiled system assets already verify. Effective root, canonical paths, retained release provenance, inactive aliases and fixed stopped/disabled/job-free services with absent native workload/broker domains and sockets remain admission requirements. The enclosing operation retains approval, account validation, pending direction and stable setup exclusion. Neither this component nor its serializer grants root, new release, set-ID publication, service mutation or arbitrary-file authority.
+
+The product owns two fixed leaves in the retained existing data directory: `dev-auth-setup-helper` at root-owned ordinary 0755 and `setup-helper-v1.json` at root-owned 0644. Candidate helper bytes are read through the shared descriptor-bound directory interface from the exact immutable approved executable, with bounded single-link regular-file custody and ordinary 0755 permissions. Current helper bytes may be absent or match the candidate or a retained helper-owning prior release. A current sidecar may be absent or strictly decode to the expected candidate or helper-owning prior receipt, including native target and provenance. Unknown fields, unrelated bytes, special permission bits, wrong owners, symbolic/hard links and redirected parents reject without adoption. A pre-helper prior release contributes no helper ownership. An already-correct candidate sidecar keeps its exact serialization; otherwise publication uses the existing candidate serializer.
+
+Both leaves and the candidate source are admitted before mutation. The proof retains their observed content identities or absence and holds the source and destination directories. Revalidation rejects a changed selected leaf even if its replacement would qualify under a fresh proof. The component publishes the helper before its sidecar through `ExistingDocumentDirectory`, recording each established change separately. It rechecks the retained product receipt, committed binary, complete non-helper assets and service quiescence around publication, then requires complete candidate verification before conditional product receipt publication. A late independent writer is preserved; a failure after helper publication remains known change. A fresh proof may resume the resulting mixed retained pair. Exact byte/mode matching retries synchronize without republishing; the higher-level completed receipt retry is read-only.
+
+The shared binary recovery callback already holds installation exclusion and validates its exact receipt/artifact endpoints. Its product verifier checks assets without reacquiring that lock. Independent checks before and after shared recovery use the locked read-only observer. These boundaries do not create atomic exclusion against a nonparticipating same-owner writer; stable setup exclusion and the pending generation remain the writer-coordination authority. No new shared primitive, public command arguments, receipt schema or release bytes are introduced. Recovery reports `complete_initial_strong_installation` or `complete_upgrade_strong_installation` when helper publication is selected; the existing receipt-only names remain for complete pairs.
+
+## Evidence and remaining gates
+
+Two separately isolated native systemd fixtures exercise initial and retained-upgrade helper completion across all absent/candidate/prior helper and sidecar combinations, strict final ordinary modes, complete product verification and unchanged retry. They reject stale absence selection, unrelated bytes, special bits, hard/symbolic links, unknown sidecar fields and a set-ID candidate source. A callback inserts independent sidecar bytes after actual helper publication; recovery reports established change, preserves that sidecar and the original product receipt, and resumes the mixed state only after an independently corrected sidecar and fresh proof. Privileged-launcher and system-asset inode/mode observations remain unchanged. The existing three complete-receipt fixtures continue to cover active sockets, committed journals, uncommitted strong rejection and legacy private receipt replacement. The first native helper run exposed callback relocking; the integrated check separates held-transaction validation from independent observation.
+
+Run the ignored `setup::recovery_native::native_disposable_strong_initial_helper_completion` and `native_disposable_strong_upgrade_helper_completion` tests individually under the opt-in, private-cgroup, network-free, mount-free systemd fixture contract in ADR 0078. Synthetic executable bytes and retained provenance are not executed or signature-verified. Signed public-CLI acceptance, actual process death, incomplete privileged/system-asset recovery, uncommitted strong binary recovery, all-writer coordination, active-broker teardown and non-Linux native qualification remain delivery gates.

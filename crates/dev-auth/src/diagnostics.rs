@@ -2,6 +2,7 @@ use crate::broker_protocol::{BrokerSessionProbe, LocalSessionClaim, RoutingDecis
 use crate::setup::{current_runtime_installation, verify_runtime_installation_at, InstallMode};
 use anyhow::{bail, Result};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +28,10 @@ pub struct BrokerStatusReport {
     pub signing_configured: bool,
     pub ssh_authentication_configured: bool,
     pub credential_ready: bool,
+    /// Metadata observation, never proof that the provider accepted a credential.
+    pub credential_observation: CredentialObservation,
+    pub credential_slots: BTreeMap<String, CredentialObservation>,
+    pub provider_use_observation: &'static str,
     pub session_state: &'static str,
     pub broker_state: &'static str,
     pub degraded_same_user_boundary: bool,
@@ -44,6 +49,26 @@ pub struct ExplainReport {
 }
 
 pub fn broker_status() -> Result<BrokerStatusReport> {
+    status_with_probe(true)
+}
+
+/// Read-only local diagnostics: no broker connection, credential-store lookup,
+/// provider call, recovery, installation lock or service activation.
+pub fn local_status() -> Result<BrokerStatusReport> {
+    status_with_probe(false)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialObservation {
+    NotRequired,
+    Present,
+    Missing,
+    NotObservable,
+    Unsafe,
+}
+
+fn status_with_probe(probe_broker: bool) -> Result<BrokerStatusReport> {
     let (paths, receipt) = current_runtime_installation()?;
     let setup = verify_runtime_installation_at(&paths, &receipt)?;
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?;
@@ -96,11 +121,42 @@ pub fn broker_status() -> Result<BrokerStatusReport> {
     });
     let (workload_tool_plane_ready, launcher_resolution_ready) =
         crate::setup::v3_launcher_readiness(&setup, integrations.as_ref());
-    let credential_ready = match receipt.mode {
-        InstallMode::Strong => crate::setup::system_service_credential_ready(),
-        InstallMode::UserOnly => crate::runtime::user_broker_service_token().is_ok(),
+    let required_slots = resolved.as_ref().map(|resolved| {
+        resolved
+            .authority_profiles
+            .values()
+            .flat_map(|profile| profile.credential_slots.iter().cloned())
+            .collect::<BTreeSet<_>>()
+    });
+    let credential_slots = required_slots
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|slot| {
+            let observation = match receipt.mode {
+                InstallMode::Strong => crate::setup::observe_system_credential_slot(slot),
+                // Native credential-store reads may unlock a store or retrieve
+                // material. A status observation must not do either.
+                InstallMode::UserOnly => CredentialObservation::NotObservable,
+            };
+            (slot.clone(), observation)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let credential_observation = match required_slots {
+        None => CredentialObservation::NotObservable,
+        Some(slots) if slots.is_empty() => CredentialObservation::NotRequired,
+        Some(_) => aggregate_credential_observations(credential_slots.values().copied()),
     };
-    let (claim, probe) = claim_and_probe(receipt.mode)?;
+    let credential_ready = matches!(
+        credential_observation,
+        CredentialObservation::Present | CredentialObservation::NotRequired
+    );
+    let (session_state, broker_state) = if probe_broker {
+        let (claim, probe) = claim_and_probe(receipt.mode)?;
+        (claim_name(&claim), probe_name(&probe))
+    } else {
+        ("not_probed", "not_probed")
+    };
     Ok(BrokerStatusReport {
         schema: "dev-auth-broker-status-v2",
         mode: receipt.mode,
@@ -127,10 +183,29 @@ pub fn broker_status() -> Result<BrokerStatusReport> {
         signing_configured,
         ssh_authentication_configured,
         credential_ready,
-        session_state: claim_name(&claim),
-        broker_state: probe_name(&probe),
+        credential_observation,
+        credential_slots,
+        provider_use_observation: "not_checked",
+        session_state,
+        broker_state,
         degraded_same_user_boundary: receipt.mode == InstallMode::UserOnly,
     })
+}
+
+fn aggregate_credential_observations(
+    observations: impl Iterator<Item = CredentialObservation>,
+) -> CredentialObservation {
+    let observations = observations.collect::<Vec<_>>();
+    for state in [
+        CredentialObservation::Unsafe,
+        CredentialObservation::Missing,
+        CredentialObservation::NotObservable,
+    ] {
+        if observations.contains(&state) {
+            return state;
+        }
+    }
+    CredentialObservation::Present
 }
 
 pub fn explain(command: &str) -> Result<ExplainReport> {
@@ -195,5 +270,26 @@ fn probe_name(probe: &BrokerSessionProbe) -> &'static str {
         BrokerSessionProbe::NoSession => "no_session",
         BrokerSessionProbe::Invalid { .. } => "invalid",
         BrokerSessionProbe::Unavailable { .. } => "unavailable",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_aggregation_never_turns_unobserved_credentials_into_presence() {
+        use CredentialObservation::*;
+        for (observations, expected) in [
+            (vec![Present, Present], Present),
+            (vec![Present, NotObservable], NotObservable),
+            (vec![Missing, NotObservable], Missing),
+            (vec![Present, Missing, Unsafe], Unsafe),
+        ] {
+            assert_eq!(
+                aggregate_credential_observations(observations.into_iter()),
+                expected
+            );
+        }
     }
 }

@@ -3,7 +3,38 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// The exact single-range UID map produced by systemd's full identity user namespace.
+/// Host boot-relative monotonic time, including time spent suspended. Strong
+/// workloads retain the host time namespace; these ticks never cross hosts.
+pub fn boot_time_millis() -> Result<u64> {
+    let mut value = nix::libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a live, aligned writable timespec with the libc ABI.
+    // clock_gettime writes only that object and retains no pointer after return.
+    if unsafe { nix::libc::clock_gettime(nix::libc::CLOCK_BOOTTIME, &mut value) } != 0 {
+        bail!("native boot clock is unavailable");
+    }
+    if value.tv_sec < 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        bail!("native boot clock returned an invalid observation");
+    }
+    u64::try_from(value.tv_sec)?
+        .checked_mul(1000)
+        .and_then(|seconds| seconds.checked_add(value.tv_nsec as u64 / 1_000_000))
+        .context("native boot clock observation overflowed")
+}
+
+pub(crate) fn deadline_after_seconds(now_ms: u64, seconds: u64) -> Result<u64> {
+    if seconds == 0 {
+        bail!("approved duration must be positive");
+    }
+    seconds
+        .checked_mul(1000)
+        .and_then(|duration| now_ms.checked_add(duration))
+        .context("approved duration exceeds the native clock range")
+}
+
+/// A complete identity mapping, including systemd's root/non-root partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityUserNamespace;
 
@@ -11,27 +42,34 @@ impl IdentityUserNamespace {
     pub const RANGE_LENGTH: u32 = u32::MAX;
 
     pub fn parse(input: &[u8]) -> Result<Self> {
+        if input.len() > 4096 {
+            bail!("identity map exceeds its observation bound");
+        }
         let input = std::str::from_utf8(input).context("UID map is not UTF-8")?;
-        let mut lines = input.lines();
-        let line = lines.next().context("UID map is empty")?;
-        if lines.any(|remaining| !remaining.trim().is_empty()) {
-            bail!("identity UID map must contain exactly one range");
+        let mut ranges = Vec::new();
+        for line in input.lines().filter(|line| !line.trim().is_empty()) {
+            let mut fields = line.split_ascii_whitespace();
+            let inside_start = parse_field(fields.next(), "inside UID start")?;
+            let host_start = parse_field(fields.next(), "host UID start")?;
+            let length = parse_field(fields.next(), "UID range length")?;
+            if fields.next().is_some() || inside_start != host_start || length == 0 {
+                bail!("identity map contains invalid or remapped ranges");
+            }
+            let end = u64::from(inside_start) + u64::from(length);
+            if end > u64::from(Self::RANGE_LENGTH) {
+                bail!("identity range exceeds native ID bounds");
+            }
+            ranges.push((u64::from(inside_start), end));
         }
-
-        let mut fields = line.split_ascii_whitespace();
-        let inside_start = parse_field(fields.next(), "inside UID start")?;
-        let host_start = parse_field(fields.next(), "host UID start")?;
-        let length = parse_field(fields.next(), "UID range length")?;
-        if fields.next().is_some() {
-            bail!("identity UID map contains unexpected fields");
+        ranges.sort_unstable();
+        let mut next = 0;
+        for (start, end) in ranges {
+            if start != next {
+                bail!("identity map has a gap or overlapping ranges");
+            }
+            next = end;
         }
-        if inside_start != 0 {
-            bail!("identity UID map must begin at namespace UID zero");
-        }
-        if host_start != 0 {
-            bail!("identity UID map must preserve host UID zero");
-        }
-        if length != Self::RANGE_LENGTH {
+        if next != u64::from(Self::RANGE_LENGTH) {
             bail!("full identity UID map must preserve the complete UID range");
         }
         Ok(Self)

@@ -7,7 +7,13 @@ use std::io::{self, Read};
 use zeroize::Zeroize;
 
 mod completion;
+mod doctor;
+mod execution_result;
 mod product_cli;
+mod secret_cli;
+mod secret_execution;
+mod validation_cli;
+mod workload_cli;
 
 const REQUEST_LIMIT: u64 = 64 * 1024;
 
@@ -52,17 +58,26 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn base_usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth workload launch NAME -- [args...]\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 fn usage() -> String {
+    let commands = format!(
+        "{}\n\n{}\n{}\n{}\n{}\n{}\n{}",
+        base_usage(),
+        doctor::help(),
+        workload_cli::help(),
+        secret_cli::help(),
+        validation_cli::specification().render_long_help(),
+        completion::setup_recovery_command().render_long_help(),
+        completion::setup_restoration_command().render_long_help()
+    );
     format!(
         "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
-        base_usage()
+        commands
     )
 }
 
-#[cfg(target_os = "linux")]
 fn run_workload_os() -> Result<i32> {
     let mut arguments = std::env::args_os().skip(2);
     let operation = arguments.next().context("workload operation is required")?;
@@ -79,17 +94,7 @@ fn run_workload_os() -> Result<i32> {
             .collect::<Result<Vec<_>>>()?;
         return run_workload_management(std::iter::once(operation).chain(arguments));
     }
-    let workload = arguments
-        .next()
-        .context("workload launch requires a configured workload name")?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("workload name is not UTF-8"))?;
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
-        bail!("workload launch requires -- before workload arguments");
-    }
-    let arguments = arguments.collect::<Vec<_>>();
-    let status = dev_auth::supervisor::run_workload_alias(&workload, &arguments)?;
-    workload_status_code(status)
+    workload_cli::run(arguments.collect())
 }
 
 fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
@@ -301,7 +306,7 @@ fn run_supervisor_arguments(
     operation: &str,
     arguments: &mut impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<i32> {
-    if !matches!(operation, "dispatch" | "launch")
+    if !matches!(operation, "dispatch" | "dispatch-enrolled" | "launch")
         || arguments.next().as_deref() != Some(std::ffi::OsStr::new("--uid"))
     {
         bail!("supervisor requires dispatch or launch with exact public selectors");
@@ -355,7 +360,7 @@ fn run_supervisor_arguments(
     } else {
         None
     };
-    let (launcher_pid, environment_socket, boundary_socket) = if operation == "dispatch" {
+    let (launcher_pid, environment_socket, boundary_socket) = if operation != "launch" {
         if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--launcher-pid")) {
             bail!("supervisor launcher PID selector is missing");
         }
@@ -406,7 +411,12 @@ fn run_supervisor_arguments(
         )?;
         Ok(exit_status_code(status))
     } else {
-        let status = dev_auth::supervisor::run_root_dispatcher(
+        let dispatch = if operation == "dispatch-enrolled" {
+            dev_auth::supervisor::run_enrolled_dispatcher
+        } else {
+            dev_auth::supervisor::run_root_dispatcher
+        };
+        let status = dispatch(
             owner_uid,
             &workload,
             &cwd,
@@ -875,9 +885,12 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
     let operation = arguments.next().context(usage())?;
     match operation.as_str() {
         "template" => {
-            let name = arguments.next().context(
-                "setup template requires deployment, administrator-policy, user-only-policy, or user-config",
-            )?;
+            let name = arguments.next().with_context(|| {
+                format!(
+                    "setup template requires one of: {}",
+                    dev_auth::SETUP_TEMPLATE_NAMES.join(", ")
+                )
+            })?;
             if arguments.next().is_some() {
                 bail!("setup template accepts exactly one template name");
             }
@@ -1587,10 +1600,12 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 bail!("setup verify --sha256 and --format require --plan");
             }
             let paths = setup_paths(setup_mode(mode.as_deref())?)?;
-            let report = dev_auth::setup::verify_at(&paths)?;
+            let report = dev_auth::setup::verify_at_read_only(&paths)?;
             println!("{}", serde_json::to_string(&report)?);
             Ok(0)
         }
+        "recover" => run_setup_recovery(arguments),
+        "restore" => run_setup_restoration(arguments),
         "repair" | "rollback" | "deactivate" | "uninstall" => {
             let mut mode = None;
             while let Some(argument) = arguments.next() {
@@ -1601,15 +1616,16 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     _ => bail!("setup operation received an unsupported or duplicate argument"),
                 }
             }
-            let paths = setup_paths(setup_mode(mode.as_deref())?)?;
+            let mode = setup_mode(mode.as_deref())?;
+            let paths = setup_paths(mode)?;
             if operation == "uninstall" {
-                let report = dev_auth::setup::uninstall_at(&paths)?;
+                let report = dev_auth::setup::uninstall_native(mode)?;
                 println!("{}", serde_json::to_string(&report)?);
                 return Ok(0);
             }
             let report = match operation.as_str() {
-                "repair" => dev_auth::setup::repair_at(&paths)?,
-                "rollback" => dev_auth::setup::rollback_at(&paths)?,
+                "repair" => dev_auth::setup::repair_native(mode)?,
+                "rollback" => dev_auth::setup::rollback_native(mode)?,
                 "deactivate" => dev_auth::setup::deactivate_transparent_launchers_at(&paths)?,
                 _ => bail!("unknown setup operation"),
             };
@@ -1623,6 +1639,133 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
 #[cfg(not(unix))]
 fn run_setup(_arguments: impl Iterator<Item = String>) -> Result<i32> {
     bail!("dev-auth setup is not supported on this platform yet")
+}
+
+#[cfg(unix)]
+fn run_setup_restoration(arguments: impl Iterator<Item = String>) -> Result<i32> {
+    let matches = match completion::setup_restoration_command()
+        .try_get_matches_from(std::iter::once("restore".to_owned()).chain(arguments))
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            let code = error.exit_code();
+            error.print()?;
+            return Ok(code);
+        }
+    };
+    let mode = setup_mode(matches.get_one::<String>("mode").map(String::as_str))?;
+    let json = matches
+        .get_one::<String>("format")
+        .is_some_and(|format| format == "json");
+    #[cfg(target_os = "linux")]
+    {
+        let report = dev_auth::setup_v3::restore_setup_v3(mode);
+        if json {
+            println!("{}", serde_json::to_string(&report)?);
+        } else {
+            println!(
+                "changed={}",
+                report
+                    .changed
+                    .map(|changed| changed.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+            println!("verified={}", report.verified);
+            println!("next_action={}", report.next_action);
+            if let Some(executable) = &report.retry_executable {
+                println!("retry_executable={}", executable.display());
+                let mode = if mode == dev_auth::setup::InstallMode::Strong {
+                    "strong"
+                } else {
+                    "user-only"
+                };
+                println!("retry_arguments=setup restore --mode {mode} --format json");
+            }
+        }
+        Ok(report.exit_code)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mode;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"schema": "dev-auth-setup-restore-v1", "changed": false, "verified": false, "next_action": "native_restoration_backend_required", "retry_executable": null, "error_kind": "setup_restoration_blocked", "exit_code": 3})
+            );
+        } else {
+            println!(
+                "changed=false\nverified=false\nnext_action=native_restoration_backend_required"
+            );
+        }
+        Ok(3)
+    }
+}
+
+#[cfg(unix)]
+fn run_setup_recovery(arguments: impl Iterator<Item = String>) -> Result<i32> {
+    use dev_auth::credential_input::CredentialInputSource;
+    let matches = match completion::setup_recovery_command()
+        .try_get_matches_from(std::iter::once("recover".to_owned()).chain(arguments))
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            let code = error.exit_code();
+            error.print()?;
+            return Ok(code);
+        }
+    };
+    let mode = setup_mode(matches.get_one::<String>("mode").map(String::as_str))?;
+    let format = matches
+        .get_one::<String>("format")
+        .context("setup recovery format is absent")?;
+    let mut sources = std::collections::BTreeMap::new();
+    if let Some(slot) = matches.get_one::<String>("credential-stdin") {
+        sources.insert(slot.clone(), CredentialInputSource::Stdin);
+    }
+    for argument in ["credential-fd", "credential-file"] {
+        for value in matches.get_many::<String>(argument).into_iter().flatten() {
+            let (slot, value) = value
+                .split_once('=')
+                .context("credential input requires SLOT=VALUE")?;
+            let source = if argument == "credential-fd" {
+                CredentialInputSource::Fd(
+                    value
+                        .parse()
+                        .context("credential file descriptor is invalid")?,
+                )
+            } else {
+                let path = std::path::PathBuf::from(value);
+                if !path.is_absolute() {
+                    bail!("credential file path must be absolute");
+                }
+                CredentialInputSource::File(path)
+            };
+            if sources.insert(slot.to_owned(), source).is_some() {
+                bail!("credential input slot was defined more than once");
+            }
+        }
+    }
+    let report = dev_auth::setup_v3::recover_setup_v3(mode, &sources, &mut std::io::stdin().lock());
+    if format == "json" {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "changed={}",
+            report
+                .changed
+                .map(|changed| changed.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        println!("verified={}", report.verified);
+        println!("next_action={}", report.next_action);
+        for slot in &report.input_required {
+            println!("input_required={slot}");
+        }
+        for slot in &report.blocked {
+            println!("blocked={slot}");
+        }
+    }
+    Ok(report.exit_code)
 }
 
 #[cfg(unix)]
@@ -1864,22 +2007,6 @@ fn run() -> Result<i32> {
                 let _ = command;
                 bail!("explain is not supported on this platform yet")
             }
-        }
-        "validate" => {
-            let online = match arguments.next().as_deref() {
-                None => false,
-                Some("--online") if arguments.next().is_none() => true,
-                _ => bail!("validate accepts only the optional --online flag"),
-            };
-            let report = dev_auth::validate_configuration(online)?;
-            println!(
-                "config_valid=true online={} declared_exec_profiles={} declared_ssh_profiles={} declared_secret_references={}",
-                report.online,
-                report.declared_exec_profiles,
-                report.declared_ssh_profiles,
-                report.declared_secret_references
-            );
-            Ok(0)
         }
         "workspace-status" => {
             if arguments.next().is_some() {
@@ -2153,6 +2280,24 @@ fn is_core_frontend(frontend: &str) -> bool {
 }
 
 fn main() {
+    // A set-user-ID invocation has exactly one entry point, independent of
+    // argv[0], public subcommands, environment hints or helper aliases. The
+    // dispatcher rechecks the kernel real UID, fixed receipt-owned executable
+    // and explicit enrolled admission policy before any workload can start.
+    #[cfg(target_os = "linux")]
+    if nix::unistd::getuid() != nix::unistd::geteuid()
+        || nix::unistd::getgid() != nix::unistd::getegid()
+    {
+        let result =
+            run_supervisor_arguments("dispatch-enrolled", &mut std::env::args_os().skip(1));
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(_) => {
+                eprintln!("dev-auth: enrolled workload launch denied");
+                std::process::exit(4);
+            }
+        }
+    }
     let program = std::env::args_os()
         .next()
         .and_then(|value| {
@@ -2168,9 +2313,14 @@ fn main() {
         .unwrap_or(&normalized_program);
     let gh_child = std::env::var("DEV_AUTH_GH_CHILD").as_deref() == Ok("1");
     let git_child = std::env::var("DEV_AUTH_GIT_CHILD").as_deref() == Ok("1");
-    #[cfg(target_os = "linux")]
     let core_operation = std::env::args_os().nth(1);
     let result = match (frontend, gh_child, git_child) {
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("secret")) =>
+        {
+            secret_cli::run(std::env::args_os().skip(2).collect())
+        }
         ("git", true, _) => run_gh_git_child_frontend(),
         ("cat", true, _) => run_gh_pager_frontend(),
         ("false", true, _) => Ok(1),
@@ -2187,15 +2337,27 @@ fn main() {
         ("git-credential-dev-auth", _, _) => run_credential_frontend(),
         ("gh-dev-auth", _, _) => run_gh_frontend(),
         ("ssh-keygen-dev-auth", _, _) => run_ssh_keygen_frontend(),
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("doctor")) =>
+        {
+            Ok(doctor::run(std::env::args_os().skip(2).collect()))
+        }
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("validate")) =>
+        {
+            Ok(validation_cli::run(std::env::args_os().skip(2).collect()))
+        }
         #[cfg(target_os = "linux")]
         ("dev-auth-provider-exec", false, false) => dev_auth::run_provider_exec_child(),
         #[cfg(target_os = "linux")]
         ("dev-auth-setup-helper", false, false) => run_setup_helper_os(),
         #[cfg(target_os = "linux")]
         ("dev-auth-workload-launcher", false, false) => run_privileged_launcher_os(),
-        #[cfg(target_os = "linux")]
-        ("dev-auth", false, false)
-            if core_operation.as_deref() == Some(std::ffi::OsStr::new("workload")) =>
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("workload")) =>
         {
             run_workload_os()
         }
