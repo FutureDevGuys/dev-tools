@@ -35,6 +35,7 @@ release_signing_key = { private_key_ref = "op://Automation/dev-tools release sig
 
 ```sh
 release_signer_profile=source-maintenance # exact name from the installed config-v2.toml
+release_signer_executable=$(/usr/bin/readlink -e /usr/local/bin/dev-auth)
 next_dev_auth_generation=NEXT_UNUSED_GENERATION
 source_commit=$(/usr/bin/git rev-parse HEAD)
 "$HOME/.local/bin/release-admin" set build \
@@ -47,14 +48,14 @@ source_commit=$(/usr/bin/git rev-parse HEAD)
   --product dev-auth \
   --root-document "$PWD/release-trust/dev-tools-root.json" \
   --trusted-root-public-key "$PWD/crates/update-all/trust/root-public-key.txt" \
-  --signer /usr/local/bin/dev-auth \
+  --signer "$release_signer_executable" \
   --signer-profile "$release_signer_profile" \
   --release-key-id release-ca568413f0f27130 \
   --manifest-generation "$next_dev_auth_generation" \
   --output "${XDG_CACHE_HOME:-$HOME/.cache}/dev-tools-release/dev-auth-release-set"
 ```
 
-`EXACT_CARGO` names the reviewed native Cargo executable and `PRIVATE_OFFLINE_CARGO_HOME` is an existing canonical owner-only Cargo home containing the locked dependency cache but no release credential. The output parent is also an existing canonical owner-only directory. The native builder clears its environment, forces Cargo offline, retains the exact Git, Cargo, and signer identities, clones the exact clean commit into a private non-local checkout, remaps host paths, and publishes the release directory atomically only after the source-bound v2 manifest and built artifact verify. Cargo identity alone does not authenticate the compiler/linker toolchain, so two independent invocations under the accepted pinned build environment must still produce byte-identical release directories before publication.
+`EXACT_CARGO` names the reviewed native Cargo executable and `PRIVATE_OFFLINE_CARGO_HOME` is an existing canonical owner-only Cargo home containing the locked dependency cache but no release credential. The signer input is the resolved root-owned regular executable behind the installed Dev Auth launcher; the retained-executable boundary rejects symlink inputs. The output parent is also an existing canonical owner-only directory. The native builder clears its environment, forces Cargo offline, retains the exact Git, Cargo, and signer identities, clones the exact clean commit into a private non-local checkout, remaps host paths, and publishes the release directory atomically only after the source-bound v2 manifest and built artifact verify. Cargo identity alone does not authenticate the compiler/linker toolchain, so two independent invocations under the accepted pinned build environment must still produce byte-identical release directories before publication.
 
 Release publication is a separate operation from construction and signing. Run the standalone native publisher from a clean canonical checkout inside an admitted workload whose profile grants the required source-maintenance Git, GitHub, and SSH-signing operations. Its exact same-name `git` and `gh` children receive only that workload authority. `EXPECTED_GIT_SIGNING_PUBLIC_KEY` is the public OpenSSH key from the approved workload profile; it is reviewed input rather than a value discovered from repository Git configuration. Outside an admitted workload, `git` and `gh` intentionally remain native human passthrough and SHALL NOT be used for unattended publication.
 
