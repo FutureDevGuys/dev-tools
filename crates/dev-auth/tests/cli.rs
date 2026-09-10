@@ -3169,6 +3169,41 @@ products = ["fixture"]
         user.uid.as_raw(),
     )
     .unwrap();
+    let doctor = bounded_output(
+        Command::new(&installed)
+            .args(["doctor", "--json"])
+            .env_clear()
+            .current_dir(&root),
+    );
+    assert_eq!(doctor.status.code(), Some(0));
+    assert!(doctor.stderr.is_empty());
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["details"]["policy_ready"], true, "{doctor}");
+    assert_eq!(doctor["details"]["user_config_ready"], true, "{doctor}");
+    assert_eq!(
+        doctor["details"]["policy_resolution_ready"], true,
+        "{doctor}"
+    );
+    let legacy_config = b"version = 2\nauthority_profiles = {}\nworkloads = []\n";
+    dev_auth::policy_v2::parse_user_config_v2(legacy_config).unwrap();
+    let legacy_path = config_root.join("config-v2.toml");
+    fs::write(&legacy_path, legacy_config).unwrap();
+    fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let active_config = config_root.join("config-v3.toml");
+    let retained_config = root.join("retained-config-v3.toml");
+    fs::rename(&active_config, &retained_config).unwrap();
+    let missing_config = bounded_output(
+        Command::new(&installed)
+            .args(["doctor", "--json"])
+            .env_clear()
+            .current_dir(&root),
+    );
+    assert_eq!(missing_config.status.code(), Some(3));
+    let missing_config: serde_json::Value = serde_json::from_slice(&missing_config.stdout).unwrap();
+    assert_eq!(missing_config["details"]["policy_ready"], true);
+    assert_eq!(missing_config["details"]["user_config_ready"], false);
+    assert_eq!(missing_config["details"]["policy_resolution_ready"], false);
+    fs::rename(retained_config, active_config).unwrap();
     let output = bounded_output(
         Command::new(&installed)
             .args([

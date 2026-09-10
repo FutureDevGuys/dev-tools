@@ -72,22 +72,36 @@ fn status_with_probe(probe_broker: bool) -> Result<BrokerStatusReport> {
     let (paths, receipt) = current_runtime_installation()?;
     let setup = verify_runtime_installation_at(&paths, &receipt)?;
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?;
-    let policy_ready = match (receipt.mode, user.as_ref()) {
-        (InstallMode::Strong, _) => crate::policy_store::load_system_policy().is_ok(),
-        (InstallMode::UserOnly, Some(user)) => crate::policy_store::load_user_policy_at(
-            &crate::policy_store::user_policy_path(user),
-            user.uid.as_raw(),
+    let administrator = match (receipt.mode, user.as_ref()) {
+        (InstallMode::Strong, _) => crate::policy_store::load_runtime_system_policy_at(
+            std::path::Path::new(crate::policy_store::SYSTEM_POLICY_PATH),
         )
-        .is_ok(),
-        (InstallMode::UserOnly, None) => false,
+        .ok(),
+        (InstallMode::UserOnly, Some(user)) => crate::policy_store::runtime_user_policy_path(user)
+            .and_then(|path| {
+                crate::policy_store::load_runtime_user_policy_at(&path, user.uid.as_raw())
+            })
+            .ok(),
+        (InstallMode::UserOnly, None) => None,
     };
-    let user_config_ready = user.as_ref().is_some_and(|user| {
-        crate::policy_store::load_user_config_at(
-            &crate::policy_store::user_config_path(user),
-            user.uid.as_raw(),
-        )
-        .is_ok()
-    });
+    let policy_ready = administrator.is_some();
+    let user_config_ready =
+        user.as_ref()
+            .zip(administrator.as_ref())
+            .is_some_and(|(user, administrator)| {
+                crate::policy_store::read_runtime_user_config_at(
+                    &crate::policy_store::runtime_user_config_path(administrator, user),
+                    user.uid.as_raw(),
+                )
+                .is_ok_and(|bytes| match administrator {
+                    crate::runtime_policy::RuntimeAdministrator::Legacy(_) => {
+                        crate::policy_v2::parse_user_config_v2(&bytes).is_ok()
+                    }
+                    crate::runtime_policy::RuntimeAdministrator::Logical(_) => {
+                        crate::policy_v3::parse_user_config_v3(&bytes).is_ok()
+                    }
+                })
+            });
     let resolved = match (receipt.mode, user.as_ref()) {
         (InstallMode::Strong, Some(user)) => {
             crate::policy_store::load_resolved_policy_for_uid(user.uid.as_raw()).ok()

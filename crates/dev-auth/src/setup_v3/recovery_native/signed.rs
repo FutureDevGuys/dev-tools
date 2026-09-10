@@ -1,6 +1,7 @@
 //! Public signed intake in a fresh disposable native root. The runner supplies
 //! exact release sets at /signed/candidate and /signed/prior; no fake provenance.
 use super::*;
+use std::os::unix::process::CommandExt;
 
 const ACCOUNT: &str = "dev-auth-release-test";
 
@@ -67,6 +68,39 @@ fn release_path(generation: &str, version: &str) -> PathBuf {
     ))
 }
 
+fn require_ready_diagnostics(account: &nix::unistd::User, executable: &Path) {
+    let held = dev_tools_command::HeldExecutable::open(executable).unwrap();
+    let mut selected = held.command(executable.as_os_str()).unwrap();
+    selected
+        .uid(account.uid.as_raw())
+        .gid(account.gid.as_raw())
+        .env_clear()
+        .current_dir(&account.dir)
+        .args(["doctor", "--json"]);
+    let output = dev_tools_command::run_prepared_bounded_command(
+        &mut selected,
+        std::time::Duration::from_secs(40),
+        64 * 1024,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "native doctor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for field in [
+        "policy_ready",
+        "user_config_ready",
+        "policy_resolution_ready",
+    ] {
+        assert_eq!(report["details"][field], true, "{report}");
+    }
+    assert_eq!(report["details"]["broker_state"], "not_probed");
+    assert_eq!(report["details"]["provider_use_observation"], "not_checked");
+}
+
 fn install(generation: &str, version: &str, policy: &[u8], config: &[u8]) -> PathBuf {
     let source = release_path(generation, version);
     let root = format!("/signed/{generation}/dev-tools-root.json");
@@ -99,6 +133,8 @@ fn install(generation: &str, version: &str, policy: &[u8], config: &[u8]) -> Pat
                 "plan",
                 "--mode",
                 "strong",
+                "--channel",
+                "stable",
                 "--offline",
                 "--release-root",
                 &root,
@@ -154,6 +190,7 @@ fn native_disposable_signed_fresh_install_workload_and_restore() {
     let account = fixture();
     let (policy, config) = workload::prepare(&account);
     let installed = install("candidate", env!("CARGO_PKG_VERSION"), &policy, &config);
+    require_ready_diagnostics(&account, &installed);
     workload::exercise(&account, &installed);
 }
 
@@ -168,10 +205,10 @@ mode = "strong"
 allowed_users = ["{ACCOUNT}"]
 [programs]
 op = "/usr/local/libexec/dev-auth-fixture-provider"
-git = "/usr/bin/true"
-gh = "/usr/bin/false"
-ssh = "/usr/bin/true"
-ssh_keygen = "/usr/bin/true"
+git = "/usr/bin/git"
+gh = "/usr/bin/gh"
+ssh = "/usr/bin/ssh"
+ssh_keygen = "/usr/bin/ssh-keygen"
 [trusted_launchers]
 worker = "/usr/local/libexec/dev-auth-fixture-worker"
 [github_apps]
@@ -202,6 +239,7 @@ mode = "none"
     let prior_config_path = account.dir.join(".config/dev-auth/config-v2.toml");
     let prior_config_bytes = fs::read(&prior_config_path).unwrap();
     let installed = install("candidate", env!("CARGO_PKG_VERSION"), &policy, &config);
+    require_ready_diagnostics(&account, &installed);
     workload::require_credential_operation(&account, &installed);
     let restored = json(
         &installed,
@@ -234,6 +272,44 @@ mode = "none"
         "{}",
         String::from_utf8_lossy(&prior_verified.stderr)
     );
+    let retry = json(
+        &installed,
+        &["setup", "restore", "--mode", "strong", "--format", "json"],
+    );
+    assert_eq!(retry["verified"], true);
+    assert_eq!(retry["changed"], false);
+}
+
+#[test]
+#[ignore = "requires an owned rootful disposable systemd container with clean signed candidate and 0.4.0 release sets"]
+fn native_disposable_signed_v3_patch_upgrade_and_restore() {
+    let account = fixture();
+    let (policy, config) = workload::prepare(&account);
+    install("prior", "0.4.0", &policy, &config);
+    let prior_policy = fs::read("/etc/dev-auth/policy.toml").unwrap();
+    let config_path = account.dir.join(".config/dev-auth/config-v3.toml");
+    let prior_config = fs::read(&config_path).unwrap();
+    let installed = install("candidate", env!("CARGO_PKG_VERSION"), &policy, &config);
+    require_ready_diagnostics(&account, &installed);
+    workload::require_credential_operation(&account, &installed);
+    let restored = json(
+        &installed,
+        &["setup", "restore", "--mode", "strong", "--format", "json"],
+    );
+    assert_eq!(restored["verified"], true, "{restored}");
+    assert_eq!(restored["changed"], true);
+    assert_eq!(fs::read("/etc/dev-auth/policy.toml").unwrap(), prior_policy);
+    assert_eq!(fs::read(config_path).unwrap(), prior_config);
+    assert!(crate::setup::system_service_credential_slot_ready(
+        "automation"
+    ));
+    assert_eq!(
+        fs::canonicalize("/usr/local/bin/dev-auth").unwrap(),
+        Path::new("/usr/local/lib/dev-auth/versions/0.4.0/dev-auth")
+    );
+    for socket in ["/run/dev-auth/broker.sock", "/run/dev-auth/control.sock"] {
+        assert!(!Path::new(socket).exists());
+    }
     let retry = json(
         &installed,
         &["setup", "restore", "--mode", "strong", "--format", "json"],

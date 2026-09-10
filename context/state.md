@@ -1,6 +1,5 @@
 # Active work
 
-- Construct reproducible signed release artifacts from clean source, migrate the existing installation with retained rollback authority, and verify the live result.
-- Preserve `release-builder` as a general-purpose approved workload with its existing name/invocation contract. Migrate configured deadlines to 24 hours for Codex/Claude and 2 hours for release-builder, retaining launch-time approval and existing resource/workspace authority.
-- Preserve the original development checkout and its unrelated updater changes; this worktree owns the Dev Auth candidate and its shared installation/execution dependencies.
-- Continuation bindings, general administrator sessions and non-Linux native acceptance remain deferred unless a concrete dependency blocks this Linux release.
+- Complete the 0.4.1 readiness-reporting patch, its native tests, clean signed source and reproducible artifacts. Preserve immutable 0.4.0 release bytes and source identity.
+- Wait for the separate consumer live-convergence task to finish before publication or host installation. Do not hold a long admitted release-build workload while that task needs configuration mutation.
+- Publish and install the qualified patch with existing v3 authority and enrollment preserved; verify corrected diagnostics, a new-plan no-op and real enrolled operations.
