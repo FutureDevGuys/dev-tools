@@ -1,5 +1,4 @@
 # Active work
 
-- Complete the 0.4.1 readiness-reporting patch, its native tests, clean signed source and reproducible artifacts. Preserve immutable 0.4.0 release bytes and source identity.
-- Wait for the separate consumer live-convergence task to finish before publication or host installation. Do not hold a long admitted release-build workload while that task needs configuration mutation.
-- Publish and install the qualified patch with existing v3 authority and enrollment preserved; verify corrected diagnostics, a new-plan no-op and real enrolled operations.
+- Implement native stable-volume identity and automatic device-number repair for Dev Cache, without host paths or private consumer dependencies. Preserve root/runtime IDs, unrelated contents, read-only diagnostics and rejection of actual volume replacement.
+- Qualify legacy enrollment, concurrency, interrupted publication and Linux/Windows/macOS adapters, then deliver a signed independently installable update. The current installed release still lacks automatic repair across reboot-assigned device changes.

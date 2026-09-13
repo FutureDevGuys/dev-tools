@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::util::{now_unix, write_json_atomic};
+use crate::util::now_unix;
+
+mod volume;
 
 const MARKER_NAME: &str = ".dev-cache-root.json";
 
@@ -31,6 +33,8 @@ pub struct RootMarker {
     pub root_id: String,
     pub canonical_path: PathBuf,
     pub volume_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_volume_identity: Option<String>,
     pub created_unix: u64,
     #[serde(default)]
     pub runtime_domains: HashMap<String, String>,
@@ -57,7 +61,7 @@ impl RootHandle {
             );
         }
         ensure_writable(&canonical)?;
-        let volume_identity = volume_identity(&canonical)?;
+        let observed_volume = volume::observe(&canonical)?;
         let root_id = random_id();
         let mut runtime_domains = HashMap::new();
         runtime_domains.insert(runtime_key(), random_id());
@@ -65,11 +69,12 @@ impl RootHandle {
             schema_version: 2,
             root_id,
             canonical_path: canonical.clone(),
-            volume_identity,
+            volume_identity: observed_volume.device,
+            stable_volume_identity: observed_volume.stable,
             created_unix: now_unix(),
             runtime_domains,
         };
-        write_json_atomic(&marker_path, &marker)?;
+        write_marker_atomic(&marker_path, &marker)?;
         Self::initialize_coordination(&canonical)
     }
 
@@ -99,43 +104,38 @@ impl RootHandle {
             .canonicalize()
             .with_context(|| format!("resolve cache root {}", requested.display()))?;
         let marker_path = canonical.join(MARKER_NAME);
-        let mut marker: RootMarker = serde_json::from_slice(
-            &fs::read(&marker_path)
-                .with_context(|| format!("read cache-root marker {}", marker_path.display()))?,
-        )
-        .context("parse cache-root marker")?;
-        if marker.schema_version != 2 {
-            bail!(
-                "unsupported cache-root marker version {}; expected 2",
-                marker.schema_version
-            );
-        }
-        if marker.canonical_path != canonical {
-            bail!(
-                "cache-root path changed: marker={}, current={}",
-                marker.canonical_path.display(),
-                canonical.display()
-            );
-        }
-        let current_volume = volume_identity(&canonical)?;
-        if marker.volume_identity != current_volume {
-            bail!(
-                "cache-root volume changed; expected {}, found {}",
-                marker.volume_identity,
-                current_volume
-            );
-        }
+        let mut marker = read_marker(&marker_path, &canonical)?;
+        let current_volume = volume::observe(&canonical)?;
+        volume::validate(&marker, &current_volume)?;
         if mode == OpenMode::Prepare {
             ensure_writable(&canonical)?;
         }
         let platform = platform_namespace();
         let key = runtime_key();
-        if !marker.runtime_domains.contains_key(&key) {
-            if mode == OpenMode::Observe {
-                bail!("cache root has no initialized domain for this runtime");
+        if mode == OpenMode::Prepare
+            && (marker.volume_identity != current_volume.device
+                || (marker.stable_volume_identity.is_none() && current_volume.stable.is_some())
+                || !marker.runtime_domains.contains_key(&key))
+        {
+            // Only a needed marker update acquires write coordination. Normal
+            // observation and already-enrolled opens do not create a lock.
+            let _lock = marker_lock(&canonical)?;
+            marker = read_marker(&marker_path, &canonical)?;
+            let fresh_volume = volume::observe(&canonical)?;
+            volume::validate(&marker, &fresh_volume)?;
+            let before = marker.clone();
+            marker.volume_identity = fresh_volume.device;
+            marker.stable_volume_identity = fresh_volume.stable;
+            marker
+                .runtime_domains
+                .entry(key.clone())
+                .or_insert_with(random_id);
+            if marker != before {
+                write_marker_atomic(&marker_path, &marker)?;
             }
-            marker.runtime_domains.insert(key.clone(), random_id());
-            write_json_atomic(&marker_path, &marker)?;
+        }
+        if !marker.runtime_domains.contains_key(&key) {
+            bail!("cache root has no initialized domain for this runtime");
         }
         let domain_id = marker.runtime_domains[&key].clone();
         let platform_root = canonical.join("v2").join("domains").join(&domain_id);
@@ -193,15 +193,19 @@ impl RootHandle {
             .file_name()
             .context("replacement cache root has no final component")?;
         let replacement = parent.join(leaf);
-        if volume_identity(&parent)? != self.marker.volume_identity {
+        let current_volume = volume::observe(&self.root)?;
+        volume::validate(&self.marker, &current_volume)?;
+        if volume_identity(&parent)? != current_volume.device {
             bail!("replacement cache root must remain on the same filesystem or volume");
         }
+        self.marker.volume_identity = current_volume.device;
+        self.marker.stable_volume_identity = current_volume.stable;
         let original = self.root.clone();
         self.marker.canonical_path = replacement.clone();
-        write_json_atomic(&self.marker_path(), &self.marker)?;
+        write_marker_atomic(&self.marker_path(), &self.marker)?;
         if let Err(error) = fs::rename(&original, &replacement) {
             self.marker.canonical_path = original.clone();
-            let _ = write_json_atomic(&original.join(MARKER_NAME), &self.marker);
+            let _ = write_marker_atomic(&original.join(MARKER_NAME), &self.marker);
             return Err(error).with_context(|| {
                 format!(
                     "atomically rename cache root {} to {}",
@@ -227,6 +231,125 @@ impl RootHandle {
     }
     pub fn artifacts(&self) -> PathBuf {
         self.platform_root.join("artifacts/blake3")
+    }
+}
+
+fn read_marker(path: &Path, canonical: &Path) -> Result<RootMarker> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect cache-root marker {}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        bail!("cache-root marker is not a bounded ordinary file");
+    }
+    let marker: RootMarker = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read cache-root marker {}", path.display()))?,
+    )
+    .context("parse cache-root marker")?;
+    if marker.schema_version != 2 {
+        bail!(
+            "unsupported cache-root marker version {}; expected 2",
+            marker.schema_version
+        );
+    }
+    if marker.canonical_path != canonical {
+        bail!(
+            "cache-root path changed: marker={}, current={}",
+            marker.canonical_path.display(),
+            canonical.display()
+        );
+    }
+    Ok(marker)
+}
+
+fn write_marker_atomic(path: &Path, marker: &RootMarker) -> Result<()> {
+    let parent = path.parent().context("cache-root marker has no parent")?;
+    let temporary = parent.join(format!(".dev-cache-marker-{}.tmp", random_id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create new cache-root marker stage")?;
+    let written = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut file, marker)?;
+        file.write_all(b"\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = match fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                    meta.permissions().mode() & 0o777
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o644,
+                _ => bail!("cache-root marker publication lost ordinary-file ownership"),
+            };
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("publish cache-root marker");
+    }
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn marker_lock(root: &Path) -> Result<fs::File> {
+    use fs2::FileExt;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(root.join(".dev-cache-root.lock"))
+        .context("open cache-root marker coordination")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("cache-root marker coordination is not a regular file");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            bail!("cache-root marker coordination is a reparse point");
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    bail!("cache-root marker is busy; retry the operation");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("lock cache-root marker"),
+        }
     }
 }
 
@@ -272,12 +395,13 @@ fn runtime_key() -> String {
 pub fn platform_namespace() -> String {
     if cfg!(windows) {
         "windows".to_owned()
-    } else if std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some()
+    } else if cfg!(target_os = "linux")
+        && (std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::env::var_os("WSL_INTEROP").is_some())
     {
         "wsl".to_owned()
     } else {
-        "linux".to_owned()
+        std::env::consts::OS.to_owned()
     }
 }
 

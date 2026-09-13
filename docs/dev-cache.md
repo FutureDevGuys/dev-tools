@@ -8,6 +8,12 @@ Configuration and state use standard platform `dev-cache` roots. POSIX intercept
 
 Linux runtime acceptance covers Cargo and sccache, Go, npm, pnpm, uv and pip, ccache, Zig, Meson, Bun, and Yarn. Native Windows and WSL support is not claimed until their runtime acceptance harnesses pass.
 
+## Automatic root-identity repair
+
+Root preparation retains native filesystem identity separately from a transient Unix device number. After a reboot or device renumbering, matching retained filesystem evidence allows the device observation to refresh automatically without resetting the physical-root ID, runtime domains or cache contents. Linux uses supported native filesystem IDs, macOS uses the volume UUID, and Windows uses its native volume serial; neither a particular mount directory nor a workstation configuration is required. Unknown filesystem contracts retain strict checking rather than guessing that a replacement is the same storage.
+
+Older v2 markers gain stable evidence automatically during ordinary routed use when their original device check still matches. If an old marker already has a mismatch and contains no stable evidence, Dev Cache cannot establish its previous filesystem identity from the new device number alone; that one-time case requires independent volume verification before repairing the marker. A missing root, an actual filesystem replacement, an unowned populated directory or a changed canonical path is never silently adopted. Diagnostic commands remain read-only: they can recognize matching stable evidence but do not rewrite the marker. [ADR 0091](adr/0091-dev-cache-stable-volume-repair.md) defines compatibility, native identity and qualification limits.
+
 ## Automatic maintenance
 
 Normal routed commands maintain Dev Cache without a timer, daemon, repository hook, or per-project configuration. Compiler aliases and direct `ccache`/`sccache` intercepts are excluded from automatic maintenance: they execute once per compiler invocation and must not synchronously scan unrelated cache trees. They still route caches, publish resource records, hold activity leases and record completed use. Outer routed commands and explicit `dev-cache gc --apply` retain maintenance responsibility; a workload using only compiler intercepts needs explicit collection. See [ADR 0013](adr/0013-compiler-intercept-maintenance-boundary.md).
