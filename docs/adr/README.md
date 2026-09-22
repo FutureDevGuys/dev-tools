@@ -91,6 +91,7 @@ Read the applicable records before changing a public product contract or cross-p
 | [0084](0084-native-setup-exclusion-across-broker-and-maintenance.md) | Native setup exclusion across broker and maintenance | proposed | pending |
 | [0085](0085-linux-workload-lifecycle-and-public-restoration.md) | Linux workload lifecycle and public restoration | proposed | pending |
 | [0091](0091-dev-cache-stable-volume-repair.md) | Dev Cache stable volume evidence and automatic device-number repair | proposed | pending |
+| [0092](0092-existing-public-command-directory-mode.md) | Update All preserves owned public command directory mode | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

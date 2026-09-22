@@ -1581,6 +1581,19 @@ fn shared_installation_layout(product: Product, paths: &Paths) -> Result<Version
             }
         }
     };
+    let bin_directory_mode = match fs::symlink_metadata(&paths.bin_dir) {
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == owner_uid
+                && matches!(metadata.mode() & 0o7777, 0o700 | 0o755) =>
+        {
+            metadata.mode() & 0o7777
+        }
+        Ok(_) => bail!("public command directory has unsafe filesystem authority"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o755,
+        Err(error) => return Err(error).context("inspect public command directory"),
+    };
     Ok(VersionedLayout {
         product: product.id().into(),
         data_root: paths.product_root.clone(),
@@ -1588,7 +1601,7 @@ fn shared_installation_layout(product: Product, paths: &Paths) -> Result<Version
         artifact_name: paths.executable_name.clone(),
         owner_uid,
         directory_mode: 0o700,
-        bin_directory_mode: None,
+        bin_directory_mode: Some(bin_directory_mode),
     })
 }
 
@@ -1967,6 +1980,29 @@ impl Paths {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_installer_preserves_an_owned_public_command_directory() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir()?;
+        let paths = state_test_paths(root.path());
+        fs::create_dir(&paths.product_root)?;
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(&paths.bin_dir)?;
+        for mode in [0o700, 0o755] {
+            fs::set_permissions(&paths.bin_dir, fs::Permissions::from_mode(mode))?;
+            let layout = shared_installation_layout(Product::DevCache, &paths)?;
+            assert_eq!(layout.directory_mode, 0o700);
+            assert_eq!(layout.bin_directory_mode, Some(mode));
+            dev_tools_installation::ensure_owned_directory(&paths.bin_dir, layout.owner_uid, mode)?;
+            assert_eq!(fs::metadata(&paths.product_root)?.mode() & 0o777, 0o700);
+        }
+        fs::set_permissions(&paths.bin_dir, fs::Permissions::from_mode(0o775))?;
+        assert!(shared_installation_layout(Product::DevCache, &paths).is_err());
+        Ok(())
+    }
 
     #[test]
     fn metadata_cache_does_not_replay_unbound_legacy_validator() -> Result<()> {

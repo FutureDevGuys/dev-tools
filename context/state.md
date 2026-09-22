@@ -1,4 +1,4 @@
 # Active work
 
-- Implement native stable-volume identity and automatic device-number repair for Dev Cache, without host paths or private consumer dependencies. Preserve root/runtime IDs, unrelated contents, read-only diagnostics and rejection of actual volume replacement.
-- Qualify legacy enrollment, concurrency, interrupted publication and Linux/Windows/macOS adapters, then deliver a signed independently installable update. The current installed release still lacks automatic repair across reboot-assigned device changes.
+- Publish and activate the Update All successor that accepts an owned public command directory at its existing mode. Then install the signed Dev Cache successor, confirm ordinary intercept routing and repeat operation, and verify retained rollback without losing the selected cache-root or runtime-domain identity.
+- Qualify native Windows, WSL and macOS stable-volume recovery before claiming those runtime targets supported.
