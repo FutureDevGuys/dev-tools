@@ -11,7 +11,7 @@ case ${1:-} in
         library_test=$(realpath -e -- "$3")
         image=$4
         scenario=${5:-launch-grant}
-        [[ "$scenario" == launch-grant || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined ]]
+        [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined ]]
         [[ "$image" =~ ^[a-f0-9]{64}$ ]]
         stage=$(mktemp -d /tmp/dev-auth-installed-stage.XXXXXXXX)
         install -m 0755 -- "$product" "$stage/dev-auth"
@@ -49,7 +49,7 @@ case ${1:-} in
         chmod 0755 "$fixture/dev-auth" "$fixture/library-test" "$fixture/installed-user.sh"
         image=$(<"$fixture/image-id")
         scenario=$(<"$fixture/scenario")
-        [[ "$scenario" == launch-grant || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined ]]
+        [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined ]]
         [[ "$image" =~ ^[a-f0-9]{64}$ ]]
         # systemd-creds deliberately rejects automatic host-key encryption on
         # tmpfs when TPM2 is unavailable in a container. Preserve that policy;
@@ -63,6 +63,7 @@ case ${1:-} in
         removed=false
         prepared=false
         privilege_setup=false
+        progress_watcher=''
         phase=container_setup
         setup_log="$fixture/root-setup.log"
         : >"$setup_log"
@@ -75,6 +76,10 @@ case ${1:-} in
         cleanup() {
             code=$?
             trap - EXIT INT TERM
+            if [[ -n "$progress_watcher" ]]; then
+                kill "$progress_watcher" 2>/dev/null || true
+                wait "$progress_watcher" 2>/dev/null || true
+            fi
             if [[ -n "$container" ]]; then
                 [[ "$container" =~ ^[a-f0-9]{64}$ ]] || exit 1
                 if [[ "$prepared" == false ]]; then
@@ -87,10 +92,16 @@ case ${1:-} in
                     chmod 0644 "$fixture/container-start.log" "$fixture/container-state.json"
                 fi
                 # These files contain only fixture progress and value-free results.
-                for file in installed-progress.json installed-result.json failed-start-result.json grants.json; do
+                for file in installed-progress.json installed-result.json login-session-initial.json login-session-after-workload.json workload-launch-result.json user-launch-result.json user-leave.json failed-start-result.json grants.json; do
                     "${runtime[@]}" cp "$container:/home/dev-auth-recover-alpha/$file" "$fixture/$file" >/dev/null 2>&1 || true
                     [[ ! -f "$fixture/$file" ]] || chmod 0644 "$fixture/$file"
                 done
+                if [[ "$scenario" == login-session-probe && "$prepared" == true ]]; then
+                    # No password or grant prompt runs in this diagnostic. Keep
+                    # only native PAM/logind messages, never terminal output.
+                    "${runtime[@]}" exec "$container" /usr/bin/journalctl -b --no-pager -o cat --grep 'pam_systemd|systemd-logind' >"$fixture/login-journal.txt" 2>&1 || true
+                    chmod 0644 "$fixture/login-journal.txt"
+                fi
                 if "${runtime[@]}" rm --force --time 5 "$container"; then removed=true; else code=1; fi
             fi
             jq -n --argjson code "$code" --argjson prepared "$prepared" --argjson removed "$removed" --argjson privilege_setup "$privilege_setup" --arg scenario "$scenario" --arg storage "$storage_base" --arg phase "$phase" '{schema:"dev-auth-installed-launch-run-v1",exit_code:$code,phase:$phase,scenario:$scenario,prepared:$prepared,container_removed:$removed,image_storage:$storage,signed_release:false,privilege_setup_receipted:$privilege_setup}' >"$fixture/result.json"
@@ -129,6 +140,25 @@ case ${1:-} in
             if "${runtime[@]}" exec "$container" /usr/bin/systemctl is-active dbus.service >/dev/null 2>&1; then break; fi
             sleep 0.1
         done
+        if [[ "$scenario" == launch-grant || "$scenario" == login-session-probe ]] && ! logged "${runtime[@]}" exec "$container" /usr/bin/jq --version; then
+            printf '%s\n' 'Fixture image lacks native jq required by installed-user.sh' >&2
+            exit 1
+        fi
+        if [[ "$scenario" == tty-probe ]]; then
+            # This diagnostic runs before accounts or authentication exist. It
+            # reads no credential and checks the exact nested interactive PTY
+            # transport later used by native passwd and login.
+            phase=tty_probe
+            "${runtime[@]}" exec --interactive --tty "$container" /usr/bin/bash -c '
+                [[ -t 0 && -t 1 ]] || exit 41
+                : </dev/tty >/dev/tty || exit 43
+                /usr/bin/timeout 5 /usr/bin/cat >/dev/null
+                [[ $? == 124 ]] || exit 42'
+            /usr/bin/jq -n '{schema:"dev-auth-native-tty-probe-v1",tty_open:true,controlling_tty:true,no_input_timeout:true}' >"$fixture/tty-probe.json"
+            chmod 0644 "$fixture/tty-probe.json"
+            phase=complete
+            exit 0
+        fi
         # This opted-in preparer performs only fixed noninteractive synthetic
         # setup/recovery checks. Interactive launches below are never captured.
         phase=installed_preparation
@@ -157,7 +187,7 @@ case ${1:-} in
             phase=complete
             exit 0
         fi
-        if [[ "$scenario" != launch-grant ]]; then
+        if [[ "$scenario" != launch-grant && "$scenario" != password-diagnostic && "$scenario" != login-session-probe ]]; then
             "${runtime[@]}" cp "$container:/fixture/privilege-setup-result.json" "$fixture/privilege-setup-result.json"
             chmod 0644 "$fixture/privilege-setup-result.json"
             jq -e '.passed == true and .credentials_required == false' "$fixture/privilege-setup-result.json"
@@ -175,6 +205,44 @@ case ${1:-} in
         chmod 0644 "$fixture/prepared.json"
         jq -e '.prepared == true' "$fixture/prepared.json"
         prepared=true
+        if [[ "$scenario" == login-session-probe ]]; then
+            phase=native_login_session_probe
+            printf '{"phase":"%s"}\n' "$phase" >"$fixture/progress.json"
+            chmod 0644 "$fixture/progress.json"
+            logged "${runtime[@]}" exec "$container" /usr/bin/touch /fixture/login-session-probe-only
+            # The disposable image's default interactive class may require a
+            # user manager unavailable in this isolated container. Native
+            # user-light still registers an interactive tty session and ends
+            # with logout; debug logging is confined to this no-password run.
+            logged "${runtime[@]}" exec "$container" /usr/bin/sed -i 's/pam_systemd\.so$/pam_systemd.so debug/' /etc/pam.d/system-auth
+            printf '\nDiagnosing native logind registration through login(1) without a password. This does not qualify the installed-grant gate.\n'
+            "${runtime[@]}" exec --env XDG_SESSION_CLASS=user-light --env XDG_SESSION_TYPE=tty --interactive --tty "$container" /usr/bin/login -f dev-auth-recover-alpha
+            "${runtime[@]}" cp "$container:/home/dev-auth-recover-alpha/login-session-initial.json" "$fixture/login-session-initial.json"
+            chmod 0644 "$fixture/login-session-initial.json"
+            jq -e '.interactive == true' "$fixture/login-session-initial.json"
+            phase=diagnostic_complete
+            exit 0
+        fi
+        if [[ "$scenario" == password-diagnostic ]]; then
+            phase=native_password_diagnostic
+            printf '{"phase":"%s"}\n' "$phase" >"$fixture/progress.json"
+            chmod 0644 "$fixture/progress.json"
+            printf '\nNative passwd diagnostic: only process/file/wait syscalls are traced; no read or write payload is recorded.\n'
+            passwd_status=0
+            "${runtime[@]}" exec --interactive --tty "$container" /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 120s \
+                /usr/bin/strace -qq -f -ttt -T -o /fixture/passwd-syscalls.trace \
+                -e 'trace=%process,%file,flock,poll,ppoll,fsync,fdatasync' \
+                /usr/bin/passwd dev-auth-recover-alpha || passwd_status=$?
+            "${runtime[@]}" cp "$container:/fixture/passwd-syscalls.trace" "$fixture/passwd-syscalls.trace"
+            chmod 0644 "$fixture/passwd-syscalls.trace"
+            "${runtime[@]}" exec "$container" /usr/bin/passwd -S dev-auth-recover-alpha >"$fixture/passwd-status.txt"
+            chmod 0644 "$fixture/passwd-status.txt"
+            /usr/bin/jq -n --argjson status "$passwd_status" \
+                '{schema:"dev-auth-native-password-diagnostic-v1",passwd_exit_code:$status,signed_release:false}' >"$fixture/password-diagnostic.json"
+            chmod 0644 "$fixture/password-diagnostic.json"
+            phase=diagnostic_complete
+            exit 0
+        fi
         phase=native_password
         printf '{"phase":"%s"}\n' "$phase" >"$fixture/progress.json"
         chmod 0644 "$fixture/progress.json"
@@ -183,11 +251,25 @@ case ${1:-} in
         phase=native_login_and_launch
         printf '{"phase":"%s"}\n' "$phase" >"$fixture/progress.json"
         printf '\nStarting the isolated native login and approval checks.\n'
+        watch_progress() {
+            while :; do
+                if "${runtime[@]}" cp "$container:/home/dev-auth-recover-alpha/installed-progress.json" "$fixture/.installed-progress.next" >/dev/null 2>&1; then
+                    chmod 0644 "$fixture/.installed-progress.next"
+                    mv -f -- "$fixture/.installed-progress.next" "$fixture/installed-progress.json"
+                fi
+                sleep 1
+            done
+        }
+        watch_progress &
+        progress_watcher=$!
         "${runtime[@]}" exec --interactive --tty "$container" /usr/bin/login dev-auth-recover-alpha
+        kill "$progress_watcher" 2>/dev/null || true
+        wait "$progress_watcher" 2>/dev/null || true
+        progress_watcher=''
         "${runtime[@]}" cp "$container:/home/dev-auth-recover-alpha/installed-result.json" "$fixture/installed-result.json"
         chmod 0644 "$fixture/installed-result.json"
         jq -e '.exit_code == 0 and .step == "complete"' "$fixture/installed-result.json"
         phase=complete
         ;;
-    *) printf '%s\n' 'usage: installed-linux.sh run PRODUCT LIBRARY_TEST IMAGE_ID [launch-grant|privilege-setup|privilege-setup-interrupted|privilege-setup-reconfigured|privilege-combined]' >&2; exit 2 ;;
+    *) printf '%s\n' 'usage: installed-linux.sh run PRODUCT LIBRARY_TEST IMAGE_ID [launch-grant|tty-probe|password-diagnostic|login-session-probe|privilege-setup|privilege-setup-interrupted|privilege-setup-reconfigured|privilege-combined]' >&2; exit 2 ;;
 esac

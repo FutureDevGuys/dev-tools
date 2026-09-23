@@ -1004,6 +1004,7 @@ fn run_prepared_bounded_command_unix(
     let mut leader_exited = false;
     let started = Instant::now();
     let primary = loop {
+        let mut progressed = false;
         if cancelled.load(Ordering::Acquire) {
             break Some(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
         }
@@ -1021,7 +1022,11 @@ fn run_prepared_bounded_command_unix(
                 BoundedCommandStream::Stdout,
             ) {
                 Ok(DrainProgress::Pending) => {}
-                Ok(DrainProgress::Closed) => stdout_closed = true,
+                Ok(DrainProgress::Read) => progressed = true,
+                Ok(DrainProgress::Closed) => {
+                    stdout_closed = true;
+                    progressed = true;
+                }
                 Err(error) => break Some(error),
             }
         }
@@ -1033,7 +1038,11 @@ fn run_prepared_bounded_command_unix(
                 BoundedCommandStream::Stderr,
             ) {
                 Ok(DrainProgress::Pending) => {}
-                Ok(DrainProgress::Closed) => stderr_closed = true,
+                Ok(DrainProgress::Read) => progressed = true,
+                Ok(DrainProgress::Closed) => {
+                    stderr_closed = true;
+                    progressed = true;
+                }
                 Err(error) => break Some(error),
             }
         }
@@ -1056,7 +1065,9 @@ fn run_prepared_bounded_command_unix(
         if remaining.is_zero() {
             break Some(BoundedCommandError::new(BoundedCommandErrorKind::TimedOut));
         }
-        thread::sleep(remaining.min(MONITOR_INTERVAL));
+        if !progressed {
+            thread::sleep(remaining.min(MONITOR_INTERVAL));
+        }
     };
 
     if let Some(primary) = primary {
@@ -1097,6 +1108,7 @@ fn run_prepared_bounded_command_unix(
 ))]
 enum DrainProgress {
     Pending,
+    Read,
     Closed,
 }
 
@@ -1134,6 +1146,7 @@ fn drain_available(
     stream: BoundedCommandStream,
 ) -> std::result::Result<DrainProgress, BoundedCommandError> {
     let mut buffer = Zeroizing::new([0_u8; 8 * 1024]);
+    let mut read_any = false;
     loop {
         let remaining = limit.saturating_sub(output.len());
         let read_limit = remaining.saturating_add(1).min(buffer.len());
@@ -1145,10 +1158,17 @@ fn drain_available(
                     BoundedCommandErrorKind::OutputLimit(stream),
                 ));
             }
-            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                read_any = true;
+            }
             Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(DrainProgress::Pending);
+                return Ok(if read_any {
+                    DrainProgress::Read
+                } else {
+                    DrainProgress::Pending
+                });
             }
             Err(source) => {
                 return Err(BoundedCommandError::with_source(

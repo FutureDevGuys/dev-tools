@@ -1167,8 +1167,11 @@ impl PendingLaunchGrant {
         let response = crate::privilege::control(crate::privilege::ControlRequest::Request {
             request: request.clone(),
         });
-        if response.error_kind.is_some() {
-            bail!("native administrator approval did not complete; workload was not started");
+        if let Some(failure) = response.error_kind {
+            bail!(
+                "native administrator approval did not complete ({}); workload was not started",
+                failure.message()
+            );
         }
         let grant = response
             .grant

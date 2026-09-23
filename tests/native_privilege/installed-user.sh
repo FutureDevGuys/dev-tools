@@ -30,8 +30,50 @@ no_active_user_grant() {
     status
     jq -e '[.grants[]? | select(.scope == "user" and .state == "active")] | length == 0' grants.json >/dev/null
 }
+interactive_login_session() {
+    local result_file=$1
+    local account_uid sessions session class kind state count=0 found=false
+    account_uid=$(id -u)
+    sessions=$(loginctl show-user "$account_uid" --property=Sessions --value 2>/dev/null) || sessions=''
+    class=''
+    kind=''
+    state=''
+    for session in $sessions; do
+        ((count += 1))
+        class=$(loginctl show-session "$session" --property=Class --value 2>/dev/null) || class=''
+        kind=$(loginctl show-session "$session" --property=Type --value 2>/dev/null) || kind=''
+        state=$(loginctl show-session "$session" --property=State --value 2>/dev/null) || state=''
+        case "$class:$kind:$state" in
+            user:tty:online|user:tty:active|user-early:tty:online|user-early:tty:active|user-light:tty:online|user-light:tty:active|user-early-light:tty:online|user-early-light:tty:active)
+                found=true
+                break
+                ;;
+        esac
+    done
+    jq -n --argjson session_count "$count" --argjson interactive "$found" \
+        --arg class "$class" --arg type "$kind" --arg state "$state" \
+        '{schema:"dev-auth-installed-login-check-v1",session_count:$session_count,interactive:$interactive,last_class:$class,last_type:$type,last_state:$state}' >"$result_file"
+    [[ "$found" == true ]]
+}
+
+phase login_initial_preflight
+if ! interactive_login_session login-session-initial.json; then
+    printf '%s\n' 'native login has no interactive logind session; user-wide grant cannot be requested' >&2
+    exit 1
+fi
+if [[ -e /fixture/login-session-probe-only ]]; then
+    phase complete
+    exit 0
+fi
 
 for scope in workload user; do
+    if [[ "$scope" == user ]]; then
+        phase login_after_workload_preflight
+        if ! interactive_login_session login-session-after-workload.json; then
+            printf '%s\n' 'interactive logind session ended during workload launch; user-wide grant cannot be requested' >&2
+            exit 1
+        fi
+    fi
     phase "${scope}_approval"
     [[ ! -e "$HOME/payload-$scope" ]]
     "$product" workload launch worker --privilege-scope "$scope" --privilege-duration 120s --result-file "$HOME/$scope-launch-result.json" -- privilege-check "$scope"

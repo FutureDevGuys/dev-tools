@@ -544,10 +544,13 @@ async fn issue(
         .approve_limits(&caller.scope.account, &request)?;
     let scope = requested_scope(caller, request.scope)?;
     request.idle_seconds = effective_idle(&service.policy, &scope.account, &request)?;
-    if request.scope == GrantScope::User
-        && !super::approval::account_has_login(caller.peer.uid).await?
-    {
-        return Err(Failure::AuthorityDenied);
+    if request.scope == GrantScope::User {
+        let Account::Unix { uid } = &scope.account else {
+            return Err(Failure::AuthorityDenied);
+        };
+        if !super::approval::account_has_login(*uid).await? {
+            return Err(Failure::AuthorityDenied);
+        }
     }
     let id = new_id()?;
     let pending = {
