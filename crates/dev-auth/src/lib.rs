@@ -64,6 +64,8 @@ pub mod stable_release;
 mod strict_serde;
 #[cfg(target_os = "linux")]
 pub mod supervisor;
+#[cfg(target_os = "linux")]
+pub mod update_status;
 
 pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,

@@ -352,6 +352,50 @@ fn standard_identity_is_local_and_preserves_legacy_release_build_info() {
 }
 
 #[test]
+fn uninstalled_update_observation_is_external_and_does_not_fetch_or_create_state() {
+    let root = tempfile::tempdir().unwrap();
+    for operation in ["status", "check"] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .env("HOME", root.path())
+                .env("PATH", "/missing")
+                .current_dir(root.path())
+                .args(["update", operation, "--json"]),
+        );
+        assert!(output.status.success(), "{operation}");
+        assert!(output.stderr.is_empty(), "{operation}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-tools-operation-result-v2");
+        assert_eq!(report["operation"], format!("update_{operation}"));
+        assert_eq!(report["outcome"], "external");
+        assert_eq!(report["changed"], false);
+        assert_eq!(report["installation_state"], "external");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    let apply = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["update", "apply", "--json"]),
+    );
+    assert_eq!(apply.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&apply.stdout).unwrap()["outcome"],
+        "external"
+    );
+    let install = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["update", "install", "--offline", "--json"]),
+    );
+    assert_eq!(install.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&install.stdout).unwrap()["outcome"],
+        "requires_setup"
+    );
+}
+
+#[test]
 fn standard_identity_rejects_extra_arguments_without_output() {
     for arguments in [
         vec!["--version", "extra"],
@@ -518,6 +562,14 @@ COMP_WORDS=(dev-auth setup plan --channel st)
 COMP_CWORD=4
 "$function_name" dev-auth st --channel
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth update status --j)
+COMP_CWORD=3
+"$function_name" dev-auth --j status
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth update apply --off)
+COMP_CWORD=3
+"$function_name" dev-auth --off apply
+printf '%s\n' "${COMPREPLY[@]}"
 COMP_WORDS=(dev-auth workload bind plan --command-n)
 COMP_CWORD=4
 "$function_name" dev-auth --command-n plan
@@ -550,7 +602,7 @@ printf '%s\n' "${COMPREPLY[@]}"
     );
     assert_eq!(
         output.stdout,
-        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--command-name\nstructured\n--caller-argument-index\nproviders\n"
+        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\nstructured\n--caller-argument-index\nproviders\n"
     );
 }
 
@@ -1306,6 +1358,12 @@ impl NativeUserSandbox {
 
     fn install_binary(&self, destination: &Path) {
         fs::copy(env!("CARGO_BIN_EXE_dev-auth"), destination).unwrap();
+        assert!(Command::new("/usr/bin/strip")
+            .arg("--strip-debug")
+            .arg(destination)
+            .status()
+            .unwrap()
+            .success());
         fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
@@ -1451,6 +1509,58 @@ config = "{}"
     assert_eq!(first["changed"], true);
     assert_eq!(first["verified"], true);
 
+    let receipt: dev_auth::setup::InstallReceipt =
+        serde_json::from_slice(&fs::read(paths.data_root.join("install-v2.json")).unwrap())
+            .unwrap();
+    let update_sources =
+        dev_auth::setup_v3::prepare_update_intent_from_accepted_at(&paths, &receipt).unwrap();
+    assert_eq!(
+        fs::read(&update_sources.intent.administrator_policy).unwrap(),
+        fs::read(&policy).unwrap()
+    );
+    assert_eq!(update_sources.intent.users.len(), 1);
+    assert_eq!(
+        fs::read(&update_sources.intent.users[0].config).unwrap(),
+        fs::read(&config).unwrap()
+    );
+    let staged_source = update_sources.intent.administrator_policy.clone();
+    drop(update_sources);
+    assert!(!staged_source.exists());
+    let worker_root = tempfile::Builder::new()
+        .prefix("dev-auth-update-sources-")
+        .tempdir_in(&paths.data_root)
+        .unwrap();
+    fs::set_permissions(worker_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let worker_plan = worker_root.path().join("update-plan.json");
+    assert_eq!(write_setup_plan_v3_at(&worker_plan, &plan).unwrap(), digest);
+    let worker_result = worker_root.path().join("update-result.json");
+    let worker = bounded_output(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["update-worker", "--plan"])
+            .arg(&worker_plan)
+            .args(["--sha256", &digest, "--result"])
+            .arg(&worker_result)
+            .env_clear()
+            .current_dir("/"),
+    );
+    assert_eq!(
+        worker.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&worker.stdout),
+        String::from_utf8_lossy(&worker.stderr)
+    );
+    assert!(worker.stdout.is_empty());
+    assert!(worker.stderr.is_empty());
+    let worker_report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_result).unwrap()).unwrap();
+    assert_eq!(worker_report["schema"], "dev-auth-update-apply-worker-v1");
+    assert_eq!(worker_report["plan_sha256"], digest);
+    assert_eq!(worker_report["outcome"], "completed");
+    assert_eq!(worker_report["changed"], false);
+    assert_eq!(worker_report["verified"], true);
+    drop(worker_root);
+
     let trace_path = root.path().join("doctor.trace");
     let mut doctor_command = if trace_doctor {
         let mut command = Command::new("/usr/bin/strace");
@@ -1482,6 +1592,43 @@ config = "{}"
     assert_eq!(doctor["details"]["broker_state"], "not_probed");
     assert_eq!(doctor["details"]["credential_observation"], "not_required");
     assert_eq!(doctor["details"]["provider_use_observation"], "not_checked");
+    let update_status = bounded_output(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["update", "status", "--json"])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/missing")
+            .current_dir(&user.dir),
+    );
+    assert_eq!(update_status.status.code(), Some(0));
+    assert!(update_status.stderr.is_empty());
+    let update_status: serde_json::Value = serde_json::from_slice(&update_status.stdout).unwrap();
+    assert_eq!(update_status["schema"], "dev-tools-operation-result-v2");
+    assert_eq!(update_status["operation"], "update_status");
+    assert_eq!(update_status["installation_state"], "managed");
+    assert_eq!(update_status["outcome"], "unknown");
+    assert_eq!(update_status["cache_freshness"], "absent");
+    assert_eq!(update_status["changed"], false);
+    assert!(!user
+        .dir
+        .join(".cache/dev-auth/stable-release-observation-v1.json")
+        .exists());
+    let offline_update = bounded_output(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["update", "apply", "--offline", "--json"])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/missing")
+            .current_dir(&user.dir),
+    );
+    assert_eq!(offline_update.status.code(), Some(3));
+    let offline_update: serde_json::Value = serde_json::from_slice(&offline_update.stdout).unwrap();
+    assert_eq!(offline_update["operation"], "update_apply");
+    assert_eq!(offline_update["changed"], false);
+    assert_eq!(
+        offline_update["installed_version"],
+        "0.3.0-clean-device-test"
+    );
     if trace_doctor {
         assert!(fs::metadata(&trace_path).unwrap().len() <= PUBLIC_SUBPROCESS_OUTPUT_LIMIT);
         let trace = fs::read_to_string(&trace_path).unwrap();
@@ -1729,6 +1876,30 @@ config = "{}"
     assert!(!deactivated.transparent_launchers_active);
     assert!(!user.dir.join(".local/bin/git").exists());
     assert!(!user.dir.join(".local/bin/gh").exists());
+    let update_rollback = bounded_output_with_timeout(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["update", "rollback", "--json"])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&user.dir),
+        Duration::from_secs(120),
+        "setup-owned update rollback",
+    );
+    assert_eq!(
+        update_rollback.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&update_rollback.stdout),
+        String::from_utf8_lossy(&update_rollback.stderr)
+    );
+    let rollback_result: serde_json::Value =
+        serde_json::from_slice(&update_rollback.stdout).unwrap();
+    assert_eq!(rollback_result["operation"], "update_rollback");
+    assert_eq!(rollback_result["outcome"], "rolled_back");
+    assert_eq!(rollback_result["changed"], true);
+    assert_eq!(rollback_result["installation_state"], "absent");
+    assert!(!paths.data_root.join("install-v2.json").exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -3176,7 +3347,7 @@ fn standalone_user_only_setup_is_idempotent_transparent_and_deactivatable() {
             "standalone_user_only_setup_is_idempotent_transparent_and_deactivatable",
             "--nocapture",
         ]),
-        Duration::from_secs(90),
+        Duration::from_secs(180),
         "standalone setup acceptance subprocess",
     );
     assert!(
@@ -3219,7 +3390,7 @@ fn standalone_doctor_has_no_network_helpers_or_mutation() {
             "--test-threads=1",
             "--nocapture",
         ]),
-        Duration::from_secs(150),
+        Duration::from_secs(240),
         "standalone doctor native boundary acceptance",
     );
     assert!(

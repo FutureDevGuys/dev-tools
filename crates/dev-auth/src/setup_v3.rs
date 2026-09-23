@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const DOCUMENT_LIMIT: u64 = 1024 * 1024;
@@ -2800,6 +2800,184 @@ struct RetainedSetupGeneration {
     plan: SetupPlanV3,
     documents: Vec<RetainedSetupObject>,
     candidate_documents: Vec<RetainedCandidateDocument>,
+}
+
+/// Keep the exact accepted configuration bytes available only while an update
+/// plan is built and entered. Once setup publishes its retained generation,
+/// recovery no longer depends on these ephemeral source paths.
+pub struct PreparedUpdateIntent {
+    pub intent: DeploymentIntent,
+    _sources: tempfile::TempDir,
+}
+
+pub struct PreparedUpdatePlan {
+    pub plan: SetupPlanV3,
+    pub sha256: String,
+    _sources: PreparedUpdateIntent,
+}
+
+impl PreparedUpdatePlan {
+    pub fn write_private_plan(&self) -> Result<PathBuf> {
+        let path = self._sources._sources.path().join("update-plan.json");
+        let written = write_setup_plan_v3_at(&path, &self.plan)?;
+        if written != self.sha256 {
+            bail!("private update plan differs from its approved digest");
+        }
+        Ok(path)
+    }
+
+    pub fn private_result_path(&self) -> PathBuf {
+        self._sources._sources.path().join("update-result.json")
+    }
+}
+
+pub fn build_update_plan_for_verified_release(
+    release: &crate::stable_release::StagedStableRelease,
+    offline: bool,
+) -> Result<PreparedUpdatePlan> {
+    let mut sources = prepare_update_intent_from_accepted()?;
+    sources.intent.offline = offline;
+    let plan =
+        build_setup_plan_v3_for_verified_release(sources.intent.clone(), release.verified.clone())?;
+    let (_, sha256) = render_setup_plan_v3(&plan)?;
+    Ok(PreparedUpdatePlan {
+        plan,
+        sha256,
+        _sources: sources,
+    })
+}
+
+pub fn prepare_update_intent_from_accepted() -> Result<PreparedUpdateIntent> {
+    let (paths, receipt) = crate::setup::current_installation()?;
+    prepare_update_intent_from_accepted_at(&paths, &receipt)
+}
+
+pub fn prepare_update_intent_from_accepted_at(
+    paths: &crate::setup::SetupPaths,
+    receipt: &crate::setup::InstallReceipt,
+) -> Result<PreparedUpdateIntent> {
+    let owner_uid = match receipt.mode {
+        crate::setup::InstallMode::Strong => 0,
+        crate::setup::InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
+    };
+    let transition = crate::setup_transition::retained_transition(paths, owner_uid)?
+        .context("an accepted full setup generation is required for update")?;
+    if transition.phase != crate::setup_transition::Phase::Accepted {
+        bail!("the current setup generation requires recovery or restoration before update");
+    }
+    let generation: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes)
+        .context("decode accepted full setup generation")?;
+    if generation.schema != "dev-auth-retained-setup-generation-v1"
+        || generation.plan_sha256 != transition.plan_sha256
+        || sha256_hex(&serde_jcs::to_vec(&generation.plan)?) != transition.plan_sha256
+        || generation.plan.installation.paths != *paths
+        || generation.plan.installation.request.version != receipt.version
+        || generation.plan.installation.request.mode != receipt.mode
+        || generation.plan.installation.request.purpose != receipt.purpose
+        || generation.plan.installation.source_length != receipt.executable_length
+        || generation.plan.installation.source_sha256 != receipt.executable_sha256
+    {
+        bail!("accepted setup generation does not match the running installation");
+    }
+    validate_candidate_inventory(&generation.plan, &generation.candidate_documents)?;
+    verify_postcondition(
+        &generation.plan,
+        &transition.plan_sha256,
+        &generation.candidate_documents,
+    )
+    .context("current accepted setup postcondition changed before update")?;
+    let data_root =
+        fs::symlink_metadata(&paths.data_root).context("inspect accepted update staging root")?;
+    if !data_root.is_dir()
+        || data_root.file_type().is_symlink()
+        || data_root.uid() != owner_uid
+        || data_root.mode() & 0o022 != 0
+    {
+        bail!("accepted update staging root has unsafe native authority");
+    }
+    let sources = tempfile::Builder::new()
+        .prefix("dev-auth-update-sources-")
+        .tempdir_in(&paths.data_root)
+        .context("create private update source snapshot")?;
+    fs::set_permissions(sources.path(), fs::Permissions::from_mode(0o700))
+        .context("protect private update source snapshot")?;
+    let mut intent = generation.plan.intent.clone();
+    let mut seen = BTreeSet::new();
+    for (index, document) in generation.candidate_documents.iter().enumerate() {
+        let key = (
+            document.identity.kind.as_str(),
+            document.identity.subject.as_str(),
+        );
+        if !seen.insert(key) {
+            bail!("accepted setup source inventory contains a duplicate declaration");
+        }
+        let path = sources.path().join(format!("source-{index}"));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .context("create private update source document")?;
+        file.write_all(&document.bytes)
+            .context("write private update source document")?;
+        file.sync_all()
+            .context("sync private update source document")?;
+        match key {
+            ("administrator_policy", "system")
+                if intent.administrator_policy == document.identity.path =>
+            {
+                intent.administrator_policy = path;
+            }
+            ("privilege_policy", "system")
+                if intent.privilege_policy.as_ref() == Some(&document.identity.path) =>
+            {
+                intent.privilege_policy = Some(path);
+            }
+            ("privilege_policy", "system")
+                if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly
+                    && intent.administrator_policy == document.identity.path =>
+            {
+                intent.administrator_policy = path;
+            }
+            ("user_configuration", user) => {
+                let target = intent
+                    .users
+                    .iter_mut()
+                    .find(|entry| entry.name == user && entry.config == document.identity.path)
+                    .context("accepted update user configuration source is unbound")?;
+                target.config = path;
+            }
+            ("user_policy", user) => {
+                let target = intent
+                    .users
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.name == user && entry.policy.as_ref() == Some(&document.identity.path)
+                    })
+                    .context("accepted update user policy source is unbound")?;
+                target.policy = Some(path);
+            }
+            _ => bail!("accepted update source has no deployment-intent binding"),
+        }
+    }
+    let expected = 1
+        + usize::from(intent.privilege_policy.is_some())
+        + intent
+            .users
+            .iter()
+            .map(|user| 1 + usize::from(user.policy.is_some()))
+            .sum::<usize>();
+    if seen.len() != expected {
+        bail!("accepted update source inventory is incomplete");
+    }
+    for credential in &mut intent.credentials {
+        credential.intent = CredentialIntent::Preserve;
+    }
+    canonical_deployment_intent(&intent)?;
+    Ok(PreparedUpdateIntent {
+        intent,
+        _sources: sources,
+    })
 }
 
 fn approved_candidate_documents(plan: &SetupPlanV3) -> Result<Vec<RetainedCandidateDocument>> {

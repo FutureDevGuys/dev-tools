@@ -13,6 +13,7 @@ mod privilege_cli;
 mod product_cli;
 mod secret_cli;
 mod secret_execution;
+mod update_cli;
 mod validation_cli;
 mod workload_cli;
 
@@ -59,7 +60,7 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn base_usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|credential-privilege-deployment\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--privilege-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth update status|check [--json]\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|credential-privilege-deployment\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--privilege-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 fn usage() -> String {
@@ -78,6 +79,9 @@ fn usage() -> String {
         &privilege_cli::specification()
             .render_long_help()
             .to_string(),
+    );
+    commands.push_str(
+        "\n  dev-auth update install|apply [--json] [--offline]\n  dev-auth update rollback [--json]",
     );
     format!(
         "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
@@ -1933,6 +1937,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         "setup" => run_setup(arguments),
+        "update" => update_cli::run(arguments),
         "reconcile" => run_reconcile(arguments),
         "workload" => run_workload_management(arguments),
         "broker" => {
@@ -2373,6 +2378,12 @@ fn main() {
             if core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege-plan-worker")) =>
         {
             Ok(dev_auth::privilege::run_plan_worker())
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("update-worker")) =>
+        {
+            Ok(update_cli::worker(std::env::args_os().skip(2).collect()))
         }
         #[cfg(target_os = "linux")]
         ("dev-auth", false, false)

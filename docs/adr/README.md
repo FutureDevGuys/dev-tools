@@ -95,6 +95,9 @@ Read the applicable records before changing a public product contract or cross-p
 | [0088](0088-approved-command-graphs-in-owned-execution.md) | Approved command graphs in owned execution | proposed | pending |
 | [0089](0089-privilege-component-in-retained-setup.md) | Privilege component in retained setup | proposed | pending |
 | [0090](0090-explicit-empty-file-custody.md) | Explicit empty-file custody | proposed | pending |
+| [0091](0091-dev-auth-metadata-only-release-observation.md) | Dev Auth metadata-only stable-release observation | proposed | pending |
+| [0092](0092-read-only-signed-release-cache-observation.md) | Read-only signed-release cache observation | proposed | pending |
+| [0093](0093-setup-owned-dev-auth-update-transitions.md) | Setup-owned Dev Auth update transitions | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

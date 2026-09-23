@@ -941,6 +941,7 @@ dependencies = [
  "dev-tools-reconcile-protocol",
  "dev-tools-release",
  "dev-tools-secret",
+ "dev-tools-update",
  "directories",
  "ed25519-dalek",
  "fs2",

@@ -1574,6 +1574,53 @@ pub fn load_cached_release(
     load_cached_release_unlocked(cache_root, authority, version, owner_uid)
 }
 
+/// Observe a completed immutable cache entry without creating a directory,
+/// lock, or recovery state. An entry without its receipt is still preparation
+/// in progress and is not an available artifact. A present receipt requires
+/// full signed-byte and custody verification; a concurrent writer may cause
+/// a transient observation error, never installation authority.
+pub fn observe_cached_release(
+    cache_root: &Path,
+    authority: &ReleaseAuthority,
+    version: &Version,
+    owner_uid: u32,
+) -> Result<Option<CachedRelease>> {
+    if !cache_root.is_absolute() {
+        bail!("verified release cache root must be absolute");
+    }
+    let root = match fs::symlink_metadata(cache_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect release cache root"),
+    };
+    if !root.file_type().is_dir() {
+        bail!("verified release cache root is not a directory");
+    }
+    #[cfg(unix)]
+    if root.uid() != owner_uid || root.mode() & 0o022 != 0 {
+        bail!("verified release cache root has unsafe filesystem authority");
+    }
+    let directory = cache_directory(cache_root, &authority.product, version, &authority.target);
+    let entry = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect release cache entry"),
+    };
+    if !entry.file_type().is_dir() {
+        bail!("verified release cache entry is not a directory");
+    }
+    #[cfg(unix)]
+    if entry.uid() != owner_uid || entry.mode() & 0o777 != 0o700 {
+        bail!("verified release cache entry has unsafe filesystem authority");
+    }
+    match fs::symlink_metadata(directory.join("receipt.json")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect release cache receipt"),
+    }
+    load_cached_release_unlocked(cache_root, authority, version, owner_uid).map(Some)
+}
+
 fn load_cached_release_unlocked(
     cache_root: &Path,
     authority: &ReleaseAuthority,

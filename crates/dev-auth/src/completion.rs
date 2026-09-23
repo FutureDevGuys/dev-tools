@@ -193,6 +193,14 @@ fn specification() -> Command {
             "powershell",
         ])))
         .subcommand(setup())
+        .subcommand(
+            command("update")
+                .subcommand(command("status").arg(flag("json")))
+                .subcommand(command("check").arg(flag("json")))
+                .subcommand(command("install").args([flag("json"), flag("offline")]))
+                .subcommand(command("apply").args([flag("json"), flag("offline")]))
+                .subcommand(command("rollback").arg(flag("json"))),
+        )
         .subcommand(crate::doctor::specification())
         .subcommand(crate::secret_cli::specification())
         .subcommand(crate::privilege_cli::specification())
