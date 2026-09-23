@@ -58,7 +58,8 @@ case ${1:-} in
         [[ ! -e "$storage_base" && ! -L "$storage_base" ]]
         mkdir -m 0700 -- "$storage_base"
         install -d -m 0700 "$storage_base/storage" "$fixture/runtime"
-        runtime=(/usr/bin/podman --root "$storage_base/storage" --runroot "$fixture/runtime" --storage-driver vfs --cgroup-manager cgroupfs)
+        cgroup_manager=cgroupfs
+        runtime=(/usr/bin/podman --root "$storage_base/storage" --runroot "$fixture/runtime" --storage-driver vfs --cgroup-manager "$cgroup_manager")
         container=''
         removed=false
         prepared=false
@@ -106,7 +107,7 @@ case ${1:-} in
                 fi
                 if "${runtime[@]}" rm --force --time 5 "$container"; then removed=true; else code=1; fi
             fi
-            jq -n --argjson code "$code" --argjson prepared "$prepared" --argjson removed "$removed" --argjson privilege_setup "$privilege_setup" --arg scenario "$scenario" --arg storage "$storage_base" --arg phase "$phase" '{schema:"dev-auth-installed-launch-run-v1",exit_code:$code,phase:$phase,scenario:$scenario,prepared:$prepared,container_removed:$removed,image_storage:$storage,signed_release:false,privilege_setup_receipted:$privilege_setup}' >"$fixture/result.json"
+            jq -n --argjson code "$code" --argjson prepared "$prepared" --argjson removed "$removed" --argjson privilege_setup "$privilege_setup" --arg scenario "$scenario" --arg storage "$storage_base" --arg phase "$phase" --arg cgroup_manager "$cgroup_manager" '{schema:"dev-auth-installed-launch-run-v1",exit_code:$code,phase:$phase,scenario:$scenario,cgroup_manager:$cgroup_manager,prepared:$prepared,container_removed:$removed,image_storage:$storage,signed_release:false,privilege_setup_receipted:$privilege_setup}' >"$fixture/result.json"
             chmod 0644 "$fixture/result.json"
             printf 'Installed launch result: %s/result.json\n' "$fixture"
             exit "$code"
@@ -144,6 +145,10 @@ case ${1:-} in
         done
         if [[ "$scenario" == launch-grant || "$scenario" == login-session-probe ]] && ! logged "${runtime[@]}" exec "$container" /usr/bin/jq --version; then
             printf '%s\n' 'Fixture image lacks native jq required by installed-user.sh' >&2
+            exit 1
+        fi
+        if [[ "$scenario" == launch-grant || "$scenario" == login-session-probe ]] && ! logged "${runtime[@]}" exec "$container" /usr/bin/test -f /usr/lib64/security/pam_systemd.so; then
+            printf '%s\n' 'Fixture image lacks Fedora systemd-pam required for logind session registration' >&2
             exit 1
         fi
         if [[ "$scenario" == tty-probe ]]; then
