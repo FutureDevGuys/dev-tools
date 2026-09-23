@@ -31,6 +31,7 @@ const SESSION_LEASE_SECONDS: i64 = 15 * 60;
 const SESSION_RENEW_SECONDS: u64 = 5;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ENVIRONMENT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINATION_MAGIC: &[u8; 4] = b"DAT1";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -88,11 +89,18 @@ struct GatedChildRequest<'a> {
     environment: BTreeMap<OsString, OsString>,
     sandbox: Option<SandboxLaunch>,
     identity_already_set: bool,
+    startup_proof: bool,
 }
 
 struct GatedChild {
     child: Child,
     release: OwnedFd,
+    startup: Option<OwnedFd>,
+}
+
+pub struct SupervisorChildDescriptors {
+    pub gate: RawFd,
+    pub startup: Option<RawFd>,
 }
 
 struct AgentProxyProcess {
@@ -1182,16 +1190,26 @@ impl PendingLaunchGrant {
     fn commit(&mut self) {
         self.0 = None;
     }
+
+    fn revoke(&mut self) -> Result<()> {
+        let Some(grant) = self.0.as_ref() else {
+            return Ok(());
+        };
+        let result = crate::privilege::control(crate::privilege::ControlRequest::Revoke {
+            grant: grant.clone(),
+        });
+        if result.exit_code() != 0 || result.error_kind.is_some() {
+            bail!("new administrator grant could not be revoked after failed launch");
+        }
+        self.0 = None;
+        Ok(())
+    }
 }
 
 impl Drop for PendingLaunchGrant {
     fn drop(&mut self) {
-        if let Some(grant) = self.0.take() {
-            let result =
-                crate::privilege::control(crate::privilege::ControlRequest::Revoke { grant });
-            if result.error_kind.is_some() {
-                eprintln!("dev-auth: failed launch grant cleanup needs operator inspection");
-            }
+        if self.revoke().is_err() {
+            eprintln!("dev-auth: failed launch grant cleanup needs operator inspection");
         }
     }
 }
@@ -1625,6 +1643,9 @@ pub fn run_root_supervisor(
         .context("retain the authenticated workload dispatcher identity")?;
     let cgroup = crate::linux_admission::current_workload_cgroup(session_id)?;
     let sandbox = select_sandbox_launch(&policy, workload)?;
+    if privilege.is_some() && sandbox.is_some() {
+        bail!("administrator launch startup proof does not support a sandbox adapter");
+    }
     let executable = fs::canonicalize(std::env::current_exe()?)
         .context("resolve installed strong workload tool-plane executable")?;
     let runtime = strong_workload_runtime_directory(session_id)?;
@@ -1666,7 +1687,9 @@ pub fn run_root_supervisor(
     ) {
         Ok(proxies) => proxies,
         Err(error) => {
+            let grant_cleanup = launch_grant.revoke();
             let _ = end_active_session(session_id);
+            grant_cleanup?;
             return Err(error).context("start strong workload capability frontends");
         }
     };
@@ -1683,24 +1706,46 @@ pub fn run_root_supervisor(
         environment,
         sandbox,
         identity_already_set: true,
+        startup_proof: privilege.is_some(),
     });
     let mut gated = match gated {
         Ok(gated) => gated,
         Err(error) => {
+            let grant_cleanup = launch_grant.revoke();
             stop_agent_proxies(&mut agent_proxies);
             let _ = end_active_session(session_id);
+            grant_cleanup?;
             return Err(error);
         }
     };
-    if let Err(error) = nix::unistd::write(&gated.release, &[1]) {
+    let release = nix::unistd::write(&gated.release, &[1]).and_then(|written| {
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(nix::errno::Errno::EIO)
+        }
+    });
+    if let Err(error) = release {
         let _ = gated.child.kill();
         let _ = gated.child.wait();
+        let grant_cleanup = launch_grant.revoke();
         stop_agent_proxies(&mut agent_proxies);
         let _ = end_active_session(session_id);
+        grant_cleanup?;
         return Err(error).context("release the admitted workload process");
     }
     drop(gated.release);
-
+    if let Some(startup) = gated.startup.take() {
+        if let Err(error) = await_startup_proof(&mut gated.child, &startup, &executable) {
+            let _ = gated.child.kill();
+            let _ = gated.child.wait();
+            let grant_cleanup = launch_grant.revoke();
+            stop_agent_proxies(&mut agent_proxies);
+            let _ = end_active_session(session_id);
+            grant_cleanup?;
+            return Err(error).context("configured workload did not start after approval");
+        }
+    }
     launch_grant.commit();
 
     let result = supervise_active_child(
@@ -1726,12 +1771,21 @@ pub fn run_supervisor_child(
     expected_cgroup: &Path,
     launcher: &Path,
     sandbox: Option<&SandboxLaunch>,
-    gate_fd: RawFd,
+    descriptors: SupervisorChildDescriptors,
     arguments: &[OsString],
 ) -> Result<()> {
+    let mut startup = match descriptors.startup {
+        Some(fd) if fd >= 3 && fd != descriptors.gate => {
+            // SAFETY: the root supervisor passed one inherited pipe descriptor
+            // to this private child and does not take ownership of it again.
+            Some(unsafe { File::from_raw_fd(fd) })
+        }
+        Some(_) => bail!("supervisor child startup descriptor is invalid"),
+        None => None,
+    };
     validate_identifier(session_id, "session identifier")?;
     validate_root_owned_launcher(launcher)?;
-    wait_for_admission_gate(gate_fd)?;
+    wait_for_admission_gate(descriptors.gate)?;
     let claim = crate::linux_admission::local_session_claim()?;
     let expected_marker = format!("strong:{}", expected_cgroup.display());
     if claim
@@ -1755,6 +1809,9 @@ pub fn run_supervisor_child(
         }
     }
     if let Some(sandbox) = sandbox {
+        if startup.is_some() {
+            bail!("administrator launch startup proof does not support a sandbox adapter");
+        }
         validate_root_owned_launcher(&sandbox.executable)?;
         let executable = fs::canonicalize(std::env::current_exe()?)
             .context("resolve the sandbox probe executable")?;
@@ -1772,7 +1829,22 @@ pub fn run_supervisor_child(
             .exec();
         return Err(error).context("replace supervisor gate with the sandbox adapter");
     }
-    let error = Command::new(launcher).args(arguments).exec();
+    let mut command = Command::new(launcher);
+    command.args(arguments);
+    if let Some(writer) = startup.as_mut() {
+        nix::fcntl::fcntl(
+            &*writer,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .context("arm configured launcher startup proof")?;
+        writer
+            .write_all(&[1])
+            .context("announce configured launcher exec attempt")?;
+    }
+    let error = command.exec();
+    if let Some(writer) = startup.as_mut() {
+        let _ = writer.write_all(&[2]);
+    }
     Err(error).context("replace supervisor gate with the configured workload launcher")
 }
 
@@ -2349,6 +2421,22 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         nix::unistd::pipe().context("create workload admission gate")?;
     let gate_read_fd = gate_reader.as_raw_fd();
     let gate_write_fd = gate_writer.as_raw_fd();
+    let (startup_reader, startup_writer) = if request.startup_proof {
+        let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("create workload startup proof")?;
+        // The first exec enters our own supervisor-child. It must retain this
+        // writer until the final configured launcher exec closes it.
+        nix::fcntl::fcntl(
+            &writer,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .context("retain workload startup proof across supervisor exec")?;
+        (Some(reader), Some(writer))
+    } else {
+        (None, None)
+    };
+    let startup_read_fd = startup_reader.as_ref().map(AsRawFd::as_raw_fd);
+    let startup_write_fd = startup_writer.as_ref().map(AsRawFd::as_raw_fd);
     nix::fcntl::fcntl(
         &gate_reader,
         nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
@@ -2379,9 +2467,11 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
             .arg(sandbox.arguments.len().to_string())
             .args(&sandbox.arguments);
     }
+    command.arg("--gate-fd").arg(gate_read_fd.to_string());
+    if let Some(fd) = startup_write_fd {
+        command.arg("--startup-fd").arg(fd.to_string());
+    }
     command
-        .arg("--gate-fd")
-        .arg(gate_read_fd.to_string())
         .arg("--")
         .args(request.arguments)
         .current_dir(request.cwd)
@@ -2397,6 +2487,9 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         unsafe {
             command.pre_exec(move || {
                 nix::libc::close(gate_write_fd);
+                if let Some(fd) = startup_read_fd {
+                    nix::libc::close(fd);
+                }
                 Ok(())
             });
         }
@@ -2408,6 +2501,9 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         unsafe {
             command.pre_exec(move || {
                 nix::libc::close(gate_write_fd);
+                if let Some(fd) = startup_read_fd {
+                    nix::libc::close(fd);
+                }
                 nix::unistd::setgroups(&groups).map_err(std::io::Error::from)?;
                 nix::unistd::setgid(owner_gid).map_err(std::io::Error::from)?;
                 nix::unistd::setuid(owner_uid).map_err(std::io::Error::from)?;
@@ -2417,10 +2513,79 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
     }
     let child = command.spawn().context("start gated workload process")?;
     drop(gate_reader);
+    drop(startup_writer);
     Ok(GatedChild {
         child,
         release: gate_writer,
+        startup: startup_reader,
     })
+}
+
+/// A private child announces its final exec attempt, then its close-on-exec
+/// writer closes only after that exec succeeds. Any explicit failure byte,
+/// missing announcement, abnormal early exit, or timeout keeps the new grant
+/// pending so the caller can revoke it before ending the workload session.
+fn await_startup_proof(
+    child: &mut Child,
+    reader: &OwnedFd,
+    supervisor_executable: &Path,
+) -> Result<()> {
+    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
+    let mut announced = false;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("configured workload startup proof timed out");
+        }
+        let mut descriptors = [PollFd::new(
+            reader.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        poll(&mut descriptors, PollTimeout::from(20_u16))
+            .context("wait for configured workload startup proof")?;
+        let events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+        if events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+            bail!("configured workload startup proof pipe failed");
+        }
+        if !events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+            continue;
+        }
+        let mut bytes = [0_u8; 2];
+        match nix::unistd::read(reader, &mut bytes) {
+            Ok(0) if announced => {
+                let observation_deadline = Instant::now() + Duration::from_millis(100);
+                loop {
+                    if child
+                        .try_wait()
+                        .context("observe configured workload startup")?
+                        .is_some()
+                    {
+                        bail!("configured workload ended before startup could be established");
+                    }
+                    let observed = fs::read_link(format!("/proc/{}/exe", child.id()))
+                        .context("observe retained configured workload executable")?;
+                    if observed != supervisor_executable {
+                        return Ok(());
+                    }
+                    if Instant::now() >= observation_deadline {
+                        bail!("configured workload has not replaced its supervisor executable");
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(0) => bail!("configured workload did not announce its final exec"),
+            Ok(length) => {
+                for byte in &bytes[..length] {
+                    if !announced && *byte == 1 {
+                        announced = true;
+                    } else {
+                        bail!("configured workload reported an unsuccessful final exec");
+                    }
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(error).context("read configured workload startup proof"),
+        }
+    }
 }
 
 fn sandboxed_workload_arguments(request: &SandboxedWorkloadRequest<'_>) -> Result<Vec<OsString>> {
@@ -2785,6 +2950,82 @@ fn validate_identifier(value: &str, description: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_proof_requires_final_exec_and_rejects_failed_or_interrupted_start() {
+        use super::await_startup_proof;
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::{Command, Stdio};
+
+        if let Ok(case) = std::env::var("DEV_AUTH_STARTUP_PROOF_FIXTURE") {
+            let fd = std::env::var("DEV_AUTH_STARTUP_PROOF_FD")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            // SAFETY: the parent created and transferred this exact pipe writer
+            // for the isolated test child, which takes sole ownership here.
+            let mut writer = unsafe { File::from_raw_fd(fd) };
+            match case.as_str() {
+                "success" | "failed-exec" | "signal" => {
+                    nix::fcntl::fcntl(
+                        &writer,
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+                    )
+                    .unwrap();
+                    writer.write_all(&[1]).unwrap();
+                }
+                "missing-ready" => std::process::exit(2),
+                _ => unreachable!(),
+            }
+            if case == "signal" {
+                nix::sys::signal::raise(nix::sys::signal::Signal::SIGKILL).unwrap();
+                unreachable!();
+            }
+            let target = if case == "success" {
+                "/usr/bin/sleep"
+            } else {
+                "/dev/null"
+            };
+            let mut command = Command::new(target);
+            if case == "success" {
+                command.arg("1");
+            }
+            let _ = command.exec();
+            let _ = writer.write_all(&[2]);
+            std::process::exit(2);
+        }
+
+        for case in ["success", "failed-exec", "missing-ready", "signal"] {
+            let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+            nix::fcntl::fcntl(
+                &writer,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+            )
+            .unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::startup_proof_requires_final_exec_and_rejects_failed_or_interrupted_start",
+                ])
+                .env("DEV_AUTH_STARTUP_PROOF_FIXTURE", case)
+                .env("DEV_AUTH_STARTUP_PROOF_FD", writer.as_raw_fd().to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            drop(writer);
+            let proof = await_startup_proof(&mut child, &reader, &std::env::current_exe().unwrap());
+            assert_eq!(proof.is_ok(), case == "success", "{case}: {proof:?}");
+            let status = child.wait().unwrap();
+            if case == "signal" {
+                assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+            }
+        }
+    }
+
     #[test]
     fn only_explicit_enrollment_authority_selects_prompt_free_outer_admission() {
         use super::{outer_admission, OuterAdmission};

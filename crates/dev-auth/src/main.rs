@@ -652,7 +652,20 @@ fn run_supervisor_child_os() -> Result<i32> {
         .map_err(|_| anyhow::anyhow!("supervisor child admission gate is not UTF-8"))?
         .parse::<std::os::fd::RawFd>()
         .context("supervisor child admission gate is invalid")?;
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let next = arguments.next();
+    let (startup_fd, separator) = if next.as_deref() == Some(std::ffi::OsStr::new("--startup-fd")) {
+        let fd = arguments
+            .next()
+            .context("supervisor child startup descriptor is missing")?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("supervisor child startup descriptor is not UTF-8"))?
+            .parse::<std::os::fd::RawFd>()
+            .context("supervisor child startup descriptor is invalid")?;
+        (Some(fd), arguments.next())
+    } else {
+        (None, next)
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("supervisor child requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
@@ -662,7 +675,10 @@ fn run_supervisor_child_os() -> Result<i32> {
         &cgroup,
         &launcher,
         sandbox.as_ref(),
-        gate_fd,
+        dev_auth::supervisor::SupervisorChildDescriptors {
+            gate: gate_fd,
+            startup: startup_fd,
+        },
         &arguments,
     )?;
     bail!("supervisor child returned unexpectedly")
