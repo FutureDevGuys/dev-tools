@@ -72,6 +72,7 @@ struct TransientServiceRequest<'a> {
     tool_bin: &'a Path,
     arguments: &'a [OsString],
     duration_seconds: Option<u64>,
+    privilege: Option<&'a crate::privilege::GrantRequest>,
 }
 
 struct GatedChildRequest<'a> {
@@ -555,6 +556,19 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
             OsString::from(format!("--property=RuntimeMaxSec={seconds}s")),
         );
     }
+    if let Some(privilege) = request.privilege {
+        privilege
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid administrator launch request"))?;
+        let position = command.len() - 1;
+        command.splice(
+            position..position,
+            [
+                OsString::from("--privilege-request"),
+                OsString::from(serde_json::to_string(privilege)?),
+            ],
+        );
+    }
     command.extend_from_slice(request.arguments);
     Ok(command)
 }
@@ -929,13 +943,14 @@ fn select_sandbox_launch(
 }
 
 pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitStatus> {
-    launch_via_native_helper(workload, arguments, false)
+    launch_via_native_helper(workload, arguments, false, None)
 }
 
 fn launch_via_native_helper(
     workload: &str,
     arguments: &[OsString],
     enrolled: bool,
+    privilege: Option<&crate::privilege::GrantRequest>,
 ) -> Result<ExitStatus> {
     validate_identifier(workload, "workload")?;
     if nix::unistd::Uid::effective().is_root() {
@@ -964,9 +979,16 @@ fn launch_via_native_helper(
         .arg("--launcher-pid")
         .arg(launcher_pid)
         .arg("--environment-socket")
-        .arg(&environment_socket)
-        .arg("--")
-        .args(arguments);
+        .arg(&environment_socket);
+    if let Some(privilege) = privilege {
+        privilege
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid administrator launch request"))?;
+        command
+            .arg("--privilege-request")
+            .arg(serde_json::to_string(privilege)?);
+    }
+    command.arg("--").args(arguments);
     let mut child = command
         .spawn()
         .context("start the privileged workload dispatcher")?;
@@ -1025,15 +1047,36 @@ pub fn run_workload_alias_request(
     noninteractive: bool,
     record_result: bool,
 ) -> Result<WorkloadLaunchOutcome> {
+    run_workload_alias_request_with_grant(workload, arguments, noninteractive, record_result, None)
+}
+
+pub fn run_workload_alias_request_with_grant(
+    workload: &str,
+    arguments: &[OsString],
+    noninteractive: bool,
+    record_result: bool,
+    privilege: Option<&crate::privilege::GrantRequest>,
+) -> Result<WorkloadLaunchOutcome> {
+    if let Some(request) = privilege {
+        request
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid administrator launch request"))?;
+        if noninteractive {
+            return Ok(WorkloadLaunchOutcome::ApprovalRequired);
+        }
+    }
     let resolved = crate::setup::resolve_current_workload_alias(workload)?;
     let (_, receipt) = crate::setup::current_runtime_installation()?;
+    if privilege.is_some() && receipt.mode != crate::setup::InstallMode::Strong {
+        bail!("launch-with-grant requires the registered strong workload boundary");
+    }
     let (claim, probe) = crate::broker_client::active_claim_and_probe()?;
     match claim {
         crate::broker_protocol::LocalSessionClaim::Absent => {
             match outer_admission(receipt.mode, resolved.admission, noninteractive) {
                 OuterAdmission::ApprovalRequired => Ok(WorkloadLaunchOutcome::ApprovalRequired),
                 OuterAdmission::Enrolled if receipt.mode == crate::setup::InstallMode::Strong => {
-                    launch_via_native_helper(workload, arguments, true)
+                    launch_via_native_helper(workload, arguments, true, privilege)
                         .map(WorkloadLaunchOutcome::Exited)
                 }
                 OuterAdmission::Enrolled => match launch_user_only(
@@ -1050,7 +1093,8 @@ pub fn run_workload_alias_request(
                 OuterAdmission::Interactive
                     if receipt.mode == crate::setup::InstallMode::Strong =>
                 {
-                    launch_via_pkexec(workload, arguments).map(WorkloadLaunchOutcome::Exited)
+                    launch_via_native_helper(workload, arguments, false, privilege)
+                        .map(WorkloadLaunchOutcome::Exited)
                 }
                 OuterAdmission::Interactive => launch_user_only(
                     workload,
@@ -1080,6 +1124,7 @@ pub fn run_workload_alias_request(
                     nix::unistd::Uid::effective().as_raw(),
                 )?,
             }
+            let mut launch_grant = PendingLaunchGrant::request(privilege)?;
             if record_result {
                 let deadline = match crate::broker_client::request_active(
                     crate::broker_protocol::BrokerRequest::Probe,
@@ -1100,6 +1145,7 @@ pub fn run_workload_alias_request(
                         })
                     },
                 )?;
+                launch_grant.commit();
                 if output.cancelled {
                     bail!("nested workload authority expired");
                 }
@@ -1107,6 +1153,42 @@ pub fn run_workload_alias_request(
             }
             let error = Command::new(&resolved.launcher_path).args(arguments).exec();
             Err(error).context("replace nested workload alias with its configured launcher")
+        }
+    }
+}
+
+struct PendingLaunchGrant(Option<String>);
+
+impl PendingLaunchGrant {
+    fn request(request: Option<&crate::privilege::GrantRequest>) -> Result<Self> {
+        let Some(request) = request else {
+            return Ok(Self(None));
+        };
+        let response = crate::privilege::control(crate::privilege::ControlRequest::Request {
+            request: request.clone(),
+        });
+        if response.error_kind.is_some() {
+            bail!("native administrator approval did not complete; workload was not started");
+        }
+        let grant = response
+            .grant
+            .context("approved administrator grant is absent")?;
+        Ok(Self(Some(grant.id)))
+    }
+
+    fn commit(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PendingLaunchGrant {
+    fn drop(&mut self) {
+        if let Some(grant) = self.0.take() {
+            let result =
+                crate::privilege::control(crate::privilege::ControlRequest::Revoke { grant });
+            if result.error_kind.is_some() {
+                eprintln!("dev-auth: failed launch grant cleanup needs operator inspection");
+            }
         }
     }
 }
@@ -1295,6 +1377,7 @@ pub fn run_root_dispatcher(
     launcher_pid: u32,
     environment_socket: &Path,
     arguments: &[OsString],
+    privilege: Option<&crate::privilege::GrantRequest>,
 ) -> Result<ExitStatus> {
     run_authorized_dispatcher(
         owner_uid,
@@ -1303,7 +1386,10 @@ pub fn run_root_dispatcher(
         launcher_pid,
         environment_socket,
         arguments,
-        false,
+        DispatcherAdmission {
+            enrolled: false,
+            privilege,
+        },
     )
 }
 
@@ -1314,6 +1400,7 @@ pub fn run_enrolled_dispatcher(
     launcher_pid: u32,
     environment_socket: &Path,
     arguments: &[OsString],
+    privilege: Option<&crate::privilege::GrantRequest>,
 ) -> Result<ExitStatus> {
     if nix::unistd::getuid().as_raw() != owner_uid || owner_uid == 0 {
         bail!("native enrolled launcher caller does not match workload owner");
@@ -1325,8 +1412,21 @@ pub fn run_enrolled_dispatcher(
         launcher_pid,
         environment_socket,
         arguments,
-        true,
+        DispatcherAdmission {
+            enrolled: true,
+            privilege,
+        },
     )
+}
+
+struct DispatcherAdmission<'a> {
+    enrolled: bool,
+    privilege: Option<&'a crate::privilege::GrantRequest>,
+}
+
+pub struct WorkloadInvocation<'a> {
+    pub arguments: &'a [OsString],
+    pub privilege: Option<&'a crate::privilege::GrantRequest>,
 }
 
 fn run_authorized_dispatcher(
@@ -1336,8 +1436,12 @@ fn run_authorized_dispatcher(
     launcher_pid: u32,
     environment_socket: &Path,
     arguments: &[OsString],
-    enrolled: bool,
+    admission: DispatcherAdmission<'_>,
 ) -> Result<ExitStatus> {
+    let DispatcherAdmission {
+        enrolled,
+        privilege,
+    } = admission;
     if !nix::unistd::Uid::effective().is_root() {
         bail!("strong workload dispatch requires root");
     }
@@ -1404,6 +1508,7 @@ fn run_authorized_dispatcher(
         tool_bin: &tool_bin,
         arguments,
         duration_seconds: workload.duration_seconds,
+        privilege,
     }) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -1488,8 +1593,12 @@ pub fn run_root_supervisor(
     session_id: &str,
     tool_bin: &Path,
     boundary_socket: &Path,
-    arguments: &[OsString],
+    invocation: WorkloadInvocation<'_>,
 ) -> Result<ExitStatus> {
+    let WorkloadInvocation {
+        arguments,
+        privilege,
+    } = invocation;
     crate::linux_platform::IdentityUserNamespace::from_current_process()
         .context("strong workload requires a systemd identity user namespace")?;
     validate_identifier(workload_name, "workload")?;
@@ -1536,6 +1645,13 @@ pub fn run_root_supervisor(
         workload_name,
         &workload.authority_profile,
     )?;
+    let mut launch_grant = match PendingLaunchGrant::request(privilege) {
+        Ok(grant) => grant,
+        Err(error) => {
+            let _ = end_active_session(session_id);
+            return Err(error);
+        }
+    };
     let mut agent_proxies = match start_agent_proxies(
         &owner,
         session_id,
@@ -1581,6 +1697,8 @@ pub fn run_root_supervisor(
         return Err(error).context("release the admitted workload process");
     }
     drop(gated.release);
+
+    launch_grant.commit();
 
     let result = supervise_active_child(
         &mut gated.child,
@@ -3066,8 +3184,51 @@ mod tests {
     }
 
     #[test]
+    fn explicit_launch_grant_is_transported_separately_from_workload_arguments() {
+        let privilege = crate::privilege::GrantRequest {
+            scope: crate::privilege::GrantScope::Workload,
+            authority: crate::privilege::Authority::Administrator,
+            duration_seconds: 43200,
+            idle_seconds: None,
+            uses: None,
+        };
+        let payload = [
+            OsString::from("--privilege-request"),
+            OsString::from_vec(vec![b'x', 255]),
+        ];
+        let arguments = transient_service_arguments(&TransientServiceRequest {
+            duration_seconds: Some(86400),
+            privilege: Some(&privilege),
+            session_id: "0123456789abcdef0123456789abcdef",
+            owner_uid: 1000,
+            owner_gid: 1001,
+            workload: "worker",
+            cwd: Path::new("/home/example/work"),
+            boundary_socket: Path::new(
+                "/run/dev-auth/workloads/0123456789abcdef0123456789abcdef.sock",
+            ),
+            executable: Path::new("/usr/local/lib/dev-auth/versions/0.5.0/dev-auth"),
+            tool_bin: Path::new("/run/dev-auth-workload-0123456789abcdef0123456789abcdef/tool-bin"),
+            arguments: &payload,
+        })
+        .unwrap();
+        let separator = arguments.iter().rposition(|value| value == "--").unwrap();
+        assert_eq!(&arguments[separator + 1..], &payload);
+        assert_eq!(arguments[separator - 2], "--privilege-request");
+        let request: crate::privilege::GrantRequest =
+            serde_json::from_str(arguments[separator - 1].to_str().unwrap()).unwrap();
+        assert_eq!(request.scope, crate::privilege::GrantScope::Workload);
+        assert_eq!(request.duration_seconds, 43200);
+        assert_eq!(request.idle_seconds, None);
+        assert!(arguments
+            .iter()
+            .any(|value| value == "--property=PrivateUsers=full"));
+    }
+
+    #[test]
     fn transient_systemd_boundary_is_exact_and_kills_the_whole_workload_on_supervisor_exit() {
         let arguments = transient_service_arguments(&TransientServiceRequest {
+            privilege: None,
             duration_seconds: None,
             session_id: "0123456789abcdef0123456789abcdef",
             owner_uid: 1000,

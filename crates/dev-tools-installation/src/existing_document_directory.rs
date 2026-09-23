@@ -107,6 +107,22 @@ impl DocumentDirectoryPreparation {
         }
     }
 
+    /// Read raw regular-file bytes, allowing an explicitly empty file.
+    pub fn read_file(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+    ) -> Result<Option<AtomicDocument>> {
+        validate_name(name)?;
+        validate_document_authority(authority)?;
+        self.verify_observed()?;
+        if self.missing.is_empty() {
+            self.ancestor.read_file(name, authority)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Publish the admitted missing suffix and return its descriptor-bound
     /// document directory. Errors after publication can have uncertain progress;
     /// reacquire admission for a retained transaction, never adopt staging names.
@@ -344,7 +360,22 @@ impl ExistingDocumentDirectory {
         validate_name(name)?;
         validate_document_authority(authority)?;
         self.validate()?;
-        let current = self.open_document(name, authority)?;
+        let current = self.open_document(name, authority, false)?;
+        self.require_named_current(name, current.as_ref())?;
+        self.validate()?;
+        Ok(current.map(|current| current.document))
+    }
+
+    /// Read raw regular-file bytes without weakening document-only reads.
+    pub fn read_file(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+    ) -> Result<Option<AtomicDocument>> {
+        validate_name(name)?;
+        validate_document_authority(authority)?;
+        self.validate()?;
+        let current = self.open_document(name, authority, true)?;
         self.require_named_current(name, current.as_ref())?;
         self.validate()?;
         Ok(current.map(|current| current.document))
@@ -366,6 +397,7 @@ impl ExistingDocumentDirectory {
             authority,
             current_authority,
             Some(expected_current),
+            false,
         )
     }
 
@@ -379,7 +411,37 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected_current: Option<&ArtifactIdentity>,
     ) -> Result<bool> {
-        self.write_with_current_authority(name, bytes, authority, authority, expected_current)
+        self.write_with_current_authority(
+            name,
+            bytes,
+            authority,
+            authority,
+            expected_current,
+            false,
+        )
+    }
+
+    /// Publish exact regular-file bytes, including an intentional empty file.
+    pub fn write_file(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        authority: &DocumentAuthority,
+        expected: Option<&ArtifactIdentity>,
+    ) -> Result<bool> {
+        self.write_with_current_authority(name, bytes, authority, authority, expected, true)
+    }
+
+    /// Replace an admitted file while preserving explicit before/after modes.
+    pub fn replace_file(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        authority: &DocumentAuthority,
+        current: &DocumentAuthority,
+        expected: &ArtifactIdentity,
+    ) -> Result<bool> {
+        self.write_with_current_authority(name, bytes, authority, current, Some(expected), true)
     }
 
     fn write_with_current_authority(
@@ -389,6 +451,7 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         current_authority: &DocumentAuthority,
         expected_current: Option<&ArtifactIdentity>,
+        allow_empty: bool,
     ) -> Result<bool> {
         validate_name(name)?;
         validate_document_authority(authority)?;
@@ -396,11 +459,11 @@ impl ExistingDocumentDirectory {
         if authority.owner_uid != current_authority.owner_uid {
             bail!("document replacement cannot change its native owner");
         }
-        if bytes.is_empty() || bytes.len() as u64 > authority.limit {
+        if (!allow_empty && bytes.is_empty()) || bytes.len() as u64 > authority.limit {
             bail!("document publication exceeds its content bounds");
         }
         self.validate()?;
-        let current = self.open_document(name, current_authority)?;
+        let current = self.open_document(name, current_authority, allow_empty)?;
         if let Some(current) = &current {
             if current.document.bytes == bytes && authority.mode == current_authority.mode {
                 self.require_named_current(name, Some(current))?;
@@ -444,10 +507,11 @@ impl ExistingDocumentDirectory {
             .sync_all()
             .context("sync held document data and metadata")?;
         temporary.file.rewind()?;
-        let staged = read_atomic_document_file(
+        let staged = read_atomic_file_content(
             temporary.file.try_clone()?,
             &self.path.join(&temporary.name),
             authority,
+            allow_empty,
         )?;
         if staged.bytes != bytes {
             bail!("held document staging bytes changed");
@@ -473,7 +537,7 @@ impl ExistingDocumentDirectory {
         rustix::fs::fsync(&self.directory).context("sync published held document parent")?;
         self.validate()?;
         let published = self
-            .open_document(name, authority)?
+            .open_document(name, authority, allow_empty)?
             .context("published document disappeared")?;
         if published.document.bytes != bytes {
             bail!("published held document changed before acknowledgement");
@@ -490,9 +554,29 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected: &ArtifactIdentity,
     ) -> Result<bool> {
+        self.remove_content(name, authority, expected, false)
+    }
+
+    /// Remove exact owned file content, including the empty-file identity.
+    pub fn remove_file(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+        expected: &ArtifactIdentity,
+    ) -> Result<bool> {
+        self.remove_content(name, authority, expected, true)
+    }
+
+    fn remove_content(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+        expected: &ArtifactIdentity,
+        allow_empty: bool,
+    ) -> Result<bool> {
         validate_name(name)?;
         validate_document_authority(authority)?;
-        if expected.length == 0
+        if (!allow_empty && expected.length == 0)
             || expected.length > authority.limit
             || expected.sha256.len() != 64
             || !expected
@@ -503,7 +587,7 @@ impl ExistingDocumentDirectory {
             bail!("held document removal identity is invalid");
         }
         self.validate()?;
-        let current = self.open_document(name, authority)?;
+        let current = self.open_document(name, authority, allow_empty)?;
         if let Some(current) = &current {
             if current.document.identity != *expected {
                 bail!("held document removal does not match expected content");
@@ -538,6 +622,7 @@ impl ExistingDocumentDirectory {
         &self,
         name: &OsStr,
         authority: &DocumentAuthority,
+        allow_empty: bool,
     ) -> Result<Option<OpenedDocument>> {
         let file = match rustix::fs::openat(
             &self.directory,
@@ -555,8 +640,12 @@ impl ExistingDocumentDirectory {
         if metadata.mode() & 0o7777 != authority.mode {
             bail!("held document has unexpected permission bits");
         }
-        let document =
-            read_atomic_document_file(file.try_clone()?, &self.path.join(name), authority)?;
+        let document = read_atomic_file_content(
+            file.try_clone()?,
+            &self.path.join(name),
+            authority,
+            allow_empty,
+        )?;
         require_named_file(&self.directory, name, &metadata)?;
         Ok(Some(OpenedDocument {
             file,

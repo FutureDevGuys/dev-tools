@@ -355,6 +355,7 @@ pub(super) mod tests {
             schema: "dev-auth-setup-plan-v2".into(),
             paths: crate::setup::SetupPaths::strong(),
             request: crate::setup::InstallRequest {
+                purpose: Default::default(),
                 mode: crate::setup::InstallMode::Strong,
                 version: "0.4.0".into(),
                 source_executable: "/fixture/candidate".into(),
@@ -367,12 +368,14 @@ pub(super) mod tests {
             verified_release: None,
         };
         let intent = DeploymentIntent {
+            purpose: Default::default(),
             schema: "dev-auth-deployment-v1".into(),
             mode: DeploymentMode::Strong,
             channel: crate::deployment::Channel::Stable,
             offline: true,
             activation: Activation::Inactive,
             administrator_policy: "/fixture/policy".into(),
+            privilege_policy: None,
             users: Vec::new(),
             credentials: Vec::new(),
         };
@@ -439,6 +442,9 @@ pub(super) mod tests {
             schema: "dev-auth-retained-setup-generation-v1".into(),
             plan_sha256: String::new(),
             plan: SetupPlanV3 {
+                privilege_previous_block: None,
+                privilege_current_state: None,
+                privilege_payload: Default::default(),
                 schema: "dev-auth-setup-plan-v3".into(),
                 authority_schema: authority_schema.map(str::to_owned),
                 intent,

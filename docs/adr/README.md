@@ -90,6 +90,11 @@ Read the applicable records before changing a public product contract or cross-p
 | [0083](0083-conditional-document-directory-preparation.md) | Conditional document-directory preparation | proposed | pending |
 | [0084](0084-native-setup-exclusion-across-broker-and-maintenance.md) | Native setup exclusion across broker and maintenance | proposed | pending |
 | [0085](0085-linux-workload-lifecycle-and-public-restoration.md) | Linux workload lifecycle and public restoration | proposed | pending |
+| [0086](0086-native-administrator-grants-and-separate-execution-ownership.md) | Native administrator grants and separate execution ownership | proposed | pending |
+| [0087](0087-versioned-user-configuration-reconciliation.md) | Versioned user-configuration reconciliation | proposed | pending |
+| [0088](0088-approved-command-graphs-in-owned-execution.md) | Approved command graphs in owned execution | proposed | pending |
+| [0089](0089-privilege-component-in-retained-setup.md) | Privilege component in retained setup | proposed | pending |
+| [0090](0090-explicit-empty-file-custody.md) | Explicit empty-file custody | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

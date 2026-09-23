@@ -17,6 +17,19 @@ pub(super) fn specification() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("privilege-scope")
+                .long("privilege-scope")
+                .value_parser(["user", "workload"])
+                .requires("privilege-duration")
+                .help("Request fresh administrator approval in this scope before starting the workload"),
+        )
+        .arg(
+            Arg::new("privilege-duration")
+                .long("privilege-duration")
+                .requires("privilege-scope")
+                .help("Explicit finite administrator-grant duration, for example 30m or 12h"),
+        )
+        .arg(
             Arg::new("result-file")
                 .long("result-file")
                 .help("Write a separate value-free execution result to a new private file")
@@ -73,6 +86,29 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         eprintln!("dev-auth: invalid workload name");
         return Ok(2);
     }
+    let privilege = match parsed.get_one::<String>("privilege-scope") {
+        Some(scope) => {
+            let duration = parsed
+                .get_one::<String>("privilege-duration")
+                .and_then(|value| dev_auth::privilege::parse_duration(value).ok());
+            let Some(duration) = duration else {
+                eprintln!("dev-auth: invalid administrator launch duration");
+                return Ok(2);
+            };
+            Some(dev_auth::privilege::GrantRequest {
+                scope: if scope == "workload" {
+                    dev_auth::privilege::GrantScope::Workload
+                } else {
+                    dev_auth::privilege::GrantScope::User
+                },
+                authority: dev_auth::privilege::Authority::Administrator,
+                duration_seconds: duration.as_secs(),
+                idle_seconds: None,
+                uses: None,
+            })
+        }
+        None => None,
+    };
     let destination = parsed.get_one::<OsString>("result-file");
     let result_sink = match destination
         .map(|path| ResultDestination::reserve(Path::new(path)))
@@ -95,6 +131,7 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         &arguments,
         parsed.get_flag("non-interactive"),
         result_sink,
+        privilege.as_ref(),
     )
 }
 
@@ -122,18 +159,26 @@ fn execute(
     arguments: &[OsString],
     noninteractive: bool,
     sink: Option<ResultDestination>,
+    privilege: Option<&dev_auth::privilege::GrantRequest>,
 ) -> anyhow::Result<i32> {
+    if noninteractive && privilege.is_some() {
+        return finish(
+            ExecutionResult::launch("approval_required", Some(false), 3).error("approval_required"),
+            sink,
+        );
+    }
     if !dev_auth::setup::running_executable_has_version_layout()? {
         return finish(
             ExecutionResult::launch("requires_setup", Some(false), 3).error("requires_setup"),
             sink,
         );
     }
-    let outcome = dev_auth::supervisor::run_workload_alias_request(
+    let outcome = dev_auth::supervisor::run_workload_alias_request_with_grant(
         name,
         arguments,
         noninteractive,
         sink.is_some(),
+        privilege,
     );
     finish_native_outcome(outcome, sink)
 }
@@ -188,6 +233,7 @@ fn execute(
     _arguments: &[OsString],
     _noninteractive: bool,
     sink: Option<ResultDestination>,
+    _privilege: Option<&dev_auth::privilege::GrantRequest>,
 ) -> anyhow::Result<i32> {
     finish(
         ExecutionResult::launch("unsupported", Some(false), 3).error("unsupported"),

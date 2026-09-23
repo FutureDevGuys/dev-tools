@@ -172,12 +172,28 @@ pub(super) fn finish(file: fs::File, limit: usize) -> Result<CaptureBuffer, Boun
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn kernel_caps_public_file_without_a_running_supervisor() {
         let mut command = Command::new("/usr/bin/head");
         command.env_clear().args(["-c", "1048576", "/dev/zero"]);
         let file = configure(&mut command, 1024).unwrap();
+        // Ignoring SIGXFSZ makes head observe EFBIG from the kernel instead of
+        // entering the host core pipeline, which can defer reaping and launch
+        // crash UI. RLIMIT_CORE=0 does not disable piped core handlers, and exec
+        // resets dumpability. Ignored signal dispositions survive native exec.
+        // This changes only the fixture child, never production capture policy.
+        // SAFETY: this child-only callback sets a constant ignored disposition
+        // with async-signal-safe signal(); it neither allocates nor locks.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         // Deliberately do not run the monitor: this must be a kernel bound,
         // not an observation that only happens to catch a fast writer in time.
         let mut child = command.spawn().unwrap();
@@ -187,6 +203,15 @@ mod tests {
             child.wait().unwrap();
         }
         assert!(completed.is_some(), "finite writer did not terminate");
+        let status = completed.unwrap();
+        assert!(
+            !status.success(),
+            "the writer must observe the kernel limit"
+        );
+        assert!(
+            !status.core_dumped(),
+            "the kernel-bound fixture must not invoke host crash reporting"
+        );
         assert_eq!(file.metadata().unwrap().len(), 1025);
         assert_eq!(
             check_size(&file, 1024).unwrap_err().kind(),

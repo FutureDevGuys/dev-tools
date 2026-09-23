@@ -28,6 +28,10 @@ enum Unit {
 
 const UNITS: [Unit; 3] = [Unit::PublicSocket, Unit::ControlSocket, Unit::Broker];
 
+pub(super) fn require_privilege_domain_empty() -> Result<()> {
+    cgroup::require_privilege_empty()
+}
+
 impl Unit {
     fn name(self) -> &'static str {
         match self {

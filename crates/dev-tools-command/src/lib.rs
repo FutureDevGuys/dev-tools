@@ -3,6 +3,11 @@
 mod inherited;
 pub use inherited::{run_prepared_inherited_command, InheritedCommandOutput};
 
+#[cfg(unix)]
+mod graph;
+#[cfg(unix)]
+pub use graph::{run_command_graph, GraphFailure, GraphOutput};
+
 #[cfg(target_os = "linux")]
 mod public_file_stdout;
 #[cfg(target_os = "linux")]

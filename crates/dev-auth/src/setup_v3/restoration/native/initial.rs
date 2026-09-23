@@ -97,6 +97,7 @@ fn initial_strong_generation_case(partial: bool) {
         schema: "dev-auth-setup-plan-v2".into(),
         paths: paths.clone(),
         request: crate::setup::InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::Strong,
             version: "0.4.0".into(),
             source_executable: source.clone(),
@@ -125,12 +126,14 @@ fn initial_strong_generation_case(partial: bool) {
         }),
     };
     let intent = DeploymentIntent {
+        purpose: Default::default(),
         schema: "dev-auth-deployment-intent-v1".into(),
         mode: DeploymentMode::Strong,
         channel: crate::deployment::Channel::Stable,
         offline: true,
         activation: Activation::Inactive,
         administrator_policy: source_policy.clone(),
+        privilege_policy: None,
         users: vec![crate::deployment::DeploymentUser {
             name: account.name.clone(),
             config: source_config.clone(),
@@ -150,6 +153,9 @@ fn initial_strong_generation_case(partial: bool) {
         .iter()
         .all(|current| current.identity.is_none()));
     let plan = SetupPlanV3 {
+        privilege_previous_block: None,
+        privilege_current_state: None,
+        privilege_payload: Default::default(),
         schema: "dev-auth-setup-plan-v3".into(),
         authority_schema: Some("dev-auth-administrator-policy-v3".into()),
         intent_sha256: sha256_hex(&canonical_deployment_intent(&intent).unwrap()),
@@ -203,6 +209,7 @@ fn initial_strong_generation_case(partial: bool) {
     )
     .unwrap();
     let candidate = InstallReceipt {
+        purpose: Default::default(),
         schema: "dev-auth-install-v2".into(),
         mode: InstallMode::Strong,
         version: "0.4.0".into(),

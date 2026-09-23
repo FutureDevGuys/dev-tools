@@ -8,32 +8,74 @@ use std::os::unix::fs::PermissionsExt;
 #[test]
 #[ignore = "requires an owned disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_initial_staged_recovery() {
-    exercise(true, false);
+    exercise(true, Scenario::Empty);
 }
 
 #[test]
 #[ignore = "requires an owned disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_initial_unstaged_recovery() {
-    exercise(false, false);
+    exercise(false, Scenario::Empty);
 }
 
 #[test]
 #[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_enrolled_workload() {
-    exercise(false, true);
+    exercise(false, Scenario::Workload);
 }
 
+mod combined;
+mod privilege_launch;
 mod signed;
 mod workload;
 
+#[test]
+#[ignore = "prepares an interactive privilege fixture in an owned rootful disposable systemd container; never run on the host"]
+fn native_disposable_prepare_installed_launch_with_grant() {
+    exercise(false, Scenario::PrivilegeLaunch);
+}
+
+#[test]
+#[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
+fn native_disposable_combined_credential_privilege_upgrade() {
+    exercise(false, Scenario::Combined);
+}
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    Empty,
+    Workload,
+    PrivilegeLaunch,
+    Combined,
+}
+
 fn command(executable: &Path, arguments: &[&str]) -> dev_tools_command::BoundedCommandOutput {
     eprintln!("fixture command: {} {arguments:?}", executable.display());
+    // The interactive fixture's preparer runs before any real password input.
+    // Trace only process/file/locking syscalls around fixed recovery, excluding
+    // read/write payloads, to distinguish native waits from custody hashing.
+    let trace_recovery = std::env::var("DEV_AUTH_NATIVE_TRACE_SETUP").as_deref() == Ok("1")
+        && arguments.starts_with(&["setup", "recover"]);
+    let mut native_arguments = Vec::new();
+    let selected = if trace_recovery {
+        native_arguments.extend([
+            "-qq".into(),
+            "-f".into(),
+            "-ttt".into(),
+            "-T".into(),
+            "-o".into(),
+            "/fixture/setup-recovery.trace".into(),
+            "-e".into(),
+            "trace=%process,%file,flock,poll,ppoll,futex,fsync,fdatasync".into(),
+            executable.as_os_str().to_owned(),
+        ]);
+        Path::new("/usr/bin/strace")
+    } else {
+        executable
+    };
+    native_arguments.extend(arguments.iter().map(std::ffi::OsString::from));
     dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
-        executable,
-        arguments: &arguments
-            .iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>(),
+        executable: selected,
+        arguments: &native_arguments,
         environment: &BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: Some(Path::new("/")),
         timeout: std::time::Duration::from_secs(90),
@@ -65,7 +107,11 @@ fn recover(executable: &Path) -> SetupRecoveryReportV1 {
     report
 }
 
-fn exercise(staged: bool, with_workload: bool) {
+fn exercise(staged: bool, scenario: Scenario) {
+    let with_workload = matches!(
+        scenario,
+        Scenario::Workload | Scenario::PrivilegeLaunch | Scenario::Combined
+    );
     assert_eq!(
         std::env::var("DEV_AUTH_NATIVE_SYSTEMD_FIXTURE").as_deref(),
         Ok("disposable")
@@ -150,14 +196,15 @@ ssh_keygen = "/usr/bin/true"
 "#
     )
     .into_bytes();
-    let (policy, config) = if with_workload {
-        workload::prepare(&account)
-    } else {
-        (
+    let (policy, config) = match scenario {
+        Scenario::Workload => workload::prepare(&account),
+        Scenario::PrivilegeLaunch => privilege_launch::prepare(&account),
+        Scenario::Combined => workload::prepare(&account),
+        Scenario::Empty => (
             empty_policy,
             b"schema = \"dev-auth-user-config-v3\"\nworkloads = []\n[authority_profiles]\n"
                 .to_vec(),
-        )
+        ),
     };
     publish(policy_path, &policy, 0o600);
     publish(config_path, &config, 0o600);
@@ -167,6 +214,7 @@ ssh_keygen = "/usr/bin/true"
         schema: "dev-auth-setup-plan-v2".into(),
         paths: paths.clone(),
         request: crate::setup::InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::Strong,
             version: version.into(),
             source_executable: source.into(),
@@ -194,6 +242,7 @@ ssh_keygen = "/usr/bin/true"
         }),
     };
     let intent = DeploymentIntent {
+        purpose: Default::default(),
         schema: "dev-auth-deployment-intent-v1".into(),
         mode: DeploymentMode::Strong,
         channel: crate::deployment::Channel::Stable,
@@ -204,6 +253,7 @@ ssh_keygen = "/usr/bin/true"
             Activation::Inactive
         },
         administrator_policy: policy_path.into(),
+        privilege_policy: None,
         users: vec![crate::deployment::DeploymentUser {
             name: name.into(),
             config: config_path.into(),
@@ -362,8 +412,17 @@ ssh_keygen = "/usr/bin/true"
     assert!(report.verified);
     assert_eq!(report.changed, Some(false));
     assert!(report.actions.is_empty());
+    if matches!(scenario, Scenario::Combined) {
+        combined::upgrade_and_restore(&plan, &account, &policy, &config, &executable);
+        return;
+    }
     if with_workload {
-        workload::exercise(&account, &executable);
+        match scenario {
+            Scenario::PrivilegeLaunch => privilege_launch::finish_prepare(&account, &executable),
+            Scenario::Workload => workload::exercise(&account, &executable),
+            Scenario::Empty => unreachable!(),
+            Scenario::Combined => unreachable!(),
+        }
         return;
     }
     // An accepted generation cannot be replayed to repair an incomplete state.

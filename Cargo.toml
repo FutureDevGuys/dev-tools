@@ -2,6 +2,7 @@
 members = [
     "crates/artifact-update",
     "crates/dev-auth",
+    "crates/dev-auth-sudo",
     "crates/dev-cache",
     "crates/dev-tools-command",
     "crates/dev-tools-completion",

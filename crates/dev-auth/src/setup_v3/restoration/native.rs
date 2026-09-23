@@ -213,6 +213,7 @@ fn native_disposable_strong_generation_restores_inactive_and_retries() {
         old_assets.insert(path.display().to_string(), sha256_hex(&bytes));
     }
     let prior = InstallReceipt {
+        purpose: Default::default(),
         schema: "dev-auth-install-v2".into(),
         mode: InstallMode::Strong,
         version: request.version.clone(),
@@ -348,6 +349,7 @@ fn native_disposable_strong_generation_restores_inactive_and_retries() {
         schema: "dev-auth-setup-plan-v2".into(),
         paths: paths.clone(),
         request: crate::setup::InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::Strong,
             version: request.version.clone(),
             source_executable: candidate_source.clone(),
@@ -375,12 +377,14 @@ fn native_disposable_strong_generation_restores_inactive_and_retries() {
         }),
     };
     let intent = DeploymentIntent {
+        purpose: Default::default(),
         schema: "dev-auth-deployment-intent-v1".into(),
         mode: DeploymentMode::Strong,
         channel: crate::deployment::Channel::Stable,
         offline: true,
         activation: Activation::Inactive,
         administrator_policy: source_policy.clone(),
+        privilege_policy: None,
         users: vec![crate::deployment::DeploymentUser {
             name: accounts[0].name.clone(),
             config: source_config.clone(),
@@ -397,6 +401,9 @@ fn native_disposable_strong_generation_restores_inactive_and_retries() {
     )
     .unwrap();
     let plan = SetupPlanV3 {
+        privilege_previous_block: None,
+        privilege_current_state: None,
+        privilege_payload: Default::default(),
         schema: "dev-auth-setup-plan-v3".into(),
         authority_schema: Some("dev-auth-administrator-policy-v3".into()),
         intent_sha256: sha256_hex(&canonical_deployment_intent(&intent).unwrap()),

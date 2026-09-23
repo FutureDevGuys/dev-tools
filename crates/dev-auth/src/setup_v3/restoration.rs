@@ -329,10 +329,60 @@ fn restore_owned_inner(
         Ok(())
     })?;
     let configurations = restoration_documents(&generation)?;
-    validate_prior_configuration(&generation)?;
     for document in &configurations {
         document.observe()?;
     }
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        if transition.phase == Phase::RestoredInactive {
+            for document in &configurations {
+                document.verify_restored()?;
+            }
+            privilege::verify_restored(&generation)?;
+            installation.verify_restored()?;
+            return Ok(restored_report(false));
+        }
+        progress.enter_mutation();
+        progress.next_action = "retry_setup_restoration";
+        let mut changed = crate::setup_transition::advance(
+            &paths,
+            owner,
+            &transition.plan_sha256,
+            Phase::Restoring,
+        )?;
+        progress.record_change(changed);
+        progress.next_action = "retry_privilege_file_restoration";
+        changed |= privilege::restore(&generation)?;
+        progress.record_change(changed);
+        progress.next_action = "retry_core_deactivation";
+        changed |= installation.deactivate()?;
+        progress.record_change(changed);
+        // Strong installation owns these definitions regardless of whether
+        // credential configuration is selected. Restore them only after the
+        // core services are stopped, before withdrawing their native helpers.
+        progress.next_action = "retry_core_definition_restoration";
+        for document in &configurations {
+            changed |= document.restore()?;
+            progress.record_change(changed);
+        }
+        progress.next_action = "retry_core_restoration";
+        changed |= installation.restore()?;
+        progress.record_change(changed);
+        for document in &configurations {
+            document.verify_restored()?;
+        }
+        progress.next_action = "verify_privilege_restoration";
+        privilege::verify_restored(&generation)?;
+        progress.next_action = "verify_core_restoration";
+        installation.verify_restored()?;
+        changed |= crate::setup_transition::advance(
+            &paths,
+            owner,
+            &transition.plan_sha256,
+            Phase::RestoredInactive,
+        )?;
+        return Ok(restored_report(changed));
+    }
+    validate_prior_configuration(&generation)?;
     let integration_executable = installation.integration_executable()?;
     let workload_retirements =
         integration::workload_retirements(&generation, &integration_executable)?;
@@ -347,6 +397,9 @@ fn restore_owned_inner(
         crate::setup::require_user_sessions_absent()?;
     }
     if transition.phase == Phase::RestoredInactive {
+        if plan.intent.privilege_policy.is_some() {
+            privilege::verify_restored(&generation)?;
+        }
         for retirement in &workload_retirements {
             retirement.verify_retired()?;
         }
@@ -363,6 +416,11 @@ fn restore_owned_inner(
     progress.next_action = "retry_setup_restoration";
     let mut changed =
         crate::setup_transition::advance(&paths, owner, &transition.plan_sha256, Phase::Restoring)?;
+    if plan.intent.privilege_policy.is_some() {
+        progress.next_action = "retry_privilege_file_restoration";
+        changed |= privilege::restore(&generation)?;
+        progress.record_change(changed);
+    }
     changed |= installation.deactivate()?;
     // Receipt-owned removal also handles a previous interrupted deactivation.
     // It neither reinstalls old launchers nor treats arbitrary files as owned.
@@ -376,6 +434,9 @@ fn restore_owned_inner(
         changed |= document.restore()?;
     }
     changed |= installation.restore()?;
+    if plan.intent.privilege_policy.is_some() {
+        privilege::verify_restored(&generation)?;
+    }
     for document in &configurations {
         document.verify_restored()?;
     }
@@ -619,6 +680,9 @@ fn restoration_documents(
     let plan = &generation.plan;
     if plan.intent.mode == DeploymentMode::Strong {
         let mut documents = system_asset_documents(generation)?;
+        if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+            return Ok(documents);
+        }
         for spec in configuration::strong_configuration_specs(generation)? {
             documents.push(RestorationDocument::new(
                 spec.prior,
@@ -817,6 +881,94 @@ fn validate_prior_configuration(generation: &RetainedSetupGeneration) -> Result<
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn privilege_only_restoration_includes_shared_system_definitions_without_credentials() {
+        let paths = crate::setup::SetupPaths::strong();
+        let current_paths = crate::setup::installation_current_state_paths(
+            &paths,
+            crate::setup::InstallMode::Strong,
+        )
+        .into_iter()
+        .map(|(kind, subject, path)| CurrentPathIdentity {
+            kind,
+            subject,
+            path,
+            identity: None,
+        })
+        .collect::<Vec<_>>();
+        let plan = SetupPlanV3 {
+            privilege_previous_block: None,
+            privilege_current_state: None,
+            privilege_payload: BTreeMap::new(),
+            authority_schema: Some("dev-auth-privilege-policy-v1".into()),
+            schema: "dev-auth-setup-plan-v4".into(),
+            intent: DeploymentIntent {
+                purpose: crate::deployment::SetupPurpose::PrivilegeOnly,
+                schema: "dev-auth-deployment-intent-v2".into(),
+                mode: DeploymentMode::Strong,
+                channel: crate::deployment::Channel::Stable,
+                offline: true,
+                activation: Activation::Inactive,
+                administrator_policy: "/fixture/privilege-policy.json".into(),
+                privilege_policy: None,
+                users: Vec::new(),
+                credentials: Vec::new(),
+            },
+            intent_sha256: String::new(),
+            installation: SetupPlan {
+                schema: "dev-auth-setup-binary-plan-v3".into(),
+                paths,
+                request: crate::setup::InstallRequest {
+                    purpose: crate::deployment::SetupPurpose::PrivilegeOnly,
+                    mode: crate::setup::InstallMode::Strong,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    source_executable: "/fixture/dev-auth".into(),
+                    native_git: PathBuf::new(),
+                    native_gh: PathBuf::new(),
+                    activate_transparent_launchers: false,
+                },
+                source_length: 1,
+                source_sha256: sha256_hex(b"x"),
+                verified_release: None,
+            },
+            source_documents: Vec::new(),
+            accounts: Vec::new(),
+            retiring_accounts: Vec::new(),
+            current_paths: current_paths.clone(),
+            current_credential_ready: BTreeSet::new(),
+            current_broker_state: String::new(),
+            current_state_sha256: String::new(),
+            actions: Vec::new(),
+        };
+        // Selection-only fixture: no release is admitted and no live path is
+        // mutated. The native fixture covers the public restoration workflow.
+        let generation = RetainedSetupGeneration {
+            schema: "dev-auth-retained-setup-generation-v1".into(),
+            plan_sha256: sha256_hex(&serde_jcs::to_vec(&plan).unwrap()),
+            plan,
+            documents: current_paths
+                .into_iter()
+                .map(|current| RetainedSetupObject {
+                    current,
+                    bytes: None,
+                })
+                .collect(),
+            candidate_documents: Vec::new(),
+        };
+        let documents = restoration_documents(&generation)
+            .expect("privilege-only restoration must not require credential policy or accounts");
+        assert_eq!(documents.len(), crate::setup::linux_system_assets().len());
+        for ((path, bytes, mode), document) in crate::setup::linux_system_assets()
+            .into_iter()
+            .zip(documents)
+        {
+            assert_eq!(document.prior.current.path, path);
+            assert!(document.prior.bytes.is_none());
+            assert_eq!(document.candidate, Some(bytes.as_bytes()));
+            assert_eq!(document.authority.mode, mode);
+        }
+    }
 
     #[test]
     fn initial_system_assets_require_exact_fixed_absent_approval() {

@@ -280,6 +280,31 @@ fn admit_at(lock: &Path, state: &Path, owner_uid: u32) -> Result<InstallationLoc
     Ok(lease)
 }
 
+/// Short admission leases protect privilege publication/startup, not the
+/// running grant's lifetime: setup must still be able to stop granted work.
+pub(crate) fn try_privilege_admission() -> Result<Option<InstallationLock>> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("privilege admission requires its native coordinator");
+    }
+    try_admit_at(
+        &lock_path(DeploymentMode::Strong, None)?,
+        &state_path(&SetupPaths::strong()),
+        0,
+    )
+}
+
+fn try_admit_at(lock: &Path, state: &Path, owner_uid: u32) -> Result<Option<InstallationLock>> {
+    let Some(lease) = InstallationLock::try_acquire_shared(lock)? else {
+        return Ok(None);
+    };
+    if let Some(document) = read_atomic_document(state, &authority(owner_uid))? {
+        if parse(&document.bytes)?.phase != Phase::Accepted {
+            return Ok(None);
+        }
+    }
+    Ok(Some(lease))
+}
+
 pub(crate) fn require_accepted(paths: &SetupPaths, owner_uid: u32) -> Result<()> {
     require_accepted_at(&state_path(paths), owner_uid)
 }
@@ -323,6 +348,37 @@ pub(crate) fn admit(mode: InstallMode) -> Result<InstallationLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_privilege_admission_requires_an_accepted_generation_and_excludes_its_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: temp.path().join("data"),
+            bin_dir: temp.path().join("bin"),
+        };
+        let lock = temp.path().join("setup.lock");
+        let owner = nix::unistd::geteuid().as_raw();
+        let digest = "c".repeat(64);
+        begin(&paths, owner, &digest, || Ok(b"fixed generation".to_vec())).unwrap();
+        assert!(try_admit_at(&lock, &state_path(&paths), owner)
+            .unwrap()
+            .is_none());
+        accept(&paths, owner, &digest).unwrap();
+        let lease = try_admit_at(&lock, &state_path(&paths), owner)
+            .unwrap()
+            .unwrap();
+        assert!(InstallationLock::try_acquire(&lock).unwrap().is_none());
+        drop(lease);
+        let writer = InstallationLock::try_acquire(&lock).unwrap().unwrap();
+        assert!(try_admit_at(&lock, &state_path(&paths), owner)
+            .unwrap()
+            .is_none());
+        drop(writer);
+        advance(&paths, owner, &digest, Phase::Restoring).unwrap();
+        assert!(try_admit_at(&lock, &state_path(&paths), owner)
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn phase_publication_is_digest_bound_idempotent_and_one_way() {

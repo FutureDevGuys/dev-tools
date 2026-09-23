@@ -5,6 +5,12 @@ const CGROUP2_MAGIC: u64 = 0x6367_7270;
 const LIMIT: u64 = 4096;
 const MAX_ENTRIES: usize = 16_384;
 
+pub(super) fn require_privilege_empty() -> Result<()> {
+    let root = KernelDirectory::open(Path::new(crate::linux_admission::WORKLOAD_CGROUP_ROOT))?;
+    root.require_empty(OsStr::new("dev-auth-privilege.service"))?;
+    root.validate()
+}
+
 pub(super) fn require_absence(include_broker: bool) -> Result<()> {
     let root = KernelDirectory::open(Path::new(crate::linux_admission::WORKLOAD_CGROUP_ROOT))?;
     let mut entries = rustix::fs::Dir::read_from(&root.directory)?;

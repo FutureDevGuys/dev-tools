@@ -109,6 +109,7 @@ fn setup() -> Command {
         ]))
         .subcommand(command("plan").args([
             path("deployment"),
+            choice("purpose", ["credentials", "privilege-only"]),
             mode(),
             choice("channel", ["stable"]),
             flag("offline"),
@@ -117,6 +118,7 @@ fn setup() -> Command {
             path("release-artifact"),
             choice("activation", ["transparent", "inactive"]),
             path("administrator-policy"),
+            path("privilege-policy"),
             value("user-config"),
             value("user-policy"),
             value("credential-intent"),
@@ -126,7 +128,7 @@ fn setup() -> Command {
         .subcommand(command("apply").args([
             path("plan"),
             value("sha256"),
-            choice("authorize", ["sudo"]),
+            choice("authorize", ["sudo", "polkit"]),
             value("credential-stdin"),
             value("credential-fd"),
             value("credential-file"),
@@ -193,6 +195,7 @@ fn specification() -> Command {
         .subcommand(setup())
         .subcommand(crate::doctor::specification())
         .subcommand(crate::secret_cli::specification())
+        .subcommand(crate::privilege_cli::specification())
         .subcommand(command("broker").subcommand(command("serve")))
         .subcommand(command("status").arg(flag("broker")))
         .subcommand(crate::validation_cli::specification())

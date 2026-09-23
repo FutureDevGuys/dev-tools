@@ -10,6 +10,21 @@ use std::str::FromStr;
 
 const DOCUMENT_LIMIT: usize = 1024 * 1024;
 
+/// Feature selection is independent of native root/user installation ownership.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupPurpose {
+    #[default]
+    Credentials,
+    PrivilegeOnly,
+}
+
+impl SetupPurpose {
+    pub fn is_credentials(&self) -> bool {
+        *self == Self::Credentials
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeploymentMode {
@@ -58,6 +73,8 @@ pub struct DeploymentCredential {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentDocument {
+    #[serde(default)]
+    pub purpose: SetupPurpose,
     pub schema: String,
     pub mode: DeploymentMode,
     pub channel: Channel,
@@ -65,6 +82,8 @@ pub struct DeploymentDocument {
     pub offline: bool,
     pub activation: Activation,
     pub administrator_policy: PathBuf,
+    #[serde(default)]
+    pub privilege_policy: Option<PathBuf>,
     #[serde(default)]
     pub users: Vec<DeploymentUser>,
     #[serde(default)]
@@ -73,11 +92,13 @@ pub struct DeploymentDocument {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeploymentCliInput {
+    pub purpose: Option<SetupPurpose>,
     pub mode: Option<DeploymentMode>,
     pub channel: Option<Channel>,
     pub offline: Option<bool>,
     pub activation: Option<Activation>,
     pub administrator_policy: Option<PathBuf>,
+    pub privilege_policy: Option<PathBuf>,
     pub user_configs: Vec<(String, PathBuf)>,
     pub user_policies: Vec<(String, PathBuf)>,
     pub credential_intents: Vec<(String, CredentialIntent)>,
@@ -86,14 +107,24 @@ pub struct DeploymentCliInput {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentIntent {
+    #[serde(default, skip_serializing_if = "SetupPurpose::is_credentials")]
+    pub purpose: SetupPurpose,
     pub schema: String,
     pub mode: DeploymentMode,
     pub channel: Channel,
     pub offline: bool,
     pub activation: Activation,
     pub administrator_policy: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_policy: Option<PathBuf>,
     pub users: Vec<DeploymentUser>,
     pub credentials: Vec<DeploymentCredential>,
+}
+
+impl DeploymentIntent {
+    pub fn has_privilege(&self) -> bool {
+        self.purpose == SetupPurpose::PrivilegeOnly || self.privilege_policy.is_some()
+    }
 }
 
 pub fn parse_deployment_document(input: &[u8]) -> Result<DeploymentDocument> {
@@ -151,6 +182,13 @@ pub fn normalize_deployment(
     if let Some(document) = &document {
         validate_document(document)?;
     }
+    let purpose = match (document.as_ref().map(|value| value.purpose), cli.purpose) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("setup purpose conflicts between deployment document and CLI")
+        }
+        (Some(purpose), _) | (_, Some(purpose)) => purpose,
+        (None, None) => SetupPurpose::Credentials,
+    };
     let cli_users = cli_users(&cli)?;
     let cli_credentials = unique_credentials(&cli.credential_intents, "CLI")?;
 
@@ -183,6 +221,20 @@ pub fn normalize_deployment(
         cli.administrator_policy,
         "administrator policy",
     )?;
+    let privilege_policy = match (
+        document
+            .as_ref()
+            .and_then(|value| value.privilege_policy.as_ref()),
+        cli.privilege_policy.as_ref(),
+    ) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("privilege policy conflicts between deployment document and CLI")
+        }
+        (Some(path), _) | (_, Some(path)) => {
+            Some(normalized_absolute_path(path, "privilege policy")?)
+        }
+        (None, None) => None,
+    };
 
     let mut users = document
         .as_ref()
@@ -197,14 +249,20 @@ pub fn normalize_deployment(
         .unwrap_or_default();
     merge_maps(&mut credentials, cli_credentials, "credential slot")?;
 
-    if users.is_empty() {
+    if purpose.is_credentials() && users.is_empty() {
         bail!("deployment intent must declare at least one native user");
     }
     if mode == DeploymentMode::Strong && users.values().any(|user| user.policy.is_some()) {
         bail!("strong mode does not accept per-user policy authority");
     }
     let intent = DeploymentIntent {
-        schema: "dev-auth-deployment-intent-v1".into(),
+        purpose,
+        schema: if purpose.is_credentials() && privilege_policy.is_none() {
+            "dev-auth-deployment-intent-v1"
+        } else {
+            "dev-auth-deployment-intent-v2"
+        }
+        .into(),
         mode,
         channel,
         offline,
@@ -213,6 +271,7 @@ pub fn normalize_deployment(
             &administrator_policy,
             "administrator policy",
         )?,
+        privilege_policy,
         users: users.into_values().collect(),
         credentials: credentials.into_values().collect(),
     };
@@ -341,33 +400,84 @@ fn merge_maps<T: PartialEq>(
 }
 
 fn validate_document(document: &DeploymentDocument) -> Result<()> {
-    if document.schema != "dev-auth-deployment-v1" {
+    let expected_schema =
+        if document.purpose.is_credentials() && document.privilege_policy.is_none() {
+            "dev-auth-deployment-v1"
+        } else {
+            "dev-auth-deployment-v2"
+        };
+    if document.schema != expected_schema {
         bail!("dev-auth deployment document schema is unsupported");
     }
     normalized_absolute_path(&document.administrator_policy, "administrator policy")?;
+    if let Some(path) = &document.privilege_policy {
+        normalized_absolute_path(path, "privilege policy")?;
+    }
     let users = user_map(&document.users, "deployment document")?;
-    if users.is_empty() {
+    if document.purpose.is_credentials() && users.is_empty() {
         bail!("deployment document must declare at least one native user");
     }
     if document.mode == DeploymentMode::Strong && users.values().any(|user| user.policy.is_some()) {
         bail!("strong mode does not accept per-user policy authority");
     }
     credential_map(&document.credentials, "deployment document")?;
+    validate_purpose(
+        document.purpose,
+        document.mode,
+        &document.users,
+        &document.credentials,
+        document.privilege_policy.as_deref(),
+    )?;
     Ok(())
 }
 
 fn validate_intent(intent: &DeploymentIntent) -> Result<()> {
-    if intent.schema != "dev-auth-deployment-intent-v1" {
+    let expected_schema = if intent.purpose.is_credentials() && intent.privilege_policy.is_none() {
+        "dev-auth-deployment-intent-v1"
+    } else {
+        "dev-auth-deployment-intent-v2"
+    };
+    if intent.schema != expected_schema {
         bail!("dev-auth deployment intent schema is unsupported");
     }
     normalized_absolute_path(&intent.administrator_policy, "administrator policy")?;
+    if let Some(path) = &intent.privilege_policy {
+        normalized_absolute_path(path, "privilege policy")?;
+    }
     let users = user_map(&intent.users, "deployment intent")?;
     credential_map(&intent.credentials, "deployment intent")?;
-    if users.is_empty() {
+    if intent.purpose.is_credentials() && users.is_empty() {
         bail!("deployment intent must declare at least one native user");
     }
     if intent.mode == DeploymentMode::Strong && users.values().any(|user| user.policy.is_some()) {
         bail!("strong mode does not accept per-user policy authority");
+    }
+    validate_purpose(
+        intent.purpose,
+        intent.mode,
+        &intent.users,
+        &intent.credentials,
+        intent.privilege_policy.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn validate_purpose(
+    purpose: SetupPurpose,
+    mode: DeploymentMode,
+    users: &[DeploymentUser],
+    credentials: &[DeploymentCredential],
+    privilege_policy: Option<&Path>,
+) -> Result<()> {
+    if purpose == SetupPurpose::PrivilegeOnly
+        && (mode != DeploymentMode::Strong || !users.is_empty() || !credentials.is_empty())
+    {
+        bail!("privilege-only setup requires system ownership and no credential or user-configuration actions");
+    }
+    if privilege_policy.is_some()
+        && (purpose != SetupPurpose::Credentials || mode != DeploymentMode::Strong)
+    {
+        bail!("combined credential and privilege setup requires strong system ownership");
     }
     Ok(())
 }

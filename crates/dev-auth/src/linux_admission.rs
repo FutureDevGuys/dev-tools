@@ -539,6 +539,10 @@ pub(crate) fn pidfd_process_is_alive(pidfd: &OwnedFd) -> Result<bool> {
 }
 
 pub fn peer_evidence(stream: &UnixStream) -> Result<LinuxPeerEvidence> {
+    peer_evidence_fd(stream)
+}
+
+pub(crate) fn peer_evidence_fd(stream: &impl AsFd) -> Result<LinuxPeerEvidence> {
     let credentials =
         getsockopt(stream, sockopt::PeerCredentials).context("read broker peer credentials")?;
     let peer_pidfd =
@@ -594,7 +598,7 @@ pub(crate) fn workload_session_id(cgroup: &Path) -> Option<&str> {
         })
 }
 
-fn read_unified_cgroup(pid: u32) -> Result<PathBuf> {
+pub(crate) fn read_unified_cgroup(pid: u32) -> Result<PathBuf> {
     let path = PathBuf::from(format!("/proc/{pid}/cgroup"));
     let metadata = fs::symlink_metadata(&path).context("inspect broker peer cgroup record")?;
     if !metadata.file_type().is_file() || metadata.len() > PROC_CGROUP_LIMIT {

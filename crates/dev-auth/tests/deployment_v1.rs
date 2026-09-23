@@ -107,11 +107,13 @@ fn setup_plan_rejects_fifo_deployment_without_waiting_for_a_writer() {
 
 fn cli_equivalent() -> DeploymentCliInput {
     DeploymentCliInput {
+        purpose: Default::default(),
         mode: Some(DeploymentMode::Strong),
         channel: Some(Channel::Stable),
         offline: Some(true),
         activation: Some(Activation::Transparent),
         administrator_policy: Some(PathBuf::from("/srv/dev-auth/policy.toml")),
+        privilege_policy: None,
         user_configs: vec![
             ("bob".into(), PathBuf::from("/srv/dev-auth/bob.toml")),
             ("alice".into(), PathBuf::from("/srv/dev-auth/alice.toml")),
@@ -346,6 +348,7 @@ executable = "{}"
     let installation = build_plan(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: if logical { "0.4.0" } else { "0.3.0-test" }.into(),
             source_executable: candidate,
@@ -378,11 +381,13 @@ config = "{}"
     let intent_from_cli = normalize_deployment(
         None,
         DeploymentCliInput {
+            purpose: Default::default(),
             mode: Some(DeploymentMode::UserOnly),
             channel: Some(Channel::Stable),
             offline: Some(false),
             activation: Some(Activation::Transparent),
             administrator_policy: Some(policy),
+            privilege_policy: None,
             user_configs: vec![(user.name.clone(), config)],
             user_policies: Vec::new(),
             credential_intents: Vec::new(),
@@ -559,6 +564,7 @@ ssh_keygen = "{}"
     let mut installation = build_plan(
         &SetupPaths::user_only(&user.dir),
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.3.0-test".into(),
             source_executable: candidate,

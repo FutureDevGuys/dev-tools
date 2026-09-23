@@ -73,11 +73,11 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | `dev-tools-command` | Bounded direct process execution and prepared-command execution. |
 | `dev-tools-completion` | Static shell rendering from trusted product-owned Clap command definitions; no discovery, execution or publication. |
 | `dev-tools-privilege` | One-shot typed privileged-operation authorization. |
-| `dev-tools-privilege-session` | Local lease expiry, use accounting, and stopping/cleanup lifecycle; identity binding, delegated authority, and native backends remain gated. |
+| `dev-tools-privilege-session` | Lease expiry, use accounting, typed scope/authority containment, conserved delegation, stopping/cleanup lifecycle and retained Linux cgroup-v2 execution mechanisms; products supply native identity, approval and service ownership. |
 | `dev-tools-secret` | Provider-neutral secret identifiers, operation capabilities, bounded cancellation contexts, zeroizing material, and value-free failures. |
 | `dev-tools-reconcile-protocol` | Typed external reconciliation documents. |
 
-`dev-tools-update` provides the executable product-neutral operation ordering and adapter contract. Persistent authenticated-cache transports and product adapters remain product-owned and are introduced incrementally behind that contract. The privilege-session lifecycle foundation remains separate from the mandatory one-shot authorization primitive and does not itself authorize or terminate native work. `release-admin` is a product, not a shared authority crate.
+`dev-tools-update` provides the executable product-neutral operation ordering and adapter contract. Persistent authenticated-cache transports and product adapters remain product-owned and are introduced incrementally behind that contract. The privilege-session foundation remains separate from mandatory one-shot authorization: its native mechanisms can terminate owned work but never authorize it. A native backend implementation does not establish product or platform acceptance; ADR 0086 owns the Linux integration gate. `release-admin` is a product, not a shared authority crate.
 
 Rust is the operational implementation, not a wrapper around embedded Python, PowerShell, or shell programs. Non-Rust material is limited to declarative configuration and schemas, generated completions, explicit user-owned hooks, minimal platform bootstrap launchers, protocol fixtures, and tests whose subject is a foreign-language boundary. A bootstrap launcher may locate and verify a pinned native binary but contains no package, release, migration, or policy business logic.
 

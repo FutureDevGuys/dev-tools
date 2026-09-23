@@ -1,6 +1,11 @@
 //! Binary portion of a retained full-generation restoration. The full setup
 //! owner holds admission exclusion, validates retention and stops integrations.
 use super::*;
+
+/// Read-only native absence proof for the separate administrator domain.
+pub(crate) fn require_privilege_domain_empty() -> Result<()> {
+    service::require_privilege_domain_empty()
+}
 use dev_tools_installation::{ArtifactIdentity, DocumentAuthority, VersionedReceipt};
 
 mod helper;
@@ -32,7 +37,9 @@ pub(crate) struct InitialInstallationRestoration {
 
 impl InitialInstallationRestoration {
     pub(crate) fn new(plan: &SetupPlan) -> Result<Self> {
-        if plan.schema != "dev-auth-setup-plan-v2" || plan.request.activate_transparent_launchers {
+        if plan.schema != binary_plan_schema(plan.request.purpose)
+            || plan.request.activate_transparent_launchers
+        {
             bail!("initial restoration requires an inactive installation plan");
         }
         let strong = plan.request.mode == InstallMode::Strong;
@@ -44,8 +51,14 @@ impl InitialInstallationRestoration {
             bail!("initial strong restoration requires native system and release authority");
         }
         validate_version(&plan.request.version)?;
-        validate_native_program(&plan.request.native_git, "candidate native Git")?;
-        validate_native_program(&plan.request.native_gh, "candidate native GitHub CLI")?;
+        validate_native_tool_selection(
+            plan.request.purpose,
+            plan.request.mode,
+            &plan.request.version,
+            &plan.request.native_git,
+            &plan.request.native_gh,
+            false,
+        )?;
         let executable = plan.paths.versioned_binary(&plan.request.version);
         if file_identity(&executable)? != (plan.source_length, plan.source_sha256.clone()) {
             bail!("retained initial candidate executable changed");
@@ -65,6 +78,7 @@ impl InitialInstallationRestoration {
         }
         let release = plan.verified_release.as_ref();
         let candidate = InstallReceipt {
+            purpose: plan.request.purpose,
             schema: RECEIPT_SCHEMA.into(),
             mode: plan.request.mode,
             version: plan.request.version.clone(),
@@ -347,7 +361,8 @@ impl RetainedInstallationRestoration {
         prior_shared: &VersionedReceipt,
         prior_receipt_mode: u32,
     ) -> Result<Self> {
-        if plan.schema != "dev-auth-setup-plan-v2"
+        if plan.schema != binary_plan_schema(plan.request.purpose)
+            || plan.request.purpose != prior.purpose
             || plan.request.mode != prior.mode
             || plan.request.activate_transparent_launchers
             || prior_receipt_mode & !0o777 != 0
@@ -414,11 +429,15 @@ impl RetainedInstallationRestoration {
         {
             bail!("retained installation histories disagree");
         }
-        for program in [&prior.native_git, &prior.native_gh] {
-            validate_native_program(Path::new(program), "retained native program")?;
-        }
-        validate_native_program(&plan.request.native_git, "candidate native Git")?;
-        validate_native_program(&plan.request.native_gh, "candidate native GitHub CLI")?;
+        validate_receipted_native_tools(prior)?;
+        validate_native_tool_selection(
+            plan.request.purpose,
+            plan.request.mode,
+            &plan.request.version,
+            &plan.request.native_git,
+            &plan.request.native_gh,
+            false,
+        )?;
         let candidate_path = plan.paths.versioned_binary(&plan.request.version);
         if file_identity(&candidate_path)? != (plan.source_length, plan.source_sha256.clone())
             || file_identity(Path::new(&prior.executable))?
@@ -1061,6 +1080,7 @@ mod tests {
             .unwrap()
             .receipt;
         let prior = InstallReceipt {
+            purpose: Default::default(),
             schema: RECEIPT_SCHEMA.into(),
             mode: InstallMode::Strong,
             version: request.version.clone(),
@@ -1096,6 +1116,7 @@ mod tests {
             schema: "dev-auth-setup-plan-v2".into(),
             paths,
             request: InstallRequest {
+                purpose: Default::default(),
                 mode: InstallMode::Strong,
                 version: request.version,
                 source_executable: source,
@@ -1128,6 +1149,7 @@ mod tests {
         fs::copy(&source, &native_git).unwrap();
         fs::copy(&source, &native_gh).unwrap();
         let request = InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.4.0".into(),
             source_executable: source.clone(),
@@ -1296,6 +1318,7 @@ mod tests {
             };
             executable(&source, b"old executable");
             let mut request = InstallRequest {
+                purpose: Default::default(),
                 mode: InstallMode::UserOnly,
                 version: "0.3.11".into(),
                 source_executable: source.clone(),

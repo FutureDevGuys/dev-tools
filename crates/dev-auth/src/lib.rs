@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use zeroize::Zeroizing;
 
-pub const SETUP_TEMPLATE_NAMES: [&str; 7] = [
+pub const SETUP_TEMPLATE_NAMES: [&str; 10] = [
     "deployment",
     "administrator-policy",
     "user-only-policy",
@@ -12,6 +12,9 @@ pub const SETUP_TEMPLATE_NAMES: [&str; 7] = [
     "administrator-policy-v3",
     "user-only-policy-v3",
     "user-config-v3",
+    "privilege-policy",
+    "privilege-deployment",
+    "credential-privilege-deployment",
 ];
 
 #[cfg(target_os = "linux")]
@@ -40,6 +43,7 @@ pub mod policy_store;
 pub mod policy_v2;
 pub mod policy_v3;
 pub mod policy_v3_operations;
+pub mod privilege;
 pub(crate) mod provider_operation;
 #[cfg(unix)]
 pub mod reconcile;

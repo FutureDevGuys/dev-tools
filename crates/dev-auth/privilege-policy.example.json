@@ -1,0 +1,7 @@
+{
+  "schema": "dev-auth-privilege-policy-v1",
+  "subjects": [],
+  "sudo_program": "/usr/bin/sudo",
+  "plans": {},
+  "operations": {}
+}

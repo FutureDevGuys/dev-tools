@@ -9,6 +9,7 @@ use zeroize::Zeroize;
 mod completion;
 mod doctor;
 mod execution_result;
+mod privilege_cli;
 mod product_cli;
 mod secret_cli;
 mod secret_execution;
@@ -58,11 +59,11 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn base_usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|credential-privilege-deployment\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--privilege-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 fn usage() -> String {
-    let commands = format!(
+    let mut commands = format!(
         "{}\n\n{}\n{}\n{}\n{}\n{}\n{}",
         base_usage(),
         doctor::help(),
@@ -71,6 +72,12 @@ fn usage() -> String {
         validation_cli::specification().render_long_help(),
         completion::setup_recovery_command().render_long_help(),
         completion::setup_restoration_command().render_long_help()
+    );
+    commands.push('\n');
+    commands.push_str(
+        &privilege_cli::specification()
+            .render_long_help()
+            .to_string(),
     );
     format!(
         "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
@@ -391,7 +398,26 @@ fn run_supervisor_arguments(
         );
         (None, None, Some(boundary_socket))
     };
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let mut separator = arguments.next();
+    let privilege = if separator.as_deref() == Some(std::ffi::OsStr::new("--privilege-request")) {
+        let value = arguments
+            .next()
+            .context("administrator launch request is missing")?;
+        let value = value
+            .to_str()
+            .filter(|value| value.len() <= 16 * 1024)
+            .context("administrator launch request is invalid")?;
+        let request: dev_auth::privilege::GrantRequest = serde_json::from_str(value)
+            .map_err(|_| anyhow::anyhow!("administrator launch request is invalid"))?;
+        request
+            .validate()
+            .map_err(|_| anyhow::anyhow!("administrator launch request is invalid"))?;
+        separator = arguments.next();
+        Some(request)
+    } else {
+        None
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("supervisor requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
@@ -407,7 +433,10 @@ fn run_supervisor_arguments(
             boundary_socket
                 .as_deref()
                 .context("strong supervisor boundary socket is missing")?,
-            &arguments,
+            dev_auth::supervisor::WorkloadInvocation {
+                arguments: &arguments,
+                privilege: privilege.as_ref(),
+            },
         )?;
         Ok(exit_status_code(status))
     } else {
@@ -425,6 +454,7 @@ fn run_supervisor_arguments(
                 .as_deref()
                 .context("privileged dispatcher environment socket is missing")?,
             &arguments,
+            privilege.as_ref(),
         )?;
         Ok(exit_status_code(status))
     }
@@ -1088,11 +1118,27 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                                 .parse()?,
                         )
                     }
+                    "--purpose" if cli.purpose.is_none() => {
+                        cli.purpose = Some(match arguments.next().as_deref() {
+                            Some("credentials") => dev_auth::deployment::SetupPurpose::Credentials,
+                            Some("privilege-only") => {
+                                dev_auth::deployment::SetupPurpose::PrivilegeOnly
+                            }
+                            _ => bail!("setup purpose must be credentials or privilege-only"),
+                        });
+                    }
                     "--administrator-policy" if cli.administrator_policy.is_none() => {
                         cli.administrator_policy = Some(std::path::PathBuf::from(
                             arguments
                                 .next()
                                 .context("--administrator-policy requires a path")?,
+                        ))
+                    }
+                    "--privilege-policy" if cli.privilege_policy.is_none() => {
+                        cli.privilege_policy = Some(std::path::PathBuf::from(
+                            arguments
+                                .next()
+                                .context("--privilege-policy requires a path")?,
                         ))
                     }
                     "--user-config" => {
@@ -1319,8 +1365,8 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if let Some(authorize) = authorize {
                 #[cfg(target_os = "linux")]
                 {
-                    if authorize != "sudo" {
-                        bail!("setup apply authorization must be sudo");
+                    if !matches!(authorize.as_str(), "sudo" | "polkit") {
+                        bail!("setup apply authorization must be sudo or polkit");
                     }
                     let request =
                         dev_auth::setup_authorization::StrongSetupApplyAuthorization::new(
@@ -1329,6 +1375,13 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                             format,
                             authorization_credentials,
                         )?;
+                    if authorize == "polkit" {
+                        return authorized_setup_exit_code(
+                            dev_auth::setup_authorization::authorize_strong_apply_via_polkit(
+                                &request,
+                            )?,
+                        );
+                    }
                     dev_auth::setup::validate_installed_setup_helper().context(
                         "validate the receipt-owned setup helper before requesting privilege; bootstrap strong setup as root when the helper is not installed",
                     )?;
@@ -2315,6 +2368,40 @@ fn main() {
     let git_child = std::env::var("DEV_AUTH_GIT_CHILD").as_deref() == Ok("1");
     let core_operation = std::env::args_os().nth(1);
     let result = match (frontend, gh_child, git_child) {
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege-plan-worker")) =>
+        {
+            Ok(dev_auth::privilege::run_plan_worker())
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege-payload")) =>
+        {
+            Ok(privilege_cli::payload(
+                std::env::args_os().skip(2).collect(),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege-sudo-relay")) =>
+        {
+            Ok(privilege_cli::sudo_relay(
+                std::env::args_os().skip(2).collect(),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege-daemon")) =>
+        {
+            Ok(privilege_cli::daemon(std::env::args_os().skip(2).collect()))
+        }
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege")) =>
+        {
+            Ok(privilege_cli::run(std::env::args_os().skip(2).collect()))
+        }
         (frontend, false, false)
             if is_core_frontend(frontend)
                 && core_operation.as_deref() == Some(std::ffi::OsStr::new("secret")) =>

@@ -58,7 +58,9 @@ pub fn plan_user_config_for_protocol(source: &Path) -> Result<UserConfigPlanOutc
     let user = native_user()?;
     let policy = match installation.mode {
         crate::setup::InstallMode::Strong => PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH),
-        crate::setup::InstallMode::UserOnly => crate::policy_store::user_policy_path(&user),
+        crate::setup::InstallMode::UserOnly => {
+            crate::policy_store::runtime_user_policy_path(&user)?
+        }
     };
     match fs::symlink_metadata(&policy) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -99,15 +101,16 @@ pub fn plan_user_config(source: &Path) -> Result<(UserConfigReconcilePlan, Recon
     let (installation_paths, installation) = crate::setup::current_runtime_installation()?;
     let user = native_user()?;
     let (source_bytes, source_state) = read_public_document(source, user.uid.as_raw())?;
-    let user_config = crate::policy_v2::parse_user_config_v2(&source_bytes)?;
     let policy = match installation.mode {
         crate::setup::InstallMode::Strong => PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH),
-        crate::setup::InstallMode::UserOnly => crate::policy_store::user_policy_path(&user),
+        crate::setup::InstallMode::UserOnly => {
+            crate::policy_store::runtime_user_policy_path(&user)?
+        }
     };
     let (policy_bytes, policy_state) = read_public_document(&policy, user.uid.as_raw())?;
-    let parsed_policy = crate::policy_v2::parse_system_policy_v2(&policy_bytes)?;
-    crate::policy_v2::resolve_policy_for_user(&parsed_policy, &user.name, &user_config)?;
-    let destination = crate::policy_store::user_config_path(&user);
+    let parsed_policy = crate::runtime_policy::parse_runtime_administrator(&policy_bytes)?;
+    parsed_policy.resolve_user(&user.name, &source_bytes)?;
+    let destination = crate::policy_store::runtime_user_config_path(&parsed_policy, &user);
     let current_state = optional_installed_document(&destination, user.uid.as_raw())?;
     let plan = UserConfigReconcilePlan {
         schema: PLAN_SCHEMA.into(),
@@ -144,7 +147,12 @@ pub fn apply_user_config(
     if plan.current_state.as_ref() == Some(&plan.source_state) {
         return result(false, true, "none");
     }
-    crate::setup::reconcile_user_config_for_account_at(
+    let (_, installation) = crate::setup::current_runtime_installation()?;
+    let _lease = crate::setup::configuration_exclusion(installation.mode)?;
+    // Recompute authority after acquiring the existing setup/admission lock.
+    // The configuration client never owns launcher or desktop activation.
+    revalidate_plan(plan)?;
+    crate::setup::reconcile_inactive_user_config_for_account_at(
         &plan.installation_paths,
         &plan.source,
         &plan.source_state.sha256,
@@ -213,22 +221,12 @@ pub fn read_plan(path: &Path) -> Result<UserConfigReconcilePlan> {
 
 fn revalidate_plan(plan: &UserConfigReconcilePlan) -> Result<()> {
     validate_plan(plan)?;
-    let (paths, installation) = crate::setup::current_runtime_installation()?;
-    let user = native_user()?;
-    if paths != plan.installation_paths
-        || installation.version != plan.installation_version
-        || installation.executable_sha256 != plan.installation_sha256
-        || user.name != plan.account_name
-        || user.uid.as_raw() != plan.account_uid
-        || user.dir != plan.account_home
-    {
-        bail!("reconcile authority changed after planning");
-    }
-    let (_, source) = read_public_document(&plan.source, plan.account_uid)?;
-    let (_, policy) = read_public_document(&plan.policy, plan.account_uid)?;
-    let current = optional_installed_document(&plan.destination, plan.account_uid)?;
-    if source != plan.source_state || policy != plan.policy_state || current != plan.current_state {
-        bail!("reconcile inputs changed after planning");
+    // Policy selection and destination follow current installed authority,
+    // including v3 precedence over a retained v2 policy. A digest cannot make a
+    // caller-selected old policy or destination authoritative.
+    let (current, _) = plan_user_config(&plan.source)?;
+    if current != *plan {
+        bail!("reconcile inputs or authority changed after planning");
     }
     Ok(())
 }
@@ -239,7 +237,12 @@ fn validate_plan(plan: &UserConfigReconcilePlan) -> Result<()> {
         || !plan.policy.is_absolute()
         || !plan.destination.is_absolute()
         || plan.account_name.is_empty()
-        || plan.account_home.join(".config/dev-auth/config-v2.toml") != plan.destination
+        || ![
+            crate::policy_store::USER_CONFIG_RELATIVE_PATH,
+            crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH,
+        ]
+        .iter()
+        .any(|relative| plan.account_home.join(relative) == plan.destination)
         || plan.installation_version.is_empty()
     {
         bail!("user reconcile plan has an unsupported contract");

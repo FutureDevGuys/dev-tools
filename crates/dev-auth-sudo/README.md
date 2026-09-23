@@ -1,0 +1,11 @@
+# Dev Auth native sudo helper
+
+This private Rust cdylib is a component of Dev Auth, not a separate public product. Its audit, approval and external-group records target sudo plugin API 1.22 and group API 1.0. It never obtains passwords, chooses a shell, or treats grant IDs, environment values or cached sudo timestamps as authority.
+
+The coordinator authenticates the running sudo executable and kernel peer before accepting original-account and post-policy observations. Every helper message carries explicit kernel-checked effective UID/GID credentials: the implicit Linux message credentials use real IDs and cannot match a setuid sudo connection's effective identity. The helper retains its connection, joins an owned cgroup before checking revocation/deadline gates, and fails rather than disabling itself after managed denial. Namespace relay preserves native parsing and original user identity. Packet and message definitions are shared from this product's source tree, without a public protocol compatibility promise.
+
+The group-provider cleanup callback is required by upstream sudoers, even when it has no independent state to free. It is a non-null no-op here: the audit plugin retains invocation state through final admission and owns its cleanup. Header-layout agreement alone does not verify that callback lifecycle contract.
+
+`just build` embeds matching helper bytes into Dev Auth. Version, declared source identity and target must agree. Setup must receipt-own the library and plugin registrations, reject unrelated group-provider conflicts, activate last and retain rollback; that setup integration is not complete. Do not install these source assets manually as a supported deployment.
+
+Tests cover bounded native arguments, fixed failure behavior, identity-field rejection and explicit message credentials through a real socket. `just accept-sudo-abi` checks the installed C header. The ignored `native_setid_messages_match_effective_peer_identity` test additionally requires a root-approved test child with differing real/effective UID and GID; it is not part of the ordinary test pass. Full native authority, namespace, terminal, timestamp and teardown acceptance remains separate; see [administrator grants](../../docs/dev-auth-privilege.md).

@@ -177,6 +177,17 @@ impl StrongSetupApplyAuthorization {
         arguments.push(OsString::from(self.format.as_str()));
         arguments
     }
+
+    pub fn require_polkit_safe_input(&self) -> Result<()> {
+        if self
+            .credentials
+            .values()
+            .any(|source| *source == CanonicalCredentialSource::Stdin)
+        {
+            bail!("PolicyKit setup authorization cannot forward credential stdin; use an explicit protected credential file or direct native setup");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +222,20 @@ pub fn authorize_strong_apply_with<A: PrivilegeAuthorizer + ?Sized>(
             StrongSetupApplyAuthorizationOutcome::Unavailable(reason)
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+pub fn authorize_strong_apply_via_polkit(
+    request: &StrongSetupApplyAuthorization,
+) -> Result<StrongSetupApplyAuthorizationOutcome> {
+    request.require_polkit_safe_input()?;
+    crate::setup::validate_installed_setup_helper()?;
+    crate::setup::validate_root_owned_executable(
+        Path::new("/usr/bin/pkexec"),
+        "native setup authorization",
+    )?;
+    let authorizer = dev_tools_privilege::PkexecAuthorizer::new("/usr/bin/pkexec")?;
+    authorize_strong_apply_with(&authorizer, request)
 }
 
 fn normalize_sha256(value: &str) -> Result<String> {

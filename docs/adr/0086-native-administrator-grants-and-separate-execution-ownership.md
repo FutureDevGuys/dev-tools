@@ -1,0 +1,41 @@
+---
+authority: canonical
+owner: dev-tools
+---
+
+# ADR 0086: Native administrator grants and separate execution ownership
+
+status: proposed
+verification: pending
+
+## Decision
+
+Dev Auth adds an explicitly approved administrator-grant authority independent of credential enrollment and ordinary setup/update privilege. It refines ADR 0004 with separately policy-enabled workload and OS-user scopes, an explicitly chosen finite duration, no default idle cutoff, and Linux execution groups outside the non-root workload's lifetime boundary. The historical credential and workload limits remain unchanged. Neither configuration nor a successful native approval restores or extends an earlier grant.
+
+The focused privilege-session foundation owns lease accounting, typed containment constraints, conserved delegation, and retained native execution mechanisms. Dev Auth owns policy, caller authentication, approval, IPC, selection, service lifecycle and presentation. No public SDK, MCP surface, sibling runtime, interpreter, or stable public broker protocol is introduced. Local just commands own verification; this change introduces no hosted CI.
+
+Linux uses a root-owned service with verified control-group teardown, an authenticated message-oriented Unix endpoint, kernel peer credentials and retained pidfds. A workload key comes from the protected native cgroup's device/inode identity. A request's PID, grant ID, path or environment never creates that authority. A caller in a supported workload user namespace retains its existing containment; privileged execution stays in the host user namespace and adopts only the verified native mount/cwd context. Original full UID/GID identity is preserved for ordinary work.
+
+Every new grant requires fresh PolicyKit administrator authentication with no retained authorization result. Approval describes scope, duration, optional idle/use limits, and unrestricted authority's root-equivalent consequences. An account-wide grant ends on final interactive logout. Workload end, policy/identity loss, revocation, suspend-aware hard expiry, or coordinator failure also invalidate authority. Grant memory is never restored after restart.
+
+Interactive requests register native `pkttyagent` for the requesting process and its kernel start time, so a workload without a desktop/login-session agent can still expose native authentication. It is not registered as a fallback: PolicyKit's fallback lookup does not select the process agent when no login session exists. Its input, output and errors go directly to the controlling terminal, never through product capture or JSON. Readiness precedes the request; owned shutdown and a parent-death signal bound the helper to that request. Noninteractive requests neither launch the terminal agent nor acquire authority. Registration is not authorization, and other process/session agents are not replaced. The authorization subject uses PolicyKit's exact uint32 PID, uint64 start time and int32 UID types.
+
+Privileged descendants occupy root-owned non-delegated cgroup-v2 boundaries. Admission attaches before checking persistent eventfd revocation gates and the hard deadline, so revocation cannot race a prepared spawn into an unowned process. A coordinator pidfd closes admission across crashes; the service manager independently kills the unit's processes. A grant is terminal only when pending admissions have settled, descendants are gone, and owned group removal succeeds. Failed cleanup remains a failure. Ordinary workload processes are not members of these execution groups and continue under their own limits.
+
+Selected managed routing remains fail-closed after expiry, coordinator restart, or observation retirement. A failed managed call does not search a broader grant or reuse native cached authentication. Explicit `privilege leave` removes this selection after cleanup; it grants nothing. Fresh approval and product recovery stay independent of an active grant. Native sudo integration retains upstream parsing, run-as and terminal policy and may activate only after its authentication/admission race and cached-ticket behavior pass native acceptance.
+
+The CLI adds request, status, inspect, exec, delegate, revoke and leave. Control results use `dev-auth-privilege-result-v1`, fixed value-free failures and common exit categories. `changed` is false before effects, true after an established authority/use/routing/execution effect, and null when entered mutation has uncertain progress. Execution metadata uses a separate destination from child streams. Noninteractive approval requests return promptly without a prompt. Human-edited policy represents Unicode native strings directly and uses explicitly platform-tagged arrays only for otherwise unrepresentable native bytes or code units.
+
+Strong workload launch accepts an explicit administrator scope and duration, transported as a separate closed request through the existing native dispatcher and registered supervisor, not through ambient environment or workload argv. Approval occurs inside the authenticated workload boundary before command release. Nested launch uses its existing registered boundary. Startup failure revokes only the newly issued grant; successful launch leaves scope lifetime to the coordinator. User-wide authority may therefore outlive the launched workload, as explicitly approved. Credential/workload limits and launcher policy do not change, and noninteractive combined launch cannot request a new grant.
+
+## Migration and rollback
+
+The candidate uses a product-owned sudo cdylib with audit preflight, conditional external-group authorization, final approval and a front-end audit check. Its source-matched bytes are embedded in the containing executable. A private workload namespace uses an unprivileged relay and a retained host sudo ELF descriptor, preserving the original real UID, primary/supplementary groups and native invocation. The approved coordinator establishes effective root explicitly for that held image; setuid mode bits cannot supply elevation to a host-user-namespace process executing in a mount namespace owned by a different user namespace. The ordinary workload keeps `PrivateUsers=full`. Relay preflight retains its exact grant; its prepaid admission binds the directly owned child and is consumed once. The mechanism and installation remain conditional on native acceptance; a failed property reopens the mechanism.
+
+Native sudo's final completion callback may run under a different effective group than preflight. Only the post-admission completion-only receive phase accepts that transition; it still requires the retained process, root UID, native sudo executable and exact execution cgroup. That phase accepts no new admission or attachment and grants no authority. All admission-bearing messages retain exact connection PID/UID/GID validation.
+
+Existing enrollment, credential scopes, strong workload identity, configured limits and accepted release bytes remain authoritative. Privilege policy starts with no subjects and activates no account-wide or workload authority implicitly. Product-owned system units, approval definitions and any sudo bridge belong to an authenticated setup generation, with prior-generation restoration and owned removal. Service/authority transitions stop affected coordinators, prove cleanup, preserve authenticated rollback material, and activate last. A failed transition never introduces a static passwordless authorization whose safety depends on later cleanup.
+
+## Verification
+
+Local policy and lifecycle tests establish finite overnight duration, absence of implicit idle policy, explicit scopes, unknown-operation denial, strict native arguments, conserved delegated uses, recursive revocation, and truthful mutation results. Native acceptance additionally proves process membership, inherited gates, stop/expiry races, crash cleanup, logout, policy replacement, binary streams, terminals, and retained non-root workloads. Native sudo, Ansible, setup/update/recovery and overnight acceptance are release gates, not conclusions from unit tests. Windows, WSL and macOS implementations and acceptance remain separately reported; missing host/signing evidence never becomes a platform support claim.

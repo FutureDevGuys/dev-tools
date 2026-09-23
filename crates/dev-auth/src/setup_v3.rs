@@ -23,10 +23,13 @@ use std::path::{Path, PathBuf};
 
 const DOCUMENT_LIMIT: u64 = 1024 * 1024;
 const CURRENT_OBJECT_LIMIT: u64 = 256 * 1024 * 1024;
+const PRIVILEGE_LIBRARY_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[cfg(all(test, target_os = "linux"))]
 mod recovery_native;
 
+#[cfg(target_os = "linux")]
+mod privilege;
 #[cfg(target_os = "linux")]
 mod restoration;
 #[cfg(target_os = "linux")]
@@ -85,6 +88,12 @@ pub struct SetupActionV3 {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SetupPlanV3 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_previous_block: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_current_state: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub privilege_payload: BTreeMap<String, dev_tools_installation::ArtifactIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_schema: Option<String>,
     pub schema: String,
@@ -443,6 +452,10 @@ fn recover_setup_v3_inner(
         bail!("setup recovery cannot initialize a transition")
     })?;
     let mut actions = Vec::new();
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        #[cfg(target_os = "linux")]
+        progress.record_change(privilege::stop(plan)?);
+    }
     let binary_changed =
         installed.finish_binary_transition(|changed| progress.record_change(changed))?;
     if binary_changed {
@@ -614,6 +627,12 @@ fn finish_setup_candidate<'a, F>(
 where
     F: FnOnce(&BTreeSet<String>, &BTreeSet<String>) -> Result<LoadedCredentialMaterials<'a>>,
 {
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        #[cfg(target_os = "linux")]
+        return privilege::finish(plan, digest, documents, before, actions);
+        #[cfg(not(target_os = "linux"))]
+        bail!("privilege setup requires the native Linux backend");
+    }
     let declared = declared_credential_slots(plan);
     install_configuration(plan, documents, &mut actions)?;
 
@@ -660,6 +679,10 @@ where
     let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
     apply_credential_actions(plan, &action_set_sha256, credentials, &mut actions)?;
     start_and_activate_candidate(plan, &mut actions)?;
+    #[cfg(target_os = "linux")]
+    if plan.intent.privilege_policy.is_some() {
+        privilege::apply_component(plan, documents, &mut actions)?;
+    }
     if !postcondition_satisfied(plan, digest, documents) {
         bail!("setup plan v3 postcondition verification failed");
     }
@@ -791,6 +814,15 @@ fn canonical_plan_release_source(
 }
 
 fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if plan.intent.mode == DeploymentMode::Strong {
+        crate::setup::require_independent_setup_execution()?;
+        if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly
+            && nix::unistd::getegid().as_raw() != 0
+        {
+            bail!("privilege setup requires the native root primary group");
+        }
+    }
     match plan.intent.mode {
         DeploymentMode::Strong if !nix::unistd::Uid::effective().is_root() => {
             bail!("strong setup apply requires root")
@@ -828,6 +860,10 @@ fn revalidate_candidate_documents(
     documents: &[RetainedCandidateDocument],
 ) -> Result<()> {
     validate_candidate_inventory(plan, documents)?;
+    #[cfg(target_os = "linux")]
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        return privilege::revalidate(plan, documents, validate_installation);
+    }
     let prior_policy = approved_prior_policy(plan)?;
     let rebuilt = build_setup_plan_v3_with_reader(
         plan.intent.clone(),
@@ -850,7 +886,22 @@ fn revalidate_candidate_documents(
         validate_installation,
         prior_policy.as_deref(),
     )?;
+    #[cfg(target_os = "linux")]
+    let retained_privilege_generation = if plan.intent.privilege_policy.is_some() {
+        let digest = sha256_hex(&serde_jcs::to_vec(plan)?);
+        let retained = crate::setup_transition::retained_transition(&plan.installation.paths, 0)?
+            .is_some_and(|transition| transition.plan_sha256 == digest);
+        privilege::revalidate(plan, documents, validate_installation)?;
+        retained
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "linux"))]
+    let retained_privilege_generation = false;
     if rebuilt.authority_schema != plan.authority_schema
+        || rebuilt.privilege_payload != plan.privilege_payload
+        || (!retained_privilege_generation
+            && rebuilt.privilege_previous_block != plan.privilege_previous_block)
         || rebuilt.intent_sha256 != plan.intent_sha256
         || rebuilt.source_documents != plan.source_documents
         || rebuilt.accounts != plan.accounts
@@ -886,6 +937,13 @@ fn require_initial_or_resumable_state(plan: &SetupPlanV3) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<bool> {
+    let privilege_changed = if plan.intent.has_privilege() {
+        let changed = privilege::stop(plan)?;
+        actions.push("stop_privilege_coordinator".into());
+        changed
+    } else {
+        false
+    };
     let transition = crate::setup_transition::retained_transition(
         &plan.installation.paths,
         apply_owner_uid(plan)?,
@@ -926,7 +984,7 @@ fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) 
     for account in plan.accounts.iter().chain(&plan.retiring_accounts) {
         actions.push(format!("deactivate_user_integrations:{}", account.name));
     }
-    Ok(changed)
+    Ok(changed || privilege_changed)
 }
 
 // Retain the existing non-Linux implementation until a native descriptor-bound
@@ -1169,11 +1227,18 @@ fn verify_postcondition(
     documents: &[RetainedCandidateDocument],
 ) -> Result<()> {
     let setup = crate::setup::verify_at_read_only(&plan.installation.paths)?;
-    let transparent_expected = plan.intent.activation == Activation::Transparent;
+    let transparent_expected =
+        plan.intent.purpose.is_credentials() && plan.intent.activation == Activation::Transparent;
     if setup.version != plan.installation.request.version
         || setup.transparent_launchers_active != transparent_expected
     {
         bail!("installed release does not match the deployment intent");
+    }
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        #[cfg(target_os = "linux")]
+        return privilege::verify(plan, documents);
+        #[cfg(not(target_os = "linux"))]
+        bail!("privilege verification requires the native Linux backend");
     }
     let administrator = document_identity(plan, "administrator_policy", "system")?;
     let system_policy = parse_runtime_administrator(candidate_bytes(documents, administrator)?)?;
@@ -1240,6 +1305,10 @@ fn verify_postcondition(
         {
             bail!("system broker remains active when the deployment requires it stopped");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if plan.intent.privilege_policy.is_some() {
+        privilege::verify(plan, documents)?;
     }
     Ok(())
 }
@@ -1458,6 +1527,12 @@ fn deployment_lock_path_for(mode: DeploymentMode, owner_uid: Option<u32>) -> Res
 }
 
 fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        #[cfg(target_os = "linux")]
+        return privilege::fingerprint(plan);
+        #[cfg(not(target_os = "linux"))]
+        bail!("privilege state requires the native Linux backend");
+    }
     #[derive(Serialize)]
     struct State<'a> {
         files: Vec<(PathBuf, Option<(u64, String)>)>,
@@ -1535,14 +1610,22 @@ fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
             crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => "unavailable",
         }
     };
-    Ok(sha256_hex(
+    let credential_state = sha256_hex(
         &serde_jcs::to_vec(&State {
             files,
             credential_ready: ready_credential_slots(plan)?,
             broker,
         })
         .context("serialize deployment state")?,
-    ))
+    );
+    #[cfg(target_os = "linux")]
+    if plan.intent.privilege_policy.is_some() {
+        return Ok(sha256_hex(&serde_jcs::to_vec(&(
+            credential_state,
+            privilege::fingerprint(plan)?,
+        ))?));
+    }
+    Ok(credential_state)
 }
 
 pub fn build_setup_plan_v3(
@@ -1556,6 +1639,10 @@ pub fn build_setup_plan_v3_for_verified_release(
     intent: DeploymentIntent,
     verified: crate::release_manifest::VerifiedDevAuthRelease,
 ) -> Result<SetupPlanV3> {
+    if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        let installation = crate::setup::build_verified_privilege_release_plan(verified)?;
+        return build_setup_plan_v3(intent, installation);
+    }
     let administrator = read_document(
         &intent.administrator_policy,
         "administrator_policy",
@@ -1582,7 +1669,11 @@ pub fn build_setup_plan_v3_at(
     installation: SetupPlan,
     require_privileged: bool,
 ) -> Result<SetupPlanV3> {
-    let prior_policy = read_prior_system_policy(intent.mode)?;
+    let prior_policy = if intent.purpose.is_credentials() {
+        read_prior_system_policy(intent.mode)?
+    } else {
+        None
+    };
     let plan = build_setup_plan_v3_with_reader(
         intent,
         installation,
@@ -1591,7 +1682,9 @@ pub fn build_setup_plan_v3_at(
         &validate_live_installation_plan,
         prior_policy.as_deref(),
     )?;
-    require_prior_policy_snapshot(&plan, prior_policy.as_deref())?;
+    if plan.intent.purpose.is_credentials() {
+        require_prior_policy_snapshot(&plan, prior_policy.as_deref())?;
+    }
     Ok(plan)
 }
 
@@ -1603,6 +1696,25 @@ fn build_setup_plan_v3_with_reader(
     validate_installation: &dyn Fn(&SetupPlan) -> Result<()>,
     prior_policy: Option<&[u8]>,
 ) -> Result<SetupPlanV3> {
+    if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        #[cfg(target_os = "linux")]
+        return privilege::build(
+            intent,
+            installation,
+            require_privileged,
+            read_source,
+            validate_installation,
+        );
+        #[cfg(not(target_os = "linux"))]
+        bail!("privilege setup requires the native Linux backend");
+    }
+    if installation.request.purpose != intent.purpose {
+        bail!("setup feature selection differs from its binary installation");
+    }
+    #[cfg(target_os = "linux")]
+    if intent.mode == DeploymentMode::Strong && intent.privilege_policy.is_none() {
+        privilege::require_selected_if_retained(&installation)?;
+    }
     let intent_bytes = canonical_deployment_intent(&intent)?;
     let intent_sha256 = sha256_hex(&intent_bytes);
     validate_installation(&installation).context("validate staged installation plan")?;
@@ -1672,6 +1784,16 @@ fn build_setup_plan_v3_with_reader(
     }
 
     let mut documents = vec![administrator.identity];
+    #[cfg(target_os = "linux")]
+    if let Some(path) = &intent.privilege_policy {
+        let selected = read_source(path, "privilege_policy", "system")?;
+        privilege::validate_policy(&selected.bytes)?;
+        documents.push(selected.identity);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if intent.privilege_policy.is_some() {
+        bail!("combined privilege setup requires the native Linux backend");
+    }
     let mut accounts = Vec::with_capacity(intent.users.len());
     let mut account_names = BTreeSet::new();
     let mut used_credential_slots = BTreeSet::new();
@@ -1777,15 +1899,32 @@ fn build_setup_plan_v3_with_reader(
         &retiring_accounts,
         authority_schema.as_deref(),
     )?;
-    let current_state_sha256 = stored_current_state_digest(
+    #[cfg(target_os = "linux")]
+    let privilege_current_state = intent
+        .privilege_policy
+        .as_ref()
+        .map(|_| privilege::state())
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    let privilege_current_state: Option<String> = None;
+    let current_state_sha256 = stored_current_state_digest_with_privilege(
         &current_paths,
         &current_credential_ready,
         &current_broker_state,
+        privilege_current_state.as_deref(),
     )?;
     let actions = planned_action_contract(&intent);
     let plan = SetupPlanV3 {
+        privilege_previous_block: None,
+        privilege_current_state,
+        privilege_payload: Default::default(),
         authority_schema,
-        schema: "dev-auth-setup-plan-v3".into(),
+        schema: if intent.privilege_policy.is_some() {
+            "dev-auth-setup-plan-v4"
+        } else {
+            "dev-auth-setup-plan-v3"
+        }
+        .into(),
         intent,
         intent_sha256,
         installation,
@@ -1798,6 +1937,12 @@ fn build_setup_plan_v3_with_reader(
         current_state_sha256,
         actions,
     };
+    #[cfg(target_os = "linux")]
+    let mut plan = plan;
+    #[cfg(target_os = "linux")]
+    if plan.intent.privilege_policy.is_some() {
+        privilege::attach(&mut plan, validate_installation)?;
+    }
     validate_setup_plan_v3_with_installation_check(&plan, validate_installation)?;
     Ok(plan)
 }
@@ -1865,6 +2010,9 @@ fn validate_prior_policy_bytes(current: &CurrentPathIdentity, bytes: Option<&[u8
 }
 
 fn approved_prior_policy(plan: &SetupPlanV3) -> Result<Option<Vec<u8>>> {
+    if !plan.intent.purpose.is_credentials() {
+        return Ok(None);
+    }
     if plan.intent.mode != DeploymentMode::Strong {
         return Ok(None);
     }
@@ -2176,6 +2324,23 @@ fn validate_setup_plan_v3_with_installation_check(
     plan: &SetupPlanV3,
     validate_installation: &dyn Fn(&SetupPlan) -> Result<()>,
 ) -> Result<()> {
+    let privilege_only = plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly;
+    if privilege_only {
+        #[cfg(target_os = "linux")]
+        privilege::validate(plan)?;
+        #[cfg(not(target_os = "linux"))]
+        bail!("privilege setup requires the native Linux backend");
+    } else if plan.intent.privilege_policy.is_some() {
+        #[cfg(target_os = "linux")]
+        privilege::validate_component(plan)?;
+        #[cfg(not(target_os = "linux"))]
+        bail!("combined privilege setup requires the native Linux backend");
+    } else if !plan.privilege_payload.is_empty()
+        || plan.privilege_previous_block.is_some()
+        || plan.privilege_current_state.is_some()
+    {
+        bail!("credential-only setup cannot carry privilege authority");
+    }
     if !plan.retiring_accounts.is_empty() && plan.intent.mode != DeploymentMode::Strong {
         bail!("only strong setup may contain retiring accounts");
     }
@@ -2201,20 +2366,26 @@ fn validate_setup_plan_v3_with_installation_check(
     }
     if !matches!(
         plan.authority_schema.as_deref(),
-        None | Some("dev-auth-administrator-policy-v3")
+        None | Some("dev-auth-administrator-policy-v3") | Some("dev-auth-privilege-policy-v1")
     ) {
         bail!("setup plan has an unsupported authority schema");
     }
-    if plan.schema != "dev-auth-setup-plan-v3"
+    if plan.schema
+        != if plan.intent.has_privilege() {
+            "dev-auth-setup-plan-v4"
+        } else {
+            "dev-auth-setup-plan-v3"
+        }
         || plan.intent_sha256 != sha256_hex(&canonical_deployment_intent(&plan.intent)?)
         || plan.source_documents.is_empty()
-        || plan.accounts.is_empty()
+        || (!privilege_only && plan.accounts.is_empty())
         || plan.actions.is_empty()
         || plan.current_state_sha256
-            != stored_current_state_digest(
+            != stored_current_state_digest_with_privilege(
                 &plan.current_paths,
                 &plan.current_credential_ready,
                 &plan.current_broker_state,
+                plan.privilege_current_state.as_deref(),
             )?
         || plan.actions.last().map(|action| action.kind.as_str()) != Some("verify")
         || plan
@@ -2262,6 +2433,21 @@ fn expected_current_path_keys(
     retiring_accounts: &[NativeAccountIdentity],
     authority_schema: Option<&str>,
 ) -> Vec<(String, String, PathBuf)> {
+    #[cfg(target_os = "linux")]
+    if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        let mut paths = crate::setup::installation_current_state_paths(
+            &installation.paths,
+            installation.request.mode,
+        );
+        paths.push((
+            "setup_transition".into(),
+            "system".into(),
+            crate::setup_transition::state_path(&installation.paths),
+        ));
+        paths.extend(privilege::paths());
+        paths.sort();
+        return paths;
+    }
     let logical = authority_schema == Some("dev-auth-administrator-policy-v3");
     let mut paths = crate::setup::installation_current_state_paths(
         &installation.paths,
@@ -2359,11 +2545,42 @@ fn expected_current_path_keys(
             ));
         }
     }
+    #[cfg(target_os = "linux")]
+    if intent.privilege_policy.is_some() {
+        paths.extend(privilege::paths());
+    }
     paths.sort();
     paths
 }
 
 pub fn planned_action_contract(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
+    if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        let mut kinds = vec![
+            "stop_privilege_coordinator",
+            "stop_broker",
+            "install_release",
+            "install_privilege_library",
+            "install_privilege_policy",
+            "install_privilege_action",
+            "install_privilege_service",
+            "install_privilege_sudoers",
+            "install_privilege_sudo_conf",
+            "reload_service_manager",
+        ];
+        if intent.activation == Activation::Transparent {
+            kinds.push("activate_privilege_coordinator");
+        }
+        kinds.push("verify");
+        return kinds
+            .into_iter()
+            .enumerate()
+            .map(|(order, kind)| SetupActionV3 {
+                order: order as u32,
+                kind: kind.into(),
+                subject: None,
+            })
+            .collect();
+    }
     let mut actions = Vec::new();
     let mut push = |kind: &str, subject: Option<String>| {
         actions.push(SetupActionV3 {
@@ -2372,6 +2589,9 @@ pub fn planned_action_contract(intent: &DeploymentIntent) -> Vec<SetupActionV3> 
             subject,
         });
     };
+    if intent.privilege_policy.is_some() {
+        push("stop_privilege_coordinator", None);
+    }
     push("deactivate_transparent_launchers", None);
     if intent.mode == DeploymentMode::Strong {
         push("stop_broker", None);
@@ -2407,6 +2627,22 @@ pub fn planned_action_contract(intent: &DeploymentIntent) -> Vec<SetupActionV3> 
     if intent.activation == Activation::Transparent {
         push("activate_transparent_launchers", None);
     }
+    if intent.privilege_policy.is_some() {
+        for kind in [
+            "install_privilege_library",
+            "install_privilege_policy",
+            "install_privilege_action",
+            "install_privilege_service",
+            "install_privilege_sudoers",
+            "install_privilege_sudo_conf",
+            "reload_service_manager",
+        ] {
+            push(kind, None);
+        }
+        if intent.activation == Activation::Transparent {
+            push("activate_privilege_coordinator", None);
+        }
+    }
     push("verify", None);
     actions
 }
@@ -2430,8 +2666,12 @@ fn current_state_snapshot(
         let identity = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-                    let document =
-                        read_bounded_at(&path, CURRENT_OBJECT_LIMIT, "setup current-state file")?;
+                    let document = read_bounded_at_with_empty(
+                        &path,
+                        CURRENT_OBJECT_LIMIT,
+                        "setup current-state file",
+                        kind == "privilege_sudo_conf",
+                    )?;
                     Some(CurrentFileIdentity {
                         object_type: "file".into(),
                         owner_uid: metadata.uid(),
@@ -2471,6 +2711,10 @@ fn current_state_snapshot(
             path,
             identity,
         });
+    }
+    #[cfg(target_os = "linux")]
+    if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        return Ok((entries, BTreeSet::new(), privilege::state()?));
     }
     let broker = if intent.mode == DeploymentMode::UserOnly {
         "user_only"
@@ -2514,6 +2758,19 @@ fn stored_current_state_digest(
         })
         .context("canonicalize setup current state")?,
     ))
+}
+
+fn stored_current_state_digest_with_privilege(
+    paths: &[CurrentPathIdentity],
+    credential_ready: &BTreeSet<String>,
+    broker: &str,
+    privilege_state: Option<&str>,
+) -> Result<String> {
+    let base = stored_current_state_digest(paths, credential_ready, broker)?;
+    match privilege_state {
+        Some(state) => Ok(sha256_hex(&serde_jcs::to_vec(&(base, state))?)),
+        None => Ok(base),
+    }
 }
 
 struct OpenedDocument {
@@ -2698,14 +2955,20 @@ fn capture_retained_object(current: &CurrentPathIdentity) -> Result<RetainedSetu
             None
         }
         Some(identity) if identity.object_type == "file" => {
-            let document = read_atomic_document(
-                &current.path,
-                &DocumentAuthority {
-                    owner_uid: identity.owner_uid,
-                    mode: identity.mode,
-                    limit: DOCUMENT_LIMIT,
+            let authority = DocumentAuthority {
+                owner_uid: identity.owner_uid,
+                mode: identity.mode,
+                limit: if current.kind == "privilege_library" {
+                    PRIVILEGE_LIBRARY_LIMIT
+                } else {
+                    DOCUMENT_LIMIT
                 },
-            )?
+            };
+            let document = if current.kind == "privilege_sudo_conf" {
+                dev_tools_installation::read_atomic_file(&current.path, &authority)
+            } else {
+                read_atomic_document(&current.path, &authority)
+            }?
             .context("retained setup document disappeared")?;
             if document.identity.length != identity.length
                 || document.identity.sha256 != identity.sha256
@@ -2754,6 +3017,15 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn read_bounded_at(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
+    read_bounded_at_with_empty(path, limit, description, false)
+}
+
+fn read_bounded_at_with_empty(
+    path: &Path,
+    limit: u64,
+    description: &str,
+    allow_empty: bool,
+) -> Result<Vec<u8>> {
     if !path.is_absolute() {
         bail!("{description} path must be absolute");
     }
@@ -2769,7 +3041,7 @@ fn read_bounded_at(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>
         .with_context(|| format!("inspect {description} {}", path.display()))?;
     if !before.file_type().is_file()
         || before.nlink() != 1
-        || before.len() == 0
+        || (!allow_empty && before.len() == 0)
         || before.len() > limit
         || before.mode() & 0o022 != 0
     {
@@ -2833,16 +3105,21 @@ mod tests {
         )
         .unwrap();
         let intent = DeploymentIntent {
+            purpose: Default::default(),
             schema: "dev-auth-deployment-v1".into(),
             mode: DeploymentMode::Strong,
             channel: crate::deployment::Channel::Stable,
             offline: true,
             activation: Activation::Inactive,
             administrator_policy: root.path().join("candidate.toml"),
+            privilege_policy: None,
             users: Vec::new(),
             credentials: Vec::new(),
         };
         let mut plan = SetupPlanV3 {
+            privilege_previous_block: None,
+            privilege_current_state: None,
+            privilege_payload: Default::default(),
             authority_schema: Some("dev-auth-administrator-policy-v3".into()),
             schema: "dev-auth-setup-plan-v3".into(),
             intent_sha256: String::new(),
@@ -2854,6 +3131,7 @@ mod tests {
                     bin_dir: root.path().join("bin"),
                 },
                 request: crate::setup::InstallRequest {
+                    purpose: Default::default(),
                     mode: crate::setup::InstallMode::Strong,
                     version: "0.4.0".into(),
                     source_executable: executable.clone(),
@@ -3300,12 +3578,14 @@ mod tests {
     #[test]
     fn credential_action_epoch_is_independent_of_noncredential_deployment_state() {
         let intent = DeploymentIntent {
+            purpose: Default::default(),
             schema: "dev-auth-deployment-v1".into(),
             mode: DeploymentMode::Strong,
             channel: crate::deployment::Channel::Stable,
             offline: false,
             activation: Activation::Transparent,
             administrator_policy: PathBuf::from("/etc/dev-auth/policy.toml"),
+            privilege_policy: None,
             users: vec![crate::deployment::DeploymentUser {
                 name: "alice".into(),
                 config: PathBuf::from("/tmp/alice.toml"),
@@ -3397,12 +3677,14 @@ mod tests {
     #[test]
     fn transparent_strong_activation_always_requires_the_broker() {
         let intent = DeploymentIntent {
+            purpose: Default::default(),
             schema: "dev-auth-deployment-v1".into(),
             mode: DeploymentMode::Strong,
             channel: crate::deployment::Channel::Stable,
             offline: false,
             activation: Activation::Transparent,
             administrator_policy: PathBuf::from("/etc/dev-auth/policy.toml"),
+            privilege_policy: None,
             users: Vec::new(),
             credentials: Vec::new(),
         };
@@ -3415,6 +3697,7 @@ mod tests {
         assert!(!broker_desired(&inactive));
 
         let user_only = DeploymentIntent {
+            purpose: Default::default(),
             mode: DeploymentMode::UserOnly,
             activation: Activation::Transparent,
             ..inactive

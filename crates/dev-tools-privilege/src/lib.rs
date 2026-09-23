@@ -163,11 +163,72 @@ impl PrivilegeAuthorizer for SudoAuthorizer {
     }
 }
 
+/// An independent native PolicyKit invocation. This never routes through sudo
+/// or a reusable administrator grant. The caller owns helper-specific receipts.
+#[derive(Debug, Clone)]
+#[cfg(target_os = "linux")]
+pub struct PkexecAuthorizer {
+    program: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl PkexecAuthorizer {
+    pub fn new(program: impl Into<PathBuf>) -> Result<Self> {
+        let program = program.into();
+        validate_exact_executable(&program, "authorization program")?;
+        Ok(Self { program })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PrivilegeAuthorizer for PkexecAuthorizer {
+    fn authorize_and_run_exact_helper(
+        &self,
+        request: &ExactHelperRequest<'_>,
+    ) -> Result<PrivilegeOutcome> {
+        validate_request(request)?;
+        // Disabling pkexec's internal agent does not prohibit an external
+        // graphical agent. There is no equivalent of sudo's -n contract.
+        if request.interaction == UserInteraction::Forbidden {
+            bail!("PolicyKit authorization cannot guarantee prompt-free interaction");
+        }
+        validate_exact_executable(&self.program, "authorization program")?;
+        let mut command = Command::new(&self.program);
+        command
+            .env_clear()
+            .current_dir("/")
+            .arg(request.helper)
+            .args(request.arguments)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(PrivilegeOutcome::Unavailable(
+                    UnavailableReason::AuthorizationProgram,
+                ));
+            }
+            Err(error) => return Err(error).context("start exact PolicyKit authorizer"),
+        };
+        // A helper can itself return 126 or 127. Preserve its native status;
+        // a raw exit code is not proof of authentication, denial or cancellation.
+        Ok(classify_status(
+            child.wait().context("wait for exact PolicyKit helper")?,
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn validate_request(request: &ExactHelperRequest<'_>) -> Result<()> {
     validate_exact_executable(request.helper, "privileged helper")?;
     if request.deadline.is_some() {
-        bail!("sudo cannot safely enforce a complete privileged helper deadline");
+        bail!("native authorization cannot safely enforce a complete privileged helper deadline");
     }
     if request.interaction == UserInteraction::Allowed && request.stdio != StdioPolicy::Inherit {
         bail!("interactive privilege authorization requires inherited standard streams");
@@ -223,4 +284,82 @@ fn classify_status(status: ExitStatus) -> PrivilegeOutcome {
         code: status.code(),
         signal: status.signal(),
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pkexec_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn program(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn polkit_runs_only_the_exact_helper_and_preserves_ambiguous_native_statuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let authorization = directory.path().join("pkexec");
+        let helper = directory.path().join("helper");
+        let output = directory.path().join("literal-arguments");
+        program(&authorization, "#!/bin/sh\nexec \"$@\"\n");
+        program(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' \"$2\" >\"$1\"\nexit 127\n",
+        );
+        let backend = PkexecAuthorizer::new(authorization).unwrap();
+        let arguments = [
+            output.clone().into_os_string(),
+            "literal ; $(not-executed)".into(),
+        ];
+        let result = backend
+            .authorize_and_run_exact_helper(&ExactHelperRequest {
+                helper: &helper,
+                arguments: &arguments,
+                deadline: None,
+                interaction: UserInteraction::Allowed,
+                stdio: StdioPolicy::Inherit,
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            PrivilegeOutcome::Exited(ProcessTermination {
+                code: Some(127),
+                signal: None
+            })
+        );
+        assert_eq!(fs::read(output).unwrap(), b"literal ; $(not-executed)\n");
+    }
+
+    #[test]
+    fn unsupported_noninteractive_or_deadline_requests_never_start_an_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let authorization = directory.path().join("pkexec");
+        let marker = directory.path().join("must-not-start");
+        program(
+            &authorization,
+            &format!("#!/bin/sh\n/usr/bin/touch '{}'\n", marker.display()),
+        );
+        let backend = PkexecAuthorizer::new(authorization).unwrap();
+        for (interaction, deadline, stdio) in [
+            (UserInteraction::Forbidden, None, StdioPolicy::Null),
+            (
+                UserInteraction::Allowed,
+                Some(Duration::from_secs(1)),
+                StdioPolicy::Inherit,
+            ),
+            (UserInteraction::Allowed, None, StdioPolicy::Null),
+        ] {
+            assert!(backend
+                .authorize_and_run_exact_helper(&ExactHelperRequest {
+                    helper: Path::new("/usr/bin/true"),
+                    arguments: &[],
+                    deadline,
+                    interaction,
+                    stdio,
+                })
+                .is_err());
+        }
+        assert!(!marker.exists());
+    }
 }
