@@ -2,6 +2,8 @@
 
 `dev-cache` routes positively known disposable tool caches to a machine-selected storage root. It preserves source trees, dependency trees, environments, installed tools, final binaries, documentation, and other deliverables in their normal locations. Unknown, overridden, ambiguous, or unsafe state causes the affected adapter to abstain or fail closed.
 
+If the operating system makes an otherwise selected cache root read-only before an intercepted tool starts, the intercept delegates once to the original tool without Dev Cache routing; compiler-name aliases bypass ccache. A read-only failure after the tool has run preserves its exit status without replay. This does not repair the filesystem or authorize fallback for a changed volume identity, unsafe ownership, missing root, permission failure or invalid configuration. `dev-cache doctor` remains the way to inspect the unhealthy cache root; native storage repair is external to Dev Cache. [ADR 0093](adr/0093-read-only-cache-root-intercept-fallback.md) owns this narrow failure behavior.
+
 Configuration and state use standard platform `dev-cache` roots. POSIX intercepts live under `${XDG_DATA_HOME:-$HOME/.local/share}/dev-cache/intercepts`; Windows intercepts and generated completion live under `%LOCALAPPDATA%\dev-cache`.
 
 `dev-cache build-info --json` emits the common checkout-independent `dev-tools-build-info-v1` document without initializing cache routing or maintenance state. The hidden `--build-info` form remains for rollback to the pre-standard 0.1 line and is removed in the next minor release after one accepted release has shipped the standard subcommand.

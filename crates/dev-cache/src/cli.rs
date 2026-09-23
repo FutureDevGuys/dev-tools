@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -1410,16 +1411,35 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
         }
         return cargo_intercept::delegate(&real, &args, &[], None);
     }
-    let root = open_root(&config)?;
-    let workspace =
-        Repository::discover(&current_dir, &root)?.context("resolve current workspace scope")?;
+    let root = match open_root(&config) {
+        Ok(root) => root,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, compiler_intercept);
+        }
+        Err(error) => return Err(error),
+    };
+    let workspace = match Repository::discover(&current_dir, &root)
+        .and_then(|workspace| workspace.context("resolve current workspace scope"))
+    {
+        Ok(workspace) => workspace,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, compiler_intercept);
+        }
+        Err(error) => return Err(error),
+    };
     // Compiler aliases and cache launchers run once per compilation, not once
     // per build. Outer routed tools and explicit GC own full-root maintenance.
     let automatic_maintenance = !matches!(adapter, Adapter::Ccache | Adapter::Sccache);
     if automatic_maintenance {
         maybe_automatic_gc(&root, &config, true);
     }
-    let setup_lease = RootLease::shared(&root, &format!("intercept:{command}"))?;
+    let setup_lease = match RootLease::shared(&root, &format!("intercept:{command}")) {
+        Ok(lease) => lease,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, compiler_intercept);
+        }
+        Err(error) => return Err(error),
+    };
     let context = AdapterContext {
         worktree_cache: workspace.cache_dir.clone(),
         shared_cache: root.shared(),
@@ -1435,9 +1455,27 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     );
     let native = native_tool(&real, command, &args, adapter);
     let hazards = adapter_hazards(adapter, &args, &current_dir);
-    let resource_ids =
-        prepare_adapter_environment(&root, &workspace, adapter, &environment, &native, &hazards)?;
-    let active_lease = setup_lease.into_active(&resource_ids)?;
+    let resource_ids = match prepare_adapter_environment(
+        &root,
+        &workspace,
+        adapter,
+        &environment,
+        &native,
+        &hazards,
+    ) {
+        Ok(resources) => resources,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, compiler_intercept);
+        }
+        Err(error) => return Err(error),
+    };
+    let active_lease = match setup_lease.into_active(&resource_ids) {
+        Ok(lease) => lease,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, compiler_intercept);
+        }
+        Err(error) => return Err(error),
+    };
     let routed: Vec<(String, String)> = environment.into_iter().collect();
     let code = if compiler_intercept {
         let ccache = cargo_intercept::resolve_real_command("ccache", &current_exe)?;
@@ -1448,12 +1486,37 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
     } else {
         cargo_intercept::delegate(&real, &args, &routed, None)?
     };
-    resources::complete(&root, &resource_ids)?;
+    if let Err(error) = resources::complete(&root, &resource_ids) {
+        if is_read_only_root_failure(&error) {
+            if !compiler_intercept {
+                eprintln!("dev-cache: cache root became read-only after the tool ran; its exit status is preserved");
+            }
+        } else {
+            return Err(error);
+        }
+    }
     drop(active_lease);
     if automatic_maintenance {
         maybe_automatic_gc(&root, &config, false);
     }
     Ok(code)
+}
+
+fn is_read_only_root_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::ReadOnlyFilesystem)
+    })
+}
+
+fn delegate_without_cache(real: &Path, args: &[OsString], compiler_intercept: bool) -> Result<i32> {
+    if !compiler_intercept {
+        eprintln!(
+            "dev-cache: cache root is read-only; running the original tool without cache routing"
+        );
+    }
+    cargo_intercept::delegate(real, args, &[], None)
 }
 
 fn preview_root() -> PathBuf {
@@ -1970,7 +2033,13 @@ fn run_cargo(args: Vec<OsString>) -> Result<i32> {
     let informational = help || cargo_intercept::is_version_request(&args);
     let supports_build_dir =
         !informational && cargo_intercept::cargo_supports_build_dir(&real, &args);
-    let routing = cargo_routing(&config, &args, informational, supports_build_dir)?;
+    let routing = match cargo_routing(&config, &args, informational, supports_build_dir) {
+        Ok(routing) => routing,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, false);
+        }
+        Err(error) => return Err(error),
+    };
     let prefix = help.then(|| cargo_help_prefix(&routing.status));
     let code = cargo_intercept::delegate(&real, &args, &routing.environment, prefix.as_deref())?;
     finish_cargo_routing(routing, &config);
@@ -1988,7 +2057,13 @@ fn run_rustup(args: Vec<OsString>) -> Result<i32> {
     let informational = help || cargo_intercept::is_version_request(cargo_args);
     let supports_build_dir =
         !informational && cargo_intercept::rustup_cargo_supports_build_dir(&real, &args);
-    let routing = cargo_routing(&config, cargo_args, informational, supports_build_dir)?;
+    let routing = match cargo_routing(&config, cargo_args, informational, supports_build_dir) {
+        Ok(routing) => routing,
+        Err(error) if is_read_only_root_failure(&error) => {
+            return delegate_without_cache(&real, &args, false);
+        }
+        Err(error) => return Err(error),
+    };
     let prefix = help.then(|| cargo_help_prefix(&routing.status));
     let code = cargo_intercept::delegate(&real, &args, &routing.environment, prefix.as_deref())?;
     finish_cargo_routing(routing, &config);
@@ -2362,5 +2437,23 @@ fn display_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
         _ => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod read_only_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn only_native_read_only_failures_allow_unrouted_delegation() {
+        let read_only = anyhow::Error::new(io::Error::from(io::ErrorKind::ReadOnlyFilesystem))
+            .context("create private cache-root write probe");
+        assert!(is_read_only_root_failure(&read_only));
+        let denied = anyhow::Error::new(io::Error::from(io::ErrorKind::PermissionDenied))
+            .context("create private cache-root write probe");
+        assert!(!is_read_only_root_failure(&denied));
+        assert!(!is_read_only_root_failure(&anyhow::anyhow!(
+            "cache-root volume identity changed"
+        )));
     }
 }
