@@ -4571,6 +4571,9 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
     ] {
         assert!(help.contains(command));
     }
+    assert_eq!(help.matches("dev-auth workload bind plan NAME").count(), 1);
+    assert!(help.contains("--code-trust pinned|mutable"));
+    assert!(help.contains("--caller-argument-index N"));
     assert!(!help.to_ascii_lowercase().contains("codex"));
     assert!(!help.to_ascii_lowercase().contains("homelab"));
 }

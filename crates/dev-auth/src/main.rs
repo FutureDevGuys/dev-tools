@@ -84,10 +84,10 @@ fn usage() -> String {
         "\n  dev-auth update install|apply [--json] [--offline]\n  dev-auth update rollback [--json]",
     );
     commands.push_str(
-        "\n  dev-auth setup template binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth workload bind inspect ALIAS [--json]\n  dev-auth workload bind plan NAME --user USER --workload WORKLOAD --command-name COMMAND --target current-resolution|structured --code-trust pinned|mutable --output PLAN [--json]",
+        "\n  dev-auth setup template binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind inspect ALIAS [--json]\n  dev-auth workload bind plan NAME [--user USER] --workload WORKLOAD --command-name COMMAND --target current-resolution|structured [--executable PATH] [--arg VALUE]... [--caller-argument-index N] [--code-trust pinned|mutable] --output PLAN [--json]",
     );
     format!(
-        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
+        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell",
         commands
     )
 }
