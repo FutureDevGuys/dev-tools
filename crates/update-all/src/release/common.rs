@@ -90,6 +90,7 @@ impl CandidateCache {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn load(paths: &Paths) -> Result<Option<AuthenticatedCandidate>> {
         let authority = Self::authority(paths)?;
         let Some(document) =
@@ -263,11 +264,18 @@ impl UpdateAdapter for CommonAdapter {
     fn load_authenticated_candidate(
         &mut self,
     ) -> Result<Option<AuthenticatedCandidate>, UpdateError> {
-        let paths = self
-            .paths
-            .as_ref()
-            .map_err(|_| UpdateError::new(UpdateErrorKind::InvalidConfiguration))?;
-        CandidateCache::load(paths).map_err(|_| UpdateError::new(UpdateErrorKind::Authority))
+        #[cfg(target_os = "linux")]
+        {
+            let paths = self
+                .paths
+                .as_ref()
+                .map_err(|_| UpdateError::new(UpdateErrorKind::InvalidConfiguration))?;
+            CandidateCache::load(paths).map_err(|_| UpdateError::new(UpdateErrorKind::Authority))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(UpdateError::new(UpdateErrorKind::Unsupported))
+        }
     }
 
     fn refresh_authenticated_candidate(&mut self) -> Result<AuthenticatedCandidate, UpdateError> {
