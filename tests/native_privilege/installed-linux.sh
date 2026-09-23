@@ -92,7 +92,7 @@ case ${1:-} in
                     chmod 0644 "$fixture/container-start.log" "$fixture/container-state.json"
                 fi
                 # These files contain only fixture progress and value-free results.
-                for file in installed-progress.json installed-result.json login-session-initial.json login-session-after-workload.json workload-launch-result.json user-launch-result.json user-leave.json failed-start-result.json grants.json; do
+                for file in installed-progress.json installed-result.json login-session-initial.json login-session-after-workload.json loginctl-error.txt workload-launch-result.json user-launch-result.json user-leave.json failed-start-result.json grants.json; do
                     "${runtime[@]}" cp "$container:/home/dev-auth-recover-alpha/$file" "$fixture/$file" >/dev/null 2>&1 || true
                     [[ ! -f "$fixture/$file" ]] || chmod 0644 "$fixture/$file"
                 done
@@ -101,6 +101,8 @@ case ${1:-} in
                     # only native PAM/logind messages, never terminal output.
                     "${runtime[@]}" exec "$container" /usr/bin/journalctl -b --no-pager -o cat --grep 'pam_systemd|systemd-logind' >"$fixture/login-journal.txt" 2>&1 || true
                     chmod 0644 "$fixture/login-journal.txt"
+                    "${runtime[@]}" exec "$container" /usr/bin/journalctl -b --no-pager -o cat SYSLOG_IDENTIFIER=login >"$fixture/pam-login-journal.txt" 2>&1 || true
+                    chmod 0644 "$fixture/pam-login-journal.txt"
                 fi
                 if "${runtime[@]}" rm --force --time 5 "$container"; then removed=true; else code=1; fi
             fi
@@ -216,6 +218,8 @@ case ${1:-} in
             # with logout; debug logging is confined to this no-password run.
             logged "${runtime[@]}" exec "$container" /usr/bin/sed -i 's/pam_systemd\.so$/pam_systemd.so debug/' /etc/pam.d/system-auth
             printf '\nDiagnosing native logind registration through login(1) without a password. This does not qualify the installed-grant gate.\n'
+            # Do not interpose strace on login's foreground PTY: ptrace can
+            # stop its terminal ownership transition with SIGTTOU.
             "${runtime[@]}" exec --env XDG_SESSION_CLASS=user-light --env XDG_SESSION_TYPE=tty --interactive --tty "$container" /usr/bin/login -f dev-auth-recover-alpha
             "${runtime[@]}" cp "$container:/home/dev-auth-recover-alpha/login-session-initial.json" "$fixture/login-session-initial.json"
             chmod 0644 "$fixture/login-session-initial.json"

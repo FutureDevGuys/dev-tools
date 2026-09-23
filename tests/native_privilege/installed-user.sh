@@ -32,9 +32,13 @@ no_active_user_grant() {
 }
 interactive_login_session() {
     local result_file=$1
-    local account_uid sessions session class kind state count=0 found=false
+    local account_uid sessions session class kind state count=0 found=false query_ok=true
     account_uid=$(id -u)
-    sessions=$(loginctl show-user "$account_uid" --property=Sessions --value 2>/dev/null) || sessions=''
+    if [[ -e /fixture/login-session-probe-only ]]; then
+        sessions=$(loginctl show-user "$account_uid" --property=Sessions --value 2>loginctl-error.txt) || { sessions=''; query_ok=false; }
+    else
+        sessions=$(loginctl show-user "$account_uid" --property=Sessions --value 2>/dev/null) || { sessions=''; query_ok=false; }
+    fi
     class=''
     kind=''
     state=''
@@ -50,9 +54,11 @@ interactive_login_session() {
                 ;;
         esac
     done
-    jq -n --argjson session_count "$count" --argjson interactive "$found" \
+    jq -n --argjson session_count "$count" --argjson interactive "$found" --argjson loginctl_query_ok "$query_ok" \
+        --argjson xdg_session_id_present "$([[ -n ${XDG_SESSION_ID:-} ]] && echo true || echo false)" \
+        --arg environment_class "${XDG_SESSION_CLASS:-}" --arg environment_type "${XDG_SESSION_TYPE:-}" \
         --arg class "$class" --arg type "$kind" --arg state "$state" \
-        '{schema:"dev-auth-installed-login-check-v1",session_count:$session_count,interactive:$interactive,last_class:$class,last_type:$type,last_state:$state}' >"$result_file"
+        '{schema:"dev-auth-installed-login-check-v1",session_count:$session_count,interactive:$interactive,loginctl_query_ok:$loginctl_query_ok,xdg_session_id_present:$xdg_session_id_present,environment_class:$environment_class,environment_type:$environment_type,last_class:$class,last_type:$type,last_state:$state}' >"$result_file"
     [[ "$found" == true ]]
 }
 
