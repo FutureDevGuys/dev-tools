@@ -271,7 +271,7 @@ case ${1:-} in
         }
         watch_progress &
         progress_watcher=$!
-        "${runtime[@]}" exec --interactive --tty "$container" /usr/bin/login dev-auth-recover-alpha
+        "${runtime[@]}" exec --env XDG_SESSION_CLASS=user-light --env XDG_SESSION_TYPE=tty --interactive --tty "$container" /usr/bin/login dev-auth-recover-alpha
         kill "$progress_watcher" 2>/dev/null || true
         wait "$progress_watcher" 2>/dev/null || true
         progress_watcher=''
