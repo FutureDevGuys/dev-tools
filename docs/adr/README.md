@@ -98,6 +98,8 @@ Read the applicable records before changing a public product contract or cross-p
 | [0091](0091-dev-auth-metadata-only-release-observation.md) | Dev Auth metadata-only stable-release observation | proposed | pending |
 | [0092](0092-read-only-signed-release-cache-observation.md) | Read-only signed-release cache observation | proposed | pending |
 | [0093](0093-setup-owned-dev-auth-update-transitions.md) | Setup-owned Dev Auth update transitions | proposed | pending |
+| [0094](0094-explicit-binding-code-trust.md) | Explicit binding code trust | proposed | pending |
+| [0095](0095-setup-owned-mutable-binding-activation.md) | Setup-owned mutable binding activation | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

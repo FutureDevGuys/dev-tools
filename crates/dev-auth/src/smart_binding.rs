@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v2";
+const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v3";
 const MAX_BINDING_TARGET_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,6 +24,13 @@ pub enum BindingMode {
 pub enum BindingAuthority {
     RootOwned,
     UserOwned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingCodeTrust {
+    Pinned,
+    Mutable,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,7 +111,7 @@ impl From<ResolvedContinuation> for BindingResolution {
 }
 
 impl BindingResolution {
-    fn identity(&self) -> &ExecutableIdentity {
+    pub fn identity(&self) -> &ExecutableIdentity {
         match self {
             Self::Continuation { resolution } => &resolution.identity,
             Self::Structured { identity } => identity,
@@ -195,6 +202,7 @@ impl BindingTargetIntent {
 pub struct BindingIntent {
     pub command_name: String,
     pub workload: String,
+    pub code_trust: BindingCodeTrust,
     pub target: BindingTargetIntent,
 }
 
@@ -241,8 +249,14 @@ impl BindingIntent {
         Ok(Self {
             command_name,
             workload,
+            code_trust: BindingCodeTrust::Pinned,
             target,
         })
+    }
+
+    pub fn with_code_trust(mut self, code_trust: BindingCodeTrust) -> Self {
+        self.code_trust = code_trust;
+        self
     }
 }
 
@@ -352,7 +366,7 @@ pub fn build_binding_plan(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(BindingPlan {
-        schema: "dev-auth-workload-binding-plan-v2".to_owned(),
+        schema: "dev-auth-workload-binding-plan-v3".to_owned(),
         platform: current_platform(),
         name,
         intent,
@@ -394,7 +408,7 @@ pub fn write_binding_plan(path: &Path, plan: &BindingPlan) -> Result<String> {
 }
 
 fn validate_binding_plan(plan: &BindingPlan) -> Result<()> {
-    if plan.schema != "dev-auth-workload-binding-plan-v2" {
+    if plan.schema != "dev-auth-workload-binding-plan-v3" {
         bail!("workload binding plan schema is not supported");
     }
     if plan.platform != current_platform() {

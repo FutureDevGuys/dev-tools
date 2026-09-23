@@ -223,6 +223,11 @@ fn specification() -> Command {
                 .subcommand(
                     command("bind")
                         .subcommand(
+                            command("inspect")
+                                .arg(positional("alias"))
+                                .arg(flag("json")),
+                        )
+                        .subcommand(
                             command("discover")
                                 .arg(positional("command"))
                                 .arg(flag("json")),
@@ -231,8 +236,10 @@ fn specification() -> Command {
                             command("plan").args([
                                 positional("name"),
                                 value("workload"),
+                                value("user"),
                                 value("command-name"),
                                 choice("target", ["current-resolution", "structured"]),
+                                choice("code-trust", ["pinned", "mutable"]),
                                 path("executable"),
                                 value("arg")
                                     .action(clap::ArgAction::Append)

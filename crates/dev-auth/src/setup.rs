@@ -63,6 +63,9 @@ pub fn setup_template(name: &str) -> Result<&'static str> {
         "credential-privilege-deployment" => Ok(include_str!(
             "../credential-privilege-deployment.example.toml"
         )),
+        "binding-deployment" => Ok(include_str!("../binding-deployment.example.toml")),
+        "binding-user-only-policy" => Ok(include_str!("../binding-policy-v3.example.toml")),
+        "binding-user-config" => Ok(include_str!("../binding-config-v3.example.toml")),
         _ => bail!(
             "setup template must be one of: {}",
             crate::SETUP_TEMPLATE_NAMES.join(", ")
@@ -2274,6 +2277,14 @@ pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
         true,
     )?;
     Ok((paths, receipt))
+}
+
+pub(crate) fn read_install_receipt_at(paths: &SetupPaths) -> Result<Option<InstallReceipt>> {
+    match fs::symlink_metadata(paths.receipt_path()) {
+        Ok(_) => read_receipt(&paths.receipt_path()).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect current installation receipt"),
+    }
 }
 
 /// Resolves the receipt-owned running executable without entering the installation mutation lane.
@@ -4815,7 +4826,17 @@ pub fn verify_user_integrations_at(
     owner_uid: u32,
 ) -> Result<UserIntegrationReport> {
     let aliases = workloads.keys().cloned().collect::<Vec<_>>();
-    validate_workload_alias_names(&aliases)?;
+    verify_user_integrations_with_aliases_at(home, executable, workloads, &aliases, owner_uid)
+}
+
+pub fn verify_user_integrations_with_aliases_at(
+    home: &Path,
+    executable: &Path,
+    workloads: &BTreeMap<String, crate::policy_v2::ResolvedWorkload>,
+    aliases: &[String],
+    owner_uid: u32,
+) -> Result<UserIntegrationReport> {
+    validate_workload_alias_names(aliases)?;
     validate_native_program(executable, "workload broker executable")?;
     let workload_receipt = read_workload_alias_receipt(home, owner_uid)?;
     if aliases.is_empty() {
@@ -4829,10 +4850,12 @@ pub fn verify_user_integrations_at(
         let receipt = workload_receipt
             .as_ref()
             .context("workload launcher receipt is not installed")?;
-        if receipt.executable != executable.display().to_string() || receipt.aliases != aliases {
+        if receipt.executable != executable.display().to_string()
+            || receipt.aliases.as_slice() != aliases
+        {
             bail!("workload launcher receipt does not match the resolved policy");
         }
-        for alias in &aliases {
+        for alias in aliases {
             let path = home.join(".local/bin").join(alias);
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect workload launcher {}", path.display()))?;
@@ -5420,18 +5443,7 @@ pub fn resolve_current_workload_alias(alias: &str) -> Result<crate::policy_v2::R
         .context("native user account does not exist")?;
     let (_, installation) = current_runtime_installation()?;
     let executable = PathBuf::from(&installation.executable);
-    let receipt = read_workload_alias_receipt(&user.dir, owner_uid)?
-        .context("workload launcher receipt is not installed")?;
-    if !receipt.aliases.iter().any(|value| value == alias)
-        || Path::new(&receipt.executable) != executable
-    {
-        bail!("workload launcher is outside the installed alias set");
-    }
-    let path = user.dir.join(".local/bin").join(alias);
-    let metadata = fs::symlink_metadata(&path).context("inspect current workload launcher")?;
-    if !metadata.file_type().is_symlink() || fs::read_link(&path)? != executable {
-        bail!("current workload launcher does not match its receipt");
-    }
+    verify_current_workload_alias_link(alias, &user.dir, owner_uid, &executable)?;
     let policy = match installation.mode {
         InstallMode::Strong => crate::policy_store::load_resolved_policy_for_uid(owner_uid)?,
         InstallMode::UserOnly => {
@@ -5443,6 +5455,28 @@ pub fn resolve_current_workload_alias(alias: &str) -> Result<crate::policy_v2::R
         .get(alias)
         .cloned()
         .context("workload launcher is absent from the resolved user policy")
+}
+
+pub(crate) fn verify_current_workload_alias_link(
+    alias: &str,
+    home: &Path,
+    owner_uid: u32,
+    executable: &Path,
+) -> Result<()> {
+    validate_workload_alias_names(&[alias.to_owned()])?;
+    let receipt = read_workload_alias_receipt(home, owner_uid)?
+        .context("workload launcher receipt is not installed")?;
+    if !receipt.aliases.iter().any(|value| value == alias)
+        || Path::new(&receipt.executable) != executable
+    {
+        bail!("workload launcher is outside the installed alias set");
+    }
+    let path = home.join(".local/bin").join(alias);
+    let metadata = fs::symlink_metadata(&path).context("inspect current workload launcher")?;
+    if !metadata.file_type().is_symlink() || fs::read_link(&path)? != executable {
+        bail!("current workload launcher does not match its receipt");
+    }
+    Ok(())
 }
 
 fn read_approved_public_document(source: &Path, approved_sha256: &str) -> Result<Vec<u8>> {

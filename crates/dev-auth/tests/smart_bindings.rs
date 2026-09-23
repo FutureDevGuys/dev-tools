@@ -4,8 +4,8 @@ use dev_auth::smart_binding::{
     advance_binding, build_binding_plan, canonical_binding_plan, classify_binding_change,
     default_proxy_directories, require_automatic_refresh, resolve_continuation,
     resolve_structured_target, validate_binding_receipt_structure, write_binding_plan,
-    BindingAuthority, BindingChange, BindingIntent, BindingMode, BindingPlanChange, BindingReceipt,
-    BindingResolution, BindingTargetIntent,
+    BindingAuthority, BindingChange, BindingCodeTrust, BindingIntent, BindingMode,
+    BindingPlanChange, BindingReceipt, BindingResolution, BindingTargetIntent,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -449,7 +449,8 @@ fn canonical_binding_plans_are_value_stable_and_create_new() {
     assert_eq!(digest.len(), 64);
     assert!(write_binding_plan(&output, &first).is_err());
     let persisted: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
-    assert_eq!(persisted["schema"], "dev-auth-workload-binding-plan-v2");
+    assert_eq!(persisted["schema"], "dev-auth-workload-binding-plan-v3");
+    assert_eq!(persisted["intent"]["code_trust"], "pinned");
     assert_eq!(persisted["resolved"]["kind"], "continuation");
     assert_eq!(persisted["change"], "install");
 }
@@ -710,6 +711,8 @@ fn cli_plans_a_structured_alias_without_path_discovery_or_execution() {
             "batch",
             "--caller-argument-index",
             "1",
+            "--code-trust",
+            "mutable",
             "--output",
         ])
         .arg(&output)
@@ -723,8 +726,9 @@ fn cli_plans_a_structured_alias_without_path_discovery_or_execution() {
     );
     let plan: dev_auth::smart_binding::BindingPlan =
         serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
-    assert_eq!(plan.schema, "dev-auth-workload-binding-plan-v2");
+    assert_eq!(plan.schema, "dev-auth-workload-binding-plan-v3");
     assert_eq!(plan.intent.command_name, "agent");
+    assert_eq!(plan.intent.code_trust, BindingCodeTrust::Mutable);
     assert!(matches!(
         plan.resolved,
         BindingResolution::Structured { .. }
@@ -756,7 +760,7 @@ fn structured_resolution_does_not_invent_a_path_slot_and_rejects_kind_confusion(
     let plan = build_binding_plan("agent", intent.clone(), resolved.clone(), None).unwrap();
     let document: serde_json::Value =
         serde_json::from_slice(&canonical_binding_plan(&plan).unwrap()).unwrap();
-    assert_eq!(document["schema"], "dev-auth-workload-binding-plan-v2");
+    assert_eq!(document["schema"], "dev-auth-workload-binding-plan-v3");
     assert_eq!(document["resolved"]["kind"], "structured");
     assert!(document["resolved"].get("search_index").is_none());
     assert!(document["resolved"].get("continuation_path").is_none());
@@ -830,7 +834,7 @@ fn structured_cli_rejects_invalid_shapes_before_writing_a_plan() {
 }
 
 #[test]
-fn v2_resolution_rejects_extra_fields_and_legacy_schema_relabeling() {
+fn v3_resolution_rejects_extra_fields_and_legacy_schema_relabeling() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("agent");
     executable(&target, b"runtime");
@@ -840,11 +844,85 @@ fn v2_resolution_rejects_extra_fields_and_legacy_schema_relabeling() {
     assert!(serde_json::from_value::<BindingResolution>(encoded).is_err());
     let intent = BindingIntent::structured("agent", "automation", &target, ["--batch"]).unwrap();
     let mut plan = build_binding_plan("agent", intent.clone(), resolved.clone(), None).unwrap();
-    plan.schema = "dev-auth-workload-binding-plan-v1".into();
+    plan.schema = "dev-auth-workload-binding-plan-v2".into();
     assert!(canonical_binding_plan(&plan).is_err());
     let mut receipt = BindingReceipt::new(intent, resolved).unwrap();
-    receipt.schema = "dev-auth-workload-binding-receipt-v1".into();
+    receipt.schema = "dev-auth-workload-binding-receipt-v2".into();
     assert!(validate_binding_receipt_structure(&receipt).is_err());
+}
+
+#[test]
+fn mutable_code_trust_requires_an_explicit_rebind_from_pinned() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("agent");
+    executable(&target, b"runtime");
+    let resolved = resolve_structured_target(&target).unwrap();
+    let pinned =
+        BindingIntent::structured("agent", "automation", &target, Vec::<String>::new()).unwrap();
+    let receipt = BindingReceipt::new(pinned.clone(), resolved.clone()).unwrap();
+    let unchanged = build_binding_plan("agent", pinned, resolved.clone(), Some(&receipt)).unwrap();
+    assert_eq!(unchanged.change, BindingPlanChange::Unchanged);
+    let mutable = BindingIntent::structured("agent", "automation", &target, Vec::<String>::new())
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
+    let rebind =
+        build_binding_plan("agent", mutable.clone(), resolved.clone(), Some(&receipt)).unwrap();
+    assert_eq!(rebind.change, BindingPlanChange::Rebind);
+    let advanced = advance_binding(&receipt, mutable, resolved).unwrap();
+    assert_eq!(advanced.active.intent.code_trust, BindingCodeTrust::Mutable);
+    assert_eq!(
+        advanced.previous.unwrap().intent.code_trust,
+        BindingCodeTrust::Pinned
+    );
+}
+
+#[test]
+fn minimal_binding_workload_needs_no_credential_provider() {
+    let policy = br#"schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["binding-test"]
+[programs]
+git = "/usr/bin/true"
+gh = "/usr/bin/true"
+ssh = "/usr/bin/true"
+ssh_keygen = "/usr/bin/true"
+[trusted_launchers]
+agent = "/usr/bin/true"
+[credentials]
+providers = {}
+credential_slots = {}
+resources = {}
+[credentials.resource_caps.empty]
+users = ["binding-test"]
+resources = {}
+[workload_caps.agent]
+users = ["binding-test"]
+resource_cap = "empty"
+launchers = ["agent"]
+admission = ["approval_required"]
+max_duration_seconds = 3600
+"#;
+    let config = br#"schema = "dev-auth-user-config-v3"
+[authority_profiles.main]
+cap = "agent"
+resources = {}
+[[workloads]]
+name = "automation"
+profile = "main"
+launcher = "agent"
+admission = "approval_required"
+duration_seconds = 1800
+resources = {}
+"#;
+    let administrator = dev_auth::runtime_policy::parse_runtime_administrator(policy).unwrap();
+    let resolved = administrator.resolve_user("binding-test", config).unwrap();
+    assert_eq!(
+        resolved.workloads["automation"].launcher_path,
+        "/usr/bin/true"
+    );
+    assert!(resolved.workloads["automation"]
+        .secret_references
+        .is_empty());
 }
 
 #[test]

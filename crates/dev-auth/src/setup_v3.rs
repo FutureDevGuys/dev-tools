@@ -10,7 +10,8 @@ use crate::runtime_policy::{parse_runtime_administrator, RuntimeAdministrator};
 use crate::setup::{render_plan, SetupPlan};
 use anyhow::{bail, Context, Result};
 use dev_tools_installation::{
-    read_atomic_document, write_atomic_document, DocumentAuthority, InstallationLock,
+    read_atomic_document, write_atomic_document, ArtifactIdentity, DocumentAuthority,
+    InstallationLock,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +25,16 @@ use std::path::{Path, PathBuf};
 const DOCUMENT_LIMIT: u64 = 1024 * 1024;
 const CURRENT_OBJECT_LIMIT: u64 = 256 * 1024 * 1024;
 const PRIVILEGE_LIBRARY_LIMIT: u64 = 16 * 1024 * 1024;
+
+fn setup_plan_schema(intent: &DeploymentIntent) -> &'static str {
+    if intent.schema == "dev-auth-deployment-intent-v3" {
+        "dev-auth-setup-plan-v5"
+    } else if intent.has_privilege() {
+        "dev-auth-setup-plan-v4"
+    } else {
+        "dev-auth-setup-plan-v3"
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod recovery_native;
@@ -678,7 +689,7 @@ where
 
     let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
     apply_credential_actions(plan, &action_set_sha256, credentials, &mut actions)?;
-    start_and_activate_candidate(plan, &mut actions)?;
+    start_and_activate_candidate(plan, documents, &mut actions)?;
     #[cfg(target_os = "linux")]
     if plan.intent.privilege_policy.is_some() {
         privilege::apply_component(plan, documents, &mut actions)?;
@@ -1188,7 +1199,127 @@ fn revoke_credential(plan: &SetupPlanV3, slot: &str) -> Result<()> {
     }
 }
 
-fn start_and_activate_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<()> {
+#[cfg(target_os = "linux")]
+fn publish_binding_sets(
+    plan: &SetupPlanV3,
+    documents: &[RetainedCandidateDocument],
+    actions: &mut Vec<String>,
+) -> Result<BTreeMap<String, crate::binding_activation::BindingSetReceipt>> {
+    if plan.intent.schema != "dev-auth-deployment-intent-v3" {
+        return Ok(BTreeMap::new());
+    }
+    let digest = render_setup_plan_v3(plan)?.1;
+    let owner_uid = apply_owner_uid(plan)?;
+    let transition =
+        crate::setup_transition::retained_transition(&plan.installation.paths, owner_uid)?
+            .context("binding publication requires retained full setup authority")?;
+    let generation: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes)?;
+    if transition.phase != crate::setup_transition::Phase::Pending
+        || generation.plan_sha256 != digest
+        || generation.plan != *plan
+    {
+        bail!("binding publication does not match its pending setup generation");
+    }
+    let prior_installation =
+        retained_installation_receipts(&generation)?.map(|(receipt, _)| receipt);
+    let next_installation = crate::setup::read_install_receipt_at(&plan.installation.paths)?
+        .context("binding publication requires the candidate installation receipt")?;
+    let mut active = BTreeMap::new();
+    for account in plan.accounts.iter().chain(&plan.retiring_accounts) {
+        let current = plan
+            .current_paths
+            .iter()
+            .find(|entry| entry.kind == "binding_set_receipt" && entry.subject == account.name)
+            .context("binding set receipt is absent from setup current-state inventory")?;
+        let expected = current.identity.as_ref().map(|identity| ArtifactIdentity {
+            length: identity.length,
+            sha256: identity.sha256.clone(),
+        });
+        let retained = generation
+            .documents
+            .iter()
+            .find(|entry| entry.current == *current)
+            .context("binding set receipt is absent from retained setup generation")?;
+        let prior_set = retained
+            .bytes
+            .as_ref()
+            .map(|bytes| {
+                serde_json::from_slice::<crate::binding_activation::BindingSetReceipt>(bytes)
+            })
+            .transpose()
+            .context("decode retained binding set receipt")?;
+        if prior_set.is_some() != expected.is_some()
+            || (prior_set.is_some() && prior_installation.is_none())
+        {
+            bail!("retained binding receipt does not match prior installation authority");
+        }
+        let path = crate::binding_activation::native_receipt_path(
+            plan.installation.request.mode,
+            &account.home,
+            account.uid,
+        )?;
+        let desired = if plan.accounts.iter().any(|entry| entry.name == account.name) {
+            let plans = plan
+                .intent
+                .bindings
+                .iter()
+                .filter(|binding| binding.user == account.name)
+                .map(|binding| {
+                    let subject = format!("{}/{}", binding.user, binding.name);
+                    let identity = document_identity(plan, "binding_plan", &subject)?;
+                    serde_json::from_slice::<crate::smart_binding::BindingPlan>(candidate_bytes(
+                        documents, identity,
+                    )?)
+                    .context("decode retained binding plan")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(crate::binding_activation::build_desired(
+                account.uid,
+                &next_installation,
+                prior_set.as_ref().zip(prior_installation.as_ref()),
+                &plans,
+            )?)
+        } else {
+            None
+        };
+        match desired {
+            Some(desired) if !desired.bindings.is_empty() => {
+                crate::binding_activation::write_at(
+                    &path,
+                    plan.installation.request.mode,
+                    account.uid,
+                    &next_installation,
+                    &desired,
+                    expected.as_ref(),
+                )?;
+                active.insert(account.name.clone(), desired);
+                actions.push(format!("publish_binding_generation:{}", account.name));
+            }
+            _ => {
+                if let Some(expected) = &expected {
+                    crate::binding_activation::retire_at(
+                        &path,
+                        plan.installation.request.mode,
+                        account.uid,
+                        expected,
+                    )?;
+                    actions.push(format!("retire_binding_generation:{}", account.name));
+                }
+            }
+        }
+    }
+    Ok(active)
+}
+
+fn start_and_activate_candidate(
+    plan: &SetupPlanV3,
+    documents: &[RetainedCandidateDocument],
+    actions: &mut Vec<String>,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let bindings = publish_binding_sets(plan, documents, actions)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = documents;
     if plan.intent.mode == DeploymentMode::Strong && broker_desired(&plan.intent) {
         crate::setup::start_system_broker_at(&plan.installation.paths)?;
         actions.push("start_broker".into());
@@ -1197,7 +1328,13 @@ fn start_and_activate_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -
         let setup = crate::setup::verify_at(&plan.installation.paths)?;
         for account in &plan.accounts {
             let workloads = resolved_workloads_for_account(plan, account)?;
-            let aliases = workloads.keys().cloned().collect::<Vec<_>>();
+            let mut aliases = workloads.keys().cloned().collect::<Vec<_>>();
+            #[cfg(target_os = "linux")]
+            if let Some(set) = bindings.get(&account.name) {
+                aliases.extend(set.bindings.keys().cloned());
+            }
+            aliases.sort();
+            aliases.dedup();
             crate::setup::reconcile_workload_launchers_at(
                 &account.home,
                 Path::new(&setup.executable),
@@ -1221,6 +1358,82 @@ fn postcondition_satisfied(
     verify_postcondition(plan, digest, documents).is_ok()
 }
 
+#[cfg(target_os = "linux")]
+fn binding_aliases_for_verified_account(
+    plan: &SetupPlanV3,
+    documents: &[RetainedCandidateDocument],
+    account: &NativeAccountIdentity,
+    installation: &crate::setup::InstallReceipt,
+    workloads: &BTreeMap<String, crate::policy_v2::ResolvedWorkload>,
+    generation: &RetainedSetupGeneration,
+    prior_installation: Option<&crate::setup::InstallReceipt>,
+) -> Result<Vec<String>> {
+    if plan.intent.schema != "dev-auth-deployment-intent-v3" {
+        return Ok(Vec::new());
+    }
+    let path = crate::binding_activation::native_receipt_path(
+        plan.installation.request.mode,
+        &account.home,
+        account.uid,
+    )?;
+    let actual = crate::binding_activation::read_at(
+        &path,
+        plan.installation.request.mode,
+        account.uid,
+        installation,
+    )?;
+    let retained = generation
+        .documents
+        .iter()
+        .find(|object| {
+            object.current.kind == "binding_set_receipt" && object.current.subject == account.name
+        })
+        .context("retained binding receipt is absent")?;
+    let prior_set = retained
+        .bytes
+        .as_ref()
+        .map(|bytes| serde_json::from_slice::<crate::binding_activation::BindingSetReceipt>(bytes))
+        .transpose()?;
+    if prior_set.is_some() != retained.current.identity.is_some()
+        || (prior_set.is_some() && prior_installation.is_none())
+    {
+        bail!("retained binding set has incompatible prior authority");
+    }
+    let mut plans = Vec::new();
+    for reference in plan
+        .intent
+        .bindings
+        .iter()
+        .filter(|binding| binding.user == account.name)
+    {
+        let subject = format!("{}/{}", reference.user, reference.name);
+        let identity = document_identity(plan, "binding_plan", &subject)?;
+        let binding: crate::smart_binding::BindingPlan =
+            serde_json::from_slice(candidate_bytes(documents, identity)?)?;
+        let workload = workloads
+            .get(&binding.intent.workload)
+            .context("verified binding workload is absent from native policy")?;
+        if binding.name != reference.name
+            || Path::new(&workload.launcher_path)
+                != binding.resolved.identity().canonical_path.as_path()
+        {
+            bail!("verified binding plan differs from installed workload authority");
+        }
+        plans.push(binding);
+    }
+    let expected = crate::binding_activation::expected_desired_from_approved_plans(
+        account.uid,
+        installation,
+        prior_set.as_ref().zip(prior_installation),
+        &plans,
+    )?;
+    match actual {
+        None if expected.bindings.is_empty() => Ok(Vec::new()),
+        Some((actual, _)) if actual == expected => Ok(expected.bindings.into_keys().collect()),
+        _ => bail!("binding set receipt does not match approved desired state"),
+    }
+}
+
 fn verify_postcondition(
     plan: &SetupPlanV3,
     digest: &str,
@@ -1240,6 +1453,31 @@ fn verify_postcondition(
         #[cfg(not(target_os = "linux"))]
         bail!("privilege verification requires the native Linux backend");
     }
+    #[cfg(target_os = "linux")]
+    let binding_installation = if plan.intent.schema == "dev-auth-deployment-intent-v3" {
+        Some(
+            crate::setup::read_install_receipt_at(&plan.installation.paths)?
+                .context("verified binding installation receipt is absent")?,
+        )
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let binding_retained = if plan.intent.schema == "dev-auth-deployment-intent-v3" {
+        let transition = crate::setup_transition::retained_transition(
+            &plan.installation.paths,
+            apply_owner_uid(plan)?,
+        )?
+        .context("verified binding generation lacks retained setup authority")?;
+        let generation: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes)?;
+        if generation.plan != *plan || generation.plan_sha256 != digest {
+            bail!("verified binding generation differs from retained setup authority");
+        }
+        let prior = retained_installation_receipts(&generation)?.map(|(receipt, _)| receipt);
+        Some((generation, prior))
+    } else {
+        None
+    };
     let administrator = document_identity(plan, "administrator_policy", "system")?;
     let system_policy = parse_runtime_administrator(candidate_bytes(documents, administrator)?)?;
     match plan.intent.mode {
@@ -1269,19 +1507,62 @@ fn verify_postcondition(
             }
         };
         let resolved = policy.resolve_user(&account.name, &user_config)?;
+        #[cfg(target_os = "linux")]
+        let binding_aliases = if let Some(installation) = &binding_installation {
+            let (generation, prior) = binding_retained
+                .as_ref()
+                .context("verified binding generation is absent")?;
+            binding_aliases_for_verified_account(
+                plan,
+                documents,
+                account,
+                installation,
+                &resolved.workloads,
+                generation,
+                prior.as_ref(),
+            )?
+        } else {
+            Vec::new()
+        };
         let expected_workloads = if plan.intent.activation == Activation::Transparent {
             resolved.workloads
         } else {
             BTreeMap::new()
         };
-        crate::setup::verify_user_integrations_at(
+        let mut aliases = expected_workloads.keys().cloned().collect::<Vec<_>>();
+        #[cfg(target_os = "linux")]
+        if plan.intent.activation == Activation::Transparent {
+            aliases.extend(binding_aliases);
+        }
+        aliases.sort();
+        aliases.dedup();
+        crate::setup::verify_user_integrations_with_aliases_at(
             &account.home,
             Path::new(&setup.executable),
             &expected_workloads,
+            &aliases,
             account.uid,
         )?;
     }
     for account in &plan.retiring_accounts {
+        #[cfg(target_os = "linux")]
+        if let Some(installation) = &binding_installation {
+            let path = crate::binding_activation::native_receipt_path(
+                plan.installation.request.mode,
+                &account.home,
+                account.uid,
+            )?;
+            if crate::binding_activation::read_at(
+                &path,
+                plan.installation.request.mode,
+                account.uid,
+                installation,
+            )?
+            .is_some()
+            {
+                bail!("retiring account retains a binding set receipt");
+            }
+        }
         crate::setup::verify_user_integrations_at(
             &account.home,
             Path::new(&setup.executable),
@@ -1797,6 +2078,7 @@ fn build_setup_plan_v3_with_reader(
     let mut accounts = Vec::with_capacity(intent.users.len());
     let mut account_names = BTreeSet::new();
     let mut used_credential_slots = BTreeSet::new();
+    let mut resolved_workloads = BTreeMap::new();
     for user in &intent.users {
         let account = nix::unistd::User::from_name(&user.name)?
             .with_context(|| format!("native account {} does not exist", user.name))?;
@@ -1845,12 +2127,102 @@ fn build_setup_plan_v3_with_reader(
                 )
             },
         )?;
+        resolved_workloads.insert(account.name.clone(), resolved.workloads.clone());
         accounts.push(NativeAccountIdentity {
             name: account.name,
             uid: account.uid.as_raw(),
             gid: account.gid.as_raw(),
             home: account.dir,
         });
+    }
+    #[cfg(target_os = "linux")]
+    let prior_installation = crate::setup::read_install_receipt_at(&installation.paths)?;
+    for binding in &intent.bindings {
+        let account = accounts
+            .iter()
+            .find(|account| account.name == binding.user)
+            .context("binding native account is outside the setup generation")?;
+        let source = read_source(
+            &binding.plan,
+            "binding_plan",
+            &format!("{}/{}", binding.user, binding.name),
+        )?;
+        if source.identity.sha256 != binding.sha256 {
+            bail!("binding plan source does not match its declared digest");
+        }
+        let plan: crate::smart_binding::BindingPlan =
+            serde_json::from_slice(&source.bytes).context("decode approved binding plan")?;
+        if plan.name != binding.name
+            || crate::smart_binding::canonical_binding_plan(&plan)? != source.bytes
+        {
+            bail!("binding plan is not canonical for its declared name");
+        }
+        if plan.intent.code_trust != crate::smart_binding::BindingCodeTrust::Mutable {
+            bail!("pinned binding activation requires retained-byte native launch support");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let receipt_path = crate::binding_activation::native_receipt_path(
+                installation.request.mode,
+                &account.home,
+                account.uid,
+            )?;
+            let current = match &prior_installation {
+                Some(prior) => crate::binding_activation::read_at(
+                    &receipt_path,
+                    installation.request.mode,
+                    account.uid,
+                    prior,
+                )?
+                .map(|(receipt, _)| receipt),
+                None => {
+                    if fs::symlink_metadata(&receipt_path).is_ok() {
+                        bail!("binding receipt exists without an installation receipt");
+                    }
+                    None
+                }
+            };
+            if plan.current_receipt.as_ref()
+                != current
+                    .as_ref()
+                    .and_then(|current| current.bindings.get(&plan.intent.command_name))
+            {
+                bail!("binding plan no longer matches its receipt-owned generation");
+            }
+        }
+        let workload = resolved_workloads
+            .get(&account.name)
+            .and_then(
+                |workloads: &BTreeMap<String, crate::policy_v2::ResolvedWorkload>| {
+                    workloads.get(&plan.intent.workload)
+                },
+            )
+            .context("binding workload is outside the resolved user policy")?;
+        if resolved_workloads
+            .get(&account.name)
+            .is_some_and(|workloads| workloads.contains_key(&plan.intent.command_name))
+        {
+            bail!("binding alias collides with an existing workload launcher");
+        }
+        let launcher = Path::new(&workload.launcher_path);
+        let target = plan.resolved.identity().canonical_path.as_path();
+        if launcher != target
+            || matches!(
+                &plan.resolved,
+                crate::smart_binding::BindingResolution::Continuation { resolution }
+                    if resolution.visible_path != launcher
+            )
+            || target.starts_with(
+                account
+                    .home
+                    .join(".local/share/dev-auth/workload-bindings/bin"),
+            )
+            || target.starts_with("/usr/local/lib/dev-auth/workload-bindings/bin")
+            || target == Path::new(&installation.request.source_executable)
+        {
+            bail!("binding target does not match its configured workload launcher");
+        }
+        documents.push(source.identity);
     }
     validate_deployment_user_set(
         intent.mode,
@@ -1866,6 +2238,20 @@ fn build_setup_plan_v3_with_reader(
     });
     accounts.sort_by(|left, right| left.name.cmp(&right.name));
     let retiring_accounts = resolve_retiring_accounts(intent.mode, prior_policy, &accounts)?;
+    #[cfg(target_os = "linux")]
+    crate::binding_activation::require_explicit_selection_if_retained(
+        installation.request.mode,
+        &accounts
+            .iter()
+            .chain(&retiring_accounts)
+            .cloned()
+            .collect::<Vec<_>>(),
+        intent.schema == "dev-auth-deployment-intent-v3",
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    if intent.schema == "dev-auth-deployment-intent-v3" {
+        bail!("binding activation requires a native platform backend");
+    }
 
     let declared_credential_slots = intent
         .credentials
@@ -1919,12 +2305,7 @@ fn build_setup_plan_v3_with_reader(
         privilege_current_state,
         privilege_payload: Default::default(),
         authority_schema,
-        schema: if intent.privilege_policy.is_some() {
-            "dev-auth-setup-plan-v4"
-        } else {
-            "dev-auth-setup-plan-v3"
-        }
-        .into(),
+        schema: setup_plan_schema(&intent).into(),
         intent,
         intent_sha256,
         installation,
@@ -2370,12 +2751,7 @@ fn validate_setup_plan_v3_with_installation_check(
     ) {
         bail!("setup plan has an unsupported authority schema");
     }
-    if plan.schema
-        != if plan.intent.has_privilege() {
-            "dev-auth-setup-plan-v4"
-        } else {
-            "dev-auth-setup-plan-v3"
-        }
+    if plan.schema != setup_plan_schema(&plan.intent)
         || plan.intent_sha256 != sha256_hex(&canonical_deployment_intent(&plan.intent)?)
         || plan.source_documents.is_empty()
         || (!privilege_only && plan.accounts.is_empty())
@@ -2403,7 +2779,7 @@ fn validate_setup_plan_v3_with_installation_check(
             &plan.accounts,
             &plan.retiring_accounts,
             plan.authority_schema.as_deref(),
-        )
+        )?
     {
         bail!("setup plan v3 current-state paths do not match the deployment authority");
     }
@@ -2432,7 +2808,7 @@ fn expected_current_path_keys(
     accounts: &[NativeAccountIdentity],
     retiring_accounts: &[NativeAccountIdentity],
     authority_schema: Option<&str>,
-) -> Vec<(String, String, PathBuf)> {
+) -> Result<Vec<(String, String, PathBuf)>> {
     #[cfg(target_os = "linux")]
     if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
         let mut paths = crate::setup::installation_current_state_paths(
@@ -2446,7 +2822,7 @@ fn expected_current_path_keys(
         ));
         paths.extend(privilege::paths());
         paths.sort();
-        return paths;
+        return Ok(paths);
     }
     let logical = authority_schema == Some("dev-auth-administrator-policy-v3");
     let mut paths = crate::setup::installation_current_state_paths(
@@ -2487,6 +2863,18 @@ fn expected_current_path_keys(
         }
     }
     for account in accounts {
+        #[cfg(target_os = "linux")]
+        if intent.schema == "dev-auth-deployment-intent-v3" {
+            paths.push((
+                "binding_set_receipt".into(),
+                account.name.clone(),
+                crate::binding_activation::native_receipt_path(
+                    installation.request.mode,
+                    &account.home,
+                    account.uid,
+                )?,
+            ));
+        }
         paths.extend(crate::setup::user_integration_receipt_paths(
             &account.home,
             &account.name,
@@ -2524,6 +2912,18 @@ fn expected_current_path_keys(
         }
     }
     for account in retiring_accounts {
+        #[cfg(target_os = "linux")]
+        if intent.schema == "dev-auth-deployment-intent-v3" {
+            paths.push((
+                "binding_set_receipt".into(),
+                account.name.clone(),
+                crate::binding_activation::native_receipt_path(
+                    installation.request.mode,
+                    &account.home,
+                    account.uid,
+                )?,
+            ));
+        }
         paths.extend(crate::setup::user_integration_receipt_paths(
             &account.home,
             &account.name,
@@ -2550,7 +2950,7 @@ fn expected_current_path_keys(
         paths.extend(privilege::paths());
     }
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 pub fn planned_action_contract(intent: &DeploymentIntent) -> Vec<SetupActionV3> {
@@ -2616,6 +3016,9 @@ pub fn planned_action_contract(intent: &DeploymentIntent) -> Vec<SetupActionV3> 
         };
         push(kind, Some(credential.slot.clone()));
     }
+    if intent.schema == "dev-auth-deployment-intent-v3" {
+        push("publish_binding_generations", None);
+    }
     if intent.activation == Activation::Transparent {
         for user in &intent.users {
             push("install_user_integrations", Some(user.name.clone()));
@@ -2660,7 +3063,7 @@ fn current_state_snapshot(
         accounts,
         retiring_accounts,
         authority_schema,
-    );
+    )?;
     let mut entries = Vec::with_capacity(paths.len());
     for (kind, subject, path) in paths {
         let identity = match fs::symlink_metadata(&path) {
@@ -2852,6 +3255,87 @@ pub fn prepare_update_intent_from_accepted() -> Result<PreparedUpdateIntent> {
     prepare_update_intent_from_accepted_at(&paths, &receipt)
 }
 
+#[cfg(target_os = "linux")]
+fn refreshed_mutable_binding_source(
+    document: &RetainedCandidateDocument,
+    installation: &crate::setup::InstallReceipt,
+    accounts: &[NativeAccountIdentity],
+) -> Result<Vec<u8>> {
+    let prior: crate::smart_binding::BindingPlan = serde_json::from_slice(&document.bytes)
+        .context("decode accepted mutable binding source")?;
+    if prior.intent.code_trust != crate::smart_binding::BindingCodeTrust::Mutable {
+        return Ok(document.bytes.clone());
+    }
+    let (user_name, binding_name) = document
+        .identity
+        .subject
+        .split_once('/')
+        .context("accepted binding source has no native account selector")?;
+    if prior.name != binding_name {
+        bail!("accepted binding source name differs from its retained identity");
+    }
+    let account = accounts
+        .iter()
+        .find(|account| account.name == user_name)
+        .context("accepted binding native account is absent")?;
+    let receipt_path = crate::binding_activation::native_receipt_path(
+        installation.mode,
+        &account.home,
+        account.uid,
+    )?;
+    let (set, _) = crate::binding_activation::read_at(
+        &receipt_path,
+        installation.mode,
+        account.uid,
+        installation,
+    )?
+    .context("accepted mutable binding receipt is absent")?;
+    let current = set
+        .bindings
+        .get(&prior.intent.command_name)
+        .context("accepted mutable binding alias is absent")?;
+    if current.active.intent != prior.intent {
+        bail!("accepted mutable binding intent changed outside setup authority");
+    }
+    let excluded = vec![
+        PathBuf::from(&installation.executable),
+        account
+            .home
+            .join(".local/share/dev-auth/workload-bindings/bin"),
+        PathBuf::from("/usr/local/lib/dev-auth/workload-bindings/bin"),
+    ];
+    let resolved = match (&prior.intent.target, &prior.resolved) {
+        (
+            crate::smart_binding::BindingTargetIntent::Structured { executable, .. },
+            crate::smart_binding::BindingResolution::Structured { .. },
+        ) => crate::smart_binding::resolve_structured_target_excluding(executable, &excluded)?,
+        (
+            crate::smart_binding::BindingTargetIntent::Continuation,
+            crate::smart_binding::BindingResolution::Continuation { resolution },
+        ) => {
+            let next = crate::smart_binding::resolve_continuation(
+                &prior.intent.command_name,
+                &resolution.continuation_path,
+                &excluded,
+            )?;
+            if next.visible_path != resolution.visible_path
+                || next.canonical_path != resolution.canonical_path
+            {
+                bail!("mutable binding location changed outside its approved source");
+            }
+            next.into()
+        }
+        _ => bail!("accepted mutable binding target kind is invalid"),
+    };
+    let refreshed = crate::smart_binding::build_binding_plan(
+        prior.name,
+        prior.intent,
+        resolved,
+        Some(current),
+    )?;
+    crate::smart_binding::canonical_binding_plan(&refreshed)
+}
+
 pub fn prepare_update_intent_from_accepted_at(
     paths: &crate::setup::SetupPaths,
     receipt: &crate::setup::InstallReceipt,
@@ -2911,6 +3395,14 @@ pub fn prepare_update_intent_from_accepted_at(
         if !seen.insert(key) {
             bail!("accepted setup source inventory contains a duplicate declaration");
         }
+        #[cfg(target_os = "linux")]
+        let source_bytes = if key.0 == "binding_plan" {
+            refreshed_mutable_binding_source(document, receipt, &generation.plan.accounts)?
+        } else {
+            document.bytes.clone()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let source_bytes = document.bytes.clone();
         let path = sources.path().join(format!("source-{index}"));
         let mut file = OpenOptions::new()
             .write(true)
@@ -2918,7 +3410,7 @@ pub fn prepare_update_intent_from_accepted_at(
             .mode(0o600)
             .open(&path)
             .context("create private update source document")?;
-        file.write_all(&document.bytes)
+        file.write_all(&source_bytes)
             .context("write private update source document")?;
         file.sync_all()
             .context("sync private update source document")?;
@@ -2957,11 +3449,24 @@ pub fn prepare_update_intent_from_accepted_at(
                     .context("accepted update user policy source is unbound")?;
                 target.policy = Some(path);
             }
+            ("binding_plan", subject) => {
+                let target = intent
+                    .bindings
+                    .iter_mut()
+                    .find(|binding| {
+                        format!("{}/{}", binding.user, binding.name) == subject
+                            && binding.plan == document.identity.path
+                    })
+                    .context("accepted update binding plan source is unbound")?;
+                target.plan = path;
+                target.sha256 = sha256_hex(&source_bytes);
+            }
             _ => bail!("accepted update source has no deployment-intent binding"),
         }
     }
     let expected = 1
         + usize::from(intent.privilege_policy.is_some())
+        + intent.bindings.len()
         + intent
             .users
             .iter()
@@ -3293,6 +3798,7 @@ mod tests {
             privilege_policy: None,
             users: Vec::new(),
             credentials: Vec::new(),
+            bindings: Vec::new(),
         };
         let mut plan = SetupPlanV3 {
             privilege_previous_block: None,
@@ -3346,7 +3852,8 @@ mod tests {
                 &plan.retiring_accounts,
                 &[],
                 schema,
-            );
+            )
+            .unwrap();
             for relative in [
                 crate::policy_store::USER_CONFIG_RELATIVE_PATH,
                 crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH,
@@ -3378,6 +3885,7 @@ mod tests {
             &plan.retiring_accounts,
             plan.authority_schema.as_deref(),
         )
+        .unwrap()
         .into_iter()
         .filter(|(_, subject, _)| subject == "retiring")
         {
@@ -3773,6 +4281,7 @@ mod tests {
                 slot: "automation".into(),
                 intent: CredentialIntent::Rotate,
             }],
+            bindings: Vec::new(),
         };
         let epoch = credential_action_set_sha256(&intent).unwrap();
         let unrelated_change = DeploymentIntent {
@@ -3865,6 +4374,7 @@ mod tests {
             privilege_policy: None,
             users: Vec::new(),
             credentials: Vec::new(),
+            bindings: Vec::new(),
         };
         assert!(broker_desired(&intent));
 

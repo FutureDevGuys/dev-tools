@@ -57,6 +57,29 @@ intent = "enroll-if-absent"
 "#;
 
 #[test]
+fn binding_references_require_explicit_deployment_v3_and_exact_users() {
+    let binding = format!(
+        "\n[[bindings]]\nuser = \"alice\"\nname = \"agent\"\nplan = \"/srv/dev-auth/agent-binding.json\"\nsha256 = \"{}\"\n",
+        "a".repeat(64)
+    );
+    let legacy = format!("{DEPLOYMENT}{binding}");
+    assert!(parse_deployment_document(legacy.as_bytes()).is_err());
+    let versioned = legacy.replace("dev-auth-deployment-v1", "dev-auth-deployment-v3");
+    let document = parse_deployment_document(versioned.as_bytes()).unwrap();
+    let intent = normalize_deployment(Some(document), DeploymentCliInput::default()).unwrap();
+    assert_eq!(intent.schema, "dev-auth-deployment-intent-v3");
+    assert_eq!(intent.bindings.len(), 1);
+    assert_eq!(intent.bindings[0].user, "alice");
+    assert_eq!(intent.bindings[0].name, "agent");
+    assert!(canonical_deployment_intent(&intent).is_ok());
+    let foreign = versioned.replace(
+        "user = \"alice\"\nname = \"agent\"",
+        "user = \"mallory\"\nname = \"agent\"",
+    );
+    assert!(parse_deployment_document(foreign.as_bytes()).is_err());
+}
+
+#[test]
 fn deployment_reader_preserves_regular_document_custody_checks() {
     use dev_auth::deployment::read_deployment_document;
     let root = tempfile::tempdir().unwrap();
@@ -120,6 +143,7 @@ fn cli_equivalent() -> DeploymentCliInput {
         ],
         user_policies: Vec::new(),
         credential_intents: vec![("automation".into(), CredentialIntent::EnrollIfAbsent)],
+        bindings: Vec::new(),
     }
 }
 
@@ -179,6 +203,27 @@ fn published_deployment_example_is_nonsecret_and_parses_as_full_desired_state() 
     assert!(!text.contains("op://"));
     assert!(!text.to_ascii_lowercase().contains("token ="));
     assert!(!text.to_ascii_lowercase().contains("password ="));
+}
+
+#[test]
+fn published_binding_templates_are_provider_free_and_schema_bound() {
+    let deployment = dev_auth::setup::setup_template("binding-deployment").unwrap();
+    let document = parse_deployment_document(deployment.as_bytes()).unwrap();
+    assert_eq!(document.schema, "dev-auth-deployment-v3");
+    assert_eq!(document.bindings.len(), 1);
+    let intent = normalize_deployment(Some(document), DeploymentCliInput::default()).unwrap();
+    assert_eq!(intent.schema, "dev-auth-deployment-intent-v3");
+    let policy = dev_auth::setup::setup_template("binding-user-only-policy").unwrap();
+    let config = dev_auth::setup::setup_template("binding-user-config").unwrap();
+    let resolved = dev_auth::runtime_policy::parse_runtime_administrator(policy.as_bytes())
+        .unwrap()
+        .resolve_user("example-user", config.as_bytes())
+        .unwrap();
+    assert!(resolved.workloads.contains_key("automation"));
+    assert!(resolved.workloads["automation"]
+        .secret_references
+        .is_empty());
+    assert!(!deployment.contains("op://"));
 }
 
 #[test]
@@ -391,6 +436,7 @@ config = "{}"
             user_configs: vec![(user.name.clone(), config)],
             user_policies: Vec::new(),
             credential_intents: Vec::new(),
+            bindings: Vec::new(),
         },
     )
     .unwrap();

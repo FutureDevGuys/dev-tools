@@ -391,6 +391,7 @@ fn native_disposable_strong_generation_restores_inactive_and_retries() {
             policy: None,
         }],
         credentials: Vec::new(),
+        bindings: Vec::new(),
     };
     let (current_paths, ready, broker) = current_state_snapshot(
         &installation,

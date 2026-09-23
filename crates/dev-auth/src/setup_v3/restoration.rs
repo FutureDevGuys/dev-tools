@@ -2,6 +2,8 @@ use super::*;
 use crate::setup::restoration::{InitialInstallationRestoration, RetainedInstallationRestoration};
 use crate::setup_transition::Phase;
 
+#[cfg(target_os = "linux")]
+mod binding;
 mod configuration;
 mod integration;
 #[cfg(test)]
@@ -328,6 +330,7 @@ fn restore_owned_inner(
         }
         Ok(())
     })?;
+    progress.next_action = "inspect_retained_configuration";
     let configurations = restoration_documents(&generation)?;
     for document in &configurations {
         document.observe()?;
@@ -384,14 +387,26 @@ fn restore_owned_inner(
     }
     validate_prior_configuration(&generation)?;
     let integration_executable = installation.integration_executable()?;
+    progress.next_action = "inspect_retained_workload_integrations";
     let workload_retirements =
         integration::workload_retirements(&generation, &integration_executable)?;
     for retirement in &workload_retirements {
         retirement.observe()?;
     }
+    progress.next_action = "inspect_retained_desktop_integrations";
     let desktop_retirements = integration::desktop_retirements(&generation)?;
     for retirement in &desktop_retirements {
         retirement.observe()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        progress.next_action = "inspect_retained_binding_integrations";
+    }
+    #[cfg(target_os = "linux")]
+    let binding_restorations = binding::binding_restorations(&generation)?;
+    #[cfg(target_os = "linux")]
+    for restoration in &binding_restorations {
+        restoration.observe()?;
     }
     if deployment_mode == DeploymentMode::UserOnly {
         crate::setup::require_user_sessions_absent()?;
@@ -405,6 +420,10 @@ fn restore_owned_inner(
         }
         for retirement in &desktop_retirements {
             retirement.verify_retired()?;
+        }
+        #[cfg(target_os = "linux")]
+        for restoration in &binding_restorations {
+            restoration.verify_restored()?;
         }
         for document in &configurations {
             document.verify_restored()?;
@@ -430,6 +449,10 @@ fn restore_owned_inner(
     for retirement in &desktop_retirements {
         changed |= retirement.retire()?;
     }
+    #[cfg(target_os = "linux")]
+    for restoration in &binding_restorations {
+        changed |= restoration.restore()?;
+    }
     for document in &configurations {
         changed |= document.restore()?;
     }
@@ -439,6 +462,10 @@ fn restore_owned_inner(
     }
     for document in &configurations {
         document.verify_restored()?;
+    }
+    #[cfg(target_os = "linux")]
+    for restoration in &binding_restorations {
+        restoration.verify_restored()?;
     }
     // restore() verified the exact binary postcondition; configuration reads
     // above do not mutate installation state and the exclusive lease remains held.
@@ -914,6 +941,7 @@ mod tests {
                 privilege_policy: None,
                 users: Vec::new(),
                 credentials: Vec::new(),
+                bindings: Vec::new(),
             },
             intent_sha256: String::new(),
             installation: SetupPlan {

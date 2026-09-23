@@ -1,0 +1,30 @@
+# Fictional provider-free user-only workload authority. Replace native paths
+# and account before setup; a template alone does not activate a binding.
+schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["example-user"]
+
+[programs]
+git = "/usr/bin/git"
+gh = "/usr/bin/gh"
+ssh = "/usr/bin/ssh"
+ssh_keygen = "/usr/bin/ssh-keygen"
+
+[trusted_launchers]
+agent = "/home/example-user/.local/bin/agent-real"
+
+[credentials]
+providers = {}
+credential_slots = {}
+resources = {}
+
+[credentials.resource_caps.empty]
+users = ["example-user"]
+resources = {}
+
+[workload_caps.agent]
+users = ["example-user"]
+resource_cap = "empty"
+launchers = ["agent"]
+admission = ["approval_required"]
+max_duration_seconds = 3600

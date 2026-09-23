@@ -83,6 +83,9 @@ fn usage() -> String {
     commands.push_str(
         "\n  dev-auth update install|apply [--json] [--offline]\n  dev-auth update rollback [--json]",
     );
+    commands.push_str(
+        "\n  dev-auth setup template binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth workload bind inspect ALIAS [--json]\n  dev-auth workload bind plan NAME --user USER --workload WORKLOAD --command-name COMMAND --target current-resolution|structured --code-trust pinned|mutable --output PLAN [--json]",
+    );
     format!(
         "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
         commands
@@ -113,6 +116,46 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
         bail!("workload management requires bind; launch is available on strong Linux")
     }
     match arguments.next().as_deref() {
+        Some("inspect") => {
+            let alias = arguments
+                .next()
+                .context("workload bind inspect requires an alias")?;
+            let json = match arguments.next().as_deref() {
+                None => false,
+                Some("--json") if arguments.next().is_none() => true,
+                _ => bail!("workload bind inspect accepts only ALIAS [--json]"),
+            };
+            #[cfg(target_os = "linux")]
+            {
+                let binding = dev_auth::binding_activation::resolve_current_alias(&alias, &[])?
+                    .context("binding alias is not active")?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "dev-auth-workload-binding-inspection-v1",
+                            "alias": alias,
+                            "workload": binding.workload,
+                            "generation": binding.generation,
+                            "code_trust": binding.code_trust,
+                            "target": binding.target,
+                        })
+                    );
+                } else {
+                    println!("binding_alias={alias}");
+                    println!("workload={}", binding.workload);
+                    println!("generation={}", binding.generation);
+                    println!("code_trust={:?}", binding.code_trust);
+                    println!("target={}", binding.target.display());
+                }
+                Ok(0)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (alias, json);
+                bail!("binding inspection requires a native platform backend")
+            }
+        }
         Some("discover") => {
             let command_name = arguments
                 .next()
@@ -151,8 +194,10 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                 .next()
                 .context("workload bind plan requires a binding name")?;
             let mut workload = None;
+            let mut native_user = None;
             let mut command_name = None;
             let mut target = None;
+            let mut code_trust = None;
             let mut executable = None;
             let mut fixed_arguments = Vec::new();
             let mut caller_argument_index = None;
@@ -167,6 +212,9 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                                 .context("--workload requires a workload name")?,
                         );
                     }
+                    "--user" if native_user.is_none() => {
+                        native_user = Some(arguments.next().context("--user requires a name")?);
+                    }
                     "--command-name" if command_name.is_none() => {
                         command_name = Some(
                             arguments
@@ -179,6 +227,13 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                             arguments
                                 .next()
                                 .context("--target requires a target kind")?,
+                        );
+                    }
+                    "--code-trust" if code_trust.is_none() => {
+                        code_trust = Some(
+                            arguments
+                                .next()
+                                .context("--code-trust requires pinned or mutable")?,
                         );
                     }
                     "--output" if output.is_none() => {
@@ -210,10 +265,46 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
             let workload = workload.context("workload bind plan requires --workload")?;
             let command_name =
                 command_name.context("workload bind plan requires --command-name")?;
+            #[cfg(target_os = "linux")]
+            let planning = {
+                let user = match native_user {
+                    Some(user) => user,
+                    None => {
+                        nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
+                            .context("binding planning native account is absent")?
+                            .name
+                    }
+                };
+                dev_auth::binding_activation::planning_state(&user, &command_name)?
+            };
+            #[cfg(not(target_os = "linux"))]
+            if native_user.is_some() {
+                bail!("--user requires a native Linux binding backend");
+            }
+            #[cfg(target_os = "linux")]
+            let mut excluded = dev_auth::smart_binding::default_proxy_directories()?;
+            #[cfg(not(target_os = "linux"))]
+            let excluded = dev_auth::smart_binding::default_proxy_directories()?;
+            #[cfg(target_os = "linux")]
+            {
+                excluded.push(
+                    planning
+                        .account_home
+                        .join(".local/share/dev-auth/workload-bindings/bin"),
+                );
+                if let Some(executable) = &planning.installed_executable {
+                    excluded.push(executable.clone());
+                }
+            }
             let output = output.context("workload bind plan requires --output")?;
             if !output.is_absolute() {
                 bail!("workload binding plan output must be absolute")
             }
+            let code_trust = match code_trust.as_deref() {
+                None | Some("pinned") => dev_auth::smart_binding::BindingCodeTrust::Pinned,
+                Some("mutable") => dev_auth::smart_binding::BindingCodeTrust::Mutable,
+                _ => bail!("binding code trust must be pinned or mutable"),
+            };
             let (intent, resolved) = match target.as_deref() {
                 Some("current-resolution") => {
                     if executable.is_some()
@@ -223,7 +314,6 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                         bail!("structured arguments require --target structured");
                     }
                     let search_path = std::env::var_os("PATH").context("PATH is not set")?;
-                    let excluded = dev_auth::smart_binding::default_proxy_directories()?;
                     let resolved = dev_auth::smart_binding::resolve_continuation(
                         &command_name,
                         &search_path,
@@ -240,7 +330,6 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                 Some("structured") => {
                     let executable =
                         executable.context("structured target requires --executable")?;
-                    let excluded = dev_auth::smart_binding::default_proxy_directories()?;
                     let resolved = dev_auth::smart_binding::resolve_structured_target_excluding(
                         &executable,
                         &excluded,
@@ -265,7 +354,16 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                 }
                 _ => bail!("binding plan requires --target current-resolution or structured"),
             };
-            let plan = dev_auth::smart_binding::build_binding_plan(name, intent, resolved, None)?;
+            #[cfg(target_os = "linux")]
+            let current = planning.current.as_ref();
+            #[cfg(not(target_os = "linux"))]
+            let current = None;
+            let plan = dev_auth::smart_binding::build_binding_plan(
+                name,
+                intent.with_code_trust(code_trust),
+                resolved,
+                current,
+            )?;
             let digest = dev_auth::smart_binding::write_binding_plan(&output, &plan)?;
             if json {
                 println!(
@@ -284,13 +382,20 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
             }
             Ok(0)
         }
-        _ => bail!("workload bind requires discover or plan"),
+        _ => bail!("workload bind requires inspect, discover, or plan"),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn run_workload_alias_os(workload: &str) -> Result<i32> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(binding) =
+        dev_auth::binding_activation::resolve_current_alias(workload, &arguments)?
+    {
+        let status =
+            dev_auth::supervisor::run_workload_alias(&binding.workload, &binding.arguments)?;
+        return workload_status_code(status);
+    }
     let status = dev_auth::supervisor::run_workload_alias(workload, &arguments)?;
     workload_status_code(status)
 }

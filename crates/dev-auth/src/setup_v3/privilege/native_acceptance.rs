@@ -155,6 +155,7 @@ fn privilege_only_recovery_and_restore(case: Case) {
         privilege_policy: None,
         users: vec![],
         credentials: vec![],
+        bindings: vec![],
     };
     let (current_paths, current_credential_ready, current_broker_state) = current_state_snapshot(
         &installation,

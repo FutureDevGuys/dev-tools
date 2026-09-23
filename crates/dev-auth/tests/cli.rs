@@ -574,9 +574,21 @@ COMP_WORDS=(dev-auth workload bind plan --command-n)
 COMP_CWORD=4
 "$function_name" dev-auth --command-n plan
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind plan --u)
+COMP_CWORD=4
+"$function_name" dev-auth --u plan
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind inspect --j)
+COMP_CWORD=4
+"$function_name" dev-auth --j inspect
+printf '%s\n' "${COMPREPLY[@]}"
 COMP_WORDS=(dev-auth workload bind plan --target st)
 COMP_CWORD=5
 "$function_name" dev-auth st --target
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind plan --code-trust m)
+COMP_CWORD=5
+"$function_name" dev-auth m --code-trust
 printf '%s\n' "${COMPREPLY[@]}"
 COMP_WORDS=(dev-auth workload bind plan --arg structured --caller-a)
 COMP_CWORD=6
@@ -602,7 +614,7 @@ printf '%s\n' "${COMPREPLY[@]}"
     );
     assert_eq!(
         output.stdout,
-        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\nstructured\n--caller-argument-index\nproviders\n"
+        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\n--user\n--json\nstructured\nmutable\n--caller-argument-index\nproviders\n"
     );
 }
 
@@ -3357,6 +3369,453 @@ fn standalone_user_only_setup_is_idempotent_transparent_and_deactivatable() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingFixtureScenario {
+    InitialRestore,
+    Refresh,
+    Remove,
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mutable_binding_setup_is_receipt_owned_and_reversible() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_mutable_binding_setup_child(BindingFixtureScenario::InitialRestore);
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("artifact");
+    let bootstrap = sandbox.root.join("dev-auth-bootstrap");
+    sandbox.install_binary(&product);
+    sandbox.install_binary(&bootstrap);
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "mutable_binding_setup_is_receipt_owned_and_reversible",
+            "--nocapture",
+        ]),
+        Duration::from_secs(180),
+        "mutable binding full-setup acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mutable_binding_refresh_restores_the_exact_prior_generation() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_mutable_binding_setup_child(BindingFixtureScenario::Refresh);
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("artifact");
+    let bootstrap = sandbox.root.join("dev-auth-bootstrap");
+    sandbox.install_binary(&product);
+    sandbox.install_binary(&bootstrap);
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "mutable_binding_refresh_restores_the_exact_prior_generation",
+            "--nocapture",
+        ]),
+        Duration::from_secs(180),
+        "mutable binding refresh acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mutable_binding_explicit_removal_reveals_original_and_restores_prior_receipt() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_mutable_binding_setup_child(BindingFixtureScenario::Remove);
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("artifact");
+    let bootstrap = sandbox.root.join("dev-auth-bootstrap");
+    sandbox.install_binary(&product);
+    sandbox.install_binary(&bootstrap);
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "mutable_binding_explicit_removal_reveals_original_and_restores_prior_receipt",
+            "--nocapture",
+        ]),
+        Duration::from_secs(180),
+        "mutable binding removal acceptance subprocess",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn run_mutable_binding_setup_child(scenario: BindingFixtureScenario) {
+    use dev_auth::deployment::{
+        normalize_deployment, parse_deployment_document, DeploymentCliInput,
+    };
+    use dev_auth::setup::{build_plan, InstallMode, InstallRequest, SetupPaths};
+    use dev_auth::setup_v3::{build_setup_plan_v3_at, write_setup_plan_v3_at};
+    use dev_auth::smart_binding::{
+        build_binding_plan, resolve_structured_target, write_binding_plan, BindingCodeTrust,
+        BindingIntent,
+    };
+    use std::os::unix::process::CommandExt;
+
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("dev-auth-binding-setup-")
+        .tempdir_in(&user.dir)
+        .unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let candidate = user.dir.parent().unwrap().join("artifact");
+    let bootstrap = user.dir.parent().unwrap().join("dev-auth-bootstrap");
+    let native = root.path().join("native-tool");
+    let native_gh = root.path().join("native-gh");
+    let launcher = root.path().join("agent");
+    fs::write(&native, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(&native_gh, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(&launcher, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 0\n").unwrap();
+    for path in [&native, &native_gh, &launcher] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let policy = root.path().join("policy.toml");
+    fs::write(
+        &policy,
+        format!(
+            r#"schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["{}"]
+[programs]
+git = "{}"
+gh = "{}"
+ssh = "{}"
+ssh_keygen = "{}"
+[trusted_launchers]
+agent = "{}"
+[credentials]
+providers = {{}}
+credential_slots = {{}}
+resources = {{}}
+[credentials.resource_caps.empty]
+users = ["{}"]
+resources = {{}}
+[workload_caps.agent]
+users = ["{}"]
+resource_cap = "empty"
+launchers = ["agent"]
+admission = ["enrolled_noninteractive"]
+max_duration_seconds = 3600
+"#,
+            user.name,
+            native.display(),
+            native_gh.display(),
+            native.display(),
+            native.display(),
+            launcher.display(),
+            user.name,
+            user.name,
+        ),
+    )
+    .unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        b"schema = \"dev-auth-user-config-v3\"\n[authority_profiles.main]\ncap = \"agent\"\nresources = {}\n[[workloads]]\nname = \"automation\"\nprofile = \"main\"\nlauncher = \"agent\"\nadmission = \"enrolled_noninteractive\"\nduration_seconds = 1800\nresources = {}\n",
+    )
+    .unwrap();
+    for path in [&policy, &config] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let binding_path = root.path().join("binding-plan.json");
+    let binding_intent =
+        BindingIntent::structured("bound-agent", "automation", &launcher, ["--fixed"])
+            .unwrap()
+            .with_code_trust(BindingCodeTrust::Mutable);
+    let binding = build_binding_plan(
+        "agent-binding",
+        binding_intent,
+        resolve_structured_target(&launcher).unwrap(),
+        None,
+    )
+    .unwrap();
+    let binding_digest = write_binding_plan(&binding_path, &binding).unwrap();
+    let deployment = parse_deployment_document(
+        format!(
+            "schema = \"dev-auth-deployment-v3\"\nmode = \"user-only\"\nchannel = \"stable\"\nactivation = \"transparent\"\nadministrator_policy = \"{}\"\n[[users]]\nname = \"{}\"\nconfig = \"{}\"\n[[bindings]]\nuser = \"{}\"\nname = \"agent-binding\"\nplan = \"{}\"\nsha256 = \"{}\"\n",
+            policy.display(),
+            user.name,
+            config.display(),
+            user.name,
+            binding_path.display(),
+            binding_digest,
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let intent = normalize_deployment(Some(deployment), DeploymentCliInput::default()).unwrap();
+    let paths = SetupPaths::user_only(&user.dir);
+    let installation = build_plan(
+        &paths,
+        &InstallRequest {
+            purpose: Default::default(),
+            mode: InstallMode::UserOnly,
+            version: "0.5.0-binding-test".into(),
+            source_executable: candidate,
+            native_git: native.clone(),
+            native_gh,
+            activate_transparent_launchers: false,
+        },
+    )
+    .unwrap();
+    let plan = build_setup_plan_v3_at(intent, installation, false).unwrap();
+    assert_eq!(plan.schema, "dev-auth-setup-plan-v5");
+    let plan_path = root.path().join("setup-plan.json");
+    let digest = write_setup_plan_v3_at(&plan_path, &plan).unwrap();
+    let applied = bounded_output_with_timeout(
+        Command::new(&bootstrap)
+            .arg0("dev-auth")
+            .args(["setup", "apply", "--plan"])
+            .arg(&plan_path)
+            .args(["--sha256", &digest, "--format", "json"])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin"),
+        Duration::from_secs(120),
+        "mutable binding full setup apply",
+    );
+    assert!(
+        applied.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(report["verified"], true);
+    let binding_alias = user.dir.join(".local/bin/bound-agent");
+    let binding_receipt = user.dir.join(".local/share/dev-auth/binding-set-v1.json");
+    assert!(binding_alias.is_symlink());
+    assert!(binding_receipt.is_file());
+    let inspect = |expected_generation: u64| {
+        let output = bounded_output(
+            Command::new(user.dir.join(".local/bin/dev-auth"))
+                .args(["workload", "bind", "inspect", "bound-agent", "--json"])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+        );
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-auth-workload-binding-inspection-v1");
+        assert_eq!(report["workload"], "automation");
+        assert_eq!(report["code_trust"], "mutable");
+        assert_eq!(report["generation"], expected_generation);
+    };
+    inspect(1);
+    let run_bound = |expected_code| {
+        let output = bounded_output_with_timeout(
+            Command::new(&binding_alias)
+                .args(["literal $(not-expanded)", "two words"])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(root.path()),
+            Duration::from_secs(20),
+            "bound mutable workload",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout,
+            b"--fixed\nliteral $(not-expanded)\ntwo words\n"
+        );
+    };
+    run_bound(0);
+    fs::write(&launcher, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 7\n").unwrap();
+    inspect(1);
+    run_bound(7);
+    let current_installation: dev_auth::setup::InstallReceipt =
+        serde_json::from_slice(&fs::read(paths.data_root.join("install-v2.json")).unwrap())
+            .unwrap();
+    let update_sources =
+        dev_auth::setup_v3::prepare_update_intent_from_accepted_at(&paths, &current_installation)
+            .unwrap();
+    let automatic_refresh: serde_json::Value =
+        serde_json::from_slice(&fs::read(&update_sources.intent.bindings[0].plan).unwrap())
+            .unwrap();
+    assert_eq!(automatic_refresh["change"], "refresh");
+    assert_eq!(
+        automatic_refresh["current_receipt"]["active"]["generation"],
+        1
+    );
+    assert_eq!(automatic_refresh["intent"]["code_trust"], "mutable");
+    drop(update_sources);
+    let refresh_path = root.path().join("binding-refresh-plan.json");
+    let refresh = bounded_output(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["workload", "bind", "plan", "agent-binding", "--user"])
+            .arg(&user.name)
+            .args([
+                "--workload",
+                "automation",
+                "--command-name",
+                "bound-agent",
+                "--target",
+                "structured",
+                "--executable",
+            ])
+            .arg(&launcher)
+            .args(["--arg", "--fixed", "--code-trust", "mutable", "--output"])
+            .arg(&refresh_path)
+            .arg("--json")
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin"),
+    );
+    assert!(
+        refresh.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&refresh.stdout),
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    let refresh: serde_json::Value = serde_json::from_slice(&refresh.stdout).unwrap();
+    assert_eq!(refresh["change"], "refresh");
+    let refresh_plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(&refresh_path).unwrap()).unwrap();
+    assert_eq!(refresh_plan["current_receipt"]["active"]["generation"], 1);
+    assert_eq!(refresh_plan["intent"]["code_trust"], "mutable");
+    if scenario != BindingFixtureScenario::InitialRestore {
+        let mut intent = plan.intent.clone();
+        if scenario == BindingFixtureScenario::Refresh {
+            intent.bindings[0].plan = refresh_path.clone();
+            intent.bindings[0].sha256 = refresh["sha256"].as_str().unwrap().into();
+        } else {
+            intent.bindings.clear();
+        }
+        let next_installation = build_plan(
+            &paths,
+            &InstallRequest {
+                purpose: Default::default(),
+                mode: InstallMode::UserOnly,
+                version: "0.5.0-binding-test".into(),
+                source_executable: user.dir.parent().unwrap().join("artifact"),
+                native_git: root.path().join("native-tool"),
+                native_gh: root.path().join("native-gh"),
+                activate_transparent_launchers: false,
+            },
+        )
+        .unwrap();
+        let next_plan = build_setup_plan_v3_at(intent, next_installation, false).unwrap();
+        let next_plan_path = root.path().join("setup-refresh-plan.json");
+        let next_digest = write_setup_plan_v3_at(&next_plan_path, &next_plan).unwrap();
+        let applied = bounded_output_with_timeout(
+            Command::new(user.dir.join(".local/bin/dev-auth"))
+                .args(["setup", "apply", "--plan"])
+                .arg(&next_plan_path)
+                .args(["--sha256", &next_digest, "--format", "json"])
+                .env_clear()
+                .env("HOME", &user.dir)
+                .env("PATH", "/usr/bin:/bin"),
+            Duration::from_secs(120),
+            "mutable binding generation refresh",
+        );
+        assert!(
+            applied.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&applied.stdout),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&applied.stdout).unwrap()["verified"],
+            true
+        );
+        if scenario == BindingFixtureScenario::Refresh {
+            inspect(2);
+            run_bound(7);
+        } else {
+            assert!(!binding_alias.exists());
+            assert!(!binding_receipt.exists());
+            assert!(user.dir.join(".local/bin/automation").is_symlink());
+        }
+    }
+    let restored = bounded_output_with_timeout(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args([
+                "setup",
+                "restore",
+                "--mode",
+                "user-only",
+                "--format",
+                "json",
+            ])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin"),
+        Duration::from_secs(120),
+        "mutable binding retained restoration",
+    );
+    assert!(
+        restored.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(!binding_alias.exists());
+    if scenario != BindingFixtureScenario::InitialRestore {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&binding_receipt).unwrap()).unwrap();
+        assert_eq!(
+            receipt["bindings"]["bound-agent"]["active"]["generation"],
+            1
+        );
+    } else {
+        assert!(!binding_receipt.exists());
+    }
+    assert_eq!(
+        fs::read(&launcher).unwrap(),
+        b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 7\n"
+    );
 }
 
 #[cfg(target_os = "linux")]

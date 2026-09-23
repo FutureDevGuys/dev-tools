@@ -70,6 +70,15 @@ pub struct DeploymentCredential {
     pub intent: CredentialIntent,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentBinding {
+    pub user: String,
+    pub name: String,
+    pub plan: PathBuf,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentDocument {
@@ -88,6 +97,8 @@ pub struct DeploymentDocument {
     pub users: Vec<DeploymentUser>,
     #[serde(default)]
     pub credentials: Vec<DeploymentCredential>,
+    #[serde(default)]
+    pub bindings: Vec<DeploymentBinding>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -102,6 +113,7 @@ pub struct DeploymentCliInput {
     pub user_configs: Vec<(String, PathBuf)>,
     pub user_policies: Vec<(String, PathBuf)>,
     pub credential_intents: Vec<(String, CredentialIntent)>,
+    pub bindings: Vec<DeploymentBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -119,6 +131,8 @@ pub struct DeploymentIntent {
     pub privilege_policy: Option<PathBuf>,
     pub users: Vec<DeploymentUser>,
     pub credentials: Vec<DeploymentCredential>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<DeploymentBinding>,
 }
 
 impl DeploymentIntent {
@@ -248,6 +262,12 @@ pub fn normalize_deployment(
         .transpose()?
         .unwrap_or_default();
     merge_maps(&mut credentials, cli_credentials, "credential slot")?;
+    let mut bindings = document
+        .as_ref()
+        .map(|value| binding_map(&value.bindings, "deployment document"))
+        .transpose()?
+        .unwrap_or_default();
+    merge_maps(&mut bindings, binding_map(&cli.bindings, "CLI")?, "binding")?;
 
     if purpose.is_credentials() && users.is_empty() {
         bail!("deployment intent must declare at least one native user");
@@ -257,7 +277,13 @@ pub fn normalize_deployment(
     }
     let intent = DeploymentIntent {
         purpose,
-        schema: if purpose.is_credentials() && privilege_policy.is_none() {
+        schema: if !bindings.is_empty()
+            || document
+                .as_ref()
+                .is_some_and(|document| document.schema == "dev-auth-deployment-v3")
+        {
+            "dev-auth-deployment-intent-v3"
+        } else if purpose.is_credentials() && privilege_policy.is_none() {
             "dev-auth-deployment-intent-v1"
         } else {
             "dev-auth-deployment-intent-v2"
@@ -274,6 +300,7 @@ pub fn normalize_deployment(
         privilege_policy,
         users: users.into_values().collect(),
         credentials: credentials.into_values().collect(),
+        bindings: bindings.into_values().collect(),
     };
     validate_intent(&intent)?;
     Ok(intent)
@@ -380,6 +407,34 @@ fn credential_map(
     )
 }
 
+fn binding_map(
+    bindings: &[DeploymentBinding],
+    source: &str,
+) -> Result<BTreeMap<String, DeploymentBinding>> {
+    if bindings.len() > 128 {
+        bail!("{source} declares too many bindings");
+    }
+    let mut mapped = BTreeMap::new();
+    for binding in bindings {
+        validate_identifier(&binding.user, "binding native user")?;
+        validate_identifier(&binding.name, "binding name")?;
+        normalized_absolute_path(&binding.plan, "binding plan")?;
+        if binding.sha256.len() != 64
+            || !binding
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("binding plan SHA-256 is invalid");
+        }
+        let key = format!("{}/{}", binding.user, binding.name);
+        if mapped.insert(key, binding.clone()).is_some() {
+            bail!("{source} contains a duplicate binding");
+        }
+    }
+    Ok(mapped)
+}
+
 fn merge_maps<T: PartialEq>(
     destination: &mut BTreeMap<String, T>,
     source: BTreeMap<String, T>,
@@ -400,12 +455,15 @@ fn merge_maps<T: PartialEq>(
 }
 
 fn validate_document(document: &DeploymentDocument) -> Result<()> {
-    let expected_schema =
-        if document.purpose.is_credentials() && document.privilege_policy.is_none() {
-            "dev-auth-deployment-v1"
-        } else {
-            "dev-auth-deployment-v2"
-        };
+    let expected_schema = if !document.bindings.is_empty()
+        || (document.schema == "dev-auth-deployment-v3" && document.purpose.is_credentials())
+    {
+        "dev-auth-deployment-v3"
+    } else if document.purpose.is_credentials() && document.privilege_policy.is_none() {
+        "dev-auth-deployment-v1"
+    } else {
+        "dev-auth-deployment-v2"
+    };
     if document.schema != expected_schema {
         bail!("dev-auth deployment document schema is unsupported");
     }
@@ -421,18 +479,30 @@ fn validate_document(document: &DeploymentDocument) -> Result<()> {
         bail!("strong mode does not accept per-user policy authority");
     }
     credential_map(&document.credentials, "deployment document")?;
+    let bindings = binding_map(&document.bindings, "deployment document")?;
+    if bindings
+        .values()
+        .any(|binding| !users.contains_key(&binding.user))
+    {
+        bail!("binding names a user outside the deployment");
+    }
     validate_purpose(
         document.purpose,
         document.mode,
         &document.users,
         &document.credentials,
+        &document.bindings,
         document.privilege_policy.as_deref(),
     )?;
     Ok(())
 }
 
 fn validate_intent(intent: &DeploymentIntent) -> Result<()> {
-    let expected_schema = if intent.purpose.is_credentials() && intent.privilege_policy.is_none() {
+    let expected_schema = if !intent.bindings.is_empty()
+        || (intent.schema == "dev-auth-deployment-intent-v3" && intent.purpose.is_credentials())
+    {
+        "dev-auth-deployment-intent-v3"
+    } else if intent.purpose.is_credentials() && intent.privilege_policy.is_none() {
         "dev-auth-deployment-intent-v1"
     } else {
         "dev-auth-deployment-intent-v2"
@@ -446,6 +516,13 @@ fn validate_intent(intent: &DeploymentIntent) -> Result<()> {
     }
     let users = user_map(&intent.users, "deployment intent")?;
     credential_map(&intent.credentials, "deployment intent")?;
+    let bindings = binding_map(&intent.bindings, "deployment intent")?;
+    if bindings
+        .values()
+        .any(|binding| !users.contains_key(&binding.user))
+    {
+        bail!("binding names a user outside the deployment");
+    }
     if intent.purpose.is_credentials() && users.is_empty() {
         bail!("deployment intent must declare at least one native user");
     }
@@ -457,6 +534,7 @@ fn validate_intent(intent: &DeploymentIntent) -> Result<()> {
         intent.mode,
         &intent.users,
         &intent.credentials,
+        &intent.bindings,
         intent.privilege_policy.as_deref(),
     )?;
     Ok(())
@@ -467,10 +545,14 @@ fn validate_purpose(
     mode: DeploymentMode,
     users: &[DeploymentUser],
     credentials: &[DeploymentCredential],
+    bindings: &[DeploymentBinding],
     privilege_policy: Option<&Path>,
 ) -> Result<()> {
     if purpose == SetupPurpose::PrivilegeOnly
-        && (mode != DeploymentMode::Strong || !users.is_empty() || !credentials.is_empty())
+        && (mode != DeploymentMode::Strong
+            || !users.is_empty()
+            || !credentials.is_empty()
+            || !bindings.is_empty())
     {
         bail!("privilege-only setup requires system ownership and no credential or user-configuration actions");
     }

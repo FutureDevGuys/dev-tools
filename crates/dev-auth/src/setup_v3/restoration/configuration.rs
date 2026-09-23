@@ -378,6 +378,7 @@ pub(super) mod tests {
             privilege_policy: None,
             users: Vec::new(),
             credentials: Vec::new(),
+            bindings: Vec::new(),
         };
         let authority_schema = logical.then_some("dev-auth-administrator-policy-v3");
         let mut documents = Vec::new();
@@ -389,6 +390,7 @@ pub(super) mod tests {
             &retiring_accounts,
             authority_schema,
         )
+        .unwrap()
         .into_iter()
         .filter(|(kind, _, _)| {
             matches!(

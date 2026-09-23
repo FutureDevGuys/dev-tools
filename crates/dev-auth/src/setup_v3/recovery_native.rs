@@ -267,6 +267,7 @@ ssh_keygen = "/usr/bin/true"
         } else {
             Vec::new()
         },
+        bindings: Vec::new(),
     };
     let plan = build_setup_plan_v3_with_reader(
         intent,

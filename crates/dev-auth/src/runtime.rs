@@ -768,6 +768,9 @@ pub(crate) fn user_broker_service_tokens<'a>(
         let stores = slots
             .map(|slot| Ok((slot.to_owned(), user_broker_credential_store(slot)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        if stores.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         return prompt_free_store::read(&stores).map_err(Into::into);
     }
     slots
@@ -778,6 +781,15 @@ pub(crate) fn user_broker_service_tokens<'a>(
             ))
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn zero_slot_noninteractive_broker_needs_no_secret_service_session() {
+    let values =
+        user_broker_service_tokens(std::iter::empty::<&str>(), CredentialInteraction::NoPrompt)
+            .unwrap();
+    assert!(values.is_empty());
 }
 
 #[cfg(target_os = "linux")]

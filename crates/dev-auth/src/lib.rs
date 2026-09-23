@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use zeroize::Zeroizing;
 
-pub const SETUP_TEMPLATE_NAMES: [&str; 10] = [
+pub const SETUP_TEMPLATE_NAMES: [&str; 13] = [
     "deployment",
     "administrator-policy",
     "user-only-policy",
@@ -15,8 +15,13 @@ pub const SETUP_TEMPLATE_NAMES: [&str; 10] = [
     "privilege-policy",
     "privilege-deployment",
     "credential-privilege-deployment",
+    "binding-deployment",
+    "binding-user-only-policy",
+    "binding-user-config",
 ];
 
+#[cfg(target_os = "linux")]
+pub mod binding_activation;
 #[cfg(target_os = "linux")]
 pub mod broker_agent;
 #[cfg(target_os = "linux")]

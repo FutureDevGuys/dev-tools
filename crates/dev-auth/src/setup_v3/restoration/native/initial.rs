@@ -140,6 +140,7 @@ fn initial_strong_generation_case(partial: bool) {
             policy: None,
         }],
         credentials: Vec::new(),
+        bindings: Vec::new(),
     };
     let (current_paths, ready, broker) = current_state_snapshot(
         &installation,

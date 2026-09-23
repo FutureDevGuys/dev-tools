@@ -251,10 +251,13 @@ pub(super) fn workload_retirements(
             .as_deref()
             .map(serde_json::from_slice)
             .transpose()?;
-        let aliases = candidate_workloads(generation, account)?
+        let mut aliases = candidate_workloads(generation, account)?
             .keys()
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        aliases.extend(candidate_binding_aliases(generation, account)?);
+        aliases.sort();
+        aliases.dedup();
         let mut retirement = WorkloadRetirement {
             home: account.home.clone(),
             owner: account.uid,
@@ -362,6 +365,36 @@ fn candidate_workloads(
             candidate_bytes(&generation.candidate_documents, configuration)?,
         )?
         .workloads)
+}
+
+fn candidate_binding_aliases(
+    generation: &RetainedSetupGeneration,
+    account: &NativeAccountIdentity,
+) -> Result<Vec<String>> {
+    let plan = &generation.plan;
+    if plan.intent.schema != "dev-auth-deployment-intent-v3"
+        || plan.intent.activation != Activation::Transparent
+        || !plan.accounts.contains(account)
+    {
+        return Ok(Vec::new());
+    }
+    let mut aliases = Vec::new();
+    for reference in plan
+        .intent
+        .bindings
+        .iter()
+        .filter(|binding| binding.user == account.name)
+    {
+        let subject = format!("{}/{}", reference.user, reference.name);
+        let identity = document_identity(plan, "binding_plan", &subject)?;
+        let binding: crate::smart_binding::BindingPlan =
+            serde_json::from_slice(candidate_bytes(&generation.candidate_documents, identity)?)?;
+        if binding.name != reference.name {
+            bail!("candidate binding alias differs from its approved declaration");
+        }
+        aliases.push(binding.intent.command_name);
+    }
+    Ok(aliases)
 }
 
 #[cfg(test)]
