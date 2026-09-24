@@ -4,14 +4,29 @@
 # namespaces and no network. Only native passwd/login/PolicyKit handle input.
 set -euo pipefail
 umask 077
+settle_fixture_exit_code() {
+    local status=$1 stage=$2
+    if [[ $status == 0 && $stage != complete && $stage != diagnostic_complete ]]; then
+        return 1
+    fi
+    return "$status"
+}
 case ${1:-} in
+    self-test)
+        settle_fixture_exit_code 0 complete
+        settle_fixture_exit_code 0 diagnostic_complete
+        for stage in container_setup installed_preparation native_password native_login_and_launch; do
+            if settle_fixture_exit_code 0 "$stage"; then exit 1; fi
+        done
+        if settle_fixture_exit_code 137 container_setup; then exit 1; else [[ $? == 137 ]]; fi
+        ;;
     run)
         [[ ( $# == 4 || $# == 5 ) && $EUID != 0 && -t 0 && -t 1 ]]
         product=$(realpath -e -- "$2")
         library_test=$(realpath -e -- "$3")
         image=$4
         scenario=${5:-launch-grant}
-        [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined ]]
+        [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined || "$scenario" == binding-strong ]]
         [[ "$image" =~ ^[a-f0-9]{64}$ ]]
         stage=$(mktemp -d /tmp/dev-auth-installed-stage.XXXXXXXX)
         install -m 0755 -- "$product" "$stage/dev-auth"
@@ -49,7 +64,7 @@ case ${1:-} in
         chmod 0755 "$fixture/dev-auth" "$fixture/library-test" "$fixture/installed-user.sh"
         image=$(<"$fixture/image-id")
         scenario=$(<"$fixture/scenario")
-        [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined ]]
+        [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined || "$scenario" == binding-strong ]]
         [[ "$image" =~ ^[a-f0-9]{64}$ ]]
         # systemd-creds deliberately rejects automatic host-key encryption on
         # tmpfs when TPM2 is unavailable in a container. Preserve that policy;
@@ -77,6 +92,7 @@ case ${1:-} in
         cleanup() {
             code=$?
             trap - EXIT INT TERM
+            settle_fixture_exit_code "$code" "$phase" || code=$?
             if [[ -n "$progress_watcher" ]]; then
                 kill "$progress_watcher" 2>/dev/null || true
                 wait "$progress_watcher" 2>/dev/null || true
@@ -178,6 +194,8 @@ case ${1:-} in
             native_test=setup_v3::privilege::native_acceptance::native_disposable_privilege_only_reconfiguration_restores_prior_inactive
         elif [[ "$scenario" == privilege-combined ]]; then
             native_test=setup_v3::recovery_native::native_disposable_combined_credential_privilege_upgrade
+        elif [[ "$scenario" == binding-strong ]]; then
+            native_test=setup_v3::recovery_native::native_disposable_strong_mutable_binding
         fi
         if ! "${runtime[@]}" exec --env DEV_AUTH_NATIVE_SYSTEMD_FIXTURE=disposable --env DEV_AUTH_NATIVE_TRACE_SETUP=1 "$container" /fixture/library-test --ignored --exact "$native_test" --nocapture --test-threads=1 >"$fixture/preparation.log" 2>&1; then
             chmod 0644 "$fixture/preparation.log"
@@ -190,6 +208,14 @@ case ${1:-} in
             chmod 0644 "$fixture/privilege-combined-result.json"
             jq -e '.passed == true and .credential_preserved == true and .privilege_receipted == true and .signed_release == false' "$fixture/privilege-combined-result.json"
             privilege_setup=true
+            prepared=true
+            phase=complete
+            exit 0
+        fi
+        if [[ "$scenario" == binding-strong ]]; then
+            "${runtime[@]}" cp "$container:/fixture/binding-strong-result.json" "$fixture/binding-strong-result.json"
+            chmod 0644 "$fixture/binding-strong-result.json"
+            jq -e '.passed == true and .mutable_edit == true and .restored == true' "$fixture/binding-strong-result.json"
             prepared=true
             phase=complete
             exit 0
@@ -280,5 +306,5 @@ case ${1:-} in
         jq -e '.exit_code == 0 and .step == "complete"' "$fixture/installed-result.json"
         phase=complete
         ;;
-    *) printf '%s\n' 'usage: installed-linux.sh run PRODUCT LIBRARY_TEST IMAGE_ID [launch-grant|tty-probe|password-diagnostic|login-session-probe|privilege-setup|privilege-setup-interrupted|privilege-setup-reconfigured|privilege-combined]' >&2; exit 2 ;;
+    *) printf '%s\n' 'usage: installed-linux.sh run PRODUCT LIBRARY_TEST IMAGE_ID [launch-grant|tty-probe|password-diagnostic|login-session-probe|privilege-setup|privilege-setup-interrupted|privilege-setup-reconfigured|privilege-combined|binding-strong]' >&2; exit 2 ;;
 esac

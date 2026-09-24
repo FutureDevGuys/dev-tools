@@ -436,7 +436,12 @@ mod tests {
         let plan =
             build_binding_plan("agent-binding", intent.clone(), resolved.clone(), None).unwrap();
         let prior_installation = installation("/tmp/dev-auth-v1", &"a".repeat(64));
-        let initial = build_desired(uid, &prior_installation, None, &[plan]).unwrap();
+        let initial =
+            build_desired(uid, &prior_installation, None, std::slice::from_ref(&plan)).unwrap();
+        assert_eq!(
+            initial,
+            expected_desired_from_approved_plans(uid, &prior_installation, None, &[plan]).unwrap()
+        );
         let path = root.path().join("binding-set.json");
         assert!(write_at(
             &path,
@@ -531,5 +536,58 @@ mod tests {
             &[plan]
         )
         .is_err());
+    }
+
+    #[test]
+    fn strong_binding_set_round_trips_under_native_root_custody() {
+        if !nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("worker");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let plan = build_binding_plan(
+            "worker-binding",
+            BindingIntent::structured("bound-worker", "worker", &target, Vec::<String>::new())
+                .unwrap()
+                .with_code_trust(BindingCodeTrust::Mutable),
+            resolve_structured_target(&target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut installation = installation(
+            "/usr/local/lib/dev-auth/versions/0.5.0/dev-auth",
+            &"a".repeat(64),
+        );
+        installation.mode = crate::setup::InstallMode::Strong;
+        let desired =
+            build_desired(1234, &installation, None, std::slice::from_ref(&plan)).unwrap();
+        assert_eq!(
+            desired,
+            expected_desired_from_approved_plans(1234, &installation, None, &[plan]).unwrap()
+        );
+        let path = root.path().join("binding-set-v1.json");
+        write_at(
+            &path,
+            crate::setup::InstallMode::Strong,
+            1234,
+            &installation,
+            &desired,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read_at(
+                &path,
+                crate::setup::InstallMode::Strong,
+                1234,
+                &installation,
+            )
+            .unwrap()
+            .unwrap()
+            .0,
+            desired
+        );
     }
 }

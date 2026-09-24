@@ -1208,7 +1208,11 @@ fn publish_binding_sets(
     if plan.intent.schema != "dev-auth-deployment-intent-v3" {
         return Ok(BTreeMap::new());
     }
-    let digest = render_setup_plan_v3(plan)?.1;
+    // Recovery owns the retained candidate and may no longer have the public
+    // release files. Bind publication to its canonical retained plan bytes
+    // without reopening the original release source.
+    let digest =
+        sha256_hex(&serde_jcs::to_vec(plan).context("canonicalize retained binding plan")?);
     let owner_uid = apply_owner_uid(plan)?;
     let transition =
         crate::setup_transition::retained_transition(&plan.installation.paths, owner_uid)?

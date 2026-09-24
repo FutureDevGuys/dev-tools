@@ -23,6 +23,7 @@ fn native_disposable_public_strong_enrolled_workload() {
     exercise(false, Scenario::Workload);
 }
 
+mod binding;
 mod combined;
 mod privilege_launch;
 mod signed;
@@ -40,12 +41,19 @@ fn native_disposable_combined_credential_privilege_upgrade() {
     exercise(false, Scenario::Combined);
 }
 
+#[test]
+#[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
+fn native_disposable_strong_mutable_binding() {
+    exercise(false, Scenario::Binding);
+}
+
 #[derive(Clone, Copy)]
 enum Scenario {
     Empty,
     Workload,
     PrivilegeLaunch,
     Combined,
+    Binding,
 }
 
 fn command(executable: &Path, arguments: &[&str]) -> dev_tools_command::BoundedCommandOutput {
@@ -110,7 +118,7 @@ fn recover(executable: &Path) -> SetupRecoveryReportV1 {
 fn exercise(staged: bool, scenario: Scenario) {
     let with_workload = matches!(
         scenario,
-        Scenario::Workload | Scenario::PrivilegeLaunch | Scenario::Combined
+        Scenario::Workload | Scenario::PrivilegeLaunch | Scenario::Combined | Scenario::Binding
     );
     assert_eq!(
         std::env::var("DEV_AUTH_NATIVE_SYSTEMD_FIXTURE").as_deref(),
@@ -200,6 +208,7 @@ ssh_keygen = "/usr/bin/true"
         Scenario::Workload => workload::prepare(&account),
         Scenario::PrivilegeLaunch => privilege_launch::prepare(&account),
         Scenario::Combined => workload::prepare(&account),
+        Scenario::Binding => workload::prepare(&account),
         Scenario::Empty => (
             empty_policy,
             b"schema = \"dev-auth-user-config-v3\"\nworkloads = []\n[authority_profiles]\n"
@@ -208,6 +217,7 @@ ssh_keygen = "/usr/bin/true"
     };
     publish(policy_path, &policy, 0o600);
     publish(config_path, &config, 0o600);
+    let binding = matches!(scenario, Scenario::Binding).then(|| binding::prepare(&account));
     let identity = ArtifactIdentity::from_file(source, 256 * 1024 * 1024).unwrap();
     let version = env!("CARGO_PKG_VERSION");
     let installation = SetupPlan {
@@ -243,7 +253,12 @@ ssh_keygen = "/usr/bin/true"
     };
     let intent = DeploymentIntent {
         purpose: Default::default(),
-        schema: "dev-auth-deployment-intent-v1".into(),
+        schema: if binding.is_some() {
+            "dev-auth-deployment-intent-v3"
+        } else {
+            "dev-auth-deployment-intent-v1"
+        }
+        .into(),
         mode: DeploymentMode::Strong,
         channel: crate::deployment::Channel::Stable,
         offline: true,
@@ -267,7 +282,7 @@ ssh_keygen = "/usr/bin/true"
         } else {
             Vec::new()
         },
-        bindings: Vec::new(),
+        bindings: binding.clone().into_iter().collect(),
     };
     let plan = build_setup_plan_v3_with_reader(
         intent,
@@ -339,6 +354,9 @@ ssh_keygen = "/usr/bin/true"
     };
     fs::remove_file(policy_path).unwrap();
     fs::remove_file(config_path).unwrap();
+    if let Some(binding) = &binding {
+        fs::remove_file(&binding.plan).unwrap();
+    }
     let report = recover(invocation);
     if !report.verified {
         // Value-free public results intentionally omit internal context. This
@@ -410,6 +428,21 @@ ssh_keygen = "/usr/bin/true"
         fs::remove_file(source).unwrap();
     }
     let report = recover(&executable);
+    if !report.verified && matches!(scenario, Scenario::Binding) {
+        let transition = crate::setup_transition::retained_transition(&paths, 0)
+            .unwrap()
+            .unwrap();
+        let retained: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes).unwrap();
+        panic!(
+            "binding fixture recovery postcondition: {:?}",
+            verify_postcondition(
+                &retained.plan,
+                &retained.plan_sha256,
+                &retained.candidate_documents,
+            )
+            .err()
+        );
+    }
     assert!(report.verified);
     assert_eq!(report.changed, Some(false));
     assert!(report.actions.is_empty());
@@ -421,6 +454,7 @@ ssh_keygen = "/usr/bin/true"
         match scenario {
             Scenario::PrivilegeLaunch => privilege_launch::finish_prepare(&account, &executable),
             Scenario::Workload => workload::exercise(&account, &executable),
+            Scenario::Binding => binding::exercise(&account, &executable),
             Scenario::Empty => unreachable!(),
             Scenario::Combined => unreachable!(),
         }
