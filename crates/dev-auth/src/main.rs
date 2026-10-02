@@ -2152,9 +2152,61 @@ fn is_core_frontend(frontend: &str) -> bool {
         })
 }
 
+#[cfg(target_os = "linux")]
+fn launcher_invocation() -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: Linux supplies AT_EXECFN as a process-lifetime NUL-terminated
+    // string. getauxval returns zero when it is unavailable. It records the
+    // executed path independently of shell-controlled argv[0].
+    let pointer = unsafe { nix::libc::getauxval(nix::libc::AT_EXECFN) } as *const nix::libc::c_char;
+    if pointer.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes();
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(bytes));
+    let normalized = path.file_name()?.to_str()?.to_ascii_lowercase();
+    let name = normalized.strip_suffix(".exe").unwrap_or(&normalized);
+    // Unknown candidate filenames and descriptor executions intentionally use
+    // explicit argv[0] in validated internal handoffs. Only public launcher
+    // names have a stable kernel-path dispatch contract here.
+    if !is_core_frontend(name)
+        && !matches!(
+            name,
+            "git"
+                | "gh"
+                | "git-dev-auth"
+                | "gh-dev-auth"
+                | "git-credential-dev-auth"
+                | "ssh-keygen-dev-auth"
+        )
+    {
+        return None;
+    }
+    // Core and descriptor invocations deliberately select internal helpers via
+    // argv[0]; their existing receipt/descriptor checks remain authoritative.
+    let explicit_helper = std::env::args_os().next().is_some_and(|arg| {
+        matches!(
+            arg.to_str(),
+            Some("dev-auth-provider-exec" | "dev-auth-setup-helper")
+        )
+    });
+    if (is_core_frontend(name) && explicit_helper)
+        || path.starts_with("/proc/self/fd")
+        || path.starts_with("/dev/fd")
+    {
+        return None;
+    }
+    Some(path.as_os_str().to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn launcher_invocation() -> Option<std::ffi::OsString> {
+    None
+}
+
 fn main() {
-    let program = std::env::args_os()
-        .next()
+    let program = launcher_invocation()
+        .or_else(|| std::env::args_os().next())
         .and_then(|value| {
             std::path::PathBuf::from(value)
                 .file_name()

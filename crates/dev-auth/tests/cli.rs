@@ -2404,3 +2404,106 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     );
     assert!(!absent_runtime.exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exported_argv0_cannot_select_another_frontend_or_workload() {
+    use std::os::unix::process::CommandExt;
+    let temp = tempfile::tempdir().unwrap();
+    for frontend in ["git", "gh"] {
+        let alias = temp.path().join(frontend);
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dev-auth"), &alias).unwrap();
+        let baseline = Command::new(&alias)
+            .env_remove("ARGV0")
+            .arg("--version")
+            .output()
+            .unwrap();
+        for identity in [
+            "Example.AppImage",
+            "foreign-launcher",
+            "git",
+            "gh",
+            "dev-auth",
+        ] {
+            let output = Command::new(&alias)
+                .arg0(identity)
+                .env("ARGV0", identity)
+                .arg("--version")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), baseline.status.code());
+            assert_eq!(output.stdout, baseline.stdout);
+            assert_eq!(output.stderr, baseline.stderr);
+        }
+    }
+}
+
+#[test]
+fn unrelated_argv0_environment_does_not_override_direct_dispatch() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .env("ARGV0", "Example.AppImage")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .starts_with("dev-auth "));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn zsh_exported_argv0_preserves_actual_launcher_dispatch() {
+    let zsh = std::path::Path::new("/usr/bin/zsh");
+    if !zsh.is_file() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    for frontend in ["git", "gh", "dev-auth"] {
+        let alias = temp.path().join(frontend);
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dev-auth"), &alias).unwrap();
+        let baseline = Command::new(&alias)
+            .env_remove("ARGV0")
+            .arg("--version")
+            .output()
+            .unwrap();
+        for identity in ["Example.AppImage", "foreign-launcher", "git", "gh"] {
+            let output = Command::new(zsh)
+                .env("ARGV0", identity)
+                .args(["-f", "-c", "exec \"$1\" --version", "fixture"])
+                .arg(&alias)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), baseline.status.code(), "{:?}", output);
+            assert_eq!(output.stdout, baseline.stdout);
+            assert_eq!(output.stderr, baseline.stderr);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn arbitrary_candidate_filename_preserves_explicit_core_and_helper_dispatch() {
+    use std::os::unix::process::CommandExt;
+    let temp = tempfile::tempdir().unwrap();
+    let candidate = temp.path().join("candidate-payload");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dev-auth"), &candidate).unwrap();
+    for (identity, argument) in [
+        ("dev-auth", "--version"),
+        ("dev-auth-setup-helper", "apply-v3"),
+    ] {
+        let baseline = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .arg0(identity)
+            .arg(argument)
+            .output()
+            .unwrap();
+        let output = Command::new(&candidate)
+            .arg0(identity)
+            .arg(argument)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), baseline.status.code());
+        assert_eq!(output.stdout, baseline.stdout);
+        assert_eq!(output.stderr, baseline.stderr);
+    }
+}

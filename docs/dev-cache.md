@@ -62,3 +62,7 @@ Each entrypoint reports one of the following durable states:
 Explicit overrides are reported separately from native discovery. `routed_adapters` contains an adapter only when its enabled, supported, installed entrypoints all pass activation without an explicit override; finding a real tool is not sufficient. `routing_complete` reports whether every mandatory installed entrypoint and the canonical PATH activation are healthy.
 
 When the canonical intercept directory is missing from the current PATH, doctor reports `stale_current_shell` if a recognized persistent shell profile already contains activation and `persistent_configuration_missing` otherwise. This distinction is best-effort and never changes the mandatory entrypoint result. Any failed mandatory activation or maintenance check makes doctor exit nonzero.
+
+## Workspace discovery
+
+Workspace grouping uses local filesystem markers and never launches Git or its credential wrappers. The nearest `.git` file/directory takes precedence over nested language manifests; without one, the nearest supported language manifest or requested directory supplies the scope. Markers are cache grouping hints only. Git environment and configuration overrides do not change this scope. See [ADR 0028](adr/0028-local-cache-workspace-discovery.md).

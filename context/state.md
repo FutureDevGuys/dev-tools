@@ -20,3 +20,10 @@
 - Complete Linux strong-mode admission and transparent human passthrough across CLI/desktop, fresh shells, editors, nested workloads, signals, sandbox adapters, expiry/revocation and denied-session no-fallback behavior.
 - Obtain real macOS and Windows/WSL hosts, SDKs and required signing/entitlements. The Apple cross-check still requires a real SDK providing TargetConditionals.h; cross-compilation does not establish native acceptance.
 - Keep broad validation within available build capacity using bounded jobs/debug/incremental settings; preserve sources, frozen publication inputs and release provenance during scoped output cleanup.
+
+
+## Current Git/cache repair validation
+
+- Linux public Dev Auth aliases now use the kernel invocation name against zsh ARGV0 contamination; unknown candidate names and descriptor handoffs preserve explicit dispatch. Workload environments filter ARGV0. Native installed git/gh, signing, service-account and strong-session acceptance remains required on a host with normal ownership and socket support.
+- Dev Cache workspace discovery is filesystem-only and does not enter a Git/auth wrapper. Recognized ordinary, linked and nested worktree markers and malformed-marker fallback are covered. Existing compiler-maintenance fix for issue 40 is retained.
+- Cloud validation: 96 Dev Cache contract tests, lease/completion tests, targeted real-zsh/ARGV0 and candidate-helper tests, workload environment test, formatting and strict Clippy. Full native authentication and tracing suites remain blocked by remapped root ownership, denied sockets/ptrace and fixture home restrictions; those checks are not waived or marked passing. Run `cargo test -p dev-auth -p dev-cache --locked` locally before installed acceptance. No release artifact, credential policy or installed binary is changed by this source slice.

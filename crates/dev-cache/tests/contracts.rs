@@ -3812,3 +3812,74 @@ fn doctor_fails_when_the_maintenance_catalog_is_invalid() {
         1
     );
 }
+
+#[test]
+fn workspace_discovery_preserves_git_boundaries_without_a_git_process() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
+    for linked in [false, true] {
+        let project = temp.path().join(if linked { "linked" } else { "ordinary" });
+        let nested = project.join("crate/src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            project.join("crate/Cargo.toml"),
+            "[package]\nname='fixture'\n",
+        )
+        .unwrap();
+        if linked {
+            let metadata = temp.path().join("metadata/worktrees/linked");
+            fs::create_dir_all(&metadata).unwrap();
+            fs::write(metadata.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            fs::write(metadata.join("commondir"), "../..\n").unwrap();
+            fs::write(
+                project.join(".git"),
+                "gitdir: ../metadata/worktrees/linked\n",
+            )
+            .unwrap();
+        } else {
+            fs::create_dir_all(project.join(".git/objects")).unwrap();
+            fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        let discovered = Repository::discover(&nested, &root).unwrap().unwrap();
+        assert_eq!(discovered.worktree, project.canonicalize().unwrap());
+        // A submodule/nested worktree has its own scope.
+        let module = temp.path().join("metadata/modules/crate");
+        fs::create_dir_all(module.join("objects")).unwrap();
+        fs::write(module.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            project.join("crate/.git"),
+            "gitdir: ../../metadata/modules/crate\n",
+        )
+        .unwrap();
+        let nested_scope = Repository::discover(&nested, &root).unwrap().unwrap();
+        assert_eq!(
+            nested_scope.worktree,
+            project.join("crate").canonicalize().unwrap()
+        );
+    }
+}
+
+#[test]
+fn malformed_git_markers_do_not_capture_unrelated_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache")).unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::create_dir(temp.path().join(".git")).unwrap();
+    assert_eq!(
+        Repository::discover(&project.join("src"), &root)
+            .unwrap()
+            .unwrap()
+            .worktree,
+        project.canonicalize().unwrap()
+    );
+    fs::write(project.join("src/.git"), "gitdir: missing\n").unwrap();
+    assert_eq!(
+        Repository::discover(&project.join("src"), &root)
+            .unwrap()
+            .unwrap()
+            .worktree,
+        project.canonicalize().unwrap()
+    );
+}

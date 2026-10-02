@@ -2261,7 +2261,8 @@ fn environment_name_is_safe(name: &OsStr) -> bool {
         return false;
     }
     ![
-        b"GH_TOKEN".as_slice(),
+        b"ARGV0".as_slice(),
+        b"GH_TOKEN",
         b"GITHUB_TOKEN",
         b"OP_SERVICE_ACCOUNT_TOKEN",
         b"SSH_AUTH_SOCK",
@@ -2443,6 +2444,7 @@ mod tests {
     fn workload_environment_removes_auth_and_loader_injection_but_keeps_ui_settings() {
         for denied in [
             "DEV_AUTH_SESSION",
+            "ARGV0",
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
             "GH_TOKEN",

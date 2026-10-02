@@ -1,6 +1,6 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -49,21 +49,10 @@ impl Repository {
         let requested = cwd
             .canonicalize()
             .with_context(|| format!("resolve workspace start {}", cwd.display()))?;
-        let output = Command::new("git")
-            .args(["-C"])
-            .arg(&requested)
-            .args(["rev-parse", "--show-toplevel"])
-            .output();
-        let worktree = match output {
-            Ok(output) if output.status.success() => {
-                let raw = String::from_utf8(output.stdout)
-                    .context("Git returned non-UTF-8 worktree path")?;
-                PathBuf::from(raw.trim())
-                    .canonicalize()
-                    .context("resolve Git worktree")?
-            }
-            _ => native_workspace_root(&requested),
-        };
+        // Workspace discovery is local metadata observation. Invoking Git here
+        // can enter a credential broker (or hang in a user wrapper) for every
+        // compiler invocation, and makes a cache product depend on Git.
+        let worktree = native_workspace_root(&requested);
         let filesystem_identity = filesystem_identity(&worktree)?;
         let seed = format!(
             "v2\0{}\0{}\0{}",
@@ -316,6 +305,16 @@ fn identity_path(root: &RootHandle, identity: &str) -> PathBuf {
 }
 
 fn native_workspace_root(start: &Path) -> PathBuf {
+    // Prefer the nearest worktree boundary over nested language manifests,
+    // matching the workspace scope used for ordinary and linked worktrees.
+    // The marker is only a cache grouping hint, never Git/auth authority.
+    for candidate in start.ancestors() {
+        let marker = candidate.join(".git");
+        if git_workspace_marker(&marker) {
+            return candidate.to_path_buf();
+        }
+    }
+
     const MARKERS: &[&str] = &[
         "Cargo.toml",
         "go.mod",
@@ -335,6 +334,41 @@ fn native_workspace_root(start: &Path) -> PathBuf {
         }
     }
     start.to_path_buf()
+}
+
+fn git_workspace_marker(marker: &Path) -> bool {
+    if marker.is_dir() {
+        return marker.join("HEAD").is_file()
+            && (marker.join("objects").is_dir() || marker.join("commondir").is_file());
+    }
+    // Gitfiles are small public path selectors. Bound reads so a malformed
+    // marker cannot turn a compiler probe into an unbounded metadata read.
+    let Ok(metadata) = fs::metadata(marker) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 8192 {
+        return false;
+    }
+    let Ok(file) = fs::File::open(marker) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file.take(8193).read_to_end(&mut bytes).is_err() || bytes.len() > 8192 {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Some(path) = text.strip_prefix("gitdir: ") else {
+        return false;
+    };
+    let path = path.trim_end_matches(['\r', '\n']);
+    if path.is_empty() || path.contains(['\r', '\n', '\0']) {
+        return false;
+    }
+    let target = marker.parent().unwrap_or(Path::new(".")).join(path);
+    target.join("HEAD").is_file()
+        && (target.join("objects").is_dir() || target.join("commondir").is_file())
 }
 
 #[cfg(unix)]

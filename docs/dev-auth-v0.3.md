@@ -109,3 +109,7 @@ Linux is the first strong backend. Windows Job Objects, named pipes, and Credent
 ## Release acceptance
 
 Release acceptance includes semantic passthrough, unknown future Git and GitHub CLI commands, the multiword VS Code `GIT_EDITOR` regression, admitted credentials and API access, denied resources, no human fallback, subagents and fresh shells, concurrent workloads, broker restart, daemonization, teardown, token refresh and revocation, credential absence from process and persistent surfaces, sandbox positive and negative probes, standalone clean-machine installation, Syscfg-as-client installation, rollback, and hot-path performance. No normal command may reintroduce per-command Python, artifact hashing, repository traversal, or a maintained upstream command grammar.
+
+## Exported zsh ARGV0
+
+Linux public launchers recover their invoked name from the kernel's `AT_EXECFN` path, so exported zsh `ARGV0` cannot redirect a git/gh invocation to another workload. Existing receipt and broker authorization still applies. Descriptor execution and explicit core private-helper calls retain their validated internal dispatch contracts. Workload launch filters ARGV0 from child environments. Other platforms retain existing behavior pending native qualification. See [ADR 0029](adr/0029-linux-launcher-path-dispatch.md).

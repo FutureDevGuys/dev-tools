@@ -36,6 +36,8 @@ Read the applicable records before changing a public product contract or cross-p
 | [0025](0025-product-authority-ledger-import.md) | Product-authority ledger import | proposed | pending |
 | [0026](0026-local-update-mutation-preparation.md) | Local update mutation preparation | proposed | pending |
 | [0027](0027-read-only-cutover-observations.md) | Read-only cutover observations | proposed | pending |
+| [0028](0028-local-cache-workspace-discovery.md) | Local cache workspace discovery without Git execution | proposed | pending |
+| [0029](0029-linux-launcher-path-dispatch.md) | Linux launcher path dispatch | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 
