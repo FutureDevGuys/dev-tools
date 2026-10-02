@@ -1,7 +1,6 @@
 # Active work
 
 - Execute the accepted sequence and release gates in [Dev Tools completion plan](docs/dev-tools-completion-plan.md); keep this file limited to incomplete outcomes and action-changing risks.
-- Close issue 40 and attach acceptance evidence once the existing GitHub integration has Issues write authority for FutureDevGuys/dev-tools. Its admitted closeIssue operation is denied as "Resource not accessible by integration"; do not substitute credentials or widen private policy here. Check final issue/comment state before retrying.
 - Publish the authenticated narrowed generation-2 registry transaction: exact unchanged privilege/product/reconcile-protocol 0.1.0 archives from retained clean 46066ec source. Preserve the original six-package signed inventory as evidence only; its installation/secret bytes must never be uploaded.
 - Publish authenticated corrected generation-3 command 0.1.1, installation 0.2.0 and secret 0.1.1 packages from clean source bf836aa. Do not reuse original signed version identities for changed bytes.
 - Publish dependency-ready registry batches; private bootstrap input remains required. Publish dependent completion/release/update batches only after exact registry dependencies resolve, verify checksums, configure Trusted Publishing and revoke the bootstrap token. Release/update must include integrated redirect admission rather than frozen implementation bytes.
