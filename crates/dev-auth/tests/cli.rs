@@ -4072,7 +4072,14 @@ fn one_released_binary_serves_the_git_helper_symlink() {
 #[test]
 fn one_released_binary_serves_every_declared_symlink_frontend() {
     let directory = tempfile::tempdir().unwrap();
+    // Linux frontends resolve native account authority from passwd, deliberately
+    // ignoring HOME. Use the existing isolated account fixture so an installed
+    // operator configuration cannot make this missing-authority test succeed.
+    #[cfg(target_os = "linux")]
+    let sandbox = NativeUserSandbox::new();
+    #[cfg(not(target_os = "linux"))]
     let home = tempfile::tempdir().unwrap();
+    #[cfg(not(target_os = "linux"))]
     let runtime = private_runtime();
     for frontend in [
         "git-dev-auth",
@@ -4086,6 +4093,9 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
     ] {
         let path = directory.path().join(frontend);
         symlink(env!("CARGO_BIN_EXE_dev-auth"), &path).unwrap();
+        #[cfg(target_os = "linux")]
+        let output = bounded_output(sandbox.command(&path, &sandbox.home).arg("--help"));
+        #[cfg(not(target_os = "linux"))]
         let output = Command::new(&path)
             .arg("--help")
             .env_clear()
@@ -4094,7 +4104,13 @@ fn one_released_binary_serves_every_declared_symlink_frontend() {
             .env("XDG_RUNTIME_DIR", runtime.path())
             .output()
             .unwrap();
-        assert!(!output.status.success(), "{frontend}");
+        assert!(
+            !output.status.success(),
+            "{frontend}: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             String::from_utf8(output.stderr)
                 .unwrap()
