@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Complete-receipt recovery in an explicitly owned, disposable systemd root.
 //! Synthetic retained provenance is not signature or release acceptance.
 use super::*;

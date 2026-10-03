@@ -20,7 +20,7 @@ use dev_tools_installation::{
     VersionedLayout, VersionedReceipt, VersionedTwoLevelAdoption,
 };
 use dev_tools_release::{
-    accept_verified_release, select_stable_release_assets, verify_release_metadata,
+    accept_verified_release, select_stable_release_assets_with_fallback, verify_release_metadata,
     ArtifactUrlPolicy, ReleaseAuthority, ReleaseMetadata, ReleaseState as SharedReleaseState,
     VerifiedRelease as SharedVerifiedRelease,
 };
@@ -44,6 +44,7 @@ use wait_timeout::ChildExt;
 const ENGINE_PROTOCOL: u32 = 1;
 const RELEASES_URL: &str =
     "https://api.github.com/repos/FutureDevGuys/dev-tools/releases?per_page=100";
+const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/FutureDevGuys/dev-tools/releases/download/";
 const METADATA_LIMIT: u64 = 512 * 1024;
 const RELEASE_STATE_LIMIT: u64 = 64 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
@@ -1242,11 +1243,16 @@ fn resolve_release_urls(product: Product) -> Result<(String, String)> {
     let releases_url =
         env::var("DEV_TOOLS_RELEASES_URL").unwrap_or_else(|_| RELEASES_URL.to_string());
     let bytes = https_get(&releases_url, None, METADATA_LIMIT)?.bytes;
-    let selected = select_stable_release_assets(
-        &bytes,
+    select_product_release_urls(&bytes, product)
+}
+
+fn select_product_release_urls(bytes: &[u8], product: Product) -> Result<(String, String)> {
+    let selected = select_stable_release_assets_with_fallback(
+        bytes,
         product.id(),
         "dev-tools-root.json",
         &format!("{}-stable.json", product.id()),
+        Some(RELEASE_DOWNLOAD_BASE),
     )?;
     Ok((selected.root_url, selected.manifest_url))
 }
@@ -1581,6 +1587,19 @@ fn shared_installation_layout(product: Product, paths: &Paths) -> Result<Version
             }
         }
     };
+    let bin_directory_mode = match fs::symlink_metadata(&paths.bin_dir) {
+        Ok(metadata)
+            if metadata.file_type().is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == owner_uid
+                && matches!(metadata.mode() & 0o7777, 0o700 | 0o755) =>
+        {
+            metadata.mode() & 0o7777
+        }
+        Ok(_) => bail!("public command directory has unsafe filesystem authority"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o755,
+        Err(error) => return Err(error).context("inspect public command directory"),
+    };
     Ok(VersionedLayout {
         product: product.id().into(),
         data_root: paths.product_root.clone(),
@@ -1588,7 +1607,7 @@ fn shared_installation_layout(product: Product, paths: &Paths) -> Result<Version
         artifact_name: paths.executable_name.clone(),
         owner_uid,
         directory_mode: 0o700,
-        bin_directory_mode: None,
+        bin_directory_mode: Some(bin_directory_mode),
     })
 }
 
@@ -1967,6 +1986,29 @@ impl Paths {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_installer_preserves_an_owned_public_command_directory() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir()?;
+        let paths = state_test_paths(root.path());
+        fs::create_dir(&paths.product_root)?;
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(&paths.bin_dir)?;
+        for mode in [0o700, 0o755] {
+            fs::set_permissions(&paths.bin_dir, fs::Permissions::from_mode(mode))?;
+            let layout = shared_installation_layout(Product::DevCache, &paths)?;
+            assert_eq!(layout.directory_mode, 0o700);
+            assert_eq!(layout.bin_directory_mode, Some(mode));
+            dev_tools_installation::ensure_owned_directory(&paths.bin_dir, layout.owner_uid, mode)?;
+            assert_eq!(fs::metadata(&paths.product_root)?.mode() & 0o777, 0o700);
+        }
+        fs::set_permissions(&paths.bin_dir, fs::Permissions::from_mode(0o775))?;
+        assert!(shared_installation_layout(Product::DevCache, &paths).is_err());
+        Ok(())
+    }
 
     #[test]
     fn metadata_cache_does_not_replay_unbound_legacy_validator() -> Result<()> {
@@ -3100,6 +3142,31 @@ mod tests {
         let (root, manifest) = select_release_urls(&releases, Product::DevCache).unwrap();
         assert!(root.ends_with("dev-cache/v1.10.0"));
         assert!(manifest.ends_with("dev-cache/v1.10.0"));
+    }
+
+    #[test]
+    fn product_release_resolution_recovers_canonical_urls_from_an_incomplete_index() {
+        let index = serde_json::to_vec(&serde_json::json!([
+            {
+                "tag_name": "dev-cache/v0.1.10",
+                "draft": false,
+                "prerelease": false,
+                "assets": []
+            },
+            {
+                "tag_name": "dev-cache/v0.1.9",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {"name":"dev-tools-root.json","browser_download_url":"https://github.com/old-root"},
+                    {"name":"dev-cache-stable.json","browser_download_url":"https://github.com/old-manifest"}
+                ]
+            }
+        ]))
+        .unwrap();
+        let (root, manifest) = select_product_release_urls(&index, Product::DevCache).unwrap();
+        assert_eq!(root, "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-cache%2Fv0.1.10/dev-tools-root.json");
+        assert_eq!(manifest, "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-cache%2Fv0.1.10/dev-cache-stable.json");
     }
 
     #[test]

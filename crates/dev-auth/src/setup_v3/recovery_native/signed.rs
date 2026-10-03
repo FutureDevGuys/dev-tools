@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Public signed intake in a fresh disposable native root. The runner supplies
 //! exact release sets at /signed/candidate and /signed/prior; no fake provenance.
 use super::*;

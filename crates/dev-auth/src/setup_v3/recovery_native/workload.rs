@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Synthetic credential material, real systemd broker and protected dispatcher.
 use super::*;
 use std::os::fd::{AsFd, OwnedFd};

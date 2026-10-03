@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Candidate-only strong restoration, with no fabricated prior installation.
 use super::*;
 

@@ -145,7 +145,7 @@ impl Prepared {
                     command.env(name, format!("/proc/self/fd/{target}"));
                     target
                 }
-                _ => unreachable!("stdin and environment handled before descriptor projection"),
+                _ => bail!("projection kind was not handled before descriptor preparation"),
             };
             // Retain sources above every allowed target so dup2 cannot destroy a
             // later source. These descriptors remain CLOEXEC in the parent.

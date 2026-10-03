@@ -33,6 +33,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0021](0021-authenticated-product-state-cutover.md) | Authenticated product-state cutover | proposed | pending |
 | [0022](0022-common-local-update-observation.md) | Common local update observation | proposed | pending |
 | [0023](0023-common-authenticated-metadata-refresh.md) | Common authenticated metadata refresh | proposed | pending |
+| [0024](0024-canonical-release-assets-after-incomplete-index.md) | Canonical assets after an incomplete GitHub release index | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

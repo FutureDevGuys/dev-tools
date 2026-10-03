@@ -441,6 +441,16 @@ fn cfg_annotated_item_state(line: &str) -> CfgAnnotatedItemState {
 }
 
 fn compute_test_line_mask(lines: &[&str], sanitized_lines: &[&str]) -> Vec<bool> {
+    // An explicit first-item inner cfg applies to the entire out-of-line
+    // module. Require the exact test-only predicate; mixed production cfgs
+    // and nested attributes cannot classify the whole file as test code.
+    if sanitized_lines
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim() == "#![cfg(test)]")
+    {
+        return vec![true; lines.len()];
+    }
     let mut mask = vec![false; lines.len()];
     let mut pending_cfg_test = false;
     let mut in_cfg_test_block = false;
@@ -1075,6 +1085,34 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    #[test]
+    fn explicit_inner_test_cfg_masks_an_out_of_line_test_module() {
+        let source = "// test helper\n#![cfg(test)]\nfn helper() { panic!(\"fixture\"); }";
+        let sanitized = strip_comments_and_strings(source);
+        let raw: Vec<_> = source.lines().collect();
+        let clean: Vec<_> = sanitized.lines().collect();
+        assert!(compute_test_line_mask(&raw, &clean)
+            .into_iter()
+            .all(|skip| skip));
+    }
+
+    #[test]
+    fn mixed_nested_or_string_test_cfg_does_not_mask_production() {
+        for source in [
+            "#![cfg(any(test, unix))]\nfn prod() { panic!(\"bug\"); }",
+            "mod nested {\n#![cfg(test)]\n}\nfn prod() { panic!(\"bug\"); }",
+            "const TEXT: &str = \"#![cfg(test)]\";\nfn prod() { panic!(\"bug\"); }",
+        ] {
+            let sanitized = strip_comments_and_strings(source);
+            let raw: Vec<_> = source.lines().collect();
+            let clean: Vec<_> = sanitized.lines().collect();
+            assert!(!compute_test_line_mask(&raw, &clean)
+                .last()
+                .copied()
+                .unwrap());
+        }
     }
 
     #[test]

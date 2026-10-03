@@ -110,7 +110,10 @@ impl StrongAssetsCompletion {
             } else {
                 asset.observed.as_ref()
             };
-            let name = asset.path.file_name().unwrap();
+            let name = asset
+                .path
+                .file_name()
+                .context("system definition filename is absent")?;
             let observed = match prepared.get(asset.directory) {
                 Some(directory) => directory.read(name, &authority())?,
                 None => self.directories[asset.directory]
@@ -155,7 +158,10 @@ impl StrongAssetsCompletion {
             verify_generation()?;
             self.verify_progress(index, &prepared)?;
             let published = prepared[asset.directory].write(
-                asset.path.file_name().unwrap(),
+                asset
+                    .path
+                    .file_name()
+                    .context("system definition filename is absent")?,
                 asset.bytes,
                 &authority(),
                 asset.observed.as_ref(),

@@ -1112,8 +1112,40 @@ pub fn select_stable_release_assets(
     root_asset_name: &str,
     manifest_asset_name: &str,
 ) -> Result<SelectedReleaseAssets> {
+    select_stable_release_assets_with_fallback(
+        releases_json,
+        product,
+        root_asset_name,
+        manifest_asset_name,
+        None,
+    )
+}
+
+/// Resolve fixed release metadata even when GitHub's list view temporarily
+/// omits assets that are present at their canonical download URLs. Only an
+/// absent asset may use the caller-owned base; duplicates remain ambiguous.
+/// The downloaded root and manifest still require normal authentication.
+pub fn select_stable_release_assets_with_fallback(
+    releases_json: &[u8],
+    product: &str,
+    root_asset_name: &str,
+    manifest_asset_name: &str,
+    canonical_download_base: Option<&str>,
+) -> Result<SelectedReleaseAssets> {
     require_bounded(releases_json, METADATA_LIMIT, "release index")?;
-    if product.is_empty() || root_asset_name.is_empty() || manifest_asset_name.is_empty() {
+    let safe_asset_name = |name: &str| {
+        !name.is_empty()
+            && name.len() <= 128
+            && name != "."
+            && name != ".."
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    };
+    if product.is_empty()
+        || !safe_asset_name(root_asset_name)
+        || !safe_asset_name(manifest_asset_name)
+    {
         bail!("stable release selection is incomplete");
     }
     let releases: Vec<ReleaseCandidate> =
@@ -1134,6 +1166,27 @@ pub fn select_stable_release_assets(
             .iter()
             .filter(|asset| asset.name == name)
             .collect::<Vec<_>>();
+        if matches.is_empty() {
+            if let Some(base) = canonical_download_base {
+                let mut url = url::Url::parse(base).context("parse canonical release URL base")?;
+                if url.scheme() != "https"
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || !url.path().ends_with('/')
+                {
+                    bail!("canonical release URL base is invalid");
+                }
+                url.path_segments_mut()
+                    .map_err(|_| anyhow::anyhow!("canonical release URL base has no path"))?
+                    .pop_if_empty()
+                    .push(&release.tag_name)
+                    .push(name);
+                return Ok(url.to_string());
+            }
+        }
         if matches.len() != 1 {
             bail!(
                 "release {} does not contain exactly one required asset {name}",

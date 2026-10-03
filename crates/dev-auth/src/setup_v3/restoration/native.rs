@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Full fixed-path composition in an explicitly disposable systemd container.
 //! Synthetic release claims exercise retention, not release authentication.
 use super::*;

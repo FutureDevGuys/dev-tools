@@ -120,7 +120,9 @@ mod linux {
                 match self.input.read(&mut bytes) {
                     Ok(length) if length == bytes.len() => {
                         let signal = u32::from_ne_bytes(
-                            bytes[..4].try_into().expect("four-byte signal field"),
+                            bytes[..4]
+                                .try_into()
+                                .context("invalid native signal field")?,
                         );
                         if matches!(
                             signal as i32,
@@ -387,7 +389,7 @@ mod linux {
         terminal: &mut Option<Terminal>,
         continue_running: &mut impl FnMut() -> bool,
     ) -> Result<InheritedCommandOutput> {
-        let retained = child.0.as_ref().expect("retained child");
+        let retained = child.0.as_ref().context("retained child is absent")?;
         if retained.stdin.is_some() || retained.stdout.is_some() || retained.stderr.is_some() {
             bail!("native inherited execution does not service caller-selected pipes");
         }

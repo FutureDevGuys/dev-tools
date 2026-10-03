@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;

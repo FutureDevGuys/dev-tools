@@ -3,12 +3,13 @@ use base64::Engine as _;
 use dev_tools_release::{
     accept_verified_release, build_signed_envelope, build_unsigned_crate_set,
     build_unsigned_product_manifest, build_unsigned_root_document, fetch_https, release_key_id,
-    root_key_id, select_stable_release_assets, validate_unsigned_product_manifest,
-    validate_unsigned_release_document, verify_artifact_bytes, verify_crate_package_bytes,
-    verify_crate_set_metadata, verify_release_bytes, verify_release_metadata, ArtifactUrlPolicy,
-    CratePackageSpec, CrateSetAuthority, CrateSetMetadata, CrateSetSpec, EnvelopeSignature,
-    HttpsPolicy, ManifestArtifact, ProductManifestSpec, ReleaseAuthority, ReleaseBundle,
-    ReleaseMetadata, ReleaseState, RootDocumentSpec, RootReleaseKey,
+    root_key_id, select_stable_release_assets, select_stable_release_assets_with_fallback,
+    validate_unsigned_product_manifest, validate_unsigned_release_document, verify_artifact_bytes,
+    verify_crate_package_bytes, verify_crate_set_metadata, verify_release_bytes,
+    verify_release_metadata, ArtifactUrlPolicy, CratePackageSpec, CrateSetAuthority,
+    CrateSetMetadata, CrateSetSpec, EnvelopeSignature, HttpsPolicy, ManifestArtifact,
+    ProductManifestSpec, ReleaseAuthority, ReleaseBundle, ReleaseMetadata, ReleaseState,
+    RootDocumentSpec, RootReleaseKey,
 };
 #[cfg(unix)]
 use dev_tools_release::{
@@ -724,6 +725,97 @@ fn stable_selection_is_product_scoped_and_rejects_prereleases() {
     assert_eq!(selected.version.to_string(), "1.2.3");
     assert_eq!(selected.root_url, "https://github.com/root");
     assert_eq!(selected.manifest_url, "https://github.com/manifest");
+}
+
+#[test]
+fn missing_embedded_assets_use_only_the_selected_canonical_release_urls() {
+    let releases = serde_json::to_vec(&json!([
+        {
+            "tag_name": "dev-cache/v0.1.10",
+            "draft": false,
+            "prerelease": false,
+            "assets": []
+        },
+        {
+            "tag_name": "dev-cache/v0.1.9",
+            "draft": false,
+            "prerelease": false,
+            "assets": [
+                {"name": "dev-tools-root.json", "browser_download_url": "https://github.com/old-root"},
+                {"name": "dev-cache-stable.json", "browser_download_url": "https://github.com/old-manifest"}
+            ]
+        }
+    ]))
+    .unwrap();
+    assert!(select_stable_release_assets(
+        &releases,
+        "dev-cache",
+        "dev-tools-root.json",
+        "dev-cache-stable.json"
+    )
+    .is_err());
+    let selected = select_stable_release_assets_with_fallback(
+        &releases,
+        "dev-cache",
+        "dev-tools-root.json",
+        "dev-cache-stable.json",
+        Some("https://github.com/FutureDevGuys/dev-tools/releases/download/"),
+    )
+    .unwrap();
+    assert_eq!(selected.version.to_string(), "0.1.10");
+    assert_eq!(selected.root_url, "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-cache%2Fv0.1.10/dev-tools-root.json");
+    assert_eq!(selected.manifest_url, "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-cache%2Fv0.1.10/dev-cache-stable.json");
+}
+
+#[test]
+fn incomplete_index_fallback_rejects_ambiguous_assets_and_unsafe_bases() {
+    let ambiguous = serde_json::to_vec(&json!([{
+        "tag_name": "dev-cache/v0.1.10",
+        "draft": false,
+        "prerelease": false,
+        "assets": [
+            {"name": "dev-tools-root.json", "browser_download_url": "https://github.com/one"},
+            {"name": "dev-tools-root.json", "browser_download_url": "https://github.com/two"}
+        ]
+    }]))
+    .unwrap();
+    assert!(select_stable_release_assets_with_fallback(
+        &ambiguous,
+        "dev-cache",
+        "dev-tools-root.json",
+        "dev-cache-stable.json",
+        Some("https://github.com/FutureDevGuys/dev-tools/releases/download/"),
+    )
+    .is_err());
+    let empty = serde_json::to_vec(&json!([{
+        "tag_name": "dev-cache/v0.1.10",
+        "draft": false,
+        "prerelease": false,
+        "assets": []
+    }]))
+    .unwrap();
+    for base in [
+        "http://github.com/FutureDevGuys/dev-tools/releases/download/",
+        "https://user:password@github.com/FutureDevGuys/dev-tools/releases/download/",
+        "https://github.com/FutureDevGuys/dev-tools/releases/download/?query=1",
+    ] {
+        assert!(select_stable_release_assets_with_fallback(
+            &empty,
+            "dev-cache",
+            "dev-tools-root.json",
+            "dev-cache-stable.json",
+            Some(base),
+        )
+        .is_err());
+    }
+    assert!(select_stable_release_assets_with_fallback(
+        &empty,
+        "dev-cache",
+        "../dev-tools-root.json",
+        "dev-cache-stable.json",
+        Some("https://github.com/FutureDevGuys/dev-tools/releases/download/"),
+    )
+    .is_err());
 }
 
 #[test]

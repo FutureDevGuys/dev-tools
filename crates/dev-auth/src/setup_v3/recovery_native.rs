@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Standalone CLI recovery in a disposable systemd root. Retained provenance
 //! is synthetic; the actual candidate executable is supplied by the runner.
 use super::*;
