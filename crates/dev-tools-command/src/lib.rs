@@ -1,11 +1,15 @@
 //! Product-neutral executable discovery, PATH composition, and bounded execution.
 
+mod owned_prepared;
 #[cfg(target_os = "linux")]
 mod public_file_stdout;
+pub use owned_prepared::OwnedPreparedCommand;
+mod inherited;
+pub use inherited::{run_prepared_inherited_command, InheritedCommandOutput};
 #[cfg(target_os = "linux")]
 pub use public_file_stdout::{
     run_prepared_bounded_command_with_public_file_stdout,
-    run_prepared_bounded_command_with_public_file_stdout_and_cancellation, OwnedPreparedCommand,
+    run_prepared_bounded_command_with_public_file_stdout_and_cancellation,
 };
 
 use std::collections::BTreeMap;
@@ -25,8 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result as AnyhowResult};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use wait_timeout::ChildExt;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use zeroize::Zeroize;
 #[cfg(all(
     unix,
@@ -82,6 +85,21 @@ pub struct HeldExecutable {
 #[cfg(not(target_os = "linux"))]
 pub struct HeldExecutable;
 
+/// Role of a retained path descriptor presented to stricter product validation.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldComponentKind {
+    Directory,
+    Executable,
+}
+
+#[cfg(target_os = "linux")]
+impl AsFd for HeldExecutable {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.executable.as_fd()
+    }
+}
+
 pub struct HeldCommand<'a> {
     command: Command,
     _held: &'a HeldExecutable,
@@ -104,7 +122,18 @@ impl std::ops::DerefMut for HeldCommand<'_> {
 #[cfg(target_os = "linux")]
 impl HeldExecutable {
     pub fn open(path: &Path) -> AnyhowResult<Self> {
-        hold_linux_executable(path)
+        Self::open_with_validation(path, |_, _| Ok(()))
+    }
+
+    /// Add product checks to each retained source-path descriptor after the
+    /// shared ownership/type/mode checks. Acceptance cannot weaken that baseline.
+    /// Descriptors name opened objects; metadata and bytes are not frozen against
+    /// an otherwise authorized writer. Rejection stops construction.
+    pub fn open_with_validation(
+        path: &Path,
+        validate: impl FnMut(BorrowedFd<'_>, HeldComponentKind) -> AnyhowResult<()>,
+    ) -> AnyhowResult<Self> {
+        hold_linux_executable(path, validate)
     }
 
     /// Open an independent read-only handle to the retained executable inode.
@@ -767,7 +796,10 @@ fn validate_bounded_command(
 }
 
 #[cfg(target_os = "linux")]
-fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
+fn hold_linux_executable(
+    path: &Path,
+    mut validate: impl FnMut(BorrowedFd<'_>, HeldComponentKind) -> AnyhowResult<()>,
+) -> AnyhowResult<HeldExecutable> {
     use std::path::Component;
 
     let mut components = path.components();
@@ -796,6 +828,7 @@ fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
         current_uid,
         true,
     )?;
+    validate(root.as_fd(), HeldComponentKind::Directory)?;
     let mut ancestors = vec![root];
     for name in directory_names {
         let directory = rustix::fs::openat(
@@ -813,6 +846,7 @@ fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
             current_uid,
             true,
         )?;
+        validate(directory.as_fd(), HeldComponentKind::Directory)?;
         ancestors.push(directory);
     }
     let executable = rustix::fs::openat(
@@ -835,6 +869,7 @@ fn hold_linux_executable(path: &Path) -> AnyhowResult<HeldExecutable> {
     if executable_metadata.st_mode & 0o111 == 0 {
         bail!("held executable is not executable");
     }
+    validate(executable.as_fd(), HeldComponentKind::Executable)?;
     let proc_fd_directory =
         rustix::fs::open("/proc/self/fd", directory_flags, rustix::fs::Mode::empty())
             .context("open process file-descriptor directory")?;
@@ -1411,7 +1446,7 @@ fn terminate_process_domain(
     }
 
     let force_deadline = Instant::now() + FORCE_TERMINATION_GRACE;
-    match child.wait_timeout(force_deadline.saturating_duration_since(Instant::now())) {
+    match wait_for_child_reap(child, force_deadline) {
         Ok(Some(_)) => {}
         Ok(None) => failures.push(BoundedCommandCleanupFailure::marker(
             BoundedCommandCleanupOperation::WaitChild,
@@ -1423,6 +1458,31 @@ fn terminate_process_domain(
     }
     record_process_group_exit(domain, force_deadline, &mut failures);
     failures
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+fn wait_for_child_reap(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    // All real group signals precede this reaping boundary. Polling avoids a
+    // process-global SIGCHLD handler and remains valid while that signal is blocked.
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        thread::sleep(remaining.min(MONITOR_INTERVAL));
+    }
 }
 
 #[cfg(all(
@@ -1518,8 +1578,7 @@ fn terminate_lingering_domain(
     kill_child_before_reap(child, &mut failures);
 
     let force_deadline = Instant::now() + FORCE_TERMINATION_GRACE;
-    let status = match child.wait_timeout(force_deadline.saturating_duration_since(Instant::now()))
-    {
+    let status = match wait_for_child_reap(child, force_deadline) {
         Ok(Some(status)) => Some(status),
         Ok(None) => {
             failures.push(BoundedCommandCleanupFailure::marker(
@@ -1645,7 +1704,7 @@ fn terminate_direct_child(
                 ));
             }
         }
-        match child.wait_timeout(FORCE_TERMINATION_GRACE) {
+        match wait_timeout::ChildExt::wait_timeout(child, FORCE_TERMINATION_GRACE) {
             Ok(Some(observed)) => *status = Some(observed),
             Ok(None) => failures.push(BoundedCommandCleanupFailure::marker(
                 BoundedCommandCleanupOperation::WaitChild,

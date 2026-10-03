@@ -3,29 +3,6 @@
 use super::*;
 use std::os::unix::{fs::FileExt, process::CommandExt};
 
-/// A consumed prepared command, retaining a held executable's borrow when used.
-///
-/// Construct with `Command::into()` or `HeldCommand::into()`. Consumption prevents
-/// the child-only file-size setup from persisting into a subsequent execution.
-pub struct OwnedPreparedCommand<'a>(PreparedCommand<'a>);
-
-enum PreparedCommand<'a> {
-    Plain(Command),
-    Held(HeldCommand<'a>),
-}
-
-impl From<Command> for OwnedPreparedCommand<'_> {
-    fn from(command: Command) -> Self {
-        Self(PreparedCommand::Plain(command))
-    }
-}
-
-impl<'a> From<HeldCommand<'a>> for OwnedPreparedCommand<'a> {
-    fn from(command: HeldCommand<'a>) -> Self {
-        Self(PreparedCommand::Held(command))
-    }
-}
-
 /// Run an admitted public-output observer with anonymous regular-file stdout.
 ///
 /// Linux only. Unlike the default pipe API, this consumes the prepared command.
@@ -74,10 +51,7 @@ pub fn run_prepared_bounded_command_with_public_file_stdout_and_cancellation<'a>
         return Err(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
     }
     let mut owned = command.into();
-    let command = match &mut owned.0 {
-        PreparedCommand::Plain(command) => command,
-        PreparedCommand::Held(command) => &mut command.command,
-    };
+    let command = owned.command_mut();
     let file = configure(command, output_limit).map_err(capture_error)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(BoundedCommandError::new(BoundedCommandErrorKind::Cancelled));
@@ -181,7 +155,8 @@ mod tests {
         // Deliberately do not run the monitor: this must be a kernel bound,
         // not an observation that only happens to catch a fast writer in time.
         let mut child = command.spawn().unwrap();
-        let completed = child.wait_timeout(Duration::from_secs(3)).unwrap();
+        let completed =
+            wait_for_child_reap(&mut child, Instant::now() + Duration::from_secs(3)).unwrap();
         if completed.is_none() {
             child.kill().unwrap();
             child.wait().unwrap();
