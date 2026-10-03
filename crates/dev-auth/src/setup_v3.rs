@@ -5,10 +5,8 @@ use crate::deployment::{
     canonical_deployment_intent, Activation, CredentialIntent, DeploymentCredential,
     DeploymentIntent, DeploymentMode,
 };
-use crate::policy_v2::{
-    parse_system_policy_v2, parse_user_config_v2, require_system_policy_narrows,
-    resolve_policy_for_user, SystemMode,
-};
+use crate::policy_v2::SystemMode;
+use crate::runtime_policy::{parse_runtime_administrator, RuntimeAdministrator};
 use crate::setup::{render_plan, SetupPlan};
 use anyhow::{bail, Context, Result};
 use dev_tools_installation::{
@@ -25,6 +23,14 @@ use std::path::{Path, PathBuf};
 
 const DOCUMENT_LIMIT: u64 = 1024 * 1024;
 const CURRENT_OBJECT_LIMIT: u64 = 256 * 1024 * 1024;
+
+#[cfg(all(test, target_os = "linux"))]
+mod recovery_native;
+
+#[cfg(target_os = "linux")]
+mod restoration;
+#[cfg(target_os = "linux")]
+pub use restoration::{restore_setup_v3, SetupRestorationReportV1};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -79,12 +85,16 @@ pub struct SetupActionV3 {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SetupPlanV3 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_schema: Option<String>,
     pub schema: String,
     pub intent: DeploymentIntent,
     pub intent_sha256: String,
     pub installation: SetupPlan,
     pub source_documents: Vec<DocumentIdentity>,
     pub accounts: Vec<NativeAccountIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retiring_accounts: Vec<NativeAccountIdentity>,
     pub current_paths: Vec<CurrentPathIdentity>,
     pub current_credential_ready: BTreeSet<String>,
     pub current_broker_state: String,
@@ -108,6 +118,109 @@ pub struct SetupApplyReportV3 {
     pub blocked: Vec<String>,
     pub next_action: String,
     pub actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub enum SetupRecoveryFailure {
+    #[serde(rename = "setup_recovery_authority")]
+    Authority,
+    #[serde(rename = "setup_recovery_blocked")]
+    Blocked,
+    #[serde(rename = "setup_recovery_input")]
+    InvalidInput,
+    #[serde(rename = "setup_recovery_failed")]
+    Operational,
+}
+
+impl SetupRecoveryFailure {
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Authority => 4,
+            Self::Blocked => 3,
+            Self::InvalidInput => 2,
+            Self::Operational => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRecoveryReportV1 {
+    pub schema: String,
+    pub changed: Option<bool>,
+    pub verified: bool,
+    pub input_required: Vec<String>,
+    pub blocked: Vec<String>,
+    pub next_action: String,
+    pub actions: Vec<String>,
+    pub error_kind: Option<SetupRecoveryFailure>,
+    pub exit_code: i32,
+}
+
+struct RecoveryProgress {
+    entered_mutation: bool,
+    established_change: bool,
+    failure: SetupRecoveryFailure,
+    next_action: &'static str,
+}
+
+impl RecoveryProgress {
+    fn new() -> Self {
+        Self {
+            entered_mutation: false,
+            established_change: false,
+            failure: SetupRecoveryFailure::Authority,
+            next_action: "inspect_setup_authority",
+        }
+    }
+
+    fn blocked(&mut self, next_action: &'static str) {
+        self.failure = SetupRecoveryFailure::Blocked;
+        self.next_action = next_action;
+    }
+
+    fn enter_mutation(&mut self) {
+        self.entered_mutation = true;
+        self.failure = SetupRecoveryFailure::Operational;
+        self.next_action = "retry_setup_recovery";
+    }
+
+    fn record_change(&mut self, changed: bool) {
+        self.established_change |= changed;
+    }
+
+    fn report(self, outcome: Result<SetupApplyReportV3>) -> SetupRecoveryReportV1 {
+        match outcome {
+            Ok(report) => SetupRecoveryReportV1 {
+                schema: "dev-auth-setup-recover-v1".into(),
+                changed: Some(report.changed || self.established_change),
+                verified: report.verified,
+                input_required: report.input_required,
+                blocked: report.blocked,
+                next_action: report.next_action,
+                actions: report.actions,
+                error_kind: None,
+                exit_code: if report.verified { 0 } else { 3 },
+            },
+            Err(_) => SetupRecoveryReportV1 {
+                schema: "dev-auth-setup-recover-v1".into(),
+                changed: if self.established_change {
+                    Some(true)
+                } else if self.entered_mutation {
+                    None
+                } else {
+                    Some(false)
+                },
+                verified: false,
+                input_required: Vec::new(),
+                blocked: Vec::new(),
+                next_action: self.next_action.into(),
+                actions: Vec::new(),
+                error_kind: Some(self.failure),
+                exit_code: self.failure.exit_code(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -145,6 +258,10 @@ pub fn credential_requirements(
 
 pub fn required_credential_slots_for_plan(plan: &SetupPlanV3) -> Result<CredentialRequirements> {
     validate_setup_plan_v3(plan)?;
+    requirements_for_validated_plan(plan)
+}
+
+fn requirements_for_validated_plan(plan: &SetupPlanV3) -> Result<CredentialRequirements> {
     let ready = ready_credential_slots(plan)?;
     let mut requirements = credential_requirements(&plan.intent.credentials, &ready);
     let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
@@ -192,6 +309,233 @@ pub fn apply_setup_plan_v3_from_sources(
     })
 }
 
+/// Resume an already-owned setup using the approved candidate and private
+/// transition authority. This never discovers or installs a new release.
+pub fn recover_setup_v3(
+    mode: crate::setup::InstallMode,
+    sources: &BTreeMap<String, CredentialInputSource>,
+    stdin: &mut dyn Read,
+) -> SetupRecoveryReportV1 {
+    let mut progress = RecoveryProgress::new();
+    let outcome = recover_setup_v3_inner(mode, sources, stdin, &mut progress);
+    progress.report(outcome)
+}
+
+fn recover_setup_v3_inner(
+    mode: crate::setup::InstallMode,
+    sources: &BTreeMap<String, CredentialInputSource>,
+    stdin: &mut dyn Read,
+    progress: &mut RecoveryProgress,
+) -> Result<SetupApplyReportV3> {
+    if !cfg!(target_os = "linux") {
+        progress.blocked("native_recovery_backend_required");
+        bail!("setup recovery requires a qualified native observation backend");
+    }
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
+        .context("setup recovery native account is absent")?;
+    let (paths, owner_uid, deployment_mode) = match mode {
+        crate::setup::InstallMode::Strong if user.uid.is_root() => (
+            crate::setup::SetupPaths::strong(),
+            0,
+            DeploymentMode::Strong,
+        ),
+        crate::setup::InstallMode::UserOnly if !user.uid.is_root() => (
+            crate::setup::SetupPaths::user_only(&user.dir),
+            user.uid.as_raw(),
+            DeploymentMode::UserOnly,
+        ),
+        _ => {
+            progress.next_action = "run_as_installation_owner";
+            bail!("setup recovery requires the installation's native owner");
+        }
+    };
+    let lock = crate::setup_transition::lock_path(
+        deployment_mode,
+        (deployment_mode == DeploymentMode::UserOnly).then_some(owner_uid),
+    )?;
+    let Some(_lease) = InstallationLock::try_acquire(&lock)? else {
+        progress.blocked("wait_for_active_workloads_or_setup");
+        bail!("setup recovery requires active workloads and other setup operations to finish");
+    };
+    let Some(transition) = crate::setup_transition::retained_transition(&paths, owner_uid)? else {
+        progress.blocked("create_setup_plan");
+        bail!("setup recovery requires a retained setup transition");
+    };
+    let generation: RetainedSetupGeneration =
+        serde_json::from_slice(&transition.bytes).context("parse retained setup generation")?;
+    let plan = &generation.plan;
+    if generation.schema != "dev-auth-retained-setup-generation-v1"
+        || generation.plan_sha256 != transition.plan_sha256
+        || sha256_hex(&serde_jcs::to_vec(plan)?) != transition.plan_sha256
+        || plan.installation.paths != paths
+        || plan.intent.mode != deployment_mode
+        || plan.installation.request.mode != mode
+    {
+        bail!("retained setup does not match its native transition authority");
+    }
+    require_apply_identity(plan)?;
+    if matches!(
+        transition.phase,
+        crate::setup_transition::Phase::Restoring
+            | crate::setup_transition::Phase::RestoredInactive
+    ) {
+        progress.blocked(
+            if transition.phase == crate::setup_transition::Phase::Restoring {
+                "finish_setup_restoration"
+            } else {
+                "create_setup_plan"
+            },
+        );
+        bail!("setup restoration cannot resume forward");
+    }
+    let prior_installation = retained_installation_receipts(&generation)?;
+    let running_candidate = std::env::current_exe()?;
+    let (running_length, running_sha256) =
+        crate::setup::setup_executable_identity(&running_candidate)?;
+    if running_length != plan.installation.source_length
+        || running_sha256 != plan.installation.source_sha256
+    {
+        bail!("setup recovery must run from the exact approved candidate");
+    }
+    let installed = crate::setup::retained_candidate_validation_from_source(
+        &plan.installation,
+        prior_installation
+            .as_ref()
+            .map(|(receipt, shared)| (receipt, shared)),
+        Some(&running_candidate),
+    )?;
+    let validate_installed = |installation: &SetupPlan| installed.validate(installation);
+    validate_setup_plan_v3_with_installation_check(plan, &validate_installed)?;
+    revalidate_candidate_documents(plan, &validate_installed, &generation.candidate_documents)?;
+    let declared = declared_credential_slots(plan);
+    if sources.keys().any(|slot| !declared.contains(slot)) {
+        progress.failure = SetupRecoveryFailure::InvalidInput;
+        progress.next_action = "correct_credential_input";
+        bail!("credential input names a slot outside the retained setup plan");
+    }
+    let before = deployment_state_fingerprint(plan)?;
+    if postcondition_satisfied(
+        plan,
+        &transition.plan_sha256,
+        &generation.candidate_documents,
+    ) {
+        progress.enter_mutation();
+        let changed = crate::setup_transition::accept(&paths, owner_uid, &transition.plan_sha256)?;
+        return Ok(SetupApplyReportV3 {
+            schema: "dev-auth-setup-recover-v1".into(),
+            changed,
+            verified: true,
+            input_required: Vec::new(),
+            blocked: Vec::new(),
+            next_action: "none".into(),
+            actions: Vec::new(),
+        });
+    }
+    if transition.phase != crate::setup_transition::Phase::Pending {
+        progress.blocked("repair_setup");
+        bail!("accepted setup no longer satisfies its retained authority; explicit repair is required");
+    }
+    if deployment_mode == DeploymentMode::UserOnly {
+        crate::setup::require_user_sessions_absent()?;
+    }
+    progress.enter_mutation();
+    crate::setup_transition::begin(&paths, owner_uid, &transition.plan_sha256, || {
+        bail!("setup recovery cannot initialize a transition")
+    })?;
+    let mut actions = Vec::new();
+    let binary_changed =
+        installed.finish_binary_transition(|changed| progress.record_change(changed))?;
+    if binary_changed {
+        actions.push(installed.binary_recovery_action().into());
+    }
+    let integrations_changed = deactivate_and_stop_candidate(plan, &mut actions)?;
+    progress.record_change(integrations_changed);
+    let mut allowed_owner_uids = plan
+        .accounts
+        .iter()
+        .map(|account| account.uid)
+        .collect::<BTreeSet<_>>();
+    allowed_owner_uids.insert(owner_uid);
+    let context = CredentialInputContext {
+        mode: deployment_mode,
+        allowed_owner_uids,
+    };
+    let mut report = finish_setup_candidate(
+        plan,
+        &transition.plan_sha256,
+        &generation.candidate_documents,
+        |declared, required| {
+            load_credential_inputs(declared, required, sources, &context, stdin)
+                .map(LoadedCredentialMaterials::Owned)
+        },
+        before,
+        actions,
+    )?;
+    report.changed |= integrations_changed || binary_changed;
+    report.schema = "dev-auth-setup-recover-v1".into();
+    Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+fn retained_installation_receipts(
+    generation: &RetainedSetupGeneration,
+) -> Result<
+    Option<(
+        crate::setup::InstallReceipt,
+        dev_tools_installation::VersionedReceipt,
+    )>,
+> {
+    let plan = &generation.plan;
+    let owner_uid = apply_owner_uid(plan)?;
+    let receipt = restoration::retained_object(generation, "installation_receipt", "system")?;
+    let shared = restoration::retained_object(generation, "shared_installation_receipt", "system")?;
+    for (object, path) in [
+        (
+            receipt,
+            plan.installation.paths.data_root.join("install-v2.json"),
+        ),
+        (
+            shared,
+            plan.installation
+                .paths
+                .data_root
+                .join("installation-receipt-v1.json"),
+        ),
+    ] {
+        if object.current.path != path
+            || object.current.identity.as_ref().is_some_and(|identity| {
+                identity.owner_uid != owner_uid
+                    || !(identity.mode == 0o600
+                        || (object.current.kind == "installation_receipt"
+                            && plan.intent.mode == DeploymentMode::Strong
+                            && identity.mode == 0o644))
+            })
+        {
+            bail!("retained binary receipt has incompatible native authority");
+        }
+    }
+    match (&receipt.bytes, &shared.bytes) {
+        (None, None) => Ok(None),
+        (Some(receipt), Some(shared)) => Ok(Some((
+            serde_json::from_slice(receipt)?,
+            serde_json::from_slice(shared)?,
+        ))),
+        _ => bail!("retained binary recovery requires paired installation receipts"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn retained_installation_receipts(
+    _generation: &RetainedSetupGeneration,
+) -> Result<
+    Option<(
+        crate::setup::InstallReceipt,
+        dev_tools_installation::VersionedReceipt,
+    )>,
+> {
+    bail!("retained binary receipt observation requires a native Linux backend")
+}
+
 fn apply_setup_plan_v3_with_loader<'a, F>(
     plan: &SetupPlanV3,
     approved_sha256: &str,
@@ -205,15 +549,25 @@ where
         bail!("setup plan v3 does not match the approved digest");
     }
     require_apply_identity(plan)?;
-    revalidate_public_plan_inputs(plan)?;
-    let _deployment_lock = InstallationLock::acquire(&deployment_lock_path(plan)?)
-        .context("acquire full setup transaction lock")?;
-    let declared = declared_credential_slots(plan);
+    let _deployment_lock = InstallationLock::try_acquire(&deployment_lock_path(plan)?)
+        .context("acquire full setup transaction lock")?
+        .context("setup requires active workloads and other setup operations to finish")?;
+    let documents = revalidate_public_plan_inputs(plan)?;
     let before = deployment_state_fingerprint(plan)?;
-    if postcondition_satisfied(plan, &digest) {
+    let requires_new_transition = crate::setup_transition::retained_transition(
+        &plan.installation.paths,
+        apply_owner_uid(plan)?,
+    )?
+    .is_some_and(|transition| transition.phase == crate::setup_transition::Phase::RestoredInactive);
+    if !requires_new_transition && postcondition_satisfied(plan, &digest, &documents) {
+        let changed = crate::setup_transition::settle_verified(
+            &plan.installation.paths,
+            apply_owner_uid(plan)?,
+            &digest,
+        )?;
         return Ok(SetupApplyReportV3 {
             schema: "dev-auth-setup-apply-v3".into(),
-            changed: false,
+            changed,
             verified: true,
             input_required: Vec::new(),
             blocked: Vec::new(),
@@ -221,16 +575,49 @@ where
             actions: Vec::new(),
         });
     }
-    require_initial_or_resumable_state(plan)?;
+    if !crate::setup_transition::resumable(
+        &plan.installation.paths,
+        apply_owner_uid(plan)?,
+        &digest,
+    )? {
+        require_initial_or_resumable_state(plan)?;
+    }
+    if plan.intent.mode == DeploymentMode::UserOnly {
+        crate::setup::require_user_sessions_absent()?;
+    }
+    crate::setup_transition::begin(
+        &plan.installation.paths,
+        apply_owner_uid(plan)?,
+        &digest,
+        || capture_retained_generation(plan, &digest),
+    )?;
 
     let mut actions = Vec::new();
-    deactivate_and_stop_candidate(plan, &mut actions)?;
+    let integrations_changed = deactivate_and_stop_candidate(plan, &mut actions)?;
     let (_, install_digest) = render_plan(&plan.installation)?;
     crate::setup::apply_plan(&plan.installation, &install_digest)?;
     actions.push("install_release".into());
-    install_configuration(plan, &mut actions)?;
+    let mut report =
+        finish_setup_candidate(plan, &digest, &documents, load_credentials, before, actions)?;
+    report.changed |= integrations_changed;
+    Ok(report)
+}
 
-    let requirements = required_credential_slots_for_plan(plan)?;
+fn finish_setup_candidate<'a, F>(
+    plan: &SetupPlanV3,
+    digest: &str,
+    documents: &[RetainedCandidateDocument],
+    load_credentials: F,
+    before: String,
+    mut actions: Vec<String>,
+) -> Result<SetupApplyReportV3>
+where
+    F: FnOnce(&BTreeSet<String>, &BTreeSet<String>) -> Result<LoadedCredentialMaterials<'a>>,
+{
+    let declared = declared_credential_slots(plan);
+    install_configuration(plan, documents, &mut actions)?;
+
+    let requirements = requirements_for_validated_plan(plan)?;
     let mut blocked = requirements.blocked.clone();
     blocked.sort();
     blocked.dedup();
@@ -273,9 +660,10 @@ where
     let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
     apply_credential_actions(plan, &action_set_sha256, credentials, &mut actions)?;
     start_and_activate_candidate(plan, &mut actions)?;
-    if !postcondition_satisfied(plan, &digest) {
+    if !postcondition_satisfied(plan, digest, documents) {
         bail!("setup plan v3 postcondition verification failed");
     }
+    crate::setup_transition::accept(&plan.installation.paths, apply_owner_uid(plan)?, digest)?;
     let after = deployment_state_fingerprint(plan)?;
     Ok(SetupApplyReportV3 {
         schema: "dev-auth-setup-apply-v3".into(),
@@ -333,8 +721,13 @@ pub fn verify_setup_plan_v3(
         bail!("setup plan v3 does not match the approved digest");
     }
     require_apply_identity(plan)?;
-    revalidate_public_plan_inputs(plan)?;
-    let verified = postcondition_satisfied(plan, &digest);
+    let documents = revalidate_public_plan_inputs(plan)?;
+    let verified = postcondition_satisfied(plan, &digest, &documents)
+        && crate::setup_transition::require_accepted(
+            &plan.installation.paths,
+            apply_owner_uid(plan)?,
+        )
+        .is_ok();
     Ok(SetupApplyReportV3 {
         schema: "dev-auth-setup-verify-v3".into(),
         changed: false,
@@ -418,16 +811,50 @@ fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
     Ok(())
 }
 
-fn revalidate_public_plan_inputs(plan: &SetupPlanV3) -> Result<()> {
+fn revalidate_public_plan_inputs(plan: &SetupPlanV3) -> Result<Vec<RetainedCandidateDocument>> {
     if let Some(release) = &plan.installation.verified_release {
         let storage =
             crate::stable_release::native_release_storage(plan.installation.request.mode)?;
         crate::stable_release::require_accepted_release(&storage, release)?;
     }
-    let rebuilt = build_setup_plan_v3_at(plan.intent.clone(), plan.installation.clone(), false)?;
-    if rebuilt.intent_sha256 != plan.intent_sha256
+    let documents = approved_candidate_documents(plan)?;
+    revalidate_candidate_documents(plan, &validate_live_installation_plan, &documents)?;
+    Ok(documents)
+}
+
+fn revalidate_candidate_documents(
+    plan: &SetupPlanV3,
+    validate_installation: &dyn Fn(&SetupPlan) -> Result<()>,
+    documents: &[RetainedCandidateDocument],
+) -> Result<()> {
+    validate_candidate_inventory(plan, documents)?;
+    let prior_policy = approved_prior_policy(plan)?;
+    let rebuilt = build_setup_plan_v3_with_reader(
+        plan.intent.clone(),
+        plan.installation.clone(),
+        false,
+        &|path, kind, subject| {
+            let document = documents
+                .iter()
+                .find(|document| {
+                    document.identity.path == path
+                        && document.identity.kind == kind
+                        && document.identity.subject == subject
+                })
+                .context("retained setup is missing a required candidate document")?;
+            Ok(OpenedDocument {
+                identity: document.identity.clone(),
+                bytes: document.bytes.clone(),
+            })
+        },
+        validate_installation,
+        prior_policy.as_deref(),
+    )?;
+    if rebuilt.authority_schema != plan.authority_schema
+        || rebuilt.intent_sha256 != plan.intent_sha256
         || rebuilt.source_documents != plan.source_documents
         || rebuilt.accounts != plan.accounts
+        || rebuilt.retiring_accounts != plan.retiring_accounts
         || rebuilt.actions != plan.actions
     {
         bail!("setup plan v3 public inputs changed after approval");
@@ -440,7 +867,7 @@ fn require_initial_or_resumable_state(plan: &SetupPlanV3) -> Result<()> {
     if rebuilt.current_state_sha256 == plan.current_state_sha256 {
         return Ok(());
     }
-    let report = crate::setup::verify_at(&plan.installation.paths)
+    let report = crate::setup::verify_at_read_only(&plan.installation.paths)
         .context("setup state changed and is not a receipt-owned resumable candidate")?;
     if report.version != plan.installation.request.version
         || Path::new(&report.executable)
@@ -457,9 +884,59 @@ fn require_initial_or_resumable_state(plan: &SetupPlanV3) -> Result<()> {
     Ok(())
 }
 
-fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<()> {
-    if fs::symlink_metadata(installation_receipt_path(plan)).is_err() {
-        return Ok(());
+#[cfg(target_os = "linux")]
+fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<bool> {
+    let transition = crate::setup_transition::retained_transition(
+        &plan.installation.paths,
+        apply_owner_uid(plan)?,
+    )?
+    .context("integration retirement requires retained setup authority")?;
+    let generation: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes)?;
+    if transition.phase != crate::setup_transition::Phase::Pending
+        || generation.plan != *plan
+        || generation.plan_sha256 != transition.plan_sha256
+    {
+        bail!("integration retirement requires the matching pending setup generation");
+    }
+    let executable = match fs::symlink_metadata(installation_receipt_path(plan)) {
+        Ok(_) => {
+            // Journal recovery needs retained binary-transaction authority;
+            // inspecting the release before retirement cannot confer it.
+            let report = crate::setup::verify_at_read_only(&plan.installation.paths)?;
+            if report.transparent_launchers_active {
+                crate::setup::deactivate_transparent_launchers_at(&plan.installation.paths)?;
+                actions.push("deactivate_transparent_launchers".into());
+            }
+            if plan.intent.mode == DeploymentMode::Strong {
+                crate::setup::stop_system_broker_at(&plan.installation.paths)?;
+                actions.push("stop_broker".into());
+            }
+            PathBuf::from(report.executable)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => plan
+            .installation
+            .paths
+            .data_root
+            .join("versions")
+            .join(&plan.installation.request.version)
+            .join("dev-auth"),
+        Err(error) => return Err(error).context("inspect setup installation receipt"),
+    };
+    let changed = restoration::retire_user_integrations(&generation, &executable)?;
+    for account in plan.accounts.iter().chain(&plan.retiring_accounts) {
+        actions.push(format!("deactivate_user_integrations:{}", account.name));
+    }
+    Ok(changed)
+}
+
+// Retain the existing non-Linux implementation until a native descriptor-bound
+// retirement backend is available. Linux qualification does not widen support.
+#[cfg(not(target_os = "linux"))]
+fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<bool> {
+    match fs::symlink_metadata(installation_receipt_path(plan)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("inspect setup installation receipt"),
     }
     let report = crate::setup::verify_at(&plan.installation.paths)?;
     if report.transparent_launchers_active {
@@ -470,7 +947,7 @@ fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) 
         crate::setup::stop_system_broker_at(&plan.installation.paths)?;
         actions.push("stop_broker".into());
     }
-    for account in &plan.accounts {
+    for account in plan.accounts.iter().chain(&plan.retiring_accounts) {
         crate::setup::reconcile_workload_launchers_at(
             &account.home,
             Path::new(&report.executable),
@@ -480,29 +957,37 @@ fn deactivate_and_stop_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) 
         crate::setup::reconcile_desktop_entries_at(&account.home, &BTreeMap::new(), account.uid)?;
         actions.push(format!("deactivate_user_integrations:{}", account.name));
     }
-    Ok(())
+    Ok(false)
 }
 
-fn install_configuration(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Result<()> {
+fn install_configuration(
+    plan: &SetupPlanV3,
+    documents: &[RetainedCandidateDocument],
+    actions: &mut Vec<String>,
+) -> Result<()> {
     let administrator = document_identity(plan, "administrator_policy", "system")?;
     match plan.intent.mode {
         DeploymentMode::Strong => {
-            crate::setup::reconcile_system_policy_at(
-                &plan.installation.paths,
-                &administrator.path,
-                &administrator.sha256,
-                current_document_sha(plan, "administrator_policy", "system")?,
-            )?;
+            with_candidate_source(documents, administrator, |source| {
+                crate::setup::reconcile_system_policy_at(
+                    &plan.installation.paths,
+                    source,
+                    &administrator.sha256,
+                    current_document_sha(plan, "administrator_policy", "system")?,
+                )
+            })?;
             actions.push("install_administrator_policy".into());
             for account in &plan.accounts {
                 let config = document_identity(plan, "user_configuration", &account.name)?;
-                crate::setup::reconcile_inactive_user_config_for_account_at(
-                    &plan.installation.paths,
-                    &config.path,
-                    &config.sha256,
-                    &account.name,
-                    current_document_sha(plan, "user_configuration", &account.name)?,
-                )?;
+                with_candidate_source(documents, config, |source| {
+                    crate::setup::reconcile_inactive_user_config_for_account_at(
+                        &plan.installation.paths,
+                        source,
+                        &config.sha256,
+                        &account.name,
+                        current_document_sha(plan, "user_configuration", &account.name)?,
+                    )
+                })?;
                 actions.push(format!("install_user_configuration:{}", account.name));
             }
         }
@@ -513,22 +998,26 @@ fn install_configuration(plan: &SetupPlanV3, actions: &mut Vec<String>) -> Resul
                 .context("user-only deployment has no native account")?;
             let policy =
                 document_identity(plan, "user_policy", &account.name).unwrap_or(administrator);
-            crate::setup::reconcile_user_policy_for_account_at(
-                &plan.installation.paths,
-                &policy.path,
-                &policy.sha256,
-                &account.name,
-                current_document_sha(plan, "user_policy", &account.name)?,
-            )?;
+            with_candidate_source(documents, policy, |source| {
+                crate::setup::reconcile_user_policy_for_account_at(
+                    &plan.installation.paths,
+                    source,
+                    &policy.sha256,
+                    &account.name,
+                    current_document_sha(plan, "user_policy", &account.name)?,
+                )
+            })?;
             actions.push(format!("install_user_policy:{}", account.name));
             let config = document_identity(plan, "user_configuration", &account.name)?;
-            crate::setup::reconcile_inactive_user_config_for_account_at(
-                &plan.installation.paths,
-                &config.path,
-                &config.sha256,
-                &account.name,
-                current_document_sha(plan, "user_configuration", &account.name)?,
-            )?;
+            with_candidate_source(documents, config, |source| {
+                crate::setup::reconcile_inactive_user_config_for_account_at(
+                    &plan.installation.paths,
+                    source,
+                    &config.sha256,
+                    &account.name,
+                    current_document_sha(plan, "user_configuration", &account.name)?,
+                )
+            })?;
             actions.push(format!("install_user_configuration:{}", account.name));
         }
     }
@@ -666,12 +1155,20 @@ fn start_and_activate_candidate(plan: &SetupPlanV3, actions: &mut Vec<String>) -
     Ok(())
 }
 
-fn postcondition_satisfied(plan: &SetupPlanV3, digest: &str) -> bool {
-    verify_postcondition(plan, digest).is_ok()
+fn postcondition_satisfied(
+    plan: &SetupPlanV3,
+    digest: &str,
+    documents: &[RetainedCandidateDocument],
+) -> bool {
+    verify_postcondition(plan, digest, documents).is_ok()
 }
 
-fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
-    let setup = crate::setup::verify_at(&plan.installation.paths)?;
+fn verify_postcondition(
+    plan: &SetupPlanV3,
+    digest: &str,
+    documents: &[RetainedCandidateDocument],
+) -> Result<()> {
+    let setup = crate::setup::verify_at_read_only(&plan.installation.paths)?;
     let transparent_expected = plan.intent.activation == Activation::Transparent;
     if setup.version != plan.installation.request.version
         || setup.transparent_launchers_active != transparent_expected
@@ -679,7 +1176,7 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
         bail!("installed release does not match the deployment intent");
     }
     let administrator = document_identity(plan, "administrator_policy", "system")?;
-    let system_policy = parse_system_policy_v2(&read_document_bytes(&administrator.path)?)?;
+    let system_policy = parse_runtime_administrator(candidate_bytes(documents, administrator)?)?;
     match plan.intent.mode {
         DeploymentMode::Strong => {
             require_exact_document(
@@ -693,20 +1190,20 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
         let user = nix::unistd::User::from_name(&account.name)?
             .context("deployment account disappeared during verification")?;
         let config_identity = document_identity(plan, "user_configuration", &account.name)?;
-        let config_path = crate::policy_store::user_config_path(&user);
+        let config_path = crate::policy_store::runtime_user_config_path(&system_policy, &user);
         require_exact_document(&config_path, config_identity)?;
-        let user_config = parse_user_config_v2(&read_document_bytes(&config_path)?)?;
+        let user_config = read_document_bytes(&config_path)?;
         let policy = match plan.intent.mode {
             DeploymentMode::Strong => system_policy.clone(),
             DeploymentMode::UserOnly => {
                 let policy_identity =
                     document_identity(plan, "user_policy", &account.name).unwrap_or(administrator);
-                let path = crate::policy_store::user_policy_path(&user);
+                let path = crate::policy_store::user_policy_destination(&system_policy, &user);
                 require_exact_document(&path, policy_identity)?;
-                parse_system_policy_v2(&read_document_bytes(&path)?)?
+                parse_runtime_administrator(&read_document_bytes(&path)?)?
             }
         };
-        let resolved = resolve_policy_for_user(&policy, &account.name, &user_config)?;
+        let resolved = policy.resolve_user(&account.name, &user_config)?;
         let expected_workloads = if plan.intent.activation == Activation::Transparent {
             resolved.workloads
         } else {
@@ -716,6 +1213,14 @@ fn verify_postcondition(plan: &SetupPlanV3, digest: &str) -> Result<()> {
             &account.home,
             Path::new(&setup.executable),
             &expected_workloads,
+            account.uid,
+        )?;
+    }
+    for account in &plan.retiring_accounts {
+        crate::setup::verify_user_integrations_at(
+            &account.home,
+            Path::new(&setup.executable),
+            &BTreeMap::new(),
             account.uid,
         )?;
     }
@@ -793,16 +1298,21 @@ fn resolved_workloads_for_account(
     let user = nix::unistd::User::from_name(&account.name)?
         .context("deployment account disappeared while activating integrations")?;
     let policy = match plan.intent.mode {
-        DeploymentMode::Strong => crate::policy_store::load_system_policy()?,
+        DeploymentMode::Strong => crate::policy_store::load_runtime_system_policy_at(Path::new(
+            crate::policy_store::SYSTEM_POLICY_PATH,
+        ))?,
         DeploymentMode::UserOnly => {
-            let path = crate::policy_store::user_policy_path(&user);
-            parse_system_policy_v2(&read_document_bytes(&path)?)?
+            let path = crate::policy_store::runtime_user_policy_path(&user)?;
+            crate::policy_store::load_runtime_user_policy_at(&path, account.uid)?
         }
     };
-    let config = parse_user_config_v2(&read_document_bytes(
-        &crate::policy_store::user_config_path(&user),
-    )?)?;
-    Ok(resolve_policy_for_user(&policy, &account.name, &config)?.workloads)
+    Ok(crate::policy_store::resolve_runtime_config_at(
+        &policy,
+        &account.name,
+        &crate::policy_store::runtime_user_config_path(&policy, &user),
+        account.uid,
+    )?
+    .workloads)
 }
 
 fn document_identity<'a>(
@@ -944,16 +1454,7 @@ fn deployment_lock_path(plan: &SetupPlanV3) -> Result<PathBuf> {
 }
 
 fn deployment_lock_path_for(mode: DeploymentMode, owner_uid: Option<u32>) -> Result<PathBuf> {
-    match mode {
-        DeploymentMode::Strong if owner_uid.is_none() => {
-            Ok(PathBuf::from("/run/lock/dev-auth-setup-v3.lock"))
-        }
-        DeploymentMode::UserOnly => Ok(PathBuf::from(format!(
-            "/run/user/{}/dev-auth-setup-v3.lock",
-            owner_uid.context("user-only deployment lock has no native owner")?
-        ))),
-        DeploymentMode::Strong => bail!("strong deployment lock cannot have a user owner"),
-    }
+    crate::setup_transition::lock_path(mode, owner_uid)
 }
 
 fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
@@ -966,6 +1467,7 @@ fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
     let mut paths = vec![
         installation_receipt_path(plan),
         credential_action_receipt_path(plan),
+        crate::setup_transition::state_path(&plan.installation.paths),
     ];
     match plan.intent.mode {
         DeploymentMode::Strong => {
@@ -976,10 +1478,35 @@ fn deployment_state_fingerprint(plan: &SetupPlanV3) -> Result<String> {
     for account in &plan.accounts {
         let user = nix::unistd::User::from_name(&account.name)?
             .context("deployment account disappeared while fingerprinting state")?;
-        paths.push(crate::policy_store::user_config_path(&user));
+        paths.push(user.dir.join(if plan.authority_schema.is_some() {
+            crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH
+        } else {
+            crate::policy_store::USER_CONFIG_RELATIVE_PATH
+        }));
         if plan.intent.mode == DeploymentMode::UserOnly {
-            paths.push(crate::policy_store::user_policy_path(&user));
+            paths.push(user.dir.join(if plan.authority_schema.is_some() {
+                crate::policy_store::USER_POLICY_V3_RELATIVE_PATH
+            } else {
+                crate::policy_store::USER_POLICY_RELATIVE_PATH
+            }));
         }
+    }
+    for account in &plan.retiring_accounts {
+        paths.push(
+            account
+                .home
+                .join(crate::policy_store::USER_CONFIG_RELATIVE_PATH),
+        );
+        paths.push(
+            account
+                .home
+                .join(crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH),
+        );
+        paths.extend(
+            crate::setup::user_integration_receipt_paths(&account.home, &account.name)
+                .into_iter()
+                .map(|(_, _, path)| path),
+        );
     }
     paths.sort();
     paths.dedup();
@@ -1034,8 +1561,8 @@ pub fn build_setup_plan_v3_for_verified_release(
         "administrator_policy",
         "system",
     )?;
-    let policy =
-        parse_system_policy_v2(&administrator.bytes).context("validate administrator policy")?;
+    let policy = parse_runtime_administrator(&administrator.bytes)
+        .context("validate administrator policy")?;
     let mode = match intent.mode {
         DeploymentMode::Strong => crate::setup::InstallMode::Strong,
         DeploymentMode::UserOnly => crate::setup::InstallMode::UserOnly,
@@ -1044,8 +1571,8 @@ pub fn build_setup_plan_v3_for_verified_release(
         mode,
         false,
         verified,
-        PathBuf::from(&policy.programs.git),
-        PathBuf::from(&policy.programs.gh),
+        PathBuf::from(policy.programs()["git"]),
+        PathBuf::from(policy.programs()["gh"]),
     )?;
     build_setup_plan_v3(intent, installation)
 }
@@ -1055,9 +1582,30 @@ pub fn build_setup_plan_v3_at(
     installation: SetupPlan,
     require_privileged: bool,
 ) -> Result<SetupPlanV3> {
+    let prior_policy = read_prior_system_policy(intent.mode)?;
+    let plan = build_setup_plan_v3_with_reader(
+        intent,
+        installation,
+        require_privileged,
+        &read_document,
+        &validate_live_installation_plan,
+        prior_policy.as_deref(),
+    )?;
+    require_prior_policy_snapshot(&plan, prior_policy.as_deref())?;
+    Ok(plan)
+}
+
+fn build_setup_plan_v3_with_reader(
+    intent: DeploymentIntent,
+    installation: SetupPlan,
+    require_privileged: bool,
+    read_source: &dyn Fn(&Path, &str, &str) -> Result<OpenedDocument>,
+    validate_installation: &dyn Fn(&SetupPlan) -> Result<()>,
+    prior_policy: Option<&[u8]>,
+) -> Result<SetupPlanV3> {
     let intent_bytes = canonical_deployment_intent(&intent)?;
     let intent_sha256 = sha256_hex(&intent_bytes);
-    render_plan(&installation).context("validate staged installation plan")?;
+    validate_installation(&installation).context("validate staged installation plan")?;
     let current_user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective native account does not exist")?;
     let expected_install_mode = match intent.mode {
@@ -1081,24 +1629,29 @@ pub fn build_setup_plan_v3_at(
         bail!("strong setup planning requires root");
     }
 
-    let administrator = read_document(
+    let administrator = read_source(
         &intent.administrator_policy,
         "administrator_policy",
         "system",
     )?;
-    let administrator_policy =
-        parse_system_policy_v2(&administrator.bytes).context("validate administrator policy")?;
+    let administrator_policy = parse_runtime_administrator(&administrator.bytes)
+        .context("validate administrator policy")?;
+    if administrator_policy.authority_schema().is_some()
+        && semver::Version::parse(&installation.request.version)? < semver::Version::new(0, 4, 0)
+    {
+        bail!("logical authority requires a compatible runtime release");
+    }
     let expected_policy_mode = match intent.mode {
         DeploymentMode::Strong => SystemMode::Strong,
         DeploymentMode::UserOnly => SystemMode::UserOnly,
     };
-    if administrator_policy.mode != expected_policy_mode {
+    if administrator_policy.mode() != expected_policy_mode {
         bail!("administrator policy mode does not match deployment mode");
     }
-    if installation.request.native_git != Path::new(&administrator_policy.programs.git) {
+    if installation.request.native_git != Path::new(administrator_policy.programs()["git"]) {
         bail!("staged installation does not target the administrator-pinned native Git");
     }
-    if installation.request.native_gh != Path::new(&administrator_policy.programs.gh) {
+    if installation.request.native_gh != Path::new(administrator_policy.programs()["gh"]) {
         bail!("staged installation does not target the administrator-pinned native GitHub CLI");
     }
 
@@ -1128,31 +1681,31 @@ pub fn build_setup_plan_v3_at(
         if !account_names.insert(account.name.clone()) {
             bail!("deployment resolves more than one user to the same native account");
         }
-        if !administrator_policy.allowed_users.contains(&account.name) {
+        if !administrator_policy.allowed_users().contains(&account.name) {
             bail!("native account is outside administrator policy");
         }
-        let config = read_document(&user.config, "user_configuration", &account.name)?;
-        let user_config = parse_user_config_v2(&config.bytes).with_context(|| {
-            format!("validate configuration for native account {}", account.name)
-        })?;
-        let mut resolved =
-            resolve_policy_for_user(&administrator_policy, &account.name, &user_config)
-                .with_context(|| format!("resolve policy for native account {}", account.name))?;
+        let config = read_source(&user.config, "user_configuration", &account.name)?;
+        let mut resolved = administrator_policy
+            .resolve_user(&account.name, &config.bytes)
+            .with_context(|| format!("resolve policy for native account {}", account.name))?;
         documents.push(config.identity);
         if let Some(policy_path) = &user.policy {
-            let user_policy = read_document(policy_path, "user_policy", &account.name)?;
-            let parsed = parse_system_policy_v2(&user_policy.bytes)
+            let user_policy = read_source(policy_path, "user_policy", &account.name)?;
+            let parsed = parse_runtime_administrator(&user_policy.bytes)
                 .with_context(|| format!("validate user-only policy for {}", account.name))?;
-            if intent.mode != DeploymentMode::UserOnly || parsed.mode != SystemMode::UserOnly {
+            if intent.mode != DeploymentMode::UserOnly || parsed.mode() != SystemMode::UserOnly {
                 bail!("per-user policy is valid only for user-only deployment");
             }
-            require_system_policy_narrows(&administrator_policy, &parsed).with_context(|| {
-                format!(
-                    "prove user-only policy narrows administrator policy for {}",
-                    account.name
-                )
-            })?;
-            resolved = resolve_policy_for_user(&parsed, &account.name, &user_config)
+            administrator_policy
+                .require_narrows(&parsed)
+                .with_context(|| {
+                    format!(
+                        "prove user-only policy narrows administrator policy for {}",
+                        account.name
+                    )
+                })?;
+            resolved = parsed
+                .resolve_user(&account.name, &config.bytes)
                 .with_context(|| format!("resolve user-only policy for {}", account.name))?;
             documents.push(user_policy.identity);
         }
@@ -1160,7 +1713,7 @@ pub fn build_setup_plan_v3_at(
             resolved
                 .authority_profiles
                 .values()
-                .map(|profile| profile.credential_slot.clone()),
+                .flat_map(|profile| profile.credential_slots.iter().cloned()),
         );
         validate_resolved_workspace_authority(&resolved, account.uid.as_raw()).with_context(
             || {
@@ -1179,13 +1732,18 @@ pub fn build_setup_plan_v3_at(
     }
     validate_deployment_user_set(
         intent.mode,
-        &administrator_policy.allowed_users.iter().cloned().collect(),
+        &administrator_policy
+            .allowed_users()
+            .iter()
+            .cloned()
+            .collect(),
         &account_names,
     )?;
     documents.sort_by(|left, right| {
         (&left.kind, &left.subject, &left.path).cmp(&(&right.kind, &right.subject, &right.path))
     });
     accounts.sort_by(|left, right| left.name.cmp(&right.name));
+    let retiring_accounts = resolve_retiring_accounts(intent.mode, prior_policy, &accounts)?;
 
     let declared_credential_slots = intent
         .credentials
@@ -1193,9 +1751,9 @@ pub fn build_setup_plan_v3_at(
         .map(|credential| credential.slot.clone())
         .collect::<BTreeSet<_>>();
     let policy_credential_slots = administrator_policy
-        .credential_slots
-        .keys()
-        .cloned()
+        .credential_slot_names()
+        .into_iter()
+        .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     validate_deployment_credential_slots(
         &policy_credential_slots,
@@ -1211,8 +1769,14 @@ pub fn build_setup_plan_v3_at(
         bail!("transparent activation conflicts with required credential revocation");
     }
 
-    let (current_paths, current_credential_ready, current_broker_state) =
-        current_state_snapshot(&installation, &intent, &accounts)?;
+    let authority_schema = administrator_policy.authority_schema().map(str::to_owned);
+    let (current_paths, current_credential_ready, current_broker_state) = current_state_snapshot(
+        &installation,
+        &intent,
+        &accounts,
+        &retiring_accounts,
+        authority_schema.as_deref(),
+    )?;
     let current_state_sha256 = stored_current_state_digest(
         &current_paths,
         &current_credential_ready,
@@ -1220,20 +1784,164 @@ pub fn build_setup_plan_v3_at(
     )?;
     let actions = planned_action_contract(&intent);
     let plan = SetupPlanV3 {
+        authority_schema,
         schema: "dev-auth-setup-plan-v3".into(),
         intent,
         intent_sha256,
         installation,
         source_documents: documents,
         accounts,
+        retiring_accounts,
         current_paths,
         current_credential_ready,
         current_broker_state,
         current_state_sha256,
         actions,
     };
-    validate_setup_plan_v3(&plan)?;
+    validate_setup_plan_v3_with_installation_check(&plan, validate_installation)?;
     Ok(plan)
+}
+
+fn read_prior_system_policy(mode: DeploymentMode) -> Result<Option<Vec<u8>>> {
+    if mode != DeploymentMode::Strong {
+        return Ok(None);
+    }
+    let path = Path::new(crate::policy_store::SYSTEM_POLICY_PATH);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect previous administrator policy"),
+    };
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        bail!("previous administrator policy has unsafe authority");
+    }
+    let document = read_atomic_document(
+        path,
+        &DocumentAuthority {
+            owner_uid: 0,
+            mode: metadata.mode() & 0o777,
+            limit: DOCUMENT_LIMIT,
+        },
+    )?
+    .context("previous administrator policy disappeared")?;
+    Ok(Some(document.bytes))
+}
+
+fn require_prior_policy_snapshot(plan: &SetupPlanV3, bytes: Option<&[u8]>) -> Result<()> {
+    if plan.intent.mode != DeploymentMode::Strong {
+        return Ok(());
+    }
+    let current = prior_policy_identity(plan)?;
+    validate_prior_policy_bytes(current, bytes)
+}
+
+fn prior_policy_identity(plan: &SetupPlanV3) -> Result<&CurrentPathIdentity> {
+    plan.current_paths
+        .iter()
+        .find(|current| {
+            current.kind == "administrator_policy"
+                && current.subject == "system"
+                && current.path == Path::new(crate::policy_store::SYSTEM_POLICY_PATH)
+        })
+        .context("approved previous administrator policy identity is absent")
+}
+
+fn validate_prior_policy_bytes(current: &CurrentPathIdentity, bytes: Option<&[u8]>) -> Result<()> {
+    match (&current.identity, bytes) {
+        (None, None) => Ok(()),
+        (Some(identity), Some(bytes))
+            if identity.object_type == "file"
+                && identity.owner_uid == 0
+                && identity.mode & 0o022 == 0
+                && identity.link_count == 1
+                && bytes.len() as u64 <= DOCUMENT_LIMIT
+                && bytes.len() as u64 == identity.length
+                && sha256_hex(bytes) == identity.sha256 =>
+        {
+            Ok(())
+        }
+        _ => bail!("previous administrator policy differs from its approved snapshot"),
+    }
+}
+
+fn approved_prior_policy(plan: &SetupPlanV3) -> Result<Option<Vec<u8>>> {
+    if plan.intent.mode != DeploymentMode::Strong {
+        return Ok(None);
+    }
+    let current = prior_policy_identity(plan)?;
+    let digest = sha256_hex(&serde_jcs::to_vec(plan)?);
+    let object = match crate::setup_transition::retained_transition(
+        &plan.installation.paths,
+        apply_owner_uid(plan)?,
+    )? {
+        Some(transition) if transition.plan_sha256 == digest => {
+            return retained_prior_policy(plan, &digest, &transition.bytes);
+        }
+        _ => capture_retained_object(current)?,
+    };
+    validate_prior_policy_bytes(current, object.bytes.as_deref())?;
+    Ok(object.bytes)
+}
+
+fn retained_prior_policy(
+    plan: &SetupPlanV3,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let current = prior_policy_identity(plan)?;
+    let generation: RetainedSetupGeneration = serde_json::from_slice(bytes)?;
+    if generation.schema != "dev-auth-retained-setup-generation-v1"
+        || generation.plan_sha256 != digest
+        || generation.plan != *plan
+    {
+        bail!("previous policy retention does not match the approved plan");
+    }
+    let mut matching = generation
+        .documents
+        .into_iter()
+        .filter(|object| object.current == *current);
+    let object = matching
+        .next()
+        .context("retained previous policy is absent")?;
+    if matching.next().is_some() {
+        bail!("retained previous policy is ambiguous");
+    }
+    validate_prior_policy_bytes(current, object.bytes.as_deref())?;
+    Ok(object.bytes)
+}
+
+fn resolve_retiring_accounts(
+    mode: DeploymentMode,
+    prior_policy: Option<&[u8]>,
+    desired: &[NativeAccountIdentity],
+) -> Result<Vec<NativeAccountIdentity>> {
+    let Some(bytes) = prior_policy else {
+        return Ok(Vec::new());
+    };
+    if mode != DeploymentMode::Strong {
+        bail!("user-only setup cannot retire another native account");
+    }
+    let policy =
+        parse_runtime_administrator(bytes).context("validate previous administrator policy")?;
+    if policy.mode() != SystemMode::Strong {
+        bail!("previous system policy has incompatible installation authority");
+    }
+    let mut accounts = Vec::new();
+    for name in policy.allowed_users() {
+        if desired.iter().any(|account| &account.name == name) {
+            continue;
+        }
+        let user = nix::unistd::User::from_name(name)?
+            .context("retiring native account is absent; explicit identity recovery is required")?;
+        accounts.push(NativeAccountIdentity {
+            name: user.name,
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            home: user.dir,
+        });
+    }
+    accounts.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(accounts)
 }
 
 fn validate_deployment_user_set(
@@ -1279,30 +1987,30 @@ fn require_canonical_installation_layout(
 }
 
 fn validate_policy_program_authority(
-    policy: &crate::policy_v2::SystemPolicyV2,
+    policy: &RuntimeAdministrator,
     mode: DeploymentMode,
     owner_uid: u32,
 ) -> Result<()> {
-    let mut programs = vec![
-        ("1Password CLI", policy.programs.op.as_str()),
-        ("native Git", policy.programs.git.as_str()),
-        ("native GitHub CLI", policy.programs.gh.as_str()),
-        ("native SSH", policy.programs.ssh.as_str()),
-        ("native SSH key tool", policy.programs.ssh_keygen.as_str()),
-    ];
+    let mut programs = policy.programs().into_iter().collect::<Vec<_>>();
+    programs.extend(policy.provider_programs());
     programs.extend(
         policy
-            .trusted_launchers
+            .trusted_launchers()
             .iter()
             .map(|(name, path)| (name.as_str(), path.as_str())),
     );
     programs.extend(
         policy
-            .sandbox_adapters
+            .sandbox_adapters()
             .iter()
             .map(|(name, adapter)| (name.as_str(), adapter.executable.as_str())),
     );
     for (description, path) in programs {
+        let description = if description == "op" {
+            "1Password CLI"
+        } else {
+            description
+        };
         match mode {
             DeploymentMode::Strong => {
                 crate::setup::validate_root_owned_executable(Path::new(path), description)?
@@ -1457,6 +2165,46 @@ fn validate_root_plan_path(path: &Path) -> Result<()> {
 }
 
 fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
+    validate_setup_plan_v3_with_installation_check(plan, &validate_live_installation_plan)
+}
+
+fn validate_live_installation_plan(plan: &SetupPlan) -> Result<()> {
+    render_plan(plan).map(|_| ())
+}
+
+fn validate_setup_plan_v3_with_installation_check(
+    plan: &SetupPlanV3,
+    validate_installation: &dyn Fn(&SetupPlan) -> Result<()>,
+) -> Result<()> {
+    if !plan.retiring_accounts.is_empty() && plan.intent.mode != DeploymentMode::Strong {
+        bail!("only strong setup may contain retiring accounts");
+    }
+    let mut names = BTreeSet::new();
+    let mut uids = BTreeSet::new();
+    let mut homes = BTreeSet::new();
+    for account in plan.accounts.iter().chain(&plan.retiring_accounts) {
+        if !names.insert(&account.name)
+            || !uids.insert(account.uid)
+            || !homes.insert(&account.home)
+            || !account.home.is_absolute()
+            || account.home == Path::new("/")
+        {
+            bail!("setup account inventory has ambiguous native authority");
+        }
+    }
+    if plan
+        .retiring_accounts
+        .windows(2)
+        .any(|pair| pair[0].name >= pair[1].name)
+    {
+        bail!("retiring account inventory is not canonical");
+    }
+    if !matches!(
+        plan.authority_schema.as_deref(),
+        None | Some("dev-auth-administrator-policy-v3")
+    ) {
+        bail!("setup plan has an unsupported authority schema");
+    }
     if plan.schema != "dev-auth-setup-plan-v3"
         || plan.intent_sha256 != sha256_hex(&canonical_deployment_intent(&plan.intent)?)
         || plan.source_documents.is_empty()
@@ -1478,7 +2226,13 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
         bail!("dev-auth setup plan v3 has an unsupported contract");
     }
     if current_path_keys(&plan.current_paths)
-        != expected_current_path_keys(&plan.installation, &plan.intent, &plan.accounts)
+        != expected_current_path_keys(
+            &plan.installation,
+            &plan.intent,
+            &plan.accounts,
+            &plan.retiring_accounts,
+            plan.authority_schema.as_deref(),
+        )
     {
         bail!("setup plan v3 current-state paths do not match the deployment authority");
     }
@@ -1487,7 +2241,7 @@ fn validate_setup_plan_v3(plan: &SetupPlanV3) -> Result<()> {
         &plan.installation.paths,
         plan.accounts.first().map(|account| account.home.as_path()),
     )?;
-    render_plan(&plan.installation).context("validate nested installation plan")?;
+    validate_installation(&plan.installation).context("validate nested installation plan")?;
     if plan.installation.request.activate_transparent_launchers {
         bail!("setup plan v3 must stage the release with transparent launchers inactive");
     }
@@ -1505,7 +2259,10 @@ fn expected_current_path_keys(
     installation: &SetupPlan,
     intent: &DeploymentIntent,
     accounts: &[NativeAccountIdentity],
+    retiring_accounts: &[NativeAccountIdentity],
+    authority_schema: Option<&str>,
 ) -> Vec<(String, String, PathBuf)> {
+    let logical = authority_schema == Some("dev-auth-administrator-policy-v3");
     let mut paths = crate::setup::installation_current_state_paths(
         &installation.paths,
         installation.request.mode,
@@ -1518,6 +2275,11 @@ fn expected_current_path_keys(
             .data_root
             .join("credential-actions-v2.json"),
     ));
+    paths.push((
+        "setup_transition".into(),
+        "system".into(),
+        crate::setup_transition::state_path(&installation.paths),
+    ));
     match intent.mode {
         DeploymentMode::Strong => paths.push((
             "administrator_policy".into(),
@@ -1529,7 +2291,11 @@ fn expected_current_path_keys(
                 paths.push((
                     "user_policy".into(),
                     account.name.clone(),
-                    account.home.join(".config/dev-auth/policy-v2.toml"),
+                    account.home.join(if logical {
+                        crate::policy_store::USER_POLICY_V3_RELATIVE_PATH
+                    } else {
+                        crate::policy_store::USER_POLICY_RELATIVE_PATH
+                    }),
                 ));
             }
         }
@@ -1542,8 +2308,56 @@ fn expected_current_path_keys(
         paths.push((
             "user_configuration".into(),
             account.name.clone(),
-            account.home.join(".config/dev-auth/config-v2.toml"),
+            account.home.join(if logical {
+                crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH
+            } else {
+                crate::policy_store::USER_CONFIG_RELATIVE_PATH
+            }),
         ));
+        // Both versioned authorities remain rollback inputs, regardless of
+        // which schema the candidate selects.
+        paths.push((
+            "retained_user_configuration".into(),
+            account.name.clone(),
+            account.home.join(if logical {
+                crate::policy_store::USER_CONFIG_RELATIVE_PATH
+            } else {
+                crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH
+            }),
+        ));
+        if intent.mode == DeploymentMode::UserOnly {
+            paths.push((
+                "retained_user_policy".into(),
+                account.name.clone(),
+                account.home.join(if logical {
+                    crate::policy_store::USER_POLICY_RELATIVE_PATH
+                } else {
+                    crate::policy_store::USER_POLICY_V3_RELATIVE_PATH
+                }),
+            ));
+        }
+    }
+    for account in retiring_accounts {
+        paths.extend(crate::setup::user_integration_receipt_paths(
+            &account.home,
+            &account.name,
+        ));
+        for (kind, relative) in [
+            (
+                "retiring_user_configuration_v2",
+                crate::policy_store::USER_CONFIG_RELATIVE_PATH,
+            ),
+            (
+                "retiring_user_configuration_v3",
+                crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH,
+            ),
+        ] {
+            paths.push((
+                kind.into(),
+                account.name.clone(),
+                account.home.join(relative),
+            ));
+        }
     }
     paths.sort();
     paths
@@ -1601,8 +2415,16 @@ fn current_state_snapshot(
     installation: &SetupPlan,
     intent: &DeploymentIntent,
     accounts: &[NativeAccountIdentity],
+    retiring_accounts: &[NativeAccountIdentity],
+    authority_schema: Option<&str>,
 ) -> Result<(Vec<CurrentPathIdentity>, BTreeSet<String>, String)> {
-    let paths = expected_current_path_keys(installation, intent, accounts);
+    let paths = expected_current_path_keys(
+        installation,
+        intent,
+        accounts,
+        retiring_accounts,
+        authority_schema,
+    );
     let mut entries = Vec::with_capacity(paths.len());
     for (kind, subject, path) in paths {
         let identity = match fs::symlink_metadata(&path) {
@@ -1613,7 +2435,7 @@ fn current_state_snapshot(
                     Some(CurrentFileIdentity {
                         object_type: "file".into(),
                         owner_uid: metadata.uid(),
-                        mode: metadata.mode() & 0o777,
+                        mode: current_path_mode(&metadata),
                         link_count: metadata.nlink(),
                         length: document.len() as u64,
                         sha256: sha256_hex(&document),
@@ -1630,7 +2452,7 @@ fn current_state_snapshot(
                     Some(CurrentFileIdentity {
                         object_type: "symlink".into(),
                         owner_uid: metadata.uid(),
-                        mode: metadata.mode() & 0o777,
+                        mode: current_path_mode(&metadata),
                         link_count: metadata.nlink(),
                         length: target_bytes.len() as u64,
                         sha256: sha256_hex(target_bytes),
@@ -1669,6 +2491,10 @@ fn current_state_snapshot(
     Ok((entries, credential_ready, broker.to_owned()))
 }
 
+fn current_path_mode(metadata: &fs::Metadata) -> u32 {
+    metadata.mode() & 0o7777
+}
+
 fn stored_current_state_digest(
     paths: &[CurrentPathIdentity],
     credential_ready: &BTreeSet<String>,
@@ -1693,6 +2519,220 @@ fn stored_current_state_digest(
 struct OpenedDocument {
     identity: DocumentIdentity,
     bytes: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedSetupObject {
+    current: CurrentPathIdentity,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedCandidateDocument {
+    identity: DocumentIdentity,
+    bytes: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedSetupGeneration {
+    schema: String,
+    plan_sha256: String,
+    plan: SetupPlanV3,
+    documents: Vec<RetainedSetupObject>,
+    candidate_documents: Vec<RetainedCandidateDocument>,
+}
+
+fn approved_candidate_documents(plan: &SetupPlanV3) -> Result<Vec<RetainedCandidateDocument>> {
+    let digest = sha256_hex(&serde_jcs::to_vec(plan)?);
+    let documents = match crate::setup_transition::pending_generation(
+        &plan.installation.paths,
+        apply_owner_uid(plan)?,
+        &digest,
+    )? {
+        Some(bytes) => {
+            let generation: RetainedSetupGeneration =
+                serde_json::from_slice(&bytes).context("parse retained setup generation")?;
+            if generation.schema != "dev-auth-retained-setup-generation-v1"
+                || generation.plan_sha256 != digest
+                || generation.plan != *plan
+            {
+                bail!("retained setup generation does not match the approved plan");
+            }
+            generation.candidate_documents
+        }
+        None => plan
+            .source_documents
+            .iter()
+            .map(capture_candidate_document)
+            .collect::<Result<_>>()?,
+    };
+    validate_candidate_inventory(plan, &documents)?;
+    Ok(documents)
+}
+
+fn validate_candidate_inventory(
+    plan: &SetupPlanV3,
+    documents: &[RetainedCandidateDocument],
+) -> Result<()> {
+    if documents.len() != plan.source_documents.len() {
+        bail!("retained candidate inventory does not match the approved plan");
+    }
+    for (document, identity) in documents.iter().zip(&plan.source_documents) {
+        if document.identity != *identity {
+            bail!("retained candidate identity does not match the approved plan");
+        }
+        validate_candidate_bytes(document)?;
+    }
+    Ok(())
+}
+
+fn validate_candidate_bytes(document: &RetainedCandidateDocument) -> Result<()> {
+    if document.bytes.is_empty()
+        || document.bytes.len() as u64 > DOCUMENT_LIMIT
+        || document.bytes.len() as u64 != document.identity.length
+        || sha256_hex(&document.bytes) != document.identity.sha256
+    {
+        bail!("retained candidate bytes do not match their approved identity");
+    }
+    Ok(())
+}
+
+fn candidate_bytes<'a>(
+    documents: &'a [RetainedCandidateDocument],
+    identity: &DocumentIdentity,
+) -> Result<&'a [u8]> {
+    let document = documents
+        .iter()
+        .find(|document| document.identity == *identity)
+        .context("approved candidate document is absent")?;
+    validate_candidate_bytes(document)?;
+    Ok(&document.bytes)
+}
+
+fn with_candidate_source<T>(
+    documents: &[RetainedCandidateDocument],
+    identity: &DocumentIdentity,
+    apply: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    // Keep the existing bounded, digest-checking configuration installers as
+    // the mutation boundary. Never recreate or overwrite the caller's source.
+    let mut source = tempfile::NamedTempFile::new().context("stage retained setup input")?;
+    source.write_all(candidate_bytes(documents, identity)?)?;
+    source.as_file().sync_all()?;
+    apply(source.path())
+}
+
+fn capture_retained_generation(plan: &SetupPlanV3, digest: &str) -> Result<Vec<u8>> {
+    let mut documents = Vec::new();
+    for current in &plan.current_paths {
+        // Immutable release bytes retain their installation receipt authority;
+        // the configuration journal never copies executable payloads.
+        if matches!(
+            current.kind.as_str(),
+            "privileged_workload_launcher" | "privileged_setup_helper"
+        ) {
+            continue;
+        }
+        documents.push(capture_retained_object(current)?);
+    }
+    for account in plan.accounts.iter().chain(&plan.retiring_accounts) {
+        for current in crate::setup::receipt_owned_user_integration_objects(
+            &account.home,
+            &account.name,
+            account.uid,
+            if plan.intent.mode == DeploymentMode::Strong {
+                crate::setup::InstallMode::Strong
+            } else {
+                crate::setup::InstallMode::UserOnly
+            },
+        )? {
+            documents.push(capture_retained_object(&current)?);
+        }
+    }
+    // Integration inventories derive from receipts. Recheck their approved
+    // bytes after inventory capture so a changed receipt cannot add authority.
+    for current in plan.current_paths.iter().filter(|entry| {
+        matches!(
+            entry.kind.as_str(),
+            "workload_launcher_receipt" | "desktop_entry_receipt"
+        )
+    }) {
+        capture_retained_object(current)?;
+    }
+    serde_jcs::to_vec(&RetainedSetupGeneration {
+        schema: "dev-auth-retained-setup-generation-v1".into(),
+        plan_sha256: digest.into(),
+        plan: plan.clone(),
+        documents,
+        candidate_documents: plan
+            .source_documents
+            .iter()
+            .map(capture_candidate_document)
+            .collect::<Result<_>>()?,
+    })
+    .context("serialize retained setup generation")
+}
+
+fn capture_candidate_document(identity: &DocumentIdentity) -> Result<RetainedCandidateDocument> {
+    let document = read_document(&identity.path, &identity.kind, &identity.subject)?;
+    if document.identity != *identity {
+        bail!("candidate setup document changed after approval");
+    }
+    Ok(RetainedCandidateDocument {
+        identity: document.identity,
+        bytes: document.bytes,
+    })
+}
+
+fn capture_retained_object(current: &CurrentPathIdentity) -> Result<RetainedSetupObject> {
+    let bytes = match &current.identity {
+        None => {
+            match fs::symlink_metadata(&current.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect absent retained setup object"),
+                Ok(_) => bail!("retained setup object appeared after approval"),
+            }
+            None
+        }
+        Some(identity) if identity.object_type == "file" => {
+            let document = read_atomic_document(
+                &current.path,
+                &DocumentAuthority {
+                    owner_uid: identity.owner_uid,
+                    mode: identity.mode,
+                    limit: DOCUMENT_LIMIT,
+                },
+            )?
+            .context("retained setup document disappeared")?;
+            if document.identity.length != identity.length
+                || document.identity.sha256 != identity.sha256
+            {
+                bail!("retained setup document changed after approval");
+            }
+            Some(document.bytes)
+        }
+        Some(identity) if identity.object_type == "symlink" => {
+            let metadata = fs::symlink_metadata(&current.path)?;
+            let target = fs::read_link(&current.path)?;
+            if !metadata.file_type().is_symlink()
+                || metadata.uid() != identity.owner_uid
+                || metadata.nlink() != identity.link_count
+                || Some(&target) != identity.link_target.as_ref()
+                || sha256_hex(target.as_os_str().as_bytes()) != identity.sha256
+            {
+                bail!("retained setup link changed after approval");
+            }
+            None
+        }
+        Some(_) => bail!("retained setup object has an unsupported type"),
+    };
+    Ok(RetainedSetupObject {
+        current: current.clone(),
+        bytes,
+    })
 }
 
 fn read_document(path: &Path, kind: &str, subject: &str) -> Result<OpenedDocument> {
@@ -1763,6 +2803,400 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn current_path_identity_preserves_special_permission_bits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("launcher");
+        fs::write(&path, b"non-executable mode fixture").unwrap();
+        for mode in [0o755, 0o4755, 0o2755, 0o1755, 0o7755] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, mode, "fixture mode");
+            assert_eq!(current_path_mode(&metadata), mode, "approved path identity");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn generation_retains_receipt_owned_launchers_for_retiring_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let executable = root.path().join("dev-auth");
+        fs::write(&executable, b"fixture executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::setup::reconcile_workload_launchers_at(
+            root.path(),
+            &executable,
+            &["retiring-worker".into()],
+            uid,
+        )
+        .unwrap();
+        let intent = DeploymentIntent {
+            schema: "dev-auth-deployment-v1".into(),
+            mode: DeploymentMode::Strong,
+            channel: crate::deployment::Channel::Stable,
+            offline: true,
+            activation: Activation::Inactive,
+            administrator_policy: root.path().join("candidate.toml"),
+            users: Vec::new(),
+            credentials: Vec::new(),
+        };
+        let mut plan = SetupPlanV3 {
+            authority_schema: Some("dev-auth-administrator-policy-v3".into()),
+            schema: "dev-auth-setup-plan-v3".into(),
+            intent_sha256: String::new(),
+            intent,
+            installation: SetupPlan {
+                schema: "dev-auth-setup-plan-v2".into(),
+                paths: crate::setup::SetupPaths {
+                    data_root: root.path().join("data"),
+                    bin_dir: root.path().join("bin"),
+                },
+                request: crate::setup::InstallRequest {
+                    mode: crate::setup::InstallMode::Strong,
+                    version: "0.4.0".into(),
+                    source_executable: executable.clone(),
+                    native_git: executable.clone(),
+                    native_gh: executable.clone(),
+                    activate_transparent_launchers: false,
+                },
+                source_length: 0,
+                source_sha256: String::new(),
+                verified_release: None,
+            },
+            source_documents: Vec::new(),
+            accounts: Vec::new(),
+            retiring_accounts: vec![NativeAccountIdentity {
+                name: "retiring".into(),
+                uid,
+                gid: nix::unistd::Gid::effective().as_raw(),
+                home: root.path().to_path_buf(),
+            }],
+            current_paths: Vec::new(),
+            current_credential_ready: BTreeSet::new(),
+            current_broker_state: "unavailable".into(),
+            current_state_sha256: String::new(),
+            actions: Vec::new(),
+        };
+        // Switching back to v2 must retain the v3 authority just as switching
+        // to v3 retains v2. Neither selection is permission to lose rollback inputs.
+        let mut user_only_intent = plan.intent.clone();
+        user_only_intent.mode = DeploymentMode::UserOnly;
+        for schema in [None, Some("dev-auth-administrator-policy-v3")] {
+            let keys = expected_current_path_keys(
+                &plan.installation,
+                &user_only_intent,
+                &plan.retiring_accounts,
+                &[],
+                schema,
+            );
+            for relative in [
+                crate::policy_store::USER_CONFIG_RELATIVE_PATH,
+                crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH,
+                crate::policy_store::USER_POLICY_RELATIVE_PATH,
+                crate::policy_store::USER_POLICY_V3_RELATIVE_PATH,
+            ] {
+                assert_eq!(
+                    keys.iter()
+                        .filter(|(_, _, path)| *path == root.path().join(relative))
+                        .count(),
+                    1,
+                    "each authority version must be retained exactly once: {schema:?} {relative}"
+                );
+            }
+        }
+        for relative in [
+            crate::policy_store::USER_CONFIG_RELATIVE_PATH,
+            crate::policy_store::USER_CONFIG_V3_RELATIVE_PATH,
+        ] {
+            let path = root.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"retiring configuration fixture").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        for (kind, subject, path) in expected_current_path_keys(
+            &plan.installation,
+            &plan.intent,
+            &plan.accounts,
+            &plan.retiring_accounts,
+            plan.authority_schema.as_deref(),
+        )
+        .into_iter()
+        .filter(|(_, subject, _)| subject == "retiring")
+        {
+            let identity = match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    let document = read_document(&path, &kind, &subject).unwrap();
+                    Some(CurrentFileIdentity {
+                        object_type: "file".into(),
+                        owner_uid: uid,
+                        mode: metadata.mode() & 0o777,
+                        link_count: 1,
+                        length: document.identity.length,
+                        sha256: document.identity.sha256,
+                        link_target: None,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("fixture current path: {error}"),
+            };
+            plan.current_paths.push(CurrentPathIdentity {
+                kind,
+                subject,
+                path,
+                identity,
+            });
+        }
+        let digest = sha256_hex(&serde_jcs::to_vec(&plan).unwrap());
+        let bytes = capture_retained_generation(&plan, &digest).unwrap();
+        let mut retained: RetainedSetupGeneration = serde_json::from_slice(&bytes).unwrap();
+        for kind in [
+            "retiring_user_configuration_v2",
+            "retiring_user_configuration_v3",
+        ] {
+            assert!(retained
+                .documents
+                .iter()
+                .any(|document| document.current.kind == kind
+                    && document.bytes.as_deref()
+                        == Some(b"retiring configuration fixture".as_slice())));
+        }
+        assert!(
+            retained.documents.iter().any(|document| {
+                document.current.subject == "retiring"
+                    && document.current.kind == "workload_launcher"
+                    && document.current.path == root.path().join(".local/bin/retiring-worker")
+                    && document
+                        .current
+                        .identity
+                        .as_ref()
+                        .unwrap()
+                        .link_target
+                        .as_ref()
+                        == Some(&executable)
+            }),
+            "removed account's receipt-owned launcher was not retained"
+        );
+        let unrelated = root.path().join(".local/bin/unowned-worker");
+        fs::write(&unrelated, b"unowned worker").unwrap();
+        restoration::retire_user_integrations(&retained, &executable).unwrap();
+        assert!(
+            fs::symlink_metadata(root.path().join(".local/bin/retiring-worker")).is_err(),
+            "removed account's launcher survived deactivation"
+        );
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unowned worker");
+        crate::setup::verify_user_integrations_at(root.path(), &executable, &BTreeMap::new(), uid)
+            .unwrap();
+
+        // Exercise retained-policy selection without reading or changing the host's system policy.
+        let prior_bytes = include_bytes!("../policy-v3.example.toml").to_vec();
+        let prior = CurrentPathIdentity {
+            kind: "administrator_policy".into(),
+            subject: "system".into(),
+            path: crate::policy_store::SYSTEM_POLICY_PATH.into(),
+            identity: Some(CurrentFileIdentity {
+                object_type: "file".into(),
+                owner_uid: 0,
+                mode: 0o600,
+                link_count: 1,
+                length: prior_bytes.len() as u64,
+                sha256: sha256_hex(&prior_bytes),
+                link_target: None,
+            }),
+        };
+        plan.current_paths.push(prior.clone());
+        retained.plan = plan.clone();
+        let digest = sha256_hex(&serde_jcs::to_vec(&plan).unwrap());
+        retained.plan_sha256.clone_from(&digest);
+        retained.documents.push(RetainedSetupObject {
+            current: prior,
+            bytes: Some(prior_bytes.clone()),
+        });
+        let encoded = serde_jcs::to_vec(&retained).unwrap();
+        assert_eq!(
+            retained_prior_policy(&plan, &digest, &encoded).unwrap(),
+            Some(prior_bytes)
+        );
+        assert!(retained_prior_policy(&plan, &"b".repeat(64), &encoded).is_err());
+        let mut changed_plan = plan.clone();
+        changed_plan.retiring_accounts[0].home = root.path().join("different-home");
+        assert!(retained_prior_policy(&changed_plan, &digest, &encoded).is_err());
+        retained
+            .documents
+            .last_mut()
+            .unwrap()
+            .bytes
+            .as_mut()
+            .unwrap()
+            .push(b' ');
+        assert!(
+            retained_prior_policy(&plan, &digest, &serde_jcs::to_vec(&retained).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn retiring_account_inventory_is_derived_from_prior_policy_and_native_identity() {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+            .unwrap()
+            .unwrap();
+        let prior = include_str!("../policy-v3.example.toml").replace("automation", &user.name);
+        let expected = NativeAccountIdentity {
+            name: user.name,
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            home: user.dir,
+        };
+        assert_eq!(
+            resolve_retiring_accounts(DeploymentMode::Strong, Some(prior.as_bytes()), &[]).unwrap(),
+            vec![expected.clone()]
+        );
+        assert!(resolve_retiring_accounts(
+            DeploymentMode::Strong,
+            Some(prior.as_bytes()),
+            &[expected]
+        )
+        .unwrap()
+        .is_empty());
+        assert!(resolve_retiring_accounts(DeploymentMode::Strong, None, &[])
+            .unwrap()
+            .is_empty());
+        assert!(
+            resolve_retiring_accounts(DeploymentMode::UserOnly, Some(prior.as_bytes()), &[])
+                .is_err()
+        );
+        let missing = prior.replace(
+            &nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+                .unwrap()
+                .unwrap()
+                .name,
+            "dev-auth-nonexistent-retiring-fixture",
+        );
+        assert!(
+            resolve_retiring_accounts(DeploymentMode::Strong, Some(missing.as_bytes()), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_failure_reports_preserve_unknown_progress_without_private_error_text() {
+        let report =
+            RecoveryProgress::new().report(Err(anyhow::anyhow!("private diagnostic sentinel")));
+        assert_eq!(report.changed, Some(false));
+        assert_eq!(report.exit_code, 4);
+        assert_eq!(report.error_kind, Some(SetupRecoveryFailure::Authority));
+        assert!(!serde_json::to_string(&report).unwrap().contains("sentinel"));
+
+        let mut progress = RecoveryProgress::new();
+        progress.enter_mutation();
+        let report = progress.report(Err(anyhow::anyhow!("private diagnostic sentinel")));
+        assert_eq!(report.changed, None);
+        assert_eq!(report.exit_code, 1);
+        assert_eq!(report.error_kind, Some(SetupRecoveryFailure::Operational));
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(encoded["changed"].is_null());
+        assert!(!serde_json::to_string(&report).unwrap().contains("sentinel"));
+
+        let mut progress = RecoveryProgress::new();
+        progress.enter_mutation();
+        progress.record_change(true);
+        progress.record_change(false);
+        let report = progress.report(Err(anyhow::anyhow!("private diagnostic sentinel")));
+        assert_eq!(report.changed, Some(true));
+        assert_eq!(report.exit_code, 1);
+        assert!(!serde_json::to_string(&report).unwrap().contains("sentinel"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_requires_native_ownership_before_inspecting_any_installation() {
+        let wrong_mode = if nix::unistd::Uid::effective().is_root() {
+            crate::setup::InstallMode::UserOnly
+        } else {
+            crate::setup::InstallMode::Strong
+        };
+        let report = recover_setup_v3(wrong_mode, &BTreeMap::new(), &mut &b""[..]);
+        assert_eq!(report.exit_code, 4);
+        assert_eq!(report.changed, Some(false));
+        assert_eq!(report.next_action, "run_as_installation_owner");
+    }
+
+    #[test]
+    fn candidate_retention_preserves_approved_bytes_and_rejects_source_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.toml");
+        let bytes = b"# approved candidate policy\n";
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let identity = read_document(&path, "administrator_policy", "system")
+            .unwrap()
+            .identity;
+        let retained = capture_candidate_document(&identity).unwrap();
+        assert_eq!(retained.identity, identity);
+        assert_eq!(retained.bytes, bytes);
+        fs::write(&path, b"# changed candidate policy\n").unwrap();
+        assert!(capture_candidate_document(&identity).is_err());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(retained.bytes, bytes);
+        assert!(capture_candidate_document(&identity).is_err());
+        let mut documents = vec![retained];
+        let staged = with_candidate_source(&documents, &identity, |source| {
+            assert_eq!(fs::read(source)?, bytes);
+            Ok(source.to_path_buf())
+        })
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "recovery must not recreate the original input"
+        );
+        assert!(
+            !staged.exists(),
+            "temporary inputs must not outlive their use"
+        );
+        documents[0].bytes.push(b'!');
+        assert!(candidate_bytes(&documents, &identity).is_err());
+        assert!(with_candidate_source::<()>(&documents, &identity, |_| {
+            panic!("drifted retention must not enter the configuration installer")
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn retained_document_preserves_exact_bytes_and_rejects_late_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.toml");
+        let bytes = b"# prior policy fixture\n";
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let current = CurrentPathIdentity {
+            kind: "administrator_policy".into(),
+            subject: "system".into(),
+            path: path.clone(),
+            identity: Some(CurrentFileIdentity {
+                object_type: "file".into(),
+                owner_uid: nix::unistd::Uid::effective().as_raw(),
+                mode: 0o600,
+                link_count: 1,
+                length: bytes.len() as u64,
+                sha256: sha256_hex(bytes),
+                link_target: None,
+            }),
+        };
+        let retained = capture_retained_object(&current).unwrap();
+        assert_eq!(retained.bytes.as_deref(), Some(bytes.as_slice()));
+        fs::write(&path, b"# replacement policy\n").unwrap();
+        assert!(capture_retained_object(&current).is_err());
+        assert_eq!(retained.bytes.as_deref(), Some(bytes.as_slice()));
+        fs::remove_file(&path).unwrap();
+        assert!(capture_retained_object(&current).is_err());
+        let absent = CurrentPathIdentity {
+            identity: None,
+            ..current
+        };
+        assert!(capture_retained_object(&absent).unwrap().bytes.is_none());
+        fs::write(&path, bytes).unwrap();
+        assert!(capture_retained_object(&absent).is_err());
+    }
 
     fn verified_release(artifact_path: &Path) -> crate::release_manifest::VerifiedDevAuthRelease {
         crate::release_manifest::VerifiedDevAuthRelease {

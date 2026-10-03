@@ -68,10 +68,39 @@ pub struct PendingSessionRegistration {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionAuthorityGrant {
+    pub logical: Option<crate::policy_v3::LogicalSelection>,
+    pub hard_deadline_boot_ms: Option<u64>,
     pub github: Option<SessionGitHubGrant>,
     pub signing: Option<SessionOperationKeyGrant>,
     pub release_signing: Option<SessionReleaseSigningGrant>,
     pub ssh: Vec<SessionOperationKeyGrant>,
+}
+
+impl SessionAuthorityGrant {
+    pub(crate) fn hard_deadline_expired(&self) -> Result<bool> {
+        match self.hard_deadline_boot_ms {
+            Some(deadline) => Ok(crate::linux_platform::boot_time_millis()? >= deadline),
+            None => Ok(false),
+        }
+    }
+}
+
+pub(crate) fn session_authority_for_workload(
+    profile: &crate::policy_v2::ResolvedAuthorityProfile,
+    workload: &crate::policy_v2::ResolvedWorkload,
+) -> Result<SessionAuthorityGrant> {
+    let mut authority = session_authority_from_resolved(profile);
+    authority.hard_deadline_boot_ms = workload
+        .duration_seconds
+        .map(|seconds| {
+            crate::linux_platform::deadline_after_seconds(
+                crate::linux_platform::boot_time_millis()?,
+                seconds,
+            )
+        })
+        .transpose()?;
+    validate_session_authority(&authority)?;
+    Ok(authority)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -135,8 +164,10 @@ pub fn session_authority_from_resolved(
     profile: &crate::policy_v2::ResolvedAuthorityProfile,
 ) -> SessionAuthorityGrant {
     SessionAuthorityGrant {
+        logical: profile.logical_authority.clone(),
+        hard_deadline_boot_ms: None,
         github: profile.github.as_ref().map(|github| SessionGitHubGrant {
-            credential_slot: profile.credential_slot.clone(),
+            credential_slot: github.credential_slot.clone(),
             app_id: github.app_id,
             repository_selection: github.repository_selection,
             private_key_ref: github.private_key_ref.clone(),
@@ -148,10 +179,10 @@ pub fn session_authority_from_resolved(
         signing: profile
             .signing_key
             .as_ref()
-            .map(|key| operation_key_grant(&profile.credential_slot, key)),
+            .map(|key| operation_key_grant(&key.credential_slot, key)),
         release_signing: profile.release_signing_key.as_ref().map(|key| {
             SessionReleaseSigningGrant {
-                credential_slot: profile.credential_slot.clone(),
+                credential_slot: key.credential_slot.clone(),
                 private_key_ref: key.private_key_ref.clone(),
                 public_key: key.public_key.clone(),
                 products: profile.release_signing_products.iter().cloned().collect(),
@@ -160,7 +191,7 @@ pub fn session_authority_from_resolved(
         ssh: profile
             .ssh_keys
             .iter()
-            .map(|key| operation_key_grant(&profile.credential_slot, key))
+            .map(|key| operation_key_grant(&key.credential_slot, key))
             .collect(),
     }
 }
@@ -228,7 +259,9 @@ impl LinuxSessionRegistry {
             .remove(session_id)
             .context("session activation references no pending admission")?;
         drop(pending);
-        if prepared.expires_at_unix <= time::OffsetDateTime::now_utc().unix_timestamp() {
+        if prepared.expires_at_unix <= time::OffsetDateTime::now_utc().unix_timestamp()
+            || prepared.authority.hard_deadline_expired()?
+        {
             bail!("pending session admission has expired");
         }
         validate_pending_activation(&prepared, &peer)?;
@@ -347,23 +380,39 @@ impl LinuxSessionRegistry {
             .pending
             .write()
             .map_err(|_| anyhow::anyhow!("pending session registry lock is poisoned"))?;
-        pending.retain(|_, session| session.expires_at_unix > now);
+        let mut stale = Vec::new();
+        pending.retain(|session_id, session| {
+            let retained = session.expires_at_unix > now
+                && !session.authority.hard_deadline_expired().unwrap_or(true);
+            if !retained {
+                // The broker still owns the pending registration's setup
+                // lease. Return its identity through the normal cleanup path.
+                stale.push(session_id.clone());
+            }
+            retained
+        });
         drop(pending);
         let mut sessions = self
             .sessions
             .write()
             .map_err(|_| anyhow::anyhow!("session registry lock is poisoned"))?;
-        let stale = sessions
+        let active_stale = sessions
             .iter()
             .filter(|(_, session)| {
                 session.registration.expires_at_unix <= now
+                    || session
+                        .registration
+                        .authority
+                        .hard_deadline_expired()
+                        .unwrap_or(true)
                     || !pidfd_process_is_alive(&session.supervisor_pidfd).unwrap_or(false)
             })
             .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
-        for session_id in &stale {
+        for session_id in &active_stale {
             sessions.remove(session_id);
         }
+        stale.extend(active_stale);
         Ok(stale)
     }
 
@@ -379,7 +428,9 @@ impl LinuxSessionRegistry {
         let session = sessions
             .get_mut(session_id)
             .context("session renewal references an inactive session")?;
-        if session.registration.expires_at_unix <= now {
+        if session.registration.expires_at_unix <= now
+            || session.registration.authority.hard_deadline_expired()?
+        {
             bail!("session renewal cannot revive an expired lease");
         }
         if !pidfd_process_is_alive(&session.supervisor_pidfd)? {
@@ -424,6 +475,7 @@ impl LinuxSessionRegistry {
             bail!("peer matches more than one workload session");
         }
         if session.registration.expires_at_unix <= time::OffsetDateTime::now_utc().unix_timestamp()
+            || session.registration.authority.hard_deadline_expired()?
         {
             bail!("workload session lease has expired");
         }
@@ -479,7 +531,7 @@ fn lease_expiry() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp() + 15 * 60
 }
 
-fn pidfd_process_is_alive(pidfd: &OwnedFd) -> Result<bool> {
+pub(crate) fn pidfd_process_is_alive(pidfd: &OwnedFd) -> Result<bool> {
     let mut descriptors = [PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
     let ready =
         poll(&mut descriptors, PollTimeout::ZERO).context("poll session supervisor pidfd")?;
@@ -528,7 +580,7 @@ fn validate_current_workload_session(session_id: &str) -> Result<()> {
     validate_session_identifier(session_id)
 }
 
-fn workload_session_id(cgroup: &Path) -> Option<&str> {
+pub(crate) fn workload_session_id(cgroup: &Path) -> Option<&str> {
     if cgroup.parent()? != Path::new(WORKLOAD_CGROUP_ROOT) {
         return None;
     }
@@ -629,6 +681,19 @@ fn validate_session_identifier(session_id: &str) -> Result<()> {
 }
 
 fn validate_session_authority(authority: &SessionAuthorityGrant) -> Result<()> {
+    if authority.hard_deadline_expired()? {
+        bail!("session approved hard deadline has expired");
+    }
+    if let Some(logical) = &authority.logical {
+        dev_tools_secret::LogicalSecretName::parse(&logical.cap)?;
+        if authority.hard_deadline_boot_ms.is_none() || logical.resources.len() > 1024 {
+            bail!("logical session authority has no bounded lifetime or exceeds resource limits");
+        }
+        for (name, rights) in &logical.resources {
+            dev_tools_secret::LogicalSecretName::parse(name)?;
+            crate::logical_authority::require_narrowing(rights, rights)?;
+        }
+    }
     if let Some(github) = &authority.github {
         validate_public_identifier(&github.credential_slot, "credential slot")?;
         if github.app_id == 0 {
@@ -718,7 +783,9 @@ fn validate_public_identifier(value: &str, description: &str) -> Result<()> {
     let mut bytes = value.bytes();
     if value.len() > 64
         || !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
-        || !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
     {
         bail!("{description} contains unsupported characters");
     }
@@ -769,6 +836,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -797,6 +866,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -880,6 +951,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -893,6 +966,26 @@ mod tests {
         registry.prepare_root_owned(pending.clone()).unwrap();
         assert!(registry.prepare_root_owned(pending.clone()).is_err());
         assert!(registry.revoke(session_id).unwrap());
+
+        for hard_expiry in [false, true] {
+            registry.prepare_root_owned(pending.clone()).unwrap();
+            {
+                let mut selected = registry.pending.write().unwrap();
+                let selected = selected.get_mut(session_id).unwrap();
+                if hard_expiry {
+                    selected.authority.hard_deadline_boot_ms = Some(0);
+                } else {
+                    selected.expires_at_unix = 0;
+                }
+            }
+            assert_eq!(
+                registry.prune_stale().unwrap(),
+                [session_id],
+                "pending expiry must retain the cleanup identity"
+            );
+            assert!(registry.prune_stale().unwrap().is_empty());
+            assert!(!registry.revoke(session_id).unwrap());
+        }
 
         let mut wrong_cgroup = pending;
         wrong_cgroup.cgroup = PathBuf::from("/sys/fs/cgroup/system.slice/other.service");
@@ -924,6 +1017,8 @@ mod tests {
                     workload: "codex".into(),
                     profile: "automation".into(),
                     authority: SessionAuthorityGrant {
+                        logical: None,
+                        hard_deadline_boot_ms: None,
                         github: None,
                         signing: None,
                         release_signing: None,

@@ -1,0 +1,19 @@
+schema = "dev-auth-user-config-v3"
+
+[authority_profiles.worker]
+cap = "worker"
+
+[authority_profiles.worker.resources.service-token]
+purposes = ["read"]
+projections = ["stdin"]
+
+[[workloads]]
+name = "worker"
+profile = "worker"
+launcher = "worker"
+admission = "approval_required"
+duration_seconds = 3600
+
+[workloads.resources.service-token]
+purposes = ["read"]
+projections = ["stdin"]

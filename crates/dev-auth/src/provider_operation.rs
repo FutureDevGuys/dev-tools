@@ -8,6 +8,15 @@ const MAX_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const FINALIZATION_RESERVE: Duration = Duration::from_secs(2);
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn validation_must_stop(error: &dev_tools_secret::SecretError) -> bool {
+    matches!(
+        error.kind(),
+        dev_tools_secret::SecretErrorKind::CleanupFailed
+            | dev_tools_secret::SecretErrorKind::Cancelled
+            | dev_tools_secret::SecretErrorKind::DeadlineExceeded
+    )
+}
+
 /// One admitted provider operation and its absolute execution budget.
 ///
 /// In the strong broker the cancellation flag is owned by the admitted session

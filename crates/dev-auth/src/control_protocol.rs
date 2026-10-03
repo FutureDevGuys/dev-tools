@@ -1,7 +1,10 @@
-use crate::broker_protocol::{BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES};
+use crate::broker_protocol::MAX_BROKER_FRAME_BYTES;
 use crate::linux_admission::{PendingSessionRegistration, SessionRegistration};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// Control v4 requires a transferred admission lease on prepare/register.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +77,7 @@ pub fn decode_control_response(input: &[u8]) -> Result<ControlResponseEnvelope> 
 }
 
 fn validate_control_request(request: &ControlEnvelope) -> Result<()> {
-    if request.version != BROKER_PROTOCOL_VERSION {
+    if request.version != CONTROL_PROTOCOL_VERSION {
         bail!("control request protocol version is unsupported");
     }
     validate_control_identifier(&request.request_id, "control request identifier")?;
@@ -102,7 +105,7 @@ fn validate_control_request(request: &ControlEnvelope) -> Result<()> {
 }
 
 fn validate_control_response(response: &ControlResponseEnvelope) -> Result<()> {
-    if response.version != BROKER_PROTOCOL_VERSION {
+    if response.version != CONTROL_PROTOCOL_VERSION {
         bail!("control response protocol version is unsupported");
     }
     validate_control_identifier(&response.request_id, "control response identifier")?;

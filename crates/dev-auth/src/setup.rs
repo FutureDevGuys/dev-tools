@@ -10,6 +10,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(all(test, target_os = "linux"))]
+mod recovery_native;
+#[cfg(target_os = "linux")]
+pub(crate) mod restoration;
+#[cfg(all(test, target_os = "linux"))]
+mod restoration_durability;
+#[cfg(target_os = "linux")]
+mod strong_assets_completion;
+#[cfg(target_os = "linux")]
+mod strong_helper_completion;
+
 const RECEIPT_SCHEMA: &str = "dev-auth-install-v2";
 
 pub fn setup_template(name: &str) -> Result<&'static str> {
@@ -18,8 +29,12 @@ pub fn setup_template(name: &str) -> Result<&'static str> {
         "administrator-policy" => Ok(include_str!("../policy-v2.example.toml")),
         "user-only-policy" => Ok(include_str!("../policy-v2-user-only.example.toml")),
         "user-config" => Ok(include_str!("../config-v2.example.toml")),
+        "administrator-policy-v3" => Ok(include_str!("../policy-v3.example.toml")),
+        "user-only-policy-v3" => Ok(include_str!("../policy-v3-user-only.example.toml")),
+        "user-config-v3" => Ok(include_str!("../config-v3.example.toml")),
         _ => bail!(
-            "setup template must be deployment, administrator-policy, user-only-policy, or user-config"
+            "setup template must be one of: {}",
+            crate::SETUP_TEMPLATE_NAMES.join(", ")
         ),
     }
 }
@@ -29,8 +44,8 @@ const BINARY_LIMIT: u64 = 256 * 1024 * 1024;
 const SYSTEM_ASSET_LIMIT: u64 = 64 * 1024;
 const BROKER_READY_ATTEMPTS: usize = 10;
 const BROKER_READY_DELAY: Duration = Duration::from_millis(250);
-const WORKLOAD_ALIAS_RECEIPT_SCHEMA: &str = "dev-auth-workload-aliases-v1";
-const DESKTOP_ENTRY_RECEIPT_SCHEMA: &str = "dev-auth-desktop-entries-v1";
+pub(crate) const WORKLOAD_ALIAS_RECEIPT_SCHEMA: &str = "dev-auth-workload-aliases-v1";
+pub(crate) const DESKTOP_ENTRY_RECEIPT_SCHEMA: &str = "dev-auth-desktop-entries-v1";
 const PRODUCT_ALIASES: [&str; 5] = [
     "dev-auth",
     "git-credential-dev-auth",
@@ -42,6 +57,36 @@ const TRANSPARENT_ALIASES: [&str; 2] = ["git", "gh"];
 const SYSTEM_CREDENTIAL_PATH: &str = "/etc/credstore.encrypted/dev-auth.op-service-account-token";
 const SYSTEM_CREDENTIAL_DIRECTORY: &str = "/etc/credstore.encrypted/dev-auth-slots";
 const PRIVILEGED_LAUNCHER_PATH: &str = "/usr/local/lib/dev-auth/dev-auth-workload-launcher";
+
+fn privileged_launcher_mode_for_version(version: &str) -> Result<u32> {
+    validate_version(version)?;
+    #[cfg(target_os = "linux")]
+    if semver::Version::parse(version)? >= semver::Version::new(0, 4, 0) {
+        return Ok(0o4755);
+    }
+    Ok(0o755)
+}
+
+fn privileged_launcher_mode_for_executable(executable: &Path) -> Result<u32> {
+    let version = executable
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .context("privileged launcher source has no version identity")?;
+    privileged_launcher_mode_for_version(version)
+}
+
+fn publish_privileged_launcher_mode(executable: &Path, launcher: &Path) -> Result<()> {
+    let mode = privileged_launcher_mode_for_executable(executable)?;
+    if fs::symlink_metadata(launcher)?.mode() & 0o7777 == mode {
+        return Ok(());
+    }
+    fs::set_permissions(launcher, fs::Permissions::from_mode(mode))
+        .context("publish receipt-bound workload launcher permissions")?;
+    File::open(launcher)?
+        .sync_all()
+        .context("sync workload launcher permissions")
+}
 const SETUP_HELPER_PATH: &str = "/usr/local/lib/dev-auth/dev-auth-setup-helper";
 const SETUP_HELPER_RECEIPT_SCHEMA: &str = "dev-auth-setup-helper-v1";
 const SETUP_HELPER_PROTOCOL: &str = "dev-auth-setup-helper-v1";
@@ -160,6 +205,84 @@ pub(crate) fn user_integration_receipt_paths(
     ]
 }
 
+pub(crate) fn receipt_owned_user_integration_objects(
+    home: &Path,
+    user: &str,
+    owner_uid: u32,
+    mode: InstallMode,
+) -> Result<Vec<crate::setup_v3::CurrentPathIdentity>> {
+    use crate::setup_v3::{CurrentFileIdentity, CurrentPathIdentity};
+    let mut objects = Vec::new();
+    if let Some(receipt) = read_workload_alias_receipt(home, owner_uid)? {
+        for alias in &receipt.aliases {
+            let path = home.join(".local/bin").join(alias);
+            let metadata =
+                fs::symlink_metadata(&path).context("inspect retained workload launcher")?;
+            let target = fs::read_link(&path).context("read retained workload launcher")?;
+            if !metadata.file_type().is_symlink()
+                || (metadata.uid() != owner_uid
+                    && !(metadata.uid() == 0
+                        && cfg!(target_os = "linux")
+                        && mode == InstallMode::Strong
+                        && nix::unistd::Uid::effective().is_root()))
+                || target.as_os_str() != std::ffi::OsStr::new(&receipt.executable)
+                || metadata.nlink() != 1
+            {
+                bail!("retained workload launcher does not match its receipt");
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = target.as_os_str().as_bytes();
+            objects.push(CurrentPathIdentity {
+                kind: "workload_launcher".into(),
+                subject: user.into(),
+                path,
+                identity: Some(CurrentFileIdentity {
+                    object_type: "symlink".into(),
+                    owner_uid: metadata.uid(),
+                    mode: metadata.mode() & 0o7777,
+                    link_count: 1,
+                    length: bytes.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    link_target: Some(target),
+                }),
+            });
+        }
+    }
+    if let Some(receipt) = read_desktop_entry_receipt(home, owner_uid)? {
+        for (name, digest) in &receipt.entries {
+            let path = desktop_entry_directory(home).join(name);
+            let metadata = fs::symlink_metadata(&path).context("inspect retained desktop entry")?;
+            let document = dev_tools_installation::read_atomic_document(
+                &path,
+                &dev_tools_installation::DocumentAuthority {
+                    owner_uid,
+                    mode: metadata.mode() & 0o777,
+                    limit: RECEIPT_LIMIT,
+                },
+            )?
+            .context("retained desktop entry disappeared")?;
+            if document.identity.sha256 != *digest {
+                bail!("retained desktop entry does not match its receipt");
+            }
+            objects.push(CurrentPathIdentity {
+                kind: "desktop_entry".into(),
+                subject: user.into(),
+                path,
+                identity: Some(CurrentFileIdentity {
+                    object_type: "file".into(),
+                    owner_uid,
+                    mode: metadata.mode() & 0o777,
+                    link_count: 1,
+                    length: document.identity.length,
+                    sha256: digest.clone(),
+                    link_target: None,
+                }),
+            });
+        }
+    }
+    Ok(objects)
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallMode {
@@ -235,6 +358,14 @@ fn verify_shared_installation(
     let shared = dev_tools_installation::verify_versioned_installation(
         &shared_installation_layout(paths, receipt.mode),
     )?;
+    require_shared_receipt_agreement(receipt, &shared)?;
+    Ok(shared)
+}
+
+fn require_shared_receipt_agreement(
+    receipt: &InstallReceipt,
+    shared: &dev_tools_installation::VersionedReceipt,
+) -> Result<()> {
     if shared.active_version != receipt.version
         || shared.active_identity.length != receipt.executable_length
         || shared.active_identity.sha256 != receipt.executable_sha256
@@ -242,7 +373,7 @@ fn verify_shared_installation(
     {
         bail!("shared installation receipt disagrees with dev-auth product metadata");
     }
-    Ok(shared)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -455,17 +586,17 @@ struct ConfiguredWorkloadDiscovery {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct WorkloadAliasReceipt {
-    schema: String,
-    executable: String,
-    aliases: Vec<String>,
+pub(crate) struct WorkloadAliasReceipt {
+    pub(crate) schema: String,
+    pub(crate) executable: String,
+    pub(crate) aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct DesktopEntryReceipt {
-    schema: String,
-    entries: BTreeMap<String, String>,
+pub(crate) struct DesktopEntryReceipt {
+    pub(crate) schema: String,
+    pub(crate) entries: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -605,7 +736,7 @@ pub fn discover_setup_with_configuration(
         .context("resolve the running dev-auth executable")?;
     let policy = administrator_policy
         .map(|path| {
-            crate::policy_v2::parse_system_policy_v2(&read_discovery_document(
+            crate::runtime_policy::parse_runtime_administrator(&read_discovery_document(
                 path,
                 "administrator policy",
             )?)
@@ -619,7 +750,7 @@ pub fn discover_setup_with_configuration(
             InstallMode::Strong => crate::policy_v2::SystemMode::Strong,
             InstallMode::UserOnly => crate::policy_v2::SystemMode::UserOnly,
         };
-        if policy.mode != expected_mode {
+        if policy.mode() != expected_mode {
             bail!("administrator policy mode disagrees with discovery mode");
         }
     }
@@ -676,7 +807,7 @@ pub fn discover_setup_with_configuration(
 fn discover_programs(
     mode: InstallMode,
     owner_uid: u32,
-    policy: Option<&crate::policy_v2::SystemPolicyV2>,
+    policy: Option<&crate::runtime_policy::RuntimeAdministrator>,
 ) -> BTreeMap<String, Vec<DiscoveredPath>> {
     let mut candidates = BTreeMap::<String, Vec<PathBuf>>::from([
         ("git".into(), vec!["/usr/bin/git".into(), "/bin/git".into()]),
@@ -706,15 +837,14 @@ fn discover_programs(
         ("podman".into(), vec!["/usr/bin/podman".into()]),
     ]);
     if let Some(policy) = policy {
-        candidates.insert("git".into(), vec![PathBuf::from(&policy.programs.git)]);
-        candidates.insert("gh".into(), vec![PathBuf::from(&policy.programs.gh)]);
-        candidates.insert("op".into(), vec![PathBuf::from(&policy.programs.op)]);
-        candidates.insert("ssh".into(), vec![PathBuf::from(&policy.programs.ssh)]);
-        candidates.insert(
-            "ssh_keygen".into(),
-            vec![PathBuf::from(&policy.programs.ssh_keygen)],
-        );
-        for (name, adapter) in &policy.sandbox_adapters {
+        candidates.remove("op");
+        for (name, path) in policy.programs() {
+            candidates.insert(name.into(), vec![PathBuf::from(path)]);
+        }
+        for (name, path) in policy.provider_programs() {
+            candidates.insert(format!("provider:{name}"), vec![PathBuf::from(path)]);
+        }
+        for (name, adapter) in policy.sandbox_adapters() {
             candidates.insert(
                 format!("sandbox:{name}"),
                 vec![PathBuf::from(&adapter.executable)],
@@ -732,7 +862,7 @@ fn discover_programs(
 
 fn discover_configured_workloads(
     mode: InstallMode,
-    policy: Option<&crate::policy_v2::SystemPolicyV2>,
+    policy: Option<&crate::runtime_policy::RuntimeAdministrator>,
     user_configurations: &[(String, PathBuf)],
 ) -> Result<ConfiguredWorkloadDiscovery> {
     if policy.is_none() && user_configurations.is_empty() {
@@ -752,30 +882,43 @@ fn discover_configured_workloads(
         }
         let account = nix::unistd::User::from_name(user_name)?
             .with_context(|| format!("configured discovery user {user_name} does not exist"))?;
-        let config = crate::policy_v2::parse_user_config_v2(&read_discovery_document(
-            source,
-            "user configuration",
-        )?)?;
-        for workload in config.workloads {
+        let bytes = read_discovery_document(source, "user configuration")?;
+        let workloads = match policy {
+            crate::runtime_policy::RuntimeAdministrator::Legacy(_) => {
+                crate::policy_v2::parse_user_config_v2(&bytes)?
+                    .workloads
+                    .into_iter()
+                    .map(|workload| (workload.name, workload.launcher, workload.desktop.is_some()))
+                    .collect::<Vec<_>>()
+            }
+            crate::runtime_policy::RuntimeAdministrator::Logical(_) => {
+                crate::policy_v3::parse_user_config_v3(&bytes)?
+                    .workloads
+                    .into_iter()
+                    .map(|workload| (workload.name, workload.launcher, workload.desktop.is_some()))
+                    .collect::<Vec<_>>()
+            }
+        };
+        for (name, launcher_name, desktop) in workloads {
             let launcher = policy
-                .trusted_launchers
-                .get(&workload.launcher)
+                .trusted_launchers()
+                .get(&launcher_name)
                 .with_context(|| {
                     format!(
                         "configured workload {} references an unknown launcher",
-                        workload.name
+                        name
                     )
                 })?;
-            let subject = format!("{user_name}:{}", workload.name);
+            let subject = format!("{user_name}:{name}");
             launchers.insert(
                 subject.clone(),
                 discover_owned_paths(&[PathBuf::from(launcher)], mode, account.uid.as_raw(), true),
             );
-            if workload.desktop.is_some() {
+            if desktop {
                 let path = account
                     .dir
                     .join(".local/share/applications")
-                    .join(format!("dev-auth-{}.desktop", workload.name));
+                    .join(format!("dev-auth-{name}.desktop"));
                 desktop_entries.insert(
                     subject,
                     discover_owned_paths(&[path], mode, account.uid.as_raw(), false),
@@ -853,6 +996,12 @@ fn setup_prerequisite_blockers(
     programs: &BTreeMap<String, Vec<DiscoveredPath>>,
 ) -> Vec<SetupPrerequisiteBlocker> {
     let mut required = vec!["git", "gh", "op", "ssh", "ssh_keygen"];
+    required.extend(
+        programs
+            .keys()
+            .filter(|name| name.starts_with("provider:"))
+            .map(String::as_str),
+    );
     if mode == InstallMode::Strong {
         required.extend([
             "pkexec",
@@ -941,7 +1090,7 @@ fn setup_prerequisite_blockers(
 pub(crate) fn require_setup_prerequisites(
     mode: InstallMode,
     owner_uid: u32,
-    policy: &crate::policy_v2::SystemPolicyV2,
+    policy: &crate::runtime_policy::RuntimeAdministrator,
 ) -> Result<()> {
     let programs = discover_programs(mode, owner_uid, Some(policy));
     let blockers = setup_prerequisite_blockers(mode, &programs);
@@ -1097,7 +1246,7 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
         .context("effective user account does not exist")?;
     let policy_path = match mode {
         InstallMode::Strong => PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH),
-        InstallMode::UserOnly => crate::policy_store::user_policy_path(&user),
+        InstallMode::UserOnly => crate::policy_store::runtime_user_policy_path(&user)?,
     };
     let policy = match fs::symlink_metadata(&policy_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1110,38 +1259,42 @@ pub fn setup_readiness_at(paths: &SetupPaths, mode: InstallMode) -> Result<Setup
         }
         Err(error) => return Err(error).context("inspect setup policy readiness"),
         Ok(_) => match mode {
-            InstallMode::Strong => crate::policy_store::load_system_policy()?,
+            InstallMode::Strong => {
+                crate::policy_store::load_runtime_system_policy_at(&policy_path)?
+            }
             InstallMode::UserOnly => {
-                crate::policy_store::load_user_policy_at(&policy_path, user.uid.as_raw())?
+                crate::policy_store::load_runtime_user_policy_at(&policy_path, user.uid.as_raw())?
             }
         },
     };
     report.policy_ready = true;
 
-    let user_config_path = crate::policy_store::user_config_path(&user);
+    let user_config_path = crate::policy_store::runtime_user_config_path(&policy, &user);
     let user_config = match fs::symlink_metadata(&user_config_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             report.next_action = "install_user_config".into();
             return Ok(report);
         }
         Err(error) => return Err(error).context("inspect user configuration readiness"),
-        Ok(_) => crate::policy_store::load_user_config_at(&user_config_path, user.uid.as_raw())?,
+        Ok(_) => {
+            crate::policy_store::read_runtime_user_config_at(&user_config_path, user.uid.as_raw())?
+        }
     };
     report.user_config_ready = true;
     if !policy
-        .allowed_users
+        .allowed_users()
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
     {
         bail!("effective user is outside the administrator policy");
     }
-    let resolved = crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &user_config)?;
+    let resolved = policy.resolve_user(&user.name, &user_config)?;
     report.policy_resolution_ready = true;
 
     let required_slots = resolved
         .authority_profiles
         .values()
-        .map(|profile| profile.credential_slot.as_str())
+        .flat_map(|profile| profile.credential_slots.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
     match mode {
         InstallMode::Strong => {
@@ -1344,7 +1497,15 @@ pub fn apply_plan(plan: &SetupPlan, approved_sha256: &str) -> Result<SetupReport
     if source_length != plan.source_length || source_sha256 != plan.source_sha256 {
         bail!("setup executable changed after plan approval");
     }
-    install_at_with_release(&plan.paths, &plan.request, plan.verified_release.as_ref())
+    install_at_with_release(
+        &plan.paths,
+        &plan.request,
+        plan.verified_release.as_ref(),
+        &dev_tools_installation::ArtifactIdentity {
+            length: plan.source_length,
+            sha256: plan.source_sha256.clone(),
+        },
+    )
 }
 
 pub fn write_plan_at(path: &Path, plan: &SetupPlan) -> Result<String> {
@@ -1471,6 +1632,8 @@ pub fn migrate_v1_configuration(
     approved_user_config_sha256: &str,
     approved_v1_sha256: &str,
 ) -> Result<V1MigrationReport> {
+    let (_, installation) = current_runtime_installation()?;
+    let _lease = configuration_exclusion(installation.mode)?;
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
         bail!("v1 migration must run as the native non-root user");
@@ -1504,7 +1667,11 @@ pub fn migrate_v1_configuration(
     let backup_parent = backup.parent().context("v1 backup path has no parent")?;
     ensure_directory_chain_for_owner(backup_parent, owner_uid, 0o700)?;
     install_policy_document(&backup, &legacy_bytes, owner_uid, 0o600)?;
-    let destination = install_user_config(user_config_source, approved_user_config_sha256)?;
+    let destination = install_or_update_user_config_unlocked(
+        user_config_source,
+        approved_user_config_sha256,
+        None,
+    )?;
 
     Ok(V1MigrationReport {
         schema: "dev-auth-v1-migration-v1".into(),
@@ -1704,13 +1871,20 @@ fn expand_v1_workspace_root(root: &str, native_home: &Path) -> Result<PathBuf> {
 }
 
 pub fn install_at(paths: &SetupPaths, request: &InstallRequest) -> Result<SetupReport> {
-    install_at_with_release(paths, request, None)
+    let (length, sha256) = file_identity(&request.source_executable)?;
+    install_at_with_release(
+        paths,
+        request,
+        None,
+        &dev_tools_installation::ArtifactIdentity { length, sha256 },
+    )
 }
 
 fn install_at_with_release(
     paths: &SetupPaths,
     request: &InstallRequest,
     verified_release: Option<&crate::release_manifest::VerifiedDevAuthRelease>,
+    approved_source: &dev_tools_installation::ArtifactIdentity,
 ) -> Result<SetupReport> {
     validate_install_request(paths, request)?;
     let prior_receipt = match fs::symlink_metadata(paths.receipt_path()) {
@@ -1740,6 +1914,15 @@ fn install_at_with_release(
     }
     let (requested_source_length, requested_source_sha256) =
         file_identity(&request.source_executable)?;
+    if requested_source_length != approved_source.length
+        || requested_source_sha256 != approved_source.sha256
+        || verified_release.is_some_and(|release| {
+            release.artifact_length != approved_source.length
+                || release.artifact_sha256 != approved_source.sha256
+        })
+    {
+        bail!("setup executable differs from the fixed installation authority");
+    }
     if let Some(prior) = prior_receipt.as_ref() {
         validate_release_transition(prior, request, &requested_source_sha256, verified_release)?;
     }
@@ -1783,16 +1966,16 @@ fn install_at_with_release(
             layout: shared_layout,
             version: request.version.clone(),
             source: request.source_executable.clone(),
-            identity: dev_tools_installation::ArtifactIdentity {
-                length: requested_source_length,
-                sha256: requested_source_sha256.clone(),
-            },
+            identity: approved_source.clone(),
             aliases: shared_aliases,
         },
         |_| Ok(()),
     )?;
     let executable = paths.versioned_binary(&shared_report.receipt.active_version);
     let (executable_length, executable_sha256) = file_identity(&executable)?;
+    if executable_length != approved_source.length || executable_sha256 != approved_source.sha256 {
+        bail!("published setup executable differs from the fixed installation authority");
+    }
     if request.mode == InstallMode::Strong {
         install_privileged_launcher(&executable, Path::new(PRIVILEGED_LAUNCHER_PATH), paths)?;
         install_linux_system_assets(prior_receipt.as_ref())?;
@@ -1806,55 +1989,13 @@ fn install_at_with_release(
         )?;
     }
 
-    let preserved_provenance = prior_receipt.as_ref().filter(|prior| {
-        prior.version == request.version && prior.executable_sha256 == executable_sha256
-    });
-    let source_commit = verified_release
-        .map(|release| release.source_commit.clone())
-        .or_else(|| preserved_provenance.and_then(|prior| prior.source_commit.clone()));
-    let root_generation = verified_release
-        .map(|release| release.root_generation)
-        .or_else(|| preserved_provenance.and_then(|prior| prior.root_generation));
-    let manifest_generation = verified_release
-        .map(|release| release.manifest_generation)
-        .or_else(|| preserved_provenance.and_then(|prior| prior.manifest_generation));
-
-    let previous_release = match prior_receipt.as_ref() {
-        Some(prior) if prior.version == request.version => prior.previous_release.clone(),
-        Some(prior) => Some(retained_release(prior)),
-        None => None,
-    };
-    let receipt = InstallReceipt {
-        schema: RECEIPT_SCHEMA.into(),
-        mode: request.mode,
-        version: request.version.clone(),
-        executable: executable.display().to_string(),
-        bin_dir: paths.bin_dir.display().to_string(),
-        executable_length,
-        executable_sha256,
-        source_commit,
-        root_generation,
-        manifest_generation,
-        native_git: request.native_git.display().to_string(),
-        native_gh: request.native_gh.display().to_string(),
-        product_aliases: PRODUCT_ALIASES.iter().map(ToString::to_string).collect(),
-        transparent_aliases: if request.activate_transparent_launchers {
-            TRANSPARENT_ALIASES
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        } else {
-            Vec::new()
-        },
-        privileged_launcher: (request.mode == InstallMode::Strong)
-            .then(|| PRIVILEGED_LAUNCHER_PATH.to_owned()),
-        system_assets: if request.mode == InstallMode::Strong {
-            system_asset_digests()
-        } else {
-            BTreeMap::new()
-        },
-        previous_release,
-    };
+    let receipt = selected_installation_receipt(
+        paths,
+        request,
+        verified_release,
+        prior_receipt.as_ref(),
+        approved_source,
+    );
     if request.mode == InstallMode::Strong {
         if release_supports_setup_helper(&receipt) {
             let source_target = verified_release
@@ -1878,6 +2019,69 @@ fn install_at_with_release(
     }
     write_receipt(&paths.receipt_path(), &receipt)?;
     verify_at(paths)
+}
+
+/// Construct product receipt content from already-selected installation
+/// authority. This performs no observation, authentication or publication.
+fn selected_installation_receipt(
+    paths: &SetupPaths,
+    request: &InstallRequest,
+    verified_release: Option<&crate::release_manifest::VerifiedDevAuthRelease>,
+    prior_receipt: Option<&InstallReceipt>,
+    source: &dev_tools_installation::ArtifactIdentity,
+) -> InstallReceipt {
+    let preserved_provenance = prior_receipt.filter(|prior| {
+        prior.version == request.version && prior.executable_sha256 == source.sha256
+    });
+    let source_commit = verified_release
+        .map(|release| release.source_commit.clone())
+        .or_else(|| preserved_provenance.and_then(|prior| prior.source_commit.clone()));
+    let root_generation = verified_release
+        .map(|release| release.root_generation)
+        .or_else(|| preserved_provenance.and_then(|prior| prior.root_generation));
+    let manifest_generation = verified_release
+        .map(|release| release.manifest_generation)
+        .or_else(|| preserved_provenance.and_then(|prior| prior.manifest_generation));
+
+    let previous_release = match prior_receipt {
+        Some(prior) if prior.version == request.version => prior.previous_release.clone(),
+        Some(prior) => Some(retained_release(prior)),
+        None => None,
+    };
+    InstallReceipt {
+        schema: RECEIPT_SCHEMA.into(),
+        mode: request.mode,
+        version: request.version.clone(),
+        executable: paths
+            .versioned_binary(&request.version)
+            .display()
+            .to_string(),
+        bin_dir: paths.bin_dir.display().to_string(),
+        executable_length: source.length,
+        executable_sha256: source.sha256.clone(),
+        source_commit,
+        root_generation,
+        manifest_generation,
+        native_git: request.native_git.display().to_string(),
+        native_gh: request.native_gh.display().to_string(),
+        product_aliases: PRODUCT_ALIASES.iter().map(ToString::to_string).collect(),
+        transparent_aliases: if request.activate_transparent_launchers {
+            TRANSPARENT_ALIASES
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        },
+        privileged_launcher: (request.mode == InstallMode::Strong)
+            .then(|| PRIVILEGED_LAUNCHER_PATH.to_owned()),
+        system_assets: if request.mode == InstallMode::Strong {
+            system_asset_digests()
+        } else {
+            BTreeMap::new()
+        },
+        previous_release,
+    }
 }
 
 fn validate_release_transition(
@@ -1950,6 +2154,15 @@ pub fn current_installation() -> Result<(SetupPaths, InstallReceipt)> {
 
 /// Resolves the receipt-owned running executable without entering the installation mutation lane.
 /// Strong-mode runtime artifacts are root-owned and immutable to the native workload user.
+pub fn running_executable_has_version_layout() -> Result<bool> {
+    let executable = std::env::current_exe().context("locate running executable")?;
+    Ok(executable
+        .parent()
+        .and_then(|parent| parent.parent())
+        .and_then(|parent| parent.file_name())
+        == Some(OsStr::new("versions")))
+}
+
 pub(crate) fn current_runtime_installation() -> Result<(SetupPaths, InstallReceipt)> {
     let (paths, receipt, metadata) = current_installation_identity()?;
     let expected_owner = match receipt.mode {
@@ -2004,15 +2217,868 @@ fn current_installation_identity() -> Result<(SetupPaths, InstallReceipt, fs::Me
     Ok((paths, receipt, metadata))
 }
 
+/// Legacy maintenance verification, including shared installation recovery.
+/// Use `verify_at_read_only` when observation must not change managed state.
 pub fn verify_at(paths: &SetupPaths) -> Result<SetupReport> {
     let receipt = read_receipt(&paths.receipt_path())?;
     verify_receipted_installation_at(paths, &receipt, true)
+}
+
+/// Verify receipt-owned installed state without creating or recovering files.
+/// Pending binary transitions require an explicit recovery operation.
+pub fn verify_at_read_only(paths: &SetupPaths) -> Result<SetupReport> {
+    let receipt = read_receipt(&paths.receipt_path())?;
+    verify_receipted_installation_read_only(paths, &receipt)
+}
+
+fn verify_receipted_installation_read_only(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+) -> Result<SetupReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let shared = dev_tools_installation::observe_versioned_installation(
+            &shared_installation_layout(paths, receipt.mode),
+            BINARY_LIMIT,
+        )?
+        .context("shared installation receipt is absent")?;
+        require_shared_receipt_agreement(receipt, &shared)?;
+        verify_receipted_installation_at(paths, receipt, false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (paths, receipt);
+        bail!("read-only installation verification requires a native observation backend");
+    }
+}
+
+/// Revalidate an already-approved setup candidate without disposable release
+/// inputs. The caller must first establish the exact private transition record.
+/// The returned proof can complete only this retained installation generation.
+#[cfg(test)]
+fn retained_candidate_validation(
+    plan: &SetupPlan,
+    prior: Option<(&InstallReceipt, &dev_tools_installation::VersionedReceipt)>,
+) -> Result<RetainedCandidateValidation> {
+    retained_candidate_validation_from_source(plan, prior, None)
+}
+
+pub(crate) fn retained_candidate_validation_from_source(
+    plan: &SetupPlan,
+    prior: Option<(&InstallReceipt, &dev_tools_installation::VersionedReceipt)>,
+    running_candidate: Option<&Path>,
+) -> Result<RetainedCandidateValidation> {
+    let expected_product = match fs::symlink_metadata(plan.paths.receipt_path()) {
+        Ok(_) => Some(read_receipt(&plan.paths.receipt_path())?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if prior.is_some() {
+                bail!("missing product receipt is outside initial recovery");
+            }
+            None
+        }
+        Err(error) => return Err(error).context("inspect retained candidate receipt"),
+    };
+    let pending_upgrade = prior.is_some_and(|(prior, _)| {
+        let mut inactive = prior.clone();
+        inactive.transparent_aliases.clear();
+        plan.request.mode == prior.mode
+            && prior.version != plan.request.version
+            && expected_product.as_ref() == Some(&inactive)
+    });
+    let receipt_pending = expected_product.is_none() || pending_upgrade;
+    if receipt_pending
+        && plan.request.mode == InstallMode::Strong
+        && (!nix::unistd::Uid::effective().is_root() || plan.paths != SetupPaths::strong())
+    {
+        bail!("strong receipt completion requires the native system owner and layout");
+    }
+    let receipt = if receipt_pending {
+        selected_installation_receipt(
+            &plan.paths,
+            &plan.request,
+            plan.verified_release.as_ref(),
+            prior.map(|(receipt, _)| receipt),
+            &dev_tools_installation::ArtifactIdentity {
+                length: plan.source_length,
+                sha256: plan.source_sha256.clone(),
+            },
+        )
+    } else {
+        expected_product
+            .clone()
+            .context("candidate product receipt is absent")?
+    };
+    let publication_expected = if pending_upgrade {
+        let current_mode = fs::symlink_metadata(plan.paths.receipt_path())?.mode() & 0o7777;
+        if !matches!(current_mode, 0o600 | 0o644) {
+            bail!("prior product receipt has unsupported publication permissions");
+        }
+        let observed = dev_tools_installation::read_atomic_document(
+            &plan.paths.receipt_path(),
+            &dev_tools_installation::DocumentAuthority {
+                owner_uid: shared_installation_layout(&plan.paths, plan.request.mode).owner_uid,
+                mode: current_mode,
+                limit: RECEIPT_LIMIT,
+            },
+        )?
+        .context("prior product receipt disappeared during recovery admission")?;
+        if Some(serde_json::from_slice::<InstallReceipt>(&observed.bytes)?) != expected_product {
+            bail!("prior product receipt changed during recovery admission");
+        }
+        Some(ReceiptPublicationExpected {
+            identity: observed.identity,
+            mode: current_mode,
+        })
+    } else {
+        None
+    };
+    if plan.schema != "dev-auth-setup-plan-v2"
+        || receipt.mode != plan.request.mode
+        || receipt.version != plan.request.version
+        || receipt.executable_length != plan.source_length
+        || receipt.executable_sha256 != plan.source_sha256
+        || Path::new(&receipt.native_git) != plan.request.native_git
+        || Path::new(&receipt.native_gh) != plan.request.native_gh
+        || plan.request.activate_transparent_launchers
+    {
+        bail!("installed release does not match the retained setup candidate");
+    }
+    match &plan.verified_release {
+        Some(release)
+            if release.schema == "dev-auth-verified-release-v1"
+                && release.version == receipt.version
+                && release.artifact_length == receipt.executable_length
+                && release.artifact_sha256 == receipt.executable_sha256
+                && release.artifact_path == plan.request.source_executable
+                && release.root_generation > 0
+                && release.manifest_generation > 0
+                && release.target == crate::release_manifest::target_id()?
+                && Some(&release.source_commit) == receipt.source_commit.as_ref()
+                && Some(release.root_generation) == receipt.root_generation
+                && Some(release.manifest_generation) == receipt.manifest_generation => {}
+        None if receipt.mode == InstallMode::UserOnly => {}
+        _ => bail!("retained setup release authority does not match the installation receipt"),
+    }
+    let binary_source = match fs::symlink_metadata(&receipt.executable) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && receipt_pending => {
+            running_candidate
+                .context("unstaged installation requires the approved running candidate")?
+                .to_path_buf()
+        }
+        _ => PathBuf::from(&receipt.executable),
+    };
+    let mut validation = plan.clone();
+    validation.request.source_executable = binary_source.clone();
+    validation.verified_release = None;
+    validate_plan(&validation)?;
+    let candidate_shared = retained_candidate_shared_receipt(plan, &receipt, prior)?;
+    let prior_shared = prior.map(|(_, shared)| shared.clone());
+    let initial_unstaged = receipt_pending
+        && prior_shared.is_none()
+        && binary_source != Path::new(&receipt.executable);
+    #[cfg(target_os = "linux")]
+    let (journal_pending, binary_forward, strong_completion) = {
+        let layout = shared_installation_layout(&plan.paths, plan.request.mode);
+        let observed = if initial_unstaged {
+            require_initial_binary_absence(&layout)?;
+            dev_tools_installation::VersionedRecoveryObservation {
+                receipt: None,
+                journal_pending: false,
+            }
+        } else {
+            dev_tools_installation::observe_versioned_installation_transition(
+                &layout,
+                prior_shared.as_ref(),
+                &candidate_shared,
+                BINARY_LIMIT,
+                |_| Ok(()),
+            )?
+        };
+        let binary_forward = receipt_pending && observed.receipt == prior_shared;
+        if !binary_forward && observed.receipt.as_ref() != Some(&candidate_shared) {
+            bail!("setup recovery still requires a committed candidate binary receipt");
+        }
+        let mut strong_completion = None;
+        if binary_forward {
+            verify_forward_binary_candidate(
+                plan,
+                &receipt,
+                prior_shared.as_ref(),
+                observed.journal_pending,
+                !observed.journal_pending,
+                &binary_source,
+            )?;
+        } else {
+            if receipt_pending && receipt.mode == InstallMode::Strong {
+                verify_receipted_installation_components(
+                    &plan.paths,
+                    &receipt,
+                    false,
+                    StrongAssetVerification::None,
+                )?;
+            } else {
+                verify_receipted_installation_at(&plan.paths, &receipt, false)?;
+            }
+        }
+        if receipt_pending && receipt.mode == InstallMode::Strong {
+            let assets = strong_assets_completion::StrongAssetsCompletion::observe(
+                &plan.paths,
+                &receipt,
+                prior.map(|(receipt, _)| receipt),
+            )?;
+            let helper = strong_helper_completion::StrongHelperCompletion::observe(
+                &plan.paths,
+                &receipt,
+                prior.map(|(receipt, _)| receipt),
+                &binary_source,
+            )?;
+            let launcher = restoration::StrongLauncherCompletion::observe(
+                &plan.paths,
+                &receipt,
+                prior.map(|(receipt, _)| receipt),
+                &binary_source,
+            )?;
+            strong_completion = Some(StrongCompletion {
+                assets,
+                helper,
+                launcher,
+            });
+        }
+        (observed.journal_pending, binary_forward, strong_completion)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (journal_pending, binary_forward) = {
+        verify_receipted_installation_read_only(&plan.paths, &receipt)?;
+        (false, false)
+    };
+    Ok(RetainedCandidateValidation {
+        plan: plan.clone(),
+        receipt,
+        prior_shared,
+        candidate_shared,
+        journal_pending,
+        receipt_pending,
+        binary_forward,
+        expected_product,
+        publication_expected,
+        binary_source,
+        initial_unstaged,
+        #[cfg(target_os = "linux")]
+        strong_completion,
+    })
+}
+
+pub(crate) struct RetainedCandidateValidation {
+    plan: SetupPlan,
+    receipt: InstallReceipt,
+    prior_shared: Option<dev_tools_installation::VersionedReceipt>,
+    candidate_shared: dev_tools_installation::VersionedReceipt,
+    journal_pending: bool,
+    receipt_pending: bool,
+    binary_forward: bool,
+    expected_product: Option<InstallReceipt>,
+    publication_expected: Option<ReceiptPublicationExpected>,
+    binary_source: PathBuf,
+    initial_unstaged: bool,
+    #[cfg(target_os = "linux")]
+    strong_completion: Option<StrongCompletion>,
+}
+
+#[cfg(target_os = "linux")]
+struct StrongCompletion {
+    launcher: restoration::StrongLauncherCompletion,
+    assets: strong_assets_completion::StrongAssetsCompletion,
+    helper: strong_helper_completion::StrongHelperCompletion,
+}
+
+struct ReceiptPublicationExpected {
+    identity: dev_tools_installation::ArtifactIdentity,
+    mode: u32,
+}
+
+impl RetainedCandidateValidation {
+    pub(crate) fn validate(&self, plan: &SetupPlan) -> Result<()> {
+        if plan != &self.plan {
+            bail!("retained candidate proof cannot validate another installation plan");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn binary_recovery_action(&self) -> &'static str {
+        #[cfg(target_os = "linux")]
+        if self.strong_completion.as_ref().is_some_and(|strong| {
+            strong.launcher.needs_publication()
+                || strong.assets.needs_publication()
+                || strong.helper.needs_publication()
+        }) {
+            return if self.publication_expected.is_some() {
+                "complete_upgrade_strong_installation"
+            } else {
+                "complete_initial_strong_installation"
+            };
+        }
+        if self.binary_forward {
+            if self.prior_shared.is_some() {
+                "complete_upgrade_binary_installation"
+            } else {
+                "complete_initial_binary_installation"
+            }
+        } else if self.publication_expected.is_some() {
+            "complete_upgrade_binary_receipt"
+        } else if self.receipt_pending {
+            "complete_initial_binary_receipt"
+        } else {
+            "settle_binary_transition"
+        }
+    }
+
+    /// Complete only the retained binary candidate. User-only recovery may
+    /// restore the retained prior endpoint and publish fixed approved bytes.
+    pub(crate) fn finish_binary_transition(
+        &self,
+        mut record_change: impl FnMut(bool),
+    ) -> Result<bool> {
+        if !self.journal_pending && !self.receipt_pending {
+            // No binary mutation is selected. The following read-only product
+            // deactivation check still rejects a journal appearing afterward.
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let layout = shared_installation_layout(&self.plan.paths, self.plan.request.mode);
+            self.require_selected_product_receipt()?;
+            if self.receipt_pending && self.receipt.mode == InstallMode::Strong {
+                if self.binary_forward {
+                    self.verify_strong_observed()?;
+                } else {
+                    self.verify_candidate_before_completion(false)?;
+                }
+            }
+            if self.binary_forward {
+                verify_forward_binary_candidate(
+                    &self.plan,
+                    &self.receipt,
+                    self.prior_shared.as_ref(),
+                    self.journal_pending,
+                    !self.journal_pending,
+                    &self.binary_source,
+                )?;
+            }
+            let (mut changed, installed) = if self.initial_unstaged {
+                // There may be no installation lock or bin/versions layout yet.
+                // Absence is only observation; conditional publication checks
+                // it again under the shared installation lock before staging.
+                require_initial_binary_absence(&layout)?;
+                (false, None)
+            } else {
+                dev_tools_installation::recover_versioned_installation_transition(
+                    &layout,
+                    self.prior_shared.as_ref(),
+                    &self.candidate_shared,
+                    BINARY_LIMIT,
+                    |_| {
+                        self.require_selected_product_receipt()?;
+                        let current =
+                            dev_tools_installation::read_versioned_installation_receipt(&layout)?;
+                        if self.binary_forward {
+                            if current != self.prior_shared {
+                                bail!("prior binary state changed before forward recovery");
+                            }
+                            verify_forward_binary_candidate(
+                                &self.plan,
+                                &self.receipt,
+                                self.prior_shared.as_ref(),
+                                self.journal_pending,
+                                false,
+                                &self.binary_source,
+                            )?;
+                            self.verify_strong_observed()?;
+                        } else if current.as_ref() != Some(&self.candidate_shared) {
+                            bail!("committed setup candidate changed before binary settlement");
+                        } else {
+                            self.verify_candidate_before_completion(true)?;
+                        }
+                        Ok(())
+                    },
+                )?
+            };
+            record_change(changed);
+            if self.binary_forward {
+                if installed != self.prior_shared {
+                    bail!("binary recovery did not restore the retained prior endpoint");
+                }
+                self.require_selected_product_receipt()?;
+                self.verify_strong_observed()?;
+                let report = dev_tools_installation::apply_versioned_installation_if_unchanged(
+                    &dev_tools_installation::VersionedInstallRequest {
+                        layout: layout.clone(),
+                        version: self.receipt.version.clone(),
+                        source: self.binary_source.clone(),
+                        identity: self.candidate_shared.active_identity.clone(),
+                        aliases: self.candidate_shared.aliases.clone(),
+                    },
+                    self.prior_shared.as_ref(),
+                    |_| {
+                        self.require_selected_product_receipt()?;
+                        // Shared publication has just verified the exact staged
+                        // artifact under this lock; retain product layout checks.
+                        verify_forward_binary_candidate(
+                            &self.plan,
+                            &self.receipt,
+                            self.prior_shared.as_ref(),
+                            false,
+                            false,
+                            Path::new(&self.receipt.executable),
+                        )?;
+                        self.verify_strong_observed()
+                    },
+                )?;
+                record_change(report.changed);
+                changed |= report.changed;
+                if report.receipt != self.candidate_shared {
+                    bail!("binary activation differs from retained authority");
+                }
+            } else if installed.as_ref() != Some(&self.candidate_shared) {
+                bail!("binary settlement did not retain the approved candidate");
+            }
+            if let Some(strong) = &self.strong_completion {
+                changed |= strong.launcher.complete(
+                    || {
+                        self.require_selected_product_receipt()?;
+                        self.verify_committed_candidate_base()?;
+                        strong.assets.verify_observed()?;
+                        strong.helper.verify_observed()
+                    },
+                    &mut record_change,
+                )?;
+                changed |= strong.assets.complete(
+                    || {
+                        self.require_selected_product_receipt()?;
+                        self.verify_committed_candidate_base()?;
+                        strong.launcher.verify_complete()?;
+                        strong.helper.verify_observed()
+                    },
+                    &mut record_change,
+                )?;
+                let published = strong.helper.complete(
+                    || {
+                        self.require_selected_product_receipt()?;
+                        self.verify_candidate_except_helper()
+                    },
+                    &mut record_change,
+                )?;
+                changed |= published;
+            }
+            if self.receipt_pending {
+                self.require_selected_product_receipt()?;
+                if self.receipt.mode == InstallMode::Strong {
+                    self.verify_complete_candidate()?;
+                }
+                let authority = dev_tools_installation::DocumentAuthority {
+                    owner_uid: layout.owner_uid,
+                    mode: receipt_permissions(self.receipt.mode),
+                    limit: RECEIPT_LIMIT,
+                };
+                let bytes = serde_json::to_vec_pretty(&self.receipt)?;
+                let published = match &self.publication_expected {
+                    Some(expected) => dev_tools_installation::ExistingDocumentDirectory::open(
+                        &self.plan.paths.data_root,
+                        layout.owner_uid,
+                    )?
+                    .replace(
+                        OsStr::new("install-v2.json"),
+                        &bytes,
+                        &authority,
+                        &dev_tools_installation::DocumentAuthority {
+                            mode: expected.mode,
+                            ..authority.clone()
+                        },
+                        &expected.identity,
+                    )?,
+                    None => dev_tools_installation::write_atomic_document(
+                        &self.plan.paths.receipt_path(),
+                        &bytes,
+                        &authority,
+                        None,
+                    )?,
+                };
+                record_change(published);
+                changed |= published;
+                verify_receipted_installation_read_only(&self.plan.paths, &self.receipt)?;
+            }
+            Ok(changed)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &mut record_change;
+            bail!("binary transition settlement requires a native Linux backend")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_candidate_except_helper(&self) -> Result<()> {
+        self.verify_committed_candidate_base()?;
+        self.verify_candidate_assets_except_helper()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_committed_candidate_base(&self) -> Result<()> {
+        let observed = dev_tools_installation::observe_versioned_installation_transition(
+            &shared_installation_layout(&self.plan.paths, self.receipt.mode),
+            self.prior_shared.as_ref(),
+            &self.candidate_shared,
+            BINARY_LIMIT,
+            |_| Ok(()),
+        )?;
+        if observed.receipt.as_ref() != Some(&self.candidate_shared) {
+            bail!("committed candidate changed before helper completion");
+        }
+        self.verify_candidate_base()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_candidate_base(&self) -> Result<()> {
+        verify_receipted_installation_components(
+            &self.plan.paths,
+            &self.receipt,
+            false,
+            StrongAssetVerification::None,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_candidate_assets_except_helper(&self) -> Result<()> {
+        verify_receipted_installation_components(
+            &self.plan.paths,
+            &self.receipt,
+            false,
+            StrongAssetVerification::LauncherAndDefinitions,
+        )?;
+        restoration::require_candidate_services_stopped()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_candidate_before_completion(&self, installation_lock_held: bool) -> Result<()> {
+        if self.strong_completion.is_some() {
+            if installation_lock_held {
+                // The shared recovery callback has validated its exact current
+                // receipt and artifacts while holding the installation lock.
+                self.verify_candidate_base()?;
+            } else {
+                self.verify_committed_candidate_base()?;
+            }
+            self.verify_strong_observed()
+        } else {
+            self.verify_complete_candidate()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_strong_observed(&self) -> Result<()> {
+        if let Some(strong) = &self.strong_completion {
+            strong.launcher.verify_observed()?;
+            strong.assets.verify_observed()?;
+            strong.helper.verify_observed()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_complete_candidate(&self) -> Result<()> {
+        verify_receipted_installation_at(&self.plan.paths, &self.receipt, false)?;
+        if self.receipt_pending && self.receipt.mode == InstallMode::Strong {
+            restoration::require_candidate_services_stopped()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_selected_product_receipt(&self) -> Result<()> {
+        if let Some(expected) = &self.expected_product {
+            if &read_receipt(&self.plan.paths.receipt_path())? != expected {
+                bail!("selected setup product receipt changed before binary settlement");
+            }
+            if let Some(expected) = &self.publication_expected {
+                let observed = dev_tools_installation::read_atomic_document(
+                    &self.plan.paths.receipt_path(),
+                    &dev_tools_installation::DocumentAuthority {
+                        owner_uid: shared_installation_layout(
+                            &self.plan.paths,
+                            self.plan.request.mode,
+                        )
+                        .owner_uid,
+                        mode: expected.mode,
+                        limit: RECEIPT_LIMIT,
+                    },
+                )?
+                .context("selected prior product receipt disappeared")?;
+                if observed.identity != expected.identity {
+                    bail!("selected prior product receipt bytes changed");
+                }
+            }
+            Ok(())
+        } else {
+            match fs::symlink_metadata(self.plan.paths.receipt_path()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => bail!("initial product receipt is no longer absent"),
+            }
+        }
+    }
+}
+
+/// Product-owned admission for incomplete retained activation, not a fallback
+/// from a failed complete-installation verifier. Shared code owns artifact I/O.
+#[cfg(target_os = "linux")]
+fn verify_forward_binary_candidate(
+    plan: &SetupPlan,
+    receipt: &InstallReceipt,
+    prior: Option<&dev_tools_installation::VersionedReceipt>,
+    journal_pending: bool,
+    verify_artifact: bool,
+    binary_source: &Path,
+) -> Result<()> {
+    let unstaged = binary_source != Path::new(&receipt.executable);
+    if unstaged {
+        if journal_pending {
+            bail!("unstaged recovery requires a settled retained endpoint");
+        }
+        match fs::symlink_metadata(&receipt.executable) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("unstaged candidate destination changed"),
+        }
+    }
+    if receipt.mode == InstallMode::Strong
+        && (!nix::unistd::Uid::effective().is_root() || plan.paths != SetupPaths::strong())
+    {
+        bail!("strong binary recovery requires the native system owner and layout");
+    }
+    if receipt
+        .previous_release
+        .as_ref()
+        .map(|previous| &previous.version)
+        != prior.map(|prior| &prior.active_version)
+        || Path::new(&receipt.executable) != plan.paths.versioned_binary(&receipt.version)
+    {
+        bail!("staged candidate is outside retained installation authority");
+    }
+    validate_directory(&plan.paths.data_root, receipt.mode)?;
+    for directory in [
+        plan.paths.bin_dir.clone(),
+        plan.paths.data_root.join("versions"),
+    ] {
+        if unstaged && prior.is_none() {
+            match dev_tools_installation::ExistingDocumentDirectory::open(
+                &directory,
+                nix::unistd::Uid::effective().as_raw(),
+            ) {
+                Ok(_) => validate_directory(&directory, receipt.mode)?,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            validate_directory(&directory, receipt.mode)?;
+        }
+    }
+    let version_directory = plan.paths.data_root.join("versions").join(&receipt.version);
+    match fs::symlink_metadata(&version_directory) {
+        Err(error) if unstaged && error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => validate_directory(&version_directory, receipt.mode)?,
+    }
+    // A journal's artifact is checked by shared observation/recovery. Explicit
+    // candidate observation is needed when no journal describes staged bytes.
+    if verify_artifact {
+        dev_tools_installation::copy_verified_artifact_to_staging(
+            binary_source,
+            &dev_tools_installation::DocumentAuthority {
+                owner_uid: nix::unistd::Uid::effective().as_raw(),
+                mode: 0o755,
+                limit: BINARY_LIMIT,
+            },
+            &dev_tools_installation::ArtifactIdentity {
+                length: receipt.executable_length,
+                sha256: receipt.executable_sha256.clone(),
+            },
+            &mut std::io::sink(),
+        )?;
+    }
+    let active = plan.paths.data_root.join("active");
+    let mut allowed_active = Vec::new();
+    let mut allowed_previous = Vec::new();
+    if let Some(prior) = prior {
+        let prior_active = plan.paths.versioned_binary(&prior.active_version);
+        allowed_active.push(prior_active.clone());
+        if let Some(version) = &prior.previous_version {
+            allowed_previous.push(plan.paths.versioned_binary(version));
+        }
+        if journal_pending {
+            allowed_previous.push(prior_active);
+        }
+    }
+    if journal_pending {
+        allowed_active.push(PathBuf::from(&receipt.executable));
+    }
+    let mut pointers = vec![
+        (active.clone(), allowed_active),
+        (plan.paths.data_root.join("previous"), allowed_previous),
+    ];
+    pointers.extend(shared_product_aliases().into_iter().map(|alias| {
+        (
+            plan.paths.bin_dir.join(alias),
+            if journal_pending || prior.is_some() {
+                vec![active.clone()]
+            } else {
+                Vec::new()
+            },
+        )
+    }));
+    for (path, allowed_targets) in pointers {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && fs::read_link(&path)
+                        .ok()
+                        .is_some_and(|target| allowed_targets.contains(&target)) => {}
+            _ => bail!("binary activation contains an unowned pointer"),
+        }
+    }
+    verify_exact_alias_set(
+        &plan.paths.bin_dir,
+        Path::new(&receipt.executable),
+        &receipt.transparent_aliases,
+        &TRANSPARENT_ALIASES,
+        true,
+    )?;
+    validate_native_program(Path::new(&receipt.native_git), "native Git")?;
+    validate_native_program(Path::new(&receipt.native_gh), "native GitHub CLI")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_initial_binary_absence(layout: &dev_tools_installation::VersionedLayout) -> Result<()> {
+    if dev_tools_installation::observe_versioned_installation(layout, BINARY_LIMIT)?.is_some() {
+        bail!("initial binary absence changed before recovery");
+    }
+    Ok(())
+}
+
+fn retained_candidate_shared_receipt(
+    plan: &SetupPlan,
+    candidate: &InstallReceipt,
+    prior: Option<(&InstallReceipt, &dev_tools_installation::VersionedReceipt)>,
+) -> Result<dev_tools_installation::VersionedReceipt> {
+    let layout = shared_installation_layout(&plan.paths, plan.request.mode);
+    let expected_previous = match prior {
+        Some((receipt, shared)) => {
+            if receipt.schema != RECEIPT_SCHEMA
+                || receipt.mode != plan.request.mode
+                || Path::new(&receipt.executable) != plan.paths.versioned_binary(&receipt.version)
+                || Path::new(&receipt.bin_dir) != plan.paths.bin_dir
+            {
+                bail!("retained prior installation has incompatible ownership");
+            }
+            require_shared_receipt_agreement(receipt, shared)?;
+            if shared.previous_version
+                != receipt.previous_release.as_ref().map(|r| r.version.clone())
+                || shared.previous_identity
+                    != receipt.previous_release.as_ref().map(|r| {
+                        dev_tools_installation::ArtifactIdentity {
+                            length: r.executable_length,
+                            sha256: r.executable_sha256.clone(),
+                        }
+                    })
+            {
+                bail!("retained prior installation histories disagree");
+            }
+            validate_release_transition(
+                receipt,
+                &plan.request,
+                &plan.source_sha256,
+                plan.verified_release.as_ref(),
+            )?;
+            if receipt.version == candidate.version {
+                if receipt.executable_length != candidate.executable_length
+                    || receipt.executable_sha256 != candidate.executable_sha256
+                {
+                    bail!("a retained version cannot identify changed candidate bytes");
+                }
+                receipt.previous_release.clone()
+            } else {
+                Some(retained_release(receipt))
+            }
+        }
+        None => None,
+    };
+    if candidate.previous_release != expected_previous
+        || Path::new(&candidate.bin_dir) != plan.paths.bin_dir
+    {
+        bail!("candidate history differs from the retained installation generation");
+    }
+    if plan.verified_release.is_none() {
+        let preserved = prior
+            .map(|(receipt, _)| receipt)
+            .filter(|receipt| receipt.version == candidate.version);
+        if candidate.source_commit != preserved.and_then(|receipt| receipt.source_commit.clone())
+            || candidate.root_generation != preserved.and_then(|receipt| receipt.root_generation)
+            || candidate.manifest_generation
+                != preserved.and_then(|receipt| receipt.manifest_generation)
+        {
+            bail!("candidate provenance is outside retained release authority");
+        }
+    }
+    Ok(dev_tools_installation::VersionedReceipt {
+        schema: "dev-tools-versioned-installation-v1".into(),
+        product: layout.product,
+        data_root: layout.data_root,
+        bin_dir: layout.bin_dir,
+        artifact_name: layout.artifact_name,
+        active_version: candidate.version.clone(),
+        active_identity: dev_tools_installation::ArtifactIdentity {
+            length: candidate.executable_length,
+            sha256: candidate.executable_sha256.clone(),
+        },
+        previous_version: expected_previous.as_ref().map(|r| r.version.clone()),
+        previous_identity: expected_previous.as_ref().map(|r| {
+            dev_tools_installation::ArtifactIdentity {
+                length: r.executable_length,
+                sha256: r.executable_sha256.clone(),
+            }
+        }),
+        aliases: shared_product_aliases(),
+    })
 }
 
 fn verify_receipted_installation_at(
     paths: &SetupPaths,
     receipt: &InstallReceipt,
     verify_private_shared_receipt: bool,
+) -> Result<SetupReport> {
+    verify_receipted_installation_components(
+        paths,
+        receipt,
+        verify_private_shared_receipt,
+        StrongAssetVerification::Complete,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StrongAssetVerification {
+    Complete,
+    #[cfg(target_os = "linux")]
+    LauncherAndDefinitions,
+    #[cfg(target_os = "linux")]
+    None,
+}
+
+fn verify_receipted_installation_components(
+    paths: &SetupPaths,
+    receipt: &InstallReceipt,
+    verify_private_shared_receipt: bool,
+    strong: StrongAssetVerification,
 ) -> Result<SetupReport> {
     if receipt.schema != RECEIPT_SCHEMA {
         bail!("dev-auth installation receipt schema is unsupported");
@@ -2049,12 +3115,22 @@ fn verify_receipted_installation_at(
     validate_native_program(Path::new(&receipt.native_git), "native Git")?;
     validate_native_program(Path::new(&receipt.native_gh), "native GitHub CLI")?;
     if receipt.mode == InstallMode::Strong {
-        verify_linux_system_assets_against(&receipt.system_assets)?;
-        verify_privileged_launcher(&executable, receipt)?;
-        if release_supports_setup_helper(receipt) {
-            verify_setup_helper(paths, receipt)?;
-        } else {
-            verify_setup_helper_absent(paths)?;
+        if match strong {
+            StrongAssetVerification::Complete => true,
+            #[cfg(target_os = "linux")]
+            StrongAssetVerification::LauncherAndDefinitions => true,
+            #[cfg(target_os = "linux")]
+            StrongAssetVerification::None => false,
+        } {
+            verify_linux_system_assets_against(&receipt.system_assets)?;
+            verify_privileged_launcher(&executable, receipt)?;
+        }
+        if strong == StrongAssetVerification::Complete {
+            if release_supports_setup_helper(receipt) {
+                verify_setup_helper(paths, receipt)?;
+            } else {
+                verify_setup_helper_absent(paths)?;
+            }
         }
     }
 
@@ -2083,6 +3159,10 @@ pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
     if let Some(report) = resume_interrupted_setup_helper_rollback(paths, &receipt)? {
         return Ok(report);
     }
+    let approved_source = dev_tools_installation::ArtifactIdentity {
+        length: receipt.executable_length,
+        sha256: receipt.executable_sha256.clone(),
+    };
     let request = InstallRequest {
         mode: receipt.mode,
         version: receipt.version,
@@ -2091,10 +3171,101 @@ pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
         native_gh: PathBuf::from(receipt.native_gh),
         activate_transparent_launchers: !receipt.transparent_aliases.is_empty(),
     };
-    install_at(paths, &request)
+    install_at_with_release(paths, &request, None, &approved_source)
 }
 
+/// Runs binary-only rollback at the native owner's canonical installation.
+/// The exclusive lease remains held through all nested installation recovery.
+pub fn rollback_native(mode: InstallMode) -> Result<SetupReport> {
+    with_native_setup_exclusion(mode, "rollback", rollback_at)
+}
+
+pub fn repair_native(mode: InstallMode) -> Result<SetupReport> {
+    with_native_setup_exclusion(mode, "repair", |paths| {
+        require_legacy_maintenance_state(paths)?;
+        repair_at(paths)
+    })
+}
+
+pub fn uninstall_native(mode: InstallMode) -> Result<UninstallReport> {
+    with_native_setup_exclusion(mode, "uninstall", |paths| {
+        require_legacy_maintenance_state(paths)?;
+        uninstall_at(paths)
+    })
+}
+
+fn require_legacy_maintenance_state(paths: &SetupPaths) -> Result<()> {
+    require_no_full_setup_transition(
+        paths,
+        "full setup generation requires transaction-aware maintenance",
+    )
+}
+
+fn require_no_full_setup_transition(paths: &SetupPaths, refusal: &'static str) -> Result<()> {
+    match fs::symlink_metadata(crate::setup_transition::state_path(paths)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("inspect full setup maintenance authority"),
+        Ok(_) => bail!("{refusal}"),
+    }
+}
+
+fn with_native_setup_exclusion<T>(
+    mode: InstallMode,
+    operation: &'static str,
+    apply: impl FnOnce(&SetupPaths) -> Result<T>,
+) -> Result<T> {
+    let (paths, _lease) = native_setup_exclusion(mode, operation)?;
+    apply(&paths)
+}
+
+fn configuration_exclusion(mode: InstallMode) -> Result<dev_tools_installation::InstallationLock> {
+    let (paths, lease) = native_setup_exclusion(mode, "configuration maintenance")?;
+    require_legacy_maintenance_state(&paths)?;
+    Ok(lease)
+}
+
+fn native_setup_exclusion(
+    mode: InstallMode,
+    operation: &'static str,
+) -> Result<(SetupPaths, dev_tools_installation::InstallationLock)> {
+    if !cfg!(target_os = "linux") {
+        bail!("native {operation} coordination is not available on this platform");
+    }
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
+        .context("setup maintenance native account is absent")?;
+    let (paths, lock) = match mode {
+        InstallMode::Strong if user.uid.is_root() => (
+            SetupPaths::strong(),
+            crate::setup_transition::lock_path(crate::deployment::DeploymentMode::Strong, None)?,
+        ),
+        InstallMode::UserOnly if !user.uid.is_root() => (
+            SetupPaths::user_only(&user.dir),
+            crate::setup_transition::lock_path(
+                crate::deployment::DeploymentMode::UserOnly,
+                Some(user.uid.as_raw()),
+            )?,
+        ),
+        _ => bail!("{operation} requires the installation's native owner"),
+    };
+    let lease = dev_tools_installation::InstallationLock::try_acquire(&lock)?
+        .with_context(|| format!("{operation} requires active workloads and setup to finish"))?;
+    if mode == InstallMode::UserOnly {
+        require_user_sessions_absent()?;
+    }
+    Ok((paths, lease))
+}
+
+/// Low-level binary receipt rollback. Native callers use `rollback_native`
+/// to serialize this operation with full setup and workload admission.
 pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
+    // This legacy operation only swaps executable receipts. It cannot restore
+    // the policy/integration generation retained by full setup, even when that
+    // generation is already accepted. Do not enter helper or journal recovery
+    // before rejecting that incompatible authority.
+    require_no_full_setup_transition(
+        paths,
+        "binary-only rollback cannot restore a full setup generation",
+    )?;
     let mut receipt = read_receipt(&paths.receipt_path())?;
     if let Some(report) = resume_interrupted_setup_helper_rollback(paths, &receipt)? {
         return Ok(report);
@@ -2248,9 +3419,12 @@ pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
         if paths != &SetupPaths::user_only(home) {
             bail!("user-only installation is outside the native user product layout");
         }
+        let had_workload_receipt = read_workload_alias_receipt(home, owner_uid)?.is_some();
         reconcile_workload_launchers_at(home, Path::new(&receipt.executable), &[], owner_uid)?;
         reconcile_desktop_entries_at(home, &BTreeMap::new(), owner_uid)?;
-        remove_empty_workload_alias_receipt(home, &receipt.executable, owner_uid)?;
+        if had_workload_receipt {
+            remove_empty_workload_alias_receipt(home, &receipt.executable, owner_uid)?;
+        }
     }
 
     let executable = PathBuf::from(&receipt.executable);
@@ -2443,7 +3617,7 @@ fn require_broker_sockets_absent() -> Result<()> {
     Ok(())
 }
 
-fn require_user_sessions_absent() -> Result<()> {
+pub(crate) fn require_user_sessions_absent() -> Result<()> {
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
         bail!("user-only installation requires a native non-root user");
@@ -2681,13 +3855,15 @@ pub fn start_system_broker_at(paths: &SetupPaths) -> Result<SetupReport> {
         bail!("system broker activation requires a strong installation");
     }
     verify_at(paths)?;
-    let policy = crate::policy_store::load_system_policy()?;
-    if Path::new(&policy.programs.git) != Path::new(&receipt.native_git)
-        || Path::new(&policy.programs.gh) != Path::new(&receipt.native_gh)
+    let policy = crate::policy_store::load_runtime_system_policy_at(Path::new(
+        crate::policy_store::SYSTEM_POLICY_PATH,
+    ))?;
+    if Path::new(policy.programs()["git"]) != Path::new(&receipt.native_git)
+        || Path::new(policy.programs()["gh"]) != Path::new(&receipt.native_gh)
     {
         bail!("administrator policy and installation receipt disagree on native tools");
     }
-    for slot in policy.credential_slots.keys() {
+    for slot in policy.credential_slot_names() {
         if !system_service_credential_slot_ready(slot) {
             bail!("encrypted system broker credential slot is not ready");
         }
@@ -2978,27 +4154,61 @@ pub fn system_service_credential_ready() -> bool {
 }
 
 pub fn system_service_credential_slot_ready(slot: &str) -> bool {
+    observe_system_credential_slot(slot) == crate::diagnostics::CredentialObservation::Present
+}
+
+pub(crate) fn observe_system_credential_slot(
+    slot: &str,
+) -> crate::diagnostics::CredentialObservation {
+    use crate::diagnostics::CredentialObservation;
     let Ok(path) = system_credential_slot_path(slot) else {
-        return false;
+        return CredentialObservation::Unsafe;
     };
-    let parent_ready = path.parent().is_some_and(|parent| {
-        fs::symlink_metadata(parent).is_ok_and(|metadata| {
-            metadata.file_type().is_dir()
-                && !metadata.file_type().is_symlink()
-                && metadata.uid() == 0
-                && metadata.mode() & 0o077 == 0
-        })
-    });
-    parent_ready
-        && fs::symlink_metadata(path).is_ok_and(|metadata| {
-            metadata.file_type().is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.uid() == 0
-                && metadata.mode() & 0o077 == 0
-                && metadata.nlink() == 1
-                && metadata.len() > 0
-                && metadata.len() <= BINARY_LIMIT
-        })
+    observe_credential_file(&path, 0)
+}
+
+fn observe_credential_file(
+    path: &Path,
+    owner_uid: u32,
+) -> crate::diagnostics::CredentialObservation {
+    use crate::diagnostics::CredentialObservation;
+    let Some(parent) = path.parent() else {
+        return CredentialObservation::Unsafe;
+    };
+    let parent = match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) => return credential_metadata_error(&error),
+    };
+    if !parent.file_type().is_dir()
+        || parent.file_type().is_symlink()
+        || parent.uid() != owner_uid
+        || parent.mode() & 0o077 != 0
+    {
+        return CredentialObservation::Unsafe;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return credential_metadata_error(&error),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != owner_uid
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > BINARY_LIMIT
+    {
+        return CredentialObservation::Unsafe;
+    }
+    CredentialObservation::Present
+}
+
+fn credential_metadata_error(error: &std::io::Error) -> crate::diagnostics::CredentialObservation {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        crate::diagnostics::CredentialObservation::Missing
+    } else {
+        crate::diagnostics::CredentialObservation::NotObservable
+    }
 }
 
 fn system_credential_slot_path(slot: &str) -> Result<PathBuf> {
@@ -3033,6 +4243,7 @@ pub fn reconcile_system_policy(
     approved_sha256: &str,
     current_sha256: Option<&str>,
 ) -> Result<PathBuf> {
+    let _lease = configuration_exclusion(InstallMode::Strong)?;
     reconcile_system_policy_at(
         &SetupPaths::strong(),
         source,
@@ -3051,7 +4262,7 @@ pub fn reconcile_system_policy_at(
         bail!("administrator policy installation requires root and the system layout");
     }
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
     validate_system_policy_programs(&policy)?;
     let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
     match (fs::symlink_metadata(&destination), current_sha256) {
@@ -3076,12 +4287,13 @@ pub fn update_system_policy(
     approved_sha256: &str,
     current_sha256: &str,
 ) -> Result<PathBuf> {
+    let _lease = configuration_exclusion(InstallMode::Strong)?;
     if nix::unistd::Uid::effective().as_raw() != 0 {
         bail!("administrator policy update requires root");
     }
     require_stopped_strong_installation()?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
     validate_system_policy_programs(&policy)?;
     let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
     replace_policy_document(&destination, &bytes, 0, 0o644, current_sha256)?;
@@ -3089,6 +4301,7 @@ pub fn update_system_policy(
 }
 
 pub fn install_user_policy(source: &Path, approved_sha256: &str) -> Result<PathBuf> {
+    let _lease = configuration_exclusion(InstallMode::UserOnly)?;
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
         bail!("user-only policy must be installed by its native user");
@@ -3100,9 +4313,9 @@ pub fn install_user_policy(source: &Path, approved_sha256: &str) -> Result<PathB
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective user account does not exist")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
     validate_user_policy_programs(&policy, &user, owner_uid)?;
-    let destination = crate::policy_store::user_policy_path(&user);
+    let destination = crate::policy_store::user_policy_destination(&policy, &user);
     install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
     Ok(destination)
 }
@@ -3134,9 +4347,9 @@ pub fn reconcile_user_policy_for_account_at(
         bail!("user-only policy cannot configure a strong installation");
     }
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
     validate_user_policy_programs(&policy, &user, owner_uid)?;
-    let destination = crate::policy_store::user_policy_path(&user);
+    let destination = crate::policy_store::user_policy_destination(&policy, &user);
     match (fs::symlink_metadata(&destination), current_sha256) {
         (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
             install_policy_document(&destination, &bytes, owner_uid, 0o600)?;
@@ -3152,12 +4365,13 @@ pub fn reconcile_user_policy_for_account_at(
             ) {
                 bail!("user-only policy cannot change inside an admitted workload");
             }
-            let config = crate::policy_store::load_user_config_at(
-                &crate::policy_store::user_config_path(&user),
+            crate::policy_store::resolve_runtime_config_at(
+                &policy,
+                &user.name,
+                &crate::policy_store::runtime_user_config_path(&policy, &user),
                 owner_uid,
-            )?;
-            crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &config)
-                .context("updated user-only policy would invalidate the user configuration")?;
+            )
+            .context("updated user-only policy would invalidate the user configuration")?;
             replace_policy_document(&destination, &bytes, owner_uid, 0o600, current)?;
         }
         (Ok(_), None) => install_policy_document(&destination, &bytes, owner_uid, 0o600)?,
@@ -3170,6 +4384,7 @@ pub fn update_user_policy(
     approved_sha256: &str,
     current_sha256: &str,
 ) -> Result<PathBuf> {
+    let _lease = configuration_exclusion(InstallMode::UserOnly)?;
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
         bail!("user-only policy update requires a native non-root user");
@@ -3187,15 +4402,16 @@ pub fn update_user_policy(
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective user account does not exist")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::policy_v2::parse_system_policy_v2(&bytes)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
     validate_user_policy_programs(&policy, &user, owner_uid)?;
-    let config = crate::policy_store::load_user_config_at(
-        &crate::policy_store::user_config_path(&user),
+    crate::policy_store::resolve_runtime_config_at(
+        &policy,
+        &user.name,
+        &crate::policy_store::runtime_user_config_path(&policy, &user),
         owner_uid,
-    )?;
-    crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &config)
-        .context("updated user-only policy would invalidate the active user configuration")?;
-    let destination = crate::policy_store::user_policy_path(&user);
+    )
+    .context("updated user-only policy would invalidate the active user configuration")?;
+    let destination = crate::policy_store::user_policy_destination(&policy, &user);
     replace_policy_document(&destination, &bytes, owner_uid, 0o600, current_sha256)?;
     Ok(destination)
 }
@@ -3209,6 +4425,7 @@ pub fn install_strong_user_config(
     approved_sha256: &str,
     user_name: &str,
 ) -> Result<PathBuf> {
+    let _lease = configuration_exclusion(InstallMode::Strong)?;
     install_user_config_for_account_at(&SetupPaths::strong(), source, approved_sha256, user_name)
 }
 
@@ -3270,7 +4487,6 @@ fn reconcile_user_config_for_account_with_integrations_at(
     let user = nix::unistd::User::from_name(user_name)?
         .context("user configuration names an unknown native account")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let user_config = crate::policy_v2::parse_user_config_v2(&bytes)?;
     let installation = read_receipt(&paths.receipt_path())?;
     match installation.mode {
         InstallMode::Strong => {
@@ -3287,20 +4503,22 @@ fn reconcile_user_config_for_account_with_integrations_at(
         }
     }
     let policy = match installation.mode {
-        InstallMode::Strong => crate::policy_store::load_system_policy()?,
-        InstallMode::UserOnly => crate::policy_store::load_user_policy_at(
-            &crate::policy_store::user_policy_path(&user),
+        InstallMode::Strong => crate::policy_store::load_runtime_system_policy_at(Path::new(
+            crate::policy_store::SYSTEM_POLICY_PATH,
+        ))?,
+        InstallMode::UserOnly => crate::policy_store::load_runtime_user_policy_at(
+            &crate::policy_store::runtime_user_policy_path(&user)?,
             user.uid.as_raw(),
         )?,
     };
     if !policy
-        .allowed_users
+        .allowed_users()
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
     {
         bail!("native user is outside administrator policy");
     }
-    let resolved = crate::policy_v2::resolve_policy_for_user(&policy, &user.name, &user_config)?;
+    let resolved = policy.resolve_user(&user.name, &bytes)?;
     let executable = PathBuf::from(&installation.executable);
     let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
     let owner_uid = user.uid.as_raw();
@@ -3308,7 +4526,7 @@ fn reconcile_user_config_for_account_with_integrations_at(
         preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
         preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
     }
-    let destination = crate::policy_store::user_config_path(&user);
+    let destination = crate::policy_store::runtime_user_config_path(&policy, &user);
     if installation.mode == InstallMode::Strong {
         repair_exact_root_owned_user_document(&destination, &bytes, &user)?;
     }
@@ -3362,6 +4580,17 @@ fn install_or_update_user_config(
     approved_sha256: &str,
     current_sha256: Option<&str>,
 ) -> Result<PathBuf> {
+    let (_, installation) = current_runtime_installation()?;
+    let _lease = configuration_exclusion(installation.mode)?;
+    install_or_update_user_config_unlocked(source, approved_sha256, current_sha256)
+}
+
+// The native public wrapper or full setup owns exclusion before entering here.
+fn install_or_update_user_config_unlocked(
+    source: &Path,
+    approved_sha256: &str,
+    current_sha256: Option<&str>,
+) -> Result<PathBuf> {
     let owner_uid = nix::unistd::Uid::effective().as_raw();
     if owner_uid == 0 {
         bail!("user configuration must be installed by its native user");
@@ -3369,30 +4598,30 @@ fn install_or_update_user_config(
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
         .context("effective user account does not exist")?;
     let bytes = read_approved_public_document(source, approved_sha256)?;
-    let user_config = crate::policy_v2::parse_user_config_v2(&bytes)?;
     let (_, receipt) = current_runtime_installation()?;
     let system_policy = match receipt.mode {
-        InstallMode::Strong => crate::policy_store::load_system_policy()?,
-        InstallMode::UserOnly => crate::policy_store::load_user_policy_at(
-            &crate::policy_store::user_policy_path(&user),
+        InstallMode::Strong => crate::policy_store::load_runtime_system_policy_at(Path::new(
+            crate::policy_store::SYSTEM_POLICY_PATH,
+        ))?,
+        InstallMode::UserOnly => crate::policy_store::load_runtime_user_policy_at(
+            &crate::policy_store::runtime_user_policy_path(&user)?,
             owner_uid,
         )?,
     };
     if !system_policy
-        .allowed_users
+        .allowed_users()
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
     {
         bail!("native user is outside administrator policy");
     }
-    let resolved =
-        crate::policy_v2::resolve_policy_for_user(&system_policy, &user.name, &user_config)?;
+    let resolved = system_policy.resolve_user(&user.name, &bytes)?;
     let (installation_paths, installation) = current_runtime_installation()?;
     let executable = PathBuf::from(&installation.executable);
     let aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
     preflight_workload_launchers_at(&user.dir, &executable, &aliases, owner_uid)?;
     preflight_desktop_entries_at(&user.dir, &resolved.workloads, owner_uid)?;
-    let destination = crate::policy_store::user_config_path(&user);
+    let destination = crate::policy_store::runtime_user_config_path(&system_policy, &user);
     let old_workloads = preflight_user_config_destination(
         &destination,
         &bytes,
@@ -3530,7 +4759,7 @@ pub fn verify_user_integrations_at(
     })
 }
 
-fn desired_desktop_entries(
+pub(crate) fn desired_desktop_entries(
     home: &Path,
     workloads: &BTreeMap<String, crate::policy_v2::ResolvedWorkload>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -3630,7 +4859,12 @@ pub fn reconcile_desktop_entries_at(
     let directory = desktop_entry_directory(home);
     let previous = read_desktop_entry_receipt(home, owner_uid)?;
     if desired.is_empty() && previous.is_none() {
-        return Ok(());
+        return sync_existing_integration_directory(
+            desktop_entry_receipt_path(home)
+                .parent()
+                .context("desktop receipt has no parent")?,
+            owner_uid,
+        );
     }
     ensure_directory_chain_for_owner(&directory, owner_uid, 0o755)?;
     if let Some(previous) = &previous {
@@ -3663,13 +4897,23 @@ pub fn reconcile_desktop_entries_at(
         }
         entry_digests.insert(name, format!("{:x}", Sha256::digest(&content)));
     }
+    // Entry absence/publication must be durable before its ownership receipt
+    // can be removed or replaced. Otherwise restart could expose an entry
+    // whose receipt discarded the authority needed to remove it.
+    sync_existing_integration_directory(&directory, owner_uid)?;
     let receipt_path = desktop_entry_receipt_path(home);
     if entry_digests.is_empty() {
         match fs::remove_file(&receipt_path) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("remove empty desktop entry receipt"),
         }
+        return sync_existing_integration_directory(
+            receipt_path
+                .parent()
+                .context("desktop receipt has no parent")?,
+            owner_uid,
+        );
     }
     let receipt = DesktopEntryReceipt {
         schema: DESKTOP_ENTRY_RECEIPT_SCHEMA.into(),
@@ -3812,8 +5056,11 @@ pub fn reconcile_workload_launchers_at(
 ) -> Result<()> {
     preflight_workload_launchers_at(home, executable, aliases, owner_uid)?;
     let bin_dir = home.join(".local/bin");
-    ensure_directory_chain_for_owner(&bin_dir, owner_uid, 0o755)?;
     let previous = read_workload_alias_receipt(home, owner_uid)?;
+    if aliases.is_empty() && previous.is_none() {
+        return Ok(());
+    }
+    ensure_directory_chain_for_owner(&bin_dir, owner_uid, 0o755)?;
     if let Some(previous) = &previous {
         for alias in previous
             .aliases
@@ -3835,11 +5082,14 @@ pub fn reconcile_workload_launchers_at(
         }
         let temporary = path.with_extension(format!("new-{}", std::process::id()));
         symlink(executable, &temporary).context("stage workload launcher")?;
+        #[cfg(target_os = "linux")]
+        assign_staged_workload_link_owner(&temporary, executable, owner_uid)?;
         if let Err(error) = fs::rename(&temporary, &path) {
             let _ = fs::remove_file(&temporary);
             return Err(error).context("publish workload launcher");
         }
     }
+    sync_existing_integration_directory(&bin_dir, owner_uid)?;
     let receipt = WorkloadAliasReceipt {
         schema: WORKLOAD_ALIAS_RECEIPT_SCHEMA.into(),
         executable: executable.display().to_string(),
@@ -3852,6 +5102,80 @@ pub fn reconcile_workload_launchers_at(
         .context("workload alias receipt has no parent")?;
     ensure_directory_chain_for_owner(parent, owner_uid, 0o755)?;
     write_owned_public_document(&path, &bytes, owner_uid, 0o600, "workload alias receipt")
+}
+
+#[cfg(target_os = "linux")]
+fn assign_staged_workload_link_owner(path: &Path, target: &Path, owner_uid: u32) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let link = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let held = rustix::fs::fstat(&link)?;
+    if held.st_mode & nix::libc::S_IFMT != nix::libc::S_IFLNK
+        || held.st_uid != nix::unistd::Uid::effective().as_raw()
+        || held.st_nlink != 1
+        || rustix::fs::readlinkat(&link, "", Vec::new())?.as_bytes()
+            != target.as_os_str().as_bytes()
+    {
+        bail!("staged workload launcher has changed authority");
+    }
+    if held.st_uid != owner_uid {
+        if !nix::unistd::Uid::effective().is_root() {
+            bail!("staged workload launcher requires its native owner");
+        }
+        let owner = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
+            .context("workload launcher native owner is absent")?;
+        // Empty-path operation addresses the held symlink itself. A pathname
+        // replacement cannot redirect this privileged ownership change, and
+        // neither open nor chown follows the installed executable target.
+        rustix::fs::chownat(
+            &link,
+            "",
+            Some(rustix::fs::Uid::from_raw(owner_uid)),
+            Some(rustix::fs::Gid::from_raw(owner.gid.as_raw())),
+            rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+    }
+    let current = rustix::fs::fstat(&link)?;
+    let named = fs::symlink_metadata(path)?;
+    if current.st_uid != owner_uid || (held.st_dev, held.st_ino) != (named.dev(), named.ino()) {
+        bail!("staged workload launcher changed before publication");
+    }
+    Ok(())
+}
+
+fn sync_existing_integration_directory(path: &Path, owner_uid: u32) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("integration directory is not absolute");
+    }
+    // Integration callers own ancestor trust and writer exclusion. Retain the
+    // admitted leaf for synchronization; never create a missing directory on a
+    // receipt-absence retry or follow a replacement symbolic link.
+    let directory = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("open integration directory for synchronization"),
+    };
+    let held = directory.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !held.is_dir()
+        || held.uid() != owner_uid
+        || held.mode() & 0o022 != 0
+        || !named.is_dir()
+        || named.file_type().is_symlink()
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        bail!("integration directory has unsafe synchronization authority");
+    }
+    directory
+        .sync_all()
+        .context("synchronize integration directory")
 }
 
 fn write_owned_public_document(
@@ -3931,7 +5255,7 @@ fn read_workload_alias_receipt(
     Ok(Some(receipt))
 }
 
-fn validate_workload_alias_names(aliases: &[String]) -> Result<()> {
+pub(crate) fn validate_workload_alias_names(aliases: &[String]) -> Result<()> {
     if aliases.windows(2).any(|pair| pair[0] >= pair[1]) {
         bail!("workload launcher aliases must be sorted and unique");
     }
@@ -4014,23 +5338,23 @@ fn read_approved_public_document(source: &Path, approved_sha256: &str) -> Result
     Ok(bytes)
 }
 
-fn validate_system_policy_programs(policy: &crate::policy_v2::SystemPolicyV2) -> Result<()> {
-    if policy.mode != crate::policy_v2::SystemMode::Strong {
+fn validate_system_policy_programs(
+    policy: &crate::runtime_policy::RuntimeAdministrator,
+) -> Result<()> {
+    if policy.mode() != crate::policy_v2::SystemMode::Strong {
         bail!("administrator policy document has the wrong mode");
     }
-    for (path, description) in [
-        (&policy.programs.op, "1Password CLI"),
-        (&policy.programs.git, "Git"),
-        (&policy.programs.gh, "GitHub CLI"),
-        (&policy.programs.ssh, "SSH"),
-        (&policy.programs.ssh_keygen, "ssh-keygen"),
-    ] {
+    for (description, path) in policy
+        .programs()
+        .into_iter()
+        .chain(policy.provider_programs())
+    {
         validate_root_owned_executable(Path::new(path), description)?;
     }
-    for path in policy.trusted_launchers.values() {
+    for path in policy.trusted_launchers().values() {
         validate_root_owned_executable(Path::new(path), "trusted workload launcher")?;
     }
-    for adapter in policy.sandbox_adapters.values() {
+    for adapter in policy.sandbox_adapters().values() {
         validate_root_owned_executable(
             Path::new(&adapter.executable),
             "sandbox adapter executable",
@@ -4040,33 +5364,31 @@ fn validate_system_policy_programs(policy: &crate::policy_v2::SystemPolicyV2) ->
 }
 
 fn validate_user_policy_programs(
-    policy: &crate::policy_v2::SystemPolicyV2,
+    policy: &crate::runtime_policy::RuntimeAdministrator,
     user: &nix::unistd::User,
     owner_uid: u32,
 ) -> Result<()> {
-    if policy.mode != crate::policy_v2::SystemMode::UserOnly {
+    if policy.mode() != crate::policy_v2::SystemMode::UserOnly {
         bail!("user-only policy document has the wrong mode");
     }
     if !policy
-        .allowed_users
+        .allowed_users()
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
     {
         bail!("user-only policy does not admit the native user");
     }
-    for (path, description) in [
-        (&policy.programs.op, "1Password CLI"),
-        (&policy.programs.git, "Git"),
-        (&policy.programs.gh, "GitHub CLI"),
-        (&policy.programs.ssh, "SSH"),
-        (&policy.programs.ssh_keygen, "ssh-keygen"),
-    ] {
+    for (description, path) in policy
+        .programs()
+        .into_iter()
+        .chain(policy.provider_programs())
+    {
         validate_user_or_root_executable(Path::new(path), owner_uid, description)?;
     }
-    for path in policy.trusted_launchers.values() {
+    for path in policy.trusted_launchers().values() {
         validate_user_or_root_executable(Path::new(path), owner_uid, "trusted workload launcher")?;
     }
-    for adapter in policy.sandbox_adapters.values() {
+    for adapter in policy.sandbox_adapters().values() {
         validate_user_or_root_executable(
             Path::new(&adapter.executable),
             owner_uid,
@@ -4081,7 +5403,7 @@ fn preflight_user_config_destination(
     new_bytes: &[u8],
     current_sha256: Option<&str>,
     owner_uid: u32,
-    system_policy: &crate::policy_v2::SystemPolicyV2,
+    system_policy: &crate::runtime_policy::RuntimeAdministrator,
     native_user: &str,
     resolve_current_workloads: bool,
 ) -> Result<BTreeMap<String, crate::policy_v2::ResolvedWorkload>> {
@@ -4094,8 +5416,8 @@ fn preflight_user_config_destination(
         }
         Err(error) => Err(error).context("inspect current user configuration"),
         Ok(_) => {
-            let current = crate::policy_store::load_user_config_at(destination, owner_uid)?;
-            let current_bytes = fs::read(destination).context("read current user configuration")?;
+            let current_bytes =
+                crate::policy_store::read_runtime_user_config_at(destination, owner_uid)?;
             match current_sha256 {
                 Some(_) if current_bytes == new_bytes => {}
                 Some(expected) => validate_current_digest(&current_bytes, expected)?,
@@ -4103,14 +5425,9 @@ fn preflight_user_config_destination(
                 None => bail!("user configuration already exists; use a digest-bound update"),
             }
             if resolve_current_workloads {
-                Ok(
-                    crate::policy_v2::resolve_policy_for_user(
-                        system_policy,
-                        native_user,
-                        &current,
-                    )?
-                    .workloads,
-                )
+                Ok(system_policy
+                    .resolve_user(native_user, &current_bytes)?
+                    .workloads)
             } else {
                 Ok(BTreeMap::new())
             }
@@ -4462,7 +5779,9 @@ fn system_asset_digests() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn validate_system_asset_receipt_shape(receipt: &BTreeMap<String, String>) -> Result<()> {
+pub(crate) fn validate_system_asset_receipt_shape(
+    receipt: &BTreeMap<String, String>,
+) -> Result<()> {
     let expected_paths = linux_system_assets()
         .into_iter()
         .map(|(path, _, _)| path.display().to_string())
@@ -5078,6 +6397,7 @@ fn restore_interrupted_privileged_launcher_at(
     }
     let launcher_identity = file_identity(launcher)?;
     if launcher_identity == committed_identity {
+        publish_privileged_launcher_mode(committed_executable, launcher)?;
         return Ok(());
     }
     if launcher_identity != (interrupted.length, interrupted.sha256.clone()) {
@@ -5088,7 +6408,8 @@ fn restore_interrupted_privileged_launcher_at(
         launcher,
         owner_uid,
         "interrupted privileged workload launcher",
-    )
+    )?;
+    publish_privileged_launcher_mode(committed_executable, launcher)
 }
 
 fn inspect_interrupted_setup_helper_release(
@@ -5672,7 +6993,10 @@ fn install_privileged_launcher(
     }
     let executable_metadata = fs::symlink_metadata(executable)
         .context("inspect versioned executable for privileged launcher")?;
-    if executable_metadata.uid() != 0 || executable_metadata.nlink() != 1 {
+    if executable_metadata.uid() != 0
+        || executable_metadata.nlink() != 1
+        || executable_metadata.mode() & 0o7777 != 0o755
+    {
         bail!("privileged launcher source is not root-owned");
     }
     let executable_identity = file_identity(executable)?;
@@ -5681,12 +7005,13 @@ fn install_privileged_launcher(
             if !metadata.file_type().is_file()
                 || metadata.file_type().is_symlink()
                 || metadata.uid() != 0
-                || metadata.mode() & 0o777 != 0o755
+                || !matches!(metadata.mode() & 0o7777, 0o755 | 0o4755)
                 || metadata.nlink() != 1
             {
                 bail!("privileged workload launcher has unsafe authority");
             }
             if file_identity(launcher)? == executable_identity {
+                publish_privileged_launcher_mode(executable, launcher)?;
                 return Ok(());
             }
             let prior = read_receipt(&paths.receipt_path())?;
@@ -5705,6 +7030,7 @@ fn install_privileged_launcher(
         Err(error) => return Err(error).context("inspect privileged workload launcher"),
     }
     publish_executable_copy(executable, launcher, 0, "privileged workload launcher")?;
+    publish_privileged_launcher_mode(executable, launcher)?;
     verify_privileged_launcher_copy(executable, launcher)
 }
 
@@ -5838,9 +7164,10 @@ fn verify_privileged_launcher_copy(source: &Path, target: &Path) -> Result<()> {
     if !target_metadata.file_type().is_file()
         || target_metadata.file_type().is_symlink()
         || target_metadata.uid() != 0
-        || target_metadata.mode() & 0o777 != 0o755
+        || target_metadata.mode() & 0o7777 != privileged_launcher_mode_for_executable(source)?
         || target_metadata.nlink() != 1
         || source_metadata.nlink() != 1
+        || source_metadata.mode() & 0o7777 != 0o755
         || file_identity(source)? != file_identity(target)?
     {
         bail!("privileged workload launcher does not match the receipt-owned executable");
@@ -5937,28 +7264,27 @@ fn remove_owned_alias(alias: &Path, executable: &Path) -> Result<()> {
 }
 
 fn file_identity(path: &Path) -> Result<(u64, String)> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect executable {}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        bail!("installed dev-auth executable is not a regular non-symlink file");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open executable {}", path.display()))?;
+    let opened = file.metadata().context("inspect opened executable")?;
+    let identity = dev_tools_installation::ArtifactIdentity::from_open_unix_file(
+        &mut file,
+        BINARY_LIMIT,
+        |metadata| {
+            if metadata.mode() & 0o111 == 0 || metadata.mode() & 0o022 != 0 {
+                bail!("installed dev-auth executable has unsafe permissions");
+            }
+            Ok(())
+        },
+    )?;
+    let named = fs::symlink_metadata(path).context("reinspect executable path")?;
+    if !named.is_file() || !same_file_identity(&opened, &named) {
+        bail!("installed dev-auth executable path changed while being read");
     }
-    if metadata.mode() & 0o111 == 0 || metadata.mode() & 0o022 != 0 {
-        bail!("installed dev-auth executable has unsafe permissions");
-    }
-    if metadata.len() > BINARY_LIMIT {
-        bail!("installed dev-auth executable exceeds the size limit");
-    }
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer).context("hash dev-auth executable")?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok((metadata.len(), format!("{:x}", hasher.finalize())))
+    Ok((identity.length, identity.sha256))
 }
 
 pub(crate) fn setup_executable_identity(path: &Path) -> Result<(u64, String)> {
@@ -6042,6 +7368,1058 @@ fn receipt_mode_matches_installation(mode: u32, installation_mode: InstallMode) 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    fn initial_receipt_recovery_fixture() -> (tempfile::TempDir, SetupPlan, Vec<u8>) {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let git = root.path().join("git");
+        let gh = root.path().join("gh");
+        for path in [&source, &git, &gh] {
+            fs::write(path, b"approved initial candidate").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let paths = SetupPaths::user_only(&root.path().join("home"));
+        let request = InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.4.0".into(),
+            source_executable: source,
+            native_git: git,
+            native_gh: gh,
+            activate_transparent_launchers: false,
+        };
+        let plan = build_plan(&paths, &request).unwrap();
+        install_at(&paths, &request).unwrap();
+        let bytes = fs::read(paths.receipt_path()).unwrap();
+        fs::remove_file(paths.receipt_path()).unwrap();
+        (root, plan, bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn initial_receipt_recovery_journal(plan: &SetupPlan) -> (PathBuf, Vec<u8>) {
+        let next: serde_json::Value = serde_json::from_slice(
+            &fs::read(plan.paths.data_root.join("installation-receipt-v1.json")).unwrap(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-tools-versioned-transition-v1", "prior": null, "next": next,
+        }))
+        .unwrap();
+        let path = plan.paths.data_root.join("installation-transition-v1.json");
+        fs::write(&path, &bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        (path, bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn initial_unstaged_recovery_fixture(
+        remove_layout: bool,
+    ) -> (tempfile::TempDir, SetupPlan, Vec<u8>, PathBuf) {
+        let (root, plan, expected) = initial_receipt_recovery_fixture();
+        let source = root.path().join("approved-recovery-candidate");
+        let candidate = plan.paths.versioned_binary(&plan.request.version);
+        fs::copy(&candidate, &source).unwrap();
+        fs::remove_file(&candidate).unwrap();
+        fs::remove_file(&plan.request.source_executable).unwrap();
+        fs::remove_file(plan.paths.data_root.join("installation-receipt-v1.json")).unwrap();
+        fs::remove_file(plan.paths.data_root.join("active")).unwrap();
+        for alias in shared_product_aliases() {
+            fs::remove_file(plan.paths.bin_dir.join(alias)).unwrap();
+        }
+        if remove_layout {
+            fs::remove_file(plan.paths.data_root.join("installation.lock")).unwrap();
+            fs::remove_dir(candidate.parent().unwrap()).unwrap();
+            fs::remove_dir(plan.paths.data_root.join("versions")).unwrap();
+            fs::remove_dir(&plan.paths.bin_dir).unwrap();
+        }
+        (root, plan, expected, source)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_unstaged_recovery_completes_with_and_without_installation_layout() {
+        for remove_layout in [false, true] {
+            let (_root, plan, expected, source) = initial_unstaged_recovery_fixture(remove_layout);
+            let proof =
+                retained_candidate_validation_from_source(&plan, None, Some(&source)).unwrap();
+            assert!(proof.initial_unstaged);
+            assert_eq!(
+                plan.paths.data_root.join("installation.lock").exists(),
+                !remove_layout
+            );
+            assert_eq!(plan.paths.bin_dir.exists(), !remove_layout);
+            let mut changed = false;
+            assert!(proof
+                .finish_binary_transition(|value| changed |= value)
+                .unwrap());
+            assert!(changed);
+            assert_eq!(fs::read(plan.paths.receipt_path()).unwrap(), expected);
+            verify_at_read_only(&plan.paths).unwrap();
+            fs::remove_file(&source).unwrap();
+            assert!(!retained_candidate_validation(&plan, None)
+                .unwrap()
+                .finish_binary_transition(|_| panic!("retry mutated"))
+                .unwrap());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_unstaged_recovery_rejects_new_journal_without_creating_layout() {
+        let (_root, plan, _, source) = initial_unstaged_recovery_fixture(true);
+        let proof = retained_candidate_validation_from_source(&plan, None, Some(&source)).unwrap();
+        let journal = plan.paths.data_root.join("installation-transition-v1.json");
+        fs::write(&journal, b"unowned journal").unwrap();
+        assert!(retained_candidate_validation_from_source(&plan, None, Some(&source)).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("journal rejection mutated"))
+            .is_err());
+        assert_eq!(fs::read(journal).unwrap(), b"unowned journal");
+        assert!(!plan.paths.data_root.join("installation.lock").exists());
+        assert!(!plan.paths.bin_dir.exists());
+        assert!(!plan.paths.receipt_path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_unstaged_recovery_preserves_foreign_launcher_and_symlinked_layout() {
+        let (root, plan, _, source) = initial_unstaged_recovery_fixture(true);
+        let proof = retained_candidate_validation_from_source(&plan, None, Some(&source)).unwrap();
+        let foreign = root.path().join("foreign-bin");
+        fs::create_dir(&foreign).unwrap();
+        symlink(&foreign, &plan.paths.bin_dir).unwrap();
+        assert!(retained_candidate_validation_from_source(&plan, None, Some(&source)).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("symlink rejection mutated"))
+            .is_err());
+        assert_eq!(fs::read_link(&plan.paths.bin_dir).unwrap(), foreign);
+        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 0);
+        fs::remove_file(&plan.paths.bin_dir).unwrap();
+        fs::create_dir(&plan.paths.bin_dir).unwrap();
+        let launcher = plan.paths.bin_dir.join("dev-auth");
+        fs::write(&launcher, b"independent launcher").unwrap();
+        assert!(retained_candidate_validation_from_source(&plan, None, Some(&source)).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("launcher rejection mutated"))
+            .is_err());
+        assert_eq!(fs::read(launcher).unwrap(), b"independent launcher");
+        assert!(!plan.paths.data_root.join("installation.lock").exists());
+        assert!(!plan.paths.receipt_path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_unstaged_recovery_rejects_late_shared_installation() {
+        let (_root, plan, _, source) = initial_unstaged_recovery_fixture(true);
+        let proof = retained_candidate_validation_from_source(&plan, None, Some(&source)).unwrap();
+        let mut other = plan.request.clone();
+        other.version = "0.4.0-independent".into();
+        other.source_executable = source.clone();
+        install_at(&plan.paths, &other).unwrap();
+        // Leave product absence while retaining the unrelated complete binary
+        // installation; receipt absence alone cannot authorize its replacement.
+        fs::remove_file(plan.paths.receipt_path()).unwrap();
+        assert!(retained_candidate_validation_from_source(&plan, None, Some(&source)).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("installation collision mutated"))
+            .is_err());
+        assert_eq!(
+            dev_tools_installation::observe_versioned_installation(
+                &shared_installation_layout(&plan.paths, InstallMode::UserOnly),
+                BINARY_LIMIT,
+            )
+            .unwrap()
+            .unwrap()
+            .active_version,
+            other.version
+        );
+        assert!(!plan.paths.versioned_binary(&plan.request.version).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_receipt_recovery_completes_only_the_committed_user_candidate() {
+        for journal_pending in [false, true] {
+            let (_root, plan, expected) = initial_receipt_recovery_fixture();
+            let journal = journal_pending.then(|| initial_receipt_recovery_journal(&plan));
+            fs::remove_file(&plan.request.source_executable).unwrap();
+            let proof = retained_candidate_validation(&plan, None).unwrap();
+            assert!(proof.receipt_pending);
+            assert!(!plan.paths.receipt_path().exists());
+            if let Some((path, bytes)) = &journal {
+                assert_eq!(fs::read(path).unwrap(), *bytes);
+            }
+            assert_eq!(
+                proof.binary_recovery_action(),
+                "complete_initial_binary_receipt"
+            );
+            let mut known_change = false;
+            assert!(proof
+                .finish_binary_transition(|changed| known_change |= changed)
+                .unwrap());
+            assert!(known_change);
+            assert_eq!(fs::read(plan.paths.receipt_path()).unwrap(), expected);
+            assert_eq!(
+                fs::metadata(plan.paths.receipt_path()).unwrap().mode() & 0o777,
+                0o600
+            );
+            if let Some((path, _)) = journal {
+                assert!(!path.exists());
+            }
+            let settled = retained_candidate_validation(&plan, None).unwrap();
+            assert!(!settled
+                .finish_binary_transition(|_| panic!("settled receipt mutated"))
+                .unwrap());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_receipt_recovery_rejects_late_collision() {
+        let (_root, plan, _) = initial_receipt_recovery_fixture();
+        let (journal, bytes) = initial_receipt_recovery_journal(&plan);
+        let proof = retained_candidate_validation(&plan, None).unwrap();
+        fs::write(plan.paths.receipt_path(), b"unowned receipt").unwrap();
+        assert!(proof
+            .finish_binary_transition(|_| panic!("collision caused mutation"))
+            .is_err());
+        assert_eq!(
+            fs::read(plan.paths.receipt_path()).unwrap(),
+            b"unowned receipt"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_forward_recovery_completes_partial_and_restored_absence() {
+        for journal_pending in [true, false] {
+            let (_root, plan, expected) = initial_receipt_recovery_fixture();
+            let journal = journal_pending.then(|| initial_receipt_recovery_journal(&plan));
+            fs::remove_file(plan.paths.data_root.join("installation-receipt-v1.json")).unwrap();
+            for alias in shared_product_aliases() {
+                if !journal_pending || alias == "dev-auth" {
+                    fs::remove_file(plan.paths.bin_dir.join(alias)).unwrap();
+                }
+            }
+            if !journal_pending {
+                fs::remove_file(plan.paths.data_root.join("active")).unwrap();
+            }
+            fs::remove_file(&plan.request.source_executable).unwrap();
+            let proof = retained_candidate_validation(&plan, None).unwrap();
+            assert!(proof.binary_forward);
+            assert_eq!(
+                proof.binary_recovery_action(),
+                "complete_initial_binary_installation"
+            );
+            if let Some((path, bytes)) = &journal {
+                assert_eq!(fs::read(path).unwrap(), *bytes);
+            }
+            let mut changed = false;
+            assert!(proof
+                .finish_binary_transition(|value| changed |= value)
+                .unwrap());
+            assert!(changed);
+            assert_eq!(fs::read(plan.paths.receipt_path()).unwrap(), expected);
+            verify_at_read_only(&plan.paths).unwrap();
+            assert!(!retained_candidate_validation(&plan, None)
+                .unwrap()
+                .finish_binary_transition(|_| panic!("retry mutated"))
+                .unwrap());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_forward_recovery_rejects_unknown_aliases_and_changed_candidate() {
+        let (_root, plan, _) = initial_receipt_recovery_fixture();
+        let (journal, bytes) = initial_receipt_recovery_journal(&plan);
+        fs::remove_file(plan.paths.data_root.join("installation-receipt-v1.json")).unwrap();
+        let alias = plan.paths.bin_dir.join("dev-auth");
+        fs::remove_file(&alias).unwrap();
+        fs::write(&alias, b"independently owned command").unwrap();
+        let active = fs::read_link(plan.paths.data_root.join("active")).unwrap();
+        assert!(retained_candidate_validation(&plan, None).is_err());
+        assert_eq!(fs::read(&journal).unwrap(), bytes);
+        assert_eq!(fs::read(&alias).unwrap(), b"independently owned command");
+        assert_eq!(
+            fs::read_link(plan.paths.data_root.join("active")).unwrap(),
+            active
+        );
+        fs::remove_file(alias).unwrap();
+        let proof = retained_candidate_validation(&plan, None).unwrap();
+        fs::write(
+            plan.paths.versioned_binary(&plan.request.version),
+            b"changed candidate",
+        )
+        .unwrap();
+        assert!(proof
+            .finish_binary_transition(|_| panic!("rejection mutated"))
+            .is_err());
+        assert!(retained_candidate_validation(&plan, None).is_err());
+        assert_eq!(fs::read(journal).unwrap(), bytes);
+        assert!(!plan.paths.receipt_path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_forward_recovery_retains_known_restoration_on_late_collision() {
+        let (_root, plan, _) = initial_receipt_recovery_fixture();
+        let (journal, _) = initial_receipt_recovery_journal(&plan);
+        fs::remove_file(plan.paths.data_root.join("installation-receipt-v1.json")).unwrap();
+        let proof = retained_candidate_validation(&plan, None).unwrap();
+        let mut changed = false;
+        assert!(proof
+            .finish_binary_transition(|value| {
+                changed |= value;
+                if value {
+                    fs::write(plan.paths.receipt_path(), b"late independent receipt").unwrap();
+                }
+            })
+            .is_err());
+        assert!(changed);
+        assert!(!journal.exists());
+        assert!(!plan.paths.data_root.join("active").exists());
+        assert!(!plan
+            .paths
+            .data_root
+            .join("installation-receipt-v1.json")
+            .exists());
+        assert_eq!(
+            fs::read(plan.paths.receipt_path()).unwrap(),
+            b"late independent receipt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_receipt_recovery_retains_known_settlement_on_later_publication_failure() {
+        let (_root, plan, _) = initial_receipt_recovery_fixture();
+        let (journal, _) = initial_receipt_recovery_journal(&plan);
+        let proof = retained_candidate_validation(&plan, None).unwrap();
+        let mut known_change = false;
+        let result = proof.finish_binary_transition(|changed| {
+            known_change |= changed;
+            if changed {
+                fs::write(plan.paths.receipt_path(), b"late independent receipt").unwrap();
+            }
+        });
+        assert!(result.is_err());
+        assert!(known_change);
+        assert!(!journal.exists());
+        assert_eq!(
+            fs::read(plan.paths.receipt_path()).unwrap(),
+            b"late independent receipt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initial_receipt_recovery_does_not_admit_upgrade_or_strong_absence() {
+        let (_root, mut plan, bytes) = initial_receipt_recovery_fixture();
+        let prior: InstallReceipt = serde_json::from_slice(&bytes).unwrap();
+        let shared = retained_candidate_shared_receipt(&plan, &prior, None).unwrap();
+        assert!(retained_candidate_validation(&plan, Some((&prior, &shared))).is_err());
+        plan.request.mode = InstallMode::Strong;
+        assert!(retained_candidate_validation(&plan, None).is_err());
+        assert!(!plan.paths.receipt_path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    struct UpgradeReceiptFixture {
+        _root: tempfile::TempDir,
+        plan: SetupPlan,
+        prior: InstallReceipt,
+        prior_shared: dev_tools_installation::VersionedReceipt,
+        expected: Vec<u8>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl UpgradeReceiptFixture {
+        fn new(journal_pending: bool) -> Self {
+            let (root, initial, bytes) = initial_receipt_recovery_fixture();
+            fs::write(initial.paths.receipt_path(), &bytes).unwrap();
+            fs::set_permissions(
+                initial.paths.receipt_path(),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let prior: InstallReceipt = serde_json::from_slice(&bytes).unwrap();
+            let prior_shared = retained_candidate_shared_receipt(&initial, &prior, None).unwrap();
+            let mut request = initial.request.clone();
+            request.version = "0.4.1".into();
+            fs::write(
+                &request.source_executable,
+                b"approved distinct upgrade candidate",
+            )
+            .unwrap();
+            let plan = build_plan(&initial.paths, &request).unwrap();
+            install_at(&initial.paths, &request).unwrap();
+            let expected = fs::read(initial.paths.receipt_path()).unwrap();
+            fs::write(initial.paths.receipt_path(), &bytes).unwrap();
+            if journal_pending {
+                let (journal, _) = initial_receipt_recovery_journal(&plan);
+                let mut document: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+                document["prior"] = serde_json::to_value(&prior_shared).unwrap();
+                fs::write(journal, serde_json::to_vec(&document).unwrap()).unwrap();
+            }
+            fs::remove_file(&request.source_executable).unwrap();
+            Self {
+                _root: root,
+                plan,
+                prior,
+                prior_shared,
+                expected,
+            }
+        }
+
+        fn proof(&self) -> Result<RetainedCandidateValidation> {
+            retained_candidate_validation(&self.plan, Some((&self.prior, &self.prior_shared)))
+        }
+
+        fn make_uncommitted(&self) {
+            fs::write(
+                self.plan
+                    .paths
+                    .data_root
+                    .join("installation-receipt-v1.json"),
+                serde_json::to_vec(&self.prior_shared).unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn make_unstaged(&self, retain_version_directory: bool) -> PathBuf {
+            self.make_uncommitted();
+            let candidate: InstallReceipt = serde_json::from_slice(&self.expected).unwrap();
+            let next = retained_candidate_shared_receipt(
+                &self.plan,
+                &candidate,
+                Some((&self.prior, &self.prior_shared)),
+            )
+            .unwrap();
+            dev_tools_installation::recover_versioned_installation_transition(
+                &shared_installation_layout(&self.plan.paths, InstallMode::UserOnly),
+                Some(&self.prior_shared),
+                &next,
+                BINARY_LIMIT,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let source = self._root.path().join("running-candidate");
+            fs::copy(&candidate.executable, &source).unwrap();
+            fs::remove_file(&candidate.executable).unwrap();
+            if !retain_version_directory {
+                fs::remove_dir(Path::new(&candidate.executable).parent().unwrap()).unwrap();
+            }
+            source
+        }
+
+        fn proof_from_source(&self, source: &Path) -> Result<RetainedCandidateValidation> {
+            retained_candidate_validation_from_source(
+                &self.plan,
+                Some((&self.prior, &self.prior_shared)),
+                Some(source),
+            )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unstaged_upgrade_recovery_publishes_only_the_retained_running_candidate() {
+        for retain_version_directory in [false, true] {
+            let fixture = UpgradeReceiptFixture::new(true);
+            let source = fixture.make_unstaged(retain_version_directory);
+            assert!(fixture.proof().is_err());
+            let proof = fixture.proof_from_source(&source).unwrap();
+            assert!(proof.binary_forward);
+            assert_eq!(proof.binary_source, source);
+            assert!(!fixture
+                .plan
+                .paths
+                .versioned_binary(&fixture.plan.request.version)
+                .exists());
+            let mut changed = false;
+            assert!(proof
+                .finish_binary_transition(|value| changed |= value)
+                .unwrap());
+            assert!(changed);
+            assert_eq!(
+                fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+                fixture.expected
+            );
+            verify_at_read_only(&fixture.plan.paths).unwrap();
+            fs::remove_file(source).unwrap();
+            assert!(!fixture
+                .proof()
+                .unwrap()
+                .finish_binary_transition(|_| panic!("retry mutated"))
+                .unwrap());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unstaged_upgrade_recovery_rejects_changed_source_before_mutation() {
+        let fixture = UpgradeReceiptFixture::new(true);
+        let source = fixture.make_unstaged(false);
+        let proof = fixture.proof_from_source(&source).unwrap();
+        fs::write(&source, b"unapproved replacement candidate").unwrap();
+        assert!(fixture.proof_from_source(&source).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("rejection mutated"))
+            .is_err());
+        assert!(!fixture
+            .plan
+            .paths
+            .versioned_binary(&fixture.plan.request.version)
+            .exists());
+        assert_eq!(
+            read_receipt(&fixture.plan.paths.receipt_path()).unwrap(),
+            fixture.prior
+        );
+        assert_eq!(
+            dev_tools_installation::observe_versioned_installation(
+                &shared_installation_layout(&fixture.plan.paths, InstallMode::UserOnly),
+                BINARY_LIMIT,
+            )
+            .unwrap(),
+            Some(fixture.prior_shared)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unstaged_upgrade_recovery_preserves_late_candidate_collision() {
+        let fixture = UpgradeReceiptFixture::new(true);
+        let source = fixture.make_unstaged(true);
+        let proof = fixture.proof_from_source(&source).unwrap();
+        let candidate = fixture
+            .plan
+            .paths
+            .versioned_binary(&fixture.plan.request.version);
+        fs::write(&candidate, b"independent destination bytes").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(fixture.proof_from_source(&source).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("collision mutated"))
+            .is_err());
+        assert_eq!(
+            fs::read(candidate).unwrap(),
+            b"independent destination bytes"
+        );
+        assert_eq!(
+            read_receipt(&fixture.plan.paths.receipt_path()).unwrap(),
+            fixture.prior
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unstaged_upgrade_recovery_does_not_substitute_source_for_journal_artifact() {
+        let fixture = UpgradeReceiptFixture::new(true);
+        let source = fixture.make_unstaged(false);
+        let proof = fixture.proof_from_source(&source).unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-tools-versioned-transition-v1",
+            "prior": fixture.prior_shared,
+            "next": proof.candidate_shared,
+        }))
+        .unwrap();
+        let journal = fixture
+            .plan
+            .paths
+            .data_root
+            .join("installation-transition-v1.json");
+        fs::write(&journal, &bytes).unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(fixture.proof_from_source(&source).is_err());
+        assert!(proof
+            .finish_binary_transition(|_| panic!("journal rejection mutated"))
+            .is_err());
+        assert_eq!(fs::read(journal).unwrap(), bytes);
+        assert!(!fixture
+            .plan
+            .paths
+            .versioned_binary(&fixture.plan.request.version)
+            .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_receipt_recovery_completes_only_the_committed_retained_candidate() {
+        for journal_pending in [false, true] {
+            let fixture = UpgradeReceiptFixture::new(journal_pending);
+            let proof = fixture.proof().unwrap();
+            assert!(proof.receipt_pending);
+            assert!(!proof.binary_forward);
+            assert_eq!(
+                proof.binary_recovery_action(),
+                "complete_upgrade_binary_receipt"
+            );
+            let mut changed = false;
+            assert!(proof
+                .finish_binary_transition(|value| changed |= value)
+                .unwrap());
+            assert!(changed);
+            assert_eq!(
+                fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+                fixture.expected
+            );
+            verify_at_read_only(&fixture.plan.paths).unwrap();
+            assert!(!fixture
+                .proof()
+                .unwrap()
+                .finish_binary_transition(|_| panic!("retry mutated"))
+                .unwrap());
+            assert!(fixture
+                .plan
+                .paths
+                .versioned_binary(&fixture.prior.version)
+                .is_file());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_receipt_recovery_preserves_observed_journal_and_late_changed_authority() {
+        let fixture = UpgradeReceiptFixture::new(true);
+        let shared_path = fixture
+            .plan
+            .paths
+            .data_root
+            .join("installation-receipt-v1.json");
+        let committed = fs::read(&shared_path).unwrap();
+        fs::write(
+            &shared_path,
+            serde_json::to_vec(&fixture.prior_shared).unwrap(),
+        )
+        .unwrap();
+        let journal = fixture
+            .plan
+            .paths
+            .data_root
+            .join("installation-transition-v1.json");
+        let journal_bytes = fs::read(&journal).unwrap();
+        assert!(fixture.proof().unwrap().binary_forward);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        fs::write(&shared_path, committed).unwrap();
+        let proof = fixture.proof().unwrap();
+        // Even a semantically equal independent rewrite is outside the exact
+        // product document selected for replacement by this proof.
+        let replacement = serde_json::to_vec(&fixture.prior).unwrap();
+        fs::write(fixture.plan.paths.receipt_path(), &replacement).unwrap();
+        assert!(proof
+            .finish_binary_transition(|_| panic!("rejection mutated"))
+            .is_err());
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(
+            fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+            replacement
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_forward_recovery_completes_uncommitted_and_restored_prior_endpoints() {
+        for journal_pending in [true, false] {
+            let fixture = UpgradeReceiptFixture::new(true);
+            fixture.make_uncommitted();
+            let layout = shared_installation_layout(&fixture.plan.paths, InstallMode::UserOnly);
+            if !journal_pending {
+                let candidate: InstallReceipt = serde_json::from_slice(&fixture.expected).unwrap();
+                let next = retained_candidate_shared_receipt(
+                    &fixture.plan,
+                    &candidate,
+                    Some((&fixture.prior, &fixture.prior_shared)),
+                )
+                .unwrap();
+                dev_tools_installation::recover_versioned_installation_transition(
+                    &layout,
+                    Some(&fixture.prior_shared),
+                    &next,
+                    BINARY_LIMIT,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            } else {
+                fs::remove_file(fixture.plan.paths.bin_dir.join("dev-auth")).unwrap();
+            }
+            let proof = fixture.proof().unwrap();
+            assert!(proof.binary_forward);
+            assert_eq!(
+                proof.binary_recovery_action(),
+                "complete_upgrade_binary_installation"
+            );
+            let mut changed = false;
+            assert!(proof
+                .finish_binary_transition(|value| changed |= value)
+                .unwrap());
+            assert!(changed);
+            assert_eq!(
+                fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+                fixture.expected
+            );
+            verify_at_read_only(&fixture.plan.paths).unwrap();
+            assert!(!fixture
+                .proof()
+                .unwrap()
+                .finish_binary_transition(|_| panic!("retry mutated"))
+                .unwrap());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_forward_recovery_preserves_unknown_pointers_and_records_prior_restoration() {
+        let fixture = UpgradeReceiptFixture::new(true);
+        fixture.make_uncommitted();
+        let active_path = fixture.plan.paths.data_root.join("active");
+        let active = fs::read_link(&active_path).unwrap();
+        fs::remove_file(&active_path).unwrap();
+        fs::write(&active_path, b"independent pointer file").unwrap();
+        assert!(fixture.proof().is_err());
+        assert_eq!(fs::read(&active_path).unwrap(), b"independent pointer file");
+        fs::remove_file(&active_path).unwrap();
+        symlink(active, &active_path).unwrap();
+        let proof = fixture.proof().unwrap();
+        let mut changed = false;
+        assert!(proof
+            .finish_binary_transition(|value| {
+                changed |= value;
+                if value {
+                    fs::write(
+                        fixture.plan.paths.receipt_path(),
+                        b"late independent receipt",
+                    )
+                    .unwrap();
+                }
+            })
+            .is_err());
+        assert!(changed);
+        assert_eq!(
+            fs::read_link(&active_path).unwrap(),
+            fixture.plan.paths.versioned_binary(&fixture.prior.version)
+        );
+        assert_eq!(
+            dev_tools_installation::read_versioned_installation_receipt(
+                &shared_installation_layout(&fixture.plan.paths, InstallMode::UserOnly)
+            )
+            .unwrap(),
+            Some(fixture.prior_shared)
+        );
+        assert_eq!(
+            fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+            b"late independent receipt"
+        );
+        assert!(!fixture
+            .plan
+            .paths
+            .data_root
+            .join("installation-transition-v1.json")
+            .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_receipt_recovery_rejects_unsigned_successor_of_authenticated_prior() {
+        let mut fixture = UpgradeReceiptFixture::new(false);
+        fixture.prior.source_commit = Some("a".repeat(40));
+        fixture.prior.root_generation = Some(1);
+        fixture.prior.manifest_generation = Some(1);
+        let prior_bytes = serde_json::to_vec_pretty(&fixture.prior).unwrap();
+        fs::write(fixture.plan.paths.receipt_path(), &prior_bytes).unwrap();
+        assert!(fixture.proof().is_err());
+        assert_eq!(
+            fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+            prior_bytes
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_receipt_recovery_admits_only_the_retained_inactive_prior() {
+        let mut fixture = UpgradeReceiptFixture::new(false);
+        // Retention predates deactivation, but current product authority must
+        // already have surrendered its transparent launcher claim.
+        fixture.prior.transparent_aliases = TRANSPARENT_ALIASES
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(fixture.proof().is_ok());
+        let active = serde_json::to_vec_pretty(&fixture.prior).unwrap();
+        fs::write(fixture.plan.paths.receipt_path(), &active).unwrap();
+        assert!(fixture.proof().is_err());
+        assert_eq!(fs::read(fixture.plan.paths.receipt_path()).unwrap(), active);
+        fixture.plan.request.mode = InstallMode::Strong;
+        assert!(fixture.proof().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_receipt_recovery_retains_known_settlement_after_a_late_independent_receipt() {
+        let fixture = UpgradeReceiptFixture::new(true);
+        let proof = fixture.proof().unwrap();
+        let mut changed = false;
+        assert!(proof
+            .finish_binary_transition(|value| {
+                changed |= value;
+                if value {
+                    fs::write(fixture.plan.paths.receipt_path(), b"independent receipt").unwrap();
+                }
+            })
+            .is_err());
+        assert!(changed);
+        assert!(!fixture
+            .plan
+            .paths
+            .data_root
+            .join("installation-transition-v1.json")
+            .exists());
+        assert_eq!(
+            fs::read(fixture.plan.paths.receipt_path()).unwrap(),
+            b"independent receipt"
+        );
+    }
+
+    #[test]
+    fn installation_rejects_source_replacement_after_outer_plan_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let git = root.path().join("git");
+        let gh = root.path().join("gh");
+        for path in [&source, &git, &gh] {
+            fs::write(path, b"approved").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (length, sha256) = file_identity(&source).unwrap();
+        let authority = dev_tools_installation::ArtifactIdentity { length, sha256 };
+        let paths = SetupPaths::user_only(&root.path().join("home"));
+        let request = InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.4.0".into(),
+            source_executable: source.clone(),
+            native_git: git,
+            native_gh: gh,
+            activate_transparent_launchers: false,
+        };
+        // Simulate replacement after the caller validated its immutable plan.
+        fs::write(&source, b"replaced").unwrap();
+        let error = install_at_with_release(&paths, &request, None, &authority).unwrap_err();
+        assert!(error.to_string().contains("fixed installation authority"));
+        assert!(!paths.data_root.exists());
+        assert!(!paths.bin_dir.exists());
+    }
+
+    #[test]
+    fn executable_identity_preserves_regular_hardlinked_legacy_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::write(&source, b"abc").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(&source, root.path().join("legacy-alias")).unwrap();
+        assert_eq!(
+            file_identity(&source).unwrap(),
+            (3, format!("{:x}", Sha256::digest(b"abc")))
+        );
+    }
+
+    #[test]
+    fn executable_identity_rejects_symlinks_fifo_modes_and_oversize() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::write(&source, b"abc").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("link");
+        symlink(&source, &link).unwrap();
+        assert!(file_identity(&link).is_err());
+        let fifo = root.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert!(file_identity(&fifo).is_err());
+        for mode in [0o644, 0o775, 0o757] {
+            fs::set_permissions(&source, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(file_identity(&source).is_err(), "accepted mode {mode:o}");
+        }
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(BINARY_LIMIT + 1)
+            .unwrap();
+        assert!(file_identity(&source).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux subordinate UID/GID mappings and a native nobody account"]
+    fn root_workload_publication_assigns_link_not_target_to_native_account() {
+        use super::*;
+        if !nix::unistd::Uid::effective().is_root() {
+            let arguments = [
+                std::ffi::OsString::from("--user"),
+                "--map-auto".into(),
+                "--map-root-user".into(),
+                std::env::current_exe().unwrap().into_os_string(),
+                "--exact".into(),
+                "setup::tests::root_workload_publication_assigns_link_not_target_to_native_account"
+                    .into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ];
+            let output =
+                dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
+                    executable: Path::new("/usr/bin/unshare"),
+                    arguments: &arguments,
+                    environment: &BTreeMap::new(),
+                    cwd: None,
+                    timeout: Duration::from_secs(30),
+                    output_limit: 16 * 1024,
+                })
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let executable = root.path().join("root-owned-executable");
+        fs::write(&executable, b"non-executed root executable fixture").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = fs::metadata(&executable).unwrap();
+        let owner = nix::unistd::User::from_name("nobody")
+            .unwrap()
+            .unwrap()
+            .uid
+            .as_raw();
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        rustix::fs::chownat(
+            rustix::fs::CWD,
+            &home,
+            Some(rustix::fs::Uid::from_raw(owner)),
+            None,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        reconcile_workload_launchers_at(&home, &executable, &["worker".into()], owner).unwrap();
+        let path = home.join(".local/bin/worker");
+        let link = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            link.uid(),
+            owner,
+            "published workload link has wrong native owner"
+        );
+        assert_eq!(fs::read_link(&path).unwrap(), executable);
+        let target = fs::metadata(&executable).unwrap();
+        assert_eq!(
+            (target.uid(), target.mode(), target.ino()),
+            (original.uid(), original.mode(), original.ino())
+        );
+        receipt_owned_user_integration_objects(&home, "fixture", owner, InstallMode::UserOnly)
+            .unwrap();
+        reconcile_workload_launchers_at(&home, &executable, &["worker".into()], owner).unwrap();
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), link.ino());
+        rustix::fs::chownat(
+            rustix::fs::CWD,
+            &path,
+            Some(rustix::fs::Uid::ROOT),
+            None,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert!(receipt_owned_user_integration_objects(
+            &home,
+            "fixture",
+            owner,
+            InstallMode::UserOnly
+        )
+        .is_err());
+        let retained =
+            receipt_owned_user_integration_objects(&home, "fixture", owner, InstallMode::Strong)
+                .expect("root strong capture preserves a receipted legacy root link");
+        assert_eq!(retained[0].identity.as_ref().unwrap().owner_uid, 0);
+        assert_eq!(fs::symlink_metadata(&path).unwrap().uid(), 0);
+        assert_eq!(fs::metadata(&executable).unwrap().ino(), original.ino());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_guarded_successor_versions_receive_enrolled_launcher_mode() {
+        assert_eq!(
+            super::privileged_launcher_mode_for_version("0.3.11").unwrap(),
+            0o755
+        );
+        assert_eq!(
+            super::privileged_launcher_mode_for_version("0.3.12").unwrap(),
+            0o755
+        );
+        assert_eq!(
+            super::privileged_launcher_mode_for_version("0.4.0").unwrap(),
+            0o4755
+        );
+        assert!(super::privileged_launcher_mode_for_version("../0.4.0").is_err());
+    }
+    #[test]
+    fn credential_observation_uses_metadata_without_reading_material() {
+        use super::*;
+        use crate::diagnostics::CredentialObservation;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let slot = root.path().join("fixture-slot");
+        let owner = nix::unistd::Uid::effective().as_raw();
+        assert_eq!(
+            observe_credential_file(&slot, owner),
+            CredentialObservation::Missing
+        );
+        fs::write(&slot, b"synthetic encrypted bytes, not a credential").unwrap();
+        fs::set_permissions(&slot, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            observe_credential_file(&slot, owner),
+            CredentialObservation::Present
+        );
+        fs::set_permissions(&slot, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            observe_credential_file(&slot, owner),
+            CredentialObservation::Unsafe
+        );
+        fs::remove_file(&slot).unwrap();
+        symlink(root.path().join("absent-target"), &slot).unwrap();
+        assert_eq!(
+            observe_credential_file(&slot, owner),
+            CredentialObservation::Unsafe
+        );
+        fs::remove_file(&slot).unwrap();
+        nix::unistd::mkfifo(&slot, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert_eq!(
+            observe_credential_file(&slot, owner),
+            CredentialObservation::Unsafe
+        );
+    }
+
+    #[test]
+    fn unavailable_credential_metadata_is_not_reported_as_missing() {
+        use super::*;
+        use crate::diagnostics::CredentialObservation;
+        for error in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                credential_metadata_error(&std::io::Error::from(error)),
+                CredentialObservation::NotObservable
+            );
+        }
+        assert_eq!(
+            credential_metadata_error(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            CredentialObservation::Missing
+        );
+    }
     use super::*;
 
     fn setup_helper_test_receipt(
@@ -6081,6 +8459,81 @@ mod tests {
         let sidecar = root.path().join("setup-helper-v1.json");
         let receipt = setup_helper_test_receipt(&source, "0.3.8", Some(19));
         (root, source, helper, sidecar, receipt)
+    }
+
+    #[test]
+    fn retained_candidate_history_preserves_exact_prior_bytes_and_provenance() {
+        let (root, source, _, _, mut prior) = setup_helper_fixture();
+        let paths = SetupPaths::user_only(&root.path().join("home"));
+        prior.mode = InstallMode::UserOnly;
+        prior.executable = paths.versioned_binary(&prior.version).display().to_string();
+        prior.bin_dir = paths.bin_dir.display().to_string();
+        prior.privileged_launcher = None;
+        prior.system_assets.clear();
+        prior.source_commit = None;
+        prior.root_generation = None;
+        prior.manifest_generation = None;
+        let mut plan = SetupPlan {
+            schema: "dev-auth-setup-plan-v2".into(),
+            paths,
+            request: InstallRequest {
+                mode: InstallMode::UserOnly,
+                version: prior.version.clone(),
+                source_executable: source,
+                native_git: PathBuf::from(&prior.native_git),
+                native_gh: PathBuf::from(&prior.native_gh),
+                activate_transparent_launchers: false,
+            },
+            source_length: prior.executable_length,
+            source_sha256: prior.executable_sha256.clone(),
+            verified_release: None,
+        };
+        let prior_shared = retained_candidate_shared_receipt(&plan, &prior, None).unwrap();
+        assert_eq!(
+            retained_candidate_shared_receipt(&plan, &prior, Some((&prior, &prior_shared)))
+                .unwrap(),
+            prior_shared
+        );
+        let mut changed = prior.clone();
+        changed.executable_sha256 = "d".repeat(64);
+        assert!(
+            retained_candidate_shared_receipt(&plan, &changed, Some((&prior, &prior_shared)))
+                .is_err()
+        );
+        let mut invented = prior.clone();
+        invented.source_commit = Some("e".repeat(40));
+        assert!(retained_candidate_shared_receipt(&plan, &invented, None).is_err());
+        let mut inconsistent = prior_shared.clone();
+        inconsistent.previous_version = Some("0.3.0".into());
+        inconsistent.previous_identity = Some(prior_shared.active_identity.clone());
+        assert!(
+            retained_candidate_shared_receipt(&plan, &prior, Some((&prior, &inconsistent)))
+                .is_err()
+        );
+
+        plan.request.version = "0.4.0".into();
+        plan.source_sha256 = changed.executable_sha256.clone();
+        changed.version = plan.request.version.clone();
+        changed.executable = plan
+            .paths
+            .versioned_binary(&changed.version)
+            .display()
+            .to_string();
+        changed.previous_release = Some(retained_release(&prior));
+        let next =
+            retained_candidate_shared_receipt(&plan, &changed, Some((&prior, &prior_shared)))
+                .unwrap();
+        assert_eq!(next.active_version, "0.4.0");
+        assert_eq!(next.previous_version, Some(prior.version.clone()));
+        assert_eq!(
+            next.previous_identity,
+            Some(prior_shared.active_identity.clone())
+        );
+        changed.previous_release.as_mut().unwrap().source_commit = Some("f".repeat(40));
+        assert!(
+            retained_candidate_shared_receipt(&plan, &changed, Some((&prior, &prior_shared)))
+                .is_err()
+        );
     }
 
     struct SetupHelperTransitionFixture {

@@ -4,6 +4,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use zeroize::Zeroizing;
 
+pub const SETUP_TEMPLATE_NAMES: [&str; 7] = [
+    "deployment",
+    "administrator-policy",
+    "user-only-policy",
+    "user-config",
+    "administrator-policy-v3",
+    "user-only-policy-v3",
+    "user-config-v3",
+];
+
 #[cfg(target_os = "linux")]
 pub mod broker_agent;
 #[cfg(target_os = "linux")]
@@ -24,18 +34,24 @@ pub mod diagnostics;
 pub mod linux_admission;
 #[cfg(target_os = "linux")]
 pub mod linux_platform;
+pub mod logical_authority;
 #[cfg(unix)]
 pub mod policy_store;
 pub mod policy_v2;
+pub mod policy_v3;
+pub mod policy_v3_operations;
 pub(crate) mod provider_operation;
 #[cfg(unix)]
 pub mod reconcile;
 pub mod release_manifest;
 mod runtime;
+pub mod runtime_policy;
 #[cfg(unix)]
 pub mod setup;
 #[cfg(unix)]
 pub mod setup_authorization;
+#[cfg(unix)]
+mod setup_transition;
 #[cfg(unix)]
 pub mod setup_v3;
 pub mod smart_binding;
@@ -49,7 +65,9 @@ pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,
     github_token_for_repository, purge_runtime, run_agent, run_gh, run_gh_git_child, run_git,
     run_native_gh, run_native_git, run_ssh_keygen, runtime_status, ssh_load, ssh_public,
-    validate_configuration, workspace_status, RuntimeStatus, ValidationReport, WorkspaceContext,
+    validate_components, validate_configuration, workspace_status, ComponentValidationReport,
+    RuntimeStatus, ValidationCheck, ValidationComponent, ValidationReport, ValidationRequest,
+    ValidationStatus, WorkspaceContext,
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{

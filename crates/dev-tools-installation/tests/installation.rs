@@ -216,6 +216,115 @@ fn bounded_artifact_copy_never_transfers_growth_beyond_approved_length() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn exact_recovery_binds_both_receipts_and_transition_direction() {
+    use dev_tools_installation::{
+        observe_versioned_installation_transition, recover_versioned_installation_transition,
+    };
+    for committed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let first = versioned_fixture(temp.path(), "1.0.0", b"first");
+        let prior = apply_versioned_installation(&first, |_| Ok(()))
+            .unwrap()
+            .receipt;
+        let second = versioned_fixture(temp.path(), "2.0.0", b"second");
+        let next = apply_versioned_installation(&second, |_| Ok(()))
+            .unwrap()
+            .receipt;
+        let receipt_path = first.layout.data_root.join("installation-receipt-v1.json");
+        if !committed {
+            fs::write(&receipt_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+        }
+        let journal = first
+            .layout
+            .data_root
+            .join("installation-transition-v1.json");
+        let pending = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-tools-versioned-transition-v1", "prior": prior, "next": next,
+        }))
+        .unwrap();
+        fs::write(&journal, &pending).unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&receipt_path).unwrap();
+        let active = first.layout.data_root.join("active");
+        let before_active = fs::read_link(&active).unwrap();
+        let observed = observe_versioned_installation_transition(
+            &first.layout,
+            Some(&prior),
+            &next,
+            1024,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(observed.journal_pending);
+        assert_eq!(
+            observed.receipt.as_ref(),
+            Some(if committed { &next } else { &prior })
+        );
+        assert_eq!(fs::read(&journal).unwrap(), pending);
+        assert_eq!(fs::read(&receipt_path).unwrap(), before);
+        assert_eq!(fs::read_link(&active).unwrap(), before_active);
+        for (expected_prior, expected_next) in [(None, &next), (Some(&next), &prior)] {
+            let mut invoked = false;
+            assert!(recover_versioned_installation_transition(
+                &first.layout,
+                expected_prior,
+                expected_next,
+                1024,
+                |_| {
+                    invoked = true;
+                    Ok(())
+                },
+            )
+            .is_err());
+            assert!(
+                !invoked,
+                "mismatched journal must reject before verifier or mutation"
+            );
+            assert_eq!(fs::read(&journal).unwrap(), pending);
+            assert_eq!(fs::read(&receipt_path).unwrap(), before);
+            assert_eq!(fs::read_link(&active).unwrap(), before_active);
+        }
+        let expected = if committed { &next } else { &prior };
+        let (changed, installed) = recover_versioned_installation_transition(
+            &first.layout,
+            Some(&prior),
+            &next,
+            1024,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(installed.as_ref(), Some(expected));
+        assert!(!journal.exists());
+        let (changed, installed) = recover_versioned_installation_transition(
+            &first.layout,
+            Some(&prior),
+            &next,
+            1024,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(installed.as_ref(), Some(expected));
+        let lock = first.layout.data_root.join("installation.lock");
+        fs::remove_file(&lock).unwrap();
+        assert!(observe_versioned_installation_transition(
+            &first.layout,
+            Some(&prior),
+            &next,
+            1024,
+            |_| Ok(()),
+        )
+        .is_err());
+        assert!(
+            !lock.exists(),
+            "read-only transition admission must not recreate the lock"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn authenticated_recovery_preserves_rejected_transition_and_restores_prior() {
     use dev_tools_installation::recover_versioned_installation_with_verification;
     let temp = tempfile::tempdir().unwrap();

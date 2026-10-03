@@ -1,0 +1,43 @@
+# Fictional public example. Replace native account and pinned program paths.
+# Automatic admission is a separate administrator choice; this example requires approval.
+schema = "dev-auth-administrator-policy-v3"
+mode = "strong"
+allowed_users = ["automation"]
+
+[programs]
+git = "/usr/bin/git"
+gh = "/usr/bin/gh"
+ssh = "/usr/bin/ssh"
+ssh_keygen = "/usr/bin/ssh-keygen"
+
+[trusted_launchers]
+worker = "/usr/local/libexec/automation-worker"
+
+[credentials.providers.primary]
+kind = "one_password"
+executable = "/usr/bin/op"
+
+[credentials.credential_slots.automation]
+provider = "primary"
+users = ["automation"]
+
+[credentials.resources.service-token]
+credential_slot = "automation"
+reference = "op://Example/Service/token"
+kind = "exportable"
+purposes = ["read"]
+projections = ["stdin"]
+
+[credentials.resource_caps.worker]
+users = ["automation"]
+
+[credentials.resource_caps.worker.resources.service-token]
+purposes = ["read"]
+projections = ["stdin"]
+
+[workload_caps.worker]
+users = ["automation"]
+resource_cap = "worker"
+launchers = ["worker"]
+admission = ["approval_required"]
+max_duration_seconds = 86400

@@ -149,6 +149,40 @@ fn rollback_removes_same_name_routing_but_preserves_the_reversible_installation(
 }
 
 #[test]
+fn binary_only_rollback_cannot_bypass_a_full_setup_generation() {
+    for phase in ["pending", "accepted"] {
+        let (_root, paths, mut request) = fixture();
+        request.activate_transparent_launchers = true;
+        install_at(&paths, &request).unwrap();
+        let transition = paths.data_root.join("setup-transition-v1.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": "dev-auth-setup-transition-v1",
+            "plan_sha256": "a".repeat(64),
+            "phase": phase,
+            "retained_generation": {"length": 1, "sha256": "b".repeat(64)}
+        }))
+        .unwrap();
+        fs::write(&transition, &bytes).unwrap();
+        fs::set_permissions(&transition, fs::Permissions::from_mode(0o600)).unwrap();
+        let receipt_path = paths.data_root.join("install-v2.json");
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let alias_before = fs::read_link(paths.bin_dir.join("git")).unwrap();
+
+        let result = rollback_at(&paths);
+        assert!(
+            result.is_err(),
+            "binary rollback bypassed {phase} full setup"
+        );
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert_eq!(
+            fs::read_link(paths.bin_dir.join("git")).unwrap(),
+            alias_before
+        );
+        assert_eq!(fs::read(&transition).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn rollback_switches_to_the_retained_release_and_is_resume_safe() {
     let (root, paths, mut request) = fixture();
     request.version = "0.3.0-old".into();
@@ -345,6 +379,24 @@ fn repair_reconstructs_only_receipt_owned_aliases() {
     executable(&alias, "unowned");
     assert!(repair_at(&paths).is_err());
     assert_eq!(fs::read(&alias).unwrap(), b"unowned");
+}
+
+#[test]
+fn repair_keeps_receipted_artifact_authority_when_bytes_have_changed() {
+    let (_root, paths, request) = fixture();
+    let installed = install_at(&paths, &request).unwrap();
+    let receipt_path = paths.data_root.join("install-v2.json");
+    let receipt = fs::read(&receipt_path).unwrap();
+    let alias = paths.bin_dir.join("dev-auth");
+    fs::remove_file(&alias).unwrap();
+    fs::write(&installed.executable, b"changed candidate").unwrap();
+    assert!(repair_at(&paths).is_err());
+    assert!(fs::symlink_metadata(&alias).is_err());
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
+    assert_eq!(
+        fs::read(&installed.executable).unwrap(),
+        b"changed candidate"
+    );
 }
 
 #[test]
@@ -711,4 +763,16 @@ fn strong_install_never_activates_same_name_launchers_before_readiness() {
     request.mode = dev_auth::setup::InstallMode::Strong;
     request.activate_transparent_launchers = true;
     assert!(dev_auth::setup::build_plan(&paths, &request).is_err());
+}
+#[test]
+fn removing_an_absent_workload_integration_is_a_true_no_op() {
+    let home = tempfile::tempdir().unwrap();
+    dev_auth::setup::reconcile_workload_launchers_at(
+        home.path(),
+        &std::env::current_exe().unwrap(),
+        &[],
+        nix::unistd::Uid::effective().as_raw(),
+    )
+    .unwrap();
+    assert!(!home.path().join(".local").exists());
 }

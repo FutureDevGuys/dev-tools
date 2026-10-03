@@ -1,4 +1,5 @@
-use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2, resolve_policy_for_user};
+use crate::policy_v2::{parse_system_policy_v2, parse_user_config_v2};
+use crate::runtime_policy::{parse_runtime_administrator, RuntimeAdministrator};
 use anyhow::{bail, Context, Result};
 use std::fs::{self, Metadata, OpenOptions};
 use std::io::Read;
@@ -9,6 +10,66 @@ const POLICY_LIMIT: u64 = 1024 * 1024;
 pub const SYSTEM_POLICY_PATH: &str = "/etc/dev-auth/policy.toml";
 pub const USER_POLICY_RELATIVE_PATH: &str = ".config/dev-auth/policy-v2.toml";
 pub const USER_CONFIG_RELATIVE_PATH: &str = ".config/dev-auth/config-v2.toml";
+pub const USER_POLICY_V3_RELATIVE_PATH: &str = ".config/dev-auth/policy-v3.toml";
+pub const USER_CONFIG_V3_RELATIVE_PATH: &str = ".config/dev-auth/config-v3.toml";
+
+pub fn load_runtime_system_policy_at(path: &Path) -> Result<RuntimeAdministrator> {
+    parse_runtime_administrator(&read_policy_file(path, 0, 0o022, "administrator policy")?)
+}
+
+pub fn load_runtime_user_policy_at(path: &Path, owner_uid: u32) -> Result<RuntimeAdministrator> {
+    parse_runtime_administrator(&read_policy_file(
+        path,
+        owner_uid,
+        0o077,
+        "user-only administrator policy",
+    )?)
+}
+
+pub fn runtime_user_policy_path(user: &nix::unistd::User) -> Result<PathBuf> {
+    let v3 = user.dir.join(USER_POLICY_V3_RELATIVE_PATH);
+    match fs::symlink_metadata(&v3) {
+        Ok(_) => Ok(v3),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(user_policy_path(user)),
+        Err(_) => bail!("user-only authority path is unavailable"),
+    }
+}
+
+pub fn resolve_runtime_config_at(
+    policy: &RuntimeAdministrator,
+    native_user: &str,
+    path: &Path,
+    owner_uid: u32,
+) -> Result<crate::policy_v2::ResolvedPolicy> {
+    policy.resolve_user(
+        native_user,
+        &read_policy_file(path, owner_uid, 0o077, "user configuration")?,
+    )
+}
+
+pub(crate) fn read_runtime_user_config_at(path: &Path, owner_uid: u32) -> Result<Vec<u8>> {
+    read_policy_file(path, owner_uid, 0o077, "user configuration")
+}
+
+pub(crate) fn runtime_user_config_path(
+    policy: &RuntimeAdministrator,
+    user: &nix::unistd::User,
+) -> PathBuf {
+    match policy {
+        RuntimeAdministrator::Legacy(_) => user_config_path(user),
+        RuntimeAdministrator::Logical(_) => user.dir.join(USER_CONFIG_V3_RELATIVE_PATH),
+    }
+}
+
+pub(crate) fn user_policy_destination(
+    policy: &RuntimeAdministrator,
+    user: &nix::unistd::User,
+) -> PathBuf {
+    match policy {
+        RuntimeAdministrator::Legacy(_) => user_policy_path(user),
+        RuntimeAdministrator::Logical(_) => user.dir.join(USER_POLICY_V3_RELATIVE_PATH),
+    }
+}
 
 pub fn load_system_policy() -> Result<crate::policy_v2::SystemPolicyV2> {
     load_system_policy_at(Path::new(SYSTEM_POLICY_PATH))
@@ -52,34 +113,28 @@ pub fn load_user_only_resolved_policy_for_uid(
 ) -> Result<crate::policy_v2::ResolvedPolicy> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
         .context("workload owner account does not exist")?;
-    let system = load_user_policy_at(&user_policy_path(&user), owner_uid)?;
-    if system.mode != crate::policy_v2::SystemMode::UserOnly {
+    let system = load_runtime_user_policy_at(&runtime_user_policy_path(&user)?, owner_uid)?;
+    if system.mode() != crate::policy_v2::SystemMode::UserOnly {
         bail!("user-only administrator policy has the wrong mode");
     }
-    if !system
-        .allowed_users
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
-    {
-        bail!("workload owner is outside user-only policy");
-    }
-    let config = load_user_config_at(&user_config_path(&user), owner_uid)?;
-    resolve_policy_for_user(&system, &user.name, &config)
+    resolve_runtime_config_at(
+        &system,
+        &user.name,
+        &runtime_user_config_path(&system, &user),
+        owner_uid,
+    )
 }
 
 pub fn load_resolved_policy_for_uid(owner_uid: u32) -> Result<crate::policy_v2::ResolvedPolicy> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
         .context("workload owner account does not exist")?;
-    let system = load_system_policy()?;
-    if !system
-        .allowed_users
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(&user.name))
-    {
-        bail!("workload owner is outside administrator policy");
-    }
-    let config = load_user_config_at(&user_config_path(&user), owner_uid)?;
-    resolve_policy_for_user(&system, &user.name, &config)
+    let system = load_runtime_system_policy_at(Path::new(SYSTEM_POLICY_PATH))?;
+    resolve_runtime_config_at(
+        &system,
+        &user.name,
+        &runtime_user_config_path(&system, &user),
+        owner_uid,
+    )
 }
 
 fn read_policy_file(

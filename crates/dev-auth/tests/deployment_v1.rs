@@ -246,6 +246,15 @@ intent = "preserve"
 
 #[test]
 fn equivalent_intents_produce_identical_setup_v3_actions_and_digest() {
+    equivalent_policy_intents(false);
+}
+
+#[test]
+fn logical_policy_setup_plans_bind_v3_paths_and_revalidate_the_same_authority() {
+    equivalent_policy_intents(true);
+}
+
+fn equivalent_policy_intents(logical: bool) {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .unwrap()
         .unwrap();
@@ -290,6 +299,42 @@ ssh_keygen = "{}"
     )
     .unwrap();
     fs::write(&config, "version = 2\n").unwrap();
+    if logical {
+        fs::write(
+            &policy,
+            format!(
+                r#"schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["{}"]
+[programs]
+git = "{}"
+gh = "{}"
+ssh = "{}"
+ssh_keygen = "{}"
+[trusted_launchers]
+[credentials.providers.primary]
+kind = "one_password"
+executable = "{}"
+[credentials.credential_slots]
+[credentials.resources]
+[credentials.resource_caps]
+[workload_caps]
+"#,
+                user.name,
+                git.display(),
+                gh.display(),
+                ssh.display(),
+                ssh_keygen.display(),
+                op.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            "schema = 'dev-auth-user-config-v3'\nworkloads = []\n[authority_profiles]\n",
+        )
+        .unwrap();
+    }
     for path in [&policy, &config] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
@@ -302,7 +347,7 @@ ssh_keygen = "{}"
         &paths,
         &InstallRequest {
             mode: InstallMode::UserOnly,
-            version: "0.3.0-test".into(),
+            version: if logical { "0.4.0" } else { "0.3.0-test" }.into(),
             source_executable: candidate,
             native_git: git,
             native_gh: gh,
@@ -347,6 +392,15 @@ config = "{}"
 
     let document_plan =
         build_setup_plan_v3_at(intent_from_document, installation.clone(), false).unwrap();
+    if logical {
+        let mut legacy_request = installation.request.clone();
+        legacy_request.version = "0.3.11".into();
+        let legacy_installation = build_plan(&installation.paths, &legacy_request).unwrap();
+        assert!(
+            build_setup_plan_v3_at(intent_from_cli.clone(), legacy_installation, false).is_err(),
+            "logical authority must not target a legacy runtime"
+        );
+    }
     let cli_plan = build_setup_plan_v3_at(intent_from_cli, installation, false).unwrap();
     assert_eq!(document_plan, cli_plan);
     assert_eq!(
@@ -354,6 +408,19 @@ config = "{}"
         render_setup_plan_v3(&cli_plan).unwrap()
     );
     assert_eq!(document_plan.schema, "dev-auth-setup-plan-v3");
+    assert_eq!(
+        document_plan.authority_schema.as_deref(),
+        logical.then_some("dev-auth-administrator-policy-v3")
+    );
+    let expected_config = user.dir.join(if logical {
+        ".config/dev-auth/config-v3.toml"
+    } else {
+        ".config/dev-auth/config-v2.toml"
+    });
+    assert!(document_plan
+        .current_paths
+        .iter()
+        .any(|path| path.kind == "user_configuration" && path.path == expected_config));
     assert!(
         !document_plan
             .installation

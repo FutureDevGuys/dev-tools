@@ -65,4 +65,4 @@ When the canonical intercept directory is missing from the current PATH, doctor 
 
 ## Workspace discovery
 
-Workspace grouping uses local filesystem markers and never launches Git or its credential wrappers. The nearest `.git` file/directory takes precedence over nested language manifests; without one, the nearest supported language manifest or requested directory supplies the scope. Markers are cache grouping hints only. Git environment and configuration overrides do not change this scope. See [ADR 0028](adr/0028-local-cache-workspace-discovery.md).
+Workspace grouping uses local filesystem markers and never launches Git or its credential wrappers. The nearest `.git` file/directory takes precedence over nested language manifests; without one, the nearest supported language manifest or requested directory supplies the scope. Markers are cache grouping hints only. Git environment and configuration overrides do not change this scope. See [ADR 0028](adr/0086-local-cache-workspace-discovery.md).

@@ -2,13 +2,14 @@ use crate::broker_protocol::SshOperationPurpose;
 use crate::linux_admission::{
     SessionGitHubGrant, SessionOperationKeyGrant, SessionReleaseSigningGrant,
 };
-use crate::policy_v2::{SystemMode, SystemPolicyV2};
+use crate::policy_v2::SystemMode;
 use crate::provider_operation::ProviderOperation;
 use crate::runtime::{
     broker_github_token_for_repositories, broker_github_token_for_repository,
     broker_revoke_github_token_with_timeout, broker_sign_release_manifest_bytes, broker_sign_ssh,
     BrokerGitHubAuthority, BrokerGitHubToken, GITHUB_API_TIMEOUT,
 };
+use crate::runtime_policy::RuntimeAdministrator;
 use crate::SecretString;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,111 @@ const CREDENTIAL_LIMIT: u64 = 64 * 1024;
 const TOKEN_REFRESH_MARGIN_SECONDS: i64 = 300;
 const SERVICE_CREDENTIAL_PREFIX: &str = "op-service-account-token_";
 pub(crate) const SESSION_CLEANUP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn logical_binding_matches(
+    policy: &crate::policy_v3::SystemPolicyV3,
+    name: &str,
+    slot: &str,
+    reference: &str,
+) -> bool {
+    policy
+        .credentials
+        .resources
+        .get(name)
+        .is_some_and(|resource| {
+            resource.credential_slot == slot
+                && resource.reference == reference
+                && resource.kind == crate::logical_authority::ResourceKind::OperationOnly
+        })
+}
+
+fn validate_logical_github_grant(
+    policy: &crate::policy_v3::SystemPolicyV3,
+    grant: &SessionGitHubGrant,
+) -> Result<()> {
+    let canonical = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+    };
+    let owners = canonical(&grant.owners);
+    let repositories = canonical(&grant.repositories);
+    let permitted = policy.workload_caps.values().any(|cap| {
+        cap.operations.github.iter().any(|(name, allowed)| {
+            logical_binding_matches(policy, name, &grant.credential_slot, &grant.private_key_ref)
+                && allowed.app_id == grant.app_id
+                && allowed.repository_selection == grant.repository_selection
+                && !owners.is_empty()
+                && owners.is_subset(&canonical(&allowed.owners))
+                && (allowed.repositories.is_empty()
+                    || (!repositories.is_empty()
+                        && repositories.is_subset(&canonical(&allowed.repositories))))
+                && !grant.permissions.is_empty()
+                && grant.permissions.iter().all(|(name, requested)| {
+                    allowed
+                        .permissions
+                        .get(name)
+                        .is_some_and(|allowed| requested <= allowed)
+                })
+                && (allowed.installation_ids.is_empty()
+                    || (!grant.installation_ids.is_empty()
+                        && grant
+                            .installation_ids
+                            .iter()
+                            .all(|id| allowed.installation_ids.contains(id))))
+        })
+    });
+    if !permitted {
+        bail!("session GitHub authority is outside logical administrator policy");
+    }
+    Ok(())
+}
+
+fn validate_logical_ssh_grant(
+    policy: &crate::policy_v3::SystemPolicyV3,
+    purpose: SshOperationPurpose,
+    grant: &SessionOperationKeyGrant,
+) -> Result<()> {
+    let permitted = policy.workload_caps.values().any(|cap| {
+        let keys = match purpose {
+            SshOperationPurpose::GitSigning => &cap.operations.signing,
+            SshOperationPurpose::Authentication => &cap.operations.ssh,
+        };
+        keys.iter().any(|(name, key)| {
+            logical_binding_matches(policy, name, &grant.credential_slot, &grant.private_key_ref)
+                && key.public_key == grant.public_key
+                && key.fingerprint == grant.fingerprint
+        })
+    });
+    if !permitted {
+        bail!("session SSH authority is outside logical administrator policy");
+    }
+    Ok(())
+}
+
+fn validate_logical_release_grant(
+    policy: &crate::policy_v3::SystemPolicyV3,
+    grant: &SessionReleaseSigningGrant,
+    product: &str,
+) -> Result<()> {
+    let permitted = policy.workload_caps.values().any(|cap| {
+        cap.operations.release_signing.iter().any(|(name, key)| {
+            logical_binding_matches(policy, name, &grant.credential_slot, &grant.private_key_ref)
+                && key.public_key == grant.public_key
+                && !grant.products.is_empty()
+                && grant
+                    .products
+                    .iter()
+                    .all(|product| key.products.contains(product))
+                && grant.products.iter().any(|allowed| allowed == product)
+        })
+    });
+    if !permitted {
+        bail!("session release authority is outside logical administrator policy");
+    }
+    Ok(())
+}
 
 fn repository_cache_key(
     session_id: &str,
@@ -45,7 +151,87 @@ fn repository_cache_key(
     Ok(format!("{:x}", Sha256::digest(public_scope)))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderValidationCounts {
+    pub authentication_checked: u32,
+    pub authentication_total: u32,
+    pub resources_checked: u32,
+    pub resources_total: u32,
+    pub keys_checked: u32,
+    pub keys_failed: u32,
+    pub keys_total: u32,
+}
+
+enum ExpectedOperationKey<'a> {
+    GitHub,
+    Ssh(&'a crate::policy_v3_operations::SshKeyCap),
+    Release(&'a crate::policy_v3_operations::ReleaseKeyCap),
+}
+
+fn expected_operation_keys<'a>(
+    authority: &'a crate::policy_v3_operations::OperationAuthority,
+    name: &str,
+    grant: &crate::logical_authority::ResolvedResource,
+) -> Vec<ExpectedOperationKey<'a>> {
+    use crate::logical_authority::ResourcePurpose;
+    let mut keys = Vec::new();
+    if grant.allows(ResourcePurpose::GitHubToken) && authority.github.contains_key(name) {
+        keys.push(ExpectedOperationKey::GitHub);
+    }
+    for (purpose, declarations) in [
+        (ResourcePurpose::GitSigning, &authority.signing),
+        (ResourcePurpose::SshAuthentication, &authority.ssh),
+    ] {
+        if grant.allows(purpose) {
+            if let Some(key) = declarations.get(name) {
+                keys.push(ExpectedOperationKey::Ssh(key));
+            }
+        }
+    }
+    if grant.allows(ResourcePurpose::ReleaseSigning) {
+        if let Some(key) = authority.release_signing.get(name) {
+            keys.push(ExpectedOperationKey::Release(key));
+        }
+    }
+    keys
+}
+
+impl ExpectedOperationKey<'_> {
+    fn validate(&self, material: &dev_tools_secret::SecretMaterial) -> Result<()> {
+        match self {
+            Self::GitHub => crate::runtime::validate_rsa_key_material(material),
+            Self::Ssh(key) => crate::runtime::validate_ssh_key_material(
+                material,
+                &key.public_key,
+                &key.fingerprint,
+            ),
+            Self::Release(key) => {
+                crate::runtime::validate_release_key_material(material, &key.public_key)
+            }
+        }
+    }
+}
+
 pub(crate) trait CapabilityBackend: Send + Sync {
+    fn validate_providers(
+        &self,
+        _operation: &ProviderOperation<'_>,
+        _session: &crate::linux_admission::VerifiedLinuxSession,
+    ) -> Result<ProviderValidationCounts> {
+        bail!("provider validation is unavailable")
+    }
+
+    fn secret_material(
+        &self,
+        _operation: &ProviderOperation<'_>,
+        _session: &crate::linux_admission::VerifiedLinuxSession,
+        _resource: &str,
+        _purpose: crate::logical_authority::ResourcePurpose,
+        _projection: Option<crate::logical_authority::Projection>,
+    ) -> Result<crate::broker_protocol::SensitiveBytes> {
+        bail!("logical resource delivery is unavailable")
+    }
+
     fn github_token(
         &self,
         operation: &ProviderOperation<'_>,
@@ -205,7 +391,7 @@ impl TokenCache {
 }
 
 pub(crate) struct SystemCapabilityBackend {
-    policy: SystemPolicyV2,
+    policy: RuntimeAdministrator,
     service_tokens: BTreeMap<String, SecretString>,
     cache: Mutex<TokenCache>,
 }
@@ -218,14 +404,19 @@ impl SystemCapabilityBackend {
         )
     }
 
-    pub(crate) fn load_user(policy_path: &Path, owner_uid: u32) -> Result<Self> {
-        let policy = crate::policy_store::load_user_policy_at(policy_path, owner_uid)?;
-        if policy.mode != SystemMode::UserOnly {
+    pub(crate) fn load_user(
+        policy_path: &Path,
+        owner_uid: u32,
+        interaction: crate::runtime::CredentialInteraction,
+    ) -> Result<Self> {
+        let policy = crate::policy_store::load_runtime_user_policy_at(policy_path, owner_uid)?;
+        if policy.mode() != SystemMode::UserOnly {
             bail!("user broker requires a user-only administrator policy");
         }
         Ok(Self {
             service_tokens: crate::runtime::user_broker_service_tokens(
-                policy.credential_slots.keys().map(String::as_str),
+                policy.credential_slot_names().into_iter(),
+                interaction,
             )?,
             policy,
             cache: Mutex::new(TokenCache::default()),
@@ -233,8 +424,8 @@ impl SystemCapabilityBackend {
     }
 
     fn load_at(policy_path: &Path, credential_directory: &Path) -> Result<Self> {
-        let policy = crate::policy_store::load_system_policy_at(policy_path)?;
-        if policy.mode != SystemMode::Strong {
+        let policy = crate::policy_store::load_runtime_system_policy_at(policy_path)?;
+        if policy.mode() != SystemMode::Strong {
             bail!("system broker requires a strong-mode administrator policy");
         }
         let service_tokens = read_service_credentials(credential_directory, &policy)?;
@@ -252,13 +443,18 @@ impl SystemCapabilityBackend {
     }
 
     fn validate_grant(&self, grant: &SessionGitHubGrant) -> Result<&SecretString> {
-        let slot = self
-            .policy
+        let policy = match &self.policy {
+            RuntimeAdministrator::Legacy(policy) => policy,
+            RuntimeAdministrator::Logical(policy) => {
+                validate_logical_github_grant(policy, grant)?;
+                return self.service_token(&grant.credential_slot);
+            }
+        };
+        let slot = policy
             .credential_slots
             .get(&grant.credential_slot)
             .context("session credential slot is outside administrator policy")?;
-        let (app_name, app) = self
-            .policy
+        let (app_name, app) = policy
             .github_apps
             .iter()
             .find(|(_, app)| app.app_id == grant.app_id)
@@ -279,7 +475,7 @@ impl SystemCapabilityBackend {
             .iter()
             .map(|repository| repository.to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
-        let allowed = self.policy.authority_caps.iter().any(|(cap_name, cap)| {
+        let allowed = policy.authority_caps.iter().any(|(cap_name, cap)| {
             if !slot.authority_caps.contains(cap_name) {
                 return false;
             }
@@ -338,12 +534,18 @@ impl SystemCapabilityBackend {
         purpose: SshOperationPurpose,
         grant: &SessionOperationKeyGrant,
     ) -> Result<&SecretString> {
-        let slot = self
-            .policy
+        let policy = match &self.policy {
+            RuntimeAdministrator::Legacy(policy) => policy,
+            RuntimeAdministrator::Logical(policy) => {
+                validate_logical_ssh_grant(policy, purpose, grant)?;
+                return self.service_token(&grant.credential_slot);
+            }
+        };
+        let slot = policy
             .credential_slots
             .get(&grant.credential_slot)
             .context("session credential slot is outside administrator policy")?;
-        let allowed = self.policy.authority_caps.iter().any(|(cap_name, cap)| {
+        let allowed = policy.authority_caps.iter().any(|(cap_name, cap)| {
             if !slot.authority_caps.contains(cap_name) {
                 return false;
             }
@@ -366,12 +568,18 @@ impl SystemCapabilityBackend {
         grant: &SessionReleaseSigningGrant,
         product: &str,
     ) -> Result<&SecretString> {
-        let slot = self
-            .policy
+        let policy = match &self.policy {
+            RuntimeAdministrator::Legacy(policy) => policy,
+            RuntimeAdministrator::Logical(policy) => {
+                validate_logical_release_grant(policy, grant, product)?;
+                return self.service_token(&grant.credential_slot);
+            }
+        };
+        let slot = policy
             .credential_slots
             .get(&grant.credential_slot)
             .context("session credential slot is outside administrator policy")?;
-        let allowed = self.policy.authority_caps.iter().any(|(cap_name, cap)| {
+        let allowed = policy.authority_caps.iter().any(|(cap_name, cap)| {
             slot.authority_caps.contains(cap_name)
                 && cap
                     .release_signing_products
@@ -585,7 +793,234 @@ impl SystemCapabilityBackend {
     }
 }
 
+impl SystemCapabilityBackend {
+    fn validate_providers_with<H, F>(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session: &crate::linux_admission::VerifiedLinuxSession,
+        mut authenticate: H,
+        mut retrieve: F,
+    ) -> Result<ProviderValidationCounts>
+    where
+        H: FnMut(&crate::logical_authority::ResolvedResource) -> Result<()>,
+        F: FnMut(
+            &crate::logical_authority::ResolvedResource,
+        ) -> Result<dev_tools_secret::SecretMaterial>,
+    {
+        operation.checkpoint()?;
+        if session.authority.hard_deadline_expired()? {
+            bail!("workload authority expired");
+        }
+        let RuntimeAdministrator::Logical(policy) = &self.policy else {
+            bail!("logical resource authority is unavailable");
+        };
+        let selection = session
+            .authority
+            .logical
+            .as_ref()
+            .context("logical session authority is absent")?;
+        let cap = policy
+            .workload_caps
+            .get(&selection.cap)
+            .context("workload cap is absent")?;
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(session.owner_uid))?
+            .context("native workload account is absent")?;
+        if !cap.users.contains(&user.name) {
+            bail!("workload account is outside authority");
+        }
+        let grants =
+            policy
+                .credentials
+                .resolve(&user.name, &cap.resource_cap, &selection.resources)?;
+        let mut counts = ProviderValidationCounts {
+            resources_total: u32::try_from(grants.len()).context("resource count exceeds limit")?,
+            authentication_total: u32::try_from(
+                grants
+                    .values()
+                    .map(|grant| grant.credential_slot())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            )
+            .context("credential slot count exceeds limit")?,
+            ..ProviderValidationCounts::default()
+        };
+        let mut authenticated_slots = BTreeSet::new();
+        for (name, grant) in &grants {
+            operation.checkpoint()?;
+            if session.authority.hard_deadline_expired()? {
+                bail!("workload authority expired");
+            }
+            if authenticated_slots.insert(grant.credential_slot()) {
+                let result = authenticate(grant);
+                if validation_observation_succeeded(result)? {
+                    counts.authentication_checked += 1;
+                }
+                operation.checkpoint()?;
+                if session.authority.hard_deadline_expired()? {
+                    bail!("workload authority expired");
+                }
+            }
+            let keys = expected_operation_keys(&cap.operations, name.as_str(), grant);
+            counts.keys_total = counts
+                .keys_total
+                .checked_add(u32::try_from(keys.len())?)
+                .context("key observation count exceeds limit")?;
+            match retrieve(grant) {
+                Ok(material) => {
+                    operation.checkpoint()?;
+                    if session.authority.hard_deadline_expired()? {
+                        bail!("workload authority expired");
+                    }
+                    counts.resources_checked += 1;
+                    for key in keys {
+                        if key.validate(&material).is_ok() {
+                            counts.keys_checked += 1;
+                        } else {
+                            counts.keys_failed += 1;
+                        }
+                    }
+                }
+                Err(error) => {
+                    validation_observation_succeeded(Err(error))?;
+                }
+            }
+        }
+        operation.checkpoint()?;
+        if session.authority.hard_deadline_expired()? {
+            bail!("workload authority expired");
+        }
+        Ok(counts)
+    }
+}
+
+fn validation_observation_succeeded(result: Result<()>) -> Result<bool> {
+    if result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<dev_tools_secret::SecretError>())
+        .is_some_and(crate::provider_operation::validation_must_stop)
+    {
+        result.map(|()| true)
+    } else {
+        Ok(result.is_ok())
+    }
+}
+
 impl CapabilityBackend for SystemCapabilityBackend {
+    fn validate_providers(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session: &crate::linux_admission::VerifiedLinuxSession,
+    ) -> Result<ProviderValidationCounts> {
+        self.validate_providers_with(
+            operation,
+            session,
+            |grant| {
+                let slot = grant.credential_slot();
+                let provider = crate::runtime::OnePasswordProvider::named(
+                    grant.provider().clone(),
+                    self.policy.provider_program(slot)?,
+                    self.service_token(slot)?,
+                )?;
+                match dev_tools_secret::SecretProvider::health(
+                    &provider,
+                    operation.secret_context(),
+                )? {
+                    dev_tools_secret::ProviderHealth::Healthy => Ok(()),
+                    dev_tools_secret::ProviderHealth::Unavailable => {
+                        bail!("provider authentication unavailable")
+                    }
+                }
+            },
+            |grant| {
+                let slot = grant.credential_slot();
+                let provider = crate::runtime::OnePasswordProvider::named(
+                    grant.provider().clone(),
+                    self.policy.provider_program(slot)?,
+                    self.service_token(slot)?,
+                )?;
+                // Validation consumes only the admitted reference internally.
+                // Operation-only bytes never cross the broker response boundary.
+                let material = dev_tools_secret::SecretProvider::read_exportable(
+                    &provider,
+                    &grant.reference,
+                    operation.secret_context(),
+                )?;
+                Ok(material)
+            },
+        )
+    }
+
+    fn secret_material(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session: &crate::linux_admission::VerifiedLinuxSession,
+        resource: &str,
+        purpose: crate::logical_authority::ResourcePurpose,
+        projection: Option<crate::logical_authority::Projection>,
+    ) -> Result<crate::broker_protocol::SensitiveBytes> {
+        use crate::logical_authority::ResourcePurpose;
+        operation.checkpoint()?;
+        if session.authority.hard_deadline_expired()? {
+            bail!("workload authority expired");
+        }
+        let RuntimeAdministrator::Logical(policy) = &self.policy else {
+            bail!("logical resource authority is unavailable");
+        };
+        let selection = session
+            .authority
+            .logical
+            .as_ref()
+            .context("logical session authority is absent")?;
+        let cap = policy
+            .workload_caps
+            .get(&selection.cap)
+            .context("workload cap is absent")?;
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(session.owner_uid))?
+            .context("native workload account is absent")?;
+        if !cap.users.contains(&user.name) {
+            bail!("workload account is outside authority");
+        }
+        let grants =
+            policy
+                .credentials
+                .resolve(&user.name, &cap.resource_cap, &selection.resources)?;
+        let name = dev_tools_secret::LogicalSecretName::parse(resource)?;
+        let grant = grants
+            .get(&name)
+            .context("logical resource is outside workload authority")?;
+        if !grant.allows(purpose)
+            || projection.is_some_and(|projection| !grant.allows_projection(projection))
+            || (purpose != ResourcePurpose::Read && projection.is_some())
+        {
+            bail!("logical resource purpose or projection is outside authority");
+        }
+        let slot = grant.credential_slot();
+        let provider = crate::runtime::OnePasswordProvider::named(
+            grant.provider().clone(),
+            self.policy.provider_program(slot)?,
+            self.service_token(slot)?,
+        )?;
+        let material = match purpose {
+            ResourcePurpose::Read => {
+                let material =
+                    grant.read_exportable(&provider, slot, operation.secret_context())?;
+                crate::broker_protocol::SensitiveBytes::new(material.expose_secret().to_vec())?
+            }
+            ResourcePurpose::Public => {
+                let material =
+                    grant.public_material(&provider, slot, operation.secret_context())?;
+                crate::broker_protocol::SensitiveBytes::new(material.as_bytes().to_vec())?
+            }
+            _ => bail!("unsupported logical material purpose"),
+        };
+        operation.checkpoint()?;
+        if session.authority.hard_deadline_expired()? {
+            bail!("workload authority expired");
+        }
+        Ok(material)
+    }
+
     fn github_token(
         &self,
         operation: &ProviderOperation<'_>,
@@ -604,7 +1039,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
         let token = broker_github_token_for_repository(
             operation,
             BrokerGitHubAuthority {
-                op_program: &self.policy.programs.op,
+                op_program: self.policy.provider_program(&grant.credential_slot)?,
                 service_token,
                 app_id: grant.app_id,
                 repository_selection: grant.repository_selection,
@@ -649,7 +1084,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
         let token = broker_github_token_for_repositories(
             operation,
             BrokerGitHubAuthority {
-                op_program: &self.policy.programs.op,
+                op_program: self.policy.provider_program(&grant.credential_slot)?,
                 service_token,
                 app_id: grant.app_id,
                 repository_selection: grant.repository_selection,
@@ -693,7 +1128,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
         let service_token = self.validate_operation_grant(purpose, grant)?;
         broker_sign_ssh(
             operation,
-            &self.policy.programs.op,
+            self.policy.provider_program(&grant.credential_slot)?,
             service_token,
             &grant.private_key_ref,
             &grant.public_key,
@@ -717,7 +1152,7 @@ impl CapabilityBackend for SystemCapabilityBackend {
         let service_token = self.validate_release_signing_grant(grant, &document.authority)?;
         broker_sign_release_manifest_bytes(
             operation,
-            &self.policy.programs.op,
+            self.policy.provider_program(&grant.credential_slot)?,
             service_token,
             &grant.private_key_ref,
             &grant.public_key,
@@ -752,7 +1187,7 @@ fn systemd_credential_directory() -> Result<PathBuf> {
 
 fn read_service_credentials(
     directory: &Path,
-    policy: &SystemPolicyV2,
+    policy: &RuntimeAdministrator,
 ) -> Result<BTreeMap<String, SecretString>> {
     let metadata =
         fs::symlink_metadata(directory).context("inspect broker credential directory")?;
@@ -764,9 +1199,10 @@ fn read_service_credentials(
         bail!("broker credential directory has unsafe filesystem authority");
     }
     let mut tokens = BTreeMap::new();
-    for slot in policy.credential_slots.keys() {
+    let declared_slots = policy.credential_slot_names();
+    for slot in &declared_slots {
         let path = directory.join(format!("{SERVICE_CREDENTIAL_PREFIX}{slot}"));
-        tokens.insert(slot.clone(), read_service_credential(&path)?);
+        tokens.insert((*slot).to_owned(), read_service_credential(&path)?);
     }
     for entry in fs::read_dir(directory).context("enumerate broker credentials")? {
         let entry = entry.context("read broker credential entry")?;
@@ -775,7 +1211,7 @@ fn read_service_credentials(
             continue;
         };
         if let Some(slot) = name.strip_prefix(SERVICE_CREDENTIAL_PREFIX) {
-            if !policy.credential_slots.contains_key(slot) {
+            if !declared_slots.contains(&slot) {
                 bail!("broker received an undeclared credential slot");
             }
         }
@@ -858,7 +1294,363 @@ mod tests {
         ProviderOperation::uncancelled().unwrap()
     }
 
-    fn policy_with_two_slots() -> SystemPolicyV2 {
+    fn logical_validation_fixture() -> (
+        SystemCapabilityBackend,
+        crate::linux_admission::VerifiedLinuxSession,
+    ) {
+        let uid = nix::unistd::Uid::effective();
+        let user = nix::unistd::User::from_uid(uid).unwrap().unwrap();
+        let text = include_str!("../policy-v3-user-only.example.toml")
+            .replace("\"automation\"", &format!("{:?}", user.name));
+        let mut policy: crate::policy_v3::SystemPolicyV3 = toml::from_str(&text).unwrap();
+        policy
+            .credentials
+            .resources
+            .get_mut("service-token")
+            .unwrap()
+            .credential_slot = "automation".into();
+        policy.credentials.providers.insert(
+            "secondary".into(),
+            crate::logical_authority::ProviderInstance::OnePassword {
+                executable: "/opt/fixture/op-secondary".into(),
+            },
+        );
+        policy.credentials.credential_slots.insert(
+            "secondary".into(),
+            crate::logical_authority::CredentialSlot {
+                provider: "secondary".into(),
+                users: vec![user.name],
+            },
+        );
+        let mut second = policy.credentials.resources["service-token"].clone();
+        second.credential_slot = "secondary".into();
+        second.reference = "op://Fixture/Second/token".into();
+        policy
+            .credentials
+            .resources
+            .insert("zz-token".into(), second);
+        let rights = policy.credentials.resource_caps["worker"].resources["service-token"].clone();
+        policy
+            .credentials
+            .resource_caps
+            .get_mut("worker")
+            .unwrap()
+            .resources
+            .insert("zz-token".into(), rights.clone());
+        let session = crate::linux_admission::VerifiedLinuxSession {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+            owner_uid: uid.as_raw(),
+            execution_uid: uid.as_raw(),
+            workload: "worker".into(),
+            profile: "worker".into(),
+            authority: crate::linux_admission::SessionAuthorityGrant {
+                logical: Some(crate::policy_v3::LogicalSelection {
+                    cap: "worker".into(),
+                    resources: BTreeMap::from([
+                        ("service-token".into(), rights.clone()),
+                        ("zz-token".into(), rights),
+                    ]),
+                }),
+                hard_deadline_boot_ms: None,
+                github: None,
+                signing: None,
+                release_signing: None,
+                ssh: Vec::new(),
+            },
+            cgroup: PathBuf::new(),
+            expires_at_unix: i64::MAX,
+        };
+        (
+            SystemCapabilityBackend {
+                policy: RuntimeAdministrator::Logical(policy),
+                service_tokens: BTreeMap::from([
+                    (
+                        "automation".into(),
+                        SecretString::new("first-fixture-token".into()),
+                    ),
+                    (
+                        "secondary".into(),
+                        SecretString::new("second-fixture-token".into()),
+                    ),
+                ]),
+                cache: Mutex::new(TokenCache::default()),
+            },
+            session,
+        )
+    }
+
+    #[test]
+    fn provider_validation_resolves_each_slot_and_continues_after_independent_denial() {
+        let (backend, mut session) = logical_validation_fixture();
+        let mut reads = Vec::new();
+        let counts = backend
+            .validate_providers_with(
+                &operation(),
+                &session,
+                |_| Ok(()),
+                |grant| {
+                    let slot = grant.credential_slot();
+                    reads.push((
+                        grant.provider().as_str().to_owned(),
+                        slot.to_owned(),
+                        backend.policy.provider_program(slot)?.to_owned(),
+                        backend.service_token(slot)?.expose().to_owned(),
+                    ));
+                    if slot == "automation" {
+                        bail!("fixture denial");
+                    }
+                    assert_eq!(
+                        grant.reference.expose_to_provider(),
+                        "op://Fixture/Second/token"
+                    );
+                    Ok(dev_tools_secret::SecretMaterial::new(b"fixture".to_vec())?)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            ProviderValidationCounts {
+                authentication_checked: 2,
+                authentication_total: 2,
+                resources_checked: 1,
+                resources_total: 2,
+                ..ProviderValidationCounts::default()
+            }
+        );
+        assert_eq!(
+            reads,
+            vec![
+                (
+                    "primary".into(),
+                    "automation".into(),
+                    "/usr/bin/op".into(),
+                    "first-fixture-token".into()
+                ),
+                (
+                    "secondary".into(),
+                    "secondary".into(),
+                    "/opt/fixture/op-secondary".into(),
+                    "second-fixture-token".into()
+                ),
+            ]
+        );
+        let logical = session.authority.logical.as_mut().unwrap();
+        logical
+            .resources
+            .insert("outside".into(), logical.resources["service-token"].clone());
+        assert!(backend
+            .validate_providers_with(
+                &operation(),
+                &session,
+                |_| panic!("unresolved authority reached authentication"),
+                |_| panic!("unresolved authority reached provider")
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn provider_authentication_is_once_per_selected_slot_and_independent_of_retrieval() {
+        let (mut backend, mut session) = logical_validation_fixture();
+        let RuntimeAdministrator::Logical(policy) = &mut backend.policy else {
+            unreachable!();
+        };
+        let alias = policy.credentials.resources["service-token"].clone();
+        policy.credentials.resources.insert("alias".into(), alias);
+        let rights = policy.credentials.resource_caps["worker"].resources["service-token"].clone();
+        policy
+            .credentials
+            .resource_caps
+            .get_mut("worker")
+            .unwrap()
+            .resources
+            .insert("alias".into(), rights.clone());
+        session
+            .authority
+            .logical
+            .as_mut()
+            .unwrap()
+            .resources
+            .insert("alias".into(), rights);
+        let mut slots = Vec::new();
+        let mut reads = 0;
+        let counts = backend
+            .validate_providers_with(
+                &operation(),
+                &session,
+                |grant| {
+                    slots.push(grant.credential_slot().to_owned());
+                    if grant.credential_slot() == "automation" {
+                        bail!("fixture authentication denial");
+                    }
+                    Ok(())
+                },
+                |_| {
+                    reads += 1;
+                    Ok(dev_tools_secret::SecretMaterial::new(b"fixture".to_vec())?)
+                },
+            )
+            .unwrap();
+        assert_eq!(slots, ["automation", "secondary"]);
+        assert_eq!(reads, 3);
+        assert_eq!(
+            counts,
+            ProviderValidationCounts {
+                authentication_checked: 1,
+                authentication_total: 2,
+                resources_checked: 3,
+                resources_total: 3,
+                ..ProviderValidationCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn provider_validation_separates_unread_invalid_and_valid_operation_keys() {
+        use crate::logical_authority::{ResourceKind, ResourcePurpose, ResourceSelection};
+        let (mut backend, mut session) = logical_validation_fixture();
+        let RuntimeAdministrator::Logical(policy) = &mut backend.policy else {
+            unreachable!()
+        };
+        let resource = policy
+            .credentials
+            .resources
+            .get_mut("service-token")
+            .unwrap();
+        resource.kind = ResourceKind::OperationOnly;
+        resource.purposes = vec![ResourcePurpose::ReleaseSigning];
+        resource.projections.clear();
+        let rights = ResourceSelection {
+            purposes: vec![ResourcePurpose::ReleaseSigning],
+            projections: Vec::new(),
+        };
+        policy
+            .credentials
+            .resource_caps
+            .get_mut("worker")
+            .unwrap()
+            .resources
+            .insert("service-token".into(), rights.clone());
+        session
+            .authority
+            .logical
+            .as_mut()
+            .unwrap()
+            .resources
+            .insert("service-token".into(), rights);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let public = key
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        policy
+            .workload_caps
+            .get_mut("worker")
+            .unwrap()
+            .operations
+            .release_signing
+            .insert(
+                "service-token".into(),
+                crate::policy_v3_operations::ReleaseKeyCap {
+                    public_key: public,
+                    products: vec!["fixture".into()],
+                },
+            );
+        for (value, resources, passed, failed) in [
+            (None, 1, 0, 0),
+            (Some("08".repeat(32)), 2, 0, 1),
+            (Some("09".repeat(32)), 2, 1, 0),
+        ] {
+            let counts = backend
+                .validate_providers_with(
+                    &operation(),
+                    &session,
+                    |_| Ok(()),
+                    |grant| {
+                        if grant.credential_slot() == "automation" {
+                            let value = value.as_ref().context("fixture resource unavailable")?;
+                            Ok(dev_tools_secret::SecretMaterial::new(
+                                value.as_bytes().to_vec(),
+                            )?)
+                        } else {
+                            Ok(dev_tools_secret::SecretMaterial::new(vec![0xff])?)
+                        }
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                ProviderValidationCounts {
+                    authentication_checked: 2,
+                    authentication_total: 2,
+                    resources_checked: resources,
+                    resources_total: 2,
+                    keys_checked: passed,
+                    keys_failed: failed,
+                    keys_total: 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn authentication_cancellation_or_failed_cleanup_prevents_resource_reads() {
+        let (backend, session) = logical_validation_fixture();
+        for cleanup_failure in [false, true] {
+            let cancelled = AtomicBool::new(false);
+            let operation = ProviderOperation::new(&cancelled).unwrap();
+            let mut attempts = 0;
+            let result = backend.validate_providers_with(
+                &operation,
+                &session,
+                |_| {
+                    attempts += 1;
+                    if cleanup_failure {
+                        return Err(dev_tools_secret::SecretError::new(
+                            dev_tools_secret::SecretErrorKind::CleanupFailed,
+                        )
+                        .into());
+                    }
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
+                |_| panic!("terminal authentication reached resource retrieval"),
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn provider_validation_cancellation_and_failed_cleanup_prevent_further_reads() {
+        let (backend, session) = logical_validation_fixture();
+        for cleanup_failure in [false, true] {
+            let cancelled = AtomicBool::new(false);
+            let operation = ProviderOperation::new(&cancelled).unwrap();
+            let mut attempts = 0;
+            let result = backend.validate_providers_with(
+                &operation,
+                &session,
+                |_| Ok(()),
+                |_| {
+                    attempts += 1;
+                    if cleanup_failure {
+                        return Err(dev_tools_secret::SecretError::new(
+                            dev_tools_secret::SecretErrorKind::CleanupFailed,
+                        )
+                        .into());
+                    }
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(dev_tools_secret::SecretMaterial::new(b"fixture".to_vec())?)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    fn policy_with_two_slots() -> RuntimeAdministrator {
         let authority_cap = |app: &str, reference: &str| AuthorityCap {
             github_apps: vec![app.into()],
             owners: vec!["ExampleOrg".into()],
@@ -872,7 +1664,7 @@ mod tests {
             git_identities: Vec::new(),
             secret_references: vec![reference.into()],
         };
-        SystemPolicyV2 {
+        RuntimeAdministrator::Legacy(crate::policy_v2::SystemPolicyV2 {
             version: 2,
             mode: SystemMode::Strong,
             allowed_users: vec!["automation".into()],
@@ -932,7 +1724,7 @@ mod tests {
             ]),
             workspace_caps: BTreeMap::new(),
             sandbox_adapters: BTreeMap::new(),
-        }
+        })
     }
 
     #[test]

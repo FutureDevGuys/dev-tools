@@ -29,6 +29,28 @@ fn command(name: &'static str) -> Command {
         .disable_help_subcommand(true)
 }
 
+pub(super) fn setup_recovery_command() -> Command {
+    command("recover")
+        .bin_name("dev-auth setup recover")
+        .disable_help_flag(false)
+        .about("Resume retained setup using the exact installed candidate, without original input files")
+        .args([
+            mode(),
+            format().default_value("human"),
+            value("credential-stdin").value_name("SLOT"),
+            value("credential-fd").value_name("SLOT=FD").action(ArgAction::Append),
+            path("credential-file").value_name("SLOT=PATH").action(ArgAction::Append),
+        ])
+}
+
+pub(super) fn setup_restoration_command() -> Command {
+    command("restore")
+        .bin_name("dev-auth setup restore")
+        .disable_help_flag(false)
+        .about("Restore the retained generation with integrations inactive; run the exact retained candidate")
+        .args([mode(), format().default_value("human")])
+}
+
 fn flag(name: &'static str) -> Arg {
     Arg::new(name).long(name).action(ArgAction::SetTrue)
 }
@@ -64,12 +86,8 @@ fn positional(name: &'static str) -> Arg {
 fn setup() -> Command {
     let mut setup = command("setup")
         .subcommand(
-            command("template").arg(positional("template").value_parser([
-                "deployment",
-                "administrator-policy",
-                "user-only-policy",
-                "user-config",
-            ])),
+            command("template")
+                .arg(positional("template").value_parser(dev_auth::SETUP_TEMPLATE_NAMES)),
         )
         .subcommand(
             command("discover")
@@ -115,6 +133,8 @@ fn setup() -> Command {
             format(),
         ]))
         .subcommand(command("verify").args([mode(), path("plan"), value("sha256"), format()]))
+        .subcommand(setup_recovery_command())
+        .subcommand(setup_restoration_command())
         .subcommand(command("migrate-v1-preview").arg(path("output")))
         .subcommand(command("migrate-v1").args([
             path("config"),
@@ -171,9 +191,11 @@ fn specification() -> Command {
             "powershell",
         ])))
         .subcommand(setup())
+        .subcommand(crate::doctor::specification())
+        .subcommand(crate::secret_cli::specification())
         .subcommand(command("broker").subcommand(command("serve")))
         .subcommand(command("status").arg(flag("broker")))
-        .subcommand(command("validate").arg(flag("online")))
+        .subcommand(crate::validation_cli::specification())
         .subcommand(command("explain").arg(positional("command").value_parser(["git", "gh"])))
         .subcommand(command("ssh-public").args([
             value("profile"),
@@ -186,11 +208,7 @@ fn specification() -> Command {
         )
         .subcommand(
             command("workload")
-                .subcommand(
-                    command("launch")
-                        .arg(positional("name"))
-                        .arg(positional("arguments").last(true).num_args(0..)),
-                )
+                .subcommand(crate::workload_cli::specification())
                 .subcommand(
                     command("bind")
                         .subcommand(

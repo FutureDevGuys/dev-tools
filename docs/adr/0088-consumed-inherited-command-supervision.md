@@ -3,7 +3,7 @@ authority: canonical
 owner: dev-tools
 ---
 
-# ADR 0030: Consumed inherited-command supervision
+# ADR 0088: Consumed inherited-command supervision
 
 status: proposed
 verification: pending

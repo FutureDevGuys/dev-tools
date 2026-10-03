@@ -34,12 +34,18 @@ const PUBLIC_WORKERS: usize = 8;
 const PUBLIC_QUEUE: usize = 64;
 const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+mod native_lease_tests;
+
 #[derive(Default)]
 struct SessionOperations {
     // This gate pairs registry membership changes with operation admission. It
     // is released before provider calls and response I/O; those are coordinated
     // only by the affected session's state below.
     sessions: Mutex<BTreeMap<String, Arc<SessionOperationState>>>,
+    // Retained by the broker, independently of a dispatcher that may crash.
+    // Pending registrations also exclude setup until revoked or expired.
+    setup_leases: Mutex<BTreeMap<String, dev_tools_installation::InstallationLock>>,
 }
 
 struct SessionOperationState {
@@ -294,6 +300,24 @@ impl Drop for SessionOperationGuard {
 }
 
 impl SessionOperations {
+    fn reserve_setup_lease<T>(
+        &self,
+        session_id: &str,
+        lease: dev_tools_installation::InstallationLock,
+        register: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut leases = self
+            .setup_leases
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session setup lease lock is poisoned"))?;
+        if leases.contains_key(session_id) {
+            bail!("session already retains a setup admission lease");
+        }
+        let result = register()?;
+        leases.insert(session_id.into(), lease);
+        Ok(result)
+    }
+
     fn open_session<T>(&self, session_id: &str, open: impl FnOnce() -> Result<T>) -> Result<T> {
         let mut sessions = self
             .sessions
@@ -554,6 +578,13 @@ impl SessionOperations {
         {
             sessions.remove(&close.session_id);
         }
+        // Registration takes leases before sessions. Release sessions before
+        // taking leases, and retain the lease on every cleanup failure.
+        drop(sessions);
+        self.setup_leases
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session setup lease lock is poisoned"))?
+            .remove(&close.session_id);
         Ok(close.existed)
     }
 }
@@ -638,17 +669,17 @@ fn write_user_response(
     mut response: BrokerResponse,
     stop: &AtomicBool,
 ) -> Result<()> {
-    if stop.load(Ordering::Acquire) {
+    if stop.load(Ordering::Acquire) || session.authority.hard_deadline_expired()? {
         response = session_closing_denial();
     }
     emit_request_audit(Some(session), audit_request, &response);
     write_frame(
         stream,
-        &encode_response_frame(&BrokerResponseEnvelope {
+        &zeroize::Zeroizing::new(encode_response_frame(&BrokerResponseEnvelope {
             version: BROKER_PROTOCOL_VERSION,
             request_id,
             response,
-        })?,
+        })?),
     )
 }
 
@@ -934,16 +965,20 @@ fn handle_public_connection(
         },
     };
     if let Some(operation) = operation.as_ref() {
-        if !operation.commit_publication()? {
+        if audit_session
+            .as_ref()
+            .is_some_and(|session| session.authority.hard_deadline_expired().unwrap_or(true))
+            || !operation.commit_publication()?
+        {
             response = session_closing_denial();
         }
     }
     let audit_record = request_audit_record(audit_session.as_ref(), &audit_request, &response);
-    let output = encode_response_frame(&BrokerResponseEnvelope {
+    let output = zeroize::Zeroizing::new(encode_response_frame(&BrokerResponseEnvelope {
         version: BROKER_PROTOCOL_VERSION,
         request_id: request.request_id,
         response,
-    })?;
+    })?);
     write_public_response(stream, &output, operation, || {
         emit_request_audit_record(&audit_record)
     })
@@ -972,6 +1007,9 @@ fn session_response(
     request: BrokerRequest,
     backend: &dyn CapabilityBackend,
 ) -> Result<BrokerResponse> {
+    if session.authority.hard_deadline_expired()? {
+        return Ok(session_closing_denial());
+    }
     let response = match request {
         BrokerRequest::Probe => ready_response(session)?,
         BrokerRequest::ActivateSession { .. } => BrokerResponse::Denied {
@@ -1000,6 +1038,41 @@ fn session_response(
             &repository,
             GitHubResponseKind::GitCredential,
         ),
+        BrokerRequest::ValidateProviders => match backend.validate_providers(operation, session) {
+            Ok(counts) => BrokerResponse::ProviderValidation {
+                authentication_checked: counts.authentication_checked,
+                authentication_total: counts.authentication_total,
+                resources_checked: counts.resources_checked,
+                resources_total: counts.resources_total,
+                keys_checked: counts.keys_checked,
+                keys_failed: counts.keys_failed,
+                keys_total: counts.keys_total,
+            },
+            Err(_) => provider_denial(),
+        },
+        BrokerRequest::SecretRead {
+            resource,
+            projection,
+        } => match backend.secret_material(
+            operation,
+            session,
+            &resource,
+            crate::logical_authority::ResourcePurpose::Read,
+            projection,
+        ) {
+            Ok(material) => BrokerResponse::SecretMaterial { material },
+            Err(_) => provider_denial(),
+        },
+        BrokerRequest::SecretPublic { resource } => match backend.secret_material(
+            operation,
+            session,
+            &resource,
+            crate::logical_authority::ResourcePurpose::Public,
+            None,
+        ) {
+            Ok(material) => BrokerResponse::SecretMaterial { material },
+            Err(_) => provider_denial(),
+        },
         BrokerRequest::InvalidateGitCredential {
             owner, repository, ..
         } => match session.authority.github.as_ref() {
@@ -1070,6 +1143,9 @@ fn session_response(
             },
         },
     };
+    if session.authority.hard_deadline_expired()? {
+        return Ok(session_closing_denial());
+    }
     Ok(response)
 }
 
@@ -1084,6 +1160,7 @@ fn ready_response(
         profile: session.profile.clone(),
         expires_at: OffsetDateTime::from_unix_timestamp(session.expires_at_unix)?
             .format(&Rfc3339)?,
+        hard_deadline_boot_ms: session.authority.hard_deadline_boot_ms,
     })
 }
 
@@ -1127,6 +1204,13 @@ fn request_audit_record<'a>(
 ) -> BrokerAuditRecord<'a> {
     let (capability, resource_sha256) = match request {
         BrokerRequest::Probe => ("probe", None),
+        BrokerRequest::ValidateProviders => ("validate_providers", None),
+        BrokerRequest::SecretRead { resource, .. } => {
+            ("secret_read", Some(public_resource_digest(&[resource])))
+        }
+        BrokerRequest::SecretPublic { resource } => {
+            ("secret_public", Some(public_resource_digest(&[resource])))
+        }
         BrokerRequest::ActivateSession { .. } => ("session_activate", None),
         BrokerRequest::RenewSession { .. } => ("session_renew", None),
         BrokerRequest::EndSession { .. } => ("session_end", None),
@@ -1180,6 +1264,24 @@ fn request_audit_record<'a>(
         }
     };
     let outcome = match response {
+        BrokerResponse::ProviderValidation {
+            authentication_checked,
+            authentication_total,
+            resources_checked,
+            resources_total,
+            keys_checked,
+            keys_failed,
+            keys_total,
+        } => if resources_checked == resources_total
+            && authentication_checked == authentication_total
+            && keys_checked == keys_total
+            && *keys_failed == 0
+        {
+            "provider_validation_passed"
+        } else {
+            "provider_validation_failed"
+        }
+        .into(),
         BrokerResponse::Denied { code, .. } => format!("denied:{code}"),
         BrokerResponse::NoSession => "no_session".into(),
         BrokerResponse::Accepted => "accepted".into(),
@@ -1187,6 +1289,7 @@ fn request_audit_record<'a>(
         BrokerResponse::GitCredential { .. } => "credential_issued".into(),
         BrokerResponse::GhExecutionToken { .. } => "token_issued".into(),
         BrokerResponse::Signature { .. } => "signature_issued".into(),
+        BrokerResponse::SecretMaterial { .. } => "material_issued".into(),
     };
     BrokerAuditRecord {
         schema: "dev-auth-broker-audit-v1",
@@ -1340,6 +1443,31 @@ fn session_authorizes(
                     .is_some_and(|grant| github_grant_contains(grant, owner, repository))
         }
         BrokerRequest::GhExecutionToken => session.authority.github.is_some(),
+        BrokerRequest::ValidateProviders => session.authority.logical.is_some(),
+        BrokerRequest::SecretRead {
+            resource,
+            projection,
+        } => session
+            .authority
+            .logical
+            .as_ref()
+            .and_then(|logical| logical.resources.get(resource))
+            .is_some_and(|rights| {
+                rights
+                    .purposes
+                    .contains(&crate::logical_authority::ResourcePurpose::Read)
+                    && projection.is_none_or(|projection| rights.projections.contains(&projection))
+            }),
+        BrokerRequest::SecretPublic { resource } => session
+            .authority
+            .logical
+            .as_ref()
+            .and_then(|logical| logical.resources.get(resource))
+            .is_some_and(|rights| {
+                rights
+                    .purposes
+                    .contains(&crate::logical_authority::ResourcePurpose::Public)
+            }),
         BrokerRequest::SignSsh {
             profile,
             purpose,
@@ -1432,8 +1560,27 @@ fn handle_control_connection(
     if credentials.uid() != 0 {
         bail!("broker control connection is not root-owned");
     }
-    let input = read_frame(stream)?;
+    let (input, descriptor) = read_control_frame(stream)?;
     let request = decode_control_request(&input)?;
+    let needs_lease = matches!(
+        &request.request,
+        ControlRequest::Prepare { .. } | ControlRequest::Register { .. }
+    );
+    if needs_lease != descriptor.is_some() {
+        bail!("control operation has an invalid admission lease");
+    }
+    let lease = descriptor
+        .map(|descriptor| {
+            dev_tools_installation::InstallationLock::from_shared_descriptor(
+                descriptor,
+                &crate::setup_transition::lock_path(
+                    crate::deployment::DeploymentMode::Strong,
+                    None,
+                )?,
+                0,
+            )
+        })
+        .transpose()?;
     let (audit_event, audit_session) = match &request.request {
         ControlRequest::Prepare { session } => ("session_prepare", session.session_id.clone()),
         ControlRequest::Register { session } => ("session_register", session.session_id.clone()),
@@ -1443,9 +1590,15 @@ fn handle_control_connection(
     let response = match request.request {
         ControlRequest::Prepare { session } => {
             let session_id = session.session_id.clone();
-            match operations
-                .with_available_session_id(&session_id, || registry.prepare_root_owned(*session))
-            {
+            let prepared = (|| {
+                let lease = lease.context("pending registration has no admission lease")?;
+                operations.reserve_setup_lease(&session_id, lease, || {
+                    operations.with_available_session_id(&session_id, || {
+                        registry.prepare_root_owned(*session)
+                    })
+                })
+            })();
+            match prepared {
                 Ok(()) => ControlResponse::Accepted,
                 Err(_) => ControlResponse::Denied {
                     message: "pending session admission was rejected".into(),
@@ -1454,9 +1607,15 @@ fn handle_control_connection(
         }
         ControlRequest::Register { session } => {
             let session_id = session.session_id.clone();
-            match operations.open_session(&session_id, || {
-                registry.register_root_owned(*session, peer_pidfd)
-            }) {
+            let registered = (|| {
+                let lease = lease.context("registration has no admission lease")?;
+                operations.reserve_setup_lease(&session_id, lease, || {
+                    operations.open_session(&session_id, || {
+                        registry.register_root_owned(*session, peer_pidfd)
+                    })
+                })
+            })();
+            match registered {
                 Ok(()) => ControlResponse::Accepted,
                 Err(_) => ControlResponse::Denied {
                     message: "session registration was rejected".into(),
@@ -1493,7 +1652,7 @@ fn handle_control_connection(
     };
     emit_lifecycle_audit(audit_event, Some(&audit_session), audit_outcome);
     let output = encode_control_response(&ControlResponseEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: crate::control_protocol::CONTROL_PROTOCOL_VERSION,
         request_id: request.request_id,
         response,
     })?;
@@ -1550,6 +1709,56 @@ fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
     read_frame_with_clock(stream, FRAME_IO_TIMEOUT, Instant::now)
 }
 
+fn read_control_frame(stream: &mut UnixStream) -> Result<(Vec<u8>, Option<std::os::fd::OwnedFd>)> {
+    use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+    let deadline = Instant::now()
+        .checked_add(FRAME_IO_TIMEOUT)
+        .context("control read deadline overflowed")?;
+    let mut length = [0_u8; 4];
+    let mut storage = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut storage);
+    let received = loop {
+        stream.set_read_timeout(Some(remaining_frame_time(deadline, Instant::now())?))?;
+        match recvmsg(
+            &*stream,
+            &mut [std::io::IoSliceMut::new(&mut length[..1])],
+            &mut ancillary,
+            RecvFlags::CMSG_CLOEXEC,
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => break result?,
+        }
+    };
+    if received.bytes != 1
+        || received
+            .flags
+            .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC)
+    {
+        bail!("control frame or descriptor was truncated");
+    }
+    let mut descriptor = None;
+    for message in ancillary.drain() {
+        match message {
+            RecvAncillaryMessage::ScmRights(descriptors) => {
+                for received in descriptors {
+                    if descriptor.replace(received).is_some() {
+                        bail!("control frame carries multiple descriptors");
+                    }
+                }
+            }
+            _ => bail!("control frame carries unsupported ancillary data"),
+        }
+    }
+    read_exact_before(stream, &mut length[1..], deadline, &mut Instant::now)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_BROKER_FRAME_BYTES {
+        bail!("control frame exceeds the size limit");
+    }
+    let mut bytes = vec![0_u8; length];
+    read_exact_before(stream, &mut bytes, deadline, &mut Instant::now)?;
+    Ok((bytes, descriptor))
+}
+
 fn read_frame_with_clock(
     stream: &mut UnixStream,
     timeout: Duration,
@@ -1579,7 +1788,7 @@ fn write_frame_with_clock(
     timeout: Duration,
     mut now: impl FnMut() -> Instant,
 ) -> Result<()> {
-    if output.len() > MAX_BROKER_FRAME_BYTES {
+    if output.len() > crate::broker_protocol::MAX_BROKER_RESPONSE_FRAME_BYTES {
         bail!("broker response exceeds the size limit");
     }
     let deadline = now()
@@ -1826,6 +2035,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: Some(crate::linux_admission::SessionGitHubGrant {
                     credential_slot: "automation".into(),
                     app_id: 42,
@@ -1846,6 +2057,169 @@ mod tests {
             cgroup: PathBuf::new(),
             expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 900,
         }
+    }
+
+    #[test]
+    fn provider_validation_requires_logical_admission_and_keeps_partial_counts() {
+        let mut session = github_session("0123456789abcdef0123456789abcdef");
+        assert!(!session_authorizes(
+            &session,
+            &BrokerRequest::ValidateProviders
+        ));
+        assert!(matches!(
+            session_response(&provider_operation(), &session, BrokerRequest::ValidateProviders, &SigningBackend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+        session.authority.logical = Some(crate::policy_v3::LogicalSelection {
+            cap: "build".into(),
+            resources: std::collections::BTreeMap::new(),
+        });
+        let response = session_response(
+            &provider_operation(),
+            &session,
+            BrokerRequest::ValidateProviders,
+            &SigningBackend,
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            BrokerResponse::ProviderValidation {
+                authentication_checked: 1,
+                authentication_total: 1,
+                resources_checked: 1,
+                resources_total: 2,
+                keys_checked: 0,
+                keys_failed: 0,
+                keys_total: 0
+            }
+        );
+        let audit =
+            request_audit_record(Some(&session), &BrokerRequest::ValidateProviders, &response);
+        assert_eq!(audit.outcome, "provider_validation_failed");
+        assert!(audit.resource_sha256.is_none());
+        let authentication_failure = BrokerResponse::ProviderValidation {
+            authentication_checked: 0,
+            authentication_total: 1,
+            resources_checked: 2,
+            resources_total: 2,
+            keys_checked: 0,
+            keys_failed: 0,
+            keys_total: 0,
+        };
+        assert_eq!(
+            request_audit_record(
+                Some(&session),
+                &BrokerRequest::ValidateProviders,
+                &authentication_failure
+            )
+            .outcome,
+            "provider_validation_failed"
+        );
+        session.authority.hard_deadline_boot_ms = Some(0);
+        assert!(matches!(
+            session_response(
+                &provider_operation(),
+                &session,
+                BrokerRequest::ValidateProviders,
+                &SigningBackend
+            )
+            .unwrap(),
+            BrokerResponse::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn logical_delivery_requires_selected_purpose_and_projection() {
+        use crate::logical_authority::{Projection, ResourcePurpose, ResourceSelection};
+        let mut session = github_session("0123456789abcdef0123456789abcdef");
+        session.authority.logical = Some(crate::policy_v3::LogicalSelection {
+            cap: "build".into(),
+            resources: std::collections::BTreeMap::from([(
+                "token".into(),
+                ResourceSelection {
+                    purposes: vec![ResourcePurpose::Read],
+                    projections: vec![Projection::Stdin],
+                },
+            )]),
+        });
+        assert!(session_authorizes(
+            &session,
+            &BrokerRequest::SecretRead {
+                resource: "token".into(),
+                projection: None
+            }
+        ));
+        assert!(session_authorizes(
+            &session,
+            &BrokerRequest::SecretRead {
+                resource: "token".into(),
+                projection: Some(Projection::Stdin)
+            }
+        ));
+        assert!(!session_authorizes(
+            &session,
+            &BrokerRequest::SecretRead {
+                resource: "token".into(),
+                projection: Some(Projection::Environment)
+            }
+        ));
+        assert!(!session_authorizes(
+            &session,
+            &BrokerRequest::SecretPublic {
+                resource: "token".into()
+            }
+        ));
+        assert!(!session_authorizes(
+            &session,
+            &BrokerRequest::SecretRead {
+                resource: "other".into(),
+                projection: None
+            }
+        ));
+        let response = session_response(
+            &provider_operation(),
+            &session,
+            BrokerRequest::SecretRead {
+                resource: "token".into(),
+                projection: Some(Projection::Stdin),
+            },
+            &SigningBackend,
+        )
+        .unwrap();
+        assert!(
+            matches!(response, BrokerResponse::SecretMaterial { material } if material.expose() == [0, 255, 10])
+        );
+    }
+
+    #[test]
+    fn expired_hard_deadline_rejects_before_the_provider_is_invoked() {
+        let mut session = github_session("0123456789abcdef0123456789abcdef");
+        session.authority.hard_deadline_boot_ms = Some(0);
+        let (provider_started, provider_started_rx) = mpsc::channel();
+        let (provider_release, provider_release_rx) = mpsc::channel();
+        provider_release.send(()).unwrap();
+        let (session_revoked, _session_revoked_rx) = mpsc::channel();
+        let backend = LateTokenBackend {
+            provider_started,
+            provider_release: Mutex::new(provider_release_rx),
+            session_revoked,
+        };
+        let stop = AtomicBool::new(false);
+        let operation = ProviderOperation::new(&stop).unwrap();
+        let response = session_response(
+            &operation,
+            &session,
+            BrokerRequest::GitCredential {
+                protocol: "https".into(),
+                host: "github.com".into(),
+                owner: "ExampleOrg".into(),
+                repository: "api".into(),
+            },
+            &backend,
+        )
+        .unwrap();
+        assert!(matches!(response, BrokerResponse::Denied { .. }));
+        assert!(provider_started_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1988,7 +2362,16 @@ mod tests {
     fn one_close_deadline_bounds_drain_before_provider_cleanup() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let operations = SessionOperations::default();
-        operations.open_session(session_id, || Ok(())).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let lock = temp.path().join("admission.lock");
+        let lease = dev_tools_installation::InstallationLock::try_acquire_shared(&lock)
+            .unwrap()
+            .unwrap();
+        operations
+            .reserve_setup_lease(session_id, lease, || {
+                operations.open_session(session_id, || Ok(()))
+            })
+            .unwrap();
         let operation = operations.admit_session(session_id).unwrap().unwrap();
         let close = operations
             .begin_close(session_id, || Ok(true))
@@ -2005,12 +2388,21 @@ mod tests {
         assert!(operation.cancellation_requested());
         assert!(operations.admit_session(session_id).unwrap().is_none());
         drop(operation);
+        assert!(
+            dev_tools_installation::InstallationLock::try_acquire(&lock)
+                .unwrap()
+                .is_none(),
+            "failed cleanup must retain setup exclusion"
+        );
         revoke_stale_sessions(
             &LinuxSessionRegistry::new(),
             &operations,
             &UnavailableCapabilityBackend,
         )
         .unwrap();
+        assert!(dev_tools_installation::InstallationLock::try_acquire(&lock)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2145,6 +2537,36 @@ mod tests {
     }
 
     impl CapabilityBackend for SigningBackend {
+        fn validate_providers(
+            &self,
+            operation: &ProviderOperation<'_>,
+            _session: &crate::linux_admission::VerifiedLinuxSession,
+        ) -> Result<crate::broker_backend::ProviderValidationCounts> {
+            operation.checkpoint()?;
+            Ok(crate::broker_backend::ProviderValidationCounts {
+                authentication_checked: 1,
+                authentication_total: 1,
+                resources_checked: 1,
+                resources_total: 2,
+                ..crate::broker_backend::ProviderValidationCounts::default()
+            })
+        }
+        fn secret_material(
+            &self,
+            _operation: &ProviderOperation<'_>,
+            _session: &crate::linux_admission::VerifiedLinuxSession,
+            resource: &str,
+            purpose: crate::logical_authority::ResourcePurpose,
+            projection: Option<crate::logical_authority::Projection>,
+        ) -> Result<crate::broker_protocol::SensitiveBytes> {
+            assert_eq!(resource, "token");
+            assert_eq!(purpose, crate::logical_authority::ResourcePurpose::Read);
+            assert_eq!(
+                projection,
+                Some(crate::logical_authority::Projection::Stdin)
+            );
+            crate::broker_protocol::SensitiveBytes::new(vec![0, 255, 10])
+        }
         fn github_token(
             &self,
             _operation: &ProviderOperation<'_>,
@@ -2238,6 +2660,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -2278,6 +2702,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: Some(crate::linux_admission::SessionGitHubGrant {
                     credential_slot: "automation".into(),
                     app_id: 42,
@@ -2328,6 +2754,8 @@ mod tests {
             workload: "codex".into(),
             profile: "automation".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: None,
                 signing: Some(key.clone()),
                 release_signing: None,
@@ -2400,6 +2828,8 @@ mod tests {
             workload: "release-agent".into(),
             profile: "release".into(),
             authority: crate::linux_admission::SessionAuthorityGrant {
+                logical: None,
+                hard_deadline_boot_ms: None,
                 github: None,
                 signing: Some(key.clone()),
                 release_signing: None,

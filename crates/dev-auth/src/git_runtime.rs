@@ -1394,13 +1394,16 @@ fn supported_git_version(stdout: &[u8], stderr: &[u8]) -> bool {
 
 pub(super) fn validate_git_version(program: &str, program_guard: &ProgramGuard) -> Result<()> {
     let mut command = guarded_command(program, program_guard)?;
-    let output = command
+    command
         .arg("--version")
         .env_clear()
-        .envs(sanitized_current_environment())
-        .stdin(Stdio::null())
-        .output()
-        .context("inspect configured Git version")?;
+        .envs(sanitized_current_environment());
+    let output = dev_tools_command::run_prepared_bounded_command(
+        &mut command,
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .context("inspect configured Git version")?;
     if !output.status.success() || !supported_git_version(&output.stdout, &output.stderr) {
         bail!("configured Git does not satisfy the reviewed 2.40-or-newer major-2 contract");
     }

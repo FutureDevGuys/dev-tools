@@ -38,9 +38,10 @@ use std::io::{self, Read};
 use std::io::{Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(not(target_os = "linux"))]
 use std::ops::{Deref, DerefMut};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -62,6 +63,25 @@ mod windows_security;
 
 #[path = "git_runtime.rs"]
 mod git_runtime;
+
+mod validation;
+pub use validation::{
+    validate_components, ComponentValidationReport, ValidationCheck, ValidationComponent,
+    ValidationRequest, ValidationStatus,
+};
+
+#[cfg(target_os = "linux")]
+mod prompt_free_store;
+
+#[cfg(target_os = "linux")]
+pub(crate) use prompt_free_store::CredentialUnavailable;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialInteraction {
+    AllowPrompt,
+    NoPrompt,
+}
 
 use git_runtime::{
     frontend_runtime_and_config, validate_bound_git_credential_authority,
@@ -258,6 +278,16 @@ fn load_config_at(path: &Path) -> Result<Config> {
 }
 
 fn load_config_snapshot_at(path: &Path) -> Result<(Config, String)> {
+    let (config, digest) = read_config_snapshot_at(path)?;
+    #[cfg(windows)]
+    validate_configured_windows_programs(&config)?;
+    Ok((config, digest))
+}
+
+// Validation can inspect configuration without coupling that observation to
+// every configured native executable. Runtime callers retain the platform
+// executable checks in load_config_snapshot_at above.
+fn read_config_snapshot_at(path: &Path) -> Result<(Config, String)> {
     let parent = path
         .parent()
         .context("dev-auth configuration has no parent directory")?;
@@ -271,8 +301,6 @@ fn load_config_snapshot_at(path: &Path) -> Result<(Config, String)> {
         bail!("configuration exceeds the size limit");
     }
     let config = parse_config(&bytes)?;
-    #[cfg(windows)]
-    validate_configured_windows_programs(&config)?;
     let digest = Sha256::digest(&bytes);
     let digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok((config, digest))
@@ -303,21 +331,21 @@ fn validate_configured_windows_programs(config: &Config) -> Result<()> {
 #[cfg(windows)]
 type ProgramGuard = windows_security::ProgramGuard;
 #[cfg(target_os = "linux")]
-struct ProgramGuard {
-    executable: OwnedFd,
-    execution_path: PathBuf,
-    _ancestor_directories: Vec<OwnedFd>,
-    _proc_fd_directory: OwnedFd,
-}
+type ProgramGuard = dev_tools_command::HeldExecutable;
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 struct ProgramGuard;
 
+#[cfg(target_os = "linux")]
+type GuardedCommand<'a> = dev_tools_command::HeldCommand<'a>;
+
+#[cfg(not(target_os = "linux"))]
 struct GuardedCommand<'a> {
     command: Command,
     _guard: &'a ProgramGuard,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Deref for GuardedCommand<'_> {
     type Target = Command;
 
@@ -326,6 +354,7 @@ impl Deref for GuardedCommand<'_> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl DerefMut for GuardedCommand<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.command
@@ -361,26 +390,7 @@ fn guarded_command<'a>(program: &str, guard: &'a ProgramGuard) -> Result<Guarded
 
 #[cfg(target_os = "linux")]
 fn guarded_command<'a>(program: &str, guard: &'a ProgramGuard) -> Result<GuardedCommand<'a>> {
-    let descriptor = guard.executable.as_raw_fd();
-    let mut command = Command::new(&guard.execution_path);
-    command.arg0(program);
-    // SAFETY: GuardedCommand borrows ProgramGuard, so the descriptor remains open
-    // through spawn and child completion. After fork the child owns the same file
-    // table entry. Clearing only FD_CLOEXEC with fcntl is async-signal-safe and lets
-    // an interpreter reopen /proc/self/fd/N without a pathname lookup of the source.
-    unsafe {
-        command.pre_exec(move || {
-            // SAFETY: the ProgramGuard borrow described above keeps this exact raw
-            // descriptor valid until Command has completed its pre-exec callback.
-            let descriptor = BorrowedFd::borrow_raw(descriptor);
-            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
-                .map_err(io::Error::from)
-        });
-    }
-    Ok(GuardedCommand {
-        command,
-        _guard: guard,
-    })
+    guard.command(OsStr::new(program))
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
@@ -467,99 +477,28 @@ fn linux_program_filesystem_is_local(filesystem_type: u64) -> bool {
 
 #[cfg(target_os = "linux")]
 fn lock_linux_program(path: &Path, description: &str) -> Result<ProgramGuard> {
+    use dev_tools_command::HeldComponentKind;
     let identity = LinuxProgramIdentity::current()?;
-    let mut components = path.components();
-    if components.next() != Some(std::path::Component::RootDir) {
-        bail!("{description} must use an absolute native Linux path");
-    }
-    let names: Vec<OsString> = components
-        .map(|component| match component {
-            std::path::Component::Normal(name) => Ok(name.to_os_string()),
-            _ => bail!("{description} path contains a non-canonical component"),
-        })
-        .collect::<Result<_>>()?;
-    let (file_name, directory_names) = names
-        .split_last()
-        .context("configured program path has no executable name")?;
-
-    let directory_flags = rustix::fs::OFlags::PATH
-        | rustix::fs::OFlags::DIRECTORY
-        | rustix::fs::OFlags::NOFOLLOW
-        | rustix::fs::OFlags::CLOEXEC;
-    let root = rustix::fs::open("/", directory_flags, rustix::fs::Mode::empty())
-        .context("open configured program filesystem root without following links")?;
-    validate_linux_program_component(
-        &rustix::fs::fstat(&root).context("inspect configured program filesystem root")?,
-        rustix::fs::FileType::Directory,
-        &identity,
-        "configured program filesystem root",
-    )?;
-    let mut ancestor_directories = vec![root];
-    for name in directory_names {
-        let directory = rustix::fs::openat(
-            ancestor_directories
-                .last()
-                .context("configured program ancestor chain is empty")?,
-            name,
-            directory_flags,
-            rustix::fs::Mode::empty(),
-        )
-        .with_context(|| format!("open {description} ancestor without following links"))?;
+    ProgramGuard::open_with_validation(path, |descriptor, kind| {
+        let expected_type = match kind {
+            HeldComponentKind::Directory => rustix::fs::FileType::Directory,
+            HeldComponentKind::Executable => rustix::fs::FileType::RegularFile,
+        };
         validate_linux_program_component(
-            &rustix::fs::fstat(&directory)
-                .with_context(|| format!("inspect {description} ancestor"))?,
-            rustix::fs::FileType::Directory,
+            &rustix::fs::fstat(descriptor)
+                .context("inspect retained configured program component")?,
+            expected_type,
             &identity,
-            "configured program ancestor",
+            description,
         )?;
-        ancestor_directories.push(directory);
-    }
-
-    let executable = rustix::fs::openat(
-        ancestor_directories
-            .last()
-            .context("configured program ancestor chain is empty")?,
-        file_name,
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .with_context(|| format!("open configured {description} executable without following links"))?;
-    let executable_metadata = rustix::fs::fstat(&executable)
-        .with_context(|| format!("inspect configured {description}"))?;
-    validate_linux_program_component(
-        &executable_metadata,
-        rustix::fs::FileType::RegularFile,
-        &identity,
-        "configured program executable",
-    )?;
-    let filesystem = rustix::fs::fstatfs(&executable)
-        .with_context(|| format!("inspect configured {description} filesystem"))?;
-    if !linux_program_filesystem_is_local(filesystem.f_type as u64) {
-        bail!("configured {description} executable is not on a trusted local filesystem");
-    }
-
-    let proc_fd_directory =
-        rustix::fs::open("/proc/self/fd", directory_flags, rustix::fs::Mode::empty())
-            .context("open Linux process file-descriptor directory")?;
-    let proc_filesystem = rustix::fs::fstatfs(&proc_fd_directory)
-        .context("inspect Linux process file-descriptor filesystem")?;
-    if proc_filesystem.f_type as u64 != 0x0000_9fa0 {
-        bail!("Linux process file-descriptor directory is not provided by procfs");
-    }
-    let execution_path = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
-    let execution_metadata = fs::metadata(&execution_path)
-        .context("inspect held configured-program execution identity")?;
-    if execution_metadata.dev() != executable_metadata.st_dev
-        || execution_metadata.ino() != executable_metadata.st_ino
-    {
-        bail!("held configured-program execution identity does not match its descriptor");
-    }
-
-    Ok(ProgramGuard {
-        executable,
-        execution_path,
-        _ancestor_directories: ancestor_directories,
-        _proc_fd_directory: proc_fd_directory,
+        if kind == HeldComponentKind::Executable {
+            let filesystem = rustix::fs::fstatfs(descriptor)
+                .context("inspect retained configured program filesystem")?;
+            if !linux_program_filesystem_is_local(filesystem.f_type as u64) {
+                bail!("configured {description} executable is not on a trusted local filesystem");
+            }
+        }
+        Ok(())
     })
 }
 
@@ -823,7 +762,14 @@ fn validate_broker_credential_slot(slot: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub(crate) fn user_broker_service_tokens<'a>(
     slots: impl Iterator<Item = &'a str>,
+    interaction: CredentialInteraction,
 ) -> Result<BTreeMap<String, SecretString>> {
+    if interaction == CredentialInteraction::NoPrompt {
+        let stores = slots
+            .map(|slot| Ok((slot.to_owned(), user_broker_credential_store(slot)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        return prompt_free_store::read(&stores).map_err(Into::into);
+    }
     slots
         .map(|slot| {
             Ok((
@@ -952,7 +898,7 @@ fn read_declared_secret(config: &Config, reference: &str) -> Result<SecretString
     read_declared_secret_with_token(&operation, &config.programs.op, &service_token, reference)
 }
 
-struct OnePasswordProvider<'a> {
+pub(crate) struct OnePasswordProvider<'a> {
     id: ProviderId,
     op_program: &'a str,
     service_token: &'a SecretString,
@@ -962,8 +908,20 @@ struct OnePasswordProvider<'a> {
 
 impl<'a> OnePasswordProvider<'a> {
     fn new(op_program: &'a str, service_token: &'a SecretString) -> Result<Self> {
+        Self::named(
+            ProviderId::parse("one-password")?,
+            op_program,
+            service_token,
+        )
+    }
+
+    pub(crate) fn named(
+        id: ProviderId,
+        op_program: &'a str,
+        service_token: &'a SecretString,
+    ) -> Result<Self> {
         Ok(Self {
-            id: ProviderId::parse("one-password")?,
+            id,
             op_program,
             service_token,
             #[cfg(target_os = "linux")]
@@ -1020,6 +978,35 @@ struct LinuxProviderExecInvocation<'a> {
     _provider_guard: &'a ProgramGuard,
 }
 
+#[derive(Clone, Copy)]
+enum OnePasswordInvocation<'a> {
+    Read(&'a str),
+    CurrentAccount,
+}
+
+impl OnePasswordInvocation<'_> {
+    fn native_arguments(self) -> Vec<OsString> {
+        match self {
+            Self::Read(reference) => ["read", "--no-newline", reference]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            Self::CurrentAccount => ["user", "get", "--me", "--format", "json"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn child_arguments(self) -> Vec<OsString> {
+        match self {
+            Self::Read(reference) => vec!["--reference".into(), reference.into()],
+            Self::CurrentAccount => vec!["--current-account".into()],
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn sealed_provider_token(service_token: &SecretString) -> Result<File> {
     let token = service_token.expose().as_bytes();
@@ -1060,11 +1047,11 @@ fn prepare_linux_provider_exec<'a>(
     provider_guard: &'a ProgramGuard,
     op_program: &str,
     service_token: &SecretString,
-    reference: &str,
+    invocation: OnePasswordInvocation<'_>,
 ) -> Result<LinuxProviderExecInvocation<'a>> {
     let token = sealed_provider_token(service_token)?;
-    let child_fd = provider_child_guard.executable.as_raw_fd();
-    let provider_fd = provider_guard.executable.as_raw_fd();
+    let child_fd = provider_child_guard.as_fd().as_raw_fd();
+    let provider_fd = provider_guard.as_fd().as_raw_fd();
     let token_fd = token.as_raw_fd();
     if child_fd <= nix::libc::STDERR_FILENO
         || provider_fd <= nix::libc::STDERR_FILENO
@@ -1087,9 +1074,8 @@ fn prepare_linux_provider_exec<'a>(
             OsString::from(token_fd.to_string()),
             OsString::from("--provider-argv0"),
             OsString::from(op_program),
-            OsString::from("--reference"),
-            OsString::from(reference),
         ])
+        .args(invocation.child_arguments())
         .env_clear()
         .envs(sanitized_current_environment());
     // SAFETY: both descriptors remain owned by LinuxProviderExecInvocation and
@@ -1124,6 +1110,27 @@ fn run_linux_provider_read(
     reference: &str,
     timeout: Duration,
 ) -> std::result::Result<BoundedCommandOutput, SecretError> {
+    run_linux_provider_operation(
+        operation,
+        child_executable,
+        op_program,
+        provider_guard,
+        service_token,
+        OnePasswordInvocation::Read(reference),
+        timeout,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_provider_operation(
+    operation: SecretOperationContext<'_>,
+    child_executable: &Path,
+    op_program: &str,
+    provider_guard: &ProgramGuard,
+    service_token: &SecretString,
+    invocation: OnePasswordInvocation<'_>,
+    timeout: Duration,
+) -> std::result::Result<BoundedCommandOutput, SecretError> {
     let child_guard = lock_linux_program(child_executable, "running dev-auth executable")
         .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
     let mut invocation = prepare_linux_provider_exec(
@@ -1131,7 +1138,7 @@ fn run_linux_provider_read(
         provider_guard,
         op_program,
         service_token,
-        reference,
+        invocation,
     )
     .map_err(|_| secret_error(SecretErrorKind::ProviderFailure))?;
     run_prepared_bounded_command_with_cancellation(
@@ -1261,18 +1268,24 @@ pub fn run_provider_exec_child() -> Result<i32> {
     if !Path::new(&provider_argv0).is_absolute() {
         bail!("internal provider child argv0 must be an absolute path");
     }
-    if arguments.next().as_deref() != Some(OsStr::new("--reference")) {
-        bail!("internal provider child protocol is malformed");
-    }
-    let reference = arguments
-        .next()
-        .context("internal provider child reference is missing")?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("internal provider child reference is invalid"))?;
+    let native_arguments = match arguments.next().as_deref() {
+        Some(selector) if selector == OsStr::new("--reference") => {
+            let reference = arguments
+                .next()
+                .context("internal provider child reference is missing")?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("internal provider child reference is invalid"))?;
+            crate::validate_op_reference(&reference)?;
+            OnePasswordInvocation::Read(&reference).native_arguments()
+        }
+        Some(selector) if selector == OsStr::new("--current-account") => {
+            OnePasswordInvocation::CurrentAccount.native_arguments()
+        }
+        _ => bail!("internal provider child protocol is malformed"),
+    };
     if arguments.next().is_some() {
         bail!("internal provider child protocol has trailing arguments");
     }
-    crate::validate_op_reference(&reference)?;
 
     // SAFETY: the three raw descriptors were validated as open, positive, and
     // distinct in this newly execed single-threaded process. The child
@@ -1300,7 +1313,7 @@ pub fn run_provider_exec_child() -> Result<i32> {
         .context("close provider credential transport across provider exec")?;
     let error = Command::new(provider_path)
         .arg0(provider_argv0)
-        .args(["read", "--no-newline", &reference])
+        .args(native_arguments)
         .env_clear()
         .envs(sanitized_current_environment())
         .env("OP_SERVICE_ACCOUNT_TOKEN", token_text)
@@ -1317,10 +1330,29 @@ fn run_provider_read(
     reference: &str,
     timeout: Duration,
 ) -> std::result::Result<BoundedCommandOutput, SecretError> {
+    run_provider_operation(
+        operation,
+        op_program,
+        provider_guard,
+        service_token,
+        OnePasswordInvocation::Read(reference),
+        timeout,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_provider_operation(
+    operation: SecretOperationContext<'_>,
+    op_program: &str,
+    provider_guard: &ProgramGuard,
+    service_token: &SecretString,
+    invocation: OnePasswordInvocation<'_>,
+    timeout: Duration,
+) -> std::result::Result<BoundedCommandOutput, SecretError> {
     let mut command = guarded_command(op_program, provider_guard)
         .map_err(|_| secret_error(SecretErrorKind::ProviderFailure))?;
     command
-        .args(["read", "--no-newline", reference])
+        .args(invocation.native_arguments())
         .env_clear()
         .envs(sanitized_current_environment())
         .env("OP_SERVICE_ACCOUNT_TOKEN", service_token.expose());
@@ -1403,14 +1435,31 @@ fn validate_provider_read_output(
     if !output.status.success() {
         return Err(secret_error(SecretErrorKind::PermissionDenied));
     }
-    let value =
-        std::str::from_utf8(&stdout).map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
-    if value.is_empty() || value.contains('\0') {
-        return Err(secret_error(SecretErrorKind::InvalidResponse));
-    }
-    let value = SecretMaterial::new(value.as_bytes().to_vec())?;
+    let value = SecretMaterial::new(stdout.to_vec())?;
     operation.checkpoint()?;
     Ok(value)
+}
+
+fn validate_current_account_health(
+    bytes: &[u8],
+) -> std::result::Result<ProviderHealth, SecretError> {
+    #[derive(Deserialize)]
+    struct CurrentAccount {
+        id: String,
+        state: String,
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    let account: CurrentAccount = serde_json::from_slice(bytes)
+        .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
+    if account.id.is_empty() || account.kind != "SERVICE_ACCOUNT" {
+        return Err(secret_error(SecretErrorKind::InvalidResponse));
+    }
+    Ok(if account.state == "ACTIVE" {
+        ProviderHealth::Healthy
+    } else {
+        ProviderHealth::Unavailable
+    })
 }
 
 impl SecretProvider for OnePasswordProvider<'_> {
@@ -1421,7 +1470,7 @@ impl SecretProvider for OnePasswordProvider<'_> {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             exportable_read: true,
-            public_material: false,
+            public_material: true,
             signing: false,
             metadata: true,
         }
@@ -1432,10 +1481,39 @@ impl SecretProvider for OnePasswordProvider<'_> {
         operation: SecretOperationContext<'_>,
     ) -> std::result::Result<ProviderHealth, SecretError> {
         operation.checkpoint()?;
-        program_guard(self.op_program, "1Password CLI")
+        let guard = program_guard(self.op_program, "1Password CLI")
             .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
+        let timeout = operation
+            .remaining()?
+            .checked_sub(Duration::from_secs(2))
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| secret_error(SecretErrorKind::DeadlineExceeded))?;
+        #[cfg(target_os = "linux")]
+        let output = run_linux_provider_operation(
+            operation,
+            &self.child_executable,
+            self.op_program,
+            &guard,
+            self.service_token,
+            OnePasswordInvocation::CurrentAccount,
+            timeout,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let output = run_provider_operation(
+            operation,
+            self.op_program,
+            &guard,
+            self.service_token,
+            OnePasswordInvocation::CurrentAccount,
+            timeout,
+        )?;
+        let stdout = zeroize::Zeroizing::new(output.stdout);
+        let _stderr = zeroize::Zeroizing::new(output.stderr);
         operation.checkpoint()?;
-        Ok(ProviderHealth::Healthy)
+        if !output.status.success() {
+            return Ok(ProviderHealth::Unavailable);
+        }
+        validate_current_account_health(&stdout)
     }
 
     fn metadata(
@@ -1452,7 +1530,7 @@ impl SecretProvider for OnePasswordProvider<'_> {
         }
         Ok(SecretMetadata {
             exportable: true,
-            public_material: false,
+            public_material: true,
             signing: false,
         })
     }
@@ -1480,11 +1558,17 @@ impl SecretProvider for OnePasswordProvider<'_> {
 
     fn public_material(
         &self,
-        _reference: &SecretReference,
+        reference: &SecretReference,
         operation: SecretOperationContext<'_>,
     ) -> std::result::Result<SecretPublicMaterial, SecretError> {
         operation.checkpoint()?;
-        Err(secret_error(SecretErrorKind::Unsupported))
+        // The adapter may hold private material to derive a public key. Only
+        // the public derivative crosses this operation boundary; product read
+        // permission is deliberately not substituted for public permission.
+        let material = self.read_exportable(reference, operation)?;
+        let public = derive_provider_public_material(&material)?;
+        operation.checkpoint()?;
+        Ok(public)
     }
 
     fn sign(
@@ -1498,10 +1582,53 @@ impl SecretProvider for OnePasswordProvider<'_> {
     }
 }
 
+fn derive_provider_public_material(
+    material: &SecretMaterial,
+) -> std::result::Result<SecretPublicMaterial, SecretError> {
+    let source = provider_material_as_secret_string(material)
+        .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
+    if let Ok(private_key) = parse_declared_ssh_private_key(&source) {
+        let public = PublicKey::new(private_key.public_key().key_data().clone(), "dev-auth")
+            .to_openssh()
+            .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
+        return SecretPublicMaterial::new(public.into_bytes());
+    }
+    let encoded = source.expose().trim();
+    if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(secret_error(SecretErrorKind::Unsupported));
+    }
+    let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
+    }
+    let public = ed25519_dalek::SigningKey::from_bytes(&bytes).verifying_key();
+    let encoded = public
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    SecretPublicMaterial::new(encoded.into_bytes())
+}
+
 fn provider_material_as_secret_string(material: &SecretMaterial) -> Result<SecretString> {
     let value = std::str::from_utf8(material.expose_secret())
         .map_err(|_| SecretError::new(SecretErrorKind::InvalidResponse))?;
+    if value.is_empty() || value.contains('\0') {
+        return Err(SecretError::new(SecretErrorKind::InvalidResponse).into());
+    }
     Ok(SecretString::new(value.to_owned()))
+}
+
+pub(crate) fn validate_rsa_key_material(material: &SecretMaterial) -> Result<()> {
+    use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
+    let pem = std::str::from_utf8(material.expose_secret())
+        .map_err(|_| anyhow::anyhow!("declared RSA key is invalid"))?;
+    let key = rsa::RsaPrivateKey::from_pkcs8_pem(pem)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(pem))
+        .map_err(|_| anyhow::anyhow!("declared RSA key is invalid"))?;
+    key.validate()
+        .map_err(|_| anyhow::anyhow!("declared RSA key is invalid"))
 }
 
 fn read_exportable_from_provider(
@@ -2509,6 +2636,8 @@ pub fn broker_credential_get(input: &[u8]) -> Result<String> {
             bail!("broker denied Git credentials ({code}): {message}")
         }
         crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Accepted
         | crate::broker_protocol::BrokerResponse::Ready { .. }
         | crate::broker_protocol::BrokerResponse::GhExecutionToken { .. }
@@ -2535,6 +2664,8 @@ pub fn broker_credential_erase(input: &[u8]) -> Result<()> {
             bail!("broker denied Git credential invalidation ({code}): {message}")
         }
         crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Ready { .. }
         | crate::broker_protocol::BrokerResponse::GitCredential { .. }
         | crate::broker_protocol::BrokerResponse::GhExecutionToken { .. }
@@ -3288,6 +3419,8 @@ pub fn exec_broker_gh(arguments: &[OsString], session_id: &str) -> Result<()> {
             bail!("broker denied GitHub CLI authority ({code}): {message}")
         }
         crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Accepted
         | crate::broker_protocol::BrokerResponse::Ready { .. }
         | crate::broker_protocol::BrokerResponse::GitCredential { .. }
@@ -3323,26 +3456,37 @@ pub fn exec_broker_gh(arguments: &[OsString], session_id: &str) -> Result<()> {
 
     let guard = program_guard(&receipt.native_gh, "GitHub CLI")?;
     let mut command = guarded_command(&receipt.native_gh, &guard)?;
-    remove_automation_credential_environment(&mut command);
+    configure_broker_gh_command(&mut command, arguments, token.expose(), &gh_config);
+    let error = command.exec();
+    Err(error).context("exec broker-authorized native GitHub CLI")
+}
+
+#[cfg(target_os = "linux")]
+fn configure_broker_gh_command(
+    command: &mut Command,
+    arguments: &[OsString],
+    token: &str,
+    gh_config: &Path,
+) {
+    remove_automation_credential_environment(command);
     command
         .args(arguments)
-        .env("GH_TOKEN", token.expose())
-        .env("GH_CONFIG_DIR", &gh_config)
+        .env("GH_TOKEN", token)
+        .env("GH_CONFIG_DIR", gh_config)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let error = command.exec();
-    Err(error).context("exec broker-authorized native GitHub CLI")
 }
 
 #[cfg(target_os = "linux")]
 fn remove_automation_credential_environment(command: &mut Command) {
+    for variable in GITHUB_AUTH_ENVIRONMENT {
+        command.env_remove(variable);
+    }
     for variable in [
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
         "SSH_AUTH_SOCK",
@@ -3369,6 +3513,14 @@ fn remove_automation_credential_environment(command: &mut Command) {
         .env("GIT_ASKPASS", "/usr/bin/false")
         .env("SSH_ASKPASS", "/usr/bin/false");
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) const GITHUB_AUTH_ENVIRONMENT: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
 
 fn gh_version_is_supported(stdout: &[u8], stderr: &[u8]) -> bool {
     if !stderr.is_empty() {
@@ -3426,13 +3578,17 @@ fn validate_gh_version(
     paths: &RuntimePaths,
     program_guard: &ProgramGuard,
 ) -> Result<()> {
-    let output = guarded_command(program, program_guard)?
+    let mut command = guarded_command(program, program_guard)?;
+    command
         .arg("--version")
         .env_clear()
-        .envs(isolated_gh_probe_environment(paths))
-        .stdin(Stdio::null())
-        .output()
-        .context("inspect configured GitHub CLI version")?;
+        .envs(isolated_gh_probe_environment(paths));
+    let output = dev_tools_command::run_prepared_bounded_command(
+        &mut command,
+        Duration::from_secs(5),
+        16 * 1024,
+    )
+    .context("inspect configured GitHub CLI version")?;
     if !output.status.success() || !gh_version_is_supported(&output.stdout, &output.stderr) {
         bail!(
             "configured GitHub CLI does not match the supported {} protocol",
@@ -4308,6 +4464,22 @@ fn broker_sign_ssh_with_source(
     declared_fingerprint: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    let private_key =
+        parse_identity_bound_ssh_key(source, declared_public_key, declared_fingerprint)?;
+    let signature = private_key
+        .try_sign(payload)
+        .context("perform broker-backed SSH signature")?;
+    let encoded = Vec::<u8>::try_from(signature).context("encode broker-backed SSH signature")?;
+    operation.checkpoint()?;
+    Ok(encoded)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_identity_bound_ssh_key(
+    source: &SecretString,
+    declared_public_key: &str,
+    declared_fingerprint: &str,
+) -> Result<PrivateKey> {
     let private_key = parse_declared_ssh_private_key(source)?;
     let public_key = PublicKey::from_openssh(declared_public_key)
         .context("declared operation public key is invalid")?;
@@ -4316,12 +4488,20 @@ fn broker_sign_ssh_with_source(
     {
         bail!("declared operation key identity does not match private material");
     }
-    let signature = private_key
-        .try_sign(payload)
-        .context("perform broker-backed SSH signature")?;
-    let encoded = Vec::<u8>::try_from(signature).context("encode broker-backed SSH signature")?;
-    operation.checkpoint()?;
-    Ok(encoded)
+    if private_key.is_encrypted() {
+        bail!("declared operation key is encrypted");
+    }
+    Ok(private_key)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_ssh_key_material(
+    material: &SecretMaterial,
+    public_key: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let source = provider_material_as_secret_string(material)?;
+    parse_identity_bound_ssh_key(&source, public_key, fingerprint).map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -4349,6 +4529,17 @@ fn broker_sign_release_manifest_with_source(
     declared_public_key: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    let signing_key = parse_identity_bound_release_key(source, declared_public_key)?;
+    let signature = signing_key.sign(payload).to_bytes().to_vec();
+    operation.checkpoint()?;
+    Ok(signature)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_identity_bound_release_key(
+    source: &SecretString,
+    declared_public_key: &str,
+) -> Result<ed25519_dalek::SigningKey> {
     let encoded = source.expose().trim();
     if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("declared release private key is not raw Ed25519 hex material");
@@ -4364,9 +4555,16 @@ fn broker_sign_release_manifest_with_source(
     if signing_key.verifying_key() != public_key {
         bail!("declared release key identity does not match private material");
     }
-    let signature = signing_key.sign(payload).to_bytes().to_vec();
-    operation.checkpoint()?;
-    Ok(signature)
+    Ok(signing_key)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_release_key_material(
+    material: &SecretMaterial,
+    public_key: &str,
+) -> Result<()> {
+    let source = provider_material_as_secret_string(material)?;
+    parse_identity_bound_release_key(&source, public_key).map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -4411,6 +4609,8 @@ pub fn broker_sign_release_manifest(profile: &str, payload: &[u8]) -> Result<Vec
             bail!("broker denied release-signing authority ({code}): {message}")
         }
         crate::broker_protocol::BrokerResponse::NoSession
+        | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Accepted
         | crate::broker_protocol::BrokerResponse::Ready { .. }
         | crate::broker_protocol::BrokerResponse::GitCredential { .. }
@@ -4440,52 +4640,7 @@ fn parse_declared_ssh_private_key(source: &SecretString) -> Result<PrivateKey> {
 }
 
 pub fn validate_configuration(online: bool) -> Result<ValidationReport> {
-    let paths = git_runtime::native_runtime_paths()?;
-    let config = load_config(&paths)?;
-    let gh_program_guard = program_guard(&config.programs.gh, "GitHub CLI")?;
-    validate_gh_version(&config.programs.gh, &paths, &gh_program_guard)?;
-    if config.git.is_some() {
-        let git_program_guard = program_guard(&config.programs.git, "Git")?;
-        validate_git_version(&config.programs.git, &git_program_guard)?;
-        git_runtime::validate_workspace_policy(&config)?;
-    }
-    let references = config.declared_secret_references();
-    if online {
-        let mut secrets = BTreeMap::new();
-        for reference in &references {
-            secrets.insert(reference, read_declared_secret(&config, reference)?);
-        }
-        let app_key = secrets
-            .get(&config.github.private_key_ref)
-            .context("declared GitHub App private key was not checked")?;
-        EncodingKey::from_rsa_pem(app_key.expose().as_bytes())
-            .context("GitHub App private key is not a valid RSA PEM key")?;
-        for profile in config.ssh_profiles.values() {
-            for key in &profile.keys {
-                let source = secrets
-                    .get(&key.private_key_ref)
-                    .context("declared SSH private key was not checked")?;
-                let private_key = parse_declared_ssh_private_key(source)?;
-                if private_key.is_encrypted() || private_key.algorithm() != SshAlgorithm::Ed25519 {
-                    bail!("declared SSH key must be an unencrypted Ed25519 OpenSSH key");
-                }
-                if private_key
-                    .public_key()
-                    .fingerprint(HashAlg::Sha256)
-                    .to_string()
-                    != key.fingerprint
-                {
-                    bail!("declared SSH key fingerprint does not match its private key");
-                }
-            }
-        }
-    }
-    Ok(ValidationReport {
-        online,
-        declared_exec_profiles: config.profiles.len(),
-        declared_ssh_profiles: config.ssh_profiles.len(),
-        declared_secret_references: references.len(),
-    })
+    validation::validate_legacy_compatibility(online)
 }
 
 fn declared_agent(config: &Config, profile: &SshProfile) -> Result<DeclaredAgent> {
@@ -4658,6 +4813,152 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_automation_environment_removes_every_github_token_but_preserves_routing_and_ui() {
+        let mut command = Command::new("/unused");
+        for variable in GITHUB_AUTH_ENVIRONMENT {
+            command.env(variable, "synthetic-human-token");
+        }
+        command
+            .env("GH_HOST", "enterprise.example")
+            .env("GH_EDITOR", "editor --wait");
+        remove_automation_credential_environment(&mut command);
+        for variable in GITHUB_AUTH_ENVIRONMENT {
+            assert!(command
+                .get_envs()
+                .any(|(name, value)| name == *variable && value.is_none()));
+        }
+        for (variable, expected) in [
+            ("GH_HOST", "enterprise.example"),
+            ("GH_EDITOR", "editor --wait"),
+        ] {
+            assert!(command
+                .get_envs()
+                .any(|(name, value)| name == variable && value == Some(OsStr::new(expected))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_gh_native_command_preserves_unparsed_bytes_streams_status_and_routing() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = linux_program_test_directory();
+        let program = root.path().join("native-gh");
+        fs::write(
+            &program,
+            br##"#!/bin/sh
+[ "$GH_TOKEN" = synthetic-admitted-token ] || exit 90
+[ -z "${GITHUB_TOKEN+x}${GH_ENTERPRISE_TOKEN+x}${GITHUB_ENTERPRISE_TOKEN+x}" ] || exit 91
+[ "$GH_HOST" = enterprise.example ] || exit 92
+[ "$GH_EDITOR" = 'editor --wait' ] || exit 93
+[ "$GH_PROMPT_DISABLED" = 1 ] || exit 94
+[ "$GIT_CONFIG_GLOBAL" = /dev/null ] || exit 95
+[ "$GH_CONFIG_DIR" = "$PWD/private-gh" ] || exit 96
+printf 'invoked\n' >>invocations
+printf '%s\000' "$@"
+/usr/bin/cat
+printf 'native-stderr\n' >&2
+exit 29
+"##,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = lock_linux_program(&program, "synthetic GitHub CLI").unwrap();
+        let arguments = vec![
+            OsString::from("future-extension"),
+            OsString::from("--future-flag=value with spaces"),
+            OsString::from("--hostname"),
+            OsString::from("enterprise.example"),
+            OsString::from_vec(vec![0xff, b'x']),
+            OsString::from(""),
+        ];
+        let mut command = guarded_command(program.to_str().unwrap(), &guard).unwrap();
+        command.env_clear().current_dir(root.path());
+        for variable in GITHUB_AUTH_ENVIRONMENT {
+            command.env(variable, "synthetic-human-token");
+        }
+        command
+            .env("GH_HOST", "enterprise.example")
+            .env("GH_EDITOR", "editor --wait");
+        configure_broker_gh_command(
+            &mut command,
+            &arguments,
+            "synthetic-admitted-token",
+            &root.path().join("private-gh"),
+        );
+        assert!(
+            !root.path().join("invocations").exists(),
+            "preparation must not probe a banner"
+        );
+        let input = root.path().join("input");
+        fs::write(&input, b"binary\0stdin\xff").unwrap();
+        command
+            .stdin(File::open(input).unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(29));
+        let mut expected = Vec::new();
+        for argument in &arguments {
+            expected.extend_from_slice(argument.as_os_str().as_encoded_bytes());
+            expected.push(0);
+        }
+        expected.extend_from_slice(b"binary\0stdin\xff");
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stderr, b"native-stderr\n");
+        assert_eq!(
+            fs::read(root.path().join("invocations")).unwrap(),
+            b"invoked\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires explicit DEV_AUTH_TEST_NATIVE_GH absolute upstream executable paths"]
+    fn broker_gh_native_upstream_version_output_has_no_product_banner_gate() {
+        let paths = env::var_os("DEV_AUTH_TEST_NATIVE_GH").expect("explicit native gh paths");
+        let root = linux_program_test_directory();
+        let gh_config = root.path().join("private-gh");
+        fs::create_dir(&gh_config).unwrap();
+        let mut checked = 0;
+        for path in env::split_paths(&paths) {
+            let guard = lock_linux_program(&path, "explicit native GitHub CLI").unwrap();
+            let mut baseline = guard.command(path.as_os_str()).unwrap();
+            baseline
+                .env_clear()
+                .env("GH_CONFIG_DIR", &gh_config)
+                .arg("--version");
+            let expected = dev_tools_command::run_prepared_bounded_command(
+                &mut baseline,
+                Duration::from_secs(5),
+                16 * 1024,
+            )
+            .unwrap();
+            assert!(expected.status.success());
+            assert!(!expected.stdout.is_empty());
+            let mut admitted = guard.command(path.as_os_str()).unwrap();
+            admitted.env_clear();
+            configure_broker_gh_command(
+                &mut admitted,
+                &["--version".into()],
+                "synthetic-admitted-token",
+                &gh_config,
+            );
+            let actual = dev_tools_command::run_prepared_bounded_command(
+                &mut admitted,
+                Duration::from_secs(5),
+                16 * 1024,
+            )
+            .unwrap();
+            assert_eq!(actual.status, expected.status);
+            assert_eq!(actual.stdout, expected.stdout);
+            assert_eq!(actual.stderr, expected.stderr);
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
     fn config_with_profiles(profiles: BTreeMap<String, SshProfile>) -> Config {
         Config {
             version: 1,
@@ -4717,14 +5018,68 @@ set -eu\n\
 [ \"$3\" = --provider-fd ]\n\
 [ \"$5\" = --token-fd ]\n\
 [ \"$7\" = --provider-argv0 ]\n\
-[ \"$9\" = --reference ]\n\
 token=\"$(/usr/bin/cat \"/proc/self/fd/$6\")\"\n\
 export OP_SERVICE_ACCOUNT_TOKEN=\"$token\"\n\
-exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
+case \"$9\" in\n\
+  --reference) exec \"/proc/self/fd/$4\" read --no-newline \"${10}\" ;;\n\
+  --current-account) exec \"/proc/self/fd/$4\" user get --me --format json ;;\n\
+  *) exit 99 ;;\n\
+esac\n",
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_health_uses_authenticated_current_account_not_executable_presence() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let token = SecretString::new("health-fixture-token".into());
+        for (response, exit_code, expected) in [
+            (
+                r#"{"id":"fixture","state":"ACTIVE","type":"SERVICE_ACCOUNT"}"#,
+                0,
+                Some(ProviderHealth::Healthy),
+            ),
+            (
+                r#"{"id":"fixture","state":"SUSPENDED","type":"SERVICE_ACCOUNT"}"#,
+                0,
+                Some(ProviderHealth::Unavailable),
+            ),
+            (
+                r#"{"id":"fixture","state":"ACTIVE","type":"USER"}"#,
+                0,
+                None,
+            ),
+            ("invalid-response-must-not-escape", 0, None),
+            (
+                "denied-response-must-not-escape",
+                9,
+                Some(ProviderHealth::Unavailable),
+            ),
+        ] {
+            let program = write_linux_op_program(
+                directory.path(),
+                &format!(
+                    r#"
+[ "$#" = 5 ] && [ "$1" = user ] && [ "$2" = get ] && [ "$3" = --me ] && [ "$4" = --format ] && [ "$5" = json ] || exit 90
+[ "$OP_SERVICE_ACCOUNT_TOKEN" = health-fixture-token ] || exit 91
+printf '%s' '{response}'
+exit {exit_code}
+"#
+                ),
+            );
+            let provider =
+                OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+            let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+            let result = provider.health(operation.secret_context());
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected),
+                None => assert_eq!(result.unwrap_err().kind(), SecretErrorKind::InvalidResponse),
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -4744,7 +5099,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
             &provider_guard,
             provider.to_str().unwrap(),
             &token,
-            "op://Automation/provider/private-key",
+            OnePasswordInvocation::Read("op://Automation/provider/private-key"),
         )
         .unwrap();
 
@@ -4862,6 +5217,22 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
         write_linux_test_program(&program, "unsafe-ancestor", 0o700);
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
         assert!(program_guard(program.to_str().unwrap(), "test program").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_program_guard_keeps_stricter_shared_directory_policy() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let program = temporary.path().join("tool");
+        write_linux_test_program(&program, "trusted", 0o700);
+        // The shared mechanism accepts root-owned sticky ancestors. Dev Auth
+        // still rejects all group/other writable ancestors, including /tmp.
+        let metadata = fs::metadata("/tmp").unwrap();
+        assert_eq!(metadata.uid(), 0);
+        assert_ne!(metadata.mode() & 0o022, 0);
+        assert_ne!(metadata.mode() & 0o1000, 0);
+        assert!(dev_tools_command::HeldExecutable::open(&program).is_ok());
+        assert!(lock_linux_program(&program, "test program").is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -6352,6 +6723,56 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn one_password_export_preserves_binary_bytes_without_changing_key_text_validation() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let op = write_linux_op_program(directory.path(), "printf '\\377\\000A\\n'");
+        let service_token = SecretString::new("test-service-token".into());
+        let provider =
+            OnePasswordProvider::at_child(op.to_str().unwrap(), &service_token, &child).unwrap();
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+        let reference = SecretReference::new("op://Automation/provider/value").unwrap();
+        let material = provider
+            .read_exportable(&reference, operation.secret_context())
+            .unwrap();
+        assert_eq!(material.expose_secret(), &[255, 0, b'A', b'\n']);
+        assert!(provider_material_as_secret_string(&material).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_public_operation_derives_only_key_data_not_private_comments() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let key = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[41; 32])),
+            "private-comment-sentinel",
+        )
+        .unwrap();
+        let source = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        let op = write_linux_op_program(
+            directory.path(),
+            &format!("printf '%s' '{}'", source.as_str()),
+        );
+        let service_token = SecretString::new("test-service-token".into());
+        let provider =
+            OnePasswordProvider::at_child(op.to_str().unwrap(), &service_token, &child).unwrap();
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+        let reference = SecretReference::new("op://Automation/provider/value").unwrap();
+        let public = provider
+            .public_material(&reference, operation.secret_context())
+            .unwrap();
+        let text = std::str::from_utf8(public.as_bytes()).unwrap();
+        assert!(!text.contains("private-comment-sentinel"));
+        assert!(!text.contains("PRIVATE KEY"));
+        assert_eq!(
+            PublicKey::from_openssh(text).unwrap().key_data(),
+            key.public_key().key_data()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn one_password_reads_through_the_provider_neutral_contract() {
         use dev_tools_secret::{SecretProvider as _, SecretReference};
 
@@ -6532,6 +6953,68 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn rsa_key_validation_parses_private_structure_without_signing() {
+        use rsa::{pkcs1::EncodeRsaPrivateKey, pkcs8::EncodePrivateKey};
+        let key = rsa::RsaPrivateKey::from_components(
+            3233_u32.into(),
+            17_u32.into(),
+            2753_u32.into(),
+            vec![61_u32.into(), 53_u32.into()],
+        )
+        .unwrap();
+        for pem in [
+            key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap(),
+            key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap(),
+        ] {
+            let material = SecretMaterial::new(pem.as_bytes().to_vec()).unwrap();
+            validate_rsa_key_material(&material).unwrap();
+        }
+        // This is a valid PEM/ASN.1 envelope, not an RSA private key.
+        let malformed =
+            b"-----BEGIN RSA PRIVATE KEY-----\nMAMCAQA=\n-----END RSA PRIVATE KEY-----\n";
+        assert!(EncodingKey::from_rsa_pem(malformed).is_ok());
+        let material = SecretMaterial::new(malformed.to_vec()).unwrap();
+        assert!(validate_rsa_key_material(&material).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ssh_key_validation_requires_private_material_and_both_declared_identities() {
+        let private = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[29; 32])),
+            "validation fixture",
+        )
+        .unwrap();
+        let public = private.public_key();
+        let encoded = public.to_openssh().unwrap();
+        let fingerprint = public.fingerprint(HashAlg::Sha256).to_string();
+        let material = SecretMaterial::new(
+            private
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        validate_ssh_key_material(&material, &encoded, &fingerprint).unwrap();
+        assert!(validate_ssh_key_material(&material, &encoded, "SHA256:wrong").is_err());
+        let other = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[30; 32])),
+            "other",
+        )
+        .unwrap();
+        assert!(validate_ssh_key_material(
+            &material,
+            &other.public_key().to_openssh().unwrap(),
+            &fingerprint
+        )
+        .is_err());
+        let public_only = SecretMaterial::new(encoded.as_bytes().to_vec()).unwrap();
+        assert!(validate_ssh_key_material(&public_only, &encoded, &fingerprint).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn broker_signing_returns_only_a_verifiable_signature_for_the_declared_key() {
         let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
         let directory = linux_program_test_directory();
@@ -6662,9 +7145,13 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
             public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPuruylR5Dw9TRBXnt/aS8+Sj1dH3mUEcqFz8iItXZaZ dev-auth-policy-test".into(),
             fingerprint: "SHA256:5QH+7oUNO/MqyIzx8cLnowDLL1ZieiobwK9fp361KnI".into(),
         };
+        let key = crate::policy_v2::ResolvedOperationKey {
+            credential_slot: "automation".into(),
+            key,
+        };
         let profile = crate::policy_v2::ResolvedAuthorityProfile {
             system_cap: "release".into(),
-            credential_slot: "automation".into(),
+            credential_slots: BTreeSet::from(["automation".into()]),
             github: None,
             signing: true,
             signing_key: Some(key.clone()),
@@ -6677,6 +7164,7 @@ exec \"/proc/self/fd/$4\" read --no-newline \"${10}\"\n",
                 email: "automation@example.invalid".into(),
             }),
             secret_references: BTreeSet::new(),
+            logical_authority: None,
         };
         let configuration = broker_git_configuration(
             &profile,

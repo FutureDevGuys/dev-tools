@@ -3,7 +3,7 @@ authority: canonical
 owner: dev-tools
 ---
 
-# ADR 0029: Linux launcher path dispatch
+# ADR 0087: Linux launcher path dispatch
 
 status: proposed
 verification: pending

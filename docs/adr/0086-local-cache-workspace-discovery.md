@@ -3,7 +3,7 @@ authority: canonical
 owner: dev-tools
 ---
 
-# ADR 0028: Local cache workspace discovery
+# ADR 0086: Local cache workspace discovery
 
 status: proposed
 verification: pending

@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use dev_auth::broker_protocol::BROKER_PROTOCOL_VERSION;
+use dev_auth::control_protocol::CONTROL_PROTOCOL_VERSION;
 use dev_auth::control_protocol::{
     decode_control_request, decode_control_response, encode_control_request,
     encode_control_response, ControlEnvelope, ControlRequest, ControlResponse,
@@ -19,6 +19,8 @@ fn registration() -> SessionRegistration {
         workload: "codex".into(),
         profile: "automation".into(),
         authority: SessionAuthorityGrant {
+            logical: None,
+            hard_deadline_boot_ms: None,
             github: None,
             signing: None,
             release_signing: None,
@@ -38,7 +40,7 @@ fn control_operations_reject_unknown_scope_fields() {
         serde_json::json!({"operation": "revoke", "session_id": "0123456789abcdef0123456789abcdef"}),
         serde_json::json!({"operation": "register", "session": registration()}),
     ] {
-        let mut frame = serde_json::json!({"version": BROKER_PROTOCOL_VERSION, "request_id": "0123456789abcdef0123456789abcdef", "request": request});
+        let mut frame = serde_json::json!({"version": CONTROL_PROTOCOL_VERSION, "request_id": "0123456789abcdef0123456789abcdef", "request": request});
         let decoded = decode_control_request(&serde_json::to_vec(&frame).unwrap()).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&encode_control_request(&decoded).unwrap())
@@ -53,7 +55,7 @@ fn control_operations_reject_unknown_scope_fields() {
 #[test]
 fn supervisor_control_frames_are_closed_bounded_and_correlated() {
     let request = ControlEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: CONTROL_PROTOCOL_VERSION,
         request_id: "abcdef0123456789abcdef0123456789".into(),
         request: ControlRequest::Register {
             session: Box::new(registration()),
@@ -69,7 +71,7 @@ fn supervisor_control_frames_are_closed_bounded_and_correlated() {
     assert_eq!(session.execution_uid, 991);
 
     let response = ControlResponseEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: CONTROL_PROTOCOL_VERSION,
         request_id: request.request_id,
         response: ControlResponse::Accepted,
     };
@@ -87,7 +89,7 @@ fn supervisor_control_frames_are_closed_bounded_and_correlated() {
 #[test]
 fn root_control_prepares_the_kernel_observed_execution_identity() {
     let request = ControlEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: CONTROL_PROTOCOL_VERSION,
         request_id: "abcdef0123456789abcdef0123456789".into(),
         request: ControlRequest::Prepare {
             session: Box::new(PendingSessionRegistration {
@@ -98,6 +100,8 @@ fn root_control_prepares_the_kernel_observed_execution_identity() {
                 workload: "codex".into(),
                 profile: "automation".into(),
                 authority: SessionAuthorityGrant {
+                    logical: None,
+                    hard_deadline_boot_ms: None,
                     github: None,
                     signing: None,
                     release_signing: None,
@@ -120,8 +124,10 @@ fn root_control_prepares_the_kernel_observed_execution_identity() {
 
 #[test]
 fn control_protocol_rejects_invalid_identifiers_and_denial_text() {
+    let legacy = serde_json::json!({"version": 3, "request_id": "0123456789abcdef0123456789abcdef", "request": {"operation": "revoke", "session_id": "0123456789abcdef0123456789abcdef"}});
+    assert!(decode_control_request(&serde_json::to_vec(&legacy).unwrap()).is_err());
     let invalid = ControlEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: CONTROL_PROTOCOL_VERSION,
         request_id: "not-an-id".into(),
         request: ControlRequest::Revoke {
             session_id: "0123456789abcdef0123456789abcdef".into(),
@@ -130,7 +136,7 @@ fn control_protocol_rejects_invalid_identifiers_and_denial_text() {
     assert!(encode_control_request(&invalid).is_err());
 
     let invalid = ControlResponseEnvelope {
-        version: BROKER_PROTOCOL_VERSION,
+        version: CONTROL_PROTOCOL_VERSION,
         request_id: "abcdef0123456789abcdef0123456789".into(),
         response: ControlResponse::Denied {
             message: "unsafe\nmessage".into(),

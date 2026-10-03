@@ -5,8 +5,65 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-pub const BROKER_PROTOCOL_VERSION: u32 = 2;
+pub const BROKER_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_BROKER_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_BROKER_RESPONSE_FRAME_BYTES: usize = 256 * 1024;
+pub const MAX_SECRET_MATERIAL_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SensitiveBytes(Zeroizing<Vec<u8>>);
+
+impl SensitiveBytes {
+    pub fn new(value: Vec<u8>) -> Result<Self> {
+        let value = Zeroizing::new(value);
+        if value.len() > MAX_SECRET_MATERIAL_BYTES {
+            bail!("secret material exceeds the size limit");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SensitiveBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for SensitiveBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use base64::Engine;
+        let encoded =
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(self.expose()));
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        use base64::Engine;
+        let encoded = Zeroizing::new(String::deserialize(deserializer)?);
+        if encoded.len() > MAX_SECRET_MATERIAL_BYTES.div_ceil(3) * 4 {
+            return Err(serde::de::Error::custom(
+                "secret material exceeds the size limit",
+            ));
+        }
+        let mut value = Zeroizing::new(vec![0u8; encoded.len() / 4 * 3]);
+        let length = base64::engine::general_purpose::STANDARD
+            .decode_slice(encoded.as_bytes(), &mut value)
+            .map_err(|_| serde::de::Error::custom("secret material encoding is invalid"))?;
+        if length > MAX_SECRET_MATERIAL_BYTES {
+            return Err(serde::de::Error::custom(
+                "secret material exceeds the size limit",
+            ));
+        }
+        value.truncate(length);
+        Ok(Self(value))
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SensitiveString(Zeroizing<String>);
@@ -62,6 +119,16 @@ pub struct BrokerRequestEnvelope {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerRequest {
+    #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
+    ValidateProviders,
+    SecretRead {
+        resource: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projection: Option<crate::logical_authority::Projection>,
+    },
+    SecretPublic {
+        resource: String,
+    },
     #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
     Probe,
     ActivateSession {
@@ -120,6 +187,18 @@ pub struct BrokerResponseEnvelope {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BrokerResponse {
+    ProviderValidation {
+        authentication_checked: u32,
+        authentication_total: u32,
+        resources_checked: u32,
+        resources_total: u32,
+        keys_checked: u32,
+        keys_failed: u32,
+        keys_total: u32,
+    },
+    SecretMaterial {
+        material: SensitiveBytes,
+    },
     NoSession,
     Accepted,
     Ready {
@@ -129,6 +208,7 @@ pub enum BrokerResponse {
         workload: String,
         profile: String,
         expires_at: String,
+        hard_deadline_boot_ms: Option<u64>,
     },
     GitCredential {
         username: String,
@@ -237,7 +317,7 @@ pub fn encode_request_frame(request: &BrokerRequestEnvelope) -> Result<Vec<u8>> 
 }
 
 pub fn decode_response_frame(input: &[u8]) -> Result<BrokerResponseEnvelope> {
-    if input.len() > MAX_BROKER_FRAME_BYTES {
+    if input.len() > MAX_BROKER_RESPONSE_FRAME_BYTES {
         bail!("broker response exceeds the frame limit");
     }
     let response: BrokerResponseEnvelope =
@@ -257,7 +337,7 @@ pub fn encode_response_frame(response: &BrokerResponseEnvelope) -> Result<Vec<u8
     validate_request_id(&response.request_id)?;
     validate_response(&response.response)?;
     let output = serde_json::to_vec(response).context("serialize broker response")?;
-    if output.len() > MAX_BROKER_FRAME_BYTES {
+    if output.len() > MAX_BROKER_RESPONSE_FRAME_BYTES {
         bail!("broker response exceeds the frame limit");
     }
     Ok(output)
@@ -265,6 +345,26 @@ pub fn encode_response_frame(response: &BrokerResponseEnvelope) -> Result<Vec<u8
 
 fn validate_response(response: &BrokerResponse) -> Result<()> {
     match response {
+        BrokerResponse::ProviderValidation {
+            authentication_checked,
+            authentication_total,
+            resources_checked,
+            resources_total,
+            keys_checked,
+            keys_failed,
+            keys_total,
+        } => {
+            if resources_checked > resources_total
+                || authentication_checked > authentication_total
+                || keys_checked
+                    .checked_add(*keys_failed)
+                    .is_none_or(|observed| observed > *keys_total)
+            {
+                bail!("provider validation counts are invalid");
+            }
+            Ok(())
+        }
+        BrokerResponse::SecretMaterial { .. } => Ok(()),
         BrokerResponse::Ready {
             session_id,
             workload,
@@ -344,7 +444,12 @@ fn validate_request_envelope(request: &BrokerRequestEnvelope) -> Result<()> {
     }
     validate_request_id(&request.request_id)?;
     match &request.request {
-        BrokerRequest::Probe => Ok(()),
+        BrokerRequest::SecretRead { resource, .. } | BrokerRequest::SecretPublic { resource } => {
+            dev_tools_secret::LogicalSecretName::parse(resource.clone())
+                .map(|_| ())
+                .map_err(|_| anyhow::anyhow!("logical resource name is invalid"))
+        }
+        BrokerRequest::Probe | BrokerRequest::ValidateProviders => Ok(()),
         BrokerRequest::ActivateSession { session_id }
         | BrokerRequest::RenewSession { session_id }
         | BrokerRequest::EndSession { session_id } => validate_request_id(session_id),
