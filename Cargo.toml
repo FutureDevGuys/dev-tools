@@ -31,3 +31,9 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
 sha2 = "0.10"
 signature = "2"
+
+# Native setup/recovery tests verify full executable identities repeatedly.
+# Optimize the SHA implementation on development builds too, including CPUs
+# without SHA instructions; retain every verification and the existing bounds.
+[profile.dev.package.sha2]
+opt-level = 3
