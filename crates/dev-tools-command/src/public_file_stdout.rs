@@ -151,6 +151,21 @@ mod tests {
     fn kernel_caps_public_file_without_a_running_supervisor() {
         let mut command = Command::new("/usr/bin/head");
         command.env_clear().args(["-c", "1048576", "/dev/zero"]);
+        // SIGXFSZ normally requests a core dump. A host's external core collector
+        // can delay reaping independently of the file-size bound under test.
+        // Ignore that signal in the synthetic writer so it must handle EFBIG:
+        // the kernel still caps writes even without signal-based termination.
+        // Ignored dispositions survive exec. The deadline stays unchanged.
+        // SAFETY: signal installs a fixed ignored disposition without allocation
+        // in this post-fork child only. No parent or production setting changes.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let file = configure(&mut command, 1024).unwrap();
         // Deliberately do not run the monitor: this must be a kernel bound,
         // not an observation that only happens to catch a fast writer in time.
@@ -162,6 +177,11 @@ mod tests {
             child.wait().unwrap();
         }
         assert!(completed.is_some(), "finite writer did not terminate");
+        assert_eq!(
+            completed.unwrap().code(),
+            Some(1),
+            "writer must report EFBIG"
+        );
         assert_eq!(file.metadata().unwrap().len(), 1025);
         assert_eq!(
             check_size(&file, 1024).unwrap_err().kind(),
