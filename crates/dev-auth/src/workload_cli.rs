@@ -175,8 +175,12 @@ fn finish_native_outcome(
             }
             crate::workload_status_code(status)
         }
-        Err(_) => finish(
-            ExecutionResult::launch("failed", None, 1).error("operational"),
+        Err(error) => finish(
+            ExecutionResult::launch("failed", None, 1).error(
+                error
+                    .downcast_ref::<dev_auth::supervisor::WorkloadLaunchFailure>()
+                    .map_or("operational", |failure| failure.error_kind()),
+            ),
             sink,
         ),
     }
@@ -241,5 +245,53 @@ mod tests {
         assert!(!String::from_utf8(bytes)
             .unwrap()
             .contains("fixture backend text"));
+    }
+
+    #[test]
+    fn typed_outer_launch_failures_report_only_fixed_kinds_with_unknown_progress() {
+        use dev_auth::supervisor::WorkloadLaunchFailure;
+        use std::os::unix::fs::PermissionsExt;
+
+        for (failure, expected_kind) in [
+            (
+                WorkloadLaunchFailure::DispatcherStart,
+                "dispatcher_start_failed",
+            ),
+            (
+                WorkloadLaunchFailure::DispatcherExitedBeforeHandoff,
+                "dispatcher_exited_before_handoff",
+            ),
+            (
+                WorkloadLaunchFailure::EnvironmentHandoffTimedOut,
+                "environment_handoff_timed_out",
+            ),
+            (
+                WorkloadLaunchFailure::EnvironmentHandoff,
+                "environment_handoff_failed",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.path().join("result.json");
+            let sink = ResultDestination::reserve(&path).unwrap();
+            let error = anyhow::anyhow!("private underlying path, argument and credential fixture")
+                .context(failure)
+                .context("private outer fixture detail");
+            assert_eq!(finish_native_outcome(Err(error), Some(sink)).unwrap(), 1);
+            let result: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "schema": "dev-auth-execution-result-v1",
+                    "product": "dev-auth",
+                    "operation": "workload_launch",
+                    "outcome": "failed",
+                    "started": null,
+                    "exit_code": 1,
+                    "error_kind": expected_kind,
+                })
+            );
+        }
     }
 }

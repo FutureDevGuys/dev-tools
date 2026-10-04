@@ -881,7 +881,7 @@ fn validate_user_config(config: &UserConfigV2) -> Result<()> {
             |product| validate_policy_identifier(product, "release-signing product"),
             Clone::clone,
         )?;
-        if profile.ssh != !profile.ssh_keys.is_empty() {
+        if profile.ssh == profile.ssh_keys.is_empty() {
             bail!("authority profile SSH capability and operation keys disagree");
         }
         validate_unique(

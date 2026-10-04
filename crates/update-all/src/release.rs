@@ -1,5 +1,7 @@
 use crate::IntegrityFailure;
 mod common;
+mod offline;
+pub(crate) use offline::{install as install_offline, OfflineBundlePaths};
 #[cfg(target_os = "linux")]
 mod protocol;
 
@@ -687,33 +689,38 @@ fn fetch_verified_manifest(
     )
 }
 
+fn release_authority(product: Product) -> ReleaseAuthority {
+    ReleaseAuthority {
+        trusted_root_key: env!("UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY").into(),
+        product: product.id().into(),
+        accepted_manifest_schemas: if product == Product::SkillsSync {
+            vec!["dev-tools-product-v2".into(), "dev-tools-product-v1".into()]
+        } else {
+            vec!["dev-tools-product-v2".into()]
+        },
+        target: target_id(),
+        artifact_url: ArtifactUrlPolicy::GitHubRelease {
+            owner: "FutureDevGuys".into(),
+            repository: "dev-tools".into(),
+        },
+        require_source_commit: product != Product::SkillsSync,
+        engine_protocol: ENGINE_PROTOCOL,
+    }
+}
+
 fn verify_downloaded_manifest(
     product: Product,
     metadata: &ReleaseMetadata,
 ) -> Result<VerifiedManifest> {
-    let verified = verify_release_metadata(
-        metadata,
-        &ReleaseAuthority {
-            trusted_root_key: env!("UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY").into(),
-            product: product.id().into(),
-            accepted_manifest_schemas: if product == Product::SkillsSync {
-                vec!["dev-tools-product-v2".into(), "dev-tools-product-v1".into()]
-            } else {
-                vec!["dev-tools-product-v2".into()]
-            },
-            target: target_id(),
-            artifact_url: ArtifactUrlPolicy::GitHubRelease {
-                owner: "FutureDevGuys".into(),
-                repository: "dev-tools".into(),
-            },
-            require_source_commit: product != Product::SkillsSync,
-            engine_protocol: ENGINE_PROTOCOL,
-        },
-    )
-    .map_err(|error| {
-        IntegrityFailure(format!("authenticated release metadata failed: {error:#}"))
-    })?;
+    let verified =
+        verify_release_metadata(metadata, &release_authority(product)).map_err(|error| {
+            IntegrityFailure(format!("authenticated release metadata failed: {error:#}"))
+        })?;
     validate_online_migration_window(product, &verified)?;
+    Ok(project_verified_manifest(verified))
+}
+
+fn project_verified_manifest(verified: SharedVerifiedRelease) -> VerifiedManifest {
     let artifact = Artifact {
         url: verified.artifact_url,
         length: verified.artifact_length,
@@ -728,13 +735,13 @@ fn verify_downloaded_manifest(
         source_commit: verified.source_commit,
         artifacts: BTreeMap::from([(target_id(), artifact.clone())]),
     };
-    Ok(VerifiedManifest {
+    VerifiedManifest {
         root_generation: verified.root_generation,
         root_sha256: verified.root_sha256,
         manifest,
         artifact,
         manifest_sha256: verified.manifest_sha256,
-    })
+    }
 }
 
 fn validate_online_migration_window(
@@ -898,28 +905,9 @@ fn activate(
             .join("cache")
             .join(format!(".{}.candidate", product.id()));
         atomic_write(&staged, bytes, true)?;
-        let identity = artifact_identity(&verified.artifact);
-        let report = apply_versioned_installation(
-            &VersionedInstallRequest {
-                layout: shared_installation_layout(product, paths)?,
-                version: version.clone(),
-                source: staged.clone(),
-                identity,
-                aliases: vec![paths.executable_name.clone()],
-            },
-            |candidate| verify_candidate_health(product, candidate, version),
-        );
+        let report = activate_verified_source(product, paths, state, verified, &staged);
         let _ = fs::remove_file(staged);
-        let report = report?;
-        synchronize_installation_state(state, &report.receipt);
-        return Ok(Activation {
-            product,
-            version: Some(version.clone()),
-            changed: report.changed,
-            managed: true,
-            outcome: if report.changed { "updated" } else { "no_op" }.into(),
-            path: Some(target),
-        });
+        return report;
     }
     #[cfg(not(unix))]
     {
@@ -953,6 +941,36 @@ fn activate(
             path: Some(target),
         })
     }
+}
+
+#[cfg(unix)]
+fn activate_verified_source(
+    product: Product,
+    paths: &Paths,
+    state: &mut ReleaseState,
+    verified: &VerifiedManifest,
+    source: &Path,
+) -> Result<Activation> {
+    let version = &verified.manifest.version;
+    let report = apply_versioned_installation(
+        &VersionedInstallRequest {
+            layout: shared_installation_layout(product, paths)?,
+            version: version.clone(),
+            source: source.to_path_buf(),
+            identity: artifact_identity(&verified.artifact),
+            aliases: vec![paths.executable_name.clone()],
+        },
+        |candidate| verify_candidate_health(product, candidate, version),
+    )?;
+    synchronize_installation_state(state, &report.receipt);
+    Ok(Activation {
+        product,
+        version: Some(version.clone()),
+        changed: report.changed,
+        managed: true,
+        outcome: if report.changed { "updated" } else { "no_op" }.into(),
+        path: Some(version_binary(paths, version)),
+    })
 }
 
 fn activate_link(product: Product, paths: &Paths, version: &str) -> Result<()> {
@@ -1819,18 +1837,36 @@ impl<'a> ReleaseStateWriter<'a> {
     // Consume the transaction: an uncertain publication cannot be retried with
     // a newly observed identity and accidentally bless intervening history.
     fn save(self, state: &ReleaseState) -> Result<()> {
+        self.save_and_continue(state).map(|_| ())
+    }
+
+    fn save_and_continue(self, state: &ReleaseState) -> Result<Self> {
+        self.publish_and_continue(state, dev_tools_installation::write_atomic_document)
+    }
+
+    fn publish_and_continue(
+        mut self,
+        state: &ReleaseState,
+        publish: impl FnOnce(
+            &Path,
+            &[u8],
+            &dev_tools_installation::DocumentAuthority,
+            Option<&dev_tools_installation::ArtifactIdentity>,
+        ) -> Result<bool>,
+    ) -> Result<Self> {
         let bytes = serde_json::to_vec_pretty(state).context("serialize release state")?;
         let current = dev_tools_installation::read_atomic_document(self.path, &self.authority)?;
         if current.as_ref().map(|document| &document.identity) != self.expected.as_ref() {
             bail!("release state changed during the admitted mutation");
         }
-        dev_tools_installation::write_atomic_document(
-            self.path,
-            &bytes,
-            &self.authority,
-            self.expected.as_ref(),
-        )?;
-        Ok(())
+        publish(self.path, &bytes, &self.authority, self.expected.as_ref())?;
+        // Advance only from bytes this transaction successfully published,
+        // never from a newly observed destination. An error consumes the lease.
+        self.expected = Some(dev_tools_installation::ArtifactIdentity {
+            length: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+        });
+        Ok(self)
     }
 }
 

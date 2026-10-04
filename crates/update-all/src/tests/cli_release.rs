@@ -79,6 +79,137 @@ fn product_subcommands_share_the_release_engine() {
 }
 
 #[test]
+fn product_offline_bundle_arguments_are_all_or_none() {
+    use clap::error::ErrorKind;
+
+    let root = std::env::current_dir().unwrap().join("offline-bundle");
+    let options = [
+        ("--offline", None),
+        ("--root-document", Some(root.join("root.json"))),
+        ("--manifest", Some(root.join("manifest.json"))),
+        ("--artifact", Some(root.join("artifact"))),
+    ];
+    for operation in ["install", "update"] {
+        for included in 0..16 {
+            let mut arguments = vec![
+                "update-all".into(),
+                "product".into(),
+                operation.into(),
+                "dev-cache".into(),
+                "--json".into(),
+            ];
+            for (index, (flag, path)) in options.iter().enumerate() {
+                if included & (1 << index) != 0 {
+                    arguments.push(std::ffi::OsString::from(*flag));
+                    if let Some(path) = path {
+                        arguments.push(path.as_os_str().to_owned());
+                    }
+                }
+            }
+            let parsed = RunCli::try_parse_from(arguments);
+            if included == 0 || included == 15 {
+                assert!(parsed.is_ok(), "{operation} flags {included}: {parsed:?}");
+            } else {
+                assert_eq!(
+                    parsed.unwrap_err().kind(),
+                    ErrorKind::MissingRequiredArgument,
+                    "{operation} flags {included} must require the complete bundle",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn product_offline_bundle_arguments_preserve_paths_and_json() {
+    let root = std::env::current_dir().unwrap().join("offline bundle");
+    let root_document = root.join("root.json");
+    let manifest = root.join("manifest.json");
+    let artifact = root.join("artifact");
+    for operation in ["install", "update"] {
+        let parsed = RunCli::try_parse_from([
+            std::ffi::OsString::from("update-all"),
+            "product".into(),
+            operation.into(),
+            "dev-cache".into(),
+            "--offline".into(),
+            "--root-document".into(),
+            root_document.as_os_str().to_owned(),
+            "--manifest".into(),
+            manifest.as_os_str().to_owned(),
+            "--artifact".into(),
+            artifact.as_os_str().to_owned(),
+            "--json".into(),
+        ])
+        .unwrap();
+        let Some(RunSubcommand::Product(product)) = parsed.subcommand else {
+            panic!("expected product subcommand");
+        };
+        let (parsed_operation, cli) = match product.cmd {
+            ProductCmd::Install(cli) => ("install", cli),
+            ProductCmd::Update(cli) => ("update", cli),
+            _ => panic!("expected product activation subcommand"),
+        };
+        assert_eq!(parsed_operation, operation);
+        assert!(matches!(cli.output.product, ProductName::DevCache));
+        assert!(cli.output.json);
+        assert!(cli.offline);
+        assert_eq!(cli.root_document.as_ref(), Some(&root_document));
+        assert_eq!(cli.manifest.as_ref(), Some(&manifest));
+        assert_eq!(cli.artifact.as_ref(), Some(&artifact));
+    }
+}
+
+#[test]
+fn product_offline_bundle_flags_are_scoped_to_install_and_update() {
+    use clap::{error::ErrorKind, CommandFactory};
+
+    let command = RunCli::command();
+    let product = command.find_subcommand("product").unwrap();
+    for operation in ["install", "update"] {
+        let activation = product.find_subcommand(operation).unwrap();
+        for flag in ["offline", "root-document", "manifest", "artifact"] {
+            assert!(activation
+                .get_arguments()
+                .any(|argument| argument.get_long() == Some(flag)));
+        }
+    }
+    for family in ["product", "self", "update"] {
+        let subcommands = command.find_subcommand(family).unwrap();
+        for operation in subcommands.get_subcommands() {
+            if family == "product" && matches!(operation.get_name(), "install" | "update") {
+                continue;
+            }
+            for flag in ["offline", "root-document", "manifest", "artifact"] {
+                assert!(
+                    !operation
+                        .get_arguments()
+                        .any(|argument| argument.get_long() == Some(flag)),
+                    "{family} {} must not accept --{flag}",
+                    operation.get_name(),
+                );
+                let mut arguments = vec![
+                    "update-all".to_string(),
+                    family.to_string(),
+                    operation.get_name().to_string(),
+                ];
+                if family == "product" {
+                    arguments.push("dev-cache".to_string());
+                }
+                arguments.push(format!("--{flag}"));
+                if flag != "offline" {
+                    arguments.push("unused-path".to_string());
+                }
+                assert_eq!(
+                    RunCli::try_parse_from(arguments).unwrap_err().kind(),
+                    ErrorKind::UnknownArgument,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn default_completion_managed_root_remains_absolute_without_home_or_xdg() {
     let _lock = crate::test_support::env_guard();
     #[cfg(not(windows))]

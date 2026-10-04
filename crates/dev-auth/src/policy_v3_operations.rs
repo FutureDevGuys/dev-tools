@@ -134,10 +134,10 @@ impl OperationAuthority {
                             .iter()
                             .any(|id| !allowed.installation_ids.contains(id))))
                 || cap.permissions.iter().any(|(name, right)| {
-                    !allowed
+                    allowed
                         .permissions
                         .get(name)
-                        .is_some_and(|maximum| right <= maximum)
+                        .is_none_or(|maximum| right > maximum)
                 })
             {
                 bail!("narrowing widens GitHub authority");
@@ -265,10 +265,10 @@ impl OperationAuthority {
                         && (repositories.is_empty()
                             || !repositories.is_subset(&canonical(&allowed.repositories))))
                     || requested.permissions.iter().any(|(name, right)| {
-                        !allowed
+                        allowed
                             .permissions
                             .get(name)
-                            .is_some_and(|allowed| right <= allowed)
+                            .is_none_or(|allowed| right > allowed)
                     })
                 {
                     bail!("GitHub operation widens scope authority");

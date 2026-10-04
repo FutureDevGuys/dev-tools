@@ -34,6 +34,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0022](0022-common-local-update-observation.md) | Common local update observation | proposed | pending |
 | [0023](0023-common-authenticated-metadata-refresh.md) | Common authenticated metadata refresh | proposed | pending |
 | [0024](0024-canonical-release-assets-after-incomplete-index.md) | Canonical assets after an incomplete GitHub release index | proposed | pending |
+| [0025](0025-explicit-offline-signed-bundle-intake.md) | Explicit offline signed-bundle intake | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

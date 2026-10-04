@@ -4744,7 +4744,7 @@ pub fn runtime_status() -> Result<RuntimeStatus> {
                     .filter_map(Result::ok)
                     .filter_map(|entry| {
                         let path = entry.path();
-                        if !path.extension().is_some_and(|value| value == "lock") {
+                        if path.extension().is_none_or(|value| value != "lock") {
                             return None;
                         }
                         path.file_stem()?.to_str().map(str::to_owned)

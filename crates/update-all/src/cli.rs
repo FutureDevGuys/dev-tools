@@ -1688,14 +1688,14 @@ struct ProductCli {
 
 #[derive(clap::Subcommand, Debug)]
 enum ProductCmd {
-    /// Install the latest authenticated stable release.
-    Install(ProductOutputCli),
+    /// Install the latest stable release or an explicit authenticated offline bundle.
+    Install(ProductActivationCli),
     /// Show local product activation state without network access.
     Status(ProductOutputCli),
     /// Authenticate the latest stable metadata without installing it.
     Check(ProductOutputCli),
-    /// Update or install the latest authenticated stable release.
-    Update(ProductOutputCli),
+    /// Update or install the latest stable release or an explicit authenticated offline bundle.
+    Update(ProductActivationCli),
     /// Update only when the product command is already installed.
     UpdateIfInstalled(ProductOutputCli),
     /// Atomically reactivate the retained previous version.
@@ -1710,12 +1710,55 @@ struct ProductOutputCli {
     json: bool,
 }
 
+#[derive(clap::Args, Debug)]
+struct ProductActivationCli {
+    #[command(flatten)]
+    output: ProductOutputCli,
+    /// Use only the supplied signed bundle, without network access.
+    #[arg(long, requires_all = ["root_document", "manifest", "artifact"])]
+    offline: bool,
+    /// Absolute path to the signed root document.
+    #[arg(long, value_name = "ABS", requires = "offline")]
+    root_document: Option<PathBuf>,
+    /// Absolute path to the source-bound stable product-v2 manifest.
+    #[arg(long, value_name = "ABS", requires = "offline")]
+    manifest: Option<PathBuf>,
+    /// Absolute path to the native artifact authenticated by the manifest.
+    #[arg(long, value_name = "ABS", requires = "offline")]
+    artifact: Option<PathBuf>,
+}
+
+impl ProductActivationCli {
+    fn run(
+        self,
+        online: fn(crate::release::Product) -> Result<crate::release::Activation>,
+    ) -> Result<()> {
+        let product = self.output.product.into();
+        let result = match (self.offline, self.root_document, self.manifest, self.artifact) {
+            (false, None, None, None) => online(product)?,
+            (true, Some(root_document), Some(manifest), Some(artifact)) => {
+                crate::release::install_offline(
+                    product,
+                    &crate::release::OfflineBundlePaths {
+                        root_document,
+                        manifest,
+                        artifact,
+                    },
+                )?
+            }
+            _ => bail!(
+                "offline bundle intake requires --offline, --root-document, --manifest and --artifact together"
+            ),
+        };
+        emit_release_result(result, self.output.json);
+        Ok(())
+    }
+}
+
 impl ProductCli {
     fn run(self) -> Result<()> {
         match self.cmd {
-            ProductCmd::Install(cli) => {
-                emit_release_result(crate::release::install(cli.product.into())?, cli.json)
-            }
+            ProductCmd::Install(cli) => cli.run(crate::release::install)?,
             ProductCmd::Status(cli) => {
                 let status = crate::release::status(cli.product.into())?;
                 if cli.json {
@@ -1742,9 +1785,7 @@ impl ProductCli {
                     );
                 }
             }
-            ProductCmd::Update(cli) => {
-                emit_release_result(crate::release::update(cli.product.into())?, cli.json)
-            }
+            ProductCmd::Update(cli) => cli.run(crate::release::update)?,
             ProductCmd::UpdateIfInstalled(cli) => emit_release_result(
                 crate::release::update_if_installed(cli.product.into())?,
                 cli.json,

@@ -730,10 +730,10 @@ impl ArtifactRecord {
                 selector
                     .capture(candidate)
                     .filter(|captures| {
-                        !captures.get("os").is_some_and(|value| value != os)
-                            && !captures
+                        captures.get("os").is_none_or(|value| value == os)
+                            && captures
                                 .get("architecture")
-                                .is_some_and(|value| value != architecture)
+                                .is_none_or(|value| value == architecture)
                     })
                     .map(|captures| (candidate, captures))
             });

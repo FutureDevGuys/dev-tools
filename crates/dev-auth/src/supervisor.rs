@@ -33,6 +33,34 @@ const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ENVIRONMENT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_MAGIC: &[u8; 4] = b"DAT1";
 
+/// Fixed outer-launch observations, not policy decisions or proof of execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadLaunchFailure {
+    DispatcherStart,
+    DispatcherExitedBeforeHandoff,
+    EnvironmentHandoffTimedOut,
+    EnvironmentHandoff,
+}
+
+impl WorkloadLaunchFailure {
+    pub fn error_kind(self) -> &'static str {
+        match self {
+            Self::DispatcherStart => "dispatcher_start_failed",
+            Self::DispatcherExitedBeforeHandoff => "dispatcher_exited_before_handoff",
+            Self::EnvironmentHandoffTimedOut => "environment_handoff_timed_out",
+            Self::EnvironmentHandoff => "environment_handoff_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkloadLaunchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.error_kind())
+    }
+}
+
+impl std::error::Error for WorkloadLaunchFailure {}
+
 #[derive(Debug, PartialEq, Eq)]
 enum OuterAdmission {
     Enrolled,
@@ -615,18 +643,38 @@ fn send_environment_to_supervisor(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error).context("accept workload environment handoff"),
         }
-        if let Some(status) = child
+        let status = child
             .try_wait()
-            .context("poll privileged workload dispatcher")?
-        {
-            bail!("privileged workload dispatch ended before admission: {status}");
-        }
-        if started.elapsed() >= AUTHORIZATION_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("privileged workload authorization timed out");
+            .context("poll privileged workload dispatcher")?;
+        if let Some(failure) = pending_environment_handoff_failure(status, started.elapsed()) {
+            if failure == WorkloadLaunchFailure::EnvironmentHandoffTimedOut {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(failure.into());
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn pending_environment_handoff_failure(
+    status: Option<ExitStatus>,
+    elapsed: Duration,
+) -> Option<WorkloadLaunchFailure> {
+    if status.is_some() {
+        Some(WorkloadLaunchFailure::DispatcherExitedBeforeHandoff)
+    } else if elapsed >= AUTHORIZATION_TIMEOUT {
+        Some(WorkloadLaunchFailure::EnvironmentHandoffTimedOut)
+    } else {
+        None
+    }
+}
+
+fn classify_environment_handoff_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<WorkloadLaunchFailure>() {
+        error
+    } else {
+        error.context(WorkloadLaunchFailure::EnvironmentHandoff)
     }
 }
 
@@ -969,7 +1017,7 @@ fn launch_via_native_helper(
         .args(arguments);
     let mut child = command
         .spawn()
-        .context("start the privileged workload dispatcher")?;
+        .context(WorkloadLaunchFailure::DispatcherStart)?;
     let handoff = send_environment_to_supervisor(&listener, &environment_frame, &mut child);
     let _ = fs::remove_file(&environment_socket);
     let mut handoff = match handoff {
@@ -977,7 +1025,7 @@ fn launch_via_native_helper(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error)
+            return Err(classify_environment_handoff_error(error))
                 .context("transfer workload environment to the privileged supervisor");
         }
     };
@@ -2712,6 +2760,62 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn environment_handoff_wait_failure_keeps_exit_and_timeout_distinct() {
+        assert_eq!(
+            pending_environment_handoff_failure(
+                None,
+                AUTHORIZATION_TIMEOUT - Duration::from_nanos(1),
+            ),
+            None
+        );
+        for elapsed in [
+            AUTHORIZATION_TIMEOUT,
+            AUTHORIZATION_TIMEOUT + Duration::from_secs(1),
+        ] {
+            assert_eq!(
+                pending_environment_handoff_failure(None, elapsed),
+                Some(WorkloadLaunchFailure::EnvironmentHandoffTimedOut)
+            );
+        }
+        // A dispatcher that has ended before the handshake is not a workload
+        // exit, even if its status is zero or the deadline has also elapsed.
+        for status in [0, 4 << 8, nix::libc::SIGTERM] {
+            for elapsed in [Duration::ZERO, AUTHORIZATION_TIMEOUT] {
+                assert_eq!(
+                    pending_environment_handoff_failure(
+                        Some(ExitStatus::from_raw(status)),
+                        elapsed
+                    ),
+                    Some(WorkloadLaunchFailure::DispatcherExitedBeforeHandoff)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn environment_handoff_classification_preserves_typed_observations_only() {
+        for failure in [
+            WorkloadLaunchFailure::DispatcherExitedBeforeHandoff,
+            WorkloadLaunchFailure::EnvironmentHandoffTimedOut,
+        ] {
+            let error = anyhow::Error::new(failure).context("private fixture detail");
+            let error = classify_environment_handoff_error(error);
+            assert_eq!(
+                error.downcast_ref::<WorkloadLaunchFailure>(),
+                Some(&failure)
+            );
+        }
+        // Error text is never parsed to infer policy or a timeout.
+        let error = classify_environment_handoff_error(anyhow::anyhow!(
+            "environment_handoff_timed_out: private fixture detail"
+        ));
+        assert_eq!(
+            error.downcast_ref::<WorkloadLaunchFailure>(),
+            Some(&WorkloadLaunchFailure::EnvironmentHandoff)
+        );
+    }
 
     #[test]
     fn runtime_directory_publishes_exact_mode_under_restrictive_umask() {
