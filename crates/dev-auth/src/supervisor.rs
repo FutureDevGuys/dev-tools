@@ -22,6 +22,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod dispatch_diagnostics;
+pub use dispatch_diagnostics::enrolled_dispatch_diagnostic;
+use dispatch_diagnostics::{observe_dispatch, EnrolledDispatchStage};
+
 const ENVIRONMENT_LIMIT: u64 = 1024 * 1024;
 const ENVIRONMENT_MAGIC: &[u8] = b"DEV-AUTH-ENV-V1\0";
 const ENVIRONMENT_ENTRY_LIMIT: usize = 4096;
@@ -1362,7 +1366,10 @@ pub fn run_enrolled_dispatcher(
     arguments: &[OsString],
 ) -> Result<ExitStatus> {
     if nix::unistd::getuid().as_raw() != owner_uid || owner_uid == 0 {
-        bail!("native enrolled launcher caller does not match workload owner");
+        return Err(anyhow::anyhow!(
+            "native enrolled launcher caller does not match workload owner"
+        ))
+        .context(EnrolledDispatchStage::Admission);
     }
     run_authorized_dispatcher(
         owner_uid,
@@ -1384,147 +1391,163 @@ fn run_authorized_dispatcher(
     arguments: &[OsString],
     enrolled: bool,
 ) -> Result<ExitStatus> {
-    if !nix::unistd::Uid::effective().is_root() {
-        bail!("strong workload dispatch requires root");
-    }
-    let _admission = crate::setup_transition::admit(crate::setup::InstallMode::Strong)?;
-    let executable = crate::setup::validate_running_privileged_launcher()?;
-    validate_identifier(workload_name, "workload")?;
-    if !enrolled {
-        validate_pkexec_caller(owner_uid)?;
-    }
-    let policy = validate_dispatch_request(
-        owner_uid,
-        workload_name,
-        cwd,
-        launcher_pid,
-        environment_socket,
-    )?;
-    let workload = policy
-        .workloads
-        .get(workload_name)
-        .context("validated workload is no longer resolved")?;
-    if enrolled && workload.admission != Some(crate::policy_v3::Admission::EnrolledNoninteractive) {
-        bail!("workload requires interactive launch approval");
-    }
-    if enrolled {
-        // The originating account remains the explicit native owner above.
-        // Normalize this narrow dispatcher's identity before invoking pinned
-        // root infrastructure; no child workload runs under this identity.
-        nix::unistd::setgroups(&[])?;
-        nix::unistd::setresgid(
-            nix::unistd::Gid::from_raw(0),
-            nix::unistd::Gid::from_raw(0),
-            nix::unistd::Gid::from_raw(0),
-        )?;
-        nix::unistd::setresuid(
-            nix::unistd::Uid::from_raw(0),
-            nix::unistd::Uid::from_raw(0),
-            nix::unistd::Uid::from_raw(0),
-        )?;
-    }
-    let profile = policy
-        .authority_profiles
-        .get(&workload.authority_profile)
-        .context("workload authority profile is unresolved")?;
-    let authority = session_authority_for_workload(profile, workload)?;
-    let owner = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
-        .context("workload owner account does not exist")?;
-    let (environment, mut native_handoff) =
-        receive_workload_environment(owner_uid, launcher_pid, environment_socket)?;
-    let session_id = random_session_id()?;
-    let boundary = StrongBoundaryListener::create(&session_id, owner_uid, owner.gid.as_raw())?;
-    let tool_bin = strong_workload_runtime_directory(&session_id)?.join("tool-bin");
-    let cgroup = PathBuf::from(format!(
-        "{}/dev-auth-workload-{session_id}.service",
-        crate::linux_admission::WORKLOAD_CGROUP_ROOT
-    ));
-    let systemd_arguments = match transient_service_arguments(&TransientServiceRequest {
-        session_id: &session_id,
-        owner_uid,
-        owner_gid: owner.gid.as_raw(),
-        workload: workload_name,
-        cwd,
-        boundary_socket: &boundary.path,
-        executable: &executable,
-        tool_bin: &tool_bin,
-        arguments,
-        duration_seconds: workload.duration_seconds,
-    }) {
-        Ok(arguments) => arguments,
-        Err(error) => {
-            let _ = revoke_session(&session_id);
-            return Err(error).context("construct transient workload service");
+    observe_dispatch(enrolled, |stage| {
+        if !nix::unistd::Uid::effective().is_root() {
+            bail!("strong workload dispatch requires root");
         }
-    };
-    let mut systemd_run = match Command::new("/usr/bin/systemd-run")
-        .args(systemd_arguments)
-        .env_clear()
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = revoke_session(&session_id);
-            return Err(error).context("run the transient workload service");
+        let _admission = crate::setup_transition::admit(crate::setup::InstallMode::Strong)?;
+        let executable = crate::setup::validate_running_privileged_launcher()?;
+        validate_identifier(workload_name, "workload")?;
+        if !enrolled {
+            validate_pkexec_caller(owner_uid)?;
         }
-    };
-    let (mut workload_handoff, boundary_peer) = match accept_strong_boundary(
-        &boundary,
-        &cgroup,
-        owner_uid,
-        owner.gid.as_raw(),
-        &mut systemd_run,
-    ) {
-        Ok(handoff) => handoff,
-        Err(error) => {
+        let policy = validate_dispatch_request(
+            owner_uid,
+            workload_name,
+            cwd,
+            launcher_pid,
+            environment_socket,
+        )?;
+        let workload = policy
+            .workloads
+            .get(workload_name)
+            .context("validated workload is no longer resolved")?;
+        if enrolled
+            && workload.admission != Some(crate::policy_v3::Admission::EnrolledNoninteractive)
+        {
+            bail!("workload requires interactive launch approval");
+        }
+        if enrolled {
+            *stage = EnrolledDispatchStage::IdentityNormalization;
+            // The originating account remains the explicit native owner above.
+            // Normalize this narrow dispatcher's identity before invoking pinned
+            // root infrastructure; no child workload runs under this identity.
+            nix::unistd::setgroups(&[])?;
+            nix::unistd::setresgid(
+                nix::unistd::Gid::from_raw(0),
+                nix::unistd::Gid::from_raw(0),
+                nix::unistd::Gid::from_raw(0),
+            )?;
+            nix::unistd::setresuid(
+                nix::unistd::Uid::from_raw(0),
+                nix::unistd::Uid::from_raw(0),
+                nix::unistd::Uid::from_raw(0),
+            )?;
+        }
+        *stage = EnrolledDispatchStage::Authority;
+        let profile = policy
+            .authority_profiles
+            .get(&workload.authority_profile)
+            .context("workload authority profile is unresolved")?;
+        let authority = session_authority_for_workload(profile, workload)?;
+        let owner = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner_uid))?
+            .context("workload owner account does not exist")?;
+        *stage = EnrolledDispatchStage::EnvironmentReceive;
+        let (environment, mut native_handoff) =
+            receive_workload_environment(owner_uid, launcher_pid, environment_socket)?;
+        *stage = EnrolledDispatchStage::BoundaryCreate;
+        let session_id = random_session_id()?;
+        let boundary = StrongBoundaryListener::create(&session_id, owner_uid, owner.gid.as_raw())?;
+        let tool_bin = strong_workload_runtime_directory(&session_id)?.join("tool-bin");
+        let cgroup = PathBuf::from(format!(
+            "{}/dev-auth-workload-{session_id}.service",
+            crate::linux_admission::WORKLOAD_CGROUP_ROOT
+        ));
+        *stage = EnrolledDispatchStage::ServiceStart;
+        let systemd_arguments = match transient_service_arguments(&TransientServiceRequest {
+            session_id: &session_id,
+            owner_uid,
+            owner_gid: owner.gid.as_raw(),
+            workload: workload_name,
+            cwd,
+            boundary_socket: &boundary.path,
+            executable: &executable,
+            tool_bin: &tool_bin,
+            arguments,
+            duration_seconds: workload.duration_seconds,
+        }) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                let _ = revoke_session(&session_id);
+                return Err(error).context("construct transient workload service");
+            }
+        };
+        let mut systemd_run = match Command::new("/usr/bin/systemd-run")
+            .args(systemd_arguments)
+            .env_clear()
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = revoke_session(&session_id);
+                return Err(error).context("run the transient workload service");
+            }
+        };
+        *stage = EnrolledDispatchStage::BoundaryAccept;
+        let (mut workload_handoff, boundary_peer) = match accept_strong_boundary(
+            &boundary,
+            &cgroup,
+            owner_uid,
+            owner.gid.as_raw(),
+            &mut systemd_run,
+        ) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                let _ = systemd_run.kill();
+                let _ = systemd_run.wait();
+                let _ = revoke_session(&session_id);
+                return Err(error).context("establish the strong workload boundary handoff");
+            }
+        };
+        *stage = EnrolledDispatchStage::BrokerPrepare;
+        if let Err(error) = prepare_session(crate::linux_admission::PendingSessionRegistration {
+            session_id: session_id.clone(),
+            owner_uid,
+            owner_gid: owner.gid.as_raw(),
+            execution_pid: boundary_peer.pid,
+            workload: workload_name.to_owned(),
+            profile: workload.authority_profile.clone(),
+            authority,
+            cgroup: cgroup.clone(),
+            expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 60,
+        }) {
             let _ = systemd_run.kill();
             let _ = systemd_run.wait();
             let _ = revoke_session(&session_id);
-            return Err(error).context("establish the strong workload boundary handoff");
+            return Err(error).context("prepare the retained strong workload supervisor");
         }
-    };
-    if let Err(error) = prepare_session(crate::linux_admission::PendingSessionRegistration {
-        session_id: session_id.clone(),
-        owner_uid,
-        owner_gid: owner.gid.as_raw(),
-        execution_pid: boundary_peer.pid,
-        workload: workload_name.to_owned(),
-        profile: workload.authority_profile.clone(),
-        authority,
-        cgroup: cgroup.clone(),
-        expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 60,
-    }) {
-        let _ = systemd_run.kill();
-        let _ = systemd_run.wait();
-        let _ = revoke_session(&session_id);
-        return Err(error).context("prepare the retained strong workload supervisor");
-    }
-    let frame = encode_workload_environment(&environment)?;
-    if let Err(error) = write_environment_frame(&mut workload_handoff, &frame) {
-        let _ = systemd_run.kill();
-        let _ = systemd_run.wait();
-        let _ = revoke_session(&session_id);
-        return Err(error).context("release the retained strong workload supervisor");
-    }
-    let status = match systemd_run.wait() {
-        Ok(status) => status,
-        Err(error) => {
+        *stage = EnrolledDispatchStage::SupervisorRelease;
+        let frame = encode_workload_environment(&environment)?;
+        if let Err(error) = write_environment_frame(&mut workload_handoff, &frame) {
+            let _ = systemd_run.kill();
+            let _ = systemd_run.wait();
             let _ = revoke_session(&session_id);
-            return Err(error).context("wait for the transient workload service");
+            return Err(error).context("release the retained strong workload supervisor");
         }
-    };
-    drop(boundary_peer);
-    let _ = revoke_session(&session_id);
-    let termination = match receive_workload_termination(&mut workload_handoff) {
-        Ok(termination) => termination,
-        Err(_) if !status.success() => return Ok(status),
-        Err(error) => {
-            return Err(error)
-                .context("transient workload ended without an authenticated termination receipt")
-        }
-    };
-    send_workload_termination(&mut native_handoff, termination)?;
-    Ok(exit_status_from_termination(termination))
+        *stage = EnrolledDispatchStage::ServiceWait;
+        let status = match systemd_run.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = revoke_session(&session_id);
+                return Err(error).context("wait for the transient workload service");
+            }
+        };
+        drop(boundary_peer);
+        let _ = revoke_session(&session_id);
+        *stage = EnrolledDispatchStage::TerminationReceive;
+        let termination = match receive_workload_termination(&mut workload_handoff) {
+            Ok(termination) => termination,
+            Err(_) if !status.success() => return Ok(status),
+            Err(error) => {
+                return Err(error).context(
+                    "transient workload ended without an authenticated termination receipt",
+                )
+            }
+        };
+        *stage = EnrolledDispatchStage::TerminationSend;
+        send_workload_termination(&mut native_handoff, termination)?;
+        Ok(exit_status_from_termination(termination))
+    })
 }
 
 pub fn run_root_supervisor(

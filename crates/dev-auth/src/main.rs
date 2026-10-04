@@ -2344,8 +2344,11 @@ fn main() {
             run_supervisor_arguments("dispatch-enrolled", &mut std::env::args_os().skip(1));
         match result {
             Ok(code) => std::process::exit(code),
-            Err(_) => {
-                eprintln!("dev-auth: enrolled workload launch denied");
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    dev_auth::supervisor::enrolled_dispatch_diagnostic(&error)
+                );
                 std::process::exit(4);
             }
         }
@@ -2453,6 +2456,26 @@ fn main() {
             }
             eprintln!("{program}: {error:#}");
             std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod enrolled_dispatch_tests {
+    #[test]
+    fn invalid_enrolled_arguments_report_only_the_request_stage() {
+        for arguments in [
+            vec![],
+            vec!["workload", "launch", "private-workload"],
+            vec!["--uid", "private-invalid-identity"],
+        ] {
+            let mut arguments = arguments.into_iter().map(std::ffi::OsString::from);
+            let error =
+                super::run_supervisor_arguments("dispatch-enrolled", &mut arguments).unwrap_err();
+            assert_eq!(
+                dev_auth::supervisor::enrolled_dispatch_diagnostic(&error),
+                "dev-auth: enrolled workload launch denied: request"
+            );
         }
     }
 }
