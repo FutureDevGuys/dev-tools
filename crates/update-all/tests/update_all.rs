@@ -122,6 +122,80 @@ policy_key = "tool_update"
         .stdout(predicate::str::contains("Local Demo"));
 }
 
+#[cfg(unix)]
+#[test]
+fn controlled_catalog_keeps_late_errors_in_full_logs_and_bounded_summary() {
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join("config/update-all");
+    let catalog_dir = config_dir.join("catalog.d/local");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[install]\nauto_update=false\n[ui]\nmode=\"plain\"\n[logging]\ntimestamps=false\n",
+    )
+    .unwrap();
+    fs::write(catalog_dir.join("fidelity.toml"), r#"
+[tasks."local/fidelity"]
+label = "Output fidelity fixture"
+os = ["linux", "macos"]
+detect_mode = "command_available"
+category = "maintenance"
+command = "sh"
+args = ["-c", "i=0; while [ $i -lt 20 ]; do printf 'warning: sample %s\\n' \"$i\"; i=$((i+1)); done; printf 'error: final operation failed\\n' >&2; printf 'final output marker\\n'; exit 1"]
+policy_key = "tool_update"
+"#).unwrap();
+    command(&home)
+        .args([
+            "--plain",
+            "--completions",
+            "off",
+            "--only",
+            "local/fidelity",
+        ])
+        .assert()
+        .code(1);
+    let runs = home.path().join("state/update-all/runs");
+    let run = fs::read_dir(runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("run.json").is_file())
+        .unwrap();
+    let raw = fs::read_to_string(run.join("task-local%2Ffidelity.raw.log")).unwrap();
+    assert!(raw.contains("[WARN] [OUT] warning: sample 19"));
+    assert!(raw.contains("[ERROR] [STDERR] error: final operation failed"));
+    assert!(raw.contains("final output marker"));
+    let task: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("task-local%2Ffidelity.json")).unwrap()).unwrap();
+    let diagnostics = task["report_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["key"] == "command_diagnostics")
+        .unwrap();
+    assert!(diagnostics["rows"].as_array().unwrap().len() <= 5);
+    assert!(diagnostics["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["note"] == "error: final operation failed"));
+    assert!(diagnostics["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("omitted"))));
+    for line in fs::read_to_string(run.join("events.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        if event["kind"] == "log_line" {
+            assert!(!event["payload"]["line"].as_str().unwrap().contains('\n'));
+        }
+    }
+}
+
 #[test]
 fn invalid_catalog_plan_uses_documented_exit_code_three() {
     let home = TempDir::new().unwrap();

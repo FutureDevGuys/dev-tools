@@ -867,7 +867,7 @@ fn command_output_diagnostics_dedupes_and_caps_warning_samples() {
 
     assert!(result.advisories.iter().any(|advisory| {
         advisory.code == "command-output-diagnostics"
-            && advisory.severity == AdvisorySeverity::Warning
+            && advisory.severity == AdvisorySeverity::Error
             && !advisory.blocks_dependents
             && advisory.summary.contains("warning/error diagnostics")
     }));
@@ -902,6 +902,270 @@ fn command_output_diagnostics_dedupes_and_caps_warning_samples() {
         !result.blocks_dependents(),
         "diagnostic samples from a completed task should not block dependents"
     );
+}
+
+#[test]
+fn output_diagnostic_levels_agree_across_streams_and_reports() {
+    for (line, level, kind) in [
+        (
+            "warning: falling back to a full copy",
+            LogLevel::Warn,
+            "warning",
+        ),
+        (
+            "==> ERROR: A failure occurred in packaging",
+            LogLevel::Error,
+            "error",
+        ),
+        (
+            "npm error Exit handler never called!",
+            LogLevel::Error,
+            "error",
+        ),
+        (
+            " -> error making: package-exit status 4",
+            LogLevel::Error,
+            "error",
+        ),
+        (
+            "thread 'main' panicked at src/main.rs:10",
+            LogLevel::Error,
+            "error",
+        ),
+        (
+            "Error while writing index: No debugging symbols",
+            LogLevel::Warn,
+            "warning",
+        ),
+    ] {
+        for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+            assert_eq!(
+                classify_stream_level(stream, line),
+                level,
+                "{stream:?}: {line}"
+            );
+        }
+        let rows = command_diagnostic_rows(line);
+        assert_eq!(rows.len(), 1, "{line}");
+        assert_eq!(rows[0].name, kind, "{line}");
+    }
+    for line in [
+        "No errors reported",
+        "warning-count=0",
+        "thread 'worker' started",
+    ] {
+        assert_eq!(
+            classify_stream_level(StreamKind::Stderr, line),
+            LogLevel::Info
+        );
+        assert!(command_diagnostic_rows(line).is_empty(), "{line}");
+    }
+}
+
+#[test]
+fn command_diagnostics_preserve_late_errors_and_explain_omissions() {
+    let output = (0..100)
+        .map(|index| format!("warning: preliminary warning {index}"))
+        .chain(["error: final operation failed".to_string()])
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = TaskResult::completed("Diagnostics");
+    attach_command_output_diagnostics(&mut result, &output);
+    let section = result
+        .report_sections
+        .iter()
+        .find(|s| s.key == "command_diagnostics")
+        .unwrap();
+    assert!(section.rows.len() <= COMMAND_DIAGNOSTIC_SAMPLE_LIMIT);
+    assert!(section
+        .rows
+        .iter()
+        .any(|row| row.note.as_deref() == Some("error: final operation failed")));
+    assert!(section.rows.iter().any(|row| row
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("omitted") && note.contains("task log"))));
+    assert!(result
+        .advisories
+        .iter()
+        .any(|a| a.code == "command-output-diagnostics" && a.severity == AdvisorySeverity::Error));
+    assert!(!result.blocks_dependents());
+}
+
+#[test]
+fn diagnostic_footer_preserves_messages_and_severity_at_default_verbosity() {
+    let mut result = TaskResult::completed("Diagnostics");
+    attach_command_output_diagnostics(
+        &mut result,
+        "warning: using a fallback\nerror: final operation failed\n",
+    );
+    let lines = render_npm_package_footer([&result], false, NoteVerbosity::Failures);
+    assert!(lines
+        .iter()
+        .any(|line| line.text.contains("error: final operation failed")
+            && line.level == LogLevel::Error));
+    assert!(lines.iter().any(
+        |line| line.text.contains("warning: using a fallback") && line.level == LogLevel::Warn
+    ));
+    assert!(!result.blocks_dependents());
+    assert!(lines
+        .iter()
+        .any(|line| line.text.contains("[ERROR] error: final operation failed")));
+    assert!(lines
+        .iter()
+        .any(|line| line.text.contains("[WARN] warning: using a fallback")));
+}
+
+#[test]
+fn later_command_errors_upgrade_the_existing_diagnostic_advisory() {
+    let mut result = TaskResult::completed("Diagnostics");
+    attach_command_output_diagnostics(&mut result, "warning: first diagnostic\n");
+    attach_command_output_diagnostics(&mut result, "error: later diagnostic\n");
+    let advisories = result
+        .advisories
+        .iter()
+        .filter(|advisory| advisory.code == "command-output-diagnostics")
+        .collect::<Vec<_>>();
+    assert_eq!(advisories.len(), 1);
+    assert_eq!(advisories[0].severity, AdvisorySeverity::Error);
+    assert!(!advisories[0].blocks_dependents);
+}
+
+#[test]
+fn detailed_task_changes_keep_diagnostic_row_severity() {
+    let mut result = TaskResult::completed("Diagnostics");
+    attach_command_output_diagnostics(
+        &mut result,
+        "warning: first diagnostic\nerror: later diagnostic\n",
+    );
+    let categories = BTreeMap::from([("fixture".to_string(), "maintenance".to_string())]);
+    let lines = render_per_task_changes(
+        [("fixture", &result)],
+        &categories,
+        false,
+        NoteVerbosity::All,
+        true,
+    );
+    assert!(lines
+        .iter()
+        .any(|line| line.text.contains("error") && line.level == LogLevel::Error));
+    assert!(lines
+        .iter()
+        .any(|line| line.text.contains("warning") && line.level == LogLevel::Warn));
+}
+
+#[test]
+fn task_failure_summary_prefers_a_late_error_over_earlier_warnings() {
+    let command = CommandTask {
+        program: "sh".into(),
+        args: vec![],
+        mode: None,
+        command_candidates: vec![],
+        pre_commands: vec![],
+        report_commands: vec![],
+        report_patterns: vec![],
+        report_scoped_deltas: vec![],
+        policy_key: "tool_update".into(),
+        requires_elevation: false,
+        needs_sudo_session: false,
+        interactive: false,
+        external_window: false,
+        shell: false,
+        windows_bridge: false,
+        report_parser: None,
+        plain_header: None,
+        plain_start: None,
+        success_details: vec![],
+        external_manager_skip: false,
+        result_protocol: None,
+    };
+    let output = "warning: first warning\nwarning: second warning\nerror: final operation failed\n";
+    let result = failed_command_result_with_report_sections(
+        "Fixture",
+        format!("command failed: {output}"),
+        &command,
+        output,
+    );
+    assert!(result
+        .primary_detail()
+        .starts_with("command failed: error: final operation failed"));
+    assert!(result.primary_detail().contains("task log"));
+    assert!(!result.primary_detail().contains("first warning"));
+}
+
+#[test]
+fn diagnostic_samples_are_not_counted_as_package_transaction_items() {
+    let mut result = TaskResult::completed("Diagnostics");
+    attach_command_output_diagnostics(
+        &mut result,
+        "warning: fallback\nerror: final operation failed\n",
+    );
+    assert_eq!(summarize_task_items(&result), "advisories=1");
+    result.report_sections.push(TaskReportSection {
+        key: "fixture_packages".into(),
+        title: "Fixture Results".into(),
+        rows: vec![TaskReportRow {
+            name: "fixture".into(),
+            status: TaskReportStatus::Updated,
+            before: Some("1.0".into()),
+            after: Some("2.0".into()),
+            note: None,
+        }],
+    });
+    assert_eq!(summarize_task_items(&result), "updated=1 advisories=1");
+}
+
+#[test]
+fn multiline_task_logs_retain_every_logical_line_in_dashboard_and_journal() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let (tx, rx) = mpsc::channel();
+    let sender = DashboardSender::new(tx, Some(log.clone()));
+    emit_task_log(
+        &sender,
+        Some(&log),
+        "fixture",
+        LogLevel::Error,
+        LogStream::Meta,
+        "failure context\r\n\r\nsecond line\nfinal line".to_string(),
+    );
+    let lines = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            DashboardEvent::LogLine(record) => Some(record.line),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lines, ["failure context", "", "second line", "final line"]);
+    let events = fs::read_to_string(log.run_dir().join("events.jsonl")).unwrap();
+    let messages = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["kind"] == "log_line")
+        .map(|event| event["payload"]["line"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(messages, lines);
+}
+
+#[test]
+#[ignore = "manual diagnostic collector scaling measurement"]
+fn command_diagnostics_scaling_measurement() {
+    for size in [1_000, 4_000, 16_000] {
+        let output = (0..size)
+            .map(|index| format!("warning: unique sample {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for repeat in 0..3 {
+            let start = std::time::Instant::now();
+            let rows = command_diagnostic_rows(std::hint::black_box(&output));
+            std::hint::black_box(&rows);
+            assert!(rows.len() <= COMMAND_DIAGNOSTIC_SAMPLE_LIMIT);
+            crate::ua_outln!(
+                "diagnostic_scaling size={size} repeat={repeat} elapsed_us={}",
+                start.elapsed().as_micros()
+            );
+        }
+    }
 }
 
 #[test]

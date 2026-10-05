@@ -10,6 +10,58 @@ fn write_executable(path: &Path, content: &str) {
     write_executable_atomic(path, content).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn successful_capture_keeps_unterminated_stdout_separate_from_stderr() {
+    let temp = TempDir::new().unwrap();
+    let tool = temp.path().join("capture-fixture");
+    write_executable(
+        &tool,
+        "#!/bin/sh\nprintf 'machine-readable value'\nprintf 'warning: diagnostic' >&2\n",
+    );
+    let program = tool.to_str().unwrap();
+    assert_eq!(
+        run_capture(
+            program,
+            std::iter::empty::<&str>(),
+            Some(Duration::from_secs(5))
+        )
+        .unwrap(),
+        "machine-readable value\nwarning: diagnostic"
+    );
+    assert_eq!(
+        run_capture_stdout(
+            program,
+            std::iter::empty::<&str>(),
+            Some(Duration::from_secs(5))
+        )
+        .unwrap(),
+        "machine-readable value"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stdout_capture_failure_keeps_both_streams_in_error_context() {
+    let temp = TempDir::new().unwrap();
+    let tool = temp.path().join("capture-fixture");
+    write_executable(
+        &tool,
+        "#!/bin/sh\nprintf 'partial result'\nprintf 'error: failed' >&2\nexit 7\n",
+    );
+    let error = run_capture_stdout(
+        tool.to_str().unwrap(),
+        std::iter::empty::<&str>(),
+        Some(Duration::from_secs(5)),
+    )
+    .unwrap_err();
+    assert_eq!(error.downcast_ref::<ProcessExitError>().unwrap().code, "7");
+    assert_eq!(
+        process_exit_output(&error),
+        Some("partial result\nerror: failed")
+    );
+}
+
 struct EnvVarGuard {
     key: &'static str,
     original: Option<OsString>,

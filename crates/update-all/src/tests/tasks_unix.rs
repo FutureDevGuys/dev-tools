@@ -45,6 +45,113 @@ fn read_counter(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|_| "0".to_string())
 }
 
+fn npm_silent_install_health_fixture(mode: &str) -> (TempDir, TaskResult) {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    let root = temp.path().join("lib/node_modules");
+    let package = root.join("native-fixture");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"native-fixture","version":"2.0.0","bin":{"native-fixture":"launcher"}}"#,
+    )
+    .unwrap();
+    write_executable(&package.join("launcher"), "#!/bin/sh\nexit 127\n");
+    write_executable(
+        &bin.join("native-fixture"),
+        "#!/bin/sh\nprintf 'native payload missing\\n' >&2\nexit 127\n",
+    );
+    write_executable(
+        &bin.join("npm"),
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+  prefix) printf '%s\n' "$NPM_STUB_PREFIX" ;;
+  root) printf '%s\n' "$NPM_STUB_ROOT" ;;
+  list) printf '%s\n' '{"dependencies":{"native-fixture":{"version":"2.0.0"}}}' ;;
+  outdated)
+    if [ -f "$NPM_STUB_PREFIX/installed" ]; then printf '{}\n'; else
+      printf '%s\n' '{"native-fixture":{"current":"1.0.0","wanted":"2.0.0","latest":"2.0.0"}}'
+      exit 1
+    fi ;;
+  view)
+    if [ -f "$NPM_STUB_PREFIX/installed" ]; then
+      case "$NPM_STUB_MODE" in
+        unavailable_metadata) printf 'registry unavailable\n' >&2; exit 7 ;;
+        invalid_metadata) printf 'not JSON\n'; exit 0 ;;
+        noisy_metadata) printf 'wrapper output {}\n'; exit 0 ;;
+        malformed_dependency) printf '%s\n' '{"name":"native-fixture","version":"2.0.0","dependencies":{"local":17}}'; exit 0 ;;
+        array_metadata) printf '%s\n' '[{"name":"native-fixture","version":"2.0.0"}]'; exit 0 ;;
+        missing_identity) printf '%s\n' '{}'; exit 0 ;;
+        error_metadata) printf '%s\n' '{"error":{}}'; exit 0 ;;
+        wrong_name) printf '%s\n' '{"name":"other","version":"2.0.0"}'; exit 0 ;;
+        wrong_version) printf '%s\n' '{"name":"native-fixture","version":"9.0.0"}'; exit 0 ;;
+        wrong_array_identity) printf '%s\n' '[{"name":"other","version":"9.0.0"}]'; exit 0 ;;
+        empty_metadata) printf '%s\n' '[]'; exit 0 ;;
+        ambiguous_metadata) printf '%s\n' '[{},{}]'; exit 0 ;;
+        non_registry) printf '%s\n' '{"name":"native-fixture","version":"2.0.0","dependencies":{"local":"file:../local"}}'; exit 0 ;;
+      esac
+    fi
+    printf '%s\n' '{"name":"native-fixture","version":"2.0.0"}' ;;
+  install)
+    printf '%s\n' "$*" >>"$NPM_STUB_PREFIX/install-count"
+    touch "$NPM_STUB_PREFIX/installed"
+    for arg in "$@"; do
+      case "$arg" in
+        --loglevel=warn)
+          if [ "$NPM_STUB_MODE" != broken ]; then
+            printf 'npm warn install-scripts native-fixture@2.0.0 (postinstall: node install.js)\n' >&2
+          fi ;;
+        --allow-scripts=native-fixture)
+          if [ "$NPM_STUB_MODE" = recovered ] || [ "$NPM_STUB_MODE" = array_metadata ]; then
+            printf '#!/bin/sh\nexit 0\n' >"$NPM_STUB_PREFIX/bin/native-fixture"
+            printf '#!/bin/sh\nexit 0\n' >"$NPM_STUB_ROOT/native-fixture/launcher"
+          fi ;;
+      esac
+    done ;;
+
+  *) exit 2 ;;
+esac
+"#,
+    );
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let _path = EnvVarGuard::set(
+        "PATH",
+        format!("{}:{}", bin.display(), old_path.to_string_lossy()),
+    );
+    let _root = EnvVarGuard::set("NPM_STUB_ROOT", root.into_os_string());
+    let _prefix = EnvVarGuard::set("NPM_STUB_PREFIX", temp.path().as_os_str().to_os_string());
+    let _mode = EnvVarGuard::set("NPM_STUB_MODE", mode);
+    let result = npm::task_npm_sync(&test_context(Arc::new(PrivilegeSession::default()))).unwrap();
+    (temp, result)
+}
+
+#[test]
+fn npm_silent_install_does_not_report_a_broken_executable_as_updated() {
+    let (temp, result) = npm_silent_install_health_fixture("broken");
+    let row = result
+        .report_sections
+        .iter()
+        .flat_map(|s| &s.rows)
+        .find(|row| row.name == "native-fixture")
+        .unwrap();
+    assert_eq!(row.status, TaskReportStatus::Blocked);
+    assert!(row
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("executable") && note.contains("health")));
+    assert!(result.blocks_dependents());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("install-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn sudo_keepalive_drop_stops_thread() {
     let stop = Arc::new(AtomicBool::new(false));
@@ -77,6 +184,67 @@ fn sudo_keepalive_drop_stops_thread() {
         stopped_by_drop,
         "drop should stop the sudo keepalive thread"
     );
+}
+
+#[test]
+fn npm_silent_install_recovers_the_observed_registry_script_closure() {
+    for mode in ["recovered", "array_metadata"] {
+        let (temp, result) = npm_silent_install_health_fixture(mode);
+        let row = result
+            .report_sections
+            .iter()
+            .flat_map(|section| &section.rows)
+            .find(|row| row.name == "native-fixture")
+            .unwrap();
+        assert_eq!(row.status, TaskReportStatus::Updated, "{result:?}");
+        assert!(row
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("registry-only lifecycle closure")));
+        let invocations = fs::read_to_string(temp.path().join("install-count")).unwrap();
+        assert_eq!(invocations.lines().count(), 3);
+        assert_eq!(
+            invocations
+                .lines()
+                .filter(|line| line.contains("--allow-scripts=native-fixture"))
+                .count(),
+            1
+        );
+        assert!(!temp.path().join(".npmrc").exists());
+    }
+}
+
+#[test]
+fn npm_silent_install_never_authorizes_scripts_without_verified_registry_metadata() {
+    for mode in [
+        "unavailable_metadata",
+        "invalid_metadata",
+        "noisy_metadata",
+        "malformed_dependency",
+        "missing_identity",
+        "error_metadata",
+        "wrong_name",
+        "wrong_version",
+        "wrong_array_identity",
+        "empty_metadata",
+        "ambiguous_metadata",
+        "non_registry",
+    ] {
+        let (temp, result) = npm_silent_install_health_fixture(mode);
+        let row = result
+            .report_sections
+            .iter()
+            .flat_map(|section| &section.rows)
+            .find(|row| row.name == "native-fixture")
+            .unwrap();
+        assert_eq!(row.status, TaskReportStatus::Blocked, "{mode}: {result:?}");
+        let invocations = fs::read_to_string(temp.path().join("install-count")).unwrap();
+        assert_eq!(invocations.lines().count(), 2, "{mode}: {invocations}");
+        assert!(
+            !invocations.contains("--allow-scripts="),
+            "{mode}: {invocations}"
+        );
+    }
 }
 
 fn test_context(privilege_session: Arc<PrivilegeSession>) -> SyncContext {
@@ -367,6 +535,8 @@ fn npm_refreshes_package_when_current_version_is_missing() {
     let install_marker = temp.path().join("installed");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&npm_root).unwrap();
+    let refreshed = npm_root.join("missing-current");
+    fs::create_dir_all(&refreshed).unwrap();
 
     write_executable(
         &bin_dir.join("npm"),
@@ -384,9 +554,11 @@ if [ "$1" = "prefix" ] && [ "${2:-}" = "-g" ]; then
 fi
 
 if [ "$1" = "list" ] && [ "${2:-}" = "-g" ]; then
-  cat <<'JSON'
-{"dependencies":{"missing-current":{"overridden":false}}}
-JSON
+  if [ -f "${NPM_STUB_INSTALLED:?missing marker}" ]; then
+    printf '%s\n' '{"dependencies":{"missing-current":{"version":"1.2.3"}}}'
+  else
+    printf '%s\n' '{"dependencies":{"missing-current":{"overridden":false}}}'
+  fi
   exit 0
 fi
 
@@ -417,6 +589,7 @@ if [ "$1" = "install" ]; then
     exit 2
   fi
   touch "${NPM_STUB_INSTALLED:?missing marker}"
+  printf '%s\n' '{"name":"missing-current","version":"1.2.3"}' >"$NPM_STUB_ROOT/missing-current/package.json"
   printf '%s\n' 'installed missing-current'
   exit 0
 fi

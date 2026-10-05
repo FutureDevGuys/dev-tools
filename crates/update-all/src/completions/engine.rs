@@ -28,7 +28,7 @@ use super::{
 };
 use crate::config::{load_runtime_config, merge_user_completion_catalog};
 use crate::util::cancel;
-use crate::util::process::{run_capture, which};
+use crate::util::process::{run_capture_stdout, which};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -786,7 +786,7 @@ fn collect_npm_inventory(discover: bool, index: &CatalogIndex) -> ProviderInvent
         inventory.make_partial("discovery_disabled_configured_subset");
         return inventory;
     }
-    let prefix = match run_capture("npm", ["prefix", "-g"], Some(Duration::from_secs(5))) {
+    let prefix = match run_capture_stdout("npm", ["prefix", "-g"], Some(Duration::from_secs(5))) {
         Ok(value) => value.lines().next().unwrap_or("").trim().to_string(),
         Err(error) => {
             return ProviderInventory::failed("npm", format!("npm_prefix_failed:{error}"))
@@ -897,12 +897,13 @@ fn collect_pipx_inventory(discover: bool, index: &CatalogIndex) -> ProviderInven
             false,
         );
     }
-    let list_json = match run_capture("pipx", ["list", "--json"], Some(Duration::from_secs(10))) {
-        Ok(value) => value,
-        Err(error) => {
-            return ProviderInventory::failed("pipx", format!("pipx_list_failed:{error}"))
-        }
-    };
+    let list_json =
+        match run_capture_stdout("pipx", ["list", "--json"], Some(Duration::from_secs(10))) {
+            Ok(value) => value,
+            Err(error) => {
+                return ProviderInventory::failed("pipx", format!("pipx_list_failed:{error}"))
+            }
+        };
     let state: PipxState = match serde_json::from_str(&list_json) {
         Ok(value) => value,
         Err(error) => {
@@ -978,7 +979,7 @@ fn collect_uv_inventory(
         .get("uv")
         .cloned()
         .unwrap_or_default();
-    let json_result = run_capture(
+    let json_result = run_capture_stdout(
         "uv",
         ["tool", "list", "--json"],
         Some(Duration::from_secs(10)),
@@ -1020,7 +1021,7 @@ fn collect_uv_inventory(
         events.push("__UA_COMP_INFO|uv|json_discovery_unsupported".to_string());
     }
 
-    let plain = match run_capture("uv", ["tool", "list"], Some(Duration::from_secs(10))) {
+    let plain = match run_capture_stdout("uv", ["tool", "list"], Some(Duration::from_secs(10))) {
         Ok(value) => value,
         Err(error) => {
             return ProviderInventory::failed("uv", format!("uv_tool_list_failed:{error}"));
@@ -1059,14 +1060,15 @@ fn collect_go_inventory(discover: bool, index: &CatalogIndex) -> ProviderInvento
     if !discover {
         return collect_configured_inventory("go", index, PathBuf::new(), "go-configured", false);
     }
-    let gobin = match run_capture("go", ["env", "GOBIN"], Some(Duration::from_secs(5))) {
+    let gobin = match run_capture_stdout("go", ["env", "GOBIN"], Some(Duration::from_secs(5))) {
         Ok(value) => value.lines().next().unwrap_or("").trim().to_string(),
         Err(error) => {
             return ProviderInventory::failed("go", format!("go_env_gobin_failed:{error}"))
         }
     };
     let bin_dir = if gobin.is_empty() {
-        let gopath = match run_capture("go", ["env", "GOPATH"], Some(Duration::from_secs(5))) {
+        let gopath = match run_capture_stdout("go", ["env", "GOPATH"], Some(Duration::from_secs(5)))
+        {
             Ok(value) => value,
             Err(error) => {
                 return ProviderInventory::failed("go", format!("go_env_gopath_failed:{error}"));
@@ -2022,6 +2024,27 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[test]
+    fn pipx_inventory_reads_json_independently_of_stderr_diagnostics() {
+        let _lock = env_guard();
+        let temp = TempDir::new().unwrap();
+        write_executable(&temp.path().join("pipx"), r#"#!/bin/sh
+printf '%s\n' '{"venvs":{"fixture":{"metadata":{"main_package":{"package":"fixture","package_version":"1.0.0","apps":["fixture-command"]}}}}}'
+printf 'warning: cache routing unavailable\n' >&2
+"#).unwrap();
+        let _path = EnvVarGuard::set("PATH", temp.path().as_os_str());
+        let inventory = collect_pipx_inventory(true, &CatalogIndex::default());
+        assert_eq!(
+            inventory.status,
+            CompletionProviderInventoryStatus::Complete
+        );
+        assert_eq!(inventory.candidates.len(), 1);
+        assert_eq!(
+            inventory.candidates.values().next().unwrap().tool,
+            "fixture-command"
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,

@@ -1976,6 +1976,40 @@ fn does_not_coalesce_non_progress_or_other_streams() {
 }
 
 #[test]
+fn does_not_coalesce_diagnostics_or_package_messages_containing_byte_counts() {
+    for (level, lines) in [
+        (
+            LogLevel::Warn,
+            [
+                "warning: download stopped at 3MB / 5MB",
+                "warning: retry stopped at 4MB / 5MB",
+            ],
+        ),
+        (
+            LogLevel::Info,
+            [
+                "Installed first package (3MB / 5MB)",
+                "Installed second package (4MB / 5MB)",
+            ],
+        ),
+    ] {
+        let mut model = Model::new(200, true, true);
+        model.register_task("test".into(), "Test".into(), Vec::new(), false);
+        for (index, line) in lines.into_iter().enumerate() {
+            model.push_task_log(LogRecord {
+                ts_unix_ms: index as u64,
+                task_id: "test".to_string(),
+                level,
+                stream: LogStream::Stdout,
+                line: line.to_string(),
+            });
+        }
+        assert_eq!(model.tasks["test"].logs.len(), 2);
+        assert_eq!(model.global_logs.len(), 2);
+    }
+}
+
+#[test]
 fn stderr_stream_tag_is_explicit() {
     assert_eq!(stream_tag(LogStream::Stderr), "STDERR");
 }
@@ -2809,6 +2843,70 @@ fn task_log_view_shows_truncation_banner() {
     assert!(text.contains("[TRUNCATED]"));
     assert!(text.contains("press m"));
     assert!(text.contains("full task log"));
+}
+
+#[test]
+fn dashboard_shows_evicted_log_counts_while_following_the_tail() {
+    let mut model = Model::new(40, true, true);
+    model.register_task("fixture".into(), "Fixture".into(), Vec::new(), false);
+    for index in 0..43 {
+        model.push_task_log(LogRecord {
+            ts_unix_ms: index,
+            task_id: "fixture".into(),
+            level: LogLevel::Info,
+            stream: LogStream::Stdout,
+            line: format!("line-{index}"),
+        });
+    }
+    let backend = ratatui::backend::TestBackend::new(140, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let layout = layout_for(
+        Rect::new(0, 0, 140, 40),
+        true,
+        model.right_pane_mode,
+        model.active_pane,
+    );
+    terminal
+        .draw(|frame| draw_dashboard(frame, &model, &layout))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("Task Logs: 3 older"), "{text}");
+    assert!(text.contains("Global Logs: 3 older"), "{text}");
+}
+
+#[test]
+fn diagnostic_report_warning_cells_use_warning_colors() {
+    let spans = stylize_log_body(
+        "warning  emitted  captured  Warning",
+        Style::default(),
+        LogStream::Meta,
+        ReportHighlightState::Active(ReportStyleKind::Standard),
+        LabeledVersionColorMode::Standalone,
+    );
+    assert!(spans
+        .iter()
+        .any(|span| span.content.as_ref().contains("Warning")
+            && span.style.fg == Some(Color::Yellow)));
+}
+
+#[test]
+fn diagnostic_marker_colors_do_not_highlight_identifier_substrings() {
+    let spans = stylize_log_body(
+        "NO_ERRORS_REPORTED WARNING_COUNT=0",
+        Style::default(),
+        LogStream::Stdout,
+        ReportHighlightState::None,
+        LabeledVersionColorMode::Standalone,
+    );
+    assert!(spans
+        .iter()
+        .all(|span| !matches!(span.style.fg, Some(Color::Red | Color::Yellow))));
 }
 
 #[test]

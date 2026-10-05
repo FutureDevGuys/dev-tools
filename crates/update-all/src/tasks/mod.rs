@@ -1086,34 +1086,14 @@ impl SyncContext {
         line: impl Into<String>,
     ) {
         let line = line.into();
-        let task_id = if task_id == "runtime" {
-            RUN_LOG_SCOPE
-        } else {
-            task_id
-        };
-        let rec = LogRecord {
-            ts_unix_ms: now_unix_ms(),
-            task_id: task_id.to_string(),
+        emit_task_log_records(
+            self.event_tx.as_ref(),
+            self.run_log.as_ref(),
+            task_id,
             level,
             stream,
-            line,
-        };
-        if self.event_tx.is_none() {
-            if let Some(log) = &self.run_log {
-                let _ = journal_dashboard_event(log, &DashboardEvent::LogLine(rec.clone()));
-            }
-        }
-        if let Some(log) = &self.run_log {
-            if let Err(err) = log.write_raw(&rec) {
-                log.emit_write_warning_once(&err);
-            }
-            if let Err(err) = log.write_record(&rec) {
-                log.emit_write_warning_once(&err);
-            }
-        }
-        if let Some(tx) = &self.event_tx {
-            let _ = tx.send(DashboardEvent::LogLine(rec));
-        }
+            &line,
+        );
     }
 
     pub fn set_task_state(&self, task_id: &str, state: TaskState, detail: Option<String>) {
@@ -4015,6 +3995,23 @@ fn failed_command_result_with_report_sections(
     output: &str,
 ) -> TaskResult {
     let detail = detail.into();
+    let detail = if detail.starts_with("command failed:") {
+        strip_ansi(output)
+            .lines()
+            .rev()
+            .find_map(|line| {
+                let (kind, diagnostic) = command_diagnostic_sample(line)?;
+                (kind == "error").then(|| {
+                    format!(
+                        "command failed: {} (see task log for full output)",
+                        bounded_structured_text(&diagnostic.text),
+                    )
+                })
+            })
+            .unwrap_or(detail)
+    } else {
+        detail
+    };
     let mut result = TaskResult::failed(label, detail.clone());
     result.report_sections = build_failed_command_report_sections_for_command(cmd, output);
     attach_command_output_diagnostics(&mut result, output);
@@ -4038,20 +4035,28 @@ fn attach_command_output_diagnostics(result: &mut TaskResult, output: &str) {
     let Some(section) = command_diagnostic_report_section(output) else {
         return;
     };
-    let diagnostic_count = section.rows.len();
+    let severity = if section.rows.iter().any(|row| row.name == "error") {
+        AdvisorySeverity::Error
+    } else {
+        AdvisorySeverity::Warning
+    };
     result.report_sections.push(section);
-    if result.status == TaskStatus::Completed
-        && !result
-            .advisories
-            .iter()
-            .any(|advisory| advisory.code == "command-output-diagnostics")
+    if result.status != TaskStatus::Completed {
+        return;
+    }
+    if let Some(advisory) = result
+        .advisories
+        .iter_mut()
+        .find(|advisory| advisory.code == "command-output-diagnostics")
     {
+        if severity == AdvisorySeverity::Error {
+            advisory.severity = AdvisorySeverity::Error;
+        }
+    } else {
         result.advisories.push(TaskAdvisory {
-            severity: AdvisorySeverity::Warning,
+            severity,
             code: "command-output-diagnostics".to_string(),
-            summary: format!(
-                "command output included {diagnostic_count} warning/error diagnostics"
-            ),
+            summary: "command output included warning/error diagnostics; see diagnostic samples and the complete task log".to_string(),
             remediation:
                 "Review the command diagnostics section and raw task log for full context."
                     .to_string(),
@@ -4071,6 +4076,7 @@ fn command_diagnostic_report_section(output: &str) -> Option<TaskReportSection> 
 
 fn command_diagnostic_rows(output: &str) -> Vec<TaskReportRow> {
     let mut samples = Vec::<CommandDiagnosticSample>::new();
+    let mut omitted = 0usize;
     for raw_line in strip_ansi(output).replace('\r', "\n").lines() {
         let Some((kind, normalized)) = command_diagnostic_sample(raw_line) else {
             continue;
@@ -4082,6 +4088,14 @@ fn command_diagnostic_rows(output: &str) -> Vec<TaskReportRow> {
             sample.count += 1;
             continue;
         }
+        // Keep a separate bounded sample budget for each severity so an error
+        // after a noisy warning stream can still enter the final summary.
+        if samples.iter().filter(|sample| sample.kind == kind).count()
+            >= COMMAND_DIAGNOSTIC_SAMPLE_LIMIT
+        {
+            omitted += 1;
+            continue;
+        }
         samples.push(CommandDiagnosticSample {
             kind,
             key: normalized.key,
@@ -4089,9 +4103,20 @@ fn command_diagnostic_rows(output: &str) -> Vec<TaskReportRow> {
             count: 1,
         });
     }
-    samples
+    samples.sort_by_key(|sample| sample.kind != "error");
+    let limit = if omitted > 0 || samples.len() > COMMAND_DIAGNOSTIC_SAMPLE_LIMIT {
+        COMMAND_DIAGNOSTIC_SAMPLE_LIMIT.saturating_sub(1)
+    } else {
+        COMMAND_DIAGNOSTIC_SAMPLE_LIMIT
+    };
+    omitted += samples
+        .iter()
+        .skip(limit)
+        .map(|sample| sample.count)
+        .sum::<usize>();
+    let mut rows = samples
         .into_iter()
-        .take(COMMAND_DIAGNOSTIC_SAMPLE_LIMIT)
+        .take(limit)
         .map(|sample| {
             let note = if sample.count > 1 {
                 format!("{} ({} occurrences)", sample.text, sample.count)
@@ -4106,7 +4131,17 @@ fn command_diagnostic_rows(output: &str) -> Vec<TaskReportRow> {
                 note: Some(note),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if omitted > 0 {
+        rows.push(TaskReportRow {
+            name: "additional diagnostics".to_string(),
+            status: TaskReportStatus::Info,
+            before: None,
+            after: None,
+            note: Some(format!("{omitted} diagnostic occurrence(s) omitted from this summary; see the complete task log")),
+        });
+    }
+    rows
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4138,7 +4173,7 @@ fn command_diagnostic_sample(line: &str) -> Option<(&'static str, NormalizedComm
             },
         ));
     }
-    if is_warning_diagnostic_line(&lower) {
+    if command_diagnostic_kind(&lower) == Some("warning") {
         return Some((
             "warning",
             NormalizedCommandDiagnostic {
@@ -4147,7 +4182,7 @@ fn command_diagnostic_sample(line: &str) -> Option<(&'static str, NormalizedComm
             },
         ));
     }
-    if is_error_diagnostic_line(&lower) {
+    if command_diagnostic_kind(&lower) == Some("error") {
         return Some((
             "error",
             NormalizedCommandDiagnostic {
@@ -4157,6 +4192,19 @@ fn command_diagnostic_sample(line: &str) -> Option<(&'static str, NormalizedComm
         ));
     }
     None
+}
+
+fn command_diagnostic_kind(lower: &str) -> Option<&'static str> {
+    if lower.contains("no debugging symbols")
+        || is_external_manager_self_update_unsupported(lower)
+        || is_warning_diagnostic_line(lower)
+    {
+        Some("warning")
+    } else if is_error_diagnostic_line(lower) {
+        Some("error")
+    } else {
+        None
+    }
 }
 
 fn is_warning_diagnostic_line(lower: &str) -> bool {
@@ -4176,6 +4224,19 @@ fn is_error_diagnostic_line(lower: &str) -> bool {
         || lower.starts_with("fatal ")
         || lower.starts_with("panic:")
         || lower.starts_with("panic ")
+        || lower.starts_with("npm error")
+        || lower.starts_with("npm err!")
+        || lower.starts_with("-> error ")
+        || (lower.starts_with("thread '") && lower.contains(" panicked at "))
+        || lower.split_once(": ").is_some_and(|(program, message)| {
+            !program.is_empty()
+                && program
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+                && (message.starts_with("error ")
+                    || message.starts_with("error:")
+                    || message.starts_with("fatal:"))
+        })
 }
 
 fn destructive_recovery_rollback_decision(
@@ -11303,6 +11364,9 @@ struct ReportStatusCounts {
 
 impl ReportStatusCounts {
     fn add(&mut self, section_key: &str, row: &TaskReportRow) {
+        if section_key == "command_diagnostics" {
+            return;
+        }
         match (section_key, row.status) {
             ("completion_generation", TaskReportStatus::Updated) => self.generated += 1,
             ("completion_generation", TaskReportStatus::Unchanged) => self.unchanged += 1,
@@ -11509,28 +11573,35 @@ fn render_npm_package_footer<'a>(
             ]);
             lines.push(RenderedReportLine {
                 text: row_text,
-                level: report_status_level(row.status),
+                level: report_row_level(&key, row),
             });
             for note in overflow_notes {
-                if !should_render_inline_note(InlineNoteKind::Overflow, row.status, note_verbosity)
+                if key != "command_diagnostics"
+                    && !should_render_inline_note(
+                        InlineNoteKind::Overflow,
+                        row.status,
+                        note_verbosity,
+                    )
                 {
                     continue;
                 }
                 let tag = render_report_note_prefix_for_row(&key, row, color);
                 lines.push(RenderedReportLine {
                     text: format!("  {tag} {}", sanitize_report_cell_text(&note)),
-                    level: report_status_level(row.status),
+                    level: report_row_level(&key, row),
                 });
             }
             if let Some(note) = &row.note {
                 let kind = classify_row_note_kind(&key, row.status);
-                if !should_render_inline_note(kind, row.status, note_verbosity) {
+                if key != "command_diagnostics"
+                    && !should_render_inline_note(kind, row.status, note_verbosity)
+                {
                     continue;
                 }
                 let tag = render_report_note_prefix_for_row(&key, row, color);
                 lines.push(RenderedReportLine {
                     text: format!("  {tag} {}", sanitize_report_cell_text(note)),
-                    level: report_status_level(row.status),
+                    level: report_row_level(&key, row),
                 });
             }
         }
@@ -12444,7 +12515,7 @@ fn render_per_task_changes<'a>(
                 ]);
                 lines.push(RenderedReportLine {
                     text: format!("  {row_text}"),
-                    level: report_status_level(row.status),
+                    level: report_row_level(&section.key, row),
                 });
                 for note in overflow_notes {
                     if !debug_report
@@ -12462,7 +12533,7 @@ fn render_per_task_changes<'a>(
                             render_report_note_prefix_for_row(&section.key, row, color),
                             note
                         ),
-                        level: report_status_level(row.status),
+                        level: report_row_level(&section.key, row),
                     });
                 }
                 if let Some(note) = row.note.as_deref() {
@@ -12474,7 +12545,7 @@ fn render_per_task_changes<'a>(
                                 render_report_note_prefix_for_row(&section.key, row, color),
                                 sanitize_report_cell_text(note)
                             ),
-                            level: report_status_level(row.status),
+                            level: report_row_level(&section.key, row),
                         });
                     }
                 }
@@ -12716,6 +12787,13 @@ fn render_update_details_notes(section_key: &str, row: &TaskReportRow) -> String
 }
 
 fn report_status_cell_for_row(key: &str, row: &TaskReportRow) -> &'static str {
+    if key == "command_diagnostics" {
+        return match row.name.as_str() {
+            "error" => "Error",
+            "warning" => "Warning",
+            _ => "Info",
+        };
+    }
     match (key, row.status) {
         ("completion_generation", TaskReportStatus::Updated) => "Generated",
         ("completion_generation", TaskReportStatus::Refreshed) => "Refreshed",
@@ -12775,6 +12853,13 @@ fn report_status_cell(key: &str, status: TaskReportStatus) -> &'static str {
 }
 
 fn report_status_note_label_for_row(section_key: &str, row: &TaskReportRow) -> &'static str {
+    if section_key == "command_diagnostics" {
+        return match row.name.as_str() {
+            "error" => "error",
+            "warning" => "warning",
+            _ => "info",
+        };
+    }
     match (section_key, row.status) {
         ("completion_generation", TaskReportStatus::Updated) => "generated",
         ("completion_generation", TaskReportStatus::Refreshed) => "refreshed",
@@ -12807,10 +12892,24 @@ fn report_status_note_label(section_key: &str, status: TaskReportStatus) -> &'st
 }
 
 fn render_report_note_prefix_for_row(
-    _section_key: &str,
+    section_key: &str,
     row: &TaskReportRow,
     color: bool,
 ) -> String {
+    if section_key == "command_diagnostics" {
+        let diagnostic = match row.name.as_str() {
+            "error" => Some(("[ERROR]", crossterm::style::Color::Red)),
+            "warning" => Some(("[WARN]", crossterm::style::Color::Yellow)),
+            _ => None,
+        };
+        if let Some((tag, severity_color)) = diagnostic {
+            return if color_output_enabled(color) {
+                colorize_report_cell(tag, severity_color)
+            } else {
+                tag.to_string()
+            };
+        }
+    }
     render_report_note_prefix(row.status, color)
 }
 
@@ -12838,9 +12937,16 @@ fn colorize_report_cell(input: &str, color: crossterm::style::Color) -> String {
 }
 
 fn report_status_color_for_row(
-    _section_key: &str,
+    section_key: &str,
     row: &TaskReportRow,
 ) -> Option<crossterm::style::Color> {
+    if section_key == "command_diagnostics" {
+        return match row.name.as_str() {
+            "error" => Some(crossterm::style::Color::Red),
+            "warning" => Some(crossterm::style::Color::Yellow),
+            _ => None,
+        };
+    }
     if row.status == TaskReportStatus::Unchanged {
         return None;
     }
@@ -12879,6 +12985,17 @@ fn report_status_level(status: TaskReportStatus) -> LogLevel {
         | TaskReportStatus::Unchanged
         | TaskReportStatus::Skipped => LogLevel::Info,
     }
+}
+
+fn report_row_level(section_key: &str, row: &TaskReportRow) -> LogLevel {
+    if section_key == "command_diagnostics" {
+        return match row.name.as_str() {
+            "error" => LogLevel::Error,
+            "warning" => LogLevel::Warn,
+            _ => LogLevel::Info,
+        };
+    }
+    report_status_level(row.status)
 }
 
 fn format_table_row(cells: &[TableCell<'_>]) -> (String, Vec<String>) {
@@ -13395,27 +13512,47 @@ fn emit_task_log(
     stream: LogStream,
     line: String,
 ) {
+    emit_task_log_records(Some(event_tx), run_log, task_id, level, stream, &line);
+}
+
+fn emit_task_log_records(
+    event_tx: Option<&DashboardSender>,
+    run_log: Option<&Arc<RunLogSink>>,
+    task_id: &str,
+    level: LogLevel,
+    stream: LogStream,
+    line: &str,
+) {
     let task_id = if task_id == "runtime" {
         RUN_LOG_SCOPE
     } else {
         task_id
     };
-    let rec = LogRecord {
-        ts_unix_ms: now_unix_ms(),
-        task_id: task_id.to_string(),
-        level,
-        stream,
-        line,
-    };
-    if let Some(log) = run_log {
-        if let Err(err) = log.write_raw(&rec) {
-            log.emit_write_warning_once(&err);
+    for line in line.split('\n').map(|line| line.trim_end_matches('\r')) {
+        let rec = LogRecord {
+            ts_unix_ms: now_unix_ms(),
+            task_id: task_id.to_string(),
+            level,
+            stream,
+            line: line.to_string(),
+        };
+        if event_tx.is_none() {
+            if let Some(log) = run_log {
+                let _ = journal_dashboard_event(log, &DashboardEvent::LogLine(rec.clone()));
+            }
         }
-        if let Err(err) = log.write_record(&rec) {
-            log.emit_write_warning_once(&err);
+        if let Some(log) = run_log {
+            if let Err(err) = log.write_raw(&rec) {
+                log.emit_write_warning_once(&err);
+            }
+            if let Err(err) = log.write_record(&rec) {
+                log.emit_write_warning_once(&err);
+            }
+        }
+        if let Some(event_tx) = event_tx {
+            let _ = event_tx.send(DashboardEvent::LogLine(rec));
         }
     }
-    let _ = event_tx.send(DashboardEvent::LogLine(rec));
 }
 
 fn to_task_state(status: TaskStatus) -> TaskState {
@@ -13435,35 +13572,13 @@ fn capture_guard_reason_label(reason: CaptureGuardReason) -> &'static str {
     }
 }
 
-fn classify_stream_level(kind: StreamKind, line: &str) -> LogLevel {
-    if matches!(kind, StreamKind::Stdout) {
-        return LogLevel::Info;
+fn classify_stream_level(_kind: StreamKind, line: &str) -> LogLevel {
+    let clean = strip_ansi(line);
+    match command_diagnostic_kind(&clean.trim().to_ascii_lowercase()) {
+        Some("error") => LogLevel::Error,
+        Some("warning") => LogLevel::Warn,
+        _ => LogLevel::Info,
     }
-    if is_external_manager_self_update_unsupported(line) {
-        return LogLevel::Warn;
-    }
-    let lower = line.trim().to_ascii_lowercase();
-    if lower.starts_with("error:")
-        || lower.starts_with("error ")
-        || lower.starts_with("==> error:")
-        || lower.starts_with("==> error ")
-        || lower.starts_with("fatal:")
-        || lower.starts_with("fatal ")
-        || lower.starts_with("panic:")
-        || lower.starts_with("panic ")
-        || lower.starts_with("thread '")
-    {
-        return LogLevel::Error;
-    }
-    if lower.starts_with("warning:")
-        || lower.starts_with("warn:")
-        || lower.starts_with("warn ")
-        || lower.starts_with("npm warn")
-        || lower.starts_with("==> warning:")
-    {
-        return LogLevel::Warn;
-    }
-    LogLevel::Info
 }
 
 fn classify_meta_level(line: &str) -> LogLevel {

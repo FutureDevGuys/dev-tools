@@ -292,6 +292,43 @@ where
     )
 }
 
+/// Capture machine-readable stdout without appending successful stderr diagnostics.
+pub fn run_capture_stdout<I, S>(program: &str, args: I, timeout: Option<Duration>) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_capture_stdout_allow_exit_codes(program, args, timeout, &[])
+}
+
+pub fn run_capture_stdout_allow_exit_codes<I, S>(
+    program: &str,
+    args: I,
+    timeout: Option<Duration>,
+    allowed_exit_codes: &[i32],
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_capture_output_with_options(
+        program,
+        args,
+        timeout,
+        allowed_exit_codes,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        true,
+        None,
+        None,
+    )
+    .map(|output| output.stdout)
+}
+
 pub fn run_capture_streaming<I, S>(
     program: &str,
     args: I,
@@ -711,6 +748,61 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_capture_output_with_options(
+        program,
+        args,
+        timeout,
+        allowed_exit_codes,
+        stdin_inherit,
+        stdout_stderr_inherit,
+        line_cb,
+        cancel_check,
+        on_spawn,
+        on_exit,
+        managed_process_group,
+        capture_guard,
+        stdin_rx,
+    )
+    .map(CapturedOutput::combined)
+}
+
+struct CapturedOutput {
+    stdout: String,
+    stderr: String,
+}
+
+impl CapturedOutput {
+    fn combined(self) -> String {
+        let mut output = self.stdout;
+        if !self.stderr.is_empty() {
+            if !output.is_empty() && !output.ends_with(['\r', '\n']) {
+                output.push('\n');
+            }
+            output.push_str(&self.stderr);
+        }
+        output
+    }
+}
+
+fn run_capture_output_with_options<I, S>(
+    program: &str,
+    args: I,
+    timeout: Option<Duration>,
+    allowed_exit_codes: &[i32],
+    stdin_inherit: bool,
+    stdout_stderr_inherit: bool,
+    line_cb: Option<std::sync::Arc<dyn Fn(StreamKind, String) + Send + Sync>>,
+    cancel_check: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    on_spawn: Option<std::sync::Arc<dyn Fn(u32) + Send + Sync>>,
+    on_exit: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    managed_process_group: bool,
+    capture_guard: Option<CaptureGuard>,
+    stdin_rx: Option<mpsc::Receiver<String>>,
+) -> Result<CapturedOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let resolved_program = resolve_executable(program);
     let args = args
         .into_iter()
@@ -826,23 +918,24 @@ where
     if let Some(handle) = stdin_writer {
         let _ = handle.join();
     }
-    let mut out = String::from_utf8_lossy(&out_bytes).to_string();
-    if !err_bytes.is_empty() {
-        out.push_str(&String::from_utf8_lossy(&err_bytes));
-    }
+    let output = CapturedOutput {
+        stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
+    };
 
     if status.success()
         || status
             .code()
             .is_some_and(|code| allowed_exit_codes.contains(&code))
     {
-        Ok(out)
+        Ok(output)
     } else {
         let code = status
             .code()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "terminated-by-signal".to_string());
-        let trimmed = out.trim();
+        let combined = output.combined();
+        let trimmed = combined.trim();
         if trimmed.is_empty() {
             Err(anyhow!(ProcessExitError {
                 program: program.to_string(),

@@ -26,7 +26,7 @@ regex = "1"
 is-terminal = "0.4"
 libc = "0.2"
 ratatui = { version = "0.30", optional = true }
-crossterm = { version = "0.29", optional = true }
+crossterm = "0.29"
 ctrlc = "3"
 unicode-width = "0.2"
 uuid = { version = "1", default-features = false, features = ["serde", "v4"] }
@@ -44,7 +44,7 @@ nix = { version = "0.31", default-features = false, features = ["process", "sign
 
 [features]
 default = ["tui"]
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui"]
 
 # rust-development-skill:clippy-lints:start
 # Workspace Clippy + rustc lint configuration.

@@ -5,7 +5,7 @@ use crate::tasks::{
     TaskReportStatus, TaskResult, TaskStatus, TASK_NPM,
 };
 use crate::ui::{LogLevel, LogStream};
-use crate::util::process::{run_capture_allow_exit_codes, which};
+use crate::util::process::{run_capture_stdout_allow_exit_codes, which};
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -49,7 +49,7 @@ struct NpmGlobalLayout {
 }
 
 fn npm_global_path(npm_bin: &str, subcommand: &str) -> Result<PathBuf> {
-    let raw = run_capture_allow_exit_codes(
+    let raw = run_capture_stdout_allow_exit_codes(
         npm_bin,
         [subcommand, "-g"],
         Some(Duration::from_secs(30)),
@@ -628,11 +628,15 @@ fn recover_unhealthy_npm_root(
     npm_bin: &str,
     plan: &PlannedUpdate,
 ) -> Result<String, String> {
+    let mut isolated_args = npm_install_args(std::slice::from_ref(plan));
+    // Lifecycle recovery needs warnings even when the user's ordinary npm
+    // output is quiet. This is an invocation override, never persisted trust.
+    isolated_args.push("--loglevel=warn".to_string());
     let isolated_output = ctx
         .run_command_with_policy(
             TASK_NPM,
             npm_bin,
-            npm_install_args(std::slice::from_ref(plan)),
+            isolated_args,
             &ctx.task_policies.npm_install,
             false,
         )
@@ -647,7 +651,7 @@ fn recover_unhealthy_npm_root(
 
     for script in &closure {
         if let Some(issue) =
-            npm_view_manifest_protocol_issue(npm_bin, &script.package, &script.version)
+            npm_view_manifest_protocol_issue_checked(npm_bin, &script.package, &script.version)?
         {
             return Err(format!(
                 "automatic lifecycle recovery rejected non-registry closure member {}@{}: {}",
@@ -805,7 +809,7 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
         LogStream::Meta,
         format!("checking npm outdated packages via {npm_bin}"),
     );
-    let outdated = match run_capture_allow_exit_codes(
+    let outdated = match run_capture_stdout_allow_exit_codes(
         npm_bin,
         ["outdated", "-g", "--json"],
         Some(Duration::from_secs(NPM_OUTDATED_TIMEOUT_SECS)),
@@ -1482,7 +1486,7 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                 }
             }
 
-            let post_outdated = run_capture_allow_exit_codes(
+            let post_outdated = run_capture_stdout_allow_exit_codes(
                 npm_bin,
                 ["outdated", "-g", "--json"],
                 Some(Duration::from_secs(NPM_OUTDATED_TIMEOUT_SECS)),
@@ -1499,6 +1503,9 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                 "npm results per package:",
             );
             let result_row_start = report_rows.len();
+            let installed_versions = npm_list_global_versions(npm_bin);
+            let installed_root = npm_global_root(npm_bin)
+                .map_err(|error| format!("could not resolve npm global root: {error}"));
             for plan in &successful_plans {
                 if let Some(observed_entry) = post_outdated.get(&plan.package) {
                     let observed = normalize_version(observed_entry.current.as_deref())
@@ -1523,6 +1530,38 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                         )),
                     });
                 } else {
+                    let health = installed_root
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|root| {
+                            verify_installed_npm_root_with_state(plan, &installed_versions, root)
+                        });
+                    let recovery_note = match health {
+                        Ok(()) => None,
+                        Err(initial_health_failure) => {
+                            match recover_unhealthy_npm_root(ctx, npm_bin, plan) {
+                                Ok(note) => Some(note),
+                                Err(recovery_failure) => {
+                                    let reason = format!("root executable health failed ({initial_health_failure}); bounded recovery failed ({recovery_failure})");
+                                    report_rows.push(TaskReportRow {
+                                        name: plan.package.clone(),
+                                        status: TaskReportStatus::Blocked,
+                                        before: Some(plan.current.clone()),
+                                        after: installed_versions.get(&plan.package).cloned(),
+                                        note: Some(reason.clone()),
+                                    });
+                                    advisories.push(TaskAdvisory {
+                                    severity: AdvisorySeverity::Error,
+                                    code: "npm-root-health-blocked".to_string(),
+                                    summary: format!("{}: {reason}", plan.package),
+                                    remediation: "Review the package's install diagnostics and repair its declared executable before rerunning; no lifecycle trust was persisted.".to_string(),
+                                    blocks_dependents: true,
+                                });
+                                    continue;
+                                }
+                            }
+                        }
+                    };
                     let suffix = plan
                         .note
                         .as_deref()
@@ -1542,7 +1581,7 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                         status: TaskReportStatus::Updated,
                         before: Some(plan.current.clone()),
                         after: Some(plan.target.clone()),
-                        note: plan.note.clone(),
+                        note: recovery_note.or_else(|| plan.note.clone()),
                     });
                 }
             }
@@ -1731,8 +1770,12 @@ fn prune_stale_npm_temp_dirs_in_dir(
 }
 
 fn npm_global_root(npm_bin: &str) -> Result<PathBuf> {
-    let raw =
-        run_capture_allow_exit_codes(npm_bin, ["root", "-g"], Some(Duration::from_secs(30)), &[])?;
+    let raw = run_capture_stdout_allow_exit_codes(
+        npm_bin,
+        ["root", "-g"],
+        Some(Duration::from_secs(30)),
+        &[],
+    )?;
     let root = raw
         .lines()
         .rev()
@@ -1743,7 +1786,18 @@ fn npm_global_root(npm_bin: &str) -> Result<PathBuf> {
 }
 
 fn verify_installed_npm_root(npm_bin: &str, plan: &PlannedUpdate) -> Result<(), String> {
-    let observed = npm_list_global_versions(npm_bin)
+    let versions = npm_list_global_versions(npm_bin);
+    let root = npm_global_root(npm_bin)
+        .map_err(|error| format!("could not resolve npm global root: {error}"))?;
+    verify_installed_npm_root_with_state(plan, &versions, &root)
+}
+
+fn verify_installed_npm_root_with_state(
+    plan: &PlannedUpdate,
+    versions: &BTreeMap<String, String>,
+    root: &Path,
+) -> Result<(), String> {
+    let observed = versions
         .get(&plan.package)
         .cloned()
         .ok_or_else(|| format!("{} is absent from npm list -g", plan.package))?;
@@ -1754,8 +1808,6 @@ fn verify_installed_npm_root(npm_bin: &str, plan: &PlannedUpdate) -> Result<(), 
         ));
     }
 
-    let root = npm_global_root(npm_bin)
-        .map_err(|error| format!("could not resolve npm global root: {error}"))?;
     let package_dir = root.join(&plan.package);
     let manifest_path = package_dir.join("package.json");
     let manifest_raw = fs::read_to_string(&manifest_path)
@@ -1830,7 +1882,7 @@ fn verify_installed_npm_root(npm_bin: &str, plan: &PlannedUpdate) -> Result<(), 
         .or_else(|| which(primary))
         .ok_or_else(|| format!("declared global executable {primary} is not available"))?;
     for candidate in [["--version"], ["version"], ["--help"]] {
-        if run_capture_allow_exit_codes(
+        if run_capture_stdout_allow_exit_codes(
             executable.to_string_lossy().as_ref(),
             candidate,
             Some(Duration::from_secs(10)),
@@ -1941,7 +1993,7 @@ fn select_target(entry: &NpmOutdatedEntry) -> Option<String> {
 }
 
 fn npm_list_global_versions(npm_bin: &str) -> BTreeMap<String, String> {
-    run_capture_allow_exit_codes(
+    run_capture_stdout_allow_exit_codes(
         npm_bin,
         ["list", "-g", "--depth=0", "--json"],
         Some(Duration::from_secs(30)),
@@ -2035,7 +2087,7 @@ fn version_update_decision(current: &str, target: &str) -> VersionDecision {
 }
 
 fn npm_view_latest_version(npm_bin: &str, package: &str) -> Option<String> {
-    let first = run_capture_allow_exit_codes(
+    let first = run_capture_stdout_allow_exit_codes(
         npm_bin,
         ["view", package, "version", "--json"],
         Some(Duration::from_secs(30)),
@@ -2047,7 +2099,7 @@ fn npm_view_latest_version(npm_bin: &str, package: &str) -> Option<String> {
         return first;
     }
 
-    run_capture_allow_exit_codes(
+    run_capture_stdout_allow_exit_codes(
         npm_bin,
         ["view", package, "version"],
         Some(Duration::from_secs(30)),
@@ -2062,51 +2114,106 @@ fn npm_view_manifest_protocol_issue(
     package: &str,
     version: &str,
 ) -> Option<ManifestProtocolIssue> {
+    read_npm_registry_manifest(npm_bin, package, version)
+        .ok()
+        .and_then(|payload| parse_npm_manifest_protocol_issue(&payload))
+}
+
+fn npm_view_manifest_protocol_issue_checked(
+    npm_bin: &str,
+    package: &str,
+    version: &str,
+) -> Result<Option<ManifestProtocolIssue>, String> {
+    let payload = read_npm_registry_manifest(npm_bin, package, version)?;
+    parse_npm_manifest_protocol_issue_checked(&payload, package, version).map_err(|_| {
+        format!(
+            "registry manifest is invalid for {package}@{version}; no script authorization granted"
+        )
+    })
+}
+
+fn read_npm_registry_manifest(
+    npm_bin: &str,
+    package: &str,
+    version: &str,
+) -> Result<String, String> {
     let spec = format!("{package}@{version}");
-    run_capture_allow_exit_codes(
+    // A full-manifest query avoids the legitimately empty output of selected
+    // fields on packages without dependencies. npm 12 wraps it in an array.
+    run_capture_stdout_allow_exit_codes(
         npm_bin,
-        [
-            "view",
-            spec.as_str(),
-            "dependencies",
-            "optionalDependencies",
-            "peerDependencies",
-            "--json",
-        ],
+        ["view", spec.as_str(), "--json"],
         Some(Duration::from_secs(30)),
-        &[1],
+        &[],
     )
-    .ok()
-    .and_then(|payload| parse_npm_manifest_protocol_issue(&payload))
+    .map_err(|_| {
+        format!("registry manifest observation failed for {spec}; no script authorization granted")
+    })
 }
 
 fn parse_npm_manifest_protocol_issue(raw: &str) -> Option<ManifestProtocolIssue> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
+    let json: Value = parse_json_payload(raw.trim()).ok()?;
+    inspect_npm_manifest_dependency_sources(&json)
+        .ok()
+        .flatten()
+}
 
-    let json: Value = parse_json_payload(trimmed).ok()?;
-    let object = json.as_object()?;
+fn parse_npm_manifest_protocol_issue_checked(
+    raw: &str,
+    package: &str,
+    version: &str,
+) -> Result<Option<ManifestProtocolIssue>, String> {
+    let json: Value =
+        serde_json::from_str(raw.trim()).map_err(|_| "invalid registry JSON".to_string())?;
+    let manifest = match &json {
+        Value::Array(entries) if entries.len() == 1 => &entries[0],
+        Value::Object(_) => &json,
+        _ => return Err("registry result must contain exactly one manifest".to_string()),
+    };
+    if manifest.get("name").and_then(Value::as_str) != Some(package)
+        || manifest.get("version").and_then(Value::as_str) != Some(version)
+    {
+        return Err("registry manifest identity does not match requested package".to_string());
+    }
+    inspect_npm_manifest_dependency_sources(&json)
+}
+
+fn inspect_npm_manifest_dependency_sources(
+    json: &Value,
+) -> Result<Option<ManifestProtocolIssue>, String> {
+    let json = if let Value::Array(entries) = json {
+        entries
+            .first()
+            .filter(|_| entries.len() == 1)
+            .ok_or_else(|| "registry result must contain exactly one manifest".to_string())?
+    } else {
+        json
+    };
+    let object = json
+        .as_object()
+        .ok_or_else(|| "registry manifest must be an object".to_string())?;
     for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
-        let Some(map) = object.get(field).and_then(Value::as_object) else {
+        let Some(value) = object.get(field) else {
             continue;
         };
+        let map = value
+            .as_object()
+            .ok_or_else(|| format!("registry {field} must be an object"))?;
         for (dependency, spec) in map {
-            let Some(spec) = spec.as_str() else {
-                continue;
-            };
+            let spec = spec
+                .as_str()
+                .ok_or_else(|| "registry dependency selector must be a string".to_string())?;
             if let Some(protocol) = non_registry_dependency_source(spec) {
-                return Some(ManifestProtocolIssue {
+                return Ok(Some(ManifestProtocolIssue {
                     field: field.to_string(),
                     dependency: dependency.clone(),
                     spec: spec.to_string(),
                     protocol: protocol.to_string(),
-                });
+                }));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn non_registry_dependency_source(spec: &str) -> Option<&'static str> {
@@ -2309,6 +2416,21 @@ fn build_report_counts_line(rows: &[TaskReportRow]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn npm_global_path_ignores_stderr_diagnostics() {
+        let _lock = crate::test_support::env_guard();
+        let temp = tempfile::TempDir::new().unwrap();
+        let npm = temp.path().join("npm");
+        crate::test_support::write_executable(
+            &npm,
+            "#!/bin/sh\nprintf '/user-owned/prefix\\n'\nprintf 'cache routing unavailable; using the original tool\\n' >&2\n",
+        ).unwrap();
+        assert_eq!(
+            super::npm_global_path(npm.to_str().unwrap(), "prefix").unwrap(),
+            std::path::PathBuf::from("/user-owned/prefix")
+        );
+    }
     use super::*;
 
     #[cfg(unix)]

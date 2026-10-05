@@ -260,6 +260,8 @@ pub(crate) fn is_report_note_line(line: &str) -> bool {
         "[BLOCK]",
         "[SKIP]",
         "[INFO]",
+        "[WARN]",
+        "[ERROR]",
     ]
     .iter()
     .any(|prefix| {

@@ -1576,7 +1576,12 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &Layout
             model.wrap_logs,
         );
         let focused_logs_widget = Paragraph::new(task_lines).block(pane_block(
-            "Task Logs",
+            &log_pane_title(
+                "Task Logs",
+                model
+                    .selected_task_row()
+                    .map_or(0, |task| task.logs_dropped),
+            ),
             model.active_pane == ActivePane::TaskLogs,
         ));
         frame.render_widget(focused_logs_widget, rect);
@@ -1592,7 +1597,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &Layout
             model.wrap_logs,
         );
         let global_widget = Paragraph::new(global_lines).block(pane_block(
-            "Global Logs",
+            &log_pane_title("Global Logs", model.global_logs_dropped),
             model.active_pane == ActivePane::GlobalLogs,
         ));
         frame.render_widget(global_widget, rect);
@@ -1741,7 +1746,7 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|span| span.content.width()).sum()
 }
 
-fn pane_block<'a>(base: &'a str, active: bool) -> Block<'a> {
+fn pane_block(base: &str, active: bool) -> Block<'static> {
     let title = if active {
         format!("{base} [active]")
     } else {
@@ -1752,6 +1757,14 @@ fn pane_block<'a>(base: &'a str, active: bool) -> Block<'a> {
         block = block.border_style(Style::default().fg(Color::LightCyan));
     }
     block
+}
+
+fn log_pane_title<'a>(label: &'a str, dropped: u64) -> Cow<'a, str> {
+    if dropped == 0 {
+        Cow::Borrowed(label)
+    } else {
+        Cow::Owned(format!("{label}: {dropped} older (m: full log)"))
+    }
 }
 
 fn render_footer_lines(model: &Model) -> Vec<Line<'static>> {
@@ -2919,8 +2932,23 @@ fn stylize_log_body(
         let next = markers
             .iter()
             .filter_map(|(marker, style)| {
-                line[idx..].find(marker).and_then(|pos| {
+                line[idx..].match_indices(marker).find_map(|(pos, _)| {
                     let absolute_pos = idx + pos;
+                    if matches!(*marker, "WARNING" | "ERROR") {
+                        let is_identifier_char =
+                            |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-');
+                        if line[..absolute_pos]
+                            .chars()
+                            .next_back()
+                            .is_some_and(is_identifier_char)
+                            || line[absolute_pos + marker.len()..]
+                                .chars()
+                                .next()
+                                .is_some_and(is_identifier_char)
+                        {
+                            return None;
+                        }
+                    }
                     if *marker == "->" && absolute_pos != leading_arrow_pos {
                         return None;
                     }
@@ -3440,7 +3468,8 @@ fn box_table_cells(line: &str) -> Option<Vec<&str>> {
 
 fn report_note_tag_style(tag: &str) -> Option<Style> {
     match tag {
-        "FAIL" => report_outcome_style("Fail"),
+        "FAIL" | "ERROR" => report_outcome_style("Fail"),
+        "WARN" => report_outcome_style("Warning"),
         "BLOCK" => report_outcome_style("Blocked"),
         "OK" => report_outcome_style("Updated"),
         "PASS" => report_outcome_style("Pass"),
@@ -3480,7 +3509,7 @@ fn report_outcome_style(outcome: &str) -> Option<Style> {
         }
         "Blocked" | "Warn" => Some(blocked_style()),
         "Unchanged" | "No Restart" => Some(Style::default()),
-        "Skipped" | "Skip" | "Canceled" | "Removed" | "Not Restarted" => Some(
+        "Warning" | "Skipped" | "Skip" | "Canceled" | "Removed" | "Not Restarted" => Some(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -3687,6 +3716,8 @@ fn should_coalesce_progress_record(previous: Option<&LogRecord>, next: &LogRecor
     };
     previous.task_id == next.task_id
         && previous.stream == next.stream
+        && matches!(previous.level, LogLevel::Info | LogLevel::Trace)
+        && matches!(next.level, LogLevel::Info | LogLevel::Trace)
         && is_transient_progress_line(&previous.line)
         && is_transient_progress_line(&next.line)
 }
@@ -3701,7 +3732,9 @@ fn is_transient_progress_line(line: &str) -> bool {
         return true;
     }
 
-    if trimmed.contains("KB /") || trimmed.contains("MB /") || trimmed.contains("GB /") {
+    if trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && (trimmed.contains("KB /") || trimmed.contains("MB /") || trimmed.contains("GB /"))
+    {
         return true;
     }
 
