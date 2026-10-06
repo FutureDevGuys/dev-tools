@@ -65,6 +65,14 @@ Crossterm remains a required dependency for terminal colors and width discovery 
 - `npm_silent_install_never_authorizes_scripts_without_verified_registry_metadata`
 - `pipx_inventory_reads_json_independently_of_stderr_diagnostics`
 
+- `streaming_pipe_preserves_blank_records_and_line_boundaries`
+- `streaming_pipe_partial_prompt_terminators_do_not_create_blank_records`
+- `pty_reader_preserves_blank_records_and_split_crlf`
+- `streaming_readers_do_not_emit_after_capture_guard`
+- `stream_callback_keeps_subprocess_blanks_in_raw_log_only`
+- `diagnostic_rollup_preserves_complete_notes_at_every_verbosity`
+- `diagnostic_rollup_colors_do_not_change_transaction_status`
+
 ## Runtime acceptance
 
 Run a controlled catalog fixture with stdout and stderr diagnostics, more unique warnings than the sample budget, a late error and multiline result text. Verify complete disk logs, journal line boundaries, diagnostic severity and the omitted-sample notice. Check dashboard tail eviction counts. Repeat the npm lane against a disposable user-owned installation with a manifest-current but broken launcher and verify bounded recovery without persisted lifecycle trust. Native Windows and WSL acceptance and installed-release activation remain separate gates.

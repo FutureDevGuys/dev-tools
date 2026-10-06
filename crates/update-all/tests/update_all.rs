@@ -131,7 +131,7 @@ fn controlled_catalog_keeps_late_errors_in_full_logs_and_bounded_summary() {
     fs::create_dir_all(&catalog_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "[install]\nauto_update=false\n[ui]\nmode=\"plain\"\n[logging]\ntimestamps=false\n",
+        "[install]\nauto_update=false\n[ui]\nmode=\"plain\"\n[engine]\nmode=\"async\"\njobs=\"1\"\n[logging]\ntimestamps=false\nmax_in_memory_lines=40\n",
     )
     .unwrap();
     fs::write(catalog_dir.join("fidelity.toml"), r#"
@@ -141,10 +141,10 @@ os = ["linux", "macos"]
 detect_mode = "command_available"
 category = "maintenance"
 command = "sh"
-args = ["-c", "i=0; while [ $i -lt 20 ]; do printf 'warning: sample %s\\n' \"$i\"; i=$((i+1)); done; printf 'error: final operation failed\\n' >&2; printf 'final output marker\\n'; exit 1"]
+args = ["-c", "i=0; while [ $i -lt 64 ]; do printf 'fidelity line %s\\n' \"$i\"; i=$((i+1)); done; printf 'warning: alpha\\n'; printf 'warning: bravo\\n'; printf 'warning: charlie\\n'; printf 'warning: delta\\n'; printf 'warning: echo\\n'; printf 'warning: foxtrot\\n'; printf 'warning: golf\\n'; printf 'warning: hotel\\n'; printf 'warning: india\\n'; printf 'warning: juliet\\n'; printf 'warning: kilo\\n'; printf 'warning: lima\\n'; printf 'warning: stderr evidence\\n' >&2; printf 'multiline first\\n\\nmultiline second\\n'; printf 'error: stdout evidence\\n'; printf 'error: final operation failed\\n' >&2; printf 'final output marker\\n'; exit 1"]
 policy_key = "tool_update"
 "#).unwrap();
-    command(&home)
+    let captured = command(&home)
         .args([
             "--plain",
             "--completions",
@@ -152,8 +152,16 @@ policy_key = "tool_update"
             "--only",
             "local/fidelity",
         ])
-        .assert()
-        .code(1);
+        .output()
+        .unwrap();
+    assert_eq!(captured.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&captured.stdout);
+    assert!(stdout.contains("error: final operation failed"), "{stdout}");
+    assert!(
+        stdout.contains("11 diagnostic occurrence(s) omitted"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("complete task log"), "{stdout}");
     let runs = home.path().join("state/update-all/runs");
     let run = fs::read_dir(runs)
         .unwrap()
@@ -161,9 +169,59 @@ policy_key = "tool_update"
         .find(|path| path.join("run.json").is_file())
         .unwrap();
     let raw = fs::read_to_string(run.join("task-local%2Ffidelity.raw.log")).unwrap();
-    assert!(raw.contains("[WARN] [OUT] warning: sample 19"));
-    assert!(raw.contains("[ERROR] [STDERR] error: final operation failed"));
-    assert!(raw.contains("final output marker"));
+    assert_eq!(raw.matches("[local/fidelity] [INFO] [OUT] \n").count(), 1);
+    let human = fs::read_to_string(run.join("run.log")).unwrap();
+    let events: Vec<serde_json::Value> = fs::read_to_string(run.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut expected: Vec<(String, &str, &str)> = (0..64)
+        .map(|index| (format!("fidelity line {index}"), "OUT", "INFO"))
+        .collect();
+    for word in [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima",
+    ] {
+        expected.push((format!("warning: {word}"), "OUT", "WARN"));
+    }
+    expected.extend([
+        ("warning: stderr evidence".to_string(), "STDERR", "WARN"),
+        ("multiline first".to_string(), "OUT", "INFO"),
+        ("multiline second".to_string(), "OUT", "INFO"),
+        ("error: stdout evidence".to_string(), "OUT", "ERROR"),
+        (
+            "error: final operation failed".to_string(),
+            "STDERR",
+            "ERROR",
+        ),
+        ("final output marker".to_string(), "OUT", "INFO"),
+    ]);
+    for (line, stream, level) in expected {
+        let record = format!("[local/fidelity] [{level}] [{stream}] {line}\n");
+        assert_eq!(raw.matches(&record).count(), 1, "{record}");
+        assert!(human.lines().any(|entry| entry.ends_with(&line)), "{line}");
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "log_line"
+                    && event["task_id"] == "local/fidelity"
+                    && event["payload"]["line"] == line
+                    && event["payload"]["stream"] == stream
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "{line}");
+        assert_eq!(matching[0]["payload"]["level"], level);
+    }
+    for event in &events {
+        if event["kind"] == "log_line" {
+            let line = event["payload"]["line"].as_str().unwrap();
+            assert!(!line.contains(['\n', '\r']));
+            if event["payload"]["stream"] == "OUT" || event["payload"]["stream"] == "STDERR" {
+                assert!(!line.is_empty());
+            }
+        }
+    }
     let task: serde_json::Value =
         serde_json::from_slice(&fs::read(run.join("task-local%2Ffidelity.json")).unwrap()).unwrap();
     let diagnostics = task["report_sections"]
@@ -172,28 +230,26 @@ policy_key = "tool_update"
         .iter()
         .find(|section| section["key"] == "command_diagnostics")
         .unwrap();
-    assert!(diagnostics["rows"].as_array().unwrap().len() <= 5);
-    assert!(diagnostics["rows"]
+    assert_eq!(diagnostics["rows"].as_array().unwrap().len(), 5);
+    assert_eq!(diagnostics["rows"][0]["name"], "error");
+    assert_eq!(diagnostics["rows"][1]["name"], "error");
+    assert_eq!(
+        diagnostics["rows"][4]["note"],
+        "11 diagnostic occurrence(s) omitted from this summary; see the complete task log"
+    );
+    assert_eq!(task["log_file"], "task-local%2Ffidelity.log");
+    let complete: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+    assert_eq!(complete["exit_code"], 1);
+    assert_eq!(complete["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(complete["tasks"][0]["log_file"], task["log_file"]);
+    let final_diagnostics = complete["tasks"][0]["report_sections"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|row| row["note"] == "error: final operation failed"));
-    assert!(diagnostics["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|row| row["note"]
-            .as_str()
-            .is_some_and(|note| note.contains("omitted"))));
-    for line in fs::read_to_string(run.join("events.jsonl"))
-        .unwrap()
-        .lines()
-    {
-        let event: serde_json::Value = serde_json::from_str(line).unwrap();
-        if event["kind"] == "log_line" {
-            assert!(!event["payload"]["line"].as_str().unwrap().contains('\n'));
-        }
-    }
+        .find(|section| section["key"] == "command_diagnostics")
+        .unwrap();
+    assert_eq!(final_diagnostics, diagnostics);
 }
 
 #[test]

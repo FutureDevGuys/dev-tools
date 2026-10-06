@@ -376,3 +376,243 @@ printf 'selection=%s\n' "$selection"
         .iter()
         .any(|(kind, line)| { *kind == StreamKind::Stdout && line.contains("selection=1 3") }));
 }
+
+struct StreamChunks(std::collections::VecDeque<Vec<u8>>);
+
+impl Read for StreamChunks {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let Some(mut chunk) = self.0.pop_front() else {
+            return Ok(0);
+        };
+        let count = output.len().min(chunk.len());
+        let remainder = chunk.split_off(count);
+        output[..count].copy_from_slice(&chunk);
+        if !remainder.is_empty() {
+            self.0.push_front(remainder);
+        }
+        Ok(count)
+    }
+}
+
+fn pipe_records(
+    kind: StreamKind,
+    chunks: Vec<Vec<u8>>,
+    guard: Option<Arc<CaptureGuardState>>,
+) -> (Vec<u8>, Vec<(StreamKind, String)>) {
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = records.clone();
+    let reader = StreamChunks(
+        chunks
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .collect(),
+    );
+    let bytes = read_pipe_thread(
+        kind,
+        reader,
+        Some(Arc::new(move |kind, line| {
+            collected.lock().unwrap().push((kind, line));
+        })),
+        guard,
+    )
+    .join()
+    .unwrap();
+    let records = records.lock().unwrap().clone();
+    (bytes, records)
+}
+
+// A regular file makes this reader's 8192-byte read boundaries deterministic.
+// The existing real-PTY prompt/input regression still exercises native PTY IO.
+fn pty_reader_records(
+    input: &[u8],
+    guard: Option<Arc<CaptureGuardState>>,
+) -> (Vec<u8>, Vec<(StreamKind, String)>) {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("pty-reader-input");
+    fs::write(&path, input).unwrap();
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = records.clone();
+    let bytes = read_pty_thread(
+        File::open(path).unwrap(),
+        Some(Arc::new(move |kind, line| {
+            collected.lock().unwrap().push((kind, line));
+        })),
+        guard,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .join()
+    .unwrap();
+    let records = records.lock().unwrap().clone();
+    (bytes, records)
+}
+
+fn framing_cases() -> Vec<(&'static [u8], Vec<&'static str>)> {
+    vec![
+        (b"", vec![]),
+        (b"\n", vec![""]),
+        (b"\n\n", vec!["", ""]),
+        (b"a\n\nb\n", vec!["a", "", "b"]),
+        (b"a\n", vec!["a"]),
+        (b"a", vec!["a"]),
+        (b"\r", vec![""]),
+        (b"\r\n", vec![""]),
+        (b"a\r\n\r\nb\r\n", vec!["a", "", "b"]),
+        (b"a\rb\r", vec!["a", "b"]),
+        (b"a\r\r", vec!["a", ""]),
+        (b"a\n\rb", vec!["a", "", "b"]),
+        (b"\r\r\n", vec!["", ""]),
+        (b" \n\t\n", vec![" ", "\t"]),
+        (b"\xff\n\n", vec!["\u{fffd}", ""]),
+        ("\u{20ac}\n\n".as_bytes(), vec!["\u{20ac}", ""]),
+    ]
+}
+
+#[test]
+fn streaming_pipe_preserves_blank_records_and_line_boundaries() {
+    for kind in [StreamKind::Stdout, StreamKind::Stderr] {
+        for (input, lines) in framing_cases() {
+            let expected: Vec<_> = lines.iter().map(|line| (kind, line.to_string())).collect();
+            let mut partitions = vec![vec![input.to_vec()]];
+            partitions.push(input.iter().map(|byte| vec![*byte]).collect());
+            for split in 0..=input.len() {
+                partitions.push(vec![input[..split].to_vec(), input[split..].to_vec()]);
+            }
+            for chunks in partitions {
+                let (bytes, records) = pipe_records(kind, chunks.clone(), None);
+                assert_eq!(bytes, input, "captured bytes changed: {chunks:?}");
+                assert_eq!(records, expected, "framing changed: {kind:?} {chunks:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn streaming_pipe_partial_prompt_terminators_do_not_create_blank_records() {
+    let cases: Vec<(Vec<&[u8]>, Vec<&str>)> = vec![
+        (vec![b"Password:"], vec!["Password:"]),
+        (vec![b"Password:", b"\n"], vec!["Password:"]),
+        (vec![b"Password:", b"\r", b"\n"], vec!["Password:"]),
+        (vec![b"Password:", b"\n\n"], vec!["Password:", ""]),
+        (vec![b"Password:", b"\r", b"\n\r\n"], vec!["Password:", ""]),
+        (vec![b"Password:", b"answer\n"], vec!["Password:", "answer"]),
+    ];
+    for kind in [StreamKind::Stdout, StreamKind::Stderr] {
+        for (chunks, lines) in &cases {
+            let chunks: Vec<_> = chunks.iter().map(|chunk| chunk.to_vec()).collect();
+            let expected: Vec<_> = lines.iter().map(|line| (kind, line.to_string())).collect();
+            let input = chunks.concat();
+            let (bytes, records) = pipe_records(kind, chunks, None);
+            assert_eq!(bytes, input);
+            assert_eq!(records, expected);
+        }
+    }
+}
+
+#[test]
+fn pty_reader_preserves_blank_records_and_split_crlf() {
+    for (input, lines) in framing_cases() {
+        let expected: Vec<_> = lines
+            .iter()
+            .map(|line| (StreamKind::Stdout, line.to_string()))
+            .collect();
+        let (bytes, records) = pty_reader_records(input, None);
+        assert_eq!(bytes, input);
+        assert_eq!(records, expected);
+    }
+    let long = "a".repeat(8191);
+    let input = format!("{long}\r\n\r\nb\r\n");
+    let (bytes, records) = pty_reader_records(input.as_bytes(), None);
+    assert_eq!(bytes, input.as_bytes());
+    assert_eq!(
+        records,
+        vec![
+            (StreamKind::Stdout, long),
+            (StreamKind::Stdout, String::new()),
+            (StreamKind::Stdout, "b".to_string()),
+        ]
+    );
+    let prompt = format!("{}Password:", "a".repeat(8192 - "Password:".len()));
+    for ending in ["", "\n", "\r\n", "\r\n\n"] {
+        let input = format!("{prompt}{ending}");
+        let (bytes, records) = pty_reader_records(input.as_bytes(), None);
+        let mut expected = vec![(StreamKind::Stdout, prompt.clone())];
+        if ending == "\r\n\n" {
+            expected.push((StreamKind::Stdout, String::new()));
+        }
+        assert_eq!(bytes, input.as_bytes());
+        assert_eq!(records, expected);
+    }
+}
+
+#[test]
+fn streaming_readers_do_not_emit_after_capture_guard() {
+    for use_pty in [false, true] {
+        for (input, line_limit, byte_limit, pre_latched, wanted_reason, expected) in [
+            ("abc\n\n", 3, 5, false, None, vec!["abc", ""]),
+            (
+                "abcd\n\n",
+                3,
+                64,
+                false,
+                Some(CaptureGuardReason::LineTooLong),
+                vec![],
+            ),
+            (
+                "a\n\n\n",
+                64,
+                3,
+                false,
+                Some(CaptureGuardReason::CaptureLimitExceeded),
+                vec![],
+            ),
+            (
+                "\n\n",
+                64,
+                64,
+                true,
+                Some(CaptureGuardReason::Stall),
+                vec![],
+            ),
+        ] {
+            let guard = Arc::new(CaptureGuardState::new(CaptureGuard {
+                stall_timeout: Duration::ZERO,
+                max_line_bytes: line_limit,
+                max_capture_bytes: byte_limit,
+            }));
+            if pre_latched {
+                guard.mark_reason(CaptureGuardReason::Stall);
+            }
+            let (_, records) = if use_pty {
+                pty_reader_records(input.as_bytes(), Some(guard.clone()))
+            } else {
+                pipe_records(
+                    StreamKind::Stdout,
+                    vec![input.as_bytes().to_vec()],
+                    Some(guard.clone()),
+                )
+            };
+            assert_eq!(guard.reason(), wanted_reason);
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|line| (StreamKind::Stdout, line.to_string()))
+                .collect();
+            assert_eq!(records, expected, "guard emitted records: pty={use_pty}");
+        }
+    }
+    let guard = Arc::new(CaptureGuardState::new(CaptureGuard {
+        stall_timeout: Duration::ZERO,
+        max_line_bytes: 64,
+        max_capture_bytes: 5,
+    }));
+    let (bytes, records) = pipe_records(
+        StreamKind::Stderr,
+        vec![b"ok\n".to_vec(), b"over\n\n".to_vec()],
+        Some(guard.clone()),
+    );
+    assert_eq!(bytes, b"ok\n");
+    assert_eq!(records, vec![(StreamKind::Stderr, "ok".to_string())]);
+    assert_eq!(
+        guard.reason(),
+        Some(CaptureGuardReason::CaptureLimitExceeded)
+    );
+}

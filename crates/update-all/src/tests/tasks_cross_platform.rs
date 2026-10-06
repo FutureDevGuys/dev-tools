@@ -2428,6 +2428,7 @@ fn package_rollup_value_colors_follow_outcome() {
         result: "Updated".to_string(),
         note: String::new(),
         status: TaskReportStatus::Updated,
+        diagnostic_row: None,
     };
     assert_eq!(
         package_rollup_value_colors(&updated),
@@ -2487,6 +2488,7 @@ fn package_rollup_value_colors_do_not_treat_recovery_states_as_versions() {
         result: "Removed".to_string(),
         note: "cleared package cache/worktree for gibo-bin".to_string(),
         status: TaskReportStatus::Skipped,
+        diagnostic_row: None,
     };
 
     assert_eq!(package_rollup_value_colors(&recovery), (None, None));
@@ -7264,4 +7266,100 @@ fn effective_retry_budget_adds_one_retry_for_transient_network_failures() {
         ),
         0
     );
+}
+
+#[test]
+fn diagnostic_rollup_preserves_complete_notes_at_every_verbosity() {
+    let output = (0..13)
+        .map(|index| format!("warning: unique diagnostic number {index}"))
+        .chain([
+            "error: first diagnostic failure".to_string(),
+            "error: final operation failed".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = TaskResult::completed("Diagnostics");
+    attach_command_output_diagnostics(&mut result, &output);
+    let section = result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "command_diagnostics")
+        .unwrap();
+    assert_eq!(section.rows.len(), 5);
+    assert_eq!(section.rows[0].name, "error");
+    assert_eq!(section.rows[1].name, "error");
+    let omitted =
+        "11 diagnostic occurrence(s) omitted from this summary; see the complete task log";
+    assert_eq!(section.rows[4].note.as_deref(), Some(omitted));
+    let categories = BTreeMap::from([("fixture".to_string(), "maintenance".to_string())]);
+    for width in [80, 120, 240] {
+        for verbosity in [
+            NoteVerbosity::Failures,
+            NoteVerbosity::None,
+            NoteVerbosity::All,
+        ] {
+            for debug in [false, true] {
+                let lines = render_package_change_rollup_with_width(
+                    [("fixture", &result)],
+                    &categories,
+                    false,
+                    verbosity,
+                    debug,
+                    width,
+                );
+                let text = lines
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for row in &section.rows {
+                    let note = row.note.as_deref().unwrap();
+                    assert_eq!(text.matches(note).count(), 1, "{text}");
+                    assert!(
+                        lines.iter().any(|line| line.text.contains(note)
+                            && line.level == report_row_level("command_diagnostics", row)),
+                        "{text}"
+                    );
+                }
+                for line in lines
+                    .iter()
+                    .filter(|line| line.text.starts_with(['┌', '├', '│', '└']))
+                {
+                    assert!(visible_width(&line.text) <= width, "{}", line.text);
+                }
+            }
+        }
+    }
+    assert!(!result.blocks_dependents());
+    assert_eq!(result.status, TaskStatus::Completed);
+}
+
+#[test]
+fn diagnostic_rollup_colors_do_not_change_transaction_status() {
+    for (name, expected) in [
+        ("error", Some(crossterm::style::Color::Red)),
+        ("warning", Some(crossterm::style::Color::Yellow)),
+        ("additional diagnostics", None),
+    ] {
+        let diagnostic = TaskReportRow {
+            name: name.to_string(),
+            status: TaskReportStatus::Info,
+            before: None,
+            after: None,
+            note: Some("diagnostic evidence".to_string()),
+        };
+        let row = PackageChangeRow {
+            category: "maintenance".to_string(),
+            task: "fixture".to_string(),
+            item: name.to_string(),
+            before: String::new(),
+            after: String::new(),
+            result: report_status_cell_for_row("command_diagnostics", &diagnostic).to_string(),
+            note: "diagnostic evidence".to_string(),
+            status: TaskReportStatus::Info,
+            diagnostic_row: Some(diagnostic),
+        };
+        assert_eq!(package_rollup_result_color(&row), expected);
+        assert_eq!(row.status, TaskReportStatus::Info);
+    }
 }

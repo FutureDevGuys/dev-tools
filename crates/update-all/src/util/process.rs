@@ -1218,6 +1218,30 @@ impl CaptureGuardState {
     }
 }
 
+// A real delimiter may finish an empty logical line. Prompt/EOF flushes may not.
+// A latched guard must never turn a discarded buffer into a blank record.
+fn emit_captured_line(
+    line_buf: &mut Vec<u8>,
+    kind: StreamKind,
+    line_cb: &Option<Arc<dyn Fn(StreamKind, String) + Send + Sync>>,
+    guard_state: &Option<Arc<CaptureGuardState>>,
+    emit_empty: bool,
+) {
+    if line_buf.is_empty() && !emit_empty {
+        return;
+    }
+    if let Some(state) = guard_state {
+        if state.reason().is_some() || !state.note_line_len(line_buf.len()) {
+            line_buf.clear();
+            return;
+        }
+    }
+    if let Some(cb) = line_cb {
+        cb(kind, String::from_utf8_lossy(line_buf).to_string());
+    }
+    line_buf.clear();
+}
+
 fn read_pipe_thread<R: Read + Send + 'static>(
     kind: StreamKind,
     mut reader: R,
@@ -1229,29 +1253,7 @@ fn read_pipe_thread<R: Read + Send + 'static>(
         let mut chunk = [0u8; 8192];
         let mut line_buf: Vec<u8> = Vec::new();
         let mut partial_prompt_emitted = false;
-
-        let emit_line =
-            |line_buf: &mut Vec<u8>,
-             kind: StreamKind,
-             line_cb: &Option<std::sync::Arc<dyn Fn(StreamKind, String) + Send + Sync>>,
-             guard_state: &Option<Arc<CaptureGuardState>>| {
-                if line_buf.is_empty() {
-                    return;
-                }
-                if let Some(state) = guard_state {
-                    if !state.note_line_len(line_buf.len()) {
-                        line_buf.clear();
-                        return;
-                    }
-                }
-                if let Some(cb) = line_cb {
-                    let text = String::from_utf8_lossy(line_buf).to_string();
-                    if !text.is_empty() {
-                        cb(kind, text);
-                    }
-                }
-                line_buf.clear();
-            };
+        let mut previous_was_cr = false;
 
         loop {
             let read: usize = reader.read(&mut chunk).unwrap_or_default();
@@ -1269,9 +1271,28 @@ fn read_pipe_thread<R: Read + Send + 'static>(
             }
 
             for b in &chunk[..read] {
+                if guard_state
+                    .as_ref()
+                    .and_then(|state| state.reason())
+                    .is_some()
+                {
+                    break;
+                }
+                // A CRLF pair is one logical terminator, even across reads.
+                if *b == b'\n' && previous_was_cr {
+                    previous_was_cr = false;
+                    continue;
+                }
+                previous_was_cr = *b == b'\r';
                 match *b {
                     b'\n' | b'\r' => {
-                        emit_line(&mut line_buf, kind, &line_cb, &guard_state);
+                        emit_captured_line(
+                            &mut line_buf,
+                            kind,
+                            &line_cb,
+                            &guard_state,
+                            !partial_prompt_emitted,
+                        );
                         partial_prompt_emitted = false;
                     }
                     _ => {
@@ -1293,7 +1314,7 @@ fn read_pipe_thread<R: Read + Send + 'static>(
                     .and_then(|state| state.reason())
                     .is_none()
             {
-                emit_line(&mut line_buf, kind, &line_cb, &guard_state);
+                emit_captured_line(&mut line_buf, kind, &line_cb, &guard_state, false);
                 partial_prompt_emitted = true;
             }
 
@@ -1307,28 +1328,7 @@ fn read_pipe_thread<R: Read + Send + 'static>(
             }
         }
 
-        if !line_buf.is_empty()
-            && guard_state
-                .as_ref()
-                .and_then(|state| state.reason())
-                .is_none()
-        {
-            if let Some(state) = &guard_state {
-                if state.note_line_len(line_buf.len()) {
-                    if let Some(cb) = &line_cb {
-                        let text = String::from_utf8_lossy(&line_buf).to_string();
-                        if !text.is_empty() {
-                            cb(kind, text);
-                        }
-                    }
-                }
-            } else if let Some(cb) = &line_cb {
-                let text = String::from_utf8_lossy(&line_buf).to_string();
-                if !text.is_empty() {
-                    cb(kind, text);
-                }
-            }
-        }
+        emit_captured_line(&mut line_buf, kind, &line_cb, &guard_state, false);
         acc
     })
 }
@@ -1346,28 +1346,7 @@ fn read_pty_thread(
         let mut chunk = [0u8; 8192];
         let mut line_buf: Vec<u8> = Vec::new();
         let mut partial_prompt_emitted = false;
-
-        let emit_line =
-            |line_buf: &mut Vec<u8>,
-             line_cb: &Option<std::sync::Arc<dyn Fn(StreamKind, String) + Send + Sync>>,
-             guard_state: &Option<Arc<CaptureGuardState>>| {
-                if line_buf.is_empty() {
-                    return;
-                }
-                if let Some(state) = guard_state {
-                    if !state.note_line_len(line_buf.len()) {
-                        line_buf.clear();
-                        return;
-                    }
-                }
-                if let Some(cb) = line_cb {
-                    let text = String::from_utf8_lossy(line_buf).to_string();
-                    if !text.is_empty() {
-                        cb(StreamKind::Stdout, text);
-                    }
-                }
-                line_buf.clear();
-            };
+        let mut previous_was_cr = false;
 
         loop {
             let read = match reader.read(&mut chunk) {
@@ -1400,9 +1379,28 @@ fn read_pty_thread(
             }
 
             for b in &chunk[..read] {
+                if guard_state
+                    .as_ref()
+                    .and_then(|state| state.reason())
+                    .is_some()
+                {
+                    break;
+                }
+                // A CRLF pair is one logical terminator, even across reads.
+                if *b == b'\n' && previous_was_cr {
+                    previous_was_cr = false;
+                    continue;
+                }
+                previous_was_cr = *b == b'\r';
                 match *b {
                     b'\n' | b'\r' => {
-                        emit_line(&mut line_buf, &line_cb, &guard_state);
+                        emit_captured_line(
+                            &mut line_buf,
+                            StreamKind::Stdout,
+                            &line_cb,
+                            &guard_state,
+                            !partial_prompt_emitted,
+                        );
                         partial_prompt_emitted = false;
                     }
                     _ => {
@@ -1424,7 +1422,13 @@ fn read_pty_thread(
                     .and_then(|state| state.reason())
                     .is_none()
             {
-                emit_line(&mut line_buf, &line_cb, &guard_state);
+                emit_captured_line(
+                    &mut line_buf,
+                    StreamKind::Stdout,
+                    &line_cb,
+                    &guard_state,
+                    false,
+                );
                 partial_prompt_emitted = true;
             }
 
@@ -1438,28 +1442,13 @@ fn read_pty_thread(
             }
         }
 
-        if !line_buf.is_empty()
-            && guard_state
-                .as_ref()
-                .and_then(|state| state.reason())
-                .is_none()
-        {
-            if let Some(state) = &guard_state {
-                if state.note_line_len(line_buf.len()) {
-                    if let Some(cb) = &line_cb {
-                        let text = String::from_utf8_lossy(&line_buf).to_string();
-                        if !text.is_empty() {
-                            cb(StreamKind::Stdout, text);
-                        }
-                    }
-                }
-            } else if let Some(cb) = &line_cb {
-                let text = String::from_utf8_lossy(&line_buf).to_string();
-                if !text.is_empty() {
-                    cb(StreamKind::Stdout, text);
-                }
-            }
-        }
+        emit_captured_line(
+            &mut line_buf,
+            StreamKind::Stdout,
+            &line_cb,
+            &guard_state,
+            false,
+        );
         acc
     })
 }

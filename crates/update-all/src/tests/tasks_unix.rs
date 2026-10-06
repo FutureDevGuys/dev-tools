@@ -4534,3 +4534,44 @@ fn async_outcome_prefers_canceled_over_failed() {
         AsyncRunOutcome::Canceled
     );
 }
+
+#[test]
+fn stream_callback_keeps_subprocess_blanks_in_raw_log_only() {
+    let temp = TempDir::new().unwrap();
+    let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.run_log = Some(run_log.clone());
+    let (tx, rx) = mpsc::channel();
+    ctx.event_tx = Some(DashboardSender::new(tx, Some(run_log.clone())));
+    let callback = ctx.build_stream_callback("blank-fixture", false);
+    for kind in [StreamKind::Stdout, StreamKind::Stderr] {
+        callback(kind, "before blank".to_string());
+        callback(kind, String::new());
+        callback(kind, "after blank".to_string());
+    }
+    let raw = fs::read_to_string(run_log.run_dir().join("task-blank-fixture.raw.log")).unwrap();
+    for stream in ["OUT", "STDERR"] {
+        let record = format!("[blank-fixture] [INFO] [{stream}] \n");
+        assert_eq!(raw.matches(&record).count(), 1);
+    }
+    let presented: Vec<_> = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            DashboardEvent::LogLine(record) => Some(record),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(presented.len(), 4);
+    assert!(presented.iter().all(|record| !record.line.is_empty()));
+    let human = fs::read_to_string(run_log.run_dir().join("run.log")).unwrap();
+    assert_eq!(human.lines().count(), 4);
+    assert!(human.lines().all(|line| !line.trim().is_empty()));
+    let journal = fs::read_to_string(run_log.run_dir().join("events.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["kind"] == "log_line")
+        .collect();
+    assert_eq!(lines.len(), 4);
+    assert!(lines.iter().all(|event| event["payload"]["line"] != ""));
+}

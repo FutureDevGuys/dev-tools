@@ -11319,6 +11319,7 @@ struct PackageChangeRow {
     result: String,
     note: String,
     status: TaskReportStatus,
+    diagnostic_row: Option<TaskReportRow>,
 }
 
 #[derive(Clone, Debug)]
@@ -11699,6 +11700,8 @@ fn render_package_change_rollup_with_width<'a>(
                             result: report_status_cell_for_row(&section.key, row).to_string(),
                             note: render_package_rollup_note(&section.key, row),
                             status: row.status,
+                            diagnostic_row: (section.key == "command_diagnostics")
+                                .then(|| row.clone()),
                         }
                     })
                 })
@@ -11804,7 +11807,10 @@ fn render_package_change_rollup_with_width<'a>(
     });
 
     for row in rows {
-        let level = report_status_level(row.status);
+        let level = row.diagnostic_row.as_ref().map_or_else(
+            || report_status_level(row.status),
+            |diagnostic| report_row_level("command_diagnostics", diagnostic),
+        );
         let (group_text, group_overflow) = fit_visible(&row.category, group_w);
         let (task_text, task_overflow) = fit_visible(&row.task, task_w);
         let (item_text, item_overflow) = fit_visible(&row.item, item_w);
@@ -11850,6 +11856,20 @@ fn render_package_change_rollup_with_width<'a>(
             level,
         });
 
+        // Diagnostic evidence is complete at normal verbosity, independently
+        // of generic table overflow/debug policy and package transaction status.
+        if note_overflow {
+            if let Some(diagnostic) = &row.diagnostic_row {
+                lines.push(RenderedReportLine {
+                    text: format!(
+                        "  {} {}",
+                        render_report_note_prefix_for_row("command_diagnostics", diagnostic, color),
+                        sanitize_report_cell_text(&row.note),
+                    ),
+                    level,
+                });
+            }
+        }
         if !debug_report {
             continue;
         }
@@ -11862,6 +11882,7 @@ fn render_package_change_rollup_with_width<'a>(
             ("notes", note_overflow, row.note.as_str()),
         ] {
             if overflowed
+                && !(label == "notes" && row.diagnostic_row.is_some())
                 && should_render_inline_note(InlineNoteKind::Overflow, row.status, note_verbosity)
             {
                 lines.push(RenderedReportLine {
@@ -11912,6 +11933,9 @@ fn package_rollup_value_colors(
 }
 
 fn package_rollup_result_color(row: &PackageChangeRow) -> Option<crossterm::style::Color> {
+    if let Some(diagnostic) = &row.diagnostic_row {
+        return report_status_color_for_row("command_diagnostics", diagnostic);
+    }
     if row.status == TaskReportStatus::Unchanged {
         return None;
     }
