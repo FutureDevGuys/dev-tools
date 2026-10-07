@@ -8,6 +8,8 @@ owner: dev-auth
 status: proposed
 verification: pending
 
+Producer-specific qualification details are superseded by [ADR 0096](0096-producer-neutral-native-receipt-qualification.md).
+
 ## Decision
 
 ADR0094's reusable lifecycle gains one production effect definition: `dev-tools-receipt-install-v1`. Its [closed public contract](../dev-tools-receipt-install-v1.md) fixes a standalone native entrypoint, sealed canonical request, independently pinned root deployment evidence, exact derived resources and bounded result protocol. No generic executable protocol is admitted. The fixture protocol remains absent from ordinary builds.

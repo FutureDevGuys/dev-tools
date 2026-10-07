@@ -3,7 +3,7 @@
 pub mod contract;
 use super::privilege_native_faults as fault;
 use anyhow::{bail, Context, Result};
-use contract::{Case, Input};
+use contract::{ArtifactEvidence, Case, Input, ObservationLayout};
 use dev_auth::privilege::{custody, policy, protocol, receipt_install as effect};
 use std::{
     fs::{self, File, OpenOptions},
@@ -227,10 +227,10 @@ pub fn driver(path: &Path) -> Result<()> {
     let a = contract::plan(&approval, "install-a")?;
     let b = contract::plan(&approval, "install-b")?;
     for (artifact, receipt) in [
-        (&a.candidate, &input.receipt_a),
-        (&b.candidate, &input.receipt_b),
+        (&a.candidate, &input.artifact_a),
+        (&b.candidate, &input.artifact_b),
     ] {
-        verify_generation(&a, artifact, receipt)?;
+        verify_generation(&a, artifact, receipt, &input.layout)?;
     }
     if input.case == Case::AliasDenied {
         let destination = fs::metadata(&a.destination)?;
@@ -262,9 +262,11 @@ pub fn driver(path: &Path) -> Result<()> {
     }
     if Path::new(&a.destination).join(&a.binary).exists()
         || Path::new(&a.destination)
-            .join(format!(".{}.syscfg-rust.json", a.binary))
+            .join(&input.layout.installed_receipt)
             .exists()
-        || Path::new(&a.journal).join("state.json").exists()
+        || Path::new(&a.journal)
+            .join(&input.layout.journal_file)
+            .exists()
     {
         bail!("real receipt target/journal must be fresh");
     }
@@ -339,18 +341,18 @@ pub fn driver(path: &Path) -> Result<()> {
         pause();
     }
     let expected_receipt: serde_json::Value = serde_json::from_slice(if action == "install-b" {
-        &input.receipt_b
+        &input.artifact_b.receipt
     } else {
-        &input.receipt_a
+        &input.artifact_a.receipt
     })?;
-    let journal = Path::new(&a.journal).join("state.json");
+    let journal = Path::new(&a.journal).join(&input.layout.journal_file);
     let image = fs::symlink_metadata(&first.executable)?;
     let mut killed = false;
     while !killed {
         until(deadline)?;
         if let Ok(bytes) = custody::read_document(&journal, 0, 0o600) {
             let record: serde_json::Value = serde_json::from_slice(&bytes)?;
-            if record["phase"] == "pending" && record["expected"] == expected_receipt {
+            if input.layout.is_pending(&record, &expected_receipt) {
                 for domain in fs::read_dir(&unit)? {
                     let domain = domain?;
                     if !domain
@@ -379,8 +381,7 @@ pub fn driver(path: &Path) -> Result<()> {
                         let stopped = Stopped::new(fd, pid)?;
                         let current: serde_json::Value =
                             serde_json::from_slice(&custody::read_document(&journal, 0, 0o600)?)?;
-                        if current["phase"] != "pending" || current["expected"] != expected_receipt
-                        {
+                        if !input.layout.is_pending(&current, &expected_receipt) {
                             bail!("real installer interruption window was missed");
                         }
                         if input.case == Case::Transaction {
@@ -420,7 +421,7 @@ pub fn driver(path: &Path) -> Result<()> {
         bail!("real installer changed unrelated sentinel");
     }
     if input.case == Case::Transaction {
-        verify_installed(&a, &input.receipt_a)?;
+        verify_installed(&a, &input.artifact_a, &input.layout)?;
     }
     if dev_auth::setup::native_fixture_probe_strong_writer_admission().is_err() {
         bail!("setup exclusion remained after positive cleanup");
@@ -431,23 +432,20 @@ pub fn driver(path: &Path) -> Result<()> {
 fn verify_generation(
     request: &effect::Request,
     artifact: &effect::Artifact,
-    receipt: &[u8],
+    evidence: &ArtifactEvidence,
+    layout: &ObservationLayout,
 ) -> Result<()> {
+    let receipt = &evidence.receipt;
     let root = Path::new(&artifact.generation);
-    custody::validate_parents(&root.join("receipt.json"), 0, false)?;
+    custody::validate_parents(&root.join(&layout.generation_receipt), 0, false)?;
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o700 {
         bail!("real generation custody differs");
     }
-    if custody::read_document(&root.join("receipt.json"), 0, 0o600)? != receipt {
+    if custody::read_document(&root.join(&layout.generation_receipt), 0, 0o600)? != *receipt {
         bail!("real generation receipt differs from independent bytes");
     }
-    let record: serde_json::Value = serde_json::from_slice(receipt)?;
-    let expected = record["artifact_sha256"]
-        .as_str()
-        .context("artifact hash absent")?
-        .strip_prefix("sha256:")
-        .context("artifact hash invalid")?;
+    let expected = &evidence.executable_sha256;
     let image = root.join(&request.binary);
     let metadata = fs::symlink_metadata(&image)?;
     if metadata.uid() != 0
@@ -455,19 +453,20 @@ fn verify_generation(
         || !metadata.is_file()
         || metadata.mode() & 0o7022 != 0
         || metadata.mode() & 0o100 == 0
-        || metadata.len()
-            != record["artifact_bytes"]
-                .as_u64()
-                .context("artifact size absent")?
-        || policy::digest(&fs::read(image)?) != expected
+        || metadata.len() != evidence.executable_bytes
+        || &policy::digest(&fs::read(image)?) != expected
     {
         bail!("real generation artifact differs");
     }
     Ok(())
 }
-fn verify_installed(request: &effect::Request, receipt: &[u8]) -> Result<()> {
+fn verify_installed(
+    request: &effect::Request,
+    evidence: &ArtifactEvidence,
+    layout: &ObservationLayout,
+) -> Result<()> {
+    let receipt = &evidence.receipt;
     let directory = Path::new(&request.destination);
-    let record: serde_json::Value = serde_json::from_slice(receipt)?;
     let image = directory.join(&request.binary);
     let m = fs::symlink_metadata(&image)?;
     if !m.is_file()
@@ -475,19 +474,12 @@ fn verify_installed(request: &effect::Request, receipt: &[u8]) -> Result<()> {
         || m.nlink() != 1
         || m.mode() & 0o7022 != 0
         || m.mode() & 0o100 == 0
-        || format!("sha256:{}", policy::digest(&fs::read(&image)?))
-            != record["artifact_sha256"]
-                .as_str()
-                .context("artifact hash absent")?
+        || m.len() != evidence.executable_bytes
+        || policy::digest(&fs::read(&image)?) != evidence.executable_sha256
     {
         bail!("final real artifact differs");
     }
-    if custody::read_document(
-        &directory.join(format!(".{}.syscfg-rust.json", request.binary)),
-        0,
-        0o600,
-    )? != receipt
-    {
+    if custody::read_document(&directory.join(&layout.installed_receipt), 0, 0o600)? != *receipt {
         bail!("final real receipt differs");
     }
     Ok(())

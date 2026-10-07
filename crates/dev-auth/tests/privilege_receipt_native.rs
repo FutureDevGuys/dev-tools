@@ -14,7 +14,13 @@ use std::{
 
 #[test]
 fn real_adapter_matrix_is_finite_and_rejects_command_injection() {
-    let value = serde_json::json!({"schema":"dev-auth-receipt-install-native-input-v1","case":"transaction","dev_auth":"/a","dev_auth_sha256":"33".repeat(32),"controller":"/b","controller_sha256":"11".repeat(32),"fixture_root":"/var/tmp/dev-auth-receipt-native-one","approval_plan":"/c","approval_sha256":"22".repeat(32),"receipt_a":[],"receipt_b":[],"command":"sudo arbitrary"});
+    let artifact = serde_json::json!({
+        "artifact":{"generation":"/var/lib/dev-tools-maintenance/generations/example-a", "receipt_sha256":format!("sha256:{}", "a".repeat(64)), "source_fingerprint":format!("sha256:{}", "b".repeat(64))},
+        "tool":"sample", "binary":"sample", "executable_sha256":"c".repeat(64), "executable_bytes":42, "receipt":[123,125]
+    });
+    let mut value = serde_json::json!({"schema":"dev-auth-receipt-install-native-input-v2","case":"transaction","dev_auth":"/a","dev_auth_sha256":"33".repeat(32),"controller":"/b","controller_sha256":"11".repeat(32),"fixture_root":"/var/tmp/dev-auth-receipt-native-one","approval_plan":"/c","approval_sha256":"22".repeat(32),"artifact_a":artifact,"artifact_b":artifact,"layout":{"generation_receipt":"manifest.json","installed_receipt":".sample.receipt.json","journal_file":"transaction.json","phase_pointer":"/phase","receipt_pointer":"/artifact","pending_phase":"prepared"}});
+    assert!(serde_json::from_value::<Input>(value.clone()).is_ok());
+    value["command"] = "sudo arbitrary".into();
     assert!(serde_json::from_value::<Input>(value).is_err());
     for name in ["transaction", "revoke", "hard-expiry", "alias-denied"] {
         assert!(serde_json::from_value::<Case>(serde_json::json!(name)).is_ok());
@@ -338,6 +344,26 @@ impl HeldDomain {
                 );
                 bytes.lines().any(|l| l == "populated 0")
             }
+        }
+    }
+}
+
+#[test]
+fn public_receipt_fixture_has_no_downstream_schema_or_paths() {
+    for source in [
+        include_str!("support/privilege_receipt_native_contract.rs"),
+        include_str!("support/privilege_receipt_native_prepare.rs"),
+        include_str!("support/privilege_receipt_native_support.rs"),
+    ] {
+        for private_binding in [
+            "syscfg-native-artifact-v1",
+            ".syscfg-rust.json",
+            "generations/syscfg-",
+        ] {
+            assert!(
+                !source.contains(private_binding),
+                "private producer binding: {private_binding}"
+            );
         }
     }
 }

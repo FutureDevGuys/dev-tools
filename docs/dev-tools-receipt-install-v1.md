@@ -1,6 +1,6 @@
 # Standalone receipt-install protocol v1
 
-This optional, finite maintenance adapter is implemented in the unreleased Dev Auth 0.5 candidate. It does not require a sibling product, source checkout, interpreter, Git, registry, network or user-home installation. An independently approved native artifact implements the interface. The current supplied implementation reuses Syscfg's existing receipt/journal installer; Dev Auth neither contains another installer nor executes the installed payload.
+This optional, finite maintenance adapter is implemented in the unreleased Dev Auth 0.5 candidate. It does not require a sibling product, source checkout, interpreter, Git, registry, network or user-home installation. An independently approved native artifact implements the interface. Dev Auth validates the public protocol and independently admitted executor evidence; it does not select a downstream implementation or execute the installed payload. An optional consumer integration must not become a prerequisite for building, testing, releasing, installing or operating Dev Auth.
 
 ## Authority and bootstrap
 
@@ -27,7 +27,7 @@ The request is compact canonical JSON with these lexicographically ordered keys 
 - `schema`: `dev-tools-receipt-install-v1`
 - `tool`: exact receipt tool identifier
 
-An artifact has `generation`, `receipt_sha256` and `source_fingerprint`, in that order. Digests use `sha256:` plus 64 lowercase hex. The generation is one opaque lowercase identifier (up to128 bytes) below `/var/lib/dev-tools-maintenance/generations/`. The owning implementation verifies its filename/receipt relationship; Dev Auth does not add a producer-specific naming rule. The supplied Syscfg implementation requires its existing `syscfg-<canonical-receipt-digest>` name. Tool/binary/audience/executor identifiers contain lowercase ASCII letters, digits, hyphen or underscore, up to64 bytes.
+An artifact has `generation`, `receipt_sha256` and `source_fingerprint`, in that order. Digests use `sha256:` plus 64 lowercase hex. The generation is one opaque lowercase identifier (up to128 bytes) below `/var/lib/dev-tools-maintenance/generations/`. The owning implementation verifies its filename/receipt relationship; Dev Auth does not add a producer-specific naming rule. Tool/binary/audience/executor identifiers contain lowercase ASCII letters, digits, hyphen or underscore, up to64 bytes.
 
 Unknown or duplicate fields, omitted fields, noncanonical JSON, path normalization tricks, extra argv/environment, mismatched tool/source/binary/receipt and a candidate equal to its predecessor reject. Status requires `previous:null`.
 

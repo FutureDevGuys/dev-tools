@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn producer_generation_name_fits_without_a_product_specific_branch() {
         let mut r = request();
-        r.candidate.generation = format!("{GENERATIONS}syscfg-{}", "11".repeat(32));
+        r.candidate.generation = format!("{GENERATIONS}example-{}", "11".repeat(32));
         parse_request(&policy::canonical(&r).unwrap()).unwrap();
         r.candidate.generation = format!("{GENERATIONS}{}", "x".repeat(129));
         assert!(parse_request(&policy::canonical(&r).unwrap()).is_err());
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(policy::canonical(&request).unwrap(), bytes);
         assert_eq!(
             policy::digest(bytes),
-            "d2fd196d43d7f39595e89a91887230c0c2cc5f92f51b8bc1bfc7057bf8bd9c39"
+            "2e06c1950731a734e333f12d9de9d16d77ed5d761d15fbe60e4e2dd1295a8112"
         );
     }
 }

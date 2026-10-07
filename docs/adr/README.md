@@ -103,3 +103,5 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0086](0086-local-cache-workspace-discovery.md) | Local cache workspace discovery without Git execution | proposed | pending |
 | [0087](0087-linux-launcher-path-dispatch.md) | Linux launcher path dispatch | proposed | pending |
 | [0088](0088-consumed-inherited-command-supervision.md) | Consumed inherited-command supervision | proposed | pending |
+
+| [0096](0096-producer-neutral-native-receipt-qualification.md) | Producer-neutral native receipt qualification | proposed | pending |

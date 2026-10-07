@@ -1,6 +1,8 @@
 //! Non-root document preparation. Supplied build evidence is never inferred
 //! from a user installation and this command publishes no native authority.
-use super::privilege_receipt_native_support::contract::{self, Case, Input};
+use super::privilege_receipt_native_support::contract::{
+    self, ArtifactEvidence, Case, Input, ObservationLayout,
+};
 use anyhow::{bail, Context, Result};
 use dev_auth::privilege::{custody, policy, receipt_install as effect};
 use serde::{Deserialize, Serialize};
@@ -24,8 +26,9 @@ struct Preparation {
     audience: String,
     executor_receipt: effect::ExecutorReceipt,
     executor_receipt_sha256: String,
-    receipt_a: Vec<u8>,
-    receipt_b: Vec<u8>,
+    artifact_a: ArtifactEvidence,
+    artifact_b: ArtifactEvidence,
+    layout: ObservationLayout,
 }
 fn load(path: &Path) -> Result<(Preparation, u32)> {
     let uid = nix::unistd::getuid().as_raw();
@@ -33,7 +36,7 @@ fn load(path: &Path) -> Result<(Preparation, u32)> {
         bail!("preparation requires the non-root observer");
     }
     let input: Preparation = policy::parse(&custody::read_document(path, uid, 0o600)?)?;
-    if input.schema != "dev-auth-receipt-native-preparation-v1"
+    if input.schema != "dev-auth-receipt-native-preparation-v2"
         || input.fixture_root.parent() != Some(Path::new("/var/tmp"))
         || !input
             .fixture_root
@@ -60,37 +63,6 @@ fn load(path: &Path) -> Result<(Preparation, u32)> {
     }
     Ok((input, uid))
 }
-fn artifact(bytes: &[u8]) -> Result<(effect::Artifact, String, String)> {
-    if bytes.is_empty() || bytes.len() > 16 * 1024 {
-        bail!("producer receipt bounds invalid");
-    }
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
-    if value["schema"] != "syscfg-native-artifact-v1" {
-        bail!("native fixture requires the actual producer receipt");
-    }
-    let tool = value["binding"]["tool"]
-        .as_str()
-        .context("tool absent")?
-        .to_owned();
-    let binary = value["binding"]["binary"]
-        .as_str()
-        .context("binary absent")?
-        .to_owned();
-    let source = value["binding"]["source_fingerprint"]
-        .as_str()
-        .context("source absent")?
-        .to_owned();
-    let digest = policy::digest(bytes);
-    Ok((
-        effect::Artifact {
-            generation: format!("/var/lib/dev-tools-maintenance/generations/syscfg-{digest}"),
-            receipt_sha256: format!("sha256:{digest}"),
-            source_fingerprint: source,
-        },
-        tool,
-        binary,
-    ))
-}
 fn documents(input: &Preparation, uid: u32) -> Result<(policy::Policy, policy::Request)> {
     let proof = &input.executor_receipt;
     policy::hex_digest(&input.executor_receipt_sha256)?;
@@ -114,9 +86,16 @@ fn documents(input: &Preparation, uid: u32) -> Result<(policy::Policy, policy::R
         source_fingerprint: proof.source_fingerprint.clone(),
         build_receipt_sha256: proof.build_receipt_sha256.clone(),
     };
-    let (a, tool, binary) = artifact(&input.receipt_a)?;
-    let (b, other_tool, other_binary) = artifact(&input.receipt_b)?;
-    if tool != other_tool || binary != other_binary || a.receipt_sha256 == b.receipt_sha256 {
+    input.artifact_a.validate()?;
+    input.artifact_b.validate()?;
+    let a = input.artifact_a.artifact.clone();
+    let b = input.artifact_b.artifact.clone();
+    let tool = input.artifact_a.tool.clone();
+    let binary = input.artifact_a.binary.clone();
+    let other_tool = &input.artifact_b.tool;
+    let other_binary = &input.artifact_b.binary;
+    input.layout.validate(&binary)?;
+    if &tool != other_tool || &binary != other_binary || a.receipt_sha256 == b.receipt_sha256 {
         bail!("two independent generations of one tool required");
     }
     let lifetime = if input.case == Case::HardExpiry {
@@ -231,7 +210,7 @@ pub fn finish(path: &Path) -> Result<()> {
         bail!("public approval is not the supplied exact fixture authority");
     }
     let final_input = Input {
-        schema: "dev-auth-receipt-install-native-input-v1".into(),
+        schema: "dev-auth-receipt-install-native-input-v2".into(),
         case: input.case,
         dev_auth: input.dev_auth,
         dev_auth_sha256: input.dev_auth_sha256,
@@ -240,8 +219,9 @@ pub fn finish(path: &Path) -> Result<()> {
         fixture_root: input.fixture_root.clone(),
         approval_plan: approval_path,
         approval_sha256: policy::digest(&bytes),
-        receipt_a: input.receipt_a,
-        receipt_b: input.receipt_b,
+        artifact_a: input.artifact_a,
+        artifact_b: input.artifact_b,
+        layout: input.layout,
     };
     let path = input.fixture_root.join("real-input.json");
     custody::write_new_document(&path, &policy::canonical(&final_input)?, uid)?;
@@ -253,8 +233,22 @@ mod tests {
     use super::*;
     #[test]
     fn prepared_real_workflow_has_closed_scopes_and_equal_hard_timer() {
-        let receipt = |value: &str| {
-            serde_json::to_vec(&serde_json::json!({"schema":"syscfg-native-artifact-v1","binding":{"tool":"sample","binary":"sample","source_fingerprint":format!("sha256:{}",value.repeat(64))}})).unwrap()
+        let artifact = |value: &str| {
+            let receipt = serde_json::to_vec(&serde_json::json!({"sample": value})).unwrap();
+            ArtifactEvidence {
+                artifact: effect::Artifact {
+                    generation: format!(
+                        "/var/lib/dev-tools-maintenance/generations/example-{value}"
+                    ),
+                    receipt_sha256: format!("sha256:{}", policy::digest(&receipt)),
+                    source_fingerprint: format!("sha256:{}", value.repeat(64)),
+                },
+                tool: "sample".into(),
+                binary: "sample".into(),
+                executable_sha256: value.repeat(64),
+                executable_bytes: 42,
+                receipt,
+            }
         };
         let proof = effect::ExecutorReceipt {
             schema: effect::EXECUTOR_SCHEMA.into(),
@@ -266,7 +260,7 @@ mod tests {
             build_receipt_sha256: format!("sha256:{}", "33".repeat(32)),
         };
         let input = Preparation {
-            schema: "dev-auth-receipt-native-preparation-v1".into(),
+            schema: "dev-auth-receipt-native-preparation-v2".into(),
             case: Case::HardExpiry,
             dev_auth: "/dev-auth".into(),
             dev_auth_sha256: "44".repeat(32),
@@ -276,8 +270,16 @@ mod tests {
             audience: "native-receipt-source".into(),
             executor_receipt_sha256: policy::digest(&policy::canonical(&proof).unwrap()),
             executor_receipt: proof,
-            receipt_a: receipt("a"),
-            receipt_b: receipt("b"),
+            artifact_a: artifact("a"),
+            artifact_b: artifact("b"),
+            layout: ObservationLayout {
+                generation_receipt: "artifact.json".into(),
+                installed_receipt: ".sample.receipt.json".into(),
+                journal_file: "transaction.json".into(),
+                phase_pointer: "/state".into(),
+                receipt_pointer: "/candidate".into(),
+                pending_phase: "prepared".into(),
+            },
         };
         let (policy, request) = documents(&input, 1000).unwrap();
         let approval = policy::resolve(

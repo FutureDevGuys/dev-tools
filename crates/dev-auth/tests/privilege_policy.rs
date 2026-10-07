@@ -65,7 +65,7 @@ fn ordinary_contract_admits_the_closed_receipt_adapter_without_reading_root_stat
         binary: "tool".into(),
         candidate: effect::Artifact {
             generation: format!(
-                "/var/lib/dev-tools-maintenance/generations/syscfg-{}",
+                "/var/lib/dev-tools-maintenance/generations/example-{}",
                 "11".repeat(32)
             ),
             receipt_sha256: format!("sha256:{}", "11".repeat(32)),

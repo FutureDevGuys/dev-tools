@@ -6,9 +6,9 @@ Status: runnable source harness; actual native runs NOT RUN. This row uses the a
 
 Use one fresh, explicitly authorized disposable, network-free systemd guest with private cgroups/PID/mount/IPC/UTS namespaces, no host mounts and `/run/.containerenv`. The host must already satisfy Dev Auth's native platform and supported file/absolute-pipe `core_pattern` requirements. Do not change kernel settings to make a row pass. Supply a real non-root login with administrator approval and the signed/setup-qualified ordinary candidate, including the separate receipt-owned maintenance helper. Retain its independently built artifact hash and evidence that it was built without `native-privilege-fixture`.
 
-Separately approve/deploy the standalone installer artifact and canonical root deployment record described in `docs/dev-tools-receipt-install-v1.md`. Its source/build identities must be independent reviewed evidence. A hash read from a newly copied user-home installation is not bootstrap approval. Record the supplied implementation's native loader/libc prerequisites; the own-computer debug artifact currently needs Linux x86_64 and GLIBC2.39. There is no source checkout at execution.
+Separately approve/deploy the standalone installer artifact and canonical root deployment record described in `docs/dev-tools-receipt-install-v1.md`. Its source/build identities must be independent reviewed evidence. A hash read from a newly copied user-home installation is not bootstrap approval. Record the supplied implementation's native loader/libc prerequisites; no particular downstream product or personal machine defines these prerequisites. There is no source checkout at execution.
 
-Provide two actual independently verified native generations of one selected tool, A and B, with distinct canonical receipt/artifact identities, identical tool/binary binding, and their original canonical receipt bytes. Deploy both in root0700 generation directories named according to the producer's existing rules (`syscfg-<canonical receipt SHA256>`), each containing the executable and root0600 `receipt.json`. Their source fingerprints and receipt digests are independently admitted inputs. No payload is executed during this acceptance. The implementation validates special modes/capabilities and final custody itself.
+Provide two actual independently verified native generations of one selected tool, A and B, with distinct canonical receipt/artifact identities, identical tool/binary binding, and their original canonical receipt bytes. Deploy both in root0700 generation directories with independently supplied producer-neutral names, each containing the executable and its root0600 receipt. Their source fingerprints and receipt digests are independently admitted inputs. No payload is executed during this acceptance. The implementation validates special modes/capabilities and final custody itself.
 
 For each case, separately provision a fresh dedicated root0700 or0755 `/opt/dev-tools-maintenance/native-receipt-<case-id>/bin`, a matching root0700 `/var/lib/dev-tools-maintenance/journals/native-receipt-<case-id>/<binary>` and root-owned non-writable ancestors. The target binary, sidecar and journal state must initially be absent. Place a root0644 `unrelated-sentinel` with known bytes in the target. Do not reuse a target after interrupted writes. For `alias-denied`, explicitly provision the target as a bind alias of the admitted executor's parent instead; this destructive-test preparation is a separate administrator action in this disposable guest. The driver checks the actual same directory inode before trying admission. A passing transaction row with the same candidate/adapter is required as its positive control.
 
@@ -18,7 +18,7 @@ Deploy the separately built `dev-auth-privilege-native-fixture` observer/control
 
 Create a private caller-owned0700 `/var/tmp/dev-auth-receipt-native-<case-id>` directory. Supply a caller-owned0600 preparation JSON document with exactly these fields:
 
-- `schema`: `dev-auth-receipt-native-preparation-v1`
+- `schema`: `dev-auth-receipt-native-preparation-v2`
 - `case`: `transaction`, `revoke`, `hard-expiry` or `alias-denied`
 - `dev_auth`, `dev_auth_sha256`: ordinary installed candidate path and independently expected artifact hash
 - `controller`, `controller_sha256`: root-deployed fixture executable path and independently expected hash
@@ -26,7 +26,10 @@ Create a private caller-owned0700 `/var/tmp/dev-auth-receipt-native-<case-id>` d
 - `audience`: `native-receipt-<case-id>` matching the explicitly provisioned system target
 - `executor_receipt`: the complete independently approved deployment record object
 - `executor_receipt_sha256`: exact canonical record hash, without prefix
-- `receipt_a`, `receipt_b`: byte arrays containing the original independently supplied canonical producer receipts
+- `artifact_a`, `artifact_b`: independently reviewed objects containing `artifact` (the exact public request generation, receipt digest and source fingerprint), `tool`, `binary`, `executable_sha256` (unprefixed hex), `executable_bytes`, and `receipt` (the original opaque JSON receipt bytes). The harness never decodes a downstream receipt schema. The producer owns verification of its own receipt semantics; the operator independently binds every field to reviewed build evidence.
+- `layout`: the receipt filenames `generation_receipt` and `installed_receipt`, `journal_file`, JSON pointers `phase_pointer` and `receipt_pointer`, and the exact `pending_phase` string. Filenames must be distinct from the binary, single bounded components, without directory traversal. All observations stay inside already approved generation/destination/journal roots. The journal must match both the pending phase and the selected opaque receipt before and after stopping the exact process.
+
+These v2 fixture documents replace v1; they do not alter the production protocol. Use public, independently reproducible artifact inputs. No private consumer checkout, receipt schema, helper or state is a prerequisite. No fixture document creates authority.
 
 Run `dev-auth-privilege-native-fixture receipt-prepare /absolute/preparation.json`. It writes new0600 `policy.json`, `request.json` and `executor-v1.json` documents in the fixture directory. These files are only review material; they are not root policy or deployment authority. The generated policy admits six exact plans,16 total/per-operation uses and180-second hard/idle/operation caps. The hard-expiry case uses30 seconds for all three, so an earlier idle or operation timeout cannot satisfy its gate.
 
@@ -37,7 +40,7 @@ dev-auth privilege plan --request /var/tmp/dev-auth-receipt-native-CASE/request.
 dev-auth-privilege-native-fixture receipt-input /absolute/preparation.json
 ```
 
-The second command verifies the canonical public approval exactly resolves the supplied policy/request, then writes `real-input.json`. Supply an independently reviewed root-owned0600 copy of this final input to the root driver. The root copy still pins the exact public approval bytes/hash and independent A/B receipts. Keep the caller copy and its absolute name unchanged. Neither selector nor document creates a session.
+The second command verifies the canonical public approval exactly resolves the supplied policy/request, then writes v2 `real-input.json`. Supply an independently reviewed root-owned0600 copy of this final input to the root driver. The root copy still pins the exact public approval bytes/hash and independent A/B receipts. Keep the caller copy and its absolute name unchanged. Neither selector nor document creates a session.
 
 ## Run the native row
 
