@@ -73,7 +73,7 @@ fn usage() -> String {
         completion::setup_restoration_command().render_long_help()
     );
     format!(
-        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
+        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth privilege plan|request|execute|execute-plan|status|revoke [OPTIONS]\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
         commands
     )
 }
@@ -884,6 +884,45 @@ fn run_setup_helper_os() -> Result<i32> {
 fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
     let operation = arguments.next().context(usage())?;
     match operation.as_str() {
+        #[cfg(target_os = "linux")]
+        "install-privilege-policy" | "update-privilege-policy" => {
+            let mut source = None;
+            let mut sha = None;
+            let mut current = None;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--source" if source.is_none() => {
+                        source = Some(arguments.next().context("policy source is required")?)
+                    }
+                    "--sha256" if sha.is_none() => {
+                        sha = Some(arguments.next().context("policy digest is required")?)
+                    }
+                    "--current-sha256" if current.is_none() => {
+                        current = Some(
+                            arguments
+                                .next()
+                                .context("current policy digest is required")?,
+                        )
+                    }
+                    _ => bail!("invalid administrative policy invocation"),
+                }
+            }
+            if (operation == "update-privilege-policy") != current.is_some() {
+                bail!("administrative policy update requires exact current authority");
+            }
+            let source = source.context("policy source is required")?;
+            let sha = sha.context("policy digest is required")?;
+            let changed = dev_auth::setup::install_privilege_policy(
+                std::path::Path::new(&source),
+                &sha,
+                current.as_deref(),
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({"schema":"dev-auth-privilege-policy-result-v1","changed":changed,"granted":false})
+            );
+            Ok(0)
+        }
         "template" => {
             let name = arguments.next().with_context(|| {
                 format!(
@@ -2376,6 +2415,19 @@ fn main() {
         {
             secret_cli::run(std::env::args_os().skip(2).collect())
         }
+        #[cfg(target_os = "linux")]
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege")) =>
+        {
+            Ok(dev_auth::privilege::cli::run(
+                std::env::args_os().skip(2).collect(),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth-maintenance-helper", false, false) => Ok(dev_auth::privilege::cli::private(
+            std::env::args_os().skip(1).collect(),
+        )),
         ("git", true, _) => run_gh_git_child_frontend(),
         ("cat", true, _) => run_gh_pager_frontend(),
         ("false", true, _) => Ok(1),

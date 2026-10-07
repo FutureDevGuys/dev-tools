@@ -1,6 +1,6 @@
 [package]
 name = "dev-auth"
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,6 +16,7 @@ directories = "6"
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-privilege = { path = "../dev-tools-privilege" }
+dev-tools-privilege-session = { path = "../dev-tools-privilege-session" }
 dev-tools-product = { path = "../dev-tools-product" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 dev-tools-release = { path = "../dev-tools-release" }
@@ -71,3 +72,11 @@ hkdf = "0.12"
 [[bin]]
 name = "dev-auth"
 path = "src/main.rs"
+
+[features]
+native-privilege-fixture = []
+
+[[bin]]
+name = "dev-auth-privilege-native-fixture"
+path = "tests/support/privilege_native_fixture.rs"
+required-features = ["native-privilege-fixture"]

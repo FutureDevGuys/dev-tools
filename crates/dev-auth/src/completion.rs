@@ -141,6 +141,16 @@ fn setup() -> Command {
             value("sha256"),
             value("v1-sha256"),
         ]));
+    #[cfg(target_os = "linux")]
+    {
+        setup = setup
+            .subcommand(command("install-privilege-policy").args([path("source"), value("sha256")]))
+            .subcommand(command("update-privilege-policy").args([
+                path("source"),
+                value("sha256"),
+                value("current-sha256"),
+            ]));
+    }
     for name in ["readiness", "repair", "rollback", "deactivate", "uninstall"] {
         setup = setup.subcommand(command(name).arg(mode()));
     }
@@ -247,6 +257,10 @@ fn specification() -> Command {
                 ]))
                 .subcommand(command("verify").args([path("source"), choice("format", ["json"])])),
         );
+    #[cfg(target_os = "linux")]
+    {
+        root = root.subcommand(dev_auth::privilege::cli::specification());
+    }
     for name in ["sign-release-manifest", "agent", "ssh-load"] {
         root = root.subcommand(command(name).arg(value("profile")));
     }

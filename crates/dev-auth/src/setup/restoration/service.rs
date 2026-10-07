@@ -5,6 +5,10 @@ mod initial;
 
 pub(super) use initial::{require_completion_stopped, synchronize_completion};
 
+pub(super) fn require_maintenance_absence() -> Result<()> {
+    cgroup::require_maintenance_absence()
+}
+
 const COMMON_PROPERTIES: [&str; 11] = [
     "Id",
     "LoadState",

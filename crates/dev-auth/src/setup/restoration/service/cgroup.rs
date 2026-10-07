@@ -1,5 +1,6 @@
 use super::*;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 
 const CGROUP2_MAGIC: u64 = 0x6367_7270;
 const LIMIT: u64 = 4096;
@@ -32,6 +33,53 @@ pub(super) fn require_absence(include_broker: bool) -> Result<()> {
         }
     }
     root.validate()
+}
+
+/// Called only after the native strong writer has acquired exclusive setup
+/// ownership. A dead coordinator cannot make surviving kernel domains disappear
+/// merely by releasing its file lock. Population includes all descendants.
+pub(super) fn require_maintenance_absence() -> Result<()> {
+    let root = KernelDirectory::open(Path::new(crate::linux_admission::WORKLOAD_CGROUP_ROOT))?;
+    require_maintenance_absence_in(&root)
+}
+
+fn require_maintenance_absence_in(root: &KernelDirectory) -> Result<()> {
+    let mut entries = rustix::fs::Dir::read_from(&root.directory)?;
+    for (index, entry) in (&mut entries).enumerate() {
+        if index >= MAX_ENTRIES {
+            bail!("native maintenance domain inventory exceeds its bound");
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        if maintenance_unit_name(name.to_bytes())? {
+            root.require_empty(OsStr::from_bytes(name.to_bytes()))
+                .context(
+                "maintenance descendants require verified terminal cleanup before setup mutation",
+            )?;
+        }
+    }
+    root.validate()
+}
+
+fn maintenance_unit_name(name: &[u8]) -> Result<bool> {
+    const PREFIX: &[u8] = b"dev-auth-maintenance-";
+    if !name.starts_with(PREFIX) {
+        return Ok(false);
+    }
+    let Some(session) = name
+        .strip_prefix(PREFIX)
+        .and_then(|value| value.strip_suffix(b".service"))
+    else {
+        bail!("native maintenance domain has unsupported product ownership");
+    };
+    if session.len() != 64
+        || !session
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("native maintenance domain has invalid session identity");
+    }
+    Ok(true)
 }
 
 struct KernelDirectory {
@@ -197,6 +245,35 @@ fn populated(bytes: &[u8]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_unit_inventory_accepts_only_fixed_lowercase_session_shape() {
+        assert!(maintenance_unit_name(
+            format!("dev-auth-maintenance-{}.service", "a0".repeat(32)).as_bytes()
+        )
+        .unwrap());
+        for unrelated in [
+            ".",
+            "..",
+            "dev-auth-broker.service",
+            "unrelated.service",
+            "dev-auth-workload-123.scope",
+        ] {
+            assert!(!maintenance_unit_name(unrelated.as_bytes()).unwrap());
+        }
+        for invalid in [
+            "dev-auth-maintenance-.service".to_owned(),
+            format!("dev-auth-maintenance-{}.service", "a".repeat(63)),
+            format!("dev-auth-maintenance-{}.service", "a".repeat(65)),
+            format!("dev-auth-maintenance-{}.service", "A".repeat(64)),
+            format!("dev-auth-maintenance-{}.scope", "a".repeat(64)),
+            format!("dev-auth-maintenance-{}.service/child", "a".repeat(64)),
+            format!("dev-auth-maintenance-{}.service", "g".repeat(64)),
+        ] {
+            assert!(maintenance_unit_name(invalid.as_bytes()).is_err());
+        }
+        assert!(maintenance_unit_name(b"dev-auth-maintenance-\xff.service").is_err());
+    }
 
     #[test]
     fn ordinary_filesystem_cannot_forge_native_population_evidence() {

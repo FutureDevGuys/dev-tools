@@ -9,6 +9,10 @@ mod launcher;
 pub(crate) use launcher::StrongLauncherCompletion;
 mod service;
 
+pub(super) fn require_maintenance_absence() -> Result<()> {
+    service::require_maintenance_absence()
+}
+
 pub(crate) fn require_candidate_services_stopped() -> Result<()> {
     service::require_candidate_services_stopped()
 }
@@ -264,7 +268,15 @@ impl InitialInstallationRestoration {
     }
 
     pub(crate) fn verify_restored(&self) -> Result<()> {
-        for (_, _, path) in installation_current_state_paths(&self.paths, self.candidate.mode) {
+        let mut inventory = installation_current_state_paths(&self.paths, self.candidate.mode);
+        if self.candidate.mode == InstallMode::Strong {
+            inventory.extend(
+                maintenance_current_state_paths(&self.candidate.version)
+                    .into_iter()
+                    .filter(|(kind, _, _)| kind != "maintenance_policy"),
+            );
+        }
+        for (_, _, path) in inventory {
             require_restored_absence(&path)?;
         }
         require_restored_absence(&self.paths.data_root.join("installation-transition-v1.json"))?;
@@ -333,6 +345,11 @@ impl RetainedInstallationRestoration {
     pub(crate) fn restore(&self) -> Result<bool> {
         self.require_retained_services_stopped()?;
         let mut changed = self.restore_privileged_launcher()?;
+        changed |= maintenance::restore_executable(
+            &self.receipt_directory,
+            Some(&self.original),
+            &self.candidate,
+        )?;
         changed |= self.restore_binary()?;
         changed |= self.synchronize_retained_services()?;
         // The binary boundary already observed shared history and artifacts.

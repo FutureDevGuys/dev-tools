@@ -7,9 +7,14 @@
 //! each operation, conserve delegated authority, and retain the native process
 //! boundary until cleanup is positively observed.
 //!
-//! This first foundation implements local lifecycle only. It starts no process,
-//! thread, timer, privileged helper, or network request. Native backends and
-//! authority delegation are not implemented or advertised as accepted.
+//! This foundation implements local lifecycle and reusable admission accounting.
+//! Lifecycle/accounting values start no process, timer or authority. The explicit
+//! Linux module supplies held cgroup, peer and gated-process mechanics only.
+//! Product authorization, independent guardians, sandbox policy and complete
+//! native acceptance remain separate requirements; delegation is not implemented.
+
+mod authority;
+pub use authority::*;
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -60,6 +65,8 @@ pub enum StopReason {
     ParentRevoked,
     AuthorityChanged,
     BrokerShutdown,
+    /// Explicit normal completion, still requiring positive native cleanup.
+    NormalShutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +94,18 @@ impl LeaseState {
     /// A terminal state may still retain a prior cleanup failure.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminated { .. })
+    }
+
+    /// Normal shutdown is successful only after positive cleanup with no prior
+    /// cleanup failure. Revocation and expiry are distinct terminal outcomes.
+    pub const fn is_clean_shutdown(self) -> bool {
+        matches!(
+            self,
+            Self::Terminated {
+                reason: StopReason::NormalShutdown,
+                cleanup_failed: false
+            }
+        )
     }
 }
 
@@ -207,6 +226,13 @@ impl LeaseLifecycle {
         }
     }
 
+    /// Close admission for normal completion without skipping native cleanup.
+    /// The original stopping reason and cleanup-failure history are preserved.
+    pub fn shutdown(&mut self, now: Duration) {
+        self.poll(now);
+        self.stop(StopReason::NormalShutdown);
+    }
+
     /// Reports positive cleanup evidence, not a signal-send or leader-exit event.
     /// Failed cleanup stays nonterminal. A successful retry retains its failure
     /// history so callers cannot silently report the original operation successful.
@@ -255,3 +281,6 @@ impl fmt::Display for SessionError {
 }
 
 impl std::error::Error for SessionError {}
+
+#[cfg(target_os = "linux")]
+pub mod native_linux;

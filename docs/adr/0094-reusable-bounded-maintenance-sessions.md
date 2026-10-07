@@ -1,0 +1,43 @@
+---
+authority: canonical
+owner: dev-auth
+---
+
+# ADR 0094: Reusable bounded Linux maintenance sessions
+
+status: proposed
+verification: pending
+
+## Decision and scope
+
+The 0.5 candidate source adds the reusable typed/exact-plan lifecycle described by ADR 0004. The production receipt-install effect is specified by [ADR0095](0095-standalone-receipt-install-maintenance.md); native qualification remains required before claiming the privileged maintenance outcome. One native administrator approval fixes an operation/resource audience, exact helper and plan identities, per-operation and total uses, idle expiry and an absolute hard deadline. A newly created non-root controller and its kernel-authenticated descendants may request several transactions at different times. One transaction is in flight at a time; completion leaves the grant reusable. A finite batch is a consumer, not the session lifetime contract.
+
+The operation request selects a preapproved plan variant. A protocol label, ELF hash and fixed argv are not an effect definition. `dev-auth-reviewed-helper-v1` and arbitrary executable/resource policies are rejected in every build. Ordinary builds admit only the finite `dev-tools-receipt-install-v1` adapter described in ADR0095. `dev-auth-native-fixture-v1` is compiled exclusively by unit tests or the opt-in `native-privilege-fixture` feature. It admits only the fixed fixture executable, finite fixture verbs and one disposable resource; it cannot qualify a real updater.
+
+The production integration reuses the existing receipt-bound installer through an optional standalone artifact and independently bootstrapped root custody. Public Update All installation remains invoking-user-owned. Dev Auth's own signed setup engine is excluded while the live reusable grant holds installation exclusion. The dedicated maintenance target and separate installer journal do not conflict with that held exclusion.
+
+Administrator policy is a separate closed `dev-auth-privilege-policy-v1` document. Absence or an empty capability set grants nothing. Credential workload policy, existing broker sessions, environment selectors and sudo timestamps are not maintenance authority. The current shared eight-hour cap remains enforced. ADR 0004's uncapped-policy/overnight objective is not claimed as delivered by this source change.
+
+## Native boundaries
+
+A distinct root-owned ordinary mode-0755 `dev-auth-maintenance-helper` is copied and receipted only for the new version line. The existing credential broker stays non-root; the workload launcher's set-ID dispatch guard and non-root session registry remain unchanged. A separate non-kept polkit `auth_admin` action authorizes maintenance. The frontend displays the operation/resource audience and duration before entering that native surface. No password channel or global sudo refresh exists.
+
+One-use kernel-authenticated IPC carries canonical approval to a root per-session coordinator. The coordinator fixes host `CLOCK_BOOTTIME` authority before releasing the controller and owns separate nondelegated cgroups for the controller and each privileged transaction. The public ID is only a selector. Every execute rechecks UID/GID, retained peer pidfd, exact controller-domain membership, current policy/helper identity, replay state, scope, budget and deadline before the same serialized owner opens a child gate.
+
+The shared foundation owns non-cloneable authority accounting and explicit retained cgroup/peer mechanics. It does not independently authorize or sandbox root programs. Product infrastructure owns the receipt, policy, approval, independent guardian and execution profile. A kernel absolute boot-time timer remains effective when the coordinator is stopped; its systemd unit uses control-group teardown. Idle observations may rearm only an absolute deadline bounded by the immutable hard ceiling. Status and polling never extend authority.
+
+Privileged payloads execute as native root in a private PID/mount/IPC/UTS/network boundary. The resource root exposes public runtime files and only approved held resources. Writable resources do not recursively import unapproved nested mounts. Proc is read-only, outside resource descriptors do not survive native ELF exec, capabilities are narrowed to filesystem ownership/access, and namespace, external socket, tracing, kernel-handle and io_uring entry points are blocked. The retained kernel core profile rejects socket (`@`, including `@@`) collectors and ambiguous pipe patterns. An absolute pipe collector is supported only through exact soft/hard RLIMIT_CORE=1, the Linux pre-pipe-launch recursion guard, established before forks/exec and made immutable by inherited setrlimit/prlimit64 argument rules. The rules match the kernel's truncated32-bit resource number, check the full64-bit new-limit pointer, permit read-only queries and reject alternate ABIs first. Root bootstrap inherits limit1 through native approval; the independent coordinator has systemd LimitCORE=1; each private maintenance entry also suppresses trusted dumpability early. Payload safety survives ordinary exec resetting dumpability. No host sysctl changes. A hard0 caller limit fails readiness, and socket collectors remain unsupported because the pipe recursion guard does not suppress them. [Native collector-negative proof](../../crates/dev-auth/tests/support/CORE-NATIVE.md), with positive controls and root-infrastructure crash cases, is a release/deployment gate, not a new machine-local attestation authority. This is a bounded filesystem-maintenance profile. Helpers needing host service/container control, mount administration, networking or other incompatible authority are rejected or fail closed; they are not silently promoted to unrestricted authority.
+
+Expiry/revoke closes admission, cancels work, kills and joins retained domains, and requires positive kernel emptiness. Leader exit, a successful stop request and a removed registry entry are not cleanup proof. Failed cleanup remains failure. Coordinator death invalidates memory-only authority; no persisted ID or terminal observation can revive it. A separate bootstrap retains shared setup exclusion until positive whole-service cleanup; exclusive writers additionally reject populated or unverifiable orphan maintenance units. The bootstrap may report positive terminal cleanup after authenticating the exact guardian and observing its empty/removed kernel domain. It must preserve unknown execution progress when the coordinator could not return a final receipt. Completed filesystem effects are not rolled back by revocation.
+
+## Setup and compatibility
+
+The maintenance copy, sidecar and separate polkit file form one fixed receipt-owned group. Legacy five-asset inventories and pre-0.5 receipts are unchanged. New setup tracks publication, interruption, verification, retained recovery/restoration, downgrade and owned uninstall. Policy installation/update is an explicit root-only digest/CAS operation under exclusive setup exclusion. Sessions retain shared exclusion until cleanup; they cannot change their own helper, policy or installation while running. Policy restoration rejects a newer administrator choice rather than overwriting drift. Missing policy stays deny-all.
+
+The public command family is `privilege plan`, `request`, `execute`, `execute-plan`, `status` and `revoke`. The native controller runs under the original account. Helper entry points never appear in public completion. Child bytes remain on child streams and separate result files contain value-free observations.
+
+## Verification and honest release gate
+
+Source tests cover reuse, per-operation/shared budgets, replay, narrowing, clock rechecks, gate failure/panic, stop ordering, cleanup uncertainty, strict product schemas and helper/setup custody. Explicit cgroup fixtures cover placement-before-release, peer pidfds, detached descendants and positive domain cleanup. The opt-in product harness runs public request/execute/status/revoke with an installed candidate, a fresh disposable scope and real native approval. Its root helper subjects are compiled test artifacts and are never installed by default.
+
+Independent kernel timer testing is possible as an ordinary user. That does not prove privileged installation, polkit approval, root namespace containment or actual maintenance compatibility. Rootful/systemd acceptance, real approval, suspend/resume, coordinator/guardian death, hostile descendants, helper/resource replacement, signed intake and rollback must pass before advertising installed Linux support. A synthetic marker operation is not proof that a particular updater or private maintenance fixture is compatible. Non-Linux support remains unclaimed.

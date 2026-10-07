@@ -357,6 +357,10 @@ fn recover_setup_v3_inner(
         progress.blocked("wait_for_active_workloads_or_setup");
         bail!("setup recovery requires active workloads and other setup operations to finish");
     };
+    if let Err(error) = crate::setup::require_strong_maintenance_quiescence(&paths, mode) {
+        progress.blocked("wait_for_maintenance_cleanup");
+        return Err(error);
+    }
     let Some(transition) = crate::setup_transition::retained_transition(&paths, owner_uid)? else {
         progress.blocked("create_setup_plan");
         bail!("setup recovery requires a retained setup transition");
@@ -387,6 +391,9 @@ fn recover_setup_v3_inner(
             },
         );
         bail!("setup restoration cannot resume forward");
+    }
+    if transition.phase == crate::setup_transition::Phase::Pending {
+        verify_retained_maintenance_policy(plan)?;
     }
     let prior_installation = retained_installation_receipts(&generation)?;
     let running_candidate = std::env::current_exe()?;
@@ -485,6 +492,7 @@ fn retained_installation_receipts(
         dev_tools_installation::VersionedReceipt,
     )>,
 > {
+    validate_retained_maintenance_ownership(generation)?;
     let plan = &generation.plan;
     let owner_uid = apply_owner_uid(plan)?;
     let receipt = restoration::retained_object(generation, "installation_receipt", "system")?;
@@ -552,6 +560,10 @@ where
     let _deployment_lock = InstallationLock::try_acquire(&deployment_lock_path(plan)?)
         .context("acquire full setup transaction lock")?
         .context("setup requires active workloads and other setup operations to finish")?;
+    crate::setup::require_strong_maintenance_quiescence(
+        &plan.installation.paths,
+        plan.installation.request.mode,
+    )?;
     let documents = revalidate_public_plan_inputs(plan)?;
     let before = deployment_state_fingerprint(plan)?;
     let requires_new_transition = crate::setup_transition::retained_transition(
@@ -592,6 +604,7 @@ where
         || capture_retained_generation(plan, &digest),
     )?;
 
+    verify_retained_maintenance_policy(plan)?;
     let mut actions = Vec::new();
     let integrations_changed = deactivate_and_stop_candidate(plan, &mut actions)?;
     let (_, install_digest) = render_plan(&plan.installation)?;
@@ -659,6 +672,7 @@ where
 
     let action_set_sha256 = credential_action_set_sha256(&plan.intent)?;
     apply_credential_actions(plan, &action_set_sha256, credentials, &mut actions)?;
+    verify_retained_maintenance_policy(plan)?;
     start_and_activate_candidate(plan, &mut actions)?;
     if !postcondition_satisfied(plan, digest, documents) {
         bail!("setup plan v3 postcondition verification failed");
@@ -2267,6 +2281,12 @@ fn expected_current_path_keys(
         &installation.paths,
         installation.request.mode,
     );
+    #[cfg(target_os = "linux")]
+    if installation.request.mode == crate::setup::InstallMode::Strong {
+        paths.extend(crate::setup::maintenance_current_state_paths(
+            &installation.request.version,
+        ));
+    }
     paths.push((
         "credential_actions".to_owned(),
         "system".to_owned(),
@@ -2625,6 +2645,94 @@ fn with_candidate_source<T>(
     apply(source.path())
 }
 
+#[cfg(target_os = "linux")]
+fn validate_retained_maintenance_ownership(generation: &RetainedSetupGeneration) -> Result<()> {
+    use crate::setup::maintenance;
+    let plan = &generation.plan;
+    if plan.installation.request.mode != crate::setup::InstallMode::Strong
+        || !maintenance::supports_version(&plan.installation.request.version)
+    {
+        return Ok(());
+    }
+    let prior: Option<crate::setup::InstallReceipt> =
+        restoration::retained_object(generation, "installation_receipt", "system")?
+            .bytes
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?;
+    let helper = plan
+        .current_paths
+        .iter()
+        .find(|current| {
+            current.kind == "privileged_maintenance_helper" && current.subject == "system"
+        })
+        .context("retained maintenance executable observation is absent")?;
+    let prior = prior.as_ref().filter(|receipt| {
+        receipt.mode == crate::setup::InstallMode::Strong
+            && maintenance::supports_version(&receipt.version)
+    });
+    if helper.path != Path::new(maintenance::HELPER_PATH) {
+        bail!("retained maintenance executable has an unexpected destination");
+    }
+    match (&helper.identity, prior) {
+        (None, None) => {}
+        (Some(identity), Some(receipt))
+            if identity.object_type == "file"
+                && identity.owner_uid == 0
+                && identity.mode == 0o755
+                && identity.link_count == 1
+                && identity.link_target.is_none()
+                && identity.length == receipt.executable_length
+                && identity.sha256 == receipt.executable_sha256 => {}
+        _ => bail!("retained maintenance executable lacks original receipt ownership"),
+    }
+    let sidecar = restoration::retained_object(generation, "maintenance_helper_receipt", "system")?;
+    maintenance::validate_retained_sidecar(sidecar.bytes.as_deref(), prior)?;
+    let action = restoration::retained_object(generation, "maintenance_polkit_action", "system")?;
+    if action.bytes.as_deref() != prior.map(|_| maintenance::POLKIT.as_bytes()) {
+        bail!("retained maintenance action lacks original receipt ownership");
+    }
+    for (object, path) in [
+        (sidecar, maintenance::RECEIPT_PATH),
+        (action, maintenance::POLKIT_PATH),
+    ] {
+        if object.current.path != Path::new(path)
+            || object
+                .current
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.owner_uid != 0 || identity.mode != 0o644)
+        {
+            bail!("retained maintenance document has unsafe custody");
+        }
+    }
+    Ok(())
+}
+
+fn verify_retained_maintenance_policy(plan: &SetupPlanV3) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if plan.installation.request.mode == crate::setup::InstallMode::Strong
+        && crate::setup::maintenance::supports_version(&plan.installation.request.version)
+    {
+        let selected = plan
+            .current_paths
+            .iter()
+            .find(|current| current.kind == "maintenance_policy" && current.subject == "system")
+            .context("approved maintenance policy observation is absent")?;
+        if selected.path != Path::new(crate::setup::maintenance::POLICY_PATH)
+            || selected.identity.as_ref().is_some_and(|identity| {
+                identity.owner_uid != 0 || identity.mode != 0o644 || identity.link_count != 1
+            })
+        {
+            bail!("approved maintenance policy has unsafe custody");
+        }
+        capture_retained_object(selected)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = plan;
+    Ok(())
+}
+
 fn capture_retained_generation(plan: &SetupPlanV3, digest: &str) -> Result<Vec<u8>> {
     let mut documents = Vec::new();
     for current in &plan.current_paths {
@@ -2632,7 +2740,9 @@ fn capture_retained_generation(plan: &SetupPlanV3, digest: &str) -> Result<Vec<u
         // the configuration journal never copies executable payloads.
         if matches!(
             current.kind.as_str(),
-            "privileged_workload_launcher" | "privileged_setup_helper"
+            "privileged_workload_launcher"
+                | "privileged_setup_helper"
+                | "privileged_maintenance_helper"
         ) {
             continue;
         }
@@ -2662,7 +2772,7 @@ fn capture_retained_generation(plan: &SetupPlanV3, digest: &str) -> Result<Vec<u
     }) {
         capture_retained_object(current)?;
     }
-    serde_jcs::to_vec(&RetainedSetupGeneration {
+    let generation = RetainedSetupGeneration {
         schema: "dev-auth-retained-setup-generation-v1".into(),
         plan_sha256: digest.into(),
         plan: plan.clone(),
@@ -2672,8 +2782,10 @@ fn capture_retained_generation(plan: &SetupPlanV3, digest: &str) -> Result<Vec<u
             .iter()
             .map(capture_candidate_document)
             .collect::<Result<_>>()?,
-    })
-    .context("serialize retained setup generation")
+    };
+    #[cfg(target_os = "linux")]
+    validate_retained_maintenance_ownership(&generation)?;
+    serde_jcs::to_vec(&generation).context("serialize retained setup generation")
 }
 
 fn capture_candidate_document(identity: &DocumentIdentity) -> Result<RetainedCandidateDocument> {
@@ -3464,5 +3576,105 @@ mod tests {
             owner_uid,
         )
         .is_err());
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn maintenance_retention_rejects_same_content_without_original_ownership() {
+        use crate::setup::{InstallMode, InstallRequest, SetupPaths};
+        let installation = SetupPlan {
+            schema: "dev-auth-setup-plan-v2".into(),
+            paths: SetupPaths::strong(),
+            request: InstallRequest {
+                mode: InstallMode::Strong,
+                version: "0.5.0".into(),
+                source_executable: "/candidate/dev-auth".into(),
+                native_git: "/usr/bin/git".into(),
+                native_gh: "/usr/bin/gh".into(),
+                activate_transparent_launchers: false,
+            },
+            source_length: 1,
+            source_sha256: "a".repeat(64),
+            verified_release: None,
+        };
+        let mut current_paths = vec![CurrentPathIdentity {
+            kind: "installation_receipt".into(),
+            subject: "system".into(),
+            path: installation.paths.data_root.join("install-v2.json"),
+            identity: None,
+        }];
+        current_paths.extend(
+            crate::setup::maintenance_current_state_paths("0.5.0")
+                .into_iter()
+                .map(|(kind, subject, path)| CurrentPathIdentity {
+                    kind,
+                    subject,
+                    path,
+                    identity: None,
+                }),
+        );
+        let documents = current_paths
+            .iter()
+            .filter(|current| current.kind != "privileged_maintenance_helper")
+            .cloned()
+            .map(|current| RetainedSetupObject {
+                current,
+                bytes: None,
+            })
+            .collect();
+        let mut generation = RetainedSetupGeneration {
+            schema: "dev-auth-retained-setup-generation-v1".into(),
+            plan_sha256: "b".repeat(64),
+            plan: SetupPlanV3 {
+                schema: "dev-auth-setup-plan-v3".into(),
+                authority_schema: None,
+                intent: DeploymentIntent {
+                    schema: "dev-auth-deployment-v1".into(),
+                    mode: DeploymentMode::Strong,
+                    channel: crate::deployment::Channel::Stable,
+                    offline: true,
+                    activation: Activation::Inactive,
+                    administrator_policy: "/candidate/policy.toml".into(),
+                    users: vec![],
+                    credentials: vec![],
+                },
+                intent_sha256: "c".repeat(64),
+                installation,
+                source_documents: vec![],
+                accounts: vec![],
+                retiring_accounts: vec![],
+                current_paths,
+                current_credential_ready: BTreeSet::new(),
+                current_broker_state: "inactive".into(),
+                current_state_sha256: "d".repeat(64),
+                actions: vec![],
+            },
+            documents,
+            candidate_documents: vec![],
+        };
+        validate_retained_maintenance_ownership(&generation).unwrap();
+        generation
+            .plan
+            .current_paths
+            .iter_mut()
+            .find(|current| current.kind == "privileged_maintenance_helper")
+            .unwrap()
+            .identity = Some(CurrentFileIdentity {
+            object_type: "file".into(),
+            owner_uid: 0,
+            mode: 0o755,
+            link_count: 1,
+            length: 1,
+            sha256: "a".repeat(64),
+            link_target: None,
+        });
+        assert!(validate_retained_maintenance_ownership(&generation).is_err());
+        generation
+            .plan
+            .current_paths
+            .iter_mut()
+            .find(|current| current.kind == "privileged_maintenance_helper")
+            .unwrap()
+            .identity = None;
+        validate_retained_maintenance_ownership(&generation).unwrap();
     }
 }

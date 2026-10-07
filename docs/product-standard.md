@@ -73,7 +73,7 @@ Shared crates contain no product-name branches and do not form a broad `dev-tool
 | `dev-tools-command` | Bounded direct process execution and prepared-command execution. |
 | `dev-tools-completion` | Static shell rendering from trusted product-owned Clap command definitions; no discovery, execution or publication. |
 | `dev-tools-privilege` | One-shot typed privileged-operation authorization. |
-| `dev-tools-privilege-session` | Local lease expiry, use accounting, and stopping/cleanup lifecycle; identity binding, delegated authority, and native backends remain gated. |
+| `dev-tools-privilege-session` | Local reusable authority accounting plus explicit retained Linux cgroup/peer/process mechanics; product authorization, sandbox/guardian composition, native acceptance and delegated authority remain separate gates. |
 | `dev-tools-secret` | Provider-neutral secret identifiers, operation capabilities, bounded cancellation contexts, zeroizing material, and value-free failures. |
 | `dev-tools-reconcile-protocol` | Typed external reconciliation documents. |
 

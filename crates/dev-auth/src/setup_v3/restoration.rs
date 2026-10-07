@@ -108,6 +108,7 @@ impl InstallationRestoration {
 fn installation_restoration(
     generation: &RetainedSetupGeneration,
 ) -> Result<InstallationRestoration> {
+    validate_retained_maintenance_ownership(generation)?;
     let plan = &generation.plan;
     let prior = retained_object(generation, "installation_receipt", "system")?;
     let prior_shared = retained_object(generation, "shared_installation_receipt", "system")?;
@@ -157,13 +158,25 @@ fn installation_restoration(
         (None, None) => {
             // Receipt absence alone cannot authorize withdrawal of a legacy or
             // unreceipted activation. The approved topology must also be absent.
-            for (kind, subject, path) in crate::setup::installation_current_state_paths(
+            let mut inventory = crate::setup::installation_current_state_paths(
                 &plan.installation.paths,
                 plan.installation.request.mode,
-            ) {
+            );
+            if plan.installation.request.mode == crate::setup::InstallMode::Strong {
+                inventory.extend(
+                    crate::setup::maintenance_current_state_paths(
+                        &plan.installation.request.version,
+                    )
+                    .into_iter()
+                    .filter(|(kind, _, _)| kind != "maintenance_policy"),
+                );
+            }
+            for (kind, subject, path) in inventory {
                 if matches!(
                     kind.as_str(),
-                    "privileged_workload_launcher" | "privileged_setup_helper"
+                    "privileged_workload_launcher"
+                        | "privileged_setup_helper"
+                        | "privileged_maintenance_helper"
                 ) {
                     let mut matches = plan
                         .current_paths
@@ -265,6 +278,10 @@ fn restore_owned_inner(
         progress.blocked("wait_for_active_workloads_or_setup");
         bail!("restoration requires exclusive setup ownership");
     };
+    if let Err(error) = crate::setup::require_strong_maintenance_quiescence(&paths, mode) {
+        progress.blocked("wait_for_maintenance_cleanup");
+        return Err(error);
+    }
     let Some(transition) = crate::setup_transition::retained_transition(&paths, owner)? else {
         progress.blocked("create_setup_plan");
         bail!("restoration requires a retained generation");
@@ -462,6 +479,7 @@ pub(super) fn retained_object<'a>(
 struct RestorationDocument<'a> {
     prior: &'a RetainedSetupObject,
     candidate: Option<&'a [u8]>,
+    candidate_owned: Option<Vec<u8>>,
     authority: DocumentAuthority,
     prior_authority: DocumentAuthority,
     directory: Option<dev_tools_installation::ExistingDocumentDirectory>,
@@ -487,6 +505,7 @@ impl<'a> RestorationDocument<'a> {
         Ok(Self {
             prior,
             candidate,
+            candidate_owned: None,
             authority,
             prior_authority,
             directory,
@@ -521,7 +540,8 @@ impl<'a> RestorationDocument<'a> {
         if current.is_none() && self.prior.bytes.is_none() {
             return Ok(None);
         }
-        if self.candidate.is_none() || bytes != self.candidate {
+        let candidate = self.candidate_owned.as_deref().or(self.candidate);
+        if candidate.is_none() || bytes != candidate {
             bail!("configuration changed outside the retained restoration pair");
         }
         Ok(current.map(|document| (document, self.authority.clone())))
@@ -553,10 +573,7 @@ impl<'a> RestorationDocument<'a> {
         }
         // If the candidate created this parent, a retry after unlink must sync
         // absence. An untouched absent parent is not created by restoration.
-        if self.candidate.is_some() {
-            let bytes = self
-                .candidate
-                .context("candidate removal identity is absent")?;
+        if let Some(bytes) = self.candidate_owned.as_deref().or(self.candidate) {
             directory.remove(
                 name,
                 &self.authority,
@@ -619,6 +636,7 @@ fn restoration_documents(
     let plan = &generation.plan;
     if plan.intent.mode == DeploymentMode::Strong {
         let mut documents = system_asset_documents(generation)?;
+        documents.extend(maintenance_documents(generation)?);
         for spec in configuration::strong_configuration_specs(generation)? {
             documents.push(RestorationDocument::new(
                 spec.prior,
@@ -673,6 +691,62 @@ fn restoration_documents(
     })
     .collect::<Result<Vec<_>>>()?;
     Ok(documents)
+}
+
+fn maintenance_documents(
+    generation: &RetainedSetupGeneration,
+) -> Result<Vec<RestorationDocument<'_>>> {
+    use crate::setup::maintenance;
+    let plan = &generation.plan.installation;
+    if !maintenance::supports_version(&plan.request.version) {
+        return Ok(Vec::new());
+    }
+    let receipt: Option<crate::setup::InstallReceipt> =
+        retained_object(generation, "installation_receipt", "system")?
+            .bytes
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?;
+    let sidecar = retained_object(generation, "maintenance_helper_receipt", "system")?;
+    maintenance::validate_retained_sidecar(sidecar.bytes.as_deref(), receipt.as_ref())?;
+    let action = retained_object(generation, "maintenance_polkit_action", "system")?;
+    let prior_supports = receipt
+        .as_ref()
+        .is_some_and(|r| maintenance::supports_version(&r.version));
+    if (prior_supports && action.bytes.as_deref() != Some(maintenance::POLKIT.as_bytes()))
+        || (!prior_supports && action.bytes.is_some())
+    {
+        bail!("retained maintenance action lacks original receipt authority");
+    }
+    let policy = retained_object(generation, "maintenance_policy", "system")?;
+    let authority = DocumentAuthority {
+        owner_uid: 0,
+        mode: 0o644,
+        limit: DOCUMENT_LIMIT,
+    };
+    for (object, path) in [
+        (sidecar, maintenance::RECEIPT_PATH),
+        (action, maintenance::POLKIT_PATH),
+        (policy, maintenance::POLICY_PATH),
+    ] {
+        if object.current.path != Path::new(path)
+            || object
+                .current
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.owner_uid != 0 || i.mode != 0o644)
+        {
+            bail!("retained maintenance document has unsafe custody");
+        }
+    }
+    let mut sidecar_document = RestorationDocument::new(sidecar, None, authority.clone())?;
+    sidecar_document.candidate_owned =
+        Some(maintenance::candidate_sidecar(plan, receipt.as_ref())?);
+    Ok(vec![
+        RestorationDocument::new(policy, None, authority.clone())?,
+        RestorationDocument::new(action, Some(maintenance::POLKIT.as_bytes()), authority)?,
+        sidecar_document,
+    ])
 }
 
 fn system_asset_candidate(
@@ -1145,5 +1219,81 @@ mod tests {
             fs::read(retained.join("policy-v3.toml")).unwrap(),
             b"candidate"
         );
+    }
+    #[test]
+    fn maintenance_policy_restoration_preserves_later_administrator_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("policy.json");
+        fs::write(&path, b"prior administrator policy").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let owner = fs::metadata(&path).unwrap().uid();
+        let prior = RetainedSetupObject {
+            current: CurrentPathIdentity {
+                kind: "maintenance_policy".into(),
+                subject: "system".into(),
+                path: path.clone(),
+                identity: Some(CurrentFileIdentity {
+                    object_type: "file".into(),
+                    owner_uid: owner,
+                    mode: 0o644,
+                    link_count: 1,
+                    length: 26,
+                    sha256: sha256_hex(b"prior administrator policy"),
+                    link_target: None,
+                }),
+            },
+            bytes: Some(b"prior administrator policy".to_vec()),
+        };
+        let document = RestorationDocument::new(
+            &prior,
+            None,
+            DocumentAuthority {
+                owner_uid: owner,
+                mode: 0o644,
+                limit: DOCUMENT_LIMIT,
+            },
+        )
+        .unwrap();
+        assert!(!document.restore().unwrap());
+        fs::write(&path, b"new independent administrator policy").unwrap();
+        assert!(document.restore().is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"new independent administrator policy"
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(document.restore().is_err());
+    }
+
+    #[test]
+    fn maintenance_owned_sidecar_restoration_recovers_initial_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("maintenance-helper-v1.json");
+        fs::write(&path, b"exact candidate sidecar").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let owner = fs::metadata(&path).unwrap().uid();
+        let prior = RetainedSetupObject {
+            current: CurrentPathIdentity {
+                kind: "maintenance_helper_receipt".into(),
+                subject: "system".into(),
+                path: path.clone(),
+                identity: None,
+            },
+            bytes: None,
+        };
+        let mut document = RestorationDocument::new(
+            &prior,
+            None,
+            DocumentAuthority {
+                owner_uid: owner,
+                mode: 0o644,
+                limit: DOCUMENT_LIMIT,
+            },
+        )
+        .unwrap();
+        document.candidate_owned = Some(b"exact candidate sidecar".to_vec());
+        assert!(document.restore().unwrap());
+        assert!(!document.restore().unwrap());
+        document.verify_restored().unwrap();
     }
 }

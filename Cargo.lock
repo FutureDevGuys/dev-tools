@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "dev-auth"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -936,6 +936,7 @@ dependencies = [
  "dev-tools-completion",
  "dev-tools-installation",
  "dev-tools-privilege",
+ "dev-tools-privilege-session",
  "dev-tools-product",
  "dev-tools-reconcile-protocol",
  "dev-tools-release",
@@ -1055,6 +1056,11 @@ dependencies = [
 [[package]]
 name = "dev-tools-privilege-session"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "tempfile",
+]
 
 [[package]]
 name = "dev-tools-product"

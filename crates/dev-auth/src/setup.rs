@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod maintenance;
 #[cfg(all(test, target_os = "linux"))]
 mod recovery_native;
 #[cfg(target_os = "linux")]
@@ -20,6 +22,11 @@ mod restoration_durability;
 mod strong_assets_completion;
 #[cfg(target_os = "linux")]
 mod strong_helper_completion;
+#[cfg(target_os = "linux")]
+pub use maintenance::{
+    install_privilege_policy, maintenance_installation_identity,
+    validate_installed_maintenance_helper, validate_running_maintenance_helper,
+};
 
 const RECEIPT_SCHEMA: &str = "dev-auth-install-v2";
 
@@ -185,6 +192,22 @@ pub(crate) fn installation_current_state_paths(
         }));
     }
     current
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn maintenance_current_state_paths(version: &str) -> Vec<(String, String, PathBuf)> {
+    if !maintenance::supports_version(version) {
+        return Vec::new();
+    }
+    [
+        ("privileged_maintenance_helper", maintenance::HELPER_PATH),
+        ("maintenance_helper_receipt", maintenance::RECEIPT_PATH),
+        ("maintenance_polkit_action", maintenance::POLKIT_PATH),
+        ("maintenance_policy", maintenance::POLICY_PATH),
+    ]
+    .into_iter()
+    .map(|(kind, path)| (kind.into(), "system".into(), PathBuf::from(path)))
+    .collect()
 }
 
 pub(crate) fn user_integration_receipt_paths(
@@ -1961,6 +1984,17 @@ fn install_at_with_release(
     } else {
         false
     };
+    #[cfg(target_os = "linux")]
+    if request.mode == InstallMode::Strong {
+        let candidate = selected_installation_receipt(
+            paths,
+            request,
+            verified_release,
+            prior_receipt.as_ref(),
+            approved_source,
+        );
+        maintenance::prepare_install(paths, &candidate, prior_receipt.as_ref())?;
+    }
     let shared_report = dev_tools_installation::apply_versioned_installation(
         &dev_tools_installation::VersionedInstallRequest {
             layout: shared_layout,
@@ -2017,6 +2051,8 @@ fn install_at_with_release(
             remove_setup_helper(paths, prior)?;
         }
     }
+    #[cfg(target_os = "linux")]
+    maintenance::reconcile(paths, &receipt, prior_receipt.as_ref())?;
     write_receipt(&paths.receipt_path(), &receipt)?;
     verify_at(paths)
 }
@@ -2439,6 +2475,12 @@ pub(crate) fn retained_candidate_validation_from_source(
                 &binary_source,
             )?;
             strong_completion = Some(StrongCompletion {
+                maintenance: maintenance::Completion::observe(
+                    &plan.paths,
+                    &receipt,
+                    prior.map(|(receipt, _)| receipt),
+                    &binary_source,
+                )?,
                 assets,
                 helper,
                 launcher,
@@ -2486,6 +2528,7 @@ pub(crate) struct RetainedCandidateValidation {
 
 #[cfg(target_os = "linux")]
 struct StrongCompletion {
+    maintenance: Option<maintenance::Completion>,
     launcher: restoration::StrongLauncherCompletion,
     assets: strong_assets_completion::StrongAssetsCompletion,
     helper: strong_helper_completion::StrongHelperCompletion,
@@ -2507,7 +2550,11 @@ impl RetainedCandidateValidation {
     pub(crate) fn binary_recovery_action(&self) -> &'static str {
         #[cfg(target_os = "linux")]
         if self.strong_completion.as_ref().is_some_and(|strong| {
-            strong.launcher.needs_publication()
+            strong
+                .maintenance
+                .as_ref()
+                .is_some_and(maintenance::Completion::needs_publication)
+                || strong.launcher.needs_publication()
                 || strong.assets.needs_publication()
                 || strong.helper.needs_publication()
         }) {
@@ -2647,7 +2694,11 @@ impl RetainedCandidateValidation {
                         self.require_selected_product_receipt()?;
                         self.verify_committed_candidate_base()?;
                         strong.assets.verify_observed()?;
-                        strong.helper.verify_observed()
+                        strong.helper.verify_observed()?;
+                        if let Some(maintenance) = &strong.maintenance {
+                            maintenance.verify_observed()?;
+                        }
+                        Ok(())
                     },
                     &mut record_change,
                 )?;
@@ -2656,18 +2707,36 @@ impl RetainedCandidateValidation {
                         self.require_selected_product_receipt()?;
                         self.verify_committed_candidate_base()?;
                         strong.launcher.verify_complete()?;
-                        strong.helper.verify_observed()
+                        strong.helper.verify_observed()?;
+                        if let Some(maintenance) = &strong.maintenance {
+                            maintenance.verify_observed()?;
+                        }
+                        Ok(())
                     },
                     &mut record_change,
                 )?;
                 let published = strong.helper.complete(
                     || {
                         self.require_selected_product_receipt()?;
-                        self.verify_candidate_except_helper()
+                        self.verify_candidate_except_helper()?;
+                        if let Some(maintenance) = &strong.maintenance {
+                            maintenance.verify_observed()?;
+                        }
+                        Ok(())
                     },
                     &mut record_change,
                 )?;
                 changed |= published;
+                if let Some(maintenance) = &strong.maintenance {
+                    changed |= maintenance.complete(
+                        || {
+                            self.require_selected_product_receipt()?;
+                            self.verify_candidate_except_helper()?;
+                            verify_setup_helper(&self.plan.paths, &self.receipt)
+                        },
+                        &mut record_change,
+                    )?;
+                }
             }
             if self.receipt_pending {
                 self.require_selected_product_receipt()?;
@@ -2780,6 +2849,9 @@ impl RetainedCandidateValidation {
             strong.launcher.verify_observed()?;
             strong.assets.verify_observed()?;
             strong.helper.verify_observed()?;
+            if let Some(maintenance) = &strong.maintenance {
+                maintenance.verify_observed()?;
+            }
         }
         Ok(())
     }
@@ -3126,6 +3198,8 @@ fn verify_receipted_installation_components(
             verify_privileged_launcher(&executable, receipt)?;
         }
         if strong == StrongAssetVerification::Complete {
+            #[cfg(target_os = "linux")]
+            maintenance::verify(paths, receipt)?;
             if release_supports_setup_helper(receipt) {
                 verify_setup_helper(paths, receipt)?;
             } else {
@@ -3156,6 +3230,10 @@ pub(crate) fn verify_runtime_installation_at(
 
 pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
     let receipt = read_receipt(&paths.receipt_path())?;
+    #[cfg(target_os = "linux")]
+    if let Some(report) = maintenance::resume_rollback(paths, &receipt)? {
+        return Ok(report);
+    }
     if let Some(report) = resume_interrupted_setup_helper_rollback(paths, &receipt)? {
         return Ok(report);
     }
@@ -3249,10 +3327,54 @@ fn native_setup_exclusion(
     };
     let lease = dev_tools_installation::InstallationLock::try_acquire(&lock)?
         .with_context(|| format!("{operation} requires active workloads and setup to finish"))?;
+    require_strong_maintenance_quiescence(&paths, mode)?;
     if mode == InstallMode::UserOnly {
         require_user_sessions_absent()?;
     }
     Ok((paths, lease))
+}
+
+/// Every native strong exclusive writer calls this after acquiring its stable
+/// setup lock. Synthetic layouts and user-only installations do not acquire a
+/// system execution-domain claim. No environment variable bypasses this fence.
+pub(crate) fn require_strong_maintenance_quiescence(
+    paths: &SetupPaths,
+    mode: InstallMode,
+) -> Result<()> {
+    if mode != InstallMode::Strong || paths != &SetupPaths::strong() {
+        return Ok(());
+    }
+    if !nix::unistd::Uid::effective().is_root() {
+        bail!("strong setup mutation requires the native system owner");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        restoration::require_maintenance_absence()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!("strong setup mutation requires native maintenance cleanup observation")
+    }
+}
+
+/// Test-only observation of the exact native writer boundary. Acquires and drops
+/// the existing runtime exclusion lease; never changes installation state.
+#[cfg(all(target_os = "linux", feature = "native-privilege-fixture"))]
+pub fn native_fixture_probe_strong_writer_admission() -> Result<()> {
+    let lock = crate::setup_transition::lock_path(crate::deployment::DeploymentMode::Strong, None)?;
+    let metadata =
+        fs::symlink_metadata(&lock).context("fixture requires an existing setup lease")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        bail!("fixture setup lease has unsafe custody");
+    }
+    let (_, lease) = native_setup_exclusion(InstallMode::Strong, "fixture writer admission")?;
+    drop(lease);
+    Ok(())
 }
 
 /// Low-level binary receipt rollback. Native callers use `rollback_native`
@@ -3267,6 +3389,10 @@ pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
         "binary-only rollback cannot restore a full setup generation",
     )?;
     let mut receipt = read_receipt(&paths.receipt_path())?;
+    #[cfg(target_os = "linux")]
+    if let Some(report) = maintenance::resume_rollback(paths, &receipt)? {
+        return Ok(report);
+    }
     if let Some(report) = resume_interrupted_setup_helper_rollback(paths, &receipt)? {
         return Ok(report);
     }
@@ -3284,6 +3410,8 @@ pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
             },
         )?;
     }
+    #[cfg(target_os = "linux")]
+    maintenance::reconcile(paths, &receipt, None)?;
     verify_at(paths)?;
     if !receipt.transparent_aliases.is_empty() {
         deactivate_transparent_launchers_at(paths)?;
@@ -3362,6 +3490,14 @@ pub fn rollback_at(paths: &SetupPaths) -> Result<SetupReport> {
             remove_setup_helper(paths, &installed_receipt)?;
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if maintenance::supports_version(&receipt.version) {
+            maintenance::reconcile(paths, &receipt, Some(&installed_receipt))?;
+        } else {
+            maintenance::remove(paths, &installed_receipt)?;
+        }
+    }
     write_receipt(&paths.receipt_path(), &receipt)?;
     verify_at(paths)
 }
@@ -3380,6 +3516,10 @@ fn retained_release(receipt: &InstallReceipt) -> RetainedRelease {
 
 pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
     let mut receipt = read_receipt(&paths.receipt_path())?;
+    #[cfg(target_os = "linux")]
+    if maintenance::resume_rollback(paths, &receipt)?.is_some() {
+        receipt = read_receipt(&paths.receipt_path())?;
+    }
     if resume_interrupted_setup_helper_rollback(paths, &receipt)?.is_some() {
         receipt = read_receipt(&paths.receipt_path())?;
     }
@@ -3398,6 +3538,8 @@ pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
             },
         )?;
     }
+    #[cfg(target_os = "linux")]
+    maintenance::reconcile(paths, &receipt, None)?;
     verify_at(paths)?;
     if !receipt.transparent_aliases.is_empty() {
         deactivate_transparent_launchers_at(paths)?;
@@ -3432,6 +3574,8 @@ pub fn uninstall_at(paths: &SetupPaths) -> Result<UninstallReport> {
         if release_supports_setup_helper(&receipt) {
             remove_setup_helper(paths, &receipt)?;
         }
+        #[cfg(target_os = "linux")]
+        maintenance::remove(paths, &receipt)?;
         remove_privileged_launcher(&executable, &receipt)?;
         remove_linux_system_assets(&receipt)?;
     }

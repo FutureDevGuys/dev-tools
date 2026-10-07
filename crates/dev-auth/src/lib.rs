@@ -40,6 +40,8 @@ pub mod policy_store;
 pub mod policy_v2;
 pub mod policy_v3;
 pub mod policy_v3_operations;
+#[cfg(target_os = "linux")]
+pub mod privilege;
 pub(crate) mod provider_operation;
 #[cfg(unix)]
 pub mod reconcile;
