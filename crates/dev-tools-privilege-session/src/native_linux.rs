@@ -334,7 +334,7 @@ impl ValidatedCgroupBoundary {
             return Err(NativeError::UnsafeCustody);
         }
         let instance = NEXT_DOMAIN_INSTANCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| NativeError::ChildLimit)?;
