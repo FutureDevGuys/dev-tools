@@ -2704,12 +2704,24 @@ enum LogDisplayKind {
     Plain,
     Prompt,
     System,
+    Warning,
+    Error,
 }
 
 impl LogDisplayKind {
     fn badge(self) -> Option<(&'static str, Style)> {
         match self {
             Self::Plain => None,
+            Self::Warning => Some((
+                "WARN",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Self::Error => Some((
+                "ERROR",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
             Self::Prompt => Some((
                 "PROMPT",
                 Style::default()
@@ -2739,6 +2751,13 @@ fn log_display_kind(rec: &LogRecord, prompt: bool) -> LogDisplayKind {
     }
     if rec.stream == LogStream::Meta && !is_report_meta_line(&rec.line) {
         return LogDisplayKind::System;
+    }
+    if matches!(rec.stream, LogStream::Stdout | LogStream::Stderr) {
+        match rec.level {
+            LogLevel::Warn => return LogDisplayKind::Warning,
+            LogLevel::Error => return LogDisplayKind::Error,
+            LogLevel::Trace | LogLevel::Info => {}
+        }
     }
     LogDisplayKind::Plain
 }

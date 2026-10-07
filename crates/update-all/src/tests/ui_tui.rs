@@ -2910,6 +2910,210 @@ fn diagnostic_marker_colors_do_not_highlight_identifier_substrings() {
 }
 
 #[test]
+fn raw_diagnostic_badges_follow_severity_independently_of_stream() {
+    for stream in [LogStream::Stdout, LogStream::Stderr] {
+        for (level, body, badge, color) in [
+            (LogLevel::Warn, "warning: alpha", "WARN", Color::Yellow),
+            (
+                LogLevel::Error,
+                "error: final operation failed",
+                "ERROR",
+                Color::Red,
+            ),
+            (
+                LogLevel::Warn,
+                "No debugging symbols found",
+                "WARN",
+                Color::Yellow,
+            ),
+            (LogLevel::Error, "npm ERR! code EACCES", "ERROR", Color::Red),
+        ] {
+            let rec = LogRecord {
+                ts_unix_ms: 0,
+                task_id: "local/fidelity".into(),
+                level,
+                stream,
+                line: body.into(),
+            };
+            let rendered = render_log_record_line(
+                &rec,
+                false,
+                ReportHighlightState::None,
+                LabeledVersionColorMode::Standalone,
+                false,
+                true,
+            );
+            assert_eq!(rendered.to_string(), format!("00:00:00 [{badge}] {body}"));
+            let cue = rendered
+                .spans
+                .iter()
+                .find(|span| span.content == format!("[{badge}] "))
+                .unwrap();
+            assert_eq!(cue.style.fg, Some(color));
+            assert!(cue.style.add_modifier.contains(Modifier::BOLD));
+            assert_eq!(rec.line, body, "rendering must not rewrite vendor evidence");
+        }
+    }
+}
+
+#[test]
+fn raw_diagnostic_badges_render_in_focused_and_global_logs() {
+    let mut model = Model::new(40, true, true);
+    model.register_task(
+        "local/fidelity".into(),
+        "Fidelity".into(),
+        Vec::new(),
+        false,
+    );
+    for (stream, level, body, _) in [
+        (LogStream::Stdout, LogLevel::Warn, "warning: stdout", "WARN"),
+        (LogStream::Stderr, LogLevel::Warn, "warning: stderr", "WARN"),
+        (LogStream::Stdout, LogLevel::Error, "error: stdout", "ERROR"),
+        (LogStream::Stderr, LogLevel::Error, "error: stderr", "ERROR"),
+    ] {
+        model.push_task_log(LogRecord {
+            ts_unix_ms: 0,
+            task_id: "local/fidelity".into(),
+            level,
+            stream,
+            line: body.into(),
+        });
+    }
+    for lines in [render_focused_task_logs(&model), render_global_logs(&model)] {
+        for (body, badge, color) in [
+            ("warning: stdout", "WARN", Color::Yellow),
+            ("warning: stderr", "WARN", Color::Yellow),
+            ("error: stdout", "ERROR", Color::Red),
+            ("error: stderr", "ERROR", Color::Red),
+        ] {
+            let row = lines
+                .iter()
+                .find(|line| line.to_string().ends_with(body))
+                .unwrap();
+            assert!(row
+                .spans
+                .iter()
+                .any(|span| span.content == format!("[{badge}] ") && span.style.fg == Some(color)));
+        }
+    }
+}
+
+#[test]
+fn raw_diagnostic_badges_leave_neutral_and_report_display_kinds_unchanged() {
+    for stream in [LogStream::Stdout, LogStream::Stderr] {
+        for level in [LogLevel::Trace, LogLevel::Info] {
+            let rec = LogRecord {
+                ts_unix_ms: 0,
+                task_id: "task".into(),
+                level,
+                stream,
+                line: "ordinary vendor progress".into(),
+            };
+            assert_eq!(log_display_kind(&rec, false), LogDisplayKind::Plain);
+        }
+    }
+    for (stream, body, expected) in [
+        (
+            LogStream::Meta,
+            "  [WARN] existing report note",
+            LogDisplayKind::Plain,
+        ),
+        (
+            LogStream::Meta,
+            "runtime controller detail",
+            LogDisplayKind::System,
+        ),
+        (LogStream::Stdin, "user input", LogDisplayKind::Plain),
+    ] {
+        let rec = LogRecord {
+            ts_unix_ms: 0,
+            task_id: "task".into(),
+            level: LogLevel::Warn,
+            stream,
+            line: body.into(),
+        };
+        assert_eq!(log_display_kind(&rec, false), expected);
+    }
+}
+
+#[test]
+fn raw_diagnostic_badges_preserve_prompt_precedence() {
+    for level in [LogLevel::Warn, LogLevel::Error] {
+        let rec = LogRecord {
+            ts_unix_ms: 0,
+            task_id: "task".into(),
+            level,
+            stream: LogStream::Stderr,
+            line: "==> Packages to exclude:".into(),
+        };
+        let rendered = render_log_record_line(
+            &rec,
+            false,
+            ReportHighlightState::None,
+            LabeledVersionColorMode::Standalone,
+            false,
+            true,
+        )
+        .to_string();
+        assert_eq!(rendered.matches("[PROMPT]").count(), 1);
+        assert!(!rendered.contains("[WARN]") && !rendered.contains("[ERROR]"));
+        assert!(rendered.ends_with(&rec.line));
+    }
+}
+
+#[test]
+fn raw_diagnostic_badges_preserve_search_highlighting() {
+    let rec = LogRecord {
+        ts_unix_ms: 0,
+        task_id: "task".into(),
+        level: LogLevel::Warn,
+        stream: LogStream::Stdout,
+        line: "warning: alpha".into(),
+    };
+    let rendered = render_log_record_line(
+        &rec,
+        true,
+        ReportHighlightState::None,
+        LabeledVersionColorMode::Standalone,
+        false,
+        true,
+    );
+    assert_eq!(rendered.to_string(), "00:00:00 [WARN] warning: alpha");
+    assert!(rendered
+        .spans
+        .iter()
+        .all(|span| span.style.fg == Some(Color::LightMagenta)));
+}
+
+#[test]
+fn raw_diagnostic_badge_width_matches_wrapped_rendering() {
+    for level in [LogLevel::Warn, LogLevel::Error] {
+        for include_task in [false, true] {
+            let rec = LogRecord {
+                ts_unix_ms: 0,
+                task_id: "local/fidelity".into(),
+                level,
+                stream: LogStream::Stderr,
+                line: "vendor diagnostic".into(),
+            };
+            let rendered = render_log_record_line(
+                &rec,
+                false,
+                ReportHighlightState::None,
+                LabeledVersionColorMode::Standalone,
+                include_task,
+                true,
+            )
+            .to_string();
+            let width = UnicodeWidthStr::width(rendered.as_str());
+            assert_eq!(log_record_plain_width(&rec, include_task), width);
+            assert_eq!(log_record_row_count(&rec, width, true, include_task), 1);
+            assert_eq!(log_record_row_count(&rec, width - 1, true, include_task), 2);
+        }
+    }
+}
+
+#[test]
 fn global_log_view_shows_truncation_pager_hint() {
     let mut model = Model::new(2, true, true);
     for i in 0..5u64 {

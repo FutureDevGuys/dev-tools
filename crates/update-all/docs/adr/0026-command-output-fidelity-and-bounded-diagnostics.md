@@ -54,6 +54,12 @@ Crossterm remains a required dependency for terminal colors and width discovery 
 - `npm_silent_install_does_not_report_a_broken_executable_as_updated`
 - `does_not_coalesce_diagnostics_or_package_messages_containing_byte_counts`
 - `dashboard_shows_evicted_log_counts_while_following_the_tail`
+- `raw_diagnostic_badges_follow_severity_independently_of_stream`
+- `raw_diagnostic_badges_render_in_focused_and_global_logs`
+- `raw_diagnostic_badges_leave_neutral_and_report_display_kinds_unchanged`
+- `raw_diagnostic_badges_preserve_prompt_precedence`
+- `raw_diagnostic_badges_preserve_search_highlighting`
+- `raw_diagnostic_badge_width_matches_wrapped_rendering`
 - `diagnostic_report_warning_cells_use_warning_colors`
 - `diagnostic_marker_colors_do_not_highlight_identifier_substrings`
 - `task_failure_summary_prefers_a_late_error_over_earlier_warnings`
