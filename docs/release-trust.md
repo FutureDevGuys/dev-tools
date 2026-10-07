@@ -86,3 +86,5 @@ Repeat `--product` to construct more than one product from the same exact source
 Each product uses independent nested tags: `update-all/vX.Y.Z`, `dev-auth/vX.Y.Z`, `dev-cache/vX.Y.Z`, `sync-configs/vX.Y.Z`, and `skills-sync/vX.Y.Z`.
 
 Stable manifests identify versioned artifacts, byte lengths, SHA-256 hashes, and protocol compatibility. A Dev Tools Ed25519 release key signs product manifests; the recovery-only root key authorizes, rotates, or revokes release keys. Persisted generation, version, manifest hash, and binary hash prevent rollback and equivocation. Recovery restores the root credential from the encrypted vault, verifies its public-key checksum against the compiled trust root, authorizes or revokes a release key, and removes the recovered private material from the release workspace immediately afterward.
+
+A manifest-generation rollback diagnostic reports the offered and previously accepted generations and versions. Refusal preserves the retained release state; clearing accepted history is not a repair for stale or incorrectly published metadata.

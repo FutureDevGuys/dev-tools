@@ -888,7 +888,30 @@ fn release_state_rejects_rollback_and_equivocation() {
 
     let mut rollback = verified.clone();
     rollback.manifest_generation -= 1;
-    assert!(accept_verified_release(&mut state, &rollback).is_err());
+    let retained = state.clone();
+    let error = accept_verified_release(&mut state, &rollback)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&format!(
+        "offered generation {}",
+        rollback.manifest_generation
+    )));
+    assert!(error.contains(&format!(
+        "previously accepted generation {}",
+        state.accepted_generation
+    )));
+    assert!(error.contains("retained release state is unchanged"));
+    assert_eq!(state, retained);
+
+    let mut invalid_display = state.clone();
+    invalid_display.accepted_version = Some("1.2.3\nforged diagnostic".into());
+    let before = invalid_display.clone();
+    let error = accept_verified_release(&mut invalid_display, &rollback)
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("forged diagnostic"));
+    assert!(error.contains("unknown or invalid"));
+    assert_eq!(invalid_display, before);
 
     let mut equivocation = verified.clone();
     equivocation.manifest_sha256 = "d".repeat(64);

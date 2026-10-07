@@ -1461,7 +1461,17 @@ pub fn accept_verified_release(
         bail!("release root equivocation detected");
     }
     if verified.manifest_generation < state.accepted_generation {
-        bail!("release manifest generation rollback detected");
+        bail!(
+            "release manifest generation rollback detected: offered generation {} (version {}), previously accepted generation {} (version {}); retained release state is unchanged",
+            verified.manifest_generation,
+            verified.version,
+            state.accepted_generation,
+            state
+                .accepted_version
+                .as_deref()
+                .filter(|value| value.len() <= 128 && Version::parse(value).is_ok())
+                .unwrap_or("unknown or invalid"),
+        );
     }
     if verified.manifest_generation == state.accepted_generation
         && state.accepted_generation != 0
