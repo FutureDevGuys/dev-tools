@@ -325,6 +325,88 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "child fixture invoked only by admission_owner_process_death_releases_setup_exclusion"]
+    fn admission_shared_lease_child() {
+        let lock = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_LOCK").unwrap());
+        let state = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_STATE").unwrap());
+        let ready = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_READY").unwrap());
+        let owner_uid = std::env::var("DEV_AUTH_TEST_SETUP_UID")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let _lease = admit_at(&lock, &state, owner_uid).unwrap();
+        std::fs::write(ready, b"admitted").unwrap();
+        loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn admission_owner_process_death_releases_setup_exclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: temp.path().join("data"),
+            bin_dir: temp.path().join("bin"),
+        };
+        let lock = temp.path().join("setup.lock");
+        let state = state_path(&paths);
+        let ready = temp.path().join("admitted");
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let prior_digest = "c".repeat(64);
+        begin(&paths, uid, &prior_digest, || {
+            Ok(b"accepted prior generation".to_vec())
+        })
+        .unwrap();
+        accept(&paths, uid, &prior_digest).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "setup_transition::tests::admission_shared_lease_child",
+                "--test-threads=1",
+            ])
+            .env("DEV_AUTH_TEST_SETUP_LOCK", &lock)
+            .env("DEV_AUTH_TEST_SETUP_STATE", &state)
+            .env("DEV_AUTH_TEST_SETUP_READY", &ready)
+            .env("DEV_AUTH_TEST_SETUP_UID", uid.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let admitted = loop {
+            if ready.is_file() {
+                break true;
+            }
+            if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let writer_blocked = if admitted {
+            InstallationLock::try_acquire(&lock).map(|lease| lease.is_none())
+        } else {
+            Ok(false)
+        };
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(admitted, "admission owner child did not retain its lease");
+        assert!(writer_blocked.unwrap());
+        let writer = InstallationLock::try_acquire(&lock).unwrap().unwrap();
+        let digest = "d".repeat(64);
+        begin(&paths, uid, &digest, || {
+            Ok(b"retained after coordinator death".to_vec())
+        })
+        .unwrap();
+        assert!(admit_at(&lock, &state, uid).is_err());
+        drop(writer);
+        assert!(admit_at(&lock, &state, uid).is_err());
+        accept(&paths, uid, &digest).unwrap();
+        assert!(admit_at(&lock, &state, uid).is_ok());
+    }
+
+    #[test]
     fn phase_publication_is_digest_bound_idempotent_and_one_way() {
         for initially_accepted in [false, true] {
             let temp = tempfile::tempdir().unwrap();
