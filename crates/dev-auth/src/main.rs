@@ -9,6 +9,8 @@ use zeroize::Zeroize;
 mod completion;
 mod doctor;
 mod execution_result;
+#[cfg(target_os = "linux")]
+mod linux_input;
 mod product_cli;
 mod secret_cli;
 mod secret_execution;
@@ -1945,11 +1947,33 @@ fn run() -> Result<i32> {
             if arguments.next().is_some() {
                 bail!("sign-release-manifest accepts no additional arguments");
             }
-            let mut payload = Vec::new();
-            io::stdin()
-                .take(16 * 1024 + 1)
-                .read_to_end(&mut payload)
-                .context("read release manifest from standard input")?;
+            #[cfg(target_os = "linux")]
+            let payload = match linux_input::read_bounded(
+                &io::stdin(),
+                16 * 1024,
+                std::time::Duration::from_secs(30),
+            ) {
+                Ok(payload) => payload,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    bail!("release manifest exceeds the size limit")
+                }
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    eprintln!("dev-auth: release manifest input timed out");
+                    return Ok(3);
+                }
+                Err(error) => {
+                    return Err(error).context("read release manifest from standard input")
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let payload = {
+                let mut payload = Vec::new();
+                io::stdin()
+                    .take(16 * 1024 + 1)
+                    .read_to_end(&mut payload)
+                    .context("read release manifest from standard input")?;
+                payload
+            };
             if payload.is_empty() {
                 bail!("release manifest must not be empty");
             }

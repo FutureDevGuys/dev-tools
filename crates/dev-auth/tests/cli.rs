@@ -1197,6 +1197,78 @@ fn release_manifest_signing_rejects_an_empty_payload_before_broker_access() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn release_manifest_signing_bounds_input_before_broker_access() {
+    for (input, expected) in [
+        (Vec::new(), "release manifest must not be empty"),
+        (
+            vec![b'x'; 16 * 1024 + 1],
+            "release manifest exceeds the size limit",
+        ),
+    ] {
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&input).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["sign-release-manifest", "--profile", "release"])
+            .env_clear()
+            .stdin(Stdio::from(source))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if child
+            .wait_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_none()
+        {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("bounded release input did not finish");
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn release_manifest_signing_times_out_a_stalled_input_without_broker_access() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .args(["sign-release-manifest", "--profile", "release"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep the writer alive with no bytes or EOF. This exercises the public
+    // deadline without a credential store, broker, or session fixture.
+    let input = child.stdin.take().unwrap();
+    if child
+        .wait_timeout(Duration::from_secs(40))
+        .unwrap()
+        .is_none()
+    {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("release input exceeded its absolute deadline");
+    }
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("release manifest input timed out"),
+        "{stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
 struct NativeUserSandbox {
     _root: TempDir,
     root: PathBuf,
