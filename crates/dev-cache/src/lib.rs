@@ -14,6 +14,7 @@ pub mod provenance;
 pub mod repository;
 pub mod resources;
 pub mod root;
+mod space;
 pub mod util;
 
 use std::ffi::OsString;

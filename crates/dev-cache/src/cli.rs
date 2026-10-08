@@ -24,7 +24,7 @@ use crate::provenance;
 use crate::repository::Repository;
 use crate::resources::{self, NativeTool};
 use crate::root::RootHandle;
-use crate::util::{directory_size, now_unix, write_json_atomic};
+use crate::util::{now_unix, write_json_atomic};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,7 +74,11 @@ enum CommandKind {
         output: Option<PathBuf>,
     },
     /// Show effective routing state for the current worktree.
-    Status,
+    Status {
+        /// Include the exhaustive resource, workspace and maintenance audit.
+        #[arg(long)]
+        full: bool,
+    },
     /// Check configuration, root ownership, PATH activation, and adapter tools.
     Doctor,
     /// Summarize space used by each owned cache class.
@@ -231,6 +235,7 @@ struct StatusReport {
     override_reasons: Vec<String>,
     provenance: Option<serde_json::Value>,
     maintenance: Option<gc::MaintenanceStatus>,
+    maintenance_scope: &'static str,
 }
 
 struct AdapterStatusDetails {
@@ -323,7 +328,10 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
             return Ok(exit_code);
         }
     };
-    let command = cli.command.take().unwrap_or(CommandKind::Status);
+    let command = cli
+        .command
+        .take()
+        .unwrap_or(CommandKind::Status { full: false });
     match command {
         CommandKind::ContainerCache(args) => {
             let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -411,8 +419,8 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
     }
     let (config, config_path) = effective_config(&cli)?;
     match command {
-        CommandKind::Status => {
-            print_value(cli.json, &status_report(&config)?)?;
+        CommandKind::Status { full } => {
+            print_value(cli.json, &status_report(&config, full)?)?;
             Ok(0)
         }
         CommandKind::Doctor => doctor(&config, config_path.as_deref(), cli.json),
@@ -600,7 +608,7 @@ fn observe_root(config: &Config) -> Result<RootHandle> {
     )
 }
 
-fn status_report(config: &Config) -> Result<StatusReport> {
+fn status_report(config: &Config, full: bool) -> Result<StatusReport> {
     let intercept = install::default_intercept_dir();
     if !config.enabled {
         return Ok(StatusReport {
@@ -625,13 +633,26 @@ fn status_report(config: &Config) -> Result<StatusReport> {
             override_reasons: vec!["routing disabled".to_owned()],
             provenance: provenance::process_report(),
             maintenance: None,
+            maintenance_scope: "not_observed",
         });
     }
     let root = observe_root(config)?;
-    let repository = Repository::discover(&env::current_dir()?, &root)?;
-    let details = status_adapter_details(config, &root, repository.as_ref())?;
     let mut activation = install::activation_audit(&intercept);
     let classifications = classify_activation(config, &mut activation);
+    let maintenance = full.then(|| gc::maintenance_status(&root)).transpose()?;
+    status_report_observed(config, &root, &activation, &classifications, maintenance)
+}
+
+fn status_report_observed(
+    config: &Config,
+    root: &RootHandle,
+    activation: &install::ActivationAudit,
+    classifications: &[AdapterActivationClassification],
+    maintenance: Option<gc::MaintenanceStatus>,
+) -> Result<StatusReport> {
+    let intercept = install::default_intercept_dir();
+    let repository = Repository::discover(&env::current_dir()?, root)?;
+    let details = status_adapter_details(config, root, repository.as_ref())?;
     let routed_adapters = enabled_adapter_names(config)
         .into_iter()
         .filter(|name| {
@@ -674,7 +695,12 @@ fn status_report(config: &Config) -> Result<StatusReport> {
         abstentions: details.abstentions,
         override_reasons: details.override_reasons,
         provenance: provenance::process_report(),
-        maintenance: Some(gc::maintenance_status(&root)?),
+        maintenance_scope: if maintenance.is_some() {
+            "full"
+        } else {
+            "not_observed"
+        },
+        maintenance,
     })
 }
 
@@ -844,6 +870,9 @@ fn doctor(config: &Config, config_path: Option<&Path>, json: bool) -> Result<i32
     let config_ok = config.validate().is_ok();
     checks.push(serde_json::json!({"name":"config","ok":config_ok,"path":config_path}));
     let mut maintenance_ok = true;
+    let mut observed_root = None;
+    let mut observed_maintenance = None;
+    let mut root_error = None;
     let (root_check, root_ok) = if config.enabled {
         match observe_root(config) {
             Ok(root) => {
@@ -863,15 +892,18 @@ fn doctor(config: &Config, config_path: Option<&Path>, json: bool) -> Result<i32
                     "ok":maintenance_ok,
                     "status":maintenance,
                 }));
+                let check = serde_json::json!({"name":"root","ok":true,"path":root.root});
+                observed_maintenance = Some(maintenance);
+                observed_root = Some(root);
+                (check, true)
+            }
+            Err(error) => {
+                root_error = Some(format!("{error:#}"));
                 (
-                    serde_json::json!({"name":"root","ok":true,"path":root.root}),
-                    true,
+                    serde_json::json!({"name":"root","ok":false,"error":root_error}),
+                    false,
                 )
             }
-            Err(error) => (
-                serde_json::json!({"name":"root","ok":false,"error":format!("{error:#}")}),
-                false,
-            ),
         }
     } else {
         (
@@ -894,7 +926,22 @@ fn doctor(config: &Config, config_path: Option<&Path>, json: bool) -> Result<i32
         "ok":activation_ok,
         "mandatory_failures":activation.entrypoints.iter().filter(|entry| entry.mandatory && !entry.ok).count(),
     }));
-    let (status, status_ok) = match status_report(config) {
+    let status_result = if let Some(root) = observed_root.as_ref() {
+        status_report_observed(
+            config,
+            root,
+            &activation,
+            &classifications,
+            observed_maintenance,
+        )
+    } else if !config.enabled {
+        status_report(config, false)
+    } else {
+        Err(anyhow::anyhow!(
+            root_error.unwrap_or_else(|| "root observation failed".to_owned())
+        ))
+    };
+    let (status, status_ok) = match status_result {
         Ok(report) => (serde_json::to_value(report).unwrap_or_default(), true),
         Err(error) => (serde_json::json!({"error":format!("{error:#}")}), false),
     };
@@ -1092,17 +1139,49 @@ fn enabled_adapter_names(config: &Config) -> Vec<String> {
 
 fn report(config: &Config, json: bool) -> Result<i32> {
     let root = observe_root(config)?;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = cancelled.clone();
+    ctrlc::set_handler(move || {
+        signal.store(true, std::sync::atomic::Ordering::Release);
+    })
+    .context("install report cancellation handler")?;
+    let free_bytes = fs2::available_space(&root.root).ok();
+    let mut progress = crate::space::Progress::default();
+    let started = std::time::Instant::now();
+    let mut observation = crate::space::observe(&root, &cancelled, |entries| {
+        if progress.due(started.elapsed()) {
+            crate::space::write_progress(&mut std::io::stderr().lock(), entries);
+        }
+    });
+    if free_bytes.is_none() && observation.complete {
+        observation.fail("free-space-unavailable");
+    }
+    let exit_code = if observation.cancelled {
+        130
+    } else if observation.complete {
+        0
+    } else {
+        1
+    };
     let report = serde_json::json!({
         "root": root.root,
         "platform": root.platform,
-        "bytes": directory_size(&root.platform_root),
-        "free_bytes": fs2::available_space(&root.root)?,
-        "repos_bytes": directory_size(&root.repos()),
-        "shared_bytes": directory_size(&root.shared()),
-        "artifacts_bytes": directory_size(&root.artifacts()),
+        "free_bytes": free_bytes,
+        "bytes": observation.bytes,
+        "repos_bytes": observation.repos_bytes,
+        "shared_bytes": observation.shared_bytes,
+        "artifacts_bytes": observation.artifacts_bytes,
+        "other_bytes": observation.other_bytes,
+        "complete": observation.complete,
+        "cancelled": observation.cancelled,
+        "error_kind": observation.error_kind,
+        "entries_observed": observation.entries_observed,
+        "files_observed": observation.files_observed,
+        "links_skipped": observation.links_skipped,
+        "measurement": "live-apparent-bytes",
     });
     print_value(json, &report)?;
-    Ok(0)
+    Ok(exit_code)
 }
 
 fn path_command(

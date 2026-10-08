@@ -110,3 +110,4 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0098](0098-linux-private-authority-filesystem-custody.md) | Linux private-authority filesystem custody | proposed | pending |
 | [0099](0099-explicit-native-container-build-cache.md) | Explicit native container build-cache scope | proposed | pending |
 | [0100](0100-nonblocking-cache-observation-and-setup.md) | Nonblocking cache observation and routed setup | proposed | pending |
+| [0102](0102-dev-cache-scoped-status-and-single-pass-report.md) | Dev Cache scoped status and single-pass space observation | proposed | pending |
