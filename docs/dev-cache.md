@@ -10,6 +10,10 @@ Configuration and state use standard platform `dev-cache` roots. POSIX intercept
 
 Linux runtime acceptance covers Cargo and sccache, Go, npm, pnpm, uv and pip, ccache, Zig, Meson, Bun, and Yarn. Native Windows and WSL support is not claimed until their runtime acceptance harnesses pass.
 
+## Explicit native container build cache
+
+`dev-cache container-cache docker --socket /absolute/path/docker.sock --json` previews Docker Engine build-cache records through a caller-selected Linux Unix socket. Applying native cleanup requires positive local-daemon executable attestation, explicit cache IDs and matching engine ID, native storage root and rootful/rootless expectations. Unverified locality permits preview only, including some Docker-group rootful access. This separate command never routes or traverses engine storage and does not participate in filesystem GC or automatic maintenance. Podman is explicitly unsupported. Native Docker acceptance remains NOT RUN; see the [scope, accounting and disposable acceptance contract](dev-cache-native-cache.md) and [ADR 0099](adr/0099-explicit-native-container-build-cache.md).
+
 ## Automatic root-identity repair
 
 Root preparation retains native filesystem identity separately from a transient Unix device number. After a reboot or device renumbering, matching retained filesystem evidence allows the device observation to refresh automatically without resetting the physical-root ID, runtime domains or cache contents. Linux uses supported native filesystem IDs, macOS uses the volume UUID, and Windows uses its native volume serial; neither a particular mount directory nor a workstation configuration is required. Unknown filesystem contracts retain strict checking rather than guessing that a replacement is the same storage.

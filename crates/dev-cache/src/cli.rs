@@ -95,6 +95,8 @@ enum CommandKind {
     },
     /// Plan or apply lease-safe garbage collection.
     Gc(GcArgs),
+    /// Preview or explicitly prune a narrowly selected local native build cache.
+    ContainerCache(crate::native_cache::NativeCacheArgs),
     /// Manage verified disposable build artifacts.
     Artifacts {
         #[command(subcommand)]
@@ -323,6 +325,17 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
     };
     let command = cli.command.take().unwrap_or(CommandKind::Status);
     match command {
+        CommandKind::ContainerCache(args) => {
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = cancelled.clone();
+            ctrlc::set_handler(move || {
+                signal.store(true, std::sync::atomic::Ordering::Release);
+            })
+            .context("install native-cache cancellation handler")?;
+            let report = crate::native_cache::execute(&args, &cancelled);
+            print_value(cli.json, &report)?;
+            return Ok(report.exit_code);
+        }
         CommandKind::BuildInfo => {
             print_standard_build_info(cli.json)?;
             return Ok(0);
@@ -437,7 +450,9 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
         | CommandKind::Activate { .. }
         | CommandKind::Deactivate { .. }
         | CommandKind::Uninstall { .. } => bail!("internal command dispatch error"),
-        CommandKind::Completion { .. } | CommandKind::BuildInfo => {
+        CommandKind::Completion { .. }
+        | CommandKind::BuildInfo
+        | CommandKind::ContainerCache(_) => {
             bail!("internal command dispatch error")
         }
     }

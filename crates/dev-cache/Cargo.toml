@@ -11,6 +11,7 @@ description = "Route disposable development caches through owned, inspectable in
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-command = { path = "../dev-tools-command" }
 dev-tools-product = { path = "../dev-tools-product" }
@@ -25,6 +26,9 @@ wait-timeout = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
