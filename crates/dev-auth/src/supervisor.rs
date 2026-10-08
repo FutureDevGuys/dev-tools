@@ -1113,16 +1113,13 @@ pub fn run_workload_alias_request(
             }
         }
         crate::broker_protocol::LocalSessionClaim::Present { .. } => {
-            let verified_session = match probe {
-                crate::broker_protocol::BrokerSessionProbe::Verified { session_id, .. } => {
-                    session_id
-                }
-                crate::broker_protocol::BrokerSessionProbe::NoSession
-                | crate::broker_protocol::BrokerSessionProbe::Invalid { .. }
-                | crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
-                    bail!("existing workload admission is invalid or unavailable")
-                }
-            };
+            let caller_uid = nix::unistd::Uid::effective().as_raw();
+            let verified_session = nested_session_for_workload(
+                probe,
+                workload,
+                caller_uid,
+                &resolved.authority_profile,
+            )?;
             match receipt.mode {
                 crate::setup::InstallMode::Strong => {
                     validate_root_owned_launcher(Path::new(&resolved.launcher_path))?
@@ -1133,16 +1130,15 @@ pub fn run_workload_alias_request(
                 )?,
             }
             if record_result {
-                let deadline = match crate::broker_client::request_active(
-                    crate::broker_protocol::BrokerRequest::Probe,
-                )? {
-                    crate::broker_protocol::BrokerResponse::Ready {
-                        session_id,
-                        hard_deadline_boot_ms,
-                        ..
-                    } if session_id == verified_session => hard_deadline_boot_ms,
-                    _ => bail!("nested workload admission changed before execution"),
-                };
+                let deadline = nested_deadline_for_workload(
+                    crate::broker_client::request_active(
+                        crate::broker_protocol::BrokerRequest::Probe,
+                    )?,
+                    &verified_session,
+                    workload,
+                    caller_uid,
+                    &resolved.authority_profile,
+                )?;
                 let mut command = Command::new(&resolved.launcher_path);
                 command.args(arguments);
                 let output = dev_tools_command::run_prepared_inherited_command(command, || {
@@ -1158,6 +1154,65 @@ pub fn run_workload_alias_request(
             let error = Command::new(&resolved.launcher_path).args(arguments).exec();
             Err(error).context("replace nested workload alias with its configured launcher")
         }
+    }
+}
+
+fn nested_session_for_workload(
+    probe: crate::broker_protocol::BrokerSessionProbe,
+    workload: &str,
+    caller_uid: u32,
+    authority_profile: &str,
+) -> Result<String> {
+    match probe {
+        crate::broker_protocol::BrokerSessionProbe::Verified {
+            session_id,
+            owner_uid,
+            execution_uid,
+            workload: admitted,
+            profile,
+        } if owner_uid == caller_uid
+            && execution_uid == caller_uid
+            && admitted == workload
+            && profile == authority_profile =>
+        {
+            Ok(session_id)
+        }
+        crate::broker_protocol::BrokerSessionProbe::Verified { .. } => {
+            bail!("nested workload differs from its admitted session")
+        }
+        crate::broker_protocol::BrokerSessionProbe::NoSession
+        | crate::broker_protocol::BrokerSessionProbe::Invalid { .. }
+        | crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
+            bail!("existing workload admission is invalid or unavailable")
+        }
+    }
+}
+
+fn nested_deadline_for_workload(
+    response: crate::broker_protocol::BrokerResponse,
+    verified_session: &str,
+    workload: &str,
+    caller_uid: u32,
+    authority_profile: &str,
+) -> Result<Option<u64>> {
+    match response {
+        crate::broker_protocol::BrokerResponse::Ready {
+            session_id,
+            owner_uid,
+            execution_uid,
+            workload: admitted_workload,
+            profile,
+            hard_deadline_boot_ms,
+            ..
+        } if session_id == verified_session
+            && owner_uid == caller_uid
+            && execution_uid == caller_uid
+            && admitted_workload == workload
+            && profile == authority_profile =>
+        {
+            Ok(hard_deadline_boot_ms)
+        }
+        _ => bail!("nested workload admission changed before execution"),
     }
 }
 
@@ -2734,6 +2789,105 @@ fn validate_identifier(value: &str, description: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_admission_cannot_switch_to_a_different_workload() {
+        let mut probe = crate::broker_protocol::BrokerSessionProbe::Verified {
+            session_id: "session".into(),
+            owner_uid: 1000,
+            execution_uid: 1000,
+            workload: "automation".into(),
+            profile: "main".into(),
+        };
+        assert_eq!(
+            super::nested_session_for_workload(probe.clone(), "automation", 1000, "main").unwrap(),
+            "session"
+        );
+        assert!(super::nested_session_for_workload(probe.clone(), "other", 1000, "main").is_err());
+        assert!(
+            super::nested_session_for_workload(probe.clone(), "automation", 1001, "main").is_err()
+        );
+        assert!(
+            super::nested_session_for_workload(probe.clone(), "automation", 1000, "other").is_err()
+        );
+        let mut wrong_owner = probe.clone();
+        if let crate::broker_protocol::BrokerSessionProbe::Verified { owner_uid, .. } =
+            &mut wrong_owner
+        {
+            *owner_uid = 1001;
+        }
+        assert!(
+            super::nested_session_for_workload(wrong_owner, "automation", 1000, "main").is_err()
+        );
+        if let crate::broker_protocol::BrokerSessionProbe::Verified { execution_uid, .. } =
+            &mut probe
+        {
+            *execution_uid = 1001;
+        }
+        assert!(super::nested_session_for_workload(probe, "automation", 1000, "main").is_err());
+        for probe in [
+            crate::broker_protocol::BrokerSessionProbe::NoSession,
+            crate::broker_protocol::BrokerSessionProbe::Invalid {
+                reason: "fixture invalid".into(),
+            },
+            crate::broker_protocol::BrokerSessionProbe::Unavailable {
+                reason: "fixture unavailable".into(),
+            },
+        ] {
+            assert!(super::nested_session_for_workload(probe, "automation", 1000, "main").is_err());
+        }
+    }
+
+    #[test]
+    fn nested_final_probe_rechecks_each_admitted_identity() {
+        use crate::broker_protocol::BrokerResponse;
+        let ready = BrokerResponse::Ready {
+            session_id: "session".into(),
+            owner_uid: 1000,
+            execution_uid: 1000,
+            workload: "automation".into(),
+            profile: "main".into(),
+            expires_at: "fixture".into(),
+            hard_deadline_boot_ms: Some(12345),
+        };
+        let check = |response| {
+            super::nested_deadline_for_workload(response, "session", "automation", 1000, "main")
+        };
+        assert_eq!(check(ready.clone()).unwrap(), Some(12345));
+        for field in 0..5 {
+            let mut changed = ready.clone();
+            if let BrokerResponse::Ready {
+                session_id,
+                owner_uid,
+                execution_uid,
+                workload,
+                profile,
+                ..
+            } = &mut changed
+            {
+                match field {
+                    0 => *session_id = "replacement".into(),
+                    1 => *owner_uid = 1001,
+                    2 => *execution_uid = 1001,
+                    3 => *workload = "other".into(),
+                    4 => *profile = "other".into(),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(check(changed).is_err(), "changed identity field {field}");
+        }
+        assert!(check(BrokerResponse::NoSession).is_err());
+        assert!(check(BrokerResponse::Accepted).is_err());
+        let mut unbounded = ready;
+        if let BrokerResponse::Ready {
+            hard_deadline_boot_ms,
+            ..
+        } = &mut unbounded
+        {
+            *hard_deadline_boot_ms = None;
+        }
+        assert_eq!(check(unbounded).unwrap(), None);
+    }
+
     #[test]
     fn only_explicit_enrollment_authority_selects_prompt_free_outer_admission() {
         use super::{outer_admission, OuterAdmission};

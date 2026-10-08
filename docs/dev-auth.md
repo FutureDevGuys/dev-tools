@@ -12,7 +12,7 @@ The same release accepts explicit v3 authority through setup discovery and plann
 
 `dev-auth completion bash|zsh|fish|elvish|powershell` prints static shell code for implemented public commands without loading configuration or credentials, contacting the broker, or editing startup files. Private helper entrypoints and runtime profile names are not suggested. The command remains behind normal frontend identity checks; it is not an alternate entry into setup, workload or credential operations.
 
-For v3 admitted operation commands that take `--profile`, including `sign-release-manifest`, use the admitted workload name. The shared user-profile name only composes configuration; each workload has its own narrowed broker identity under [ADR 0039](adr/0039-dev-auth-versioned-workload-authority.md). `release-admin --signer-profile` passes this same operation-profile argument to Dev Auth.
+For v3 admitted operation commands that take `--profile`, including `sign-release-manifest`, use the admitted workload name. The shared user-profile name only composes configuration; each workload has its own narrowed broker identity under [ADR 0039](adr/0039-dev-auth-versioned-workload-authority.md). `release-admin --signer-profile` passes this same operation-profile argument to Dev Auth. Nested workload aliases may reuse admission only for the same broker-verified native owner, execution UID, workload and authority profile; an alias for another workload must obtain its own admission.
 
 > The v0.3 branch is a standalone transparent workload-identity broker. The detailed v0.2 behavior below remains the rollback contract until Linux strong-mode acceptance and cutover are complete.
 
