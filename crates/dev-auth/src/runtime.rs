@@ -456,26 +456,6 @@ fn validate_linux_program_component(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_program_filesystem_is_local(filesystem_type: u64) -> bool {
-    // Fail closed for known network, host-shared, and userspace-projected filesystems.
-    // Native Linux/WSL filesystems and container overlay filesystems remain admissible.
-    !matches!(
-        filesystem_type,
-        0x0000_6969 // NFS
-            | 0xff53_4d42 // CIFS
-            | 0x0000_517b // SMB
-            | 0x0102_1997 // 9P / WSL host mounts
-            | 0x7375_7245 // CODA
-            | 0x5346_414f // AFS
-            | 0x00c3_6400 // Ceph
-            | 0x0000_564c // NCP
-            | 0x6573_5546 // FUSE
-            | 0x786f_4256 // VirtualBox shared folders
-            | 0xbacb_acbc // VMware shared folders
-    )
-}
-
-#[cfg(target_os = "linux")]
 fn lock_linux_program(path: &Path, description: &str) -> Result<ProgramGuard> {
     use dev_tools_command::HeldComponentKind;
     let identity = LinuxProgramIdentity::current()?;
@@ -494,7 +474,9 @@ fn lock_linux_program(path: &Path, description: &str) -> Result<ProgramGuard> {
         if kind == HeldComponentKind::Executable {
             let filesystem = rustix::fs::fstatfs(descriptor)
                 .context("inspect retained configured program filesystem")?;
-            if !linux_program_filesystem_is_local(filesystem.f_type as u64) {
+            if !crate::linux_platform::authority_filesystem_is_not_host_shared(
+                filesystem.f_type as u64,
+            ) {
                 bail!("configured {description} executable is not on a trusted local filesystem");
             }
         }
@@ -510,9 +492,20 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
 
 #[cfg(not(windows))]
 fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
+    if !path.is_absolute() {
+        bail!("{description} path must be absolute");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY);
+    let directory = options
+        .open(path)
+        .with_context(|| format!("open {description} at {}", path.display()))?;
+    let metadata = directory
+        .metadata()
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.file_type().is_dir() {
         bail!("{description} must be a directory");
     }
     #[cfg(unix)]
@@ -522,6 +515,12 @@ fn validate_private_directory(path: &Path, description: &str) -> Result<()> {
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
         bail!("{description} permissions must not grant group or other access");
+    }
+    #[cfg(target_os = "linux")]
+    if !crate::linux_platform::authority_filesystem_is_not_host_shared(
+        rustix::fs::fstatfs(&directory)?.f_type as u64,
+    ) {
+        bail!("{description} is on a host-shared or remote filesystem");
     }
     Ok(())
 }
@@ -534,6 +533,9 @@ fn private_read(path: &Path, description: &str) -> Result<File> {
 
 #[cfg(not(windows))]
 fn private_read(path: &Path, description: &str) -> Result<File> {
+    if !path.is_absolute() {
+        bail!("{description} path must be absolute");
+    }
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {description} at {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -565,6 +567,12 @@ fn validate_open_private_file(file: &File, description: &str) -> Result<()> {
     {
         bail!("{description} has unsafe type, ownership, links, or permissions");
     }
+    #[cfg(target_os = "linux")]
+    if !crate::linux_platform::authority_filesystem_is_not_host_shared(
+        rustix::fs::fstatfs(file)?.f_type as u64,
+    ) {
+        bail!("{description} is on a host-shared or remote filesystem");
+    }
     Ok(())
 }
 
@@ -576,6 +584,9 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 
 #[cfg(not(windows))]
 fn ensure_private_directory(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("private runtime directory path must be absolute");
+    }
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(false);
@@ -591,20 +602,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
             }
         }
     }
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect private runtime directory {}", path.display()))?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        bail!("private runtime path is not a directory");
-    }
-    #[cfg(unix)]
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
-        bail!("private runtime directory is not owned by the current user");
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o077 != 0 {
-        bail!("private runtime directory grants group or other access");
-    }
-    Ok(())
+    validate_private_directory(path, "private runtime directory")
 }
 
 fn ensure_runtime(paths: &RuntimePaths) -> Result<()> {
@@ -5261,14 +5259,26 @@ exit {exit_code}
         for filesystem_type in [
             0x0000_6969,
             0xff53_4d42,
+            0x0000_517b,
             0x0102_1997,
+            0x7375_7245,
+            0x5346_414f,
+            0x00c3_6400,
+            0x0000_564c,
             0x6573_5546,
             0x786f_4256,
+            0xbacb_acbc,
         ] {
-            assert!(!linux_program_filesystem_is_local(filesystem_type));
+            assert!(
+                !crate::linux_platform::authority_filesystem_is_not_host_shared(filesystem_type)
+            );
         }
-        for filesystem_type in [0x0000_ef53, 0x9123_683e, 0x794c_7630, 0x0102_1994] {
-            assert!(linux_program_filesystem_is_local(filesystem_type));
+        // These retain the executable baseline. An unrecognized magic passes
+        // this negative classifier, but does not establish native qualification.
+        for filesystem_type in [0x0000_ef53, 0x9123_683e, 0x794c_7630, 0x0102_1994, 0] {
+            assert!(
+                crate::linux_platform::authority_filesystem_is_not_host_shared(filesystem_type)
+            );
         }
     }
 
@@ -5938,10 +5948,81 @@ exit {exit_code}
         let metadata = fs::symlink_metadata(&target).unwrap();
         assert!(metadata.file_type().is_dir());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        validate_private_directory(&target, "test runtime directory").unwrap();
+
+        for mode in [0o750, 0o707] {
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(validate_private_directory(&target, "test runtime directory").is_err());
+            assert!(ensure_private_directory(&target).is_err());
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
 
         fs::remove_dir(&target).unwrap();
         std::os::unix::fs::symlink(root.path(), &target).unwrap();
+        assert!(validate_private_directory(&target, "test runtime directory").is_err());
         assert!(ensure_private_directory(&target).is_err());
+
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"not a directory").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_private_directory(&target, "test runtime directory").is_err());
+        assert!(ensure_private_directory(&target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_authority_rejects_existing_relative_paths_before_creation_or_read() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let relative_directory = root.path().strip_prefix(&cwd).unwrap();
+        assert!(validate_private_directory(relative_directory, "test directory").is_err());
+        assert!(ensure_private_directory(relative_directory).is_err());
+
+        let authority = root.path().join("authority");
+        fs::write(&authority, b"synthetic private authority").unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o600)).unwrap();
+        private_read(&authority, "test authority").unwrap();
+        assert!(private_read(authority.strip_prefix(&cwd).unwrap(), "test authority").is_err());
+
+        assert!(ensure_private_directory(&relative_directory.join("uncreated")).is_err());
+        assert!(!root.path().join("uncreated").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_authority_file_retains_owner_only_nofollow_and_single_link_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = root.path().join("authority");
+        fs::write(&authority, b"synthetic private authority").unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o600)).unwrap();
+        let held = private_read(&authority, "test authority").unwrap();
+
+        let symlink = root.path().join("symlink");
+        std::os::unix::fs::symlink(&authority, &symlink).unwrap();
+        assert!(private_read(&symlink, "test authority").is_err());
+        assert!(private_read(root.path(), "test authority").is_err());
+
+        let hard_link = root.path().join("hard-link");
+        fs::hard_link(&authority, &hard_link).unwrap();
+        assert!(private_read(&authority, "test authority").is_err());
+        assert!(validate_open_private_file(&held, "test authority").is_err());
+        fs::remove_file(&hard_link).unwrap();
+
+        // A retained descriptor still refers to the original file after the
+        // pathname is replaced; new opens must validate the replacement.
+        fs::rename(&authority, root.path().join("retained")).unwrap();
+        fs::write(&authority, b"replacement").unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o644)).unwrap();
+        validate_open_private_file(&held, "test authority").unwrap();
+        assert!(private_read(&authority, "test authority").is_err());
+        held.set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+        assert!(validate_open_private_file(&held, "test authority").is_err());
     }
 
     #[test]

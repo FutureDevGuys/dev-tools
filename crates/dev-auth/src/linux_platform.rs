@@ -3,6 +3,26 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+/// Reject recognized remote and host-shared filesystem types for retained
+/// executable or private-document authority. This is not a whitelist of every
+/// local filesystem; unknown types still require native qualification.
+pub(crate) fn authority_filesystem_is_not_host_shared(filesystem_type: u64) -> bool {
+    !matches!(
+        filesystem_type,
+        0x0000_6969 // NFS
+            | 0xff53_4d42 // CIFS
+            | 0x0000_517b // SMB
+            | 0x0102_1997 // 9P / WSL host mounts
+            | 0x7375_7245 // CODA
+            | 0x5346_414f // AFS
+            | 0x00c3_6400 // Ceph
+            | 0x0000_564c // NCP
+            | 0x6573_5546 // FUSE
+            | 0x786f_4256 // VirtualBox shared folders
+            | 0xbacb_acbc // VMware shared folders
+    )
+}
+
 /// Host boot-relative monotonic time, including time spent suspended. Strong
 /// workloads retain the host time namespace; these ticks never cross hosts.
 pub fn boot_time_millis() -> Result<u64> {

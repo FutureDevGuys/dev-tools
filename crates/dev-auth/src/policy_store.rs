@@ -167,6 +167,12 @@ fn read_policy_file(
     if !same_policy_metadata(&metadata, &opened) {
         bail!("{description} changed while being opened");
     }
+    #[cfg(target_os = "linux")]
+    if !crate::linux_platform::authority_filesystem_is_not_host_shared(
+        rustix::fs::fstatfs(&file)?.f_type as u64,
+    ) {
+        bail!("{description} is on a host-shared or remote filesystem");
+    }
     let mut bytes = Vec::with_capacity(opened.len() as usize);
     (&file)
         .take(POLICY_LIMIT + 1)
@@ -204,6 +210,30 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_policy_reader_uses_an_absolute_owner_only_nofollow_file() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let path = root.path().join("policy");
+        fs::write(&path, b"synthetic policy").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        assert_eq!(
+            read_policy_file(&path, uid, 0o077, "test policy").unwrap(),
+            b"synthetic policy"
+        );
+        assert!(
+            read_policy_file(path.strip_prefix(&cwd).unwrap(), uid, 0o077, "test policy").is_err()
+        );
+        assert!(read_policy_file(&path, uid ^ 1, 0o077, "test policy").is_err());
+        let symlink = root.path().join("symlink");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        assert!(read_policy_file(&symlink, uid, 0o077, "test policy").is_err());
+        assert!(read_policy_file(root.path(), uid, 0o077, "test policy").is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_policy_file(&path, uid, 0o077, "test policy").is_err());
+    }
 
     #[test]
     fn policy_metadata_rejects_replacement_and_changed_open_file_authority() {
