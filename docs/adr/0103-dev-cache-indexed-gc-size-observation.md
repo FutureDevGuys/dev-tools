@@ -1,0 +1,33 @@
+---
+authority: canonical
+owner: dev-cache
+---
+
+# ADR 0103: Indexed GC size observation
+
+status: proposed
+verification: pending
+
+## Decision
+
+GC admits candidate metadata using its existing workspace identity, catalog, artifact, age, hazard and active-resource checks, removes nested resource actions already covered by repository actions, and then observes payload sizes. One traversal of the runtime domain supplies both `bytes_before` and the inclusive apparent-file sizes of directory/file-backed candidates. A component-wise ancestor index retains only candidate paths and counters rather than every payload path. Duplicate candidates reuse one measurement; overlapping candidates each retain their inclusive subtree size, preserving the previous per-action accounting. Existing age ordering, pressure selection, action bounds and action kinds remain unchanged.
+
+Artifact actions keep their existing record-size plus companion-metadata accounting; the observation does not replace it with object-file sizes. Workspace identity rehomes keep their zero-byte estimate. Other action estimates use the shared observation. Measured candidate counters and selected-size aggregation use checked arithmetic, and their overflow is an error before collection actions execute. Artifact estimates intentionally retain their existing saturating addition. Metadata admission precedes collection actions; measured sizes are estimates for reporting/pressure selection, never ownership or deletion authority.
+
+A preview therefore has one payload-size traversal, reports zero reclaimed bytes, and does not perform a second end measurement. Applied collection retains a separate post-operation observation for its existing net-size and shortfall reporting. Both measurements use the same private scanner as report. Failed or incomplete observations return an operational error rather than publishing a partial total as success. The post-operation error can occur after actions have changed cache state and says so. Existing recovery of prior trash transactions and stale activity cleanup still occurs at its original place before applied planning; a later observation error does not claim that such recovery was nonmutating.
+
+ADR 0100 remains authoritative for coordination: previews hold shared observation coordination, while applied collection retains exclusive coordination across its entire recovery, current planning and mutation lifecycle. Active-resource exclusions, native cleanup strategies, compound artifact transactions, journals, current-plan recomputation and per-action ownership validation are unchanged. No retained plan becomes mutation permission, no lock is shortened, and no persistent size cache is added.
+
+## Limits and compatibility
+
+The scanner's no-follow traversal, checked totals, explicit depth limit and root-ancestor preflight now also apply to GC size observation. This tightens earlier silently skipped traversal/metadata failures into explicit errors; no on-disk authority or result schema is changed. The index matches component spelling and does not canonicalize filesystem identities. Each candidate root must be visited, or a final no-follow metadata lookup must establish its absence. An existing unmatched candidate (including an alternate spelling on a case-insensitive/casefold filesystem) fails with `unmatched-candidate`; other metadata failures remain errors. Observed empty candidates and proven-absent candidates can measure zero. Missing candidates can therefore measure zero in a live preview if they disappear after admission, and concurrently changing payloads remain non-atomic observations. Automatic spelling reconciliation and native casefold qualification are not claimed. Symlinks/reparse entries are excluded rather than followed; pathname preflights do not provide retained descriptor custody against a same-owner adversary.
+
+One payload-size pass is not one filesystem pass overall. Resource/catalog/identity admission still reads metadata and validates paths. Identity reconciliation retains content-comparison and empty-tree checks; applied reconciliation may revisit catalog records. A configured size cap can still require an earlier automatic-pressure observation. Action limits still bound only actions, and native cleanup can be expensive. Explicit CLI GC emits an initial best-effort planning message and rate-limited size-scan progress on stderr, at most once per second between steps, while successful JSON output remains one stdout document. The scanner supplies these counts during its existing traversal; no extra scan is introduced. Library calls and automatic maintenance remain quiet by default. This adds no signal handler, scan-result sharing, idle-I/O scheduling, or hard interruption/kernel-I/O deadline. Blocking metadata or iterator steps can still delay further progress. WalkDir may buffer directory entries within one iterator step: descriptor use is bounded, but memory and per-step latency are not strictly bounded. Index memory is proportional to candidate paths; this does not bound WalkDir's own buffering.
+
+This supersedes only ADR 0102's remaining limitation concerning repeated GC payload-size measurements. Its diagnostic scope and qualification limits remain unchanged.
+
+## Verification and release boundary
+
+Synthetic tests compare indexed candidate totals to independent subtree reference measurements, assert one visit per traversal entry, cover duplicate/overlapping/exact-file/sibling/absent candidates, reject escaping candidate paths, and inject candidate/selected-total overflow without huge files. Tests preserve artifact and identity-rehome estimates, enforce the existing-unmatched candidate invariant without requiring a casefold filesystem, and prove a depth-limited observation error cannot execute newly planned actions in preview or apply. A synthetic recorded native cleaner removes payload data and creates an overly deep result; the subsequent observation must fail with an explicit post-mutation warning while retaining evidence that cleanup ran. A public synthetic preview test checks progress on stderr, one JSON stdout document and unchanged fixture inventory/content. Existing active-resource, preview nonmutation, lock coordination, ownership rejection, native cleanup, reconciliation and transactional recovery contracts remain required.
+
+These are source gates only. Cold HDD performance, large-cache throughput, native mounted/reparse behavior, actual interruption during device I/O, signed distribution and installed rollback remain separate acceptance gates. No user cache is inspected by this verification.

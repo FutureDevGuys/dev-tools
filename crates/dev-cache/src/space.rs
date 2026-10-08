@@ -1,7 +1,8 @@
 //! Read-only, single-pass apparent-size observation. This is not GC authority.
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -72,6 +73,13 @@ pub(crate) fn write_progress(writer: &mut impl Write, entries: u64) {
     );
 }
 
+pub(crate) fn write_gc_progress(writer: &mut impl Write, entries: u64) {
+    let _ = writeln!(
+        writer,
+        "dev-cache gc: planning and observing cache sizes ({entries} size-scan entries)"
+    );
+}
+
 pub(crate) fn observe(
     root: &RootHandle,
     cancelled: &AtomicBool,
@@ -79,6 +87,95 @@ pub(crate) fn observe(
 ) -> Observation {
     progress(0);
     scan(root, cancelled, |_, entries| progress(entries))
+}
+
+/// Complete apparent-size observations only; none of these paths grants
+/// mutation authority. Index memory is proportional to selected paths.
+#[derive(Debug)]
+pub(crate) struct PathMeasurements {
+    pub total: u64,
+    pub paths: BTreeMap<PathBuf, u64>,
+}
+
+#[cfg(test)]
+fn measure_paths(root: &RootHandle, paths: &[PathBuf]) -> Result<PathMeasurements, &'static str> {
+    measure_paths_with_progress(root, paths, |_| {})
+}
+
+pub(crate) fn measure_paths_with_progress(
+    root: &RootHandle,
+    paths: &[PathBuf],
+    mut progress: impl FnMut(u64),
+) -> Result<PathMeasurements, &'static str> {
+    progress(0);
+    measure_paths_observed(root, paths, |_, entries| progress(entries))
+}
+
+fn measure_paths_observed(
+    root: &RootHandle,
+    paths: &[PathBuf],
+    mut visited: impl FnMut(&Path, u64),
+) -> Result<PathMeasurements, &'static str> {
+    let mut measured = BTreeMap::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(&root.platform_root)
+            .map_err(|_| "unsafe-candidate")?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err("unsafe-candidate");
+        }
+        measured.insert(path.clone(), 0_u64);
+    }
+    let mut unobserved = measured.keys().cloned().collect::<BTreeSet<_>>();
+    let observation = scan_with_files(
+        root,
+        &AtomicBool::new(false),
+        |path, entries| {
+            unobserved.remove(path);
+            visited(path, entries);
+        },
+        |path, bytes| add_file_sizes(&mut measured, path, bytes),
+    );
+    if !observation.complete {
+        return Err(observation.error_kind.unwrap_or("incomplete-observation"));
+    }
+    validate_unobserved_candidates(&unobserved)?;
+    Ok(PathMeasurements {
+        total: observation.bytes.ok_or("incomplete-observation")?,
+        paths: measured,
+    })
+}
+
+fn validate_unobserved_candidates(paths: &BTreeSet<PathBuf>) -> Result<(), &'static str> {
+    for path in paths {
+        // A lexical index is not a filesystem identity oracle: an alternate
+        // spelling can resolve to an existing object on casefold filesystems.
+        // Only actual absence may produce zero without a visited candidate root.
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("candidate-metadata-failed"),
+            Ok(_) => return Err("unmatched-candidate"),
+        }
+    }
+    Ok(())
+}
+
+fn add_file_sizes(
+    measured: &mut BTreeMap<PathBuf, u64>,
+    path: &Path,
+    bytes: u64,
+) -> Result<(), &'static str> {
+    // Component-wise ancestor lookup handles overlapping roots and exact-file
+    // candidates without comparing each file against the entire candidate set.
+    for ancestor in path.ancestors() {
+        if let Some(total) = measured.get_mut(ancestor) {
+            *total = total.checked_add(bytes).ok_or("candidate-size-overflow")?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_root(root: &RootHandle) -> Result<(), &'static str> {
@@ -109,10 +206,15 @@ fn validate_root(root: &RootHandle) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn scan(
+fn scan(root: &RootHandle, cancelled: &AtomicBool, visited: impl FnMut(&Path, u64)) -> Observation {
+    scan_with_files(root, cancelled, visited, |_, _| Ok(()))
+}
+
+fn scan_with_files(
     root: &RootHandle,
     cancelled: &AtomicBool,
     mut visited: impl FnMut(&Path, u64),
+    mut observed_file: impl FnMut(&Path, u64) -> Result<(), &'static str>,
 ) -> Observation {
     let mut result = Observation::default();
     if result.check_cancelled(cancelled) {
@@ -190,6 +292,10 @@ fn scan(
             return result;
         };
         sizes[class] = size;
+        if let Err(kind) = observed_file(entry.path(), metadata.len()) {
+            result.fail(kind);
+            return result;
+        }
         result.files_observed += 1;
     }
     if result.check_cancelled(cancelled) {
@@ -393,11 +499,141 @@ mod tests {
         let mut writer = FailedWriter { attempts: 0 };
         let observation = observe(&root, &AtomicBool::new(false), |entries| {
             write_progress(&mut writer, entries);
+            write_gc_progress(&mut writer, entries);
         });
         assert!(writer.attempts > 0);
         assert!(observation.complete);
         assert_eq!(observation.bytes, Some(0));
         assert_eq!(observation.error_kind, None);
+    }
+
+    #[test]
+    fn indexed_candidates_match_subtree_sizes_with_one_entry_visit() {
+        let (_temp, root) = fixture();
+        for (relative, size) in [
+            ("cache/a/direct", 3),
+            ("cache/a/nested/file", 5),
+            ("cache/ab/sibling", 7),
+            ("workspaces/other", 11),
+        ] {
+            let path = root.platform_root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, vec![0; size]).unwrap();
+        }
+        let paths = vec![
+            root.shared().join("a"),
+            root.shared().join("a/nested"),
+            root.shared().join("a/nested/file"),
+            root.shared().join("ab"),
+            root.shared().join("absent"),
+            root.shared().join("a"),
+        ];
+        let mut visits = BTreeSet::new();
+        let measurement = measure_paths_observed(&root, &paths, |path, _| {
+            assert!(visits.insert(path.to_owned()), "entry measured twice");
+        })
+        .unwrap();
+        assert_eq!(
+            measurement.total,
+            crate::util::directory_size(&root.platform_root)
+        );
+        assert_eq!(measurement.total, 26);
+        assert_eq!(
+            measurement.paths.len(),
+            5,
+            "duplicate candidate is indexed once"
+        );
+        for path in paths {
+            assert_eq!(measurement.paths[&path], crate::util::directory_size(&path));
+        }
+        assert_eq!(measurement.paths[&root.shared().join("a")], 8);
+        assert_eq!(measurement.paths[&root.shared().join("a/nested")], 5);
+        assert_eq!(measurement.paths[&root.shared().join("ab")], 7);
+    }
+
+    #[test]
+    fn unobserved_existing_candidate_can_never_be_reported_as_zero() {
+        let (_temp, root) = fixture();
+        let empty = root.shared().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let file = root.shared().join("file");
+        fs::write(&file, b"payload").unwrap();
+        // Force the invariant's unmatched condition without depending on the
+        // host filesystem's casefold configuration. Native alternate-spelling
+        // acceptance is separate; existing aliases must take this rejection.
+        for path in [&empty, &file] {
+            assert_eq!(
+                validate_unobserved_candidates(&BTreeSet::from([path.clone()])),
+                Err("unmatched-candidate")
+            );
+        }
+        let absent = root.shared().join("absent");
+        assert_eq!(
+            validate_unobserved_candidates(&BTreeSet::from([absent.clone()])),
+            Ok(())
+        );
+        let measurement = measure_paths(&root, &[empty.clone(), absent.clone()]).unwrap();
+        assert_eq!(
+            measurement.paths[&empty], 0,
+            "observed empty directory remains valid"
+        );
+        assert_eq!(
+            measurement.paths[&absent], 0,
+            "proven absent candidate remains valid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unobserved_candidate_metadata_errors_are_not_absence() {
+        let (_temp, root) = fixture();
+        let file = root.shared().join("ordinary-file");
+        fs::write(&file, b"payload").unwrap();
+        assert_eq!(
+            validate_unobserved_candidates(&BTreeSet::from([file.join("child")])),
+            Err("candidate-metadata-failed")
+        );
+    }
+
+    #[test]
+    fn candidate_index_rejects_overflow_without_large_files() {
+        let path = PathBuf::from("cache/a/file");
+        let mut sizes =
+            BTreeMap::from([(PathBuf::from("cache/a"), u64::MAX - 1), (path.clone(), 0)]);
+        assert_eq!(add_file_sizes(&mut sizes, &path, 1), Ok(()));
+        assert_eq!(sizes[Path::new("cache/a")], u64::MAX);
+        assert_eq!(
+            add_file_sizes(&mut sizes, &path, 1),
+            Err("candidate-size-overflow")
+        );
+    }
+
+    #[test]
+    fn invalid_candidate_is_rejected_before_traversal() {
+        let (_temp, root) = fixture();
+        for path in [
+            root.root.join("outside-domain"),
+            root.platform_root.join("../outside"),
+        ] {
+            let result = measure_paths_observed(&root, &[path], |_, _| {
+                panic!("invalid candidate reached traversal");
+            });
+            assert!(matches!(result, Err("unsafe-candidate")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_measurement_error_never_returns_partial_totals() {
+        let (_temp, root) = fixture();
+        let removed = root.shared().join("removed");
+        fs::write(&removed, b"data").unwrap();
+        let result = measure_paths_observed(&root, &[root.shared()], |path, _| {
+            if path == removed {
+                fs::remove_file(path).unwrap();
+            }
+        });
+        assert!(matches!(result, Err("metadata-observation-failed")));
     }
 
     #[test]

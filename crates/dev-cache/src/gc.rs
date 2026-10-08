@@ -135,12 +135,37 @@ pub fn collect(
     overrides: &GcOverrides,
     apply: bool,
 ) -> Result<GcReport> {
+    collect_with_progress(
+        root,
+        policy,
+        artifact_stale_after_days,
+        overrides,
+        apply,
+        |_| {},
+    )
+}
+
+pub(crate) fn collect_with_progress(
+    root: &RootHandle,
+    policy: &GcConfig,
+    artifact_stale_after_days: u64,
+    overrides: &GcOverrides,
+    apply: bool,
+    mut progress: impl FnMut(u64),
+) -> Result<GcReport> {
     let _lease = if apply {
         RootLease::exclusive(root)?
     } else {
         RootLease::shared_read_only(root)?
     };
-    collect_with_lease(root, policy, artifact_stale_after_days, overrides, apply)
+    collect_with_lease(
+        root,
+        policy,
+        artifact_stale_after_days,
+        overrides,
+        apply,
+        &mut progress,
+    )
 }
 
 pub fn collect_if_idle(
@@ -158,7 +183,15 @@ pub fn collect_if_idle(
     let Some(_lease) = lease else {
         return Ok(None);
     };
-    collect_with_lease(root, policy, artifact_stale_after_days, overrides, apply).map(Some)
+    collect_with_lease(
+        root,
+        policy,
+        artifact_stale_after_days,
+        overrides,
+        apply,
+        &mut |_| {},
+    )
+    .map(Some)
 }
 
 fn collect_with_lease(
@@ -167,11 +200,12 @@ fn collect_with_lease(
     artifact_stale_after_days: u64,
     overrides: &GcOverrides,
     apply: bool,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<GcReport> {
+    progress(0);
     if apply {
         recover_trash(root)?;
     }
-    let bytes_before = directory_size(&root.platform_root);
     let free_before = fs2::available_space(&root.root)?;
     let stale_days = overrides
         .stale_after_days
@@ -181,7 +215,6 @@ fn collect_with_lease(
         .target_free_bytes
         .unwrap_or(policy.target_free_bytes);
     let max_bytes = overrides.max_bytes.or(policy.max_bytes);
-    let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
     let now = now_unix();
     let active_resource_ids = if apply {
         active_resource_ids(root)?
@@ -203,6 +236,8 @@ fn collect_with_lease(
     actions.extend(resource_actions);
     abstentions.extend(resource_abstentions);
     remove_nested_actions(&mut actions);
+    let bytes_before = measure_action_sizes(root, &mut actions, progress)?;
+    let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
     actions.sort_by(|left, right| {
         action_age_rank(left)
             .cmp(&action_age_rank(right))
@@ -217,13 +252,17 @@ fn collect_with_lease(
             .unwrap_or(0);
         let needed = needed_for_free.max(needed_for_size);
         let mut selected = 0_u64;
-        actions.retain(|action| {
+        let mut retained = Vec::with_capacity(actions.len());
+        for action in actions {
             if action.reason == "pressure" && selected >= needed {
-                return false;
+                continue;
             }
-            selected = selected.saturating_add(action.bytes);
-            true
-        });
+            selected = selected
+                .checked_add(action.bytes)
+                .context("selected cache bytes overflow")?;
+            retained.push(action);
+        }
+        actions = retained;
     } else {
         actions.retain(|action| action.reason != "pressure");
     }
@@ -232,7 +271,7 @@ fn collect_with_lease(
         work_remaining = actions.len() > limit;
         actions.truncate(limit);
     }
-    let bytes_selected = actions.iter().map(|action| action.bytes).sum();
+    let bytes_selected = selected_bytes(&actions)?;
     let mut failures = Vec::new();
     if apply {
         for action in &actions {
@@ -250,7 +289,10 @@ fn collect_with_lease(
     // A preview never reclaims bytes. Reuse its initial observation rather than
     // scanning the whole domain again or attributing concurrent work to GC.
     let bytes_after = if apply {
-        directory_size(&root.platform_root)
+        crate::space::measure_paths_with_progress(root, &[], progress)
+            .map_err(anyhow::Error::msg)
+            .context("observe cache size after applied collection; actions may already have changed cache state")?
+            .total
     } else {
         bytes_before
     };
@@ -284,6 +326,41 @@ fn collect_with_lease(
         failures,
         trash_backlog,
     })
+}
+
+fn measured_action(action: &GcAction) -> bool {
+    // Artifact objects retain record/companion accounting; identity rehomes
+    // retain their zero-byte estimate. These are not directory-size candidates.
+    !matches!(action.kind.as_str(), "artifact" | "repository-identity")
+}
+
+fn measure_action_sizes(
+    root: &RootHandle,
+    actions: &mut [GcAction],
+    progress: &mut dyn FnMut(u64),
+) -> Result<u64> {
+    let paths = actions
+        .iter()
+        .filter(|action| measured_action(action))
+        .map(|action| action.path.clone())
+        .collect::<Vec<_>>();
+    let measurement = crate::space::measure_paths_with_progress(root, &paths, progress)
+        .map_err(anyhow::Error::msg)
+        .context("observe cache sizes before collection actions")?;
+    for action in actions.iter_mut().filter(|action| measured_action(action)) {
+        action.bytes = *measurement
+            .paths
+            .get(&action.path)
+            .context("missing admitted cache size observation")?;
+    }
+    Ok(measurement.total)
+}
+
+fn selected_bytes(actions: &[GcAction]) -> Result<u64> {
+    actions
+        .iter()
+        .try_fold(0_u64, |total, action| total.checked_add(action.bytes))
+        .context("selected cache bytes overflow")
 }
 
 fn resource_actions(
@@ -367,7 +444,7 @@ fn resource_actions(
             path: path.clone(),
             destination: None,
             companion_paths: Vec::new(),
-            bytes: directory_size(&path),
+            bytes: 0, // Filled from the shared domain observation after metadata admission.
             reason: reason.to_owned(),
             strategy: format!("{:?}", record.cleanup).to_lowercase(),
             resource_id: Some(record.resource_id.clone()),
@@ -463,7 +540,7 @@ fn repository_actions(
                             path: entry.path(),
                             destination: None,
                             companion_paths: Vec::new(),
-                            bytes: directory_size(&entry.path()),
+                            bytes: 0, // Filled from the shared domain observation.
                             reason: "duplicate-identity-record".to_owned(),
                             strategy: "owneddirectory".to_owned(),
                             resource_id: None,
@@ -502,7 +579,7 @@ fn repository_actions(
                     path: entry.path(),
                     destination: None,
                     companion_paths: Vec::new(),
-                    bytes: directory_size(&entry.path()),
+                    bytes: 0, // Filled from the shared domain observation.
                     reason: if orphan { "orphan" } else { "stale" }.to_owned(),
                     strategy: "owneddirectory".to_owned(),
                     resource_id: None,
@@ -1327,6 +1404,47 @@ mod planning_tests {
         actions.retain(|action| {
             action.kind == "repository" || !roots.iter().any(|root| action.path.starts_with(root))
         });
+    }
+
+    #[test]
+    fn shared_measurement_preserves_artifact_and_reconciliation_estimates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
+        let cache = root.shared().join("candidate");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("payload"), b"cache bytes").unwrap();
+        let artifact = root.artifacts().join("artifact");
+        fs::write(&artifact, b"object").unwrap();
+        let repository = root.repos().join("identity");
+        fs::create_dir(&repository).unwrap();
+        fs::write(repository.join("identity.json"), b"identity").unwrap();
+        let mut actions = vec![
+            action("resource", &cache, 0),
+            action("artifact", &artifact, 123),
+            action("repository-identity", &repository, 0),
+            action("repository-identity-duplicate", &repository, 0),
+        ];
+        let total = measure_action_sizes(&root, &mut actions, &mut |_| {}).unwrap();
+        assert_eq!(total, directory_size(&root.platform_root));
+        assert_eq!(actions[0].bytes, 11);
+        assert_eq!(
+            actions[1].bytes, 123,
+            "artifact record/companion estimate changed"
+        );
+        assert_eq!(
+            actions[2].bytes, 0,
+            "rehome must retain its zero-byte estimate"
+        );
+        assert_eq!(actions[3].bytes, 8);
+    }
+
+    #[test]
+    fn selected_action_size_overflow_is_an_error_before_mutation() {
+        let mut actions = vec![action("artifact", "one", 0), action("resource", "two", 1)];
+        actions[0].bytes = u64::MAX;
+        assert!(selected_bytes(&actions).is_err());
+        actions[0].bytes -= 1;
+        assert_eq!(selected_bytes(&actions).unwrap(), u64::MAX);
     }
 
     #[test]

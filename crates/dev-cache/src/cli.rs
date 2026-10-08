@@ -1397,12 +1397,19 @@ fn gc_command(config: &Config, args: GcArgs, json: bool) -> Result<i32> {
         stale_after_days: args.stale_after_days,
         max_actions: None,
     };
-    let report = gc::collect(
+    let started = std::time::Instant::now();
+    let mut progress = crate::space::Progress::default();
+    let report = gc::collect_with_progress(
         &root,
         &config.gc,
         config.artifacts.stale_after_days,
         &overrides,
         args.apply,
+        |entries| {
+            if progress.due(started.elapsed()) {
+                crate::space::write_gc_progress(&mut std::io::stderr().lock(), entries);
+            }
+        },
     )?;
     let complete = report.complete;
     print_value(json, &report)?;
