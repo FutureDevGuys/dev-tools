@@ -596,16 +596,31 @@ fn artifact_actions(
 }
 
 fn remove_nested_actions(actions: &mut Vec<GcAction>) {
+    // A large plan must not compare every resource against every workspace.
+    // Use path-depth ancestor checks with logarithmic root lookups instead of
+    // scanning every repository for every action.
     let repository_roots = actions
         .iter()
         .filter(|action| action.kind == "repository")
         .map(|action| action.path.clone())
-        .collect::<Vec<_>>();
+        .collect::<std::collections::BTreeSet<_>>();
+    let covers_all_paths = repository_roots.contains(Path::new(""));
     actions.retain(|action| {
+        // Ancestors stop at a rooted Windows prefix (for example C:\), whereas
+        // starts_with also accepts its prefix-only form (C:).
+        let prefix_is_root = match action.path.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => {
+                repository_roots.contains(Path::new(prefix.as_os_str()))
+            }
+            _ => false,
+        };
         action.kind == "repository"
-            || !repository_roots
-                .iter()
-                .any(|repository| action.path.starts_with(repository))
+            || (!covers_all_paths
+                && !prefix_is_root
+                && !action
+                    .path
+                    .ancestors()
+                    .any(|ancestor| repository_roots.contains(ancestor)))
     });
 }
 
@@ -1272,5 +1287,165 @@ fn action_age_rank(action: &GcAction) -> u8 {
         "orphan" => 2,
         "stale" => 3,
         _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::*;
+
+    fn action(kind: &str, path: impl Into<PathBuf>, id: usize) -> GcAction {
+        GcAction {
+            kind: kind.to_owned(),
+            path: path.into(),
+            destination: Some(PathBuf::from(format!("destination/{id}"))),
+            companion_paths: vec![PathBuf::from(format!("companion/{id}"))],
+            bytes: id as u64,
+            reason: "stale".to_owned(),
+            strategy: "owneddirectory".to_owned(),
+            resource_id: Some(id.to_string()),
+            last_used_unix: id as u64,
+        }
+    }
+
+    fn reference_filter(actions: &mut Vec<GcAction>) {
+        let roots = actions
+            .iter()
+            .filter(|action| action.kind == "repository")
+            .map(|action| action.path.clone())
+            .collect::<Vec<_>>();
+        actions.retain(|action| {
+            action.kind == "repository" || !roots.iter().any(|root| action.path.starts_with(root))
+        });
+    }
+
+    #[test]
+    fn indexed_nested_actions_match_component_wise_reference() {
+        let paths = [
+            "cache/repos/a",
+            "cache/repos/a/",
+            "cache/repos/a/temp/cache",
+            "cache/repos/ab/temp/cache",
+            "cache/repos/a/./temp/cache",
+            "cache/repos/a/../b/cache",
+            "cache/repos/b",
+            "cache/shared/cache",
+            "cache/repos",
+            ".",
+            "",
+        ];
+        // Exercise parent/child roots, duplicates, exact matches, sibling name
+        // prefixes, component normalization, and original action ordering.
+        for mask in 0_u32..(1 << paths.len()) {
+            let mut actions = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    action(
+                        if mask & (1 << index) == 0 {
+                            "resource"
+                        } else {
+                            "repository"
+                        },
+                        path,
+                        index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut expected = actions.clone();
+            reference_filter(&mut expected);
+            remove_nested_actions(&mut actions);
+            assert_eq!(
+                serde_json::to_value(&actions).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "repository mask {mask}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_nested_plan_preserves_roots_and_unrelated_actions() {
+        let count = 12_000;
+        let mut actions = Vec::with_capacity(count * 3);
+        for index in 0..count {
+            let root = PathBuf::from("cache/repos").join(format!("{index:08}"));
+            actions.push(action("repository", &root, index * 3));
+            actions.push(action("resource", root.join("temp/cache"), index * 3 + 1));
+            actions.push(action(
+                "artifact",
+                PathBuf::from("cache/shared").join(format!("{index:08}")),
+                index * 3 + 2,
+            ));
+        }
+        remove_nested_actions(&mut actions);
+        assert_eq!(actions.len(), count * 2);
+        for (index, pair) in actions.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(pair[0].kind, "repository");
+            assert_eq!(pair[0].bytes, (index * 3) as u64);
+            assert_eq!(pair[1].kind, "artifact");
+            assert_eq!(pair[1].bytes, (index * 3 + 2) as u64);
+        }
+    }
+
+    #[test]
+    fn indexed_nested_actions_match_absolute_path_reference() {
+        let paths = [
+            "/cache/repos/a",
+            "/cache/repos/a/temp/cache",
+            "/cache/repos/ab/temp/cache",
+            "/cache/repos/a/./temp/cache",
+            "/cache/shared/cache",
+            "/cache/repos/a/../b/cache",
+            "/",
+            "",
+        ];
+        for mask in 0_u32..(1 << paths.len()) {
+            let mut actions = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    action(
+                        if mask & (1 << index) == 0 {
+                            "resource"
+                        } else {
+                            "repository"
+                        },
+                        path,
+                        index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut expected = actions.clone();
+            reference_filter(&mut expected);
+            remove_nested_actions(&mut actions);
+            assert_eq!(
+                serde_json::to_value(&actions).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "absolute repository mask {mask}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn indexed_nested_actions_match_windows_prefix_reference() {
+        for root in [r"C:", r"C:\", r"\\server\share", r"\\?\C:\"] {
+            let mut actions = vec![
+                action("repository", root, 0),
+                action("resource", r"C:\cache\item", 1),
+                action("resource", r"C:cache\item", 2),
+                action("resource", r"\\server\share\cache\item", 3),
+                action("resource", r"\\?\C:\cache\item", 4),
+                action("resource", r"D:\cache\item", 5),
+            ];
+            let mut expected = actions.clone();
+            reference_filter(&mut expected);
+            remove_nested_actions(&mut actions);
+            assert_eq!(
+                serde_json::to_value(&actions).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "Windows repository root {root}"
+            );
+        }
     }
 }
