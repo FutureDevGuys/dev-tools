@@ -105,3 +105,5 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0088](0088-consumed-inherited-command-supervision.md) | Consumed inherited-command supervision | proposed | pending |
 
 | [0096](0096-producer-neutral-native-receipt-qualification.md) | Producer-neutral native receipt qualification | proposed | pending |
+
+| [0097](0097-versioned-config-only-reconciliation.md) | Versioned config-only reconciliation | proposed | pending |

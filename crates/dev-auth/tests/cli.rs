@@ -1811,6 +1811,327 @@ config = "{}"
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn installed_user_reconcile_preserves_versioned_authority_and_config_only_scope() {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name == "dev-auth-test" {
+        run_installed_user_reconcile_child();
+        return;
+    }
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("product");
+    sandbox.install_binary(&product);
+    assert!(Command::new("/usr/bin/strip")
+        .arg("--strip-debug")
+        .arg(&product)
+        .status()
+        .unwrap()
+        .success());
+    let current = std::env::current_exe().unwrap();
+    let output = bounded_output_with_timeout(
+        sandbox.command(&current, &sandbox.home).args([
+            "--exact",
+            "installed_user_reconcile_preserves_versioned_authority_and_config_only_scope",
+            "--nocapture",
+            "--test-threads=1",
+        ]),
+        Duration::from_secs(120),
+        "versioned user configuration reconciliation",
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn run_installed_user_reconcile_child() {
+    use dev_auth::reconcile::UserConfigReconcilePlan;
+    use dev_auth::setup::{install_at, InstallMode, InstallRequest, SetupPaths};
+    use sha2::{Digest, Sha256};
+
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let root = user.dir.join("reconcile-fixture");
+    fs::create_dir(&root).unwrap();
+    let paths = SetupPaths::user_only(&user.dir);
+    let native = root.join("native-tool");
+    let native_gh = root.join("native-gh");
+    let native_op = root.join("native-op");
+    let native_ssh = root.join("native-ssh");
+    let native_keygen = root.join("native-keygen");
+    let native_worker = root.join("native-worker");
+    let called = root.join("must-not-run-native-programs");
+    fs::write(
+        &native,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\nexit 91\n",
+            called.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&native, fs::Permissions::from_mode(0o700)).unwrap();
+    for path in [
+        &native_gh,
+        &native_op,
+        &native_ssh,
+        &native_keygen,
+        &native_worker,
+    ] {
+        fs::copy(&native, path).unwrap();
+    }
+    install_at(
+        &paths,
+        &InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.4.0".into(),
+            source_executable: user.dir.parent().unwrap().join("product"),
+            native_git: native.clone(),
+            native_gh: native_gh.clone(),
+            activate_transparent_launchers: false,
+        },
+    )
+    .unwrap();
+    let installed = paths.bin_dir.join("dev-auth");
+    let config_root = user.dir.join(".config/dev-auth");
+    fs::create_dir_all(&config_root).unwrap();
+    let private_write = |path: &Path, bytes: &[u8]| {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    let run = |arguments: &[&str]| {
+        bounded_output(
+            Command::new(&installed)
+                .args(arguments)
+                .env_clear()
+                .current_dir(&root),
+        )
+    };
+    let report = |output: Output| -> serde_json::Value {
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let unowned_launcher = paths.bin_dir.join("worker");
+    private_write(
+        &unowned_launcher,
+        b"unowned launcher; not a product integration\n",
+    );
+    let policy_v3 = dev_auth::setup::setup_template("user-only-policy-v3")
+        .unwrap()
+        .replace("[\"automation\"]", &format!("[\"{}\"]", user.name))
+        .replace("/usr/bin/git", native.to_str().unwrap())
+        .replace("/usr/bin/gh", native_gh.to_str().unwrap())
+        .replace("/usr/bin/ssh-keygen", native_keygen.to_str().unwrap())
+        .replace("/usr/bin/ssh", native_ssh.to_str().unwrap())
+        .replace("/usr/bin/op", native_op.to_str().unwrap())
+        .replace(
+            "/usr/local/libexec/automation-worker",
+            native_worker.to_str().unwrap(),
+        );
+    for version in [2, 3] {
+        let policy_path = config_root.join(format!("policy-v{version}.toml"));
+        let destination = config_root.join(format!("config-v{version}.toml"));
+        let policy = if version == 2 {
+            format!(
+                "version = 2\nmode = 'user_only'\nallowed_users = ['{}']\n[programs]\nop = '{op}'\ngit = '{native}'\ngh = '{gh}'\nssh = '{ssh}'\nssh_keygen = '{keygen}'\n[trusted_launchers]\n[github_apps]\n[credential_slots]\n[authority_caps]\n[workspace_caps]\n",
+                user.name,
+                native = native.display(),
+                op = native_op.display(),
+                gh = native_gh.display(),
+                ssh = native_ssh.display(),
+                keygen = native_keygen.display(),
+            )
+        } else {
+            policy_v3.clone()
+        };
+        let original = if version == 2 {
+            "version = 2\n".to_owned()
+        } else {
+            dev_auth::setup::setup_template("user-config-v3")
+                .unwrap()
+                .to_owned()
+        };
+        dev_auth::runtime_policy::parse_runtime_administrator(policy.as_bytes())
+            .unwrap()
+            .resolve_user(&user.name, original.as_bytes())
+            .unwrap();
+        private_write(&policy_path, policy.as_bytes());
+        private_write(&destination, original.as_bytes());
+        let source = root.join(format!("desired-v{version}.toml"));
+        let desired = format!("{original}\n# desired document revision\n");
+        private_write(&source, desired.as_bytes());
+        let plan_path = root.join(format!("plan-v{version}.json"));
+        let planning = || {
+            run(&[
+                "reconcile",
+                "plan",
+                "--source",
+                source.to_str().unwrap(),
+                "--output",
+                plan_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+        };
+        let first = report(planning());
+        assert_eq!(first["changed"], true, "{first}");
+        let plan: UserConfigReconcilePlan =
+            serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+        assert_eq!(plan.policy, policy_path);
+        assert_eq!(plan.destination, destination);
+        let (_, digest) = dev_auth::reconcile::render_plan(&plan).unwrap();
+        let apply = |digest: &str| {
+            run(&[
+                "reconcile",
+                "apply",
+                "--plan",
+                plan_path.to_str().unwrap(),
+                "--sha256",
+                digest,
+                "--format",
+                "json",
+            ])
+        };
+        for changed_input in [&source, &policy_path] {
+            let before = fs::read(changed_input).unwrap();
+            let mut changed = before.clone();
+            changed.extend_from_slice(b"\n# concurrent change\n");
+            private_write(changed_input, &changed);
+            assert!(!apply(&digest).status.success());
+            assert_eq!(fs::read(&destination).unwrap(), original.as_bytes());
+            private_write(changed_input, &before);
+        }
+        if version == 2 {
+            // A newly present v3 policy is authoritative even though all of
+            // the approved v2 document identities are still unchanged.
+            let next_policy = config_root.join("policy-v3.toml");
+            let next_destination = config_root.join("config-v3.toml");
+            let next_config = dev_auth::setup::setup_template("user-config-v3").unwrap();
+            dev_auth::runtime_policy::parse_runtime_administrator(policy_v3.as_bytes())
+                .unwrap()
+                .resolve_user(&user.name, next_config.as_bytes())
+                .unwrap();
+            private_write(&next_policy, policy_v3.as_bytes());
+            private_write(&next_destination, next_config.as_bytes());
+            assert!(!apply(&digest).status.success());
+            assert_eq!(fs::read(&source).unwrap(), desired.as_bytes());
+            assert_eq!(fs::read(&policy_path).unwrap(), policy.as_bytes());
+            assert_eq!(fs::read(&destination).unwrap(), original.as_bytes());
+            assert_eq!(fs::read(&next_policy).unwrap(), policy_v3.as_bytes());
+            assert_eq!(fs::read(&next_destination).unwrap(), next_config.as_bytes());
+            assert!(!called.exists());
+            fs::remove_file(&next_policy).unwrap();
+            fs::remove_file(&next_destination).unwrap();
+        }
+        let lock_path = PathBuf::from(format!(
+            "/run/user/{}/dev-auth-setup-v3.lock",
+            user.uid.as_raw()
+        ));
+        let lease = dev_tools_installation::InstallationLock::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        assert!(!apply(&digest).status.success());
+        assert_eq!(fs::read(&destination).unwrap(), original.as_bytes());
+        drop(lease);
+        let transition = paths.data_root.join("setup-transition-v1.json");
+        private_write(
+            &transition,
+            b"retained full setup state is outside this operation\n",
+        );
+        let retained = apply(&digest);
+        assert!(!retained.status.success());
+        assert!(String::from_utf8_lossy(&retained.stderr)
+            .contains("full setup generation requires transaction-aware maintenance"));
+        assert_eq!(fs::read(&destination).unwrap(), original.as_bytes());
+        fs::remove_file(&transition).unwrap();
+        if version == 3 {
+            let legacy_destination = config_root.join("config-v2.toml");
+            let legacy_bytes = fs::read(&legacy_destination).unwrap();
+            let mut retargeted = plan.clone();
+            retargeted.destination = legacy_destination;
+            retargeted.current_state = Some(dev_auth::reconcile::FileState {
+                length: legacy_bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&legacy_bytes)),
+            });
+            let (bytes, wrong_digest) = dev_auth::reconcile::render_plan(&retargeted).unwrap();
+            private_write(&plan_path, &bytes);
+            assert!(!apply(&wrong_digest).status.success());
+            assert_eq!(fs::read(&destination).unwrap(), original.as_bytes());
+            assert_eq!(fs::read(retargeted.destination).unwrap(), legacy_bytes);
+            private_write(
+                &plan_path,
+                &dev_auth::reconcile::render_plan(&plan).unwrap().0,
+            );
+        }
+        let applied = report(apply(&digest));
+        assert_eq!(applied["changed"], true, "{applied}");
+        assert_eq!(applied["verified"], true, "{applied}");
+        assert_eq!(fs::read(&destination).unwrap(), desired.as_bytes());
+        let verified = report(run(&[
+            "reconcile",
+            "verify",
+            "--source",
+            source.to_str().unwrap(),
+            "--format",
+            "json",
+        ]));
+        assert_eq!(verified["verified"], true, "{verified}");
+        assert_eq!(verified["changed"], false, "{verified}");
+        let repeated = report(planning());
+        assert_eq!(repeated["changed"], false, "{repeated}");
+        let repeat_plan: UserConfigReconcilePlan =
+            serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+        // A verified no-op does not enter configuration maintenance, even
+        // when the full setup generation is retained or a writer owns its lock.
+        private_write(
+            &transition,
+            b"retained full setup state is outside this operation\n",
+        );
+        let lease = dev_tools_installation::InstallationLock::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let repeated = report(apply(
+            &dev_auth::reconcile::render_plan(&repeat_plan).unwrap().1,
+        ));
+        assert_eq!(repeated["changed"], false, "{repeated}");
+        drop(lease);
+        fs::remove_file(&transition).unwrap();
+        assert_eq!(fs::read(&policy_path).unwrap(), policy.as_bytes());
+        assert!(!called.exists());
+        assert_eq!(
+            fs::read(&unowned_launcher).unwrap(),
+            b"unowned launcher; not a product integration\n"
+        );
+        assert!(!paths.data_root.join("workload-aliases-v1.json").exists());
+        if version == 3 {
+            private_write(&source, b"version = 2\n");
+            assert!(!planning().status.success());
+            private_write(&policy_path, b"schema = 'invalid-v3-authority'\n");
+            assert!(!planning().status.success());
+            private_write(&policy_path, policy.as_bytes());
+            private_write(
+                &source,
+                format!("private_marker = 'do-not-echo'\n{desired}").as_bytes(),
+            );
+            let invalid = planning();
+            assert!(!invalid.status.success());
+            assert!(!String::from_utf8_lossy(&invalid.stderr).contains("do-not-echo"));
+            assert_eq!(fs::read(&destination).unwrap(), desired.as_bytes());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SetupRecoveryFixture {
     PriorInstallation,

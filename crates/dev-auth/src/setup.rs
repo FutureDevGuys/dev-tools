@@ -3296,7 +3296,9 @@ fn with_native_setup_exclusion<T>(
     apply(&paths)
 }
 
-fn configuration_exclusion(mode: InstallMode) -> Result<dev_tools_installation::InstallationLock> {
+pub(crate) fn configuration_exclusion(
+    mode: InstallMode,
+) -> Result<dev_tools_installation::InstallationLock> {
     let (paths, lease) = native_setup_exclusion(mode, "configuration maintenance")?;
     require_legacy_maintenance_state(&paths)?;
     Ok(lease)
