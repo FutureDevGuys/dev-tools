@@ -1255,7 +1255,15 @@ impl NativeUserSandbox {
             .args(["--ro-bind", "/usr", "/usr"])
             .args(["--symlink", "usr/bin", "/bin"])
             .args(["--symlink", "usr/lib", "/lib"])
-            .args(["--symlink", "usr/lib", "/lib64"])
+            .args([
+                "--symlink",
+                if Path::new("/usr/lib64").is_dir() {
+                    "usr/lib64"
+                } else {
+                    "usr/lib"
+                },
+                "/lib64",
+            ])
             .args(["--dev", "/dev"])
             .args(["--proc", "/proc"])
             .args(["--dir", "/etc"])
@@ -4791,4 +4799,286 @@ fn arbitrary_candidate_filename_preserves_explicit_core_and_helper_dispatch() {
         assert_eq!(output.stdout, baseline.stdout);
         assert_eq!(output.stderr, baseline.stderr);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_installed_launcher_identity(bin: &Path, cwd: &Path) {
+    use std::ffi::OsStr;
+    use std::os::unix::process::CommandExt;
+
+    // Resolve the receipted alias through the installed executable itself.
+    // Noninteractive admission must refuse before launching the workload.
+    let result = cwd.join("approval-required.json");
+    let approval = bounded_output(
+        Command::new(bin.join("dev-auth"))
+            .env_clear()
+            .args([
+                "workload",
+                "launch",
+                "generic-worker",
+                "--non-interactive",
+                "--result-file",
+            ])
+            .arg(&result)
+            .arg("--"),
+    );
+    assert_eq!(approval.status.code(), Some(3), "{approval:?}");
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(result["outcome"], "approval_required");
+    assert_eq!(result["started"], false);
+    for frontend in ["git", "gh"] {
+        let alias = bin.join(frontend);
+        let baseline = bounded_output(
+            Command::new(&alias)
+                .env_clear()
+                .current_dir(cwd)
+                .arg("--version"),
+        );
+        assert_eq!(baseline.status.code(), Some(91));
+        assert_eq!(baseline.stdout, format!("native-{frontend}\n").as_bytes());
+        assert!(baseline.stderr.is_empty());
+        for identity in [
+            "Example.AppImage",
+            "foreign-launcher",
+            "generic-worker",
+            "git",
+            "gh",
+            "dev-auth",
+            "dev-auth-provider-exec",
+            "dev-auth-setup-helper",
+        ] {
+            let check = |output: Output| {
+                assert_eq!(output.status.code(), baseline.status.code(), "{output:?}");
+                assert_eq!(output.stdout, baseline.stdout, "{output:?}");
+                assert_eq!(output.stderr, baseline.stderr, "{output:?}");
+            };
+            // An environment value alone never selects a route.
+            check(bounded_output(
+                Command::new(&alias)
+                    .env_clear()
+                    .env("ARGV0", identity)
+                    .current_dir(cwd)
+                    .arg("--version"),
+            ));
+            // Model argv[0] rewriting even when the shell consumes ARGV0.
+            check(bounded_output(
+                Command::new(&alias)
+                    .arg0(identity)
+                    .env_clear()
+                    .current_dir(cwd)
+                    .arg("--version"),
+            ));
+            // The held-command owner supplies argv[0] explicitly; ambient
+            // ARGV0 cannot replace it because no shell participates.
+            let held = dev_tools_command::HeldExecutable::open(&fs::canonicalize(&alias).unwrap())
+                .unwrap();
+            check(bounded_output(
+                held.command(OsStr::new(frontend))
+                    .unwrap()
+                    .env_clear()
+                    .env("ARGV0", identity)
+                    .current_dir(cwd)
+                    .arg("--version"),
+            ));
+            if Path::new("/usr/bin/zsh").is_file() {
+                check(bounded_output(
+                    Command::new("/usr/bin/zsh")
+                        .env_clear()
+                        .env("ARGV0", identity)
+                        .env("PATH", bin)
+                        .current_dir(cwd)
+                        .args(["-f", "-c", "\"$1\" --version", "fixture", frontend]),
+                ));
+            }
+        }
+        if Path::new("/usr/bin/zsh").is_file() {
+            let ordinary = bounded_output(
+                Command::new("/usr/bin/zsh")
+                    .env_clear()
+                    .env("PATH", bin)
+                    .current_dir(cwd)
+                    .args(["-f", "-c", "\"$1\" --version", "fixture", frontend]),
+            );
+            assert_eq!(ordinary.status.code(), baseline.status.code());
+            assert_eq!(ordinary.stdout, baseline.stdout);
+            assert_eq!(ordinary.stderr, baseline.stderr);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_launcher_dispatch_uses_explicit_identity_and_existing_authority() {
+    use std::ffi::OsStr;
+    use std::os::unix::process::CommandExt;
+
+    let root = private_runtime();
+    let executable = fs::canonicalize(env!("CARGO_BIN_EXE_dev-auth")).unwrap();
+    let held = dev_tools_command::HeldExecutable::open(&executable).unwrap();
+    for (frontend, argument) in [
+        ("git", "--version"),
+        ("gh", "--version"),
+        ("dev-auth", "--version"),
+        ("dev-auth-provider-exec", "--child-fd"),
+        ("dev-auth-setup-helper", "apply-v3"),
+    ] {
+        let alias = root.path().join(frontend);
+        symlink(&executable, &alias).unwrap();
+        let baseline = bounded_output(
+            Command::new(&alias)
+                .arg0(frontend)
+                .env_clear()
+                .arg(argument),
+        );
+        if frontend == "dev-auth" {
+            assert!(baseline.status.success());
+        } else {
+            // No installation or private descriptor/plan authority exists.
+            assert!(!baseline.status.success());
+            assert!(baseline.stdout.is_empty());
+        }
+        for identity in [
+            "Example.AppImage",
+            "foreign-launcher",
+            "git",
+            "gh",
+            "dev-auth",
+        ] {
+            let output = bounded_output(
+                held.command(OsStr::new(frontend))
+                    .unwrap()
+                    .env_clear()
+                    .env("ARGV0", identity)
+                    .arg(argument),
+            );
+            assert_eq!(output.status.code(), baseline.status.code(), "{output:?}");
+            assert_eq!(output.stdout, baseline.stdout);
+            assert_eq!(output.stderr, baseline.stderr);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_transparent_launchers_preserve_identity_with_argv0() {
+    use dev_auth::setup::{
+        install_at, reconcile_workload_launchers_at, InstallMode, InstallRequest, SetupPaths,
+    };
+
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    if user.name != "dev-auth-test" {
+        let sandbox = NativeUserSandbox::new();
+        sandbox.install_binary(&sandbox.root.join("product"));
+        let output = bounded_output(
+            sandbox
+                .command(&std::env::current_exe().unwrap(), &sandbox.home)
+                .args([
+                    "--exact",
+                    "installed_transparent_launchers_preserve_identity_with_argv0",
+                    "--nocapture",
+                ]),
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+
+    let paths = SetupPaths::user_only(&user.dir);
+    let native_git = user.dir.join("native-git");
+    let native_gh = user.dir.join("native-gh");
+    for (path, frontend) in [(&native_git, "git"), (&native_gh, "gh")] {
+        fs::write(
+            path,
+            format!("#!/bin/sh\nprintf 'native-{frontend}\\n'\nexit 91\n"),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let worker = user.dir.join("native-worker");
+    let marker = user.dir.join("worker-started");
+    fs::write(
+        &worker,
+        format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = format!(
+        r#"schema = "dev-auth-administrator-policy-v3"
+mode = "user_only"
+allowed_users = ["{user}"]
+[programs]
+git = "{git}"
+gh = "{gh}"
+ssh = "{git}"
+ssh_keygen = "{git}"
+[trusted_launchers]
+generic-worker = "{worker}"
+[credentials]
+providers = {{}}
+credential_slots = {{}}
+resources = {{}}
+[credentials.resource_caps.worker]
+users = ["{user}"]
+resources = {{}}
+[workload_caps.worker]
+users = ["{user}"]
+resource_cap = "worker"
+launchers = ["generic-worker"]
+admission = ["approval_required"]
+max_duration_seconds = 60
+"#,
+        user = user.name,
+        git = native_git.display(),
+        gh = native_gh.display(),
+        worker = worker.display(),
+    );
+    let config = r#"schema = "dev-auth-user-config-v3"
+[authority_profiles.worker]
+cap = "worker"
+resources = {}
+[[workloads]]
+name = "generic-worker"
+launcher = "generic-worker"
+profile = "worker"
+admission = "approval_required"
+duration_seconds = 60
+resources = {}
+"#;
+    let config_root = user.dir.join(".config/dev-auth");
+    fs::create_dir_all(&config_root).unwrap();
+    fs::set_permissions(user.dir.join(".config"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&config_root, fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, bytes) in [
+        ("policy-v3.toml", policy.as_bytes()),
+        ("config-v3.toml", config.as_bytes()),
+    ] {
+        let path = config_root.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // No broker, provider or credential store is required for native passthrough.
+    // This qualifies installed dispatch, not signed setup or admitted execution.
+    let receipt = install_at(
+        &paths,
+        &InstallRequest {
+            mode: InstallMode::UserOnly,
+            version: "0.5.0-launcher-fixture".into(),
+            source_executable: user.dir.parent().unwrap().join("product"),
+            native_git,
+            native_gh,
+            activate_transparent_launchers: true,
+        },
+    )
+    .unwrap();
+    reconcile_workload_launchers_at(
+        &user.dir,
+        Path::new(&receipt.executable),
+        &["generic-worker".into()],
+        user.uid.as_raw(),
+    )
+    .unwrap();
+    assert_installed_launcher_identity(&paths.bin_dir, &user.dir);
+    assert!(!marker.exists());
 }

@@ -114,6 +114,8 @@ Release acceptance includes semantic passthrough, unknown future Git and GitHub 
 
 ## Exported zsh ARGV0
 
-Linux public launchers recover their invoked name from the kernel's `AT_EXECFN` path, so exported zsh `ARGV0` cannot redirect a git/gh invocation to another workload. Existing receipt and broker authorization still applies. Descriptor execution and explicit core private-helper calls retain their validated internal dispatch contracts. Workload launch filters ARGV0 from child environments. Other platforms retain existing behavior pending native qualification. See [ADR 0029](adr/0087-linux-launcher-path-dispatch.md).
+Linux public `git` and `gh` launchers recover their invoked name from the kernel's `AT_EXECFN` path. Direct and ordinary zsh invocations therefore keep the selected frontend even when exported `ARGV0` names another installed workload or frontend. Existing receipt and broker authorization still applies; `ARGV0` is never frontend authority.
+
+Held-descriptor execution is a separate internal contract: the native caller supplies explicit `argv[0]` without a shell. The descriptor path does not retain the original alias, so invoking that path through a shell with rewritten `argv[0]` is not a supported transparent-launcher route. Use the installed public `git` or `gh` path instead. Explicit core private-helper calls retain their descriptor/plan checks. Workload launch filters `ARGV0` from child environments. Arbitrary workload aliases and other platforms retain existing behavior pending native qualification. See [ADR 0087](adr/0087-linux-launcher-path-dispatch.md).
 
 Private-consumer deployment acceptance belongs to that consumer and is not a Dev Auth release prerequisite. The public clean-machine gate remains required.
