@@ -1181,7 +1181,6 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
                 .or_insert_with(|| size.clone());
         }
     }
-    let active_lease = setup_lease.into_active(&resource_ids)?;
     let (program, program_args) = args.program.split_first().context("missing program")?;
     let resolved_program = if args.adapter == Adapter::Cargo
         && Path::new(program)
@@ -1192,6 +1191,11 @@ fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
     } else {
         program.clone()
     };
+    if resource_ids.is_empty() {
+        drop(setup_lease);
+        return cargo_intercept::delegate(Path::new(&resolved_program), program_args, &[], None);
+    }
+    let active_lease = setup_lease.into_active(&resource_ids)?;
     let status = Command::new(&resolved_program)
         .args(program_args)
         .envs(environment)
@@ -1484,6 +1488,12 @@ fn run_adapter_intercept(adapter: Adapter, command: &str, args: Vec<OsString>) -
         }
         Err(error) => return Err(error),
     };
+    if resource_ids.is_empty() {
+        // Auxiliary settings (for example a server port) are not a routed
+        // resource. Native overrides must retain the entire original environment.
+        drop(setup_lease);
+        return cargo_intercept::delegate(&real, &args, &[], None);
+    }
     let active_lease = match setup_lease.into_active(&resource_ids) {
         Ok(lease) => lease,
         Err(error) if is_read_only_root_failure(&error) => {
@@ -2142,16 +2152,21 @@ fn cargo_routing(
                     let (mut environment, registered) =
                         adapter_environment(&root, &repository, Adapter::Sccache)?;
                     resource_ids.extend(registered);
-                    if let Some(size) = &config.sccache.cache_size {
-                        environment
-                            .entry("SCCACHE_CACHE_SIZE".to_owned())
-                            .or_insert_with(|| size.clone());
+                    if resource_ids.is_empty() {
+                        drop(setup_lease);
+                        status = "Cargo is older than 1.91; native target layout preserved and sccache injection abstained because no managed resources remain".to_owned();
+                    } else {
+                        if let Some(size) = &config.sccache.cache_size {
+                            environment
+                                .entry("SCCACHE_CACHE_SIZE".to_owned())
+                                .or_insert_with(|| size.clone());
+                        }
+                        environment.insert("RUSTC_WRAPPER".to_owned(), "sccache".to_owned());
+                        routed.extend(environment);
+                        lease = Some(setup_lease.into_active(&resource_ids)?);
+                        maintenance_root = Some(root);
+                        status = "Cargo is older than 1.91; native target layout preserved and sccache routing is active".to_owned();
                     }
-                    environment.insert("RUSTC_WRAPPER".to_owned(), "sccache".to_owned());
-                    routed.extend(environment);
-                    lease = Some(setup_lease.into_active(&resource_ids)?);
-                    maintenance_root = Some(root);
-                    status = "Cargo is older than 1.91; native target layout preserved and sccache routing is active".to_owned();
                 } else if persistent_wrapper.is_err() {
                     status = "routing abstained because Cargo wrapper configuration is unreadable"
                         .to_owned();

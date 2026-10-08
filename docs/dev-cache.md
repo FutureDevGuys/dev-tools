@@ -52,6 +52,8 @@ There is deliberately no separate refresh command: routing is reconciled on each
 
 Explicit native cache/output settings and `DEV_CACHE_MODE=off` remain authoritative. Unsupported versions, unparseable persistent configuration, external services, remote backends, symlink-sensitive modes, and linked-state ambiguity affect only the relevant resource; the original command delegates unchanged and the resource is not presented as routed or collectible.
 
+If preparation leaves no managed resources, intercepts and explicit `exec` release the setup lease and delegate with the original environment and arguments, without publishing an empty activity record. Auxiliary settings such as an Sccache server port do not establish a routed resource. This also applies to Cargo versions older than 1.91 when their Sccache-only routing has no managed resource: Dev Cache injects neither its wrapper nor cache settings. Preparation failures still retain their existing error behavior, and any remaining routed resources keep their scoped activity protection.
+
 Migration is always explicit and dry-run first. A successful applied migration fingerprints the source and destination, publishes only into a known adapter resource, writes a receipt, and registers the verified destination in the same authoritative catalog. Dev Cache does not implicitly discover or adopt existing product state.
 
 ## Activation health
