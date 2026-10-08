@@ -37,7 +37,13 @@ struct LeaseRecord {
 impl RootLease {
     pub fn shared(root: &RootHandle, operation: &str) -> Result<Self> {
         let file = lock_file(root)?;
-        FileExt::lock_shared(&file).context("acquire shared cache-root lease")?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {}
+            Err(error) if lock_is_contended(&error) => {
+                bail!("cache root is busy with exclusive maintenance; routed setup did not start")
+            }
+            Err(error) => return Err(error).context("acquire shared cache-root setup lease"),
+        }
         let id = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
         let record = root.control().join("leases").join(format!("{id}.json"));
         // The held root lock excludes collection throughout setup. Publish only
@@ -77,39 +83,46 @@ impl RootLease {
     }
 
     pub fn exclusive(root: &RootHandle) -> Result<Self> {
-        Self::try_exclusive(root)?.context("cache root is busy with an active routed command")
+        Self::try_exclusive(root)?.context("cache root is busy with another coordinated operation")
     }
 
     pub fn try_exclusive(root: &RootHandle) -> Result<Option<Self>> {
-        Self::try_exclusive_with_mode(root, LeaseMode::Maintain)
+        Self::try_exclusive_for_maintenance(root)
     }
 
-    pub(crate) fn exclusive_read_only(root: &RootHandle) -> Result<Self> {
-        Self::try_exclusive_read_only(root)?
-            .context("cache root is busy with an active routed command")
+    pub(crate) fn shared_read_only(root: &RootHandle) -> Result<Self> {
+        Self::try_shared_read_only(root)?.context("cache root is busy with exclusive maintenance")
     }
 
-    pub(crate) fn try_exclusive_read_only(root: &RootHandle) -> Result<Option<Self>> {
-        Self::try_exclusive_with_mode(root, LeaseMode::Observe)
+    pub(crate) fn try_shared_read_only(root: &RootHandle) -> Result<Option<Self>> {
+        let file = open_lock_file(root, LeaseMode::Observe)
+            .context("open existing cache-root coordination; if absent, explicitly run config init-root for this root before previewing collection")?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => Ok(Some(Self { file, record: None })),
+            Err(error) if lock_is_contended(&error) => Ok(None),
+            Err(error) => Err(error).context("acquire shared cache-root observation lease"),
+        }
     }
 
-    fn try_exclusive_with_mode(root: &RootHandle, mode: LeaseMode) -> Result<Option<Self>> {
-        let file = if mode == LeaseMode::Maintain {
-            lock_file(root)?
-        } else {
-            open_lock_file(root, LeaseMode::Observe)
-                .context("open existing cache-root coordination; if absent, explicitly run config init-root for this root before previewing collection")?
-        };
+    fn try_exclusive_for_maintenance(root: &RootHandle) -> Result<Option<Self>> {
+        let file = lock_file(root)?;
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if lock_is_contended(&error) => return Ok(None),
             Err(error) => return Err(error).context("acquire exclusive cache-root lease"),
         }
-        if mode == LeaseMode::Maintain {
-            clean_stale_lease_records(root)?;
-        }
+        clean_stale_lease_records(root)?;
         Ok(Some(Self { file, record: None }))
     }
+}
+
+// fs2 uses platform-specific contention codes (including Windows lock violation).
+// A broad ErrorKind is insufficient there and can misclassify unrelated errors.
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    matches!(
+        (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+        (Some(actual), Some(expected)) if actual == expected
+    )
 }
 
 impl Drop for RootLease {
@@ -240,4 +253,70 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn process_alive(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_contention_classification_uses_the_exact_native_code() {
+        let expected = fs2::lock_contended_error();
+        assert!(lock_is_contended(&expected));
+        assert!(!lock_is_contended(&std::io::Error::other("unrelated")));
+        assert!(!lock_is_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!lock_is_contended(&std::io::Error::from_raw_os_error(
+            expected.raw_os_error().unwrap() + 1
+        )));
+    }
+
+    #[test]
+    fn observation_and_routed_setup_share_coordination_without_unscoped_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::initialize(&temp.path().join("root")).unwrap();
+        let observation = RootLease::shared_read_only(&root).unwrap();
+        let setup = RootLease::shared(&root, "preview-concurrent-setup").unwrap();
+        assert!(RootLease::try_shared_read_only(&root).unwrap().is_some());
+        assert!(RootLease::try_exclusive(&root).unwrap().is_none());
+        assert_eq!(
+            fs::read_dir(root.control().join("leases")).unwrap().count(),
+            0
+        );
+        drop(setup);
+        assert!(RootLease::try_exclusive(&root).unwrap().is_none());
+        drop(observation);
+        assert!(RootLease::try_exclusive(&root).unwrap().is_some());
+    }
+
+    #[test]
+    fn routed_setup_returns_busy_while_exclusive_maintenance_is_still_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootHandle::initialize(&temp.path().join("root")).unwrap();
+        let maintenance = RootLease::exclusive(&root).unwrap();
+        assert!(RootLease::try_shared_read_only(&root).unwrap().is_none());
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            let result = RootLease::shared(&worker_root, "contended-setup")
+                .err()
+                .map(|error| error.to_string());
+            send.send(result).unwrap();
+        });
+        // A blocking regression is released and joined before this test fails.
+        // The successful result must arrive before the exclusive lease is dropped.
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        drop(maintenance);
+        worker.join().unwrap();
+        let message = result
+            .expect("setup must not wait for maintenance to finish")
+            .expect("contended setup must fail, never run without protection");
+        assert!(message.contains("busy with exclusive maintenance"));
+        assert_eq!(
+            fs::read_dir(root.control().join("leases")).unwrap().count(),
+            0
+        );
+        assert!(RootLease::shared(&root, "after-maintenance").is_ok());
+    }
 }

@@ -138,7 +138,7 @@ pub fn collect(
     let _lease = if apply {
         RootLease::exclusive(root)?
     } else {
-        RootLease::exclusive_read_only(root)?
+        RootLease::shared_read_only(root)?
     };
     collect_with_lease(root, policy, artifact_stale_after_days, overrides, apply)
 }
@@ -153,7 +153,7 @@ pub fn collect_if_idle(
     let lease = if apply {
         RootLease::try_exclusive(root)?
     } else {
-        RootLease::try_exclusive_read_only(root)?
+        RootLease::try_shared_read_only(root)?
     };
     let Some(_lease) = lease else {
         return Ok(None);
@@ -247,8 +247,18 @@ fn collect_with_lease(
         }
     }
     let free_after = fs2::available_space(&root.root)?;
-    let bytes_after = directory_size(&root.platform_root);
-    let bytes_reclaimed = bytes_before.saturating_sub(bytes_after);
+    // A preview never reclaims bytes. Reuse its initial observation rather than
+    // scanning the whole domain again or attributing concurrent work to GC.
+    let bytes_after = if apply {
+        directory_size(&root.platform_root)
+    } else {
+        bytes_before
+    };
+    let bytes_reclaimed = if apply {
+        bytes_before.saturating_sub(bytes_after)
+    } else {
+        0
+    };
     let target_shortfall_bytes = if pressure {
         target_free.saturating_sub(free_after)
     } else {

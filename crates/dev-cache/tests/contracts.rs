@@ -2194,7 +2194,7 @@ fn gc_preview_refuses_missing_coordination_without_creating_it() {
 }
 
 #[test]
-fn gc_preview_keeps_nonblocking_exclusion_against_routed_setup() {
+fn gc_preview_coexists_with_routed_setup_and_defers_to_applied_maintenance() {
     let temp = tempfile::tempdir().unwrap();
     let root = RootHandle::initialize(&temp.path().join("cache-root")).unwrap();
     let policy = Config::default().gc;
@@ -2202,9 +2202,18 @@ fn gc_preview_keeps_nonblocking_exclusion_against_routed_setup() {
     assert!(
         gc::collect_if_idle(&root, &policy, 120, &GcOverrides::default(), false)
             .unwrap()
+            .is_some()
+    );
+    assert!(RootLease::try_exclusive(&root).unwrap().is_none());
+    drop(lease);
+    let maintenance = RootLease::exclusive(&root).unwrap();
+    assert!(
+        gc::collect_if_idle(&root, &policy, 120, &GcOverrides::default(), false)
+            .unwrap()
             .is_none()
     );
-    drop(lease);
+    assert!(gc::collect(&root, &policy, 120, &GcOverrides::default(), false).is_err());
+    drop(maintenance);
     assert!(
         gc::collect_if_idle(&root, &policy, 120, &GcOverrides::default(), false)
             .unwrap()
