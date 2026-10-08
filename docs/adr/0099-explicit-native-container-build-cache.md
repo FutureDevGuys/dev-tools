@@ -10,6 +10,8 @@ verification: pending
 
 ## Decision
 
+Command availability is superseded by [ADR 0104](0104-dev-cache-experimental-native-cache-gate.md): only an explicit `experimental-container-cache` source build exposes this capability. The feature defaults off, and stable builds omit the adapter and command before any provider contact. Native Docker acceptance remains NOT RUN.
+
 Dev Cache adds an explicit `container-cache` command, separate from routed-cache filesystem GC. The first adapter targets a caller-selected Linux Unix-socket endpoint through Docker Engine API 1.51. Preview observes native engine identity, backend-locality evidence and build-cache accounting. Apply requires positive local-daemon attestation, the expected engine ID, exact `DockerRootDir`, rootless/rootful domain, and one to 32 distinct explicit cache IDs. A preview is an observation, not retained authorization or a filesystem deletion plan. Apply reobserves scope and records before issuing bounded, per-record native requests.
 
 Native storage remains wholly engine-owned. The product never traverses, relocates, catalogs, renames or deletes that storage, and never puts it into `gc.rs`, automatic maintenance, intercept routing or the Dev Cache root. Images, containers, volumes, other Buildx stores, general prune and remote engines are outside this capability. Podman and non-Linux operation return unsupported without contacting a provider. No Docker CLI, Buildx plugin, context, configuration, environment-based endpoint, interpreter or temporary-directory prerequisite is introduced.

@@ -34,6 +34,15 @@ cargo deny check
 python -m pytest tests
 ```
 
+Dev Cache's default-off native-container capability needs a separate experimental source lane in addition to those default-build checks:
+
+```sh
+cargo clippy -p dev-cache --all-targets --locked --features experimental-container-cache -- -D warnings
+cargo test -p dev-cache --locked --features experimental-container-cache
+```
+
+This retains protocol/locality coverage while default tests verify command absence and zero provider contact. Neither lane establishes [native Docker acceptance](dev-cache-native-cache.md#disposable-native-acceptance), and stable Release Admin construction must retain default features only.
+
 Full workspace test builds can retain substantial debug and incremental output. Check available build-filesystem capacity before a broad gate; on constrained development hosts, `CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test --workspace --locked -j 2` keeps the test assertions while omitting debug symbols and incremental output. This is an implementation test mode, not a release-performance measurement. Keep any custom Unix `TMPDIR` short and owner-controlled: socket fixtures append session directories and socket names, and an overlong full pathname fails at socket creation before the intended test assertion.
 
 Those resource limits do not require replacing `PATH`. Ordinary developer builds retain the user's configured command lookup, including an optional Dev Cache Cargo intercept; forcing `/usr/bin:/bin` selects the system Cargo directly and bypasses that intercept. Dev Cache preserves final artifacts in Cargo's normal target location while routing supported disposable intermediates to its configured root. The isolated release constructor is different: its exact executable and explicit output directory are part of the source-bound reproducibility contract, not an ordinary development-build recommendation.

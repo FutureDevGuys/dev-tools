@@ -99,7 +99,8 @@ enum CommandKind {
     },
     /// Plan or apply lease-safe garbage collection.
     Gc(GcArgs),
-    /// Preview or explicitly prune a narrowly selected local native build cache.
+    /// Experimental, unqualified native build-cache preview or selected prune.
+    #[cfg(feature = "experimental-container-cache")]
     ContainerCache(crate::native_cache::NativeCacheArgs),
     /// Manage verified disposable build artifacts.
     Artifacts {
@@ -333,6 +334,7 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
         .take()
         .unwrap_or(CommandKind::Status { full: false });
     match command {
+        #[cfg(feature = "experimental-container-cache")]
         CommandKind::ContainerCache(args) => {
             let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let signal = cancelled.clone();
@@ -458,15 +460,22 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
         | CommandKind::Activate { .. }
         | CommandKind::Deactivate { .. }
         | CommandKind::Uninstall { .. } => bail!("internal command dispatch error"),
-        CommandKind::Completion { .. }
-        | CommandKind::BuildInfo
-        | CommandKind::ContainerCache(_) => {
+        CommandKind::Completion { .. } | CommandKind::BuildInfo => {
             bail!("internal command dispatch error")
         }
+        #[cfg(feature = "experimental-container-cache")]
+        CommandKind::ContainerCache(_) => bail!("internal command dispatch error"),
     }
 }
 
 fn print_standard_build_info(json: bool) -> Result<()> {
+    // Product-owned observational extension; shared/signed schemas are unchanged.
+    #[derive(Serialize)]
+    struct DevCacheBuildInfo {
+        #[serde(flatten)]
+        common: BuildInfo,
+        native_container_cache: &'static str,
+    }
     let info = BuildInfo::from_build_values(
         ProductId::parse("dev-cache")?,
         env!("CARGO_PKG_VERSION"),
@@ -476,7 +485,17 @@ fn print_standard_build_info(json: bool) -> Result<()> {
         option_env!("DEV_TOOLS_BUILD_PROFILE"),
         option_env!("DEV_TOOLS_BUILD_UNIX"),
     )?;
-    print_value(json, &info)
+    print_value(
+        json,
+        &DevCacheBuildInfo {
+            common: info,
+            native_container_cache: if cfg!(feature = "experimental-container-cache") {
+                "experimental-unqualified"
+            } else {
+                "disabled"
+            },
+        },
+    )
 }
 
 fn generate_completion(shell: CompletionShell, output: Option<&Path>) -> Result<Option<bool>> {

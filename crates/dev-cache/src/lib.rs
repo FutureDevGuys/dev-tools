@@ -9,6 +9,7 @@ pub mod gc;
 pub mod install;
 pub mod lease;
 pub mod migrate;
+#[cfg(feature = "experimental-container-cache")]
 pub mod native_cache;
 pub mod provenance;
 pub mod repository;

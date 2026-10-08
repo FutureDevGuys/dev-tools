@@ -7,6 +7,11 @@ repository.workspace = true
 publish = false
 description = "Route disposable development caches through owned, inspectable intercepts"
 
+[features]
+default = []
+# Native Docker acceptance is NOT RUN. Never enable in the stable release recipe.
+experimental-container-cache = ["dep:socket2"]
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"
@@ -28,7 +33,7 @@ wait-timeout = "0.2"
 libc = { version = "0.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-socket2 = { version = "0.6", default-features = false }
+socket2 = { version = "0.6", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

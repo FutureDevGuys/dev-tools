@@ -1,6 +1,6 @@
 //! Public-command protocol contracts against disposable local HTTP fixtures.
 //! These mocks do not qualify a real Docker engine or any native platform.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "experimental-container-cache"))]
 
 use std::fs;
 use std::io::{self, Read, Write};

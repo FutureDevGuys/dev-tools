@@ -1,10 +1,24 @@
 # Explicit native container build cache
 
-**Qualification status: native Docker acceptance and installed-release qualification are NOT RUN.** The command has a deliberately narrow source contract; source tests and fake socket responses do not establish supported native operation. Rootful and rootless qualification are separate gates.
+**Availability: disabled in default/stable builds; experimental source builds only. Qualification status: native Docker acceptance and installed-release qualification are NOT RUN.** The command has a deliberately narrow source contract; source tests and fake socket responses do not establish supported native operation. Rootful and rootless qualification are separate gates.
 
 `dev-cache container-cache` inspects a selected engine's native build cache and can request removal of explicitly selected eligible records. The engine owns the storage throughout. This command does not use the Dev Cache root, filesystem GC, automatic maintenance, intercepts, Docker CLI, Buildx, Docker contexts or Docker configuration. It creates no temporary directories. [ADR 0099](adr/0099-explicit-native-container-build-cache.md) owns the protocol and authority boundary.
 
-## Command
+## Build-time guard
+
+The product-owned Cargo feature `experimental-container-cache` is off by default. Without it the native adapter is not compiled, the command is absent from help and all generated completions, and preview/apply invocations fail with invalid-invocation exit 2 before configuration or provider contact. Environment variables and runtime flags cannot enable it. `dev-cache build-info --json` reports `native_container_cache: "disabled"` or `"experimental-unqualified"` as an additive observational field; this is not a signed release-schema extension or an acceptance result.
+
+The stable Release Admin recipe continues to build default features only. Do not use `--all-features` or enable this feature for stable release construction. Native acceptance requires a separately identified experimental binary, built and tested explicitly:
+
+```text
+cargo build -p dev-cache --locked --features experimental-container-cache
+cargo test -p dev-cache --locked
+cargo test -p dev-cache --locked --features experimental-container-cache
+```
+
+The default test lane verifies the absence and zero-contact boundary. The experimental lane retains protocol, locality and failure tests; it does not qualify Docker. [ADR 0104](adr/0104-dev-cache-experimental-native-cache-gate.md) owns this availability guard. Enabling a stable capability requires a separately reviewed decision and the native evidence below; disabling it does not waive other Dev Cache release gates.
+
+## Experimental command
 
 Preview an explicitly selected Linux Unix-socket endpoint for Docker Engine:
 
@@ -73,7 +87,7 @@ Ambient `DOCKER_HOST`, `DOCKER_CONTEXT`, Docker/Buildx configuration, proxy vari
 
 This is a proposed qualification procedure, not a record of a completed run or permission to touch a workstation's engine. Use an explicitly disposable Linux VM with no host engine socket, host data-directory mounts, credentials, unrelated workloads or external network access. Pre-provision trusted runtime prerequisites separately. Do not install software, change services, grant permissions or change host security settings as an implicit part of testing.
 
-Record the candidate source commit, binary digest and build information, OS/kernel/architecture, Docker Engine version/build, BuildKit dependency, storage driver, rootful/rootless mode, peer executable identity and locality result. The source-reviewed reference is Docker Engine 28.3.3, API 1.51, with BuildKit 0.23.2. Other engine versions and storage backends need their own recorded qualification; a successful HTTP response alone does not establish compatible filter semantics or local-daemon admission.
+Record the candidate source commit, binary digest and build information (including `native_container_cache: "experimental-unqualified"`), explicit feature selection, OS/kernel/architecture, Docker Engine version/build, BuildKit dependency, storage driver, rootful/rootless mode, peer executable identity and locality result. The source-reviewed reference is Docker Engine 28.3.3, API 1.51, with BuildKit 0.23.2. Other engine versions and storage backends need their own recorded qualification; a successful HTTP response alone does not establish compatible filter semantics or local-daemon admission.
 
 ### Rootful setup
 
