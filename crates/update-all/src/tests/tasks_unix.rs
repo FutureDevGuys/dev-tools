@@ -1639,12 +1639,47 @@ exit 0
     assert_eq!(events, vec!["suspend", "resume"]);
     let less_args = fs::read_to_string(&less_args_file).unwrap();
     assert!(less_args.contains("+F"), "{less_args}");
+    assert!(less_args.contains("-K"), "{less_args}");
     assert!(less_args.contains("-R"), "{less_args}");
     assert!(less_args.contains("-S"), "{less_args}");
     assert!(less_args.contains("task-npm.log"), "{less_args}");
     assert!(
         !kitty_called_file.exists(),
         "log view should not open a popup terminal"
+    );
+}
+
+#[test]
+fn log_pager_accepts_only_less_interrupt_status() {
+    let temp = TempDir::new().unwrap();
+    let program = temp.path().join("pager");
+    let log = temp.path().join("run.log");
+    fs::write(&log, "log line\n").unwrap();
+
+    for code in [0, 1, 2, 15, 130] {
+        write_executable(&program, &format!("#!/bin/sh\nexit {code}\n"));
+        for kind in [
+            LogPagerKind::Less,
+            LogPagerKind::Tail,
+            LogPagerKind::Bat,
+            LogPagerKind::More,
+        ] {
+            let result = run_log_pager_command(kind, &program, &log);
+            assert_eq!(
+                result.is_ok(),
+                code == 0 || (kind == LogPagerKind::Less && code == 2),
+                "unexpected {kind:?} result for status {code}: {result:?}"
+            );
+        }
+    }
+
+    write_executable(&program, "#!/bin/sh\nkill -TERM $$\n");
+    assert!(run_log_pager_command(LogPagerKind::Less, &program, &log).is_err());
+    assert!(
+        run_log_pager_command(LogPagerKind::Less, &temp.path().join("missing"), &log)
+            .unwrap_err()
+            .to_string()
+            .contains("launch less")
     );
 }
 

@@ -2789,7 +2789,10 @@ fn run_log_pager_command(kind: LogPagerKind, program: &Path, path: &Path) -> Res
         .args(log_pager_args(kind, path))
         .status()
         .with_context(|| format!("launch {}", kind.command_name()))?;
-    if status.success() {
+    // `less -K` reports its normal Ctrl-C dismissal with QUIT_INTERRUPT (2).
+    // This is a viewer exit, not a failed updater or a global cancellation.
+    // Do not apply that convention to other pagers or other failure statuses.
+    if status.success() || (kind == LogPagerKind::Less && status.code() == Some(2)) {
         return Ok(());
     }
     bail!("{} exited with status {status}", kind.command_name())
