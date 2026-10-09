@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::adapter::{Adapter, AdapterContext};
 use crate::artifacts;
 use crate::cargo_intercept;
+use crate::cargo_outputs;
 use crate::config::{Config, EnvironmentOverrides};
 use crate::dispatch::{classify_invocation, is_intercept_name, Dispatch};
 use crate::gc::{self, GcOverrides};
@@ -89,6 +90,9 @@ enum CommandKind {
         adapter: Adapter,
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Resolve retained Cargo output storage for the current toolchain.
+        #[arg(long)]
+        final_outputs: bool,
     },
     /// Run a command with one adapter's native cache environment.
     Exec(ExecArgs),
@@ -427,9 +431,11 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
         }
         CommandKind::Doctor => doctor(&config, config_path.as_deref(), cli.json),
         CommandKind::Report => report(&config, cli.json),
-        CommandKind::Path { adapter, repo } => {
-            path_command(&config, adapter, repo.as_deref(), cli.json)
-        }
+        CommandKind::Path {
+            adapter,
+            repo,
+            final_outputs,
+        } => path_command(&config, adapter, repo.as_deref(), final_outputs, cli.json),
         CommandKind::Exec(exec) => exec_command(&config, exec),
         CommandKind::Config {
             command: ConfigCommand::Show,
@@ -860,17 +866,53 @@ fn status_adapter_details(
             effective_paths.insert(name, paths);
         }
     }
-    if [
+    let native_layout = [
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_TARGET_DIR",
         "CARGO_BUILD_BUILD_DIR",
     ]
     .iter()
-    .any(|name| env::var_os(name).is_some())
-    {
+    .any(|name| {
+        env::var_os(name).is_some()
+            && !(config.cargo.final_outputs && provenance::inherited_is_managed(&inherited, name))
+    });
+    if native_layout {
         let reason = "cargo: inherited explicit build or target directory".to_owned();
         abstentions.push(reason.clone());
         override_reasons.push(reason);
+    }
+    if config.cargo.enabled && config.cargo.final_outputs {
+        if let Some(real) = real_executables
+            .get("cargo")
+            .and_then(|real| real.as_deref())
+        {
+            let args = [OsString::from("build")];
+            let result = if cargo_intercept::cargo_supports_build_dir(real, &args) {
+                cargo_outputs::target_dir(
+                    root,
+                    &cargo_outputs::Invocation {
+                        real,
+                        prefix: Vec::new(),
+                        args: &args,
+                    },
+                    &current_dir,
+                )
+            } else {
+                Err(anyhow::anyhow!("Cargo 1.91 or newer is required"))
+            };
+            match result {
+                Ok(path) => effective_paths
+                    .entry("cargo".to_owned())
+                    .or_default()
+                    .push(path),
+                Err(error) => {
+                    let reason =
+                        format!("cargo: retained final-output routing unavailable: {error:#}");
+                    abstentions.push(reason.clone());
+                    override_reasons.push(reason);
+                }
+            }
+        }
     }
     override_reasons.sort();
     override_reasons.dedup();
@@ -1191,6 +1233,7 @@ fn report(config: &Config, json: bool) -> Result<i32> {
         "shared_bytes": observation.shared_bytes,
         "artifacts_bytes": observation.artifacts_bytes,
         "other_bytes": observation.other_bytes,
+        "retained_outputs_bytes": observation.retained_outputs_bytes,
         "complete": observation.complete,
         "cancelled": observation.cancelled,
         "error_kind": observation.error_kind,
@@ -1207,10 +1250,35 @@ fn path_command(
     config: &Config,
     adapter: Adapter,
     repo_path: Option<&Path>,
+    final_outputs: bool,
     json: bool,
 ) -> Result<i32> {
     let root = observe_root(config)?;
-    let path = adapter_path(&root, adapter, repo_path)?;
+    let path = if final_outputs {
+        if adapter != Adapter::Cargo || !config.cargo.final_outputs {
+            bail!("retained paths require Cargo and cargo.final_outputs=true");
+        }
+        let real = cargo_intercept::resolve_real_cargo(config, &env::current_exe()?)?;
+        let args = [OsString::from("build")];
+        let cwd = repo_path
+            .map(Path::to_path_buf)
+            .unwrap_or(env::current_dir()?)
+            .canonicalize()?;
+        if !cargo_intercept::cargo_build_dir_capability(&real, &args, Some(&cwd))? {
+            bail!("retained Cargo output routing requires Cargo 1.91 or newer");
+        }
+        cargo_outputs::target_dir(
+            &root,
+            &cargo_outputs::Invocation {
+                real: &real,
+                prefix: Vec::new(),
+                args: &args,
+            },
+            &cwd,
+        )?
+    } else {
+        adapter_path(&root, adapter, repo_path)?
+    };
     if json {
         print_value(true, &serde_json::json!({"adapter":adapter,"path":path}))?;
     } else {
@@ -1261,6 +1329,37 @@ fn adapter_path(root: &RootHandle, adapter: Adapter, repo_path: Option<&Path>) -
 
 fn exec_command(config: &Config, args: ExecArgs) -> Result<i32> {
     ensure_adapter_enabled(config, args.adapter)?;
+    let (program, program_args) = args.program.split_first().context("missing program")?;
+    if args.adapter == Adapter::Cargo && config.cargo.final_outputs {
+        if !Path::new(program)
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("cargo"))
+        {
+            bail!("retained Cargo output routing requires an explicit cargo command");
+        }
+        let real = if Path::new(program).is_absolute() {
+            PathBuf::from(program)
+        } else {
+            cargo_intercept::resolve_real_cargo(config, &env::current_exe()?)?
+        };
+        let informational =
+            cargo_intercept::is_help_request(program_args.iter().map(|arg| arg.to_string_lossy()))
+                || cargo_intercept::is_version_request(program_args);
+        let invocation = cargo_outputs::Invocation {
+            real: &real,
+            prefix: Vec::new(),
+            args: program_args,
+        };
+        let supported = if needs_final_discovery(config, &invocation, informational)? {
+            cargo_intercept::cargo_build_dir_capability(&real, program_args, None)?
+        } else {
+            !informational && cargo_intercept::cargo_supports_build_dir(&real, program_args)
+        };
+        let routing = cargo_routing(config, program_args, informational, supported, &invocation)?;
+        let code = delegate_cargo(&real, program_args, &routing, None)?;
+        finish_cargo_routing(routing, config);
+        return Ok(code);
+    }
     let root = open_root(config)?;
     let repository = Repository::discover(&env::current_dir()?, &root)?
         .context("resolve current workspace scope")?;
@@ -1646,7 +1745,8 @@ fn delegate_without_cache(real: &Path, args: &[OsString], compiler_intercept: bo
             "dev-cache: cache root is read-only; running the original tool without cache routing"
         );
     }
-    cargo_intercept::delegate(real, args, &[], None)
+    let remove = managed_cargo_removals(&[]);
+    cargo_intercept::delegate_with_removals(real, args, &[], &remove, None)
 }
 
 fn preview_root() -> PathBuf {
@@ -2161,9 +2261,23 @@ fn run_cargo(args: Vec<OsString>) -> Result<i32> {
     let real = cargo_intercept::resolve_real_cargo(&config, &current_exe)?;
     let help = cargo_intercept::is_help_request(args.iter().map(|arg| arg.to_string_lossy()));
     let informational = help || cargo_intercept::is_version_request(&args);
-    let supports_build_dir =
-        !informational && cargo_intercept::cargo_supports_build_dir(&real, &args);
-    let routing = match cargo_routing(&config, &args, informational, supports_build_dir) {
+    let invocation = cargo_outputs::Invocation {
+        real: &real,
+        prefix: Vec::new(),
+        args: &args,
+    };
+    let supports_build_dir = if needs_final_discovery(&config, &invocation, informational)? {
+        cargo_intercept::cargo_build_dir_capability(&real, &args, None)?
+    } else {
+        !informational && cargo_intercept::cargo_supports_build_dir(&real, &args)
+    };
+    let routing = match cargo_routing(
+        &config,
+        &args,
+        informational,
+        supports_build_dir,
+        &invocation,
+    ) {
         Ok(routing) => routing,
         Err(error) if is_read_only_root_failure(&error) => {
             return delegate_without_cache(&real, &args, false);
@@ -2171,7 +2285,7 @@ fn run_cargo(args: Vec<OsString>) -> Result<i32> {
         Err(error) => return Err(error),
     };
     let prefix = help.then(|| cargo_help_prefix(&routing.status));
-    let code = cargo_intercept::delegate(&real, &args, &routing.environment, prefix.as_deref())?;
+    let code = delegate_cargo(&real, &args, &routing, prefix.as_deref())?;
     finish_cargo_routing(routing, &config);
     Ok(code)
 }
@@ -2185,9 +2299,24 @@ fn run_rustup(args: Vec<OsString>) -> Result<i32> {
     };
     let help = cargo_intercept::is_help_request(cargo_args.iter().map(|arg| arg.to_string_lossy()));
     let informational = help || cargo_intercept::is_version_request(cargo_args);
-    let supports_build_dir =
-        !informational && cargo_intercept::rustup_cargo_supports_build_dir(&real, &args);
-    let routing = match cargo_routing(&config, cargo_args, informational, supports_build_dir) {
+    let prefix_len = args.len() - cargo_args.len();
+    let invocation = cargo_outputs::Invocation {
+        real: &real,
+        prefix: args[..prefix_len].to_vec(),
+        args: cargo_args,
+    };
+    let supports_build_dir = if needs_final_discovery(&config, &invocation, informational)? {
+        cargo_intercept::rustup_cargo_build_dir_capability(&real, &args)?
+    } else {
+        !informational && cargo_intercept::rustup_cargo_supports_build_dir(&real, &args)
+    };
+    let routing = match cargo_routing(
+        &config,
+        cargo_args,
+        informational,
+        supports_build_dir,
+        &invocation,
+    ) {
         Ok(routing) => routing,
         Err(error) if is_read_only_root_failure(&error) => {
             return delegate_without_cache(&real, &args, false);
@@ -2195,9 +2324,21 @@ fn run_rustup(args: Vec<OsString>) -> Result<i32> {
         Err(error) => return Err(error),
     };
     let prefix = help.then(|| cargo_help_prefix(&routing.status));
-    let code = cargo_intercept::delegate(&real, &args, &routing.environment, prefix.as_deref())?;
+    let code = delegate_cargo(&real, &args, &routing, prefix.as_deref())?;
     finish_cargo_routing(routing, &config);
     Ok(code)
+}
+
+fn needs_final_discovery(
+    config: &Config,
+    invocation: &cargo_outputs::Invocation<'_>,
+    informational: bool,
+) -> Result<bool> {
+    Ok(config.enabled
+        && config.cargo.enabled
+        && config.cargo.final_outputs
+        && !informational
+        && cargo_outputs::eligible(invocation, &env::current_dir()?).is_ok())
 }
 
 struct CargoRouting {
@@ -2213,6 +2354,7 @@ fn cargo_routing(
     args: &[OsString],
     help: bool,
     supports_build_dir: bool,
+    invocation: &cargo_outputs::Invocation<'_>,
 ) -> Result<CargoRouting> {
     let mut routed = Vec::new();
     let mut status = if help && config.enabled && config.cargo.enabled {
@@ -2223,15 +2365,22 @@ fn cargo_routing(
     let mut lease = None;
     let mut maintenance_root = None;
     let mut resource_ids = Vec::new();
-    let explicit_layout = env::var_os("CARGO_TARGET_DIR").is_some()
-        || env::var_os("CARGO_BUILD_TARGET_DIR").is_some()
-        || env::var_os("CARGO_BUILD_BUILD_DIR").is_some()
-        || cargo_intercept::has_explicit_target_dir(args)
+    let inherited = env::vars().collect();
+    let explicit_layout = [
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+    ]
+    .iter()
+    .any(|name| {
+        env::var_os(name).is_some()
+            && !(config.cargo.final_outputs && provenance::inherited_is_managed(&inherited, name))
+    }) || cargo_intercept::has_explicit_target_dir(args)
         || cargo_intercept::has_explicit_config(args);
     if config.enabled && config.cargo.enabled && !explicit_layout && !supports_build_dir && !help {
         let current_dir = env::current_dir()?;
         let repository_start = cargo_intercept::repository_start(args, &current_dir);
-        match cargo_intercept::persistent_layout_override(&repository_start) {
+        match cargo_intercept::persistent_layout_override(&current_dir) {
             Ok(true) => {
                 status = "routing bypassed by persistent Cargo layout configuration".to_owned();
             }
@@ -2242,8 +2391,7 @@ fn cargo_routing(
             }
             Ok(false) => {
                 let wrapper_is_explicit = cargo_wrapper_is_explicit();
-                let persistent_wrapper =
-                    cargo_intercept::persistent_compiler_wrapper(&repository_start);
+                let persistent_wrapper = cargo_intercept::persistent_compiler_wrapper(&current_dir);
                 if config.sccache.enabled
                     && !wrapper_is_explicit
                     && find_on_path("sccache").is_some()
@@ -2292,7 +2440,7 @@ fn cargo_routing(
     if config.enabled && config.cargo.enabled && !explicit_layout && supports_build_dir {
         let current_dir = env::current_dir()?;
         let repository_start = cargo_intercept::repository_start(args, &current_dir);
-        match cargo_intercept::persistent_layout_override(&repository_start) {
+        match cargo_intercept::persistent_layout_override(&current_dir) {
             Ok(true) => {
                 status = "routing bypassed by persistent Cargo layout configuration".to_owned();
                 return Ok(CargoRouting {
@@ -2317,6 +2465,19 @@ fn cargo_routing(
             }
             Ok(false) => {}
         }
+        let route_final = config.cargo.final_outputs && !help;
+        if route_final {
+            if let Err(error) = cargo_outputs::eligible(invocation, &current_dir) {
+                eprintln!("dev-cache: final output routing abstained: {error:#}");
+                return Ok(CargoRouting {
+                    environment: routed,
+                    status: "native Cargo layout preserved".to_owned(),
+                    lease,
+                    maintenance_root,
+                    resource_ids,
+                });
+            }
+        }
         let root = match open_root(config) {
             Ok(root) => root,
             Err(error) if help => {
@@ -2331,10 +2492,32 @@ fn cargo_routing(
             Err(error) => return Err(error),
         };
         if let Some(repository) = Repository::discover(&repository_start, &root)? {
+            let final_target = if route_final {
+                Some(cargo_outputs::target_dir(&root, invocation, &current_dir)?)
+            } else {
+                None
+            };
             maybe_automatic_gc(&root, config, true);
             let setup_lease = RootLease::shared(&root, "cargo")?;
-            let (mut environment, registered) =
-                adapter_environment(&root, &repository, Adapter::Cargo)?;
+            let mut environment = adapter_values(&root, &repository, Adapter::Cargo);
+            if let Some(target) = final_target {
+                environment.insert(
+                    "CARGO_TARGET_DIR".to_owned(),
+                    target
+                        .to_str()
+                        .context("non-Unicode output root")?
+                        .to_owned(),
+                );
+                provenance::attach(&inherited, &mut environment, "cargo");
+            }
+            let registered = prepare_adapter_environment(
+                &root,
+                &repository,
+                Adapter::Cargo,
+                &environment,
+                &NativeTool::default(),
+                &BTreeSet::new(),
+            )?;
             resource_ids.extend(registered);
             if config.sccache.enabled {
                 let (sccache_environment, registered) =
@@ -2350,7 +2533,7 @@ fn cargo_routing(
                 if !wrapper_is_explicit
                     && find_on_path("sccache").is_some()
                     && matches!(
-                        cargo_intercept::persistent_compiler_wrapper(&repository_start),
+                        cargo_intercept::persistent_compiler_wrapper(&current_dir),
                         Ok(false)
                     )
                 {
@@ -2364,6 +2547,7 @@ fn cargo_routing(
                     .join("cargo/intermediate/{workspace-path-hash}")
                     .display()
             );
+            provenance::attach(&inherited, &mut environment, "cargo");
             routed.extend(environment);
             lease = Some(setup_lease.into_active(&resource_ids)?);
             maintenance_root = Some(root);
@@ -2383,7 +2567,38 @@ fn cargo_routing(
     })
 }
 
+fn delegate_cargo(
+    real: &Path,
+    args: &[OsString],
+    routing: &CargoRouting,
+    prefix: Option<&str>,
+) -> Result<i32> {
+    let remove = managed_cargo_removals(&routing.environment);
+    cargo_intercept::delegate_with_removals(real, args, &routing.environment, &remove, prefix)
+}
+
+fn managed_cargo_removals(environment: &[(String, String)]) -> Vec<&'static str> {
+    let inherited = env::vars().collect();
+    if provenance::inherited_is_managed(&inherited, "CARGO_TARGET_DIR") {
+        [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_BUILD_BUILD_DIR",
+            "RUSTC_WRAPPER",
+        ]
+        .into_iter()
+        .filter(|name| {
+            provenance::inherited_is_managed(&inherited, name)
+                && !environment.iter().any(|(key, _)| key == name)
+        })
+        .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 fn cargo_wrapper_is_explicit() -> bool {
+    let inherited = env::vars().collect();
     [
         "RUSTC_WRAPPER",
         "CARGO_BUILD_RUSTC_WRAPPER",
@@ -2392,7 +2607,7 @@ fn cargo_wrapper_is_explicit() -> bool {
         "SCCACHE_DISABLE",
     ]
     .iter()
-    .any(|name| env::var_os(name).is_some())
+    .any(|name| env::var_os(name).is_some() && !provenance::inherited_is_managed(&inherited, name))
 }
 
 fn finish_cargo_routing(routing: CargoRouting, config: &Config) {

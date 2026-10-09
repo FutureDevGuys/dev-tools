@@ -19,6 +19,8 @@ pub(crate) struct Observation {
     pub shared_bytes: Option<u64>,
     pub artifacts_bytes: Option<u64>,
     pub other_bytes: Option<u64>,
+    /// Retained outputs are a subset of other_bytes for report compatibility.
+    pub retained_outputs_bytes: Option<u64>,
     pub entries_observed: u64,
     pub files_observed: u64,
     pub links_skipped: u64,
@@ -34,6 +36,7 @@ impl Observation {
         self.shared_bytes = None;
         self.artifacts_bytes = None;
         self.other_bytes = None;
+        self.retained_outputs_bytes = None;
     }
 
     fn check_cancelled(&mut self, cancelled: &AtomicBool) -> bool {
@@ -225,6 +228,7 @@ fn scan_with_files(
         return result;
     }
     let mut sizes = [0_u64; 4];
+    let mut retained_outputs_bytes = 0_u64;
     let mut entries = walkdir::WalkDir::new(&root.platform_root)
         .follow_links(false)
         .follow_root_links(false)
@@ -287,6 +291,13 @@ fn scan_with_files(
         } else {
             3
         };
+        if relative.starts_with("outputs") {
+            let Some(size) = retained_outputs_bytes.checked_add(metadata.len()) else {
+                result.fail("size-overflow");
+                return result;
+            };
+            retained_outputs_bytes = size;
+        }
         let Some(size) = sizes[class].checked_add(metadata.len()) else {
             result.fail("size-overflow");
             return result;
@@ -310,6 +321,7 @@ fn scan_with_files(
     result.shared_bytes = Some(sizes[1]);
     result.artifacts_bytes = Some(sizes[2]);
     result.other_bytes = Some(sizes[3]);
+    result.retained_outputs_bytes = Some(retained_outputs_bytes);
     result.complete = true;
     result
 }

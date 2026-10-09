@@ -23,6 +23,9 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct CargoConfig {
     pub enabled: bool,
+    /// Route Cargo final build artifacts to retained, owned storage. Opt-in.
+    #[serde(skip_serializing_if = "is_false")]
+    pub final_outputs: bool,
     pub real_path: Option<PathBuf>,
 }
 
@@ -102,6 +105,7 @@ impl Default for CargoConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            final_outputs: false,
             real_path: None,
         }
     }
@@ -283,4 +287,8 @@ pub fn home_dir() -> PathBuf {
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

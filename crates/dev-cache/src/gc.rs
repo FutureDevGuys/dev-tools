@@ -400,6 +400,14 @@ fn resource_actions(
             });
             continue;
         }
+        if record.cleanup == CleanupStrategy::Retain {
+            abstentions.push(GcAbstention {
+                resource_id: Some(record.resource_id.clone()),
+                path,
+                reason: "retained final build outputs are not disposable cache".to_owned(),
+            });
+            continue;
+        }
         if !record.hazards.is_empty() {
             abstentions.push(GcAbstention {
                 resource_id: Some(record.resource_id.clone()),
@@ -712,6 +720,14 @@ fn remove_nested_actions(actions: &mut Vec<GcAction>) {
 }
 
 fn apply_action(root: &RootHandle, action: &GcAction) -> Result<()> {
+    let retained = root.platform_root.join("outputs");
+    if std::iter::once(&action.path)
+        .chain(&action.companion_paths)
+        .chain(action.destination.iter())
+        .any(|path| path.starts_with(&retained) || retained.starts_with(path))
+    {
+        bail!("retained output paths cannot be collected");
+    }
     if action.kind == "repository-identity" {
         return reconcile_repository_identity(root, action);
     }
@@ -733,6 +749,7 @@ fn apply_action(root: &RootHandle, action: &GcAction) -> Result<()> {
     };
     if let Some(record) = record.as_ref() {
         match record.cleanup {
+            CleanupStrategy::Retain => bail!("retained final outputs cannot be collected"),
             CleanupStrategy::OwnedDirectory => {
                 owned_transaction(root, action)?;
                 resources::remove_record(root, &record.resource_id)?;
@@ -1256,7 +1273,9 @@ fn run_native_cleanup(record: &ResourceRecord, path: &Path, reason: &str) -> Res
                 ],
                 Vec::new(),
             ),
-            CleanupStrategy::OwnedDirectory | CleanupStrategy::SccacheServerAware => {
+            CleanupStrategy::Retain
+            | CleanupStrategy::OwnedDirectory
+            | CleanupStrategy::SccacheServerAware => {
                 bail!("owned cleanup strategy was passed to native cleanup")
             }
         };

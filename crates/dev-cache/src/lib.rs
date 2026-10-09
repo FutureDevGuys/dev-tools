@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod artifacts;
 pub mod cargo_intercept;
+mod cargo_outputs;
 pub mod cli;
 pub mod config;
 pub mod dispatch;

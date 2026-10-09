@@ -1,6 +1,6 @@
 # Dev Cache
 
-`dev-cache` routes positively known disposable tool caches to a machine-selected storage root. It preserves source trees, dependency trees, environments, installed tools, final binaries, documentation, and other deliverables in their normal locations. Unknown, overridden, ambiguous, or unsafe state causes the affected adapter to abstain or fail closed.
+`dev-cache` routes positively known disposable tool caches to a machine-selected storage root. By default it preserves source trees, dependency trees, environments, installed tools, final binaries, documentation, and other deliverables in their normal locations. The optional Cargo final-output policy below routes Cargo-managed final artifacts into retained storage under the same selected root. Unknown, overridden, ambiguous, or unsafe state causes the affected adapter to abstain or fail closed.
 
 If the operating system makes an otherwise selected cache root read-only before an intercepted tool starts, the intercept delegates once to the original tool without Dev Cache routing; compiler-name aliases bypass ccache. A read-only failure after the tool has run preserves its exit status without replay. This does not repair the filesystem or authorize fallback for a changed volume identity, unsafe ownership, missing root, permission failure or invalid configuration. `dev-cache doctor` remains the way to inspect the unhealthy cache root; native storage repair is external to Dev Cache. [ADR 0093](adr/0093-read-only-cache-root-intercept-fallback.md) owns this narrow failure behavior.
 
@@ -9,6 +9,33 @@ Configuration and state use standard platform `dev-cache` roots. POSIX intercept
 `dev-cache build-info --json` emits the common checkout-independent `dev-tools-build-info-v1` document without initializing cache routing or maintenance state. Its product-owned `native_container_cache` field reports `disabled` in default builds or `experimental-unqualified` in explicit experimental builds; neither claims native acceptance. The hidden `--build-info` form remains for rollback to the pre-standard 0.1 line and is removed in the next minor release after one accepted release has shipped the standard subcommand.
 
 Linux runtime acceptance covers Cargo and sccache, Go, npm, pnpm, uv and pip, ccache, Zig, Meson, Bun, and Yarn. Native Windows and WSL support is not claimed until their runtime acceptance harnesses pass.
+
+## Retained Cargo final outputs (opt-in)
+
+Enable `[cargo] final_outputs = true` in Dev Cache's machine configuration to route Cargo-managed final outputs beneath the configured root as well as disposable intermediates. For example, a root selected as `/storage/dev-cache` keeps these outputs on that storage volume; the product never hard-codes a mount point. This source feature requires separate native/release qualification before installed use.
+
+Each actual Cargo workspace and observed toolchain gets a collision-resistant directory under `<runtime-domain>/outputs/cargo/<workspace-key>/<toolchain-key>`. Members share their workspace's directory; independent workspaces in one Git repository do not. Cargo retains its native target-triple and debug/release/named-profile layout. Existing repository-local target directories and running commands are left untouched. Re-run builds only after adopting a qualified version; this setting cannot relocate a process that is already running.
+
+Supported canonical commands are build, check, test, bench, run, doc, rustc, rustdoc, clean, metadata and locate-project on Cargo 1.91+. Direct Cargo, recognized Rustup proxies and `rustup run TOOLCHAIN cargo ...` use the same routing. `dev-cache exec cargo cargo ...` supports it too; an arbitrary shell command cannot establish Cargo workspace identity and is rejected in opt-in mode. Aliases/external subcommands, install/package/publish, unknown/nightly scope options, explicit native output/CLI config settings and ambiguous compiler/configuration selectors abstain. User environment values, even empty ones, remain authoritative. Config is inspected from the invocation directory, including with a foreign `--manifest-path`. Failed native identity discovery on an eligible invocation stops before building rather than silently creating repository-local outputs.
+
+Use `dev-cache path cargo --final-outputs --repo /path/to/workspace` to inspect the retained path without materializing it, or `cargo metadata --no-deps --format-version=1` to get Cargo's effective target directory. Set `RUSTUP_TOOLCHAIN` for a different toolchain query. Status includes the retained path or the reason it cannot be selected. Normal `path cargo` still reports intermediate storage.
+
+Final output resources are cataloged, measured and activity-protected but never removed by Dev Cache GC, including stale/orphan/pressure passes. `retained_outputs_bytes` is included within `other_bytes`, so do not add it to the total again. Retained bytes can make storage targets unattainable. Native `cargo clean` still removes native outputs; retention is not backup, and an executable may still depend on disposable intermediate files. No automatic migration or deletion of old target trees is performed. Remove the enabled `final_outputs` config key before rolling back to an older binary; older readers will also report unfamiliar retained catalog records as issues without collecting them.
+
+This is not a universal build-output redirect:
+
+| Adapter | Final-output boundary |
+|---|---|
+| Cargo | The opt-in route covers Cargo's target tree; custom build scripts and explicit compiler/output arguments can emit elsewhere. |
+| Go | Build/module/temp caches are routed; final `go build -o` output and installed `GOBIN` remain native. |
+| ccache / sccache | Compiler caches are routed; emitted compiler/linker outputs remain caller-selected. |
+| Zig | Global/local caches are routed; `zig-out`, installation prefixes and custom steps remain native. |
+| Meson | Package cache is routed; setup/build-tree arguments remain native. |
+| npm / pnpm / Yarn / Bun | Supported package/transpiler caches are routed; arbitrary scripts and Bun build output require tool/project-specific configuration. |
+| uv / pip | Supported caches are routed; environments, wheels, sdists and download destinations remain native. |
+| Temp | Temporary files only; no generic final-output setting. |
+
+[ADR 0105](adr/0105-retained-cargo-final-outputs.md) defines identity, bounded discovery, retention, nested overrides and qualification limits.
 
 ## Explicit native container build cache
 
@@ -32,7 +59,8 @@ Status, doctor, report, path lookup, migration previews and explicit GC previews
 
 | Resource | Collection behavior |
 |---|---|
-| Cargo intermediate build directories, Go/ccache/generic temporary directories, pnpm metadata, uv managed-Python archives, Zig caches, Meson package downloads, Bun transpiler cache | Transactional rename into same-domain trash, then delete; final Cargo outputs, `zig-out`, Meson build trees, installed Python, and emitted artifacts are outside the catalog. |
+| Cargo intermediate build directories, Go/ccache/generic temporary directories, pnpm metadata, uv managed-Python archives, Zig caches, Meson package downloads, Bun transpiler cache | Transactional rename into same-domain trash, then delete; default Cargo outputs, `zig-out`, Meson build trees, installed Python, and emitted artifacts are outside the catalog. |
+| Opt-in Cargo final outputs | Retained, cataloged and measured; GC explicitly abstains under every policy. |
 | sccache local data | Stop the recorded domain-specific server first, then use transactional owned deletion. Remote or foreign backends abstain. |
 | Go build and module caches | Invoke the recorded real Go executable with `go clean -cache` or `go clean -modcache` and the exact managed native environment. |
 | npm cache | Invoke npm's cache cleanup against the exact managed cache. |

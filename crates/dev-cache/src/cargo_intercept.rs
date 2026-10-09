@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -95,7 +95,7 @@ pub fn persistent_compiler_wrapper(start: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn cargo_config_files(start: &Path) -> Vec<PathBuf> {
+pub(crate) fn cargo_config_files(start: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let start = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     for ancestor in start.ancestors() {
@@ -105,19 +105,40 @@ fn cargo_config_files(start: &Path) -> Vec<PathBuf> {
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::config::home_dir().join(".cargo"));
+    let cargo_home = if cargo_home.is_absolute() {
+        cargo_home
+    } else {
+        start.join(cargo_home)
+    };
     candidates.push(cargo_home.join("config.toml"));
     candidates.push(cargo_home.join("config"));
     candidates
 }
 
 fn read_cargo_config(candidate: &Path) -> Result<toml::Value> {
-    let raw = fs::read_to_string(candidate)
-        .with_context(|| format!("read Cargo configuration {}", candidate.display()))?;
+    let raw = read_configuration(candidate)?
+        .context("Cargo configuration disappeared during observation")?;
     toml::from_str(&raw)
         .with_context(|| format!("parse Cargo configuration {}", candidate.display()))
 }
 
 pub fn cargo_supports_build_dir(real: &Path, args: &[OsString]) -> bool {
+    cargo_supports_build_dir_at(real, args, None)
+}
+
+pub(crate) fn cargo_supports_build_dir_at(
+    real: &Path,
+    args: &[OsString],
+    cwd: Option<&Path>,
+) -> bool {
+    cargo_build_dir_capability(real, args, cwd).unwrap_or(false)
+}
+
+pub(crate) fn cargo_build_dir_capability(
+    real: &Path,
+    args: &[OsString],
+    cwd: Option<&Path>,
+) -> Result<bool> {
     let mut command = Command::new(real);
     if let Some(selector) = args
         .first()
@@ -125,33 +146,46 @@ pub fn cargo_supports_build_dir(real: &Path, args: &[OsString]) -> bool {
     {
         command.arg(selector);
     }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     command.arg("--version");
-    command
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|output| cargo_version(&output))
-        .is_some_and(|(major, minor)| major > 1 || (major == 1 && minor >= 91))
+    supports_build_dir_probe(command)
 }
 
 pub fn rustup_cargo_supports_build_dir(real: &Path, args: &[OsString]) -> bool {
-    let Some(cargo_index) = args.iter().position(|arg| {
-        Path::new(arg)
-            .file_stem()
-            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case("cargo"))
-    }) else {
-        return false;
-    };
-    Command::new(real)
-        .args(&args[..=cargo_index])
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|output| cargo_version(&output))
-        .is_some_and(|(major, minor)| major > 1 || (major == 1 && minor >= 91))
+    rustup_cargo_build_dir_capability(real, args).unwrap_or(false)
+}
+
+pub(crate) fn rustup_cargo_build_dir_capability(real: &Path, args: &[OsString]) -> Result<bool> {
+    let cargo_args = rustup_cargo_args(args).context("unsupported Rustup Cargo invocation")?;
+    let prefix_len = args.len() - cargo_args.len();
+    let mut command = Command::new(real);
+    command
+        .args(args[..prefix_len].iter().filter(|arg| *arg != "--install"))
+        .arg("--version");
+    supports_build_dir_probe(command)
+}
+
+fn supports_build_dir_probe(mut command: Command) -> Result<bool> {
+    command
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("DEV_CACHE_MODE", "off");
+    let output = dev_tools_command::run_prepared_bounded_command(
+        &mut command,
+        std::time::Duration::from_secs(10),
+        64 * 1024,
+    )
+    .context("observe Cargo output-layout capability")?;
+    if !output.status.success() {
+        bail!("Cargo capability probe failed");
+    }
+    let output = String::from_utf8(output.stdout).context("unrecognized Cargo capability")?;
+    if !output.starts_with("cargo ") {
+        bail!("unrecognized Cargo capability");
+    }
+    let (major, minor) = cargo_version(&output).context("unrecognized Cargo capability")?;
+    Ok(major > 1 || (major == 1 && minor >= 91))
 }
 
 fn cargo_version(output: &str) -> Option<(u64, u64)> {
@@ -314,12 +348,26 @@ pub fn delegate(
     environment: &[(String, String)],
     help_prefix: Option<&str>,
 ) -> Result<i32> {
+    delegate_with_removals(real, args, environment, &[], help_prefix)
+}
+
+pub fn delegate_with_removals(
+    real: &Path,
+    args: &[OsString],
+    environment: &[(String, String)],
+    remove: &[&str],
+    help_prefix: Option<&str>,
+) -> Result<i32> {
     if let Some(prefix) = help_prefix {
         let mut stdout = io::stdout().lock();
         stdout.write_all(prefix.as_bytes())?;
         stdout.flush()?;
     }
-    let status = Command::new(real)
+    let mut command = Command::new(real);
+    for name in remove {
+        command.env_remove(name);
+    }
+    let status = command
         .args(args)
         .envs(environment.iter().cloned())
         .stdin(Stdio::inherit())
@@ -330,6 +378,49 @@ pub fn delegate(
     Ok(status
         .code()
         .unwrap_or_else(|| if status.success() { 0 } else { 1 }))
+}
+
+pub(crate) fn read_configuration(path: &Path) -> Result<Option<String>> {
+    const LIMIT: u64 = 1024 * 1024;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("unreadable Cargo configuration"),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        bail!("Cargo configuration must be a bounded regular file");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            bail!("Cargo configuration cannot be a reparse point");
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("Cargo configuration exceeds the observation limit");
+    }
+    Ok(Some(
+        String::from_utf8(bytes).context("non-Unicode Cargo configuration")?,
+    ))
 }
 
 #[cfg(test)]

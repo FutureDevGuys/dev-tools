@@ -15,6 +15,7 @@ const SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "kebab-case")]
 pub enum ResourceKind {
     CargoIntermediate,
+    CargoFinalOutput,
     SccacheLocal,
     GoBuild,
     GoModule,
@@ -39,6 +40,8 @@ pub enum ResourceKind {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CleanupStrategy {
+    /// Owned and measured, but never disposable through Dev Cache GC.
+    Retain,
     OwnedDirectory,
     SccacheServerAware,
     GoBuild,
@@ -133,6 +136,9 @@ pub fn register_routed(
             }
             record
         } else {
+            if kind == ResourceKind::CargoFinalOutput && directory_nonempty(&absolute)? {
+                bail!("cannot adopt unregistered final build outputs");
+            }
             let mut initial_hazards = BTreeSet::new();
             if linked_state_sensitive(kind) && directory_nonempty(&absolute)? {
                 initial_hazards.insert("existing-linked-state-unknown".to_owned());
@@ -158,6 +164,7 @@ pub fn register_routed(
                 native_environment: native.environment.clone(),
             }
         };
+        validate_record(root, &record)?;
         record.last_started_unix = now;
         record.last_completed_unix = None;
         record.hazards.extend(
@@ -408,6 +415,15 @@ pub fn validate_record(root: &RootHandle, record: &ResourceRecord) -> Result<()>
     }
     let absolute = root.platform_root.join(&record.relative_path);
     checked_relative(root, &absolute)?;
+    let retained = record.kind == ResourceKind::CargoFinalOutput;
+    if retained != (record.cleanup == CleanupStrategy::Retain)
+        || retained != record.relative_path.starts_with("outputs")
+        || (retained
+            && (record.adapter != Adapter::Cargo
+                || !record.relative_path.starts_with("outputs/cargo")))
+    {
+        bail!("invalid retained Cargo output ownership");
+    }
     Ok(())
 }
 
@@ -493,6 +509,7 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 
 fn cleanup_strategy(kind: ResourceKind) -> CleanupStrategy {
     match kind {
+        ResourceKind::CargoFinalOutput => CleanupStrategy::Retain,
         ResourceKind::SccacheLocal => CleanupStrategy::SccacheServerAware,
         ResourceKind::GoBuild => CleanupStrategy::GoBuild,
         ResourceKind::GoModule => CleanupStrategy::GoModule,
@@ -537,6 +554,7 @@ fn hazard_applies(kind: ResourceKind, hazard: &str) -> bool {
 fn resource_kind(variable: &str) -> Option<ResourceKind> {
     Some(match variable {
         "CARGO_BUILD_BUILD_DIR" => ResourceKind::CargoIntermediate,
+        "CARGO_TARGET_DIR" => ResourceKind::CargoFinalOutput,
         "SCCACHE_DIR" => ResourceKind::SccacheLocal,
         "GOCACHE" => ResourceKind::GoBuild,
         "GOMODCACHE" => ResourceKind::GoModule,

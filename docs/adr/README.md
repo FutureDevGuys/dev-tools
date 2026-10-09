@@ -113,3 +113,5 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0102](0102-dev-cache-scoped-status-and-single-pass-report.md) | Dev Cache scoped status and single-pass space observation | proposed | pending |
 | [0103](0103-dev-cache-indexed-gc-size-observation.md) | Dev Cache indexed GC size observation | proposed | pending |
 | [0104](0104-dev-cache-experimental-native-cache-gate.md) | Default-off experimental native cache | proposed | pending |
+
+| [0105](0105-retained-cargo-final-outputs.md) | Opt-in retained Cargo final-output routing | proposed | pending |

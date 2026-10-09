@@ -372,18 +372,18 @@ fn git_workspace_marker(marker: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn filesystem_identity(path: &Path) -> Result<String> {
+pub(crate) fn filesystem_identity(path: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path)?;
     Ok(format!("{}:{}", meta.dev(), meta.ino()))
 }
 
 #[cfg(windows)]
-fn filesystem_identity(path: &Path) -> Result<String> {
+pub(crate) fn filesystem_identity(path: &Path) -> Result<String> {
     Ok(path.to_string_lossy().to_lowercase())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn filesystem_identity(path: &Path) -> Result<String> {
+pub(crate) fn filesystem_identity(path: &Path) -> Result<String> {
     Ok(path.display().to_string())
 }

@@ -37,11 +37,12 @@ pub fn attach(
     let mut provenance = parse(inherited).unwrap_or_default();
     provenance.schema_version = 1;
     provenance.variables.retain(|name, record| {
-        inherited
-            .get(name)
-            .is_some_and(|value| value == &record.value)
+        name != ENV_NAME
+            && inherited
+                .get(name)
+                .is_some_and(|value| value == &record.value)
     });
-    for (name, value) in routed.iter() {
+    for (name, value) in routed.iter().filter(|(name, _)| name.as_str() != ENV_NAME) {
         provenance.variables.insert(
             name.clone(),
             ManagedVariable {
