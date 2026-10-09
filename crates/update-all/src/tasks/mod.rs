@@ -509,10 +509,10 @@ fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<(
                 "line": record.line,
             }),
         ),
-        DashboardEvent::RunComplete { success, .. } => log.write_event(
+        DashboardEvent::RunComplete { success, canceled, had_failures, .. } => log.write_event(
             "run_completed",
             None,
-            serde_json::json!({"success": success}),
+            serde_json::json!({"success": success, "canceled": canceled, "had_failures": had_failures}),
         ),
         DashboardEvent::UiSuspendRequested { reason, .. } => log.write_event(
             "frontend_suspended",
@@ -2340,6 +2340,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         ctx.note_verbosity,
         ctx.debug_report,
         outcome,
+        failed,
         tasks_completed_at,
     );
     let tasks_ended_unix_ms = now_unix_ms();
@@ -11188,10 +11189,13 @@ fn emit_async_completion_boundary_and_reports<'a>(
     note_verbosity: NoteVerbosity,
     debug_report: bool,
     outcome: AsyncRunOutcome,
+    had_failures: bool,
     completed_at: Instant,
 ) {
     let _ = event_tx.send(DashboardEvent::RunComplete {
         success: outcome == AsyncRunOutcome::Success,
+        canceled: outcome == AsyncRunOutcome::Canceled,
+        had_failures,
         completed_at,
     });
     emit_end_of_run_reports_async_logs(
@@ -12320,9 +12324,18 @@ fn attention_rows<'a>(
         {
             rows.push(AttentionRow {
                 task: sanitize_report_cell_text(&entry.label),
-                severity: AdvisorySeverity::Error,
+                severity: if entry.result.status == TaskStatus::Canceled {
+                    AdvisorySeverity::Warning
+                } else {
+                    AdvisorySeverity::Error
+                },
                 issue: sanitize_report_cell_text(&entry.result.primary_detail()),
-                action: "check task log".to_string(),
+                action: if entry.result.status == TaskStatus::Canceled {
+                    "rerun task when ready"
+                } else {
+                    "check task log"
+                }
+                .to_string(),
             });
         }
     }

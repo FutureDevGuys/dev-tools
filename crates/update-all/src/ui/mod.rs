@@ -191,6 +191,8 @@ pub enum DashboardEvent {
     LogLine(LogRecord),
     RunComplete {
         success: bool,
+        canceled: bool,
+        had_failures: bool,
         completed_at: Instant,
     },
     UiSuspendRequested {

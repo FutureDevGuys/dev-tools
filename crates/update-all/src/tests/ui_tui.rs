@@ -1794,10 +1794,36 @@ fn run_complete_event_uses_task_completion_instant() {
     let completed = started + std::time::Duration::from_secs(7);
     model.started_at = started;
 
-    apply_run_complete_event(&mut model, true, completed);
+    apply_run_complete_event(&mut model, true, false, false, completed);
 
     assert_eq!(model.run_complete, Some(true));
     assert_eq!(model_elapsed(&model).as_secs(), 7);
+}
+
+#[test]
+fn run_completion_header_preserves_cancellation_and_real_failures() {
+    for (success, canceled, had_failures, label, color) in [
+        (true, false, false, " completed ", Color::LightGreen),
+        (false, true, false, " canceled ", Color::Yellow),
+        (false, true, true, " failed ", Color::LightRed),
+        (false, false, true, " failed ", Color::LightRed),
+        (false, false, false, " failed ", Color::LightRed),
+    ] {
+        // No task rows: completion facts must also cover journal failures and
+        // cancellation after a child has already completed.
+        let mut model = Model::new(200, true, true);
+        apply_run_complete_event(&mut model, success, canceled, had_failures, Instant::now());
+        assert_eq!(run_completion_style(&model), (label, color));
+    }
+    let mut model = Model::new(200, true, true);
+    assert_eq!(run_completion_style(&model), (" running ", Color::Yellow));
+    model.register_task("one".into(), "One".into(), Vec::new(), true);
+    model.set_task_state("one", TaskState::Canceled, None);
+    apply_run_complete_event(&mut model, true, false, false, Instant::now());
+    assert_eq!(
+        run_completion_style(&model),
+        (" completed ", Color::LightGreen)
+    );
 }
 
 #[test]

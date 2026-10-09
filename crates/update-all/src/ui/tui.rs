@@ -139,6 +139,8 @@ struct Model {
     display_name: Option<String>,
     run_completed_at: Option<Instant>,
     run_complete: Option<bool>,
+    run_canceled: bool,
+    run_had_failures: bool,
     cancel_requested: bool,
     task_order: Vec<String>,
     tasks: BTreeMap<String, TaskRow>,
@@ -195,6 +197,8 @@ impl Model {
             display_name: None,
             run_completed_at: None,
             run_complete: None,
+            run_canceled: false,
+            run_had_failures: false,
             cancel_requested: false,
             task_order: Vec::new(),
             tasks: BTreeMap::new(),
@@ -616,8 +620,16 @@ pub fn run_dashboard(
                     DashboardEvent::LogLine(rec) => pending_logs.push_back(rec),
                     DashboardEvent::RunComplete {
                         success,
+                        canceled,
+                        had_failures,
                         completed_at,
-                    } => apply_run_complete_event(&mut model, success, completed_at),
+                    } => apply_run_complete_event(
+                        &mut model,
+                        success,
+                        canceled,
+                        had_failures,
+                        completed_at,
+                    ),
                     DashboardEvent::UiSuspendRequested { reason, ack } => {
                         if !suspended {
                             if let Some(mut t) = terminal.take() {
@@ -742,8 +754,16 @@ fn normalize_active_pane(model: &mut Model) {
     }
 }
 
-fn apply_run_complete_event(model: &mut Model, success: bool, completed_at: Instant) {
+fn apply_run_complete_event(
+    model: &mut Model,
+    success: bool,
+    canceled: bool,
+    had_failures: bool,
+    completed_at: Instant,
+) {
     model.run_complete = Some(success);
+    model.run_canceled = canceled;
+    model.run_had_failures = had_failures;
     model.run_completed_at.get_or_insert(completed_at);
 }
 
@@ -1529,21 +1549,22 @@ fn inner_rect(rect: Rect) -> Rect {
     )
 }
 
+fn run_completion_style(model: &Model) -> (&'static str, Color) {
+    match model.run_complete {
+        None => (" running ", Color::Yellow),
+        Some(_) if model.run_had_failures => (" failed ", Color::LightRed),
+        Some(_) if model.run_canceled => (" canceled ", Color::Yellow),
+        Some(true) => (" completed ", Color::LightGreen),
+        Some(false) => (" failed ", Color::LightRed),
+    }
+}
+
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &LayoutRects) {
     frame.render_widget(Clear, layout.root);
 
-    let status_color = match model.run_complete {
-        Some(true) => Color::LightGreen,
-        Some(false) => Color::LightRed,
-        None => Color::Yellow,
-    };
+    let (result_label, status_color) = run_completion_style(model);
     let (pending, running, completed, failed, canceled) = model.task_state_counts();
     let elapsed = model_elapsed(model);
-    let result_label = match model.run_complete {
-        Some(true) => " completed ",
-        Some(false) => " failed ",
-        None => " running ",
-    };
     let header = Paragraph::new(Line::from(render_header_spans(
         model,
         result_label,

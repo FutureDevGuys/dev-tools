@@ -3080,6 +3080,85 @@ fn attention_required_surfaces_warning_advisory_details() {
 }
 
 #[test]
+fn attention_required_distinguishes_cancellation_from_real_errors() {
+    let canceled = TaskResult::canceled("Canceled", "canceled by user");
+    let failed = TaskResult::failed("Failed", "real command failure");
+    let rows = attention_rows(
+        [("canceled", &canceled), ("failed", &failed)],
+        &BTreeMap::new(),
+    );
+    let canceled_row = rows.iter().find(|row| row.task == "Canceled").unwrap();
+    assert_eq!(canceled_row.severity, AdvisorySeverity::Warning);
+    assert_eq!(canceled_row.action, "rerun task when ready");
+    let failed_row = rows.iter().find(|row| row.task == "Failed").unwrap();
+    assert_eq!(failed_row.severity, AdvisorySeverity::Error);
+    assert_eq!(failed_row.action, "check task log");
+
+    let mut canceled_with_error = canceled;
+    canceled_with_error.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Error,
+        code: "real-error".into(),
+        summary: "real diagnostic".into(),
+        remediation: "inspect failure".into(),
+        blocks_dependents: false,
+    });
+    canceled_with_error.report_sections.push(TaskReportSection {
+        key: "fixture".into(),
+        title: "Fixture".into(),
+        rows: vec![TaskReportRow {
+            name: "failed item".into(),
+            status: TaskReportStatus::Failed,
+            before: None,
+            after: None,
+            note: None,
+        }],
+    });
+    let explicit = attention_rows([("canceled", &canceled_with_error)], &BTreeMap::new());
+    assert_eq!(explicit.len(), 2);
+    assert!(explicit
+        .iter()
+        .all(|row| row.severity == AdvisorySeverity::Error));
+}
+
+#[test]
+fn completion_event_retains_cancellation_and_failure_facts_in_journal() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let (raw_tx, rx) = mpsc::channel();
+    let tx = DashboardSender::new(raw_tx, Some(log.clone()));
+    emit_async_completion_boundary_and_reports(
+        &tx,
+        Some(&log),
+        std::iter::empty(),
+        &BTreeMap::new(),
+        crate::config::NoteVerbosity::All,
+        false,
+        AsyncRunOutcome::Canceled,
+        true,
+        Instant::now(),
+    );
+    assert!(matches!(
+        rx.recv().unwrap(),
+        DashboardEvent::RunComplete {
+            success: false,
+            canceled: true,
+            had_failures: true,
+            ..
+        }
+    ));
+    let journal = fs::read_to_string(log.run_dir().join("events.jsonl")).unwrap();
+    let completed = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["kind"] == "run_completed")
+        .unwrap();
+    assert_eq!(
+        completed["payload"],
+        serde_json::json!({"success": false, "canceled": true, "had_failures": true})
+    );
+}
+
+#[test]
 fn arch_update_service_rows_render_as_restarts_not_package_updates() {
     let mut result = TaskResult::completed("Svc Restart");
     result.report_sections.push(TaskReportSection {
@@ -5451,6 +5530,7 @@ fn async_completion_boundary_precedes_end_report_logs() {
         crate::config::NoteVerbosity::All,
         false,
         AsyncRunOutcome::Success,
+        false,
         Instant::now(),
     );
     drop(event_tx);

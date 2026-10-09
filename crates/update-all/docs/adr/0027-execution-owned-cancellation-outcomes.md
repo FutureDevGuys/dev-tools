@@ -20,6 +20,8 @@ The primary command, pre-command, sudo-refresh execution retry and transient loc
 
 After the direct child exits, ordinary pipe capture remains cancellation-aware while draining descendant output. A cancellation request still cleans the owned group but does not replace the already-observed direct-child status. The registration remains held until draining ends. Forced shutdown after the existing grace period retains its explicit direct-termination operation and existing outcome policy. Log messages distinguish a request from proven termination.
 
+Completion presentation carries explicit cancellation and genuine-failure facts from the engine alongside the existing success flag. A canceled run has a yellow canceled header unless genuine task or journal failures require the failed header. Cancel-one keeps the existing overall completion presentation. The synthesized canceled-task attention row is a warning with a rerun suggestion; explicit error advisories and failed report rows keep their original severity. Exit codes and task outcomes are unchanged.
+
 ## Invariants
 
 - The execution owner, not a competing normal UI signal, attributes ordinary command cancellation.
@@ -46,10 +48,13 @@ Normal cancellation can take the existing wait polling interval to reach the exe
 - `cancellation_does_not_replace_an_observed_process_exit`
 - `cancellation_drain_keeps_exited_status_and_releases_descendant_pipes`
 - `controlled_capture_cancel_terminates_descendants`
+- `run_completion_header_preserves_cancellation_and_real_failures`
+- `attention_required_distinguishes_cancellation_from_real_errors`
+- `completion_event_retains_cancellation_and_failure_facts_in_journal`
 
 ## Runtime acceptance
 
-Use a standalone source candidate and disposable catalogs. Verify cancel-all and cancel-one using the actual dashboard, without a pager and after returning from one. Task/run JSON, journal and dashboard must agree on canceled outcomes. Check pre-command and transient-retry cancellation; do not launch later work. Keep already-finished success and genuine failure outcomes in mixed runs. Exercise an active TERM-resistant descendant and a direct child that exits while a descendant retains its output pipes; cancel-one must finish cleanup without losing the direct child's actual outcome. Verify the existing forced-grace path. Source checks do not establish signed-release or installed-successor acceptance.
+Use a standalone source candidate and disposable catalogs. Verify cancel-all and cancel-one using the actual dashboard, without a pager and after returning from one. Task/run JSON, journal and dashboard must agree on canceled outcomes. Check pre-command and transient-retry cancellation; do not launch later work. Keep already-finished success and genuine failure outcomes in mixed runs. Exercise an active TERM-resistant descendant and a direct child that exits while a descendant retains its output pipes; cancel-one must finish cleanup without losing the direct child's actual outcome. Verify the existing forced-grace path. Inspect the actual final header and Needs Attention rows for a canceled-only run and a canceled run with genuine failures; journal completion facts, displayed labels and counters must agree without changing exit codes. Source checks do not establish signed-release or installed-successor acceptance.
 
 ## Supersession conditions
 
