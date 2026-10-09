@@ -42,6 +42,8 @@ Each task and the combined dashboard pane still retain separate bounded windows.
 
 Crossterm remains a required dependency for terminal colors and width discovery in plain reports. The optional `tui` feature controls Ratatui dashboard rendering; disabling it must leave the plain reporting build functional.
 
+Ordinary command tasks preserve the execution owner's typed cancellation error through the primary command, pre-command and command retry boundaries so the scheduler records cancellation rather than a command failure. Diagnostic text, a nonzero process exit or a later cancellation request alone does not reclassify a completed task outcome. [ADR 0027](0027-execution-owned-cancellation-outcomes.md) defines cancellation ownership and preservation of already-observed outcomes. Optional report/recovery policies remain separate.
+
 The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt exit status 2 means the user dismissed that viewer with Ctrl-C, so it resumes the dashboard without a failure advisory. This status convention applies only to Less; launch errors, other nonzero statuses and signal termination remain failures. The existing signal-cancellation suppression during log viewing is unchanged, and updater cancellation outside the viewer remains independent.
 
 ## Verification
@@ -81,12 +83,15 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 - `diagnostic_rollup_preserves_complete_notes_at_every_verbosity`
 - `diagnostic_rollup_colors_do_not_change_transaction_status`
 - `log_pager_accepts_only_less_interrupt_status`
+- `command_task_preserves_typed_cancellation_from_primary_and_pre_command`
+- `command_task_does_not_infer_cancellation_from_failure_text`
+- `command_task_preserves_typed_cancellation_from_transient_retry`
 
 ## Runtime acceptance
 
 Run a controlled catalog fixture with stdout and stderr diagnostics, more unique warnings than the sample budget, a late error and multiline result text. Verify complete disk logs, journal line boundaries, diagnostic severity and the omitted-sample notice. Check dashboard tail eviction counts. Repeat the npm lane against a disposable user-owned installation with a manifest-current but broken launcher and verify bounded recovery without persisted lifecycle trust. Native Windows and WSL acceptance and installed-release activation remain separate gates.
 
-In a real terminal, open active and completed task/run logs with the actual Less executable, dismiss with Ctrl-C, reopen, and verify dashboard recovery without a viewer-failure advisory or cancelled tasks. Separately verify that a genuine viewer error still emits the failure advisory and that the dashboard's cancel-all control still cancels its tasks after returning. A source-binary check is not signed-release acceptance.
+In a real terminal, open active and completed task/run logs with the actual Less executable, dismiss with Ctrl-C, reopen, and verify dashboard recovery without a viewer-failure advisory or cancelled tasks. Separately verify that a genuine viewer error still emits the failure advisory and that the dashboard's cancel-all control still cancels its tasks after returning. A source-binary check is not signed-release acceptance. Independently cancel active ordinary commands without opening a pager and verify canceled task state/counts in the dashboard, event journal and task/run JSON. Repeat with a pre-command and a transient retry; completed successes and genuine earlier failures in the same run must keep their original outcomes.
 
 ## Supersession conditions
 

@@ -915,6 +915,23 @@ impl RuntimeControl {
         if let Ok(mut set) = self.per_task_cancel.lock() {
             set.insert(task_id.to_string());
         }
+        // The execution owner observes this request, terminates its child and
+        // returns typed cancellation. A second killer races that attribution.
+        self.running_pids
+            .lock()
+            .map(|map| map.contains_key(task_id))
+            .unwrap_or(false)
+    }
+
+    fn request_cancel_all(&self) -> Vec<String> {
+        self.cancel_all.store(true, Ordering::SeqCst);
+        self.running_pids
+            .lock()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn force_terminate_task(&self, task_id: &str) {
         let process = self
             .running_pids
             .lock()
@@ -926,30 +943,7 @@ impl RuntimeControl {
             } else {
                 terminate_process(process.pid);
             }
-            return true;
         }
-        false
-    }
-
-    fn request_cancel_all(&self) -> Vec<String> {
-        self.cancel_all.store(true, Ordering::SeqCst);
-        let mut running = Vec::new();
-        if let Ok(map) = self.running_pids.lock() {
-            for (task_id, process) in map.iter() {
-                running.push(task_id.clone());
-                if process.managed_process_group {
-                    terminate_process_group(process.pid);
-                } else {
-                    terminate_process(process.pid);
-                }
-            }
-        }
-        if let Ok(mut set) = self.per_task_cancel.lock() {
-            for id in &running {
-                set.insert(id.clone());
-            }
-        }
-        running
     }
 
     fn register_stdin_sender(&self, task_id: &str, tx: mpsc::Sender<String>) {
@@ -1291,6 +1285,15 @@ impl SyncContext {
         let mut capture_this_run = capture_foreground_output;
 
         loop {
+            // A request admitted during retry backoff must not launch new work.
+            if cancel::is_cancel_requested()
+                || self
+                    .runtime_control
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.should_cancel(task_id))
+            {
+                return Err(anyhow::anyhow!(crate::Cancelled));
+            }
             let args_for_run = args.clone();
             let task = task_id.to_string();
             let cb = self.build_stream_callback(task_id, interactive && capture_this_run);
@@ -1958,7 +1961,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                         &event_tx,
                         ctx.run_log.as_ref(),
                         &task_id,
-                        "cancel-all requested (running process terminated)",
+                        "cancel-all requested (execution owner notified)",
                     );
                 }
                 let pending_ids: Vec<String> = pending.keys().cloned().collect();
@@ -2001,7 +2004,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                     }
 
                     let running_task = running.iter().any(|(task_id, _, _)| task_id == &id);
-                    let killed_running = runtime_control.request_task_cancel(&id);
+                    let active_process = runtime_control.request_task_cancel(&id);
                     if running_task {
                         handled = true;
                     }
@@ -2011,8 +2014,8 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                         ctx.run_log.as_ref(),
                         &id,
                         if handled {
-                            if killed_running {
-                                "cancel requested (running process terminated)"
+                            if active_process {
+                                "cancel requested (execution owner notified)"
                             } else {
                                 "cancel requested"
                             }
@@ -2033,7 +2036,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                             &event_tx,
                             ctx.run_log.as_ref(),
                             &task_id,
-                            "cancel-all requested (running process terminated)",
+                            "cancel-all requested (execution owner notified)",
                         );
                     }
                     let pending_ids: Vec<String> = pending.keys().cloned().collect();
@@ -2247,6 +2250,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                         .collect();
                     for task_id in running_ids {
                         let _ = runtime_control.request_task_cancel(&task_id);
+                        runtime_control.force_terminate_task(&task_id);
                         emit_runtime_log(
                             &event_tx,
                             ctx.run_log.as_ref(),
@@ -3638,6 +3642,7 @@ fn run_command_task_inner(
         effective_interactive,
     ) {
         Ok(out) => out,
+        Err(e) if e.downcast_ref::<crate::Cancelled>().is_some() => return Err(e),
         Err(e) => {
             let err_text = if let Some(output) = process_exit_output(&e) {
                 output.to_string()
@@ -3701,6 +3706,9 @@ fn run_command_task_inner(
                             "sudo session refresh retry succeeded".to_string(),
                         );
                         out
+                    }
+                    Err(retry_err) if retry_err.downcast_ref::<crate::Cancelled>().is_some() => {
+                        return Err(retry_err);
                     }
                     Err(retry_err) => {
                         let retry_text = if let Some(output) = process_exit_output(&retry_err) {
@@ -3838,6 +3846,11 @@ fn run_command_task_inner(
                                 "transient retry succeeded".to_string(),
                             );
                             out
+                        }
+                        Err(retry_err)
+                            if retry_err.downcast_ref::<crate::Cancelled>().is_some() =>
+                        {
+                            return Err(retry_err);
                         }
                         Err(retry_err) => {
                             let retry_text = if let Some(output) = process_exit_output(&retry_err) {
@@ -4496,6 +4509,7 @@ fn run_command_pre_commands(
             run_command_with_transcript(ctx, &spec.id, policy, &program, &args, pre_execution_path)
         } {
             Ok(output) => output,
+            Err(err) if err.downcast_ref::<crate::Cancelled>().is_some() => return Err(err),
             Err(err) => {
                 let err_text = process_exit_output(&err)
                     .map(str::to_string)

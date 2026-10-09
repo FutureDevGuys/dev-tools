@@ -10,6 +10,53 @@ fn write_executable(path: &Path, content: &str) {
     write_executable_atomic(path, content).unwrap();
 }
 
+#[test]
+fn cancellation_does_not_replace_an_observed_process_exit() {
+    for code in [0, 42] {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &format!("exit {code}")])
+            .spawn()
+            .unwrap();
+        let observed = child.wait().unwrap();
+        let result = wait_with_cancel_timeout(
+            &mut child,
+            Some(Duration::from_secs(1)),
+            Some(Arc::new(|| true)),
+            None,
+        );
+        assert!(matches!(result, Ok(status) if status == observed));
+    }
+}
+
+#[test]
+fn cancellation_drain_keeps_exited_status_and_releases_descendant_pipes() {
+    use std::os::unix::process::CommandExt;
+    for code in [0, 42] {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &format!("/bin/sleep 5 & exit {code}")])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = Some(std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
+        }));
+        let observed = child.wait().unwrap();
+        assert_eq!(observed.code(), Some(code));
+        assert!(!reader.as_ref().unwrap().is_finished());
+        let cancellation: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let started = std::time::Instant::now();
+        wait_for_pipe_readers(&mut child, true, [&reader, &None], Some(&cancellation));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(child.try_wait().unwrap(), Some(observed));
+        assert!(join_pipe_reader(reader.unwrap()).is_empty());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn successful_capture_keeps_unterminated_stdout_separate_from_stderr() {

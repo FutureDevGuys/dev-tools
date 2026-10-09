@@ -887,31 +887,44 @@ where
         None
     };
 
-    let status =
-        match wait_with_cancel_timeout(&mut child, timeout, cancel_check, guard_state.clone()) {
-            Ok(s) => s,
-            Err(WaitOutcome::Cancelled) => {
-                terminate_child(&mut child, managed_process_group);
-                let _ = child.wait();
-                return Err(anyhow!(Cancelled));
-            }
-            Err(WaitOutcome::TimedOut) => {
-                terminate_child(&mut child, managed_process_group);
-                let _ = child.wait();
-                bail!("timeout running {program}");
-            }
-            Err(WaitOutcome::GuardTriggered(reason)) => {
-                terminate_child(&mut child, managed_process_group);
-                let _ = child.wait();
-                return Err(anyhow!(CaptureGuardError { reason }));
-            }
-            Err(WaitOutcome::Other(e)) => return Err(e),
-        };
+    let status = match wait_with_cancel_timeout(
+        &mut child,
+        timeout,
+        cancel_check.clone(),
+        guard_state.clone(),
+    ) {
+        Ok(s) => s,
+        Err(WaitOutcome::Cancelled) => {
+            terminate_child(&mut child, managed_process_group);
+            let _ = child.wait();
+            return Err(anyhow!(Cancelled));
+        }
+        Err(WaitOutcome::TimedOut) => {
+            terminate_child(&mut child, managed_process_group);
+            let _ = child.wait();
+            bail!("timeout running {program}");
+        }
+        Err(WaitOutcome::GuardTriggered(reason)) => {
+            terminate_child(&mut child, managed_process_group);
+            let _ = child.wait();
+            return Err(anyhow!(CaptureGuardError { reason }));
+        }
+        Err(WaitOutcome::Other(e)) => return Err(e),
+    };
 
     if let Some(reason) = guard_state.as_ref().and_then(|state| state.reason()) {
         return Err(anyhow!(CaptureGuardError { reason }));
     }
 
+    // The direct child may exit while its descendants still hold the pipes.
+    // Retain its observed status, but keep owning cancellation of that group
+    // until capture drains; cancel-one must not strand those descendants.
+    wait_for_pipe_readers(
+        &mut child,
+        managed_process_group,
+        [&stdout_reader, &stderr_reader],
+        cancel_check.as_ref(),
+    );
     let out_bytes = stdout_reader.map(join_pipe_reader).unwrap_or_default();
     let err_bytes = stderr_reader.map(join_pipe_reader).unwrap_or_default();
     stdin_writer_stop.store(true, Ordering::SeqCst);
@@ -1541,6 +1554,27 @@ fn looks_like_partial_interactive_prompt(line_buf: &[u8]) -> bool {
         || trimmed.ends_with('?')
 }
 
+fn wait_for_pipe_readers(
+    child: &mut std::process::Child,
+    managed_process_group: bool,
+    readers: [&Option<JoinHandle<Vec<u8>>>; 2],
+    cancel_check: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
+) {
+    let mut cleanup_requested = false;
+    while readers
+        .iter()
+        .any(|reader| reader.as_ref().is_some_and(|handle| !handle.is_finished()))
+    {
+        if !cleanup_requested
+            && (cancel::is_cancel_requested() || cancel_check.is_some_and(|cb| cb()))
+        {
+            terminate_child(child, managed_process_group);
+            cleanup_requested = true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn join_pipe_reader(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
     handle.join().unwrap_or_default()
 }
@@ -1562,7 +1596,13 @@ fn wait_with_cancel_timeout(
     let mut elapsed = Duration::from_millis(0);
     loop {
         if cancel::is_cancel_requested() || cancel_check.as_ref().is_some_and(|cb| cb()) {
-            return Err(WaitOutcome::Cancelled);
+            // A cancellation request cannot erase an already-observable exit.
+            // Only the execution owner decides to terminate a still-live child.
+            return match child.try_wait() {
+                Ok(Some(status)) => Ok(status),
+                Ok(None) => Err(WaitOutcome::Cancelled),
+                Err(error) => Err(WaitOutcome::Other(anyhow!(error))),
+            };
         }
         if let Some(state) = &guard_state {
             state.mark_stall_if_needed();

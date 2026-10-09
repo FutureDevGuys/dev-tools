@@ -1475,6 +1475,170 @@ fn sudo_session_task_respects_skip_mode() {
         .unwrap_or(false));
 }
 
+fn cancellation_command_fixture(script: &str) -> (TaskSpec, CommandTask) {
+    let command = CommandTask {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        mode: None,
+        command_candidates: Vec::new(),
+        pre_commands: Vec::new(),
+        report_commands: Vec::new(),
+        report_patterns: Vec::new(),
+        report_scoped_deltas: Vec::new(),
+        policy_key: "tool_update".to_string(),
+        requires_elevation: false,
+        needs_sudo_session: false,
+        interactive: false,
+        external_window: false,
+        shell: false,
+        windows_bridge: false,
+        report_parser: None,
+        plain_header: None,
+        plain_start: None,
+        success_details: Vec::new(),
+        external_manager_skip: false,
+        result_protocol: None,
+    };
+    let spec = TaskSpec {
+        id: "cancel-fixture".to_string(),
+        label: "Cancellation fixture".to_string(),
+        depends_on: Vec::new(),
+        kind: TaskKind::Command(command.clone()),
+        category: "maintenance".to_string(),
+        resource_locks: BTreeSet::new(),
+    };
+    (spec, command)
+}
+
+#[test]
+fn command_task_preserves_typed_cancellation_from_primary_and_pre_command() {
+    let _lock = env_guard();
+    for pre_command in [false, true] {
+        let runtime = Arc::new(RuntimeControl::default());
+        runtime.cancel_all.store(true, Ordering::SeqCst);
+        let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+        ctx.runtime_control = Some(runtime);
+        let (spec, mut command) = cancellation_command_fixture("/bin/sleep 5");
+        if pre_command {
+            command.pre_commands.push(CommandPreCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "/bin/sleep 5".to_string()],
+            });
+        }
+        let error = run_command_task(&ctx, &spec, &command).unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::Cancelled>().is_some(),
+            "typed cancellation lost (pre-command={pre_command}): {error:#}"
+        );
+    }
+}
+
+#[test]
+fn command_task_does_not_infer_cancellation_from_failure_text() {
+    let _lock = env_guard();
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let (spec, command) = cancellation_command_fixture("printf 'cancelled\\n' >&2; exit 42");
+    let result = run_command_task(&ctx, &spec, &command).unwrap();
+    assert_eq!(result.status, TaskStatus::Failed);
+    assert!(result
+        .details
+        .iter()
+        .any(|detail| detail.contains("cancelled")));
+}
+
+#[test]
+fn command_task_preserves_typed_cancellation_from_transient_retry() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let count = temp.path().join("attempts");
+    let (spec, command) = cancellation_command_fixture(&format!(
+        "if [ ! -f '{}' ]; then touch '{}'; printf 'EBUSY\\n' >&2; exit 1; fi; printf 'RETRY_READY\\n'; while :; do sleep 0.1; done",
+        count.display(), count.display(),
+    ));
+    let runtime = Arc::new(RuntimeControl::default());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.runtime_control = Some(runtime.clone());
+    ctx.task_policies.tool_update.retry_backoff = Duration::from_millis(10);
+    let (event_tx, event_rx) = mpsc::channel();
+    ctx.event_tx = Some(DashboardSender::new(event_tx, None));
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        result_tx
+            .send(run_command_task(&ctx, &spec, &command))
+            .unwrap();
+    });
+    loop {
+        if let DashboardEvent::LogLine(record) =
+            event_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        {
+            if record.line == "RETRY_READY" {
+                // Let the execution owner observe cancellation and perform its cleanup.
+                runtime.cancel_all.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+    let error = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_err();
+    worker.join().unwrap();
+    assert!(
+        error.downcast_ref::<crate::Cancelled>().is_some(),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn normal_cancellation_notifies_owner_and_forced_cleanup_still_terminates() {
+    use wait_timeout::ChildExt;
+    for cancel_all in [false, true] {
+        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let runtime = RuntimeControl::default();
+        runtime.register_spawn("fixture", child.id(), false);
+        if cancel_all {
+            assert_eq!(runtime.request_cancel_all(), vec!["fixture".to_string()]);
+        } else {
+            assert!(runtime.request_task_cancel("fixture"));
+        }
+        assert!(runtime.should_cancel("fixture"));
+        assert!(child
+            .wait_timeout(Duration::from_millis(50))
+            .unwrap()
+            .is_none());
+        runtime.force_terminate_task("fixture");
+        assert!(child
+            .wait_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_some());
+        runtime.clear_spawn("fixture");
+    }
+}
+
+#[test]
+fn command_policy_pending_cancellation_does_not_spawn_new_work() {
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("unexpected-command");
+    let runtime = Arc::new(RuntimeControl::default());
+    runtime.request_task_cancel("fixture");
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.runtime_control = Some(runtime);
+    let error = ctx
+        .run_command_with_policy(
+            "fixture",
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!("printf unexpected > '{}'", marker.display()),
+            ],
+            &TaskPolicy::new(5, 0, 0),
+            false,
+        )
+        .unwrap_err();
+    assert!(error.downcast_ref::<crate::Cancelled>().is_some());
+    assert!(!marker.exists());
+}
+
 #[test]
 fn ui_suspend_waits_for_ack() {
     let mut ctx = test_context(Arc::new(PrivilegeSession::default()));

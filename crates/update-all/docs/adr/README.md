@@ -36,6 +36,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0024](0024-canonical-release-assets-after-incomplete-index.md) | Canonical assets after an incomplete GitHub release index | proposed | pending |
 | [0025](0025-explicit-offline-signed-bundle-intake.md) | Explicit offline signed-bundle intake | proposed | pending |
 | [0026](0026-command-output-fidelity-and-bounded-diagnostics.md) | Command output fidelity and bounded diagnostics | proposed | pending |
+| [0027](0027-execution-owned-cancellation-outcomes.md) | Execution-owned cancellation outcomes | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires
