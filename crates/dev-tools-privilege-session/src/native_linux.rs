@@ -403,8 +403,8 @@ struct ChildRecord {
 
 impl ChildRecord {
     fn collect(&mut self) -> Result<()> {
-        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            match self.worker.take().expect("checked worker").join() {
+        if let Some(worker) = self.worker.take_if(|worker| worker.is_finished()) {
+            match worker.join() {
                 Ok(Ok(child)) => {
                     if self.pid.is_some_and(|pid| child.id() != pid) {
                         // Retain this actual owned child for cleanup as well.

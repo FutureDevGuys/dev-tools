@@ -67,13 +67,15 @@ pub(super) fn request(method: &str, path: &str) -> Vec<u8> {
 }
 
 pub(super) fn query_encode(value: &str) -> String {
-    use std::fmt::Write;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::new();
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             encoded.push(char::from(byte));
         } else {
-            write!(encoded, "%{byte:02X}").expect("write to string");
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
     encoded

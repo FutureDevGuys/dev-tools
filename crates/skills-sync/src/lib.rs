@@ -1106,13 +1106,13 @@ impl App {
                 agents
                     .iter()
                     .filter(|agent| {
-                        !installed_agents.contains(agent)
-                            && !(scope == "global"
+                        !(installed_agents.contains(agent)
+                            || (scope == "global"
                                 && agent.as_str() == "codex"
                                 && Self::global_canonical_skill_visible_to_codex(
                                     &home_dir(),
                                     &installed_entry.path,
-                                ))
+                                )))
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -1981,8 +1981,8 @@ impl App {
         let required_agents = self.options.forced_agents.clone();
         let mut failures = Vec::new();
         for scope in ["global", "project"] {
-            if !self.payload.applied.iter().any(|plan| plan.scope == scope)
-                && !(scope == "global" && !self.payload.applied_agent_repairs.is_empty())
+            if !(self.payload.applied.iter().any(|plan| plan.scope == scope)
+                || scope == "global" && !self.payload.applied_agent_repairs.is_empty())
             {
                 continue;
             }

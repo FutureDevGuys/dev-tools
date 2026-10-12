@@ -499,7 +499,7 @@ impl<C> SessionAuthority<C> {
         let flight = self
             .in_flight
             .as_mut()
-            .expect("matched in-flight operation is retained");
+            .ok_or(ReleaseError::Authority(AuthorityError::NoSuchOperation))?;
         // Mark before calling external code; unwinding cannot restore a reusable
         // gate or refund a use. Native coordinator-death cleanup remains required.
         flight.phase = OperationPhase::ReleaseFailed;

@@ -136,22 +136,36 @@ fn inherited_lower_file_limit_is_not_relaxed() {
             },
         )
         .unwrap();
-        let output = capture(shell("printf 12345678"), 1024).unwrap();
+        // Exercise the inherited kernel limit through EFBIG, independently of
+        // host core-collector latency. Only this synthetic shell ignores SIGXFSZ.
+        let output = capture(shell("trap '' XFSZ || exit 97; printf 12345678"), 1024).unwrap();
         assert!(!output.status.success());
         assert_eq!(output.stdout, b"1234");
         return;
     }
     // Only the isolated test process lowers its limits, never the test harness.
-    let status = Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
         .args([
             "--exact",
             "inherited_lower_file_limit_is_not_relaxed",
             "--nocapture",
         ])
-        .env(CHILD, "1")
-        .status()
-        .unwrap();
-    assert!(status.success());
+        .env(CHILD, "1");
+    // Pipe the isolated harness's diagnostics: its four-byte regular-file limit
+    // must not apply to inherited test-runner log files or hide an assertion.
+    let output = dev_tools_command::run_prepared_bounded_command(
+        &mut child,
+        Duration::from_secs(10),
+        64 * 1024,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated lower-limit fixture failed: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn capture(command: Command, limit: usize) -> Result<BoundedCommandOutput, BoundedCommandError> {
