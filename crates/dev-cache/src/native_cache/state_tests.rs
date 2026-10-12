@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Pure state-machine contracts. These fakes do not attest daemon locality.
 //! Public socket admission and process behavior are covered by CLI tests.
 
