@@ -290,8 +290,17 @@ mod linux {
                 let signal: i32 = value[7..].parse().unwrap();
                 let start = Instant::now();
                 let mut sent = false;
-                let output = run_prepared_inherited_command(child("sleep"), || {
-                    if !sent && start.elapsed() > Duration::from_millis(100) {
+                let needs_ready_receipt = signal == libc::SIGQUIT;
+                let helper = if needs_ready_receipt {
+                    "signal-without-core"
+                } else {
+                    "sleep"
+                };
+                let output = run_prepared_inherited_command(child(helper), || {
+                    if !sent
+                        && start.elapsed() > Duration::from_millis(100)
+                        && (!needs_ready_receipt || fixture_root().join("spawned").exists())
+                    {
                         // SAFETY: target is this fixture's own process and a fixed signal.
                         assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
                         sent = true;
@@ -316,6 +325,15 @@ mod linux {
     pub fn run() {
         let args: Vec<_> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("child") {
+            if args.get(2).map(String::as_str) == Some("signal-without-core") {
+                // Only this synthetic helper opts out of host core collection.
+                // Its ready receipt follows the kernel-confirmed setting, so the
+                // SIGQUIT case still tests real signal termination without racing
+                // an unrelated core collector against its unchanged deadline.
+                use rustix::process::{dumpable_behavior, set_dumpable_behavior, DumpableBehavior};
+                set_dumpable_behavior(DumpableBehavior::NotDumpable).unwrap();
+                assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
+            }
             // Atomic helper receipt; it proves actual child execution for admission tests.
             let root = fixture_root();
             if !root.join("spawned").exists() {

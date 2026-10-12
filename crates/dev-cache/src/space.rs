@@ -278,10 +278,10 @@ fn scan_with_files(
         if !metadata.is_file() {
             continue;
         }
-        let relative = entry
-            .path()
-            .strip_prefix(&root.platform_root)
-            .expect("walk is rooted");
+        let Ok(relative) = entry.path().strip_prefix(&root.platform_root) else {
+            result.fail("unsafe-root");
+            return result;
+        };
         let class = if relative.starts_with("workspaces") {
             0
         } else if relative.starts_with("cache") {

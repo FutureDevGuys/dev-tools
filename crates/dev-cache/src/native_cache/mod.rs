@@ -436,7 +436,7 @@ fn execute_with(
     let scope = observe_scope(transport)?;
     check_expected(args, &scope)?;
     report.scope = Some(scope.clone());
-    report.before = Some(accounting(transport)?);
+    let before = report.before.insert(accounting(transport)?);
     if !args.apply {
         return Ok(());
     }
@@ -446,10 +446,7 @@ fn execute_with(
     // Reject the complete selection before any mutation, then revalidate each
     // record immediately before its own provider-side prune operation.
     for id in &args.cache_id {
-        if report
-            .before
-            .as_ref()
-            .unwrap()
+        if before
             .records
             .iter()
             .any(|record| &record.id == id && !record.eligible)
@@ -510,8 +507,7 @@ fn execute_with(
     if observe_scope(transport)? != scope {
         return Err(Failure::Scope);
     }
-    report.after = Some(accounting(transport)?);
-    let after = report.after.as_ref().unwrap();
+    let after = report.after.insert(accounting(transport)?);
     if after
         .records
         .iter()
@@ -636,8 +632,8 @@ fn peer_identity(stream: &std::os::unix::net::UnixStream) -> Result<(i32, u32, u
 #[cfg(target_os = "linux")]
 impl<'a> NativeSocket<'a> {
     fn new(args: &NativeCacheArgs, cancelled: &'a AtomicBool) -> Result<Self, Failure> {
-        let socket =
-            std::fs::canonicalize(args.socket.as_ref().unwrap()).map_err(socket_path_failure)?;
+        let socket = std::fs::canonicalize(args.socket.as_ref().ok_or(Failure::Invalid)?)
+            .map_err(socket_path_failure)?;
         let socket_identity = socket_identity(&socket)?;
         Ok(Self {
             socket,
