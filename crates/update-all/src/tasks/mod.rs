@@ -1180,6 +1180,25 @@ impl SyncContext {
         policy: &TaskPolicy,
         interactive: bool,
     ) -> Result<String> {
+        self.run_command_with_policy_replay(
+            task_id,
+            program,
+            args,
+            policy,
+            interactive,
+            !interactive_sudo_invocation(program, interactive),
+        )
+    }
+
+    fn run_command_with_policy_replay(
+        &self,
+        task_id: &str,
+        program: &str,
+        args: Vec<String>,
+        policy: &TaskPolicy,
+        interactive: bool,
+        allow_replay: bool,
+    ) -> Result<String> {
         // Interactive tasks should use foreground TTY to avoid dashboard/raw-mode
         // contention with tools that may prompt or manipulate terminal state.
         let (foreground_tty, capture_foreground_output) = if interactive {
@@ -1200,6 +1219,7 @@ impl SyncContext {
             interactive,
             foreground_tty,
             capture_foreground_output,
+            allow_replay,
         )
     }
 
@@ -1211,7 +1231,16 @@ impl SyncContext {
         policy: &TaskPolicy,
         interactive: bool,
     ) -> Result<String> {
-        self.run_command_with_policy_mode(task_id, program, args, policy, interactive, true, false)
+        self.run_command_with_policy_mode(
+            task_id,
+            program,
+            args,
+            policy,
+            interactive,
+            true,
+            false,
+            true,
+        )
     }
 
     fn run_command_with_policy_direct_tty(
@@ -1220,8 +1249,18 @@ impl SyncContext {
         program: &str,
         args: Vec<String>,
         policy: &TaskPolicy,
+        allow_replay: bool,
     ) -> Result<String> {
-        self.run_command_with_policy_mode(task_id, program, args, policy, true, true, false)
+        self.run_command_with_policy_mode(
+            task_id,
+            program,
+            args,
+            policy,
+            true,
+            true,
+            false,
+            allow_replay,
+        )
     }
 
     fn run_report_command_with_policy(
@@ -1279,6 +1318,7 @@ impl SyncContext {
         interactive: bool,
         foreground_tty: bool,
         capture_foreground_output: bool,
+        allow_replay: bool,
     ) -> Result<String> {
         let mut attempt = 0u32;
         let mut fallback_consumed = false;
@@ -1536,6 +1576,12 @@ impl SyncContext {
                     if e.downcast_ref::<crate::Cancelled>().is_some() {
                         return Err(e);
                     }
+                    // Sudo may already have authenticated and run part of the
+                    // protected command. Neither a timeout nor captured prose
+                    // establishes that replay is safe.
+                    if !allow_replay {
+                        return Err(e);
+                    }
                     if auto_fallback_enabled && capture_enabled_for_run && !fallback_consumed {
                         if let Some(reason) = capture_guard_reason(&e) {
                             fallback_consumed = true;
@@ -1656,10 +1702,12 @@ pub(crate) fn transient_retry_backoff(base: Duration, retry_index: u32) -> Durat
 }
 
 pub(crate) fn effective_retry_budget(policy: &TaskPolicy, err_text: &str) -> u32 {
-    if classify_runtime_failure(err_text, false) == RuntimeFailureClass::TransientNetwork {
-        policy.retries.max(1)
-    } else {
-        policy.retries
+    match classify_runtime_failure(err_text, false) {
+        // Authentication needs an explicit user decision, not another attempt in
+        // a fresh terminal. In particular, a password timeout is not a network timeout.
+        RuntimeFailureClass::SudoSessionUnavailable => 0,
+        RuntimeFailureClass::TransientNetwork => policy.retries.max(1),
+        _ => policy.retries,
     }
 }
 
@@ -2597,6 +2645,17 @@ fn command_needs_sudo_session(cmd: &CommandTask) -> bool {
     cmd.requires_elevation || cmd.needs_sudo_session
 }
 
+fn interactive_unix_elevation(host_os: HostOs, cmd: &CommandTask) -> bool {
+    matches!(host_os, HostOs::Linux | HostOs::Macos) && cmd.requires_elevation && cmd.interactive
+}
+
+fn interactive_sudo_invocation(program: &str, interactive: bool) -> bool {
+    interactive
+        && Path::new(program)
+            .file_name()
+            .is_some_and(|name| name == "sudo")
+}
+
 fn command_supports_dashboard_input(cmd: &CommandTask, runtime: &InteractiveRuntimeConfig) -> bool {
     cmd.interactive
         && !cmd.external_window
@@ -3326,6 +3385,7 @@ fn run_command_with_transcript(
                 &wrapper_program,
                 Vec::new(),
                 policy,
+                !interactive_sudo_invocation(program, true),
             );
             let transcript_out =
                 replay_interactive_transcript(ctx, task_id, &transcript.transcript_path)?;
@@ -3401,8 +3461,14 @@ fn run_command_with_transcript(
                 "interactive execution via foreground-fallback".to_string(),
             );
             let wrapper_program = transcript.wrapper_path.to_string_lossy().to_string();
-            let run_result =
-                ctx.run_command_with_policy(task_id, &wrapper_program, Vec::new(), policy, true);
+            let run_result = ctx.run_command_with_policy_replay(
+                task_id,
+                &wrapper_program,
+                Vec::new(),
+                policy,
+                true,
+                !interactive_sudo_invocation(program, true),
+            );
             let transcript_out =
                 replay_interactive_transcript(ctx, task_id, &transcript.transcript_path)?;
             run_result.map(|_| transcript_out)
@@ -3493,7 +3559,10 @@ fn run_command_task(ctx: &SyncContext, spec: &TaskSpec, cmd: &CommandTask) -> Re
     }
 
     let mut result = run_command_task_inner(ctx, spec, &command)?;
-    if uses_linux_pacman && result.status == TaskStatus::Failed {
+    if uses_linux_pacman
+        && result.status == TaskStatus::Failed
+        && !interactive_unix_elevation(ctx.host_os, &command)
+    {
         let mut repaired_after_failure = false;
         for backend in ["pacman", "aur"] {
             match package_authority::reconcile_for_task(ctx, backend, Vec::new(), false) {
@@ -3650,6 +3719,14 @@ fn run_command_task_inner(
             } else {
                 e.to_string()
             };
+            if interactive_unix_elevation(ctx.host_os, &cmd) {
+                return Ok(failed_command_result_with_report_sections(
+                    spec.label.clone(),
+                    build_command_failure_detail(spec, &cmd, &program, &err_text),
+                    &cmd,
+                    &err_text,
+                ));
+            }
             if let Some(partial) = classify_partial_winget_result(spec, &err_text) {
                 return Ok(partial);
             }
@@ -3677,6 +3754,7 @@ fn run_command_task_inner(
             let class = classify_runtime_failure(&err_text, cmd.requires_elevation);
             if class == RuntimeFailureClass::SudoSessionUnavailable
                 && command_needs_sudo_session(&cmd)
+                && !cmd.interactive
             {
                 ctx.log_line(
                     &spec.id,
@@ -5469,6 +5547,9 @@ pub(crate) fn classify_runtime_failure(
         || lower.contains("a terminal is required")
         || lower.contains("no tty present")
         || lower.contains("must have a tty")
+        || lower.contains("sudo: timed out reading password")
+        || lower.contains("sudo: no password was provided")
+        || (lower.contains("sudo:") && lower.contains("incorrect password attempt"))
     {
         return RuntimeFailureClass::SudoSessionUnavailable;
     }
@@ -5549,11 +5630,19 @@ fn build_command_failure_detail(
 ) -> String {
     let class = classify_runtime_failure(err_text, cmd.requires_elevation);
     if cmd.requires_elevation && class == RuntimeFailureClass::SudoSessionUnavailable {
+        if cmd.interactive {
+            return format!(
+                "sudo authentication failed in the task terminal: {err_text}; review the task log before retrying explicitly and answer its sudo prompt; authentication in another terminal may not apply here"
+            );
+        }
         return format!(
             "command failed because the cached sudo session was unavailable or expired: {err_text}; rerun update-all, complete sudo authentication again, and retry"
         );
     }
     if cmd.requires_elevation && program == "sudo" {
+        if cmd.interactive {
+            return format!("elevated command failed: {err_text}");
+        }
         return format!(
             "command failed after elevation preflight: {err_text}; run 'sudo -v' and retry"
         );
@@ -7990,19 +8079,16 @@ fn build_command_invocation(host_os: HostOs, cmd: &CommandTask) -> (String, Vec<
         #[cfg(unix)]
         {
             if matches!(host_os, HostOs::Linux | HostOs::Macos) {
-                if cmd.interactive {
-                    let mut args = vec![
-                        "-c".to_string(),
-                        "sudo -v && exec sudo -n -- \"$@\"".to_string(),
-                        "update-all-sudo".to_string(),
-                        base_program,
-                    ];
-                    args.extend(base_args);
-                    return ("sh".to_string(), args);
+                let mut args = Vec::new();
+                if !cmd.interactive {
+                    // Noninteractive tasks must fail fast if preflight authority
+                    // does not apply at command launch.
+                    args.push("-n".to_string());
                 }
-                // Authentication is handled by preflight; the protected command should
-                // fail fast if the cached sudo session disappears before launch.
-                let mut args = vec!["-n".to_string(), "--".to_string(), base_program];
+                // One sudo process authenticates and launches in the same task
+                // terminal, without relying on credential reuse between separate
+                // invocations. The old shell/exec wrapper changed parent identity.
+                args.extend(["--".to_string(), base_program]);
                 args.extend(base_args);
                 return ("sudo".to_string(), args);
             }

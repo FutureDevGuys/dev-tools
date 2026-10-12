@@ -2549,124 +2549,159 @@ fn sudo_session_tasks_launch_with_noninteractive_sudo_after_preflight() {
 }
 
 #[test]
-fn interactive_elevated_command_authenticates_and_runs_in_one_sudo_wrapper() {
+fn interactive_elevated_command_uses_one_sudo_process_without_auth_replay() {
     let _lock = env_guard();
 
-    let temp = TempDir::new().unwrap();
-    let bin_dir = temp.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    let sudo_log = temp.path().join("sudo.log");
-    let sudo_state = temp.path().join("sudo-state");
-    let reached_file = temp.path().join("arch-update-reached");
+    for scenario in [
+        "success",
+        "password_timeout",
+        "nested_auth_failure",
+        "nested_failure",
+        "command_timeout",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let sudo_log = temp.path().join("sudo.log");
+        let reached_file = temp.path().join("arch-update-reached");
 
-    write_executable(
-        &bin_dir.join("sudo"),
-        r#"#!/bin/sh
+        write_executable(
+            &bin_dir.join("sudo"),
+            r#"#!/bin/sh
 set -eu
-log="${SUDO_STUB_LOG:?missing sudo log}"
-state="${SUDO_STUB_STATE:?missing sudo state}"
-printf 'sudo %s\n' "$*" >> "$log"
-if [ "${1:-}" = "-v" ]; then
-  printf '%s\n' "$PPID" > "$state"
+printf 'sudo %s\n' "$*" >> "${SUDO_STUB_LOG:?}"
+if [ "${1:-}" = "-n" ] && [ "${2:-}" = "-v" ]; then
   exit 0
 fi
-if [ "${1:-}" = "-n" ]; then
-  shift
-  if [ "${1:-}" = "-v" ]; then
-    exit 0
-  fi
-  if [ "${1:-}" = "--" ]; then
-    shift
-  fi
-  if [ ! -f "$state" ] || [ "$(cat "$state")" != "$$" ]; then
-    echo "sudo: a password is required" >&2
-    exit 1
-  fi
-  exec "$@"
+if [ "${1:-}" != "--" ]; then
+  echo "unexpected separate sudo authentication or launch" >&2
+  exit 2
 fi
-echo "unsupported sudo args: $*" >&2
-exit 2
+shift
+if [ "${SUDO_STUB_SCENARIO:?}" = "password_timeout" ]; then
+  echo "sudo: timed out reading password" >&2
+  exit 1
+fi
+exec "$@"
 "#,
-    );
-    write_executable(
-        &bin_dir.join("arch-update"),
-        r#"#!/bin/sh
+        );
+        write_executable(
+            &bin_dir.join("arch-update"),
+            r#"#!/bin/sh
 set -eu
-printf 'reached\n' > "${ARCH_UPDATE_REACHED:?missing reached file}"
+printf 'reached\n' >> "${ARCH_UPDATE_REACHED:?missing reached file}"
+[ "${1:-}" = "-s" ] && [ "${2:-}" = 'one argument; $HOME' ] || exit 90
 printf 'arch-update %s\n' "$*"
+if [ "${SUDO_STUB_SCENARIO:?}" = "command_timeout" ]; then
+  sleep 2
+fi
+if [ "${SUDO_STUB_SCENARIO:?}" = "nested_failure" ]; then
+  echo 'protected command failed after making a change' >&2
+  exit 7
+fi
+if [ "${SUDO_STUB_SCENARIO:?}" = "nested_auth_failure" ]; then
+  echo "sudo: a password is required" >&2
+  exit 1
+fi
 "#,
-    );
+        );
 
-    let old_path = env::var_os("PATH").unwrap_or_default();
-    let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
-    let _path_guard = EnvVarGuard::set("PATH", merged_path);
-    let _sudo_log_guard = EnvVarGuard::set("SUDO_STUB_LOG", sudo_log.as_os_str().to_os_string());
-    let _sudo_state_guard =
-        EnvVarGuard::set("SUDO_STUB_STATE", sudo_state.as_os_str().to_os_string());
-    let _reached_guard = EnvVarGuard::set(
-        "ARCH_UPDATE_REACHED",
-        reached_file.as_os_str().to_os_string(),
-    );
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let merged_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+        let _path_guard = EnvVarGuard::set("PATH", merged_path);
+        let _sudo_log_guard =
+            EnvVarGuard::set("SUDO_STUB_LOG", sudo_log.as_os_str().to_os_string());
+        let _scenario_guard = EnvVarGuard::set("SUDO_STUB_SCENARIO", scenario);
+        let _reached_guard = EnvVarGuard::set(
+            "ARCH_UPDATE_REACHED",
+            reached_file.as_os_str().to_os_string(),
+        );
 
-    let ctx = test_context(Arc::new(PrivilegeSession::default()));
-    let spec = TaskSpec {
-        id: "arch-update-services".to_string(),
-        label: "Arch-Update Services".to_string(),
-        depends_on: Vec::new(),
-        kind: TaskKind::Command(CommandTask {
-            program: "arch-update".to_string(),
-            args: vec!["-s".to_string()],
-            mode: None,
-            command_candidates: Vec::new(),
-            pre_commands: Vec::new(),
-            report_commands: Vec::new(),
-            report_patterns: Vec::new(),
-            report_scoped_deltas: Vec::new(),
-            policy_key: "system_update".to_string(),
-            requires_elevation: true,
-            needs_sudo_session: true,
-            interactive: true,
-            external_window: false,
-            shell: false,
-            windows_bridge: false,
-            report_parser: None,
-            plain_header: None,
-            plain_start: None,
-            success_details: Vec::new(),
-            external_manager_skip: false,
-            result_protocol: None,
-        }),
-        category: "system".to_string(),
-        resource_locks: BTreeSet::new(),
-    };
-    let TaskKind::Command(cmd) = &spec.kind else {
-        panic!("expected command task");
-    };
+        let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+        ctx.task_policies.system_update.timeout = Duration::from_millis(250);
+        ctx.task_policies.system_update.retries = 3;
+        ctx.task_policies.system_update.retry_backoff = Duration::ZERO;
+        let spec = TaskSpec {
+            id: "arch-update-services".to_string(),
+            label: "Arch-Update Services".to_string(),
+            depends_on: Vec::new(),
+            kind: TaskKind::Command(CommandTask {
+                program: "arch-update".to_string(),
+                args: vec!["-s".to_string(), "one argument; $HOME".to_string()],
+                mode: None,
+                command_candidates: Vec::new(),
+                pre_commands: Vec::new(),
+                report_commands: Vec::new(),
+                report_patterns: Vec::new(),
+                report_scoped_deltas: Vec::new(),
+                policy_key: "system_update".to_string(),
+                requires_elevation: true,
+                needs_sudo_session: true,
+                interactive: true,
+                external_window: false,
+                shell: false,
+                windows_bridge: false,
+                report_parser: None,
+                plain_header: None,
+                plain_start: None,
+                success_details: Vec::new(),
+                external_manager_skip: false,
+                result_protocol: None,
+            }),
+            category: "system".to_string(),
+            resource_locks: BTreeSet::new(),
+        };
+        let TaskKind::Command(cmd) = &spec.kind else {
+            panic!("expected command task");
+        };
 
-    let result = run_command_task(&ctx, &spec, cmd).expect("command task result");
-    let sudo_log_after_run = fs::read_to_string(&sudo_log).unwrap_or_default();
+        let result = run_command_task(&ctx, &spec, cmd).expect("command task result");
+        let sudo_log_after_run = fs::read_to_string(&sudo_log).unwrap_or_default();
 
-    assert_eq!(
-        result.status,
-        TaskStatus::Completed,
-        "{result:#?}\nsudo log:\n{sudo_log_after_run}"
-    );
-    assert!(reached_file.exists(), "arch-update command was not reached");
-    let sudo_log = fs::read_to_string(sudo_log).unwrap();
-    let sudo_lines = sudo_log.lines().collect::<Vec<_>>();
-    let wrapper_auth = sudo_lines
-        .iter()
-        .position(|line| *line == "sudo -v")
-        .unwrap_or_else(|| panic!("expected in-wrapper sudo -v:\n{sudo_log}"));
-    let wrapper_launch = sudo_lines
-        .iter()
-        .position(|line| line.starts_with("sudo -n --"))
-        .unwrap_or_else(|| panic!("expected protected sudo launch:\n{sudo_log}"));
-    assert!(sudo_log.contains("sudo -n -v"), "{sudo_log}");
-    assert!(
-        wrapper_auth < wrapper_launch,
-        "sudo -v should precede protected command in the same wrapper:\n{sudo_log}"
-    );
+        assert_eq!(
+            result.status,
+            if scenario == "success" {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            },
+            "{scenario}: {result:#?}\nsudo log:\n{sudo_log_after_run}"
+        );
+        let sudo_lines = sudo_log_after_run.lines().collect::<Vec<_>>();
+        assert_eq!(
+            sudo_lines
+                .iter()
+                .filter(|line| line.starts_with("sudo --"))
+                .count(),
+            1,
+            "authentication or side effects were replayed: {sudo_log_after_run}"
+        );
+        assert!(!sudo_lines.contains(&"sudo -v"), "{sudo_log_after_run}");
+        assert!(
+            !sudo_lines.iter().any(|line| line.starts_with("sudo -n --")),
+            "{sudo_log_after_run}"
+        );
+        if scenario == "password_timeout" {
+            assert!(
+                !reached_file.exists(),
+                "protected command ran without authentication"
+            );
+        } else {
+            assert_eq!(
+                fs::read_to_string(&reached_file).unwrap().lines().count(),
+                1
+            );
+        }
+        if matches!(scenario, "password_timeout" | "nested_auth_failure") {
+            assert!(
+                result
+                    .details
+                    .iter()
+                    .any(|detail| detail.contains("task terminal")),
+                "{result:#?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -4773,4 +4808,79 @@ fn stream_callback_keeps_subprocess_blanks_in_raw_log_only() {
         .collect();
     assert_eq!(lines.len(), 4);
     assert!(lines.iter().all(|event| event["payload"]["line"] != ""));
+}
+
+#[test]
+fn interactive_sudo_transcript_wrappers_do_not_replay_protected_effects() {
+    let _lock = env_guard();
+
+    for (execution_path, force_capture_guard) in [
+        (InteractiveExecutionPath::ForegroundReplay, false),
+        (InteractiveExecutionPath::ImmediateForeground, false),
+        (InteractiveExecutionPath::ForegroundReplay, true),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let sudo = temp.path().join("sudo");
+        let protected = temp.path().join("protected-command");
+        let effects = temp.path().join("effects");
+        write_executable(
+            &sudo,
+            r#"#!/bin/sh
+set -eu
+[ "${1:-}" = "--" ] || exit 90
+shift
+exec "$@"
+"#,
+        );
+        write_executable(
+            &protected,
+            r#"#!/bin/sh
+set -eu
+printf 'changed\n' >> "$1"
+printf 'protected command failed after making a change\n' >&2
+if [ "${2:-}" = "capture_guard" ]; then
+  sleep 2
+fi
+exit 7
+"#,
+        );
+
+        let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+        ctx.run_log = Some(Arc::new(RunLogSink::new(temp.path(), false).unwrap()));
+        if force_capture_guard {
+            ctx.interactive_runtime.max_line_bytes = 8;
+        }
+        let program = sudo.to_string_lossy().into_owned();
+        let args = vec![
+            "--".to_string(),
+            protected.to_string_lossy().into_owned(),
+            effects.to_string_lossy().into_owned(),
+            if force_capture_guard {
+                "capture_guard".to_string()
+            } else {
+                "ordinary_failure".to_string()
+            },
+        ];
+        let error = run_command_with_transcript(
+            &ctx,
+            "sudo-wrapper-fixture",
+            &TaskPolicy::new(5, 3, 0),
+            &program,
+            &args,
+            execution_path,
+        )
+        .expect_err("protected command must report failure");
+
+        if force_capture_guard {
+            assert_eq!(
+                capture_guard_reason(&error),
+                Some(CaptureGuardReason::LineTooLong)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&effects).unwrap().lines().count(),
+            1,
+            "wrapper replayed protected effects ({execution_path:?}, capture_guard={force_capture_guard}): {error:#}"
+        );
+    }
 }

@@ -1016,6 +1016,9 @@ fn handle_prompt_overlay_input(
 
     if model.prompt_is_submitted() {
         match key.code {
+            // A submitted answer cannot be edited or sent again, but the
+            // protected command may still be running and must remain cancelable.
+            KeyCode::Char('k' | 'K' | 'q' | 'Q') => return false,
             KeyCode::Up => model.prompt_scroll_from_bottom += 1,
             KeyCode::PageUp => model.prompt_scroll_from_bottom += page_rows,
             KeyCode::Down => {
@@ -4157,7 +4160,9 @@ fn prompt_overlay_lines(
             "Answer submitted; waiting for command…",
             Style::default().fg(Color::LightCyan),
         )]));
-        lines.push(Line::from("Up/Down/PgUp/PgDn/Home/End: scroll"));
+        lines.push(Line::from(
+            "Up/Down/PgUp/PgDn/Home/End: scroll   k/K: cancel one/all   q: exit",
+        ));
     } else if let Some(edit) = edit {
         let display_buffer = if prompt_expects_secret(prompt) {
             "*".repeat(edit.buffer.chars().count())

@@ -7443,3 +7443,25 @@ fn diagnostic_rollup_colors_do_not_change_transaction_status() {
         assert_eq!(row.status, TaskReportStatus::Info);
     }
 }
+
+#[test]
+fn sudo_authentication_failures_never_receive_automatic_retry_budget() {
+    let policy = TaskPolicy::new(30, 5, 0);
+    for detail in [
+        "sudo: timed out reading password",
+        "sudo: no password was provided",
+        "sudo: 3 incorrect password attempts",
+        "sudo: a password is required",
+    ] {
+        assert_eq!(
+            classify_runtime_failure(detail, true),
+            RuntimeFailureClass::SudoSessionUnavailable
+        );
+        assert_eq!(effective_retry_budget(&policy, detail), 0);
+    }
+    assert_eq!(effective_retry_budget(&policy, "download timed out"), 5);
+    assert_eq!(
+        effective_retry_budget(&TaskPolicy::new(30, 0, 0), "connection reset by peer"),
+        1
+    );
+}
