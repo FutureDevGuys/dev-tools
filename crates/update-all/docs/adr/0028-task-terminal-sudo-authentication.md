@@ -73,6 +73,8 @@ still required.
 
 ## Runtime acceptance
 
+The immediate Linux delivery sequence is superseded by [ADR 0029](0029-implementation-first-linux-sudo-delivery.md). The four-policy matrix below remains explicitly tracked follow-on coverage; no unrun lane is claimed as passed. The implementation and safety invariants in this record are unchanged.
+
 Use an isolated catalog and controlled sudo executable to verify exact argv,
 one authentication/launch attempt, task-terminal input, success and failure logs,
 and no replay after a side-effecting command emits a sudo diagnostic. Exercise

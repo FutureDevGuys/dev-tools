@@ -38,6 +38,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0026](0026-command-output-fidelity-and-bounded-diagnostics.md) | Command output fidelity and bounded diagnostics | proposed | pending |
 | [0027](0027-execution-owned-cancellation-outcomes.md) | Execution-owned cancellation outcomes | proposed | pending |
 | [0028](0028-task-terminal-sudo-authentication.md) | Task-terminal sudo authentication | proposed | pending |
+| [0029](0029-implementation-first-linux-sudo-delivery.md) | Implementation-first Linux sudo delivery | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires
