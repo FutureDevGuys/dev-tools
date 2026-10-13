@@ -1,0 +1,41 @@
+---
+authority: canonical
+owner: dev-auth
+---
+
+# ADR 0115: Native administrator grants with maintenance compatibility
+
+status: proposed
+verification: pending
+
+## Decision
+
+Integrate the preserved native administrator coordinator and Sudo bridge alongside the current bounded maintenance implementation. The existing `privilege plan`, plan-bound `request`, `execute`, `execute-plan`, session `status` and `revoke`, closed maintenance schemas, receipt-install effect, helper/assets and setup ownership remain available. Their authority is never widened by an administrator grant.
+
+The additive public family is `dev-auth privilege grant request|status|inspect|exec|delegate|revoke|leave`. Its one product-owned Clap definition supplies parsing, help and completion. This compatibility slice does not declare the agreed complete administrator product finished: ordinary launch-with-grant integration and an eventual direct-command compatibility/cutover remain tracked work. Execution preserves child streams, with a separate protected result file; JSON execution without such a destination fails promptly. Private coordinator, graph-worker, payload-export and Sudo-relay entry points are excluded from public completion and cannot enter through the set-ID enrolled-workload dispatcher.
+
+Grant policy is a separate closed `dev-auth-administrator-grant-policy-v1` authority at `/etc/dev-auth/administrator-grants-v1.json`. Control and result identities are `dev-auth-administrator-grant-control-v1` and `dev-auth-administrator-grant-result-v1`. The root-owned runtime is `/run/dev-auth-grants`, independent of the current mode-0711 `/run/dev-auth-privilege` maintenance root. A capability-shaped maintenance policy cannot be relabeled as a subjects/plans/operations grant policy, and neither control decoder accepts the other's schema. Existing maintenance grants and approved bytes are not migrated into general administrator authority.
+
+A grant requires fresh native administrator approval of an explicit workload or OS-user scope, authority and finite duration within administrator policy. Workload scope comes from retained native peer/pidfd/cgroup evidence, never a submitted existing PID or copied selector. User scope is available to other native processes of that account and ends at final interactive logout. Workload scope ends with its workload. Both end at the approved hard deadline, revocation, relevant identity/policy loss or coordinator failure. Privilege expiry closes admission and stops managed privileged work without ending the ordinary non-root workload. No idle timeout or use budget applies implicitly; policy and the request may impose narrower values. Requests exceeding eight hours are permitted only under the new grant policy and explicit finite approval. Activity, status, refresh and delegation cannot extend hard expiry.
+
+Authority is typed, exact-plan, or separately permitted `administrator` authority. Administrator authority is the unrestricted root-equivalent exception in ADR0004; approval discloses that completed effects cannot be undone and deliberately hostile root commands can disable enforcement. Narrowed delegation conserves scope, authority, hard expiry and any parent use budget. Failed cleanup remains failure. Denied managed Sudo never falls back to a cached native authorization or a broader grant; explicit `leave` removes managed routing without granting authority. Unbound Sudo retains its native behavior.
+
+## Shared accounting and native ownership
+
+The focused session crate retains its current fixed-budget `LeaseLimits`/`LeaseLifecycle`, `remaining_uses() -> u64`, normal shutdown, `SessionAuthority` and `native_linux` APIs. A private accounting core owns the clock, budget and cleanup rules once. New `GrantLimits`/`GrantLifecycle` facades and `GrantRegistry<S,A>` supply optional budgets, explicitly finite longer durations and conserved delegation using typed product-owned scope/authority constraints. The compatibility facade retains its historical bounded-maintenance cap; that value is not a product-wide administrator grant ceiling. No grant state is cloneable, persisted, or restored after coordinator restart.
+
+Linux execution owns a root-created, nondelegated cgroup and admission gate for each grant and job. Deadline enforcement uses a separate guardian process outside its target boundary, with a retained gate, `cgroup.kill` descriptor and absolute `CLOCK_BOOTTIME` timer. It survives stopping the multi-grant coordinator and can stop only its own retained domain; it does not kill the whole daemon when one grant expires. Creation requires supported `clone3(CLONE_PIDFD)`, `close_range`, cgroup v2 and retained kernel custody, failing closed when unavailable. The raw child ABI is limited to Linux x86_64/aarch64: `clone_args` is the eleven-u64, 88-byte Linux UAPI layout, and raw signal-mask syscalls use the kernel’s 64-bit signal set rather than libc’s larger user-space representation. Absolute deadlines must remain within native ktime representation; unsupported architectures, syscalls or time ranges do not receive an approximation or fallback. The post-clone child performs only reviewed async-signal-safe native operations before `_exit`, closes unrelated descriptors, and owns no new product policy. Parent cleanup owns bounded guardian reaping and pidfd termination; expiry or a successful signal alone is not positive domain cleanup. A stopped-coordinator/unrelated-domain native proof remains mandatory.
+
+Graph execution uses the consumed-command API in ADR0118, retained executable borrows, bounded node/dependency definitions and product-owned streams, identity and timeout. Aggregate native signals are propagated only after owned cleanup. PTY, run-as and output effects remain product policy; a graph label, argv or executable digest alone is not an effect definition.
+
+## Sudo bridge and standalone payload
+
+The product-owned `dev-auth-sudo` helper is an internal native cdylib in the signed product payload. Its source, version, target, ABI and bytes are independently checked during embedding/setup. An ordinary development build can contain an explicit absent marker; it cannot activate a grant component requiring that bridge. No installed sibling product, interpreter, source checkout or private downstream implementation is a prerequisite.
+
+Upstream Sudo retains parsing, run-as, environment and terminals. Product-owned audit/approval/group callbacks perform conditional authority observation and final admission into the owned execution boundary. The bridge does not handle passwords, refresh global timestamps, replace the native Sudo implementation, or authorize an operation because a cached ticket exists. Setup publishes only the exact selected receipt-owned asset group and preserves unrelated plugin configuration. Privilege-only and combined setup/recovery are owned by ADR0116, independent of any active grant.
+
+## Migration and remaining gates
+
+This is an additive authority family. Existing maintenance policy, runtime, installed receipts and rollback evidence remain under their original authority. Enabling grants requires a newly selected full setup component, a compatible candidate, distinct policy inputs, stopped affected coordinators, retained rollback inputs, complete verification and activation last. Default/absent/empty grant policy grants nothing. Ordinary credential policy, enrollment and duration limits are preserved.
+
+Source fixtures cover distinct strict schemas, noninteractive approval-required results, deny-all policy, narrowed durations/budgets, public grammar and separate result destinations. Imported source and syntax checks do not qualify native administrator access. Required native gates include both scopes, wrong peers and copied hints, atomic admission, warm native timestamps, ordinary/absolute Sudo, Ansible, run-as/interactive terminals, delegation conservation, suspension, actual overnight expiry, stopped coordinator, guardian/coordinator death, policy/logout/revocation, cleanup failure and preserved non-root workload. Signed fresh/combined installation, interruption/recovery/rollback, receipt-owned removal and full conformance remain separate release gates. Other platforms remain unqualified.
