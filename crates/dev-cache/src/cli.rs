@@ -84,6 +84,8 @@ enum CommandKind {
     Doctor,
     /// Summarize space used by each owned cache class.
     Report,
+    /// Read bounded resource catalog metadata without scanning cache payloads.
+    Inventory(crate::inventory::InventoryArgs),
     /// Print the routed path for an adapter.
     Path {
         #[arg(value_enum)]
@@ -431,6 +433,13 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
         }
         CommandKind::Doctor => doctor(&config, config_path.as_deref(), cli.json),
         CommandKind::Report => report(&config, cli.json),
+        CommandKind::Inventory(args) => {
+            let root = observe_root(&config)?;
+            let report = crate::inventory::observe(&root, &config.gc, args)?;
+            let exit_code = report.exit_code();
+            print_value(cli.json, &report)?;
+            Ok(exit_code)
+        }
         CommandKind::Path {
             adapter,
             repo,
