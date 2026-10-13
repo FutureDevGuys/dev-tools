@@ -64,6 +64,7 @@ mod windows_security;
 #[path = "git_runtime.rs"]
 mod git_runtime;
 
+mod provider_metadata;
 mod validation;
 pub use validation::{
     validate_components, ComponentValidationReport, ValidationCheck, ValidationComponent,
@@ -979,6 +980,7 @@ struct LinuxProviderExecInvocation<'a> {
 #[derive(Clone, Copy)]
 enum OnePasswordInvocation<'a> {
     Read(&'a str),
+    FieldType(&'a str),
     CurrentAccount,
 }
 
@@ -989,6 +991,11 @@ impl OnePasswordInvocation<'_> {
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
+            Self::FieldType(reference) => vec![
+                "read".into(),
+                "--no-newline".into(),
+                format!("{reference}?attribute=type").into(),
+            ],
             Self::CurrentAccount => ["user", "get", "--me", "--format", "json"]
                 .into_iter()
                 .map(OsString::from)
@@ -1000,7 +1007,15 @@ impl OnePasswordInvocation<'_> {
     fn child_arguments(self) -> Vec<OsString> {
         match self {
             Self::Read(reference) => vec!["--reference".into(), reference.into()],
+            Self::FieldType(reference) => vec!["--field-type-reference".into(), reference.into()],
             Self::CurrentAccount => vec!["--current-account".into()],
+        }
+    }
+
+    fn output_limit(self) -> usize {
+        match self {
+            Self::FieldType(_) => 1024,
+            _ => OP_READ_OUTPUT_LIMIT,
         }
     }
 }
@@ -1131,6 +1146,7 @@ fn run_linux_provider_operation(
 ) -> std::result::Result<BoundedCommandOutput, SecretError> {
     let child_guard = lock_linux_program(child_executable, "running dev-auth executable")
         .map_err(|_| secret_error(SecretErrorKind::ProviderUnavailable))?;
+    let output_limit = invocation.output_limit();
     let mut invocation = prepare_linux_provider_exec(
         &child_guard,
         provider_guard,
@@ -1142,7 +1158,7 @@ fn run_linux_provider_operation(
     run_prepared_bounded_command_with_cancellation(
         &mut invocation.command,
         timeout,
-        OP_READ_OUTPUT_LIMIT,
+        output_limit,
         operation.cancellation_signal(),
     )
     .map_err(map_op_read_error)
@@ -1279,6 +1295,15 @@ pub fn run_provider_exec_child() -> Result<i32> {
         Some(selector) if selector == OsStr::new("--current-account") => {
             OnePasswordInvocation::CurrentAccount.native_arguments()
         }
+        Some(selector) if selector == OsStr::new("--field-type-reference") => {
+            let reference = arguments
+                .next()
+                .context("internal provider metadata reference is missing")?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("internal provider metadata reference is invalid"))?;
+            let reference = provider_metadata::base_reference(&reference)?;
+            OnePasswordInvocation::FieldType(reference).native_arguments()
+        }
         _ => bail!("internal provider child protocol is malformed"),
     };
     if arguments.next().is_some() {
@@ -1357,7 +1382,7 @@ fn run_provider_operation(
     run_prepared_bounded_command_with_cancellation(
         &mut command,
         timeout,
-        OP_READ_OUTPUT_LIMIT,
+        invocation.output_limit(),
         operation.cancellation_signal(),
     )
     .map_err(map_op_read_error)
@@ -1531,6 +1556,14 @@ impl SecretProvider for OnePasswordProvider<'_> {
             public_material: true,
             signing: false,
         })
+    }
+
+    fn discover_metadata(
+        &self,
+        reference: &SecretReference,
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<dev_tools_secret::SecretMetadataObservation, SecretError> {
+        provider_metadata::discover(self, reference, operation)
     }
 
     fn read_exportable(
@@ -2635,6 +2668,7 @@ pub fn broker_credential_get(input: &[u8]) -> Result<String> {
         }
         crate::broker_protocol::BrokerResponse::NoSession
         | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::ResourceMetadata { .. }
         | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Accepted
         | crate::broker_protocol::BrokerResponse::Ready { .. }
@@ -2663,6 +2697,7 @@ pub fn broker_credential_erase(input: &[u8]) -> Result<()> {
         }
         crate::broker_protocol::BrokerResponse::NoSession
         | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::ResourceMetadata { .. }
         | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Ready { .. }
         | crate::broker_protocol::BrokerResponse::GitCredential { .. }
@@ -3418,6 +3453,7 @@ pub fn exec_broker_gh(arguments: &[OsString], session_id: &str) -> Result<()> {
         }
         crate::broker_protocol::BrokerResponse::NoSession
         | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::ResourceMetadata { .. }
         | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Accepted
         | crate::broker_protocol::BrokerResponse::Ready { .. }
@@ -4608,6 +4644,7 @@ pub fn broker_sign_release_manifest(profile: &str, payload: &[u8]) -> Result<Vec
         }
         crate::broker_protocol::BrokerResponse::NoSession
         | crate::broker_protocol::BrokerResponse::ProviderValidation { .. }
+        | crate::broker_protocol::BrokerResponse::ResourceMetadata { .. }
         | crate::broker_protocol::BrokerResponse::SecretMaterial { .. }
         | crate::broker_protocol::BrokerResponse::Accepted
         | crate::broker_protocol::BrokerResponse::Ready { .. }
@@ -5020,6 +5057,7 @@ token=\"$(/usr/bin/cat \"/proc/self/fd/$6\")\"\n\
 export OP_SERVICE_ACCOUNT_TOKEN=\"$token\"\n\
 case \"$9\" in\n\
   --reference) exec \"/proc/self/fd/$4\" read --no-newline \"${10}\" ;;\n\
+  --field-type-reference) exec \"/proc/self/fd/$4\" read --no-newline \"${10}?attribute=type\" ;;\n\
   --current-account) exec \"/proc/self/fd/$4\" user get --me --format json ;;\n\
   *) exit 99 ;;\n\
 esac\n",
@@ -5027,6 +5065,243 @@ esac\n",
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_metadata_uses_exact_type_query_and_coarse_types() {
+        use dev_tools_secret::SecretValueType;
+
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let token = SecretString::new("metadata-fixture-token".into());
+        let base = "op://Machine Vault/fixture/field";
+        for (suffix, response, expected) in [
+            ("", "STRING", SecretValueType::Text),
+            (
+                "?ssh-format=openssh",
+                "concealed",
+                SecretValueType::Concealed,
+            ),
+            ("?attribute=value", "OTP", SecretValueType::OneTimePassword),
+            ("?attr=value", "FILE", SecretValueType::Other),
+            ("?attribute=content", "string", SecretValueType::Text),
+            ("?attr=content", "CONCEALED", SecretValueType::Concealed),
+            ("?attribute=otp", "otp", SecretValueType::OneTimePassword),
+            (
+                "?attr=otp",
+                "provider_type_sentinel",
+                SecretValueType::Other,
+            ),
+        ] {
+            let program = write_linux_op_program(
+                directory.path(),
+                &format!(
+                    r#"
+[ "$#" = 3 ] && [ "$1" = read ] && [ "$2" = --no-newline ] && [ "$3" = '{base}?attribute=type' ] || exit 90
+[ "$OP_SERVICE_ACCOUNT_TOKEN" = metadata-fixture-token ] || exit 91
+printf '%s' '{response}'
+"#
+                ),
+            );
+            let provider =
+                OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+            let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+            let reference = SecretReference::new(format!("{base}{suffix}")).unwrap();
+            let observation = provider
+                .discover_metadata(&reference, operation.secret_context())
+                .unwrap();
+            assert_eq!(observation.value_type, expected);
+            assert!(!format!("{observation:?}").contains(response));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_metadata_rejects_unknown_queries_before_provider_execution() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let invoked = directory.path().join("metadata-invoked");
+        let program = write_linux_op_program(
+            directory.path(),
+            &format!("/usr/bin/touch -- '{}'; printf STRING", invoked.display()),
+        );
+        let token = SecretString::new("metadata-fixture-token".into());
+        let provider =
+            OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+        for (reference, expected) in [
+            (
+                "op://Automation/item/field?unknown=value",
+                SecretErrorKind::Unsupported,
+            ),
+            (
+                "op://Automation/item/field?attribute=type",
+                SecretErrorKind::Unsupported,
+            ),
+            (
+                "op://Automation/item/field?attribute=value&attribute=otp",
+                SecretErrorKind::Unsupported,
+            ),
+            (
+                "op://Automation/item/field?ssh-format=openssh&attr=value",
+                SecretErrorKind::Unsupported,
+            ),
+            ("op://Automation/item/field?", SecretErrorKind::Unsupported),
+            ("op://Automation/item/fi%65ld", SecretErrorKind::Unsupported),
+            ("op://Automation/item/fiéld", SecretErrorKind::Unsupported),
+            ("op://Automation/item", SecretErrorKind::InvalidReference),
+            (
+                "https://Automation/item/field",
+                SecretErrorKind::InvalidReference,
+            ),
+        ] {
+            let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+            let reference = SecretReference::new(reference).unwrap();
+            let error = provider
+                .discover_metadata(&reference, operation.secret_context())
+                .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert!(!invoked.exists(), "rejected metadata invoked a provider");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_metadata_rejects_malformed_and_failed_output_without_values() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let token = SecretString::new("metadata-fixture-token".into());
+        let reference = SecretReference::new("op://Automation/item/field").unwrap();
+        let program = write_linux_op_program(directory.path(), "printf '%064d' 0");
+        let provider =
+            OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+        let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+        assert_eq!(
+            provider
+                .discover_metadata(&reference, operation.secret_context())
+                .unwrap()
+                .value_type,
+            dev_tools_secret::SecretValueType::Other
+        );
+        for (body, expected) in [
+            (":", SecretErrorKind::InvalidResponse),
+            (
+                "printf '%s' '{\"type\":\"STRING\",\"value\":\"provider-secret-diagnostic\"}'",
+                SecretErrorKind::InvalidResponse,
+            ),
+            ("printf 'STRING\\n'", SecretErrorKind::InvalidResponse),
+            ("printf '\\377'", SecretErrorKind::InvalidResponse),
+            ("printf '%065d' 0", SecretErrorKind::InvalidResponse),
+            (
+                "printf provider-secret-diagnostic; printf provider-secret-diagnostic >&2; exit 9",
+                SecretErrorKind::ProviderFailure,
+            ),
+        ] {
+            let program = write_linux_op_program(directory.path(), body);
+            let provider =
+                OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+            let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+            let error = provider
+                .discover_metadata(&reference, operation.secret_context())
+                .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            let diagnostic = format!("{error}: {error:?}");
+            assert!(!diagnostic.contains("provider-secret-diagnostic"));
+            assert!(!diagnostic.contains("op://"));
+            assert!(!diagnostic.contains(token.expose()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_metadata_bounds_each_output_stream() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let token = SecretString::new("metadata-fixture-token".into());
+        let reference = SecretReference::new("op://Automation/item/field").unwrap();
+        for body in [
+            "exec /usr/bin/head -c 1025 /dev/zero",
+            "printf STRING; /usr/bin/head -c 1025 /dev/zero >&2",
+        ] {
+            let program = write_linux_op_program(directory.path(), body);
+            let provider =
+                OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+            let operation = crate::provider_operation::ProviderOperation::uncancelled().unwrap();
+            let error = provider
+                .discover_metadata(&reference, operation.secret_context())
+                .unwrap_err();
+            assert_eq!(error.kind(), SecretErrorKind::ResourceLimitExceeded);
+            assert_eq!(
+                error.to_string(),
+                "secret provider operation exceeded a resource limit"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_metadata_observes_cancellation_during_provider_execution() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let started = directory.path().join("metadata-started");
+        let program = write_linux_op_program(
+            directory.path(),
+            &format!(
+                "/usr/bin/touch -- '{}'; exec /usr/bin/sleep 60",
+                started.display()
+            ),
+        );
+        let token = SecretString::new("metadata-fixture-token".into());
+        let provider =
+            OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+        let reference = SecretReference::new("op://Automation/item/field").unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let operation = crate::provider_operation::ProviderOperation::with_test_timeout(
+            &cancelled,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let error = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !started.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(started.exists(), "metadata provider never reported startup");
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+            });
+            provider
+                .discover_metadata(&reference, operation.secret_context())
+                .unwrap_err()
+        });
+        assert_eq!(error.kind(), SecretErrorKind::Cancelled);
+        assert_eq!(error.to_string(), "secret operation was cancelled");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_password_metadata_terminalizes_at_the_absolute_deadline() {
+        let directory = linux_program_test_directory();
+        let child = write_linux_provider_child(directory.path());
+        let program = write_linux_op_program(directory.path(), "exec /usr/bin/sleep 60");
+        let token = SecretString::new("metadata-fixture-token".into());
+        let provider =
+            OnePasswordProvider::at_child(program.to_str().unwrap(), &token, &child).unwrap();
+        let reference = SecretReference::new("op://Automation/item/field").unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let operation = crate::provider_operation::ProviderOperation::with_test_timeout(
+            &cancelled,
+            Duration::from_millis(2_100),
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let error = provider
+            .discover_metadata(&reference, operation.secret_context())
+            .unwrap_err();
+        assert_eq!(error.kind(), SecretErrorKind::DeadlineExceeded);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(target_os = "linux")]

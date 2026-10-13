@@ -116,3 +116,5 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0104](0104-dev-cache-experimental-native-cache-gate.md) | Default-off experimental native cache | proposed | pending |
 
 | [0105](0105-retained-cargo-final-outputs.md) | Opt-in retained Cargo final-output routing | proposed | pending |
+
+| [0114](0114-admitted-value-free-resource-metadata.md) | Admitted value-free resource metadata | proposed | pending |

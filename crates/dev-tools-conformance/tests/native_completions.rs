@@ -109,6 +109,9 @@ fn qualify(shell: &str, shell_key: &str) {
             ("", "completion"),
             product_probe,
         ];
+        if product.name == "dev-auth" {
+            probes.push(("secret metadata build-token --non-i", "--non-interactive"));
+        }
         if shell == "elvish" && product.name == "dev-auth" {
             probes.push(("workload bind plan --target s", "structured"));
         }

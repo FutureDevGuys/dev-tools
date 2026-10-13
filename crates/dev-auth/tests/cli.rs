@@ -27,6 +27,99 @@ const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 #[test]
+fn metadata_command_requires_admission_and_emits_one_value_free_json_document() {
+    let root = private_runtime();
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("PATH", "/missing")
+            .env("OP_SERVICE_ACCOUNT_TOKEN", "ambient-token-must-not-be-used")
+            .args([
+                "secret",
+                "metadata",
+                "build-token",
+                "--non-interactive",
+                "--json",
+            ]),
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-auth-resource-metadata-v1");
+    assert_eq!(report["operation"], "secret_metadata");
+    assert_eq!(report["outcome"], "not_observed");
+    assert_eq!(report["exit_code"], 3);
+    assert_eq!(
+        report["error_kind"],
+        if cfg!(target_os = "linux") {
+            "admission_required"
+        } else {
+            "unsupported"
+        }
+    );
+    assert_eq!(report["resource_exists"], serde_json::Value::Null);
+    assert_eq!(report["value_type"], serde_json::Value::Null);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("ambient-token"));
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+
+    let human = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .args([
+                "secret",
+                "metadata",
+                "private-logical-sentinel",
+                "--non-interactive",
+            ]),
+    );
+    assert_eq!(human.status.code(), Some(3));
+    assert!(human.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&human.stderr).contains("private-logical-sentinel"));
+    let help = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["secret", "metadata", "--help"]),
+    );
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--non-interactive"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("Never prompt"));
+
+    for arguments in [
+        vec![
+            "secret",
+            "metadata",
+            "op://private-sentinel/item/value",
+            "--json",
+        ],
+        vec![
+            "secret",
+            "metadata",
+            "build-token",
+            "--json",
+            "--private-sentinel",
+        ],
+        vec!["secret", "metadata", "--json"],
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .args(arguments),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["error_kind"], "invalid_invocation");
+        assert_eq!(report["resource_exists"], serde_json::Value::Null);
+        assert_eq!(report["value_type"], serde_json::Value::Null);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-sentinel"));
+    }
+}
+
+#[test]
 fn logical_secret_commands_fail_closed_without_admission_and_keep_stdout_clean() {
     for operation in ["read", "public"] {
         let root = private_runtime();
@@ -534,6 +627,10 @@ COMP_WORDS=(dev-auth validate --component pro)
 COMP_CWORD=3
 "$function_name" dev-auth pro --component
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth secret metadata build-token --non-i)
+COMP_CWORD=4
+"$function_name" dev-auth --non-i build-token
+printf '%s\n' "${COMPREPLY[@]}"
 "#;
     let output = bounded_output(
         Command::new("/usr/bin/bash")
@@ -550,7 +647,7 @@ printf '%s\n' "${COMPREPLY[@]}"
     );
     assert_eq!(
         output.stdout,
-        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--command-name\nstructured\n--caller-argument-index\nproviders\n"
+        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--command-name\nstructured\n--caller-argument-index\nproviders\n--non-interactive\n"
     );
 }
 
@@ -597,11 +694,16 @@ fn internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider
 
     let directory = tempfile::tempdir().unwrap();
     let provider = directory.path().join("op");
+    let invocations = directory.path().join("provider-invocations");
+    fs::write(&invocations, b"").unwrap();
+    let invocation_path = format!("'{}'", invocations.to_str().unwrap().replace('\'', "'\\''"));
     fs::write(
         &provider,
-        b"#!/bin/sh\n\
+        "#!/bin/sh\n\
+printf x >> __PROVIDER_INVOCATIONS__ || exit 97\n\
 case \"$1\" in\n\
-  read) [ \"$#\" -eq 3 ] && [ \"$2\" = --no-newline ] && [ \"$3\" = op://Automation/provider/private-key ] || exit 90 ;;\n\
+  read) [ \"$#\" -eq 3 ] && [ \"$2\" = --no-newline ] || exit 90\n\
+    [ \"$3\" = op://Automation/provider/private-key ] || [ \"$3\" = 'op://Automation/provider/private-key?attribute=type' ] || exit 90 ;;\n\
   user) [ \"$#\" -eq 5 ] && [ \"$2\" = get ] && [ \"$3\" = --me ] && [ \"$4\" = --format ] && [ \"$5\" = json ] || exit 91 ;;\n\
   *) exit 92 ;;\n\
 esac\n\
@@ -614,7 +716,11 @@ done\n\
 case \"$(/usr/bin/tr '\\000' '\\n' </proc/$$/cmdline)\" in\n\
   *transport-test-token*) exit 96 ;;\n\
 esac\n\
-printf provider-secret",
+if [ \"$1\" = read ] && [ \"${3-}\" = 'op://Automation/provider/private-key?attribute=type' ]; then\n\
+  printf CONCEALED\n\
+else\n\
+  printf provider-secret\n\
+fi".replace("__PROVIDER_INVOCATIONS__", &invocation_path),
     )
     .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -656,6 +762,36 @@ printf provider-secret",
             true,
         ),
         (vec!["--current-account"], true),
+        (
+            vec![
+                "--field-type-reference",
+                "op://Automation/provider/private-key",
+            ],
+            true,
+        ),
+        (
+            vec![
+                "--field-type-reference",
+                "op://Automation/provider/private-key?attribute=value",
+            ],
+            true,
+        ),
+        (
+            vec![
+                "--field-type-reference",
+                "op://Automation/provider/private-key?unknown=private-sentinel",
+            ],
+            false,
+        ),
+        (
+            vec![
+                "--field-type-reference",
+                "op://Automation/provider/private-key",
+                "--reference",
+                "op://Automation/provider/private-key",
+            ],
+            false,
+        ),
         (vec!["--current-account", "--user", "other"], false),
         (
             vec![
@@ -667,6 +803,8 @@ printf provider-secret",
         ),
         (vec!["--operation", "arbitrary"], false),
     ] {
+        let invocations_before = fs::read(&invocations).unwrap();
+        let metadata = arguments.first() == Some(&"--field-type-reference");
         token.seek(SeekFrom::Start(0)).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_dev-auth"));
         command
@@ -703,9 +841,22 @@ printf provider-secret",
             "provider child failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let invocations_after = fs::read(&invocations).unwrap();
         if permitted {
-            assert_eq!(output.stdout, b"provider-secret");
+            assert_eq!(invocations_after.len(), invocations_before.len() + 1);
+            assert_eq!(
+                output.stdout,
+                if metadata {
+                    &b"CONCEALED"[..]
+                } else {
+                    &b"provider-secret"[..]
+                }
+            );
         } else {
+            assert_eq!(
+                invocations_after, invocations_before,
+                "rejected selector invoked the provider"
+            );
             assert!(output.stdout.is_empty());
         }
         assert!(!output

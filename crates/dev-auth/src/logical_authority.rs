@@ -106,6 +106,31 @@ impl ResolvedResource {
         self.projections.contains(&projection)
     }
 
+    /// Observe only this admitted resource. Any existing selected purpose
+    /// permits value-free metadata, including an operation-only purpose; it
+    /// never supplies read or projection authority.
+    pub fn discover_metadata(
+        &self,
+        provider: &dyn dev_tools_secret::SecretProvider,
+        credential_slot: &str,
+        context: dev_tools_secret::OperationContext<'_>,
+    ) -> std::result::Result<
+        dev_tools_secret::SecretMetadataObservation,
+        dev_tools_secret::SecretError,
+    > {
+        use dev_tools_secret::{SecretError, SecretErrorKind};
+        context.checkpoint()?;
+        if provider.id() != &self.provider
+            || credential_slot != self.credential_slot
+            || self.purposes.is_empty()
+        {
+            return Err(SecretError::new(SecretErrorKind::PermissionDenied));
+        }
+        let observation = provider.discover_metadata(&self.reference, context)?;
+        context.checkpoint()?;
+        Ok(observation)
+    }
+
     pub fn read_exportable(
         &self,
         provider: &dyn dev_tools_secret::SecretProvider,

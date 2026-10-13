@@ -1038,6 +1038,12 @@ fn session_response(
             &repository,
             GitHubResponseKind::GitCredential,
         ),
+        BrokerRequest::SecretMetadata { resource } => {
+            match backend.resource_metadata(operation, session, &resource) {
+                Ok(value_type) => BrokerResponse::ResourceMetadata { value_type },
+                Err(error) => metadata_denial(&error),
+            }
+        }
         BrokerRequest::ValidateProviders => match backend.validate_providers(operation, session) {
             Ok(counts) => BrokerResponse::ProviderValidation {
                 authentication_checked: counts.authentication_checked,
@@ -1205,6 +1211,9 @@ fn request_audit_record<'a>(
     let (capability, resource_sha256) = match request {
         BrokerRequest::Probe => ("probe", None),
         BrokerRequest::ValidateProviders => ("validate_providers", None),
+        BrokerRequest::SecretMetadata { resource } => {
+            ("secret_metadata", Some(public_resource_digest(&[resource])))
+        }
         BrokerRequest::SecretRead { resource, .. } => {
             ("secret_read", Some(public_resource_digest(&[resource])))
         }
@@ -1290,6 +1299,7 @@ fn request_audit_record<'a>(
         BrokerResponse::GhExecutionToken { .. } => "token_issued".into(),
         BrokerResponse::Signature { .. } => "signature_issued".into(),
         BrokerResponse::SecretMaterial { .. } => "material_issued".into(),
+        BrokerResponse::ResourceMetadata { .. } => "metadata_observed".into(),
     };
     BrokerAuditRecord {
         schema: "dev-auth-broker-audit-v1",
@@ -1392,6 +1402,28 @@ fn provider_denial() -> BrokerResponse {
     }
 }
 
+fn metadata_denial(error: &anyhow::Error) -> BrokerResponse {
+    use dev_tools_secret::SecretErrorKind;
+    let code = match error
+        .downcast_ref::<dev_tools_secret::SecretError>()
+        .map(|error| error.kind())
+    {
+        Some(SecretErrorKind::Unsupported) => "metadata_unsupported",
+        Some(SecretErrorKind::Cancelled) => "metadata_cancelled",
+        Some(SecretErrorKind::DeadlineExceeded) => "metadata_deadline",
+        Some(SecretErrorKind::InvalidResponse) => "metadata_invalid_response",
+        Some(SecretErrorKind::CleanupFailed) => "metadata_cleanup_failed",
+        Some(SecretErrorKind::PermissionDenied | SecretErrorKind::InvalidReference) => {
+            "resource_denied"
+        }
+        _ => "provider_unavailable",
+    };
+    BrokerResponse::Denied {
+        code: code.into(),
+        message: "scoped resource metadata could not be observed".into(),
+    }
+}
+
 fn no_session_denial() -> BrokerResponse {
     BrokerResponse::Denied {
         code: "no_session".into(),
@@ -1444,6 +1476,12 @@ fn session_authorizes(
         }
         BrokerRequest::GhExecutionToken => session.authority.github.is_some(),
         BrokerRequest::ValidateProviders => session.authority.logical.is_some(),
+        BrokerRequest::SecretMetadata { resource } => session
+            .authority
+            .logical
+            .as_ref()
+            .and_then(|logical| logical.resources.get(resource))
+            .is_some_and(|rights| !rights.purposes.is_empty()),
         BrokerRequest::SecretRead {
             resource,
             projection,
@@ -1898,6 +1936,19 @@ mod tests {
     }
 
     impl CapabilityBackend for LateTokenBackend {
+        fn resource_metadata(
+            &self,
+            operation: &ProviderOperation<'_>,
+            _session: &crate::linux_admission::VerifiedLinuxSession,
+            _resource: &str,
+        ) -> Result<crate::resource_metadata::ValueType> {
+            operation.secret_context().checkpoint()?;
+            self.provider_started.send(()).unwrap();
+            self.provider_release.lock().unwrap().recv().unwrap();
+            operation.secret_context().checkpoint()?;
+            Ok(crate::resource_metadata::ValueType::Concealed)
+        }
+
         fn github_token(
             &self,
             operation: &ProviderOperation<'_>,
@@ -2057,6 +2108,176 @@ mod tests {
             cgroup: PathBuf::new(),
             expires_at_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 900,
         }
+    }
+
+    #[test]
+    fn metadata_requires_selected_resource_and_keeps_operation_only_bytes_private() {
+        use crate::logical_authority::{ResourcePurpose, ResourceSelection};
+        let mut session = github_session("0123456789abcdef0123456789abcdef");
+        let (provider_started, provider_started_rx) = mpsc::channel();
+        let (provider_release, provider_release_rx) = mpsc::channel();
+        provider_release.send(()).unwrap();
+        let (session_revoked, _session_revoked_rx) = mpsc::channel();
+        let backend = LateTokenBackend {
+            provider_started,
+            provider_release: Mutex::new(provider_release_rx),
+            session_revoked,
+        };
+        let request = BrokerRequest::SecretMetadata {
+            resource: "private-logical-sentinel".into(),
+        };
+        let denied =
+            session_response(&provider_operation(), &session, request.clone(), &backend).unwrap();
+        assert!(matches!(denied, BrokerResponse::Denied { code, .. } if code == "resource_denied"));
+        assert!(provider_started_rx.try_recv().is_err());
+        session.authority.logical = Some(crate::policy_v3::LogicalSelection {
+            cap: "build".into(),
+            resources: std::collections::BTreeMap::from([(
+                "private-logical-sentinel".into(),
+                ResourceSelection {
+                    purposes: vec![ResourcePurpose::ReleaseSigning],
+                    projections: vec![],
+                },
+            )]),
+        });
+        assert!(!session_authorizes(
+            &session,
+            &BrokerRequest::SecretRead {
+                resource: "private-logical-sentinel".into(),
+                projection: None,
+            }
+        ));
+        assert!(!session_authorizes(
+            &session,
+            &BrokerRequest::SecretPublic {
+                resource: "private-logical-sentinel".into(),
+            }
+        ));
+        let response =
+            session_response(&provider_operation(), &session, request.clone(), &backend).unwrap();
+        assert_eq!(
+            response,
+            BrokerResponse::ResourceMetadata {
+                value_type: crate::resource_metadata::ValueType::Concealed,
+            }
+        );
+        provider_started_rx.try_recv().unwrap();
+        let audit = request_audit_record(Some(&session), &request, &response);
+        assert_eq!(audit.capability, "secret_metadata");
+        assert_eq!(audit.outcome, "metadata_observed");
+        assert_eq!(
+            audit.resource_sha256,
+            Some(public_resource_digest(&["private-logical-sentinel"]))
+        );
+        let public = serde_json::to_string(&response).unwrap();
+        let audit = serde_json::to_string(&audit).unwrap();
+        for output in [&public, &audit] {
+            assert!(!output.contains("private-logical-sentinel"));
+            assert!(!output.contains("op://"));
+        }
+        let unselected = BrokerRequest::SecretMetadata {
+            resource: "other".into(),
+        };
+        assert!(matches!(
+            session_response(&provider_operation(), &session, unselected, &backend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+        session
+            .authority
+            .logical
+            .as_mut()
+            .unwrap()
+            .resources
+            .get_mut("private-logical-sentinel")
+            .unwrap()
+            .purposes
+            .clear();
+        assert!(matches!(
+            session_response(&provider_operation(), &session, request.clone(), &backend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "resource_denied"
+        ));
+        session
+            .authority
+            .logical
+            .as_mut()
+            .unwrap()
+            .resources
+            .get_mut("private-logical-sentinel")
+            .unwrap()
+            .purposes
+            .push(ResourcePurpose::ReleaseSigning);
+        session.authority.hard_deadline_boot_ms = Some(0);
+        assert!(matches!(
+            session_response(&provider_operation(), &session, request, &backend).unwrap(),
+            BrokerResponse::Denied { code, .. } if code == "session_invalid"
+        ));
+        assert!(provider_started_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn closing_session_rejects_late_metadata_and_revokes_before_acknowledgement() {
+        use crate::logical_authority::{ResourcePurpose, ResourceSelection};
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let operations = Arc::new(SessionOperations::default());
+        operations.open_session(session_id, || Ok(())).unwrap();
+        let operation = operations.admit_session(session_id).unwrap().unwrap();
+        let (provider_started, provider_started_rx) = mpsc::channel();
+        let (provider_release, provider_release_rx) = mpsc::channel();
+        let (session_revoked, session_revoked_rx) = mpsc::channel();
+        let backend = Arc::new(LateTokenBackend {
+            provider_started,
+            provider_release: Mutex::new(provider_release_rx),
+            session_revoked,
+        });
+        let worker_backend = Arc::clone(&backend);
+        let mut session = github_session(session_id);
+        session.authority.logical = Some(crate::policy_v3::LogicalSelection {
+            cap: "build".into(),
+            resources: std::collections::BTreeMap::from([(
+                "signer".into(),
+                ResourceSelection {
+                    purposes: vec![ResourcePurpose::ReleaseSigning],
+                    projections: vec![],
+                },
+            )]),
+        });
+        let worker = thread::spawn(move || {
+            let provider_operation = operation.provider_operation().unwrap();
+            let response = session_response(
+                &provider_operation,
+                &session,
+                BrokerRequest::SecretMetadata {
+                    resource: "signer".into(),
+                },
+                worker_backend.as_ref(),
+            )
+            .unwrap();
+            if operation.commit_publication().unwrap() {
+                response
+            } else {
+                session_closing_denial()
+            }
+        });
+        provider_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let close = operations
+            .begin_close(session_id, || Ok(true))
+            .unwrap()
+            .unwrap();
+        assert!(operations.admit_session(session_id).unwrap().is_none());
+        assert!(session_revoked_rx.try_recv().is_err());
+        provider_release.send(()).unwrap();
+        assert!(
+            matches!(worker.join().unwrap(), BrokerResponse::Denied { code, .. } if code == "session_invalid")
+        );
+        assert!(operations.complete_close(close, backend.as_ref()).unwrap());
+        assert_eq!(
+            session_revoked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            session_id
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ impl Session for BrokerAgent {
                 .map_err(|_| agent_failure("workload broker returned an invalid SSH signature"))?,
             BrokerResponse::Denied { .. }
             | BrokerResponse::ProviderValidation { .. }
+            | BrokerResponse::ResourceMetadata { .. }
             | BrokerResponse::SecretMaterial { .. }
             | BrokerResponse::NoSession
             | BrokerResponse::Accepted

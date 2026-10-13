@@ -43,6 +43,7 @@ impl BrokerTimeouts {
             | BrokerRequest::RenewSession { .. } => self.local_io,
             BrokerRequest::EndSession { .. }
             | BrokerRequest::ValidateProviders
+            | BrokerRequest::SecretMetadata { .. }
             | BrokerRequest::SecretRead { .. }
             | BrokerRequest::SecretPublic { .. }
             | BrokerRequest::GitCredential { .. }
@@ -220,6 +221,7 @@ pub fn probe_at(socket: &Path) -> Result<BrokerSessionProbe> {
         }),
         BrokerResponse::Accepted
         | BrokerResponse::ProviderValidation { .. }
+        | BrokerResponse::ResourceMetadata { .. }
         | BrokerResponse::SecretMaterial { .. }
         | BrokerResponse::GitCredential { .. }
         | BrokerResponse::GhExecutionToken { .. }
