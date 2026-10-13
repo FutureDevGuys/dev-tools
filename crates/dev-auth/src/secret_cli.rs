@@ -10,7 +10,19 @@ pub(super) fn specification() -> Command {
         .bin_name("dev-auth secret")
         .about("Use admitted logical resources without provider references")
         .disable_help_subcommand(true)
-        .subcommand_required(true);
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("metadata")
+                .about("Explicitly observe one admitted provider resource without reading values")
+                .arg(Arg::new("resource").required(true))
+                .arg(Arg::new("json").long("json").action(ArgAction::SetTrue))
+                .arg(
+                    Arg::new("non-interactive")
+                        .long("non-interactive")
+                        .action(ArgAction::SetTrue)
+                        .help("Never prompt; existing workload admission is always required"),
+                ),
+        );
     for name in ["read", "public"] {
         command = command.subcommand(
             Command::new(name)
@@ -79,11 +91,13 @@ pub(super) fn help() -> String {
 }
 
 pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
+    let metadata_json = arguments.first().is_some_and(|value| value == "metadata")
+        && arguments.iter().any(|value| value == "--json");
     let parsed = match specification()
         .try_get_matches_from(std::iter::once(OsString::from("secret")).chain(arguments))
     {
         Ok(parsed) => parsed,
-        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+        Err(error) if !metadata_json && error.kind() == clap::error::ErrorKind::DisplayHelp => {
             return Ok(
                 if std::io::stdout()
                     .lock()
@@ -97,6 +111,12 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
             );
         }
         Err(_) => {
+            if metadata_json {
+                return Ok(render_metadata(
+                    dev_auth::resource_metadata::MetadataReport::failure("invalid_invocation", 2),
+                    true,
+                ));
+            }
             eprintln!("dev-auth: invalid secret invocation");
             return Ok(2);
         }
@@ -104,6 +124,13 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
     let Some((operation, parsed)) = parsed.subcommand() else {
         return Ok(2);
     };
+    if operation == "metadata" {
+        let report = match parsed.get_one::<String>("resource") {
+            Some(resource) => dev_auth::resource_metadata::discover(resource),
+            None => dev_auth::resource_metadata::MetadataReport::failure("invalid_invocation", 2),
+        };
+        return Ok(render_metadata(report, parsed.get_flag("json")));
+    }
     if operation == "exec" {
         return run_exec(parsed);
     }
@@ -131,6 +158,36 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         "secret_public"
     };
     finish(execute(operation, resource), sink)
+}
+
+fn render_metadata(report: dev_auth::resource_metadata::MetadataReport, json: bool) -> i32 {
+    let bytes = if json {
+        match serde_json::to_vec(&report) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                bytes
+            }
+            Err(_) => return 1,
+        }
+    } else if let Some(value_type) = report.value_type {
+        format!("metadata=observed resource_exists=true value_type={value_type:?}\n").into_bytes()
+    } else {
+        format!(
+            "metadata=not_observed error_kind={}\n",
+            report.error_kind.unwrap_or("operational")
+        )
+        .into_bytes()
+    };
+    let written = if json || report.exit_code == 0 {
+        std::io::stdout().lock().write_all(&bytes)
+    } else {
+        std::io::stderr().lock().write_all(&bytes)
+    };
+    if written.is_ok() {
+        report.exit_code
+    } else {
+        1
+    }
 }
 
 fn finish(result: ExecutionResult, sink: Option<ResultDestination>) -> anyhow::Result<i32> {

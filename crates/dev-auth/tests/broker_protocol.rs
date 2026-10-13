@@ -73,7 +73,7 @@ fn provider_validation_has_no_caller_selected_authority_and_returns_only_counts(
 
 #[test]
 fn logical_secret_requests_accept_names_but_not_provider_references() {
-    for operation in ["secret_read", "secret_public"] {
+    for operation in ["secret_read", "secret_public", "secret_metadata"] {
         let frame = serde_json::json!({
             "version": BROKER_PROTOCOL_VERSION,
             "request_id": "0123456789abcdef0123456789abcdef",
@@ -85,6 +85,55 @@ fn logical_secret_requests_accept_names_but_not_provider_references() {
             rejected["request"]["resource"] = invalid.into();
             assert!(decode_request_frame(&serde_json::to_vec(&rejected).unwrap()).is_err());
         }
+    }
+}
+
+#[test]
+fn metadata_requests_accept_only_logical_names_and_responses_only_coarse_types() {
+    let request = serde_json::json!({
+        "version": BROKER_PROTOCOL_VERSION,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "request": {"operation": "secret_metadata", "resource": "release-key"}
+    });
+    let decoded = decode_request_frame(&serde_json::to_vec(&request).unwrap()).unwrap();
+    assert_eq!(
+        decoded.request,
+        BrokerRequest::SecretMetadata {
+            resource: "release-key".into()
+        }
+    );
+    for field in [
+        "provider",
+        "reference",
+        "slot",
+        "purpose",
+        "projection",
+        "user",
+    ] {
+        let mut invalid = request.clone();
+        invalid["request"][field] = "caller-selected-private-sentinel".into();
+        assert!(decode_request_frame(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+    for value_type in [
+        dev_auth::resource_metadata::ValueType::Text,
+        dev_auth::resource_metadata::ValueType::Concealed,
+        dev_auth::resource_metadata::ValueType::OneTimePassword,
+        dev_auth::resource_metadata::ValueType::Other,
+    ] {
+        let response = BrokerResponseEnvelope {
+            version: BROKER_PROTOCOL_VERSION,
+            request_id: "0123456789abcdef0123456789abcdef".into(),
+            response: BrokerResponse::ResourceMetadata { value_type },
+        };
+        let frame = encode_response_frame(&response).unwrap();
+        assert_eq!(decode_response_frame(&frame).unwrap(), response);
+        let document: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(document["response"]["status"], "resource_metadata");
+        assert_eq!(document["response"].as_object().unwrap().len(), 2);
+        assert!(!String::from_utf8_lossy(&frame).contains("release-key"));
+        let mut invalid = document;
+        invalid["response"]["value_type"] = "provider-private-sentinel".into();
+        assert!(decode_response_frame(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 }
 

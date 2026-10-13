@@ -46,6 +46,7 @@ pub(crate) mod provider_operation;
 #[cfg(unix)]
 pub mod reconcile;
 pub mod release_manifest;
+pub mod resource_metadata;
 mod runtime;
 pub mod runtime_policy;
 #[cfg(unix)]

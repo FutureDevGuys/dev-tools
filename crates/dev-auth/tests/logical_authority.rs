@@ -55,6 +55,16 @@ fn request(
     )])
 }
 
+fn signer_request(purposes: Vec<ResourcePurpose>) -> BTreeMap<String, ResourceSelection> {
+    BTreeMap::from([(
+        "signer".into(),
+        ResourceSelection {
+            purposes,
+            projections: vec![],
+        },
+    )])
+}
+
 #[test]
 fn resolves_logical_resource_to_exact_provider_slot_and_narrowed_rights() {
     let grants = authority()
@@ -132,6 +142,7 @@ fn invalid_unused_bindings_are_rejected_and_errors_never_echo_provider_reference
 struct IndependentProvider {
     id: dev_tools_secret::ProviderId,
     calls: std::sync::atomic::AtomicUsize,
+    discovery_calls: std::sync::atomic::AtomicUsize,
     exportable: bool,
     public_material: bool,
     cancel_after: Option<usize>,
@@ -142,6 +153,7 @@ impl IndependentProvider {
         Self {
             id: dev_tools_secret::ProviderId::parse(id).unwrap(),
             calls: 0.into(),
+            discovery_calls: 0.into(),
             exportable: true,
             public_material: false,
             cancel_after: None,
@@ -198,6 +210,22 @@ impl dev_tools_secret::SecretProvider for IndependentProvider {
             exportable: self.exportable,
             public_material: self.public_material,
             signing: false,
+        })
+    }
+    fn discover_metadata(
+        &self,
+        reference: &dev_tools_secret::SecretReference,
+        context: dev_tools_secret::OperationContext<'_>,
+    ) -> Result<dev_tools_secret::SecretMetadataObservation, dev_tools_secret::SecretError> {
+        assert_eq!(
+            reference.expose_to_provider(),
+            "op://Fixture/ssh/private-key"
+        );
+        self.discovery_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.called(context);
+        Ok(dev_tools_secret::SecretMetadataObservation {
+            value_type: dev_tools_secret::SecretValueType::Concealed,
         })
     }
     fn read_exportable(
@@ -406,5 +434,152 @@ fn provider_nonexportability_is_independent_of_product_export_permission() {
     assert!(grant
         .read_exportable(&provider, "service", context)
         .is_err());
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn admitted_metadata_discovery_accepts_selected_operation_only_purpose_without_export() {
+    let grants = authority()
+        .resolve(
+            "worker",
+            "build",
+            &signer_request(vec![ResourcePurpose::GitSigning]),
+        )
+        .unwrap();
+    let grant = &grants[&LogicalSecretName::parse("signer").unwrap()];
+    let mut provider = IndependentProvider::new("vault");
+    provider.exportable = false;
+    let cancelled = false.into();
+    let context = dev_tools_secret::OperationContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+        &cancelled,
+    );
+
+    let observation = grant
+        .discover_metadata(&provider, "service", context)
+        .unwrap();
+    assert_eq!(
+        observation.value_type,
+        dev_tools_secret::SecretValueType::Concealed
+    );
+    assert!(grant.allows(ResourcePurpose::GitSigning));
+    assert!(!grant.allows(ResourcePurpose::Read));
+    assert!(!grant.allows(ResourcePurpose::Public));
+    for projection in [
+        Projection::Stdin,
+        Projection::Descriptor,
+        Projection::File,
+        Projection::Environment,
+    ] {
+        assert!(!grant.allows_projection(projection));
+    }
+    let error = grant
+        .read_exportable(&provider, "service", context)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        dev_tools_secret::SecretErrorKind::PermissionDenied
+    );
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        provider
+            .discovery_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn admitted_metadata_discovery_rejects_wrong_provider_or_slot_before_observation() {
+    let grants = authority()
+        .resolve(
+            "worker",
+            "build",
+            &signer_request(vec![ResourcePurpose::GitSigning]),
+        )
+        .unwrap();
+    let grant = &grants[&LogicalSecretName::parse("signer").unwrap()];
+    for (id, slot) in [("other", "service"), ("vault", "other")] {
+        let provider = IndependentProvider::new(id);
+        let cancelled = false.into();
+        let context = dev_tools_secret::OperationContext::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            &cancelled,
+        );
+        let error = grant
+            .discover_metadata(&provider, slot, context)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            dev_tools_secret::SecretErrorKind::PermissionDenied
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn admitted_metadata_discovery_rejects_empty_selected_rights_before_observation() {
+    let provider = IndependentProvider::new("vault");
+    assert!(authority()
+        .resolve("worker", "build", &signer_request(vec![]))
+        .is_err());
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn admitted_metadata_discovery_rejects_cancelled_or_expired_context_before_observation() {
+    let grants = authority()
+        .resolve(
+            "worker",
+            "build",
+            &signer_request(vec![ResourcePurpose::GitSigning]),
+        )
+        .unwrap();
+    let grant = &grants[&LogicalSecretName::parse("signer").unwrap()];
+    for (cancelled, deadline, expected) in [
+        (
+            true,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            dev_tools_secret::SecretErrorKind::Cancelled,
+        ),
+        (
+            false,
+            std::time::Instant::now(),
+            dev_tools_secret::SecretErrorKind::DeadlineExceeded,
+        ),
+    ] {
+        let provider = IndependentProvider::new("vault");
+        let cancelled = cancelled.into();
+        let context = dev_tools_secret::OperationContext::new(deadline, &cancelled);
+        let error = grant
+            .discover_metadata(&provider, "service", context)
+            .unwrap_err();
+        assert_eq!(error.kind(), expected);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn admitted_metadata_discovery_rejects_cancellation_during_observation() {
+    let grants = authority()
+        .resolve(
+            "worker",
+            "build",
+            &signer_request(vec![ResourcePurpose::GitSigning]),
+        )
+        .unwrap();
+    let grant = &grants[&LogicalSecretName::parse("signer").unwrap()];
+    let mut provider = IndependentProvider::new("vault");
+    provider.cancel_after = Some(1);
+    let cancelled = false.into();
+    let context = dev_tools_secret::OperationContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+        &cancelled,
+    );
+    let error = grant
+        .discover_metadata(&provider, "service", context)
+        .unwrap_err();
+    assert_eq!(error.kind(), dev_tools_secret::SecretErrorKind::Cancelled);
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }

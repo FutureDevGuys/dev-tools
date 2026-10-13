@@ -110,6 +110,23 @@ pub struct SecretMetadata {
     pub signing: bool,
 }
 
+/// Coarse, value-free classification observed at the provider. Unknown native
+/// types stay `Other`; provider strings never become diagnostic output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretValueType {
+    Text,
+    Concealed,
+    OneTimePassword,
+    Other,
+}
+
+/// Successful explicit observation of the exact referenced resource. This is
+/// neither an exportability grant nor proof that a subsequent operation works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretMetadataObservation {
+    pub value_type: SecretValueType,
+}
+
 /// Secret bytes zeroized on explicit request and on drop. This type implements
 /// neither `Clone`, `Debug`, `Display`, nor serialization traits.
 /// Construction also zeroizes owned input when rejecting its size.
@@ -236,12 +253,24 @@ pub trait SecretProvider: Send + Sync {
     fn id(&self) -> &ProviderId;
     fn capabilities(&self) -> ProviderCapabilities;
     fn health(&self, context: OperationContext<'_>) -> Result<ProviderHealth, SecretError>;
+    /// Adapter capability declaration. It need not contact the provider and
+    /// must not be used as evidence of resource existence.
     fn metadata(
         &self,
         reference: &SecretReference,
         purpose: SecretPurpose,
         context: OperationContext<'_>,
     ) -> Result<SecretMetadata, SecretError>;
+    /// Explicitly observe one resource without retrieving secret field values
+    /// or enumerating sibling resources. Unsupported adapters fail closed.
+    fn discover_metadata(
+        &self,
+        _reference: &SecretReference,
+        context: OperationContext<'_>,
+    ) -> Result<SecretMetadataObservation, SecretError> {
+        context.checkpoint()?;
+        Err(SecretError::new(SecretErrorKind::Unsupported))
+    }
     fn read_exportable(
         &self,
         reference: &SecretReference,

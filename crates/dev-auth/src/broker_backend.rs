@@ -213,6 +213,18 @@ impl ExpectedOperationKey<'_> {
 }
 
 pub(crate) trait CapabilityBackend: Send + Sync {
+    fn resource_metadata(
+        &self,
+        _operation: &ProviderOperation<'_>,
+        _session: &crate::linux_admission::VerifiedLinuxSession,
+        _resource: &str,
+    ) -> Result<crate::resource_metadata::ValueType> {
+        Err(
+            dev_tools_secret::SecretError::new(dev_tools_secret::SecretErrorKind::Unsupported)
+                .into(),
+        )
+    }
+
     fn validate_providers(
         &self,
         _operation: &ProviderOperation<'_>,
@@ -907,6 +919,55 @@ fn validation_observation_succeeded(result: Result<()>) -> Result<bool> {
 }
 
 impl CapabilityBackend for SystemCapabilityBackend {
+    fn resource_metadata(
+        &self,
+        operation: &ProviderOperation<'_>,
+        session: &crate::linux_admission::VerifiedLinuxSession,
+        resource: &str,
+    ) -> Result<crate::resource_metadata::ValueType> {
+        operation.checkpoint()?;
+        if session.authority.hard_deadline_expired()? {
+            bail!("workload authority expired");
+        }
+        let RuntimeAdministrator::Logical(policy) = &self.policy else {
+            bail!("logical resource authority is unavailable");
+        };
+        let selection = session
+            .authority
+            .logical
+            .as_ref()
+            .context("logical session authority is absent")?;
+        let cap = policy
+            .workload_caps
+            .get(&selection.cap)
+            .context("workload cap is absent")?;
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(session.owner_uid))?
+            .context("native workload account is absent")?;
+        if !cap.users.contains(&user.name) {
+            bail!("workload account is outside authority");
+        }
+        let grants =
+            policy
+                .credentials
+                .resolve(&user.name, &cap.resource_cap, &selection.resources)?;
+        let name = dev_tools_secret::LogicalSecretName::parse(resource)?;
+        let grant = grants
+            .get(&name)
+            .context("logical resource is outside workload authority")?;
+        let slot = grant.credential_slot();
+        let provider = crate::runtime::OnePasswordProvider::named(
+            grant.provider().clone(),
+            self.policy.provider_program(slot)?,
+            self.service_token(slot)?,
+        )?;
+        let observation = grant.discover_metadata(&provider, slot, operation.secret_context())?;
+        operation.checkpoint()?;
+        if session.authority.hard_deadline_expired()? {
+            bail!("workload authority expired");
+        }
+        Ok(observation.value_type.into())
+    }
+
     fn validate_providers(
         &self,
         operation: &ProviderOperation<'_>,
