@@ -8,6 +8,7 @@ pub mod dispatch;
 pub mod entrypoint;
 pub mod gc;
 pub mod install;
+mod inventory;
 pub mod lease;
 pub mod migrate;
 #[cfg(feature = "experimental-container-cache")]

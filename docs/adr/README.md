@@ -117,6 +117,9 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 
 | [0105](0105-retained-cargo-final-outputs.md) | Opt-in retained Cargo final-output routing | proposed | pending |
 
+| [0106](0106-dev-cache-bounded-catalog-inventory.md) | Bounded read-only resource catalog inventory | proposed | pending |
+| [0107](0107-owner-linked-cargo-orphan-gc.md) | Owner-linked Cargo orphan collection | proposed | pending |
+
 | [0114](0114-admitted-value-free-resource-metadata.md) | Admitted value-free resource metadata | proposed | pending |
 
 | [0118](0118-consumed-native-command-graphs.md) | Consumed native command graphs | proposed | pending |
