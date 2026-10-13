@@ -1,5 +1,7 @@
 # Dev Auth executable acceptance
 
+The explicit resource-metadata source slice in [ADR 0114](adr/0114-admitted-value-free-resource-metadata.md) requires focused shared-provider, logical-admission, broker, CLI and sealed-provider-child tests. Real-provider type lookup, signed installed workload admission and strong native custody remain pending; a fake-provider or uninstalled CLI pass does not qualify those gates. Metadata must observe only a selected logical resource, retain unknown existence on every failure, preserve operation-only no-export authority, suppress late results on revocation, and keep values/references out of output and audit.
+
 The general-purpose delivery is governed by the [accepted implementation plan](../context/docs/dev-auth-delivery-plan.md). This inventory distinguishes implementation evidence from installed release and provider evidence; it is not a platform-support claim.
 
 The [0.4.0 Linux qualification record](dev-auth-linux-0.4-qualification.md) binds the signed release identity, independent reproduction, native public intake/upgrade/restoration and exercised workload-containment evidence. Its bounded claims supplement the component inventory below; they do not turn an unrun interruption or non-Linux case into acceptance.

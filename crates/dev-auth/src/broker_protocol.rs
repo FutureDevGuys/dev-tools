@@ -121,6 +121,9 @@ pub struct BrokerRequestEnvelope {
 pub enum BrokerRequest {
     #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
     ValidateProviders,
+    SecretMetadata {
+        resource: String,
+    },
     SecretRead {
         resource: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,6 +190,9 @@ pub struct BrokerResponseEnvelope {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BrokerResponse {
+    ResourceMetadata {
+        value_type: crate::resource_metadata::ValueType,
+    },
     ProviderValidation {
         authentication_checked: u32,
         authentication_total: u32,
@@ -364,7 +370,7 @@ fn validate_response(response: &BrokerResponse) -> Result<()> {
             }
             Ok(())
         }
-        BrokerResponse::SecretMaterial { .. } => Ok(()),
+        BrokerResponse::SecretMaterial { .. } | BrokerResponse::ResourceMetadata { .. } => Ok(()),
         BrokerResponse::Ready {
             session_id,
             workload,
@@ -444,7 +450,9 @@ fn validate_request_envelope(request: &BrokerRequestEnvelope) -> Result<()> {
     }
     validate_request_id(&request.request_id)?;
     match &request.request {
-        BrokerRequest::SecretRead { resource, .. } | BrokerRequest::SecretPublic { resource } => {
+        BrokerRequest::SecretRead { resource, .. }
+        | BrokerRequest::SecretPublic { resource }
+        | BrokerRequest::SecretMetadata { resource } => {
             dev_tools_secret::LogicalSecretName::parse(resource.clone())
                 .map(|_| ())
                 .map_err(|_| anyhow::anyhow!("logical resource name is invalid"))

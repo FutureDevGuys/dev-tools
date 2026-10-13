@@ -1,6 +1,7 @@
 use dev_tools_secret::{
-    LogicalSecretName, OperationContext, ProviderCapabilities, ProviderId, SecretError,
-    SecretErrorKind, SecretMaterial, SecretPurpose, SecretReference,
+    LogicalSecretName, OperationContext, ProviderCapabilities, ProviderHealth, ProviderId,
+    ProviderSignature, PublicMaterial, SecretError, SecretErrorKind, SecretMaterial,
+    SecretMetadata, SecretProvider, SecretPurpose, SecretReference,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -91,4 +92,96 @@ fn provider_capabilities_distinguish_export_from_operation_only_authority() {
     assert!(!capabilities.allows(SecretPurpose::Export));
     assert!(capabilities.allows(SecretPurpose::PublicMaterial));
     assert!(capabilities.allows(SecretPurpose::Sign));
+}
+
+struct DefaultMetadataProvider {
+    id: ProviderId,
+}
+
+impl SecretProvider for DefaultMetadataProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            exportable_read: true,
+            public_material: true,
+            signing: true,
+            metadata: true,
+        }
+    }
+
+    fn health(&self, _: OperationContext<'_>) -> Result<ProviderHealth, SecretError> {
+        panic!("default metadata discovery must not probe provider health")
+    }
+
+    fn metadata(
+        &self,
+        _: &SecretReference,
+        _: SecretPurpose,
+        _: OperationContext<'_>,
+    ) -> Result<SecretMetadata, SecretError> {
+        panic!("capability metadata must not substitute for explicit observation")
+    }
+
+    fn read_exportable(
+        &self,
+        _: &SecretReference,
+        _: OperationContext<'_>,
+    ) -> Result<SecretMaterial, SecretError> {
+        panic!("default metadata discovery must not export secret material")
+    }
+
+    fn public_material(
+        &self,
+        _: &SecretReference,
+        _: OperationContext<'_>,
+    ) -> Result<PublicMaterial, SecretError> {
+        panic!("default metadata discovery must not retrieve public material")
+    }
+
+    fn sign(
+        &self,
+        _: &SecretReference,
+        _: &[u8],
+        _: OperationContext<'_>,
+    ) -> Result<ProviderSignature, SecretError> {
+        panic!("default metadata discovery must not perform a signing operation")
+    }
+}
+
+#[test]
+fn metadata_discovery_default_is_unsupported_without_export() {
+    let provider = DefaultMetadataProvider {
+        id: ProviderId::parse("independent").unwrap(),
+    };
+    let provider: &dyn SecretProvider = &provider;
+    let reference = SecretReference::new("independent://fixture/private-key").unwrap();
+    let cancelled = AtomicBool::new(false);
+    let context = OperationContext::new(Instant::now() + Duration::from_secs(5), &cancelled);
+    assert!(provider.capabilities().metadata);
+    let error = provider.discover_metadata(&reference, context).unwrap_err();
+    assert_eq!(error.kind(), SecretErrorKind::Unsupported);
+}
+
+#[test]
+fn metadata_discovery_default_checks_cancelled_and_expired_context() {
+    let provider = DefaultMetadataProvider {
+        id: ProviderId::parse("independent").unwrap(),
+    };
+    let reference = SecretReference::new("independent://fixture/private-key").unwrap();
+    for (cancelled, deadline, expected) in [
+        (
+            true,
+            Instant::now() + Duration::from_secs(5),
+            SecretErrorKind::Cancelled,
+        ),
+        (false, Instant::now(), SecretErrorKind::DeadlineExceeded),
+    ] {
+        let cancelled = AtomicBool::new(cancelled);
+        let context = OperationContext::new(deadline, &cancelled);
+        let error = provider.discover_metadata(&reference, context).unwrap_err();
+        assert_eq!(error.kind(), expected);
+    }
 }
