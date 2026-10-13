@@ -22,6 +22,8 @@ use crate::resources::{self, CleanupStrategy, ResourceKind, ResourceRecord};
 use crate::root::RootHandle;
 use crate::util::{directory_size, now_unix, write_json_atomic};
 
+mod orphan;
+
 #[derive(Clone, Debug, Default)]
 pub struct GcOverrides {
     pub max_bytes: Option<u64>,
@@ -231,10 +233,31 @@ fn collect_with_lease(
         artifact_actions(root, now, artifact_stale_after_days)?;
     actions.extend(artifact_actions);
     abstentions.extend(artifact_abstentions);
-    let (resource_actions, resource_abstentions) =
-        resource_actions(root, now, stale_days, policy, &active_resource_ids)?;
+    let (records, catalog_issues) = resources::scan(root)?;
+    let catalog_complete = catalog_issues.is_empty();
+    let (resource_actions, resource_abstentions) = resource_actions(
+        root,
+        now,
+        stale_days,
+        policy,
+        &active_resource_ids,
+        &records,
+        catalog_issues,
+    )?;
     actions.extend(resource_actions);
     abstentions.extend(resource_abstentions);
+    let orphan_groups = orphan::link_actions(
+        &orphan::Admission {
+            root,
+            policy,
+            now,
+            active_paths: &active_paths,
+        },
+        &records,
+        catalog_complete,
+        &mut actions,
+        &mut abstentions,
+    );
     remove_nested_actions(&mut actions);
     let bytes_before = measure_action_sizes(root, &mut actions, progress)?;
     let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
@@ -275,7 +298,19 @@ fn collect_with_lease(
     let mut failures = Vec::new();
     if apply {
         for action in &actions {
-            if let Err(error) = apply_action(root, action) {
+            let result = if action.kind == orphan::ACTION_KIND {
+                orphan::apply(
+                    root,
+                    policy,
+                    action,
+                    orphan_groups
+                        .get(&action.path)
+                        .context("missing current orphan admission")?,
+                )
+            } else {
+                apply_action(root, action)
+            };
+            if let Err(error) = result {
                 failures.push(GcFailure {
                     resource_id: action.resource_id.clone(),
                     path: action.path.clone(),
@@ -342,18 +377,34 @@ fn measure_action_sizes(
     let paths = actions
         .iter()
         .filter(|action| measured_action(action))
-        .map(|action| action.path.clone())
+        .flat_map(|action| measured_paths(action).iter().cloned())
         .collect::<Vec<_>>();
     let measurement = crate::space::measure_paths_with_progress(root, &paths, progress)
         .map_err(anyhow::Error::msg)
         .context("observe cache sizes before collection actions")?;
     for action in actions.iter_mut().filter(|action| measured_action(action)) {
-        action.bytes = *measurement
-            .paths
-            .get(&action.path)
-            .context("missing admitted cache size observation")?;
+        action.bytes = measured_paths(action)
+            .iter()
+            .try_fold(0_u64, |total, path| {
+                total
+                    .checked_add(
+                        *measurement
+                            .paths
+                            .get(path)
+                            .context("missing admitted cache size observation")?,
+                    )
+                    .context("compound cache size overflow")
+            })?;
     }
     Ok(measurement.total)
+}
+
+fn measured_paths(action: &GcAction) -> &[PathBuf] {
+    if action.kind == orphan::ACTION_KIND {
+        &action.companion_paths
+    } else {
+        std::slice::from_ref(&action.path)
+    }
 }
 
 fn selected_bytes(actions: &[GcAction]) -> Result<u64> {
@@ -369,8 +420,9 @@ fn resource_actions(
     stale_days: u64,
     policy: &GcConfig,
     active_resource_ids: &std::collections::BTreeSet<String>,
+    records: &[ResourceRecord],
+    issues: Vec<resources::CatalogIssue>,
 ) -> Result<(Vec<GcAction>, Vec<GcAbstention>)> {
-    let (records, issues) = resources::scan(root)?;
     let mut actions = Vec::new();
     let mut abstentions = issues
         .into_iter()
@@ -381,7 +433,7 @@ fn resource_actions(
         })
         .collect::<Vec<_>>();
     for record in records {
-        let path = match resources::absolute_path(root, &record) {
+        let path = match resources::absolute_path(root, record) {
             Ok(path) => path,
             Err(error) => {
                 abstentions.push(GcAbstention {
@@ -696,8 +748,8 @@ fn remove_nested_actions(actions: &mut Vec<GcAction>) {
     // scanning every repository for every action.
     let repository_roots = actions
         .iter()
-        .filter(|action| action.kind == "repository")
-        .map(|action| action.path.clone())
+        .filter(|action| action.kind == "repository" || action.kind == orphan::ACTION_KIND)
+        .flat_map(|action| measured_paths(action).iter().cloned())
         .collect::<std::collections::BTreeSet<_>>();
     let covers_all_paths = repository_roots.contains(Path::new(""));
     actions.retain(|action| {
@@ -710,6 +762,7 @@ fn remove_nested_actions(actions: &mut Vec<GcAction>) {
             _ => false,
         };
         action.kind == "repository"
+            || action.kind == orphan::ACTION_KIND
             || (!covers_all_paths
                 && !prefix_is_root
                 && !action
