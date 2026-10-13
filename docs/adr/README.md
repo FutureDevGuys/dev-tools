@@ -120,3 +120,16 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0114](0114-admitted-value-free-resource-metadata.md) | Admitted value-free resource metadata | proposed | pending |
 
 | [0118](0118-consumed-native-command-graphs.md) | Consumed native command graphs | proposed | pending |
+
+| [0115](0115-native-administrator-grants-with-maintenance-compatibility.md) | Native administrator grants with maintenance compatibility | proposed | pending |
+
+| [0116](0116-retained-grant-setup-and-explicit-empty-native-files.md) | Retained grant setup and explicit empty native files | proposed | pending |
+
+| [0117](0117-deployment-selected-binding-source-lifecycle.md) | Deployment-selected binding source lifecycle and code trust | proposed | pending |
+
+| [0119](0119-bounded-grant-output-and-native-launch-activation.md) | Bounded grant output and native launch activation | proposed | pending |
+
+| [0120](0120-setup-owned-updates-and-preserving-maintenance.md) | Setup-owned updates and preserving maintenance | proposed | pending |
+
+| [0121](0121-terminal-command-graph-custody.md) | Foreground terminal command graph custody | proposed | pending |
+| [0122](0122-exact-plan-node-identity-and-streams.md) | Exact plan node identity and streams | proposed | pending |
