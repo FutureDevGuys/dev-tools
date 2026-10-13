@@ -6,6 +6,12 @@ mod public_file_stdout;
 pub use owned_prepared::OwnedPreparedCommand;
 mod inherited;
 pub use inherited::{run_prepared_inherited_command, InheritedCommandOutput};
+
+mod graph;
+pub use graph::{
+    run_prepared_command_graph, validate_command_graph_dependencies, CommandGraphNode,
+    CommandGraphOutput, GraphDependencies, GraphExitPolicy, MAX_GRAPH_NODES,
+};
 #[cfg(target_os = "linux")]
 pub use public_file_stdout::{
     run_prepared_bounded_command_with_public_file_stdout,
