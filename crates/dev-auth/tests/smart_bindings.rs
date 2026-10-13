@@ -33,6 +33,23 @@ fn native_identity(device: Option<u64>, inode: Option<u64>) -> ExecutableIdentit
 
 #[test]
 fn native_binding_identity_json_and_jcs_preserve_the_full_unsigned_range() {
+    use sha2::{Digest, Sha256};
+
+    let identity = native_identity(Some((1_u64 << 53) + 1), Some(u64::MAX));
+    let canonical = serde_jcs::to_vec(&identity).unwrap();
+    assert_eq!(
+        canonical.as_slice(),
+        br#"{"authority":"user-owned","canonical_path":"/unused/binding-target","device":"9007199254740993","group":1000,"inode":"18446744073709551615","length":7,"mode":493,"owner":1000,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+    );
+    let mut adjacent = identity.clone();
+    adjacent.device = Some(1_u64 << 53);
+    let adjacent_canonical = serde_jcs::to_vec(&adjacent).unwrap();
+    assert_ne!(canonical, adjacent_canonical);
+    assert_ne!(
+        Sha256::digest(&canonical),
+        Sha256::digest(&adjacent_canonical)
+    );
+
     for (device, inode) in [
         (0, 1),
         ((1_u64 << 53) + 1, u64::MAX),
@@ -284,7 +301,7 @@ fn argument_assembly_rejects_invalid_positions_and_unimplemented_shell_targets()
 #[cfg(target_os = "linux")]
 #[test]
 fn binding_snapshot_is_digest_verified_sealed_and_independent_of_in_place_writes() {
-    use dev_auth::smart_binding::snapshot_binding_executable;
+    use dev_auth::smart_binding::{retain_binding_executable, snapshot_binding_executable};
     use std::io::{Read, Write};
 
     let root = tempfile::tempdir().unwrap();
@@ -298,6 +315,16 @@ fn binding_snapshot_is_digest_verified_sealed_and_independent_of_in_place_writes
     let mut wrong = identity.clone();
     wrong.sha256 = "0".repeat(64);
     assert!(snapshot_binding_executable(&wrong).is_err());
+    for (device, inode) in [
+        (identity.device.unwrap() ^ 1, identity.inode.unwrap()),
+        (identity.device.unwrap(), identity.inode.unwrap() ^ 1),
+    ] {
+        let mut wrong_native_identity = identity.clone();
+        wrong_native_identity.device = Some(device);
+        wrong_native_identity.inode = Some(inode);
+        assert!(retain_binding_executable(&wrong_native_identity).is_err());
+        assert!(snapshot_binding_executable(&wrong_native_identity).is_err());
+    }
     let mut snapshot = snapshot_binding_executable(&identity).unwrap();
     assert!(rustix::fs::fcntl_get_seals(&snapshot).unwrap().contains(
         rustix::fs::SealFlags::SEAL
