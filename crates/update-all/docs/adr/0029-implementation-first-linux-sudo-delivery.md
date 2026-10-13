@@ -5,8 +5,8 @@ owner: dev-tools/update-all
 
 # ADR 0029: Implementation-first Linux sudo delivery
 
-status: proposed
-verification: pending
+status: accepted
+verification: verified
 
 ## Context
 
@@ -59,3 +59,7 @@ Retain `interactive_elevated_command_uses_one_sudo_process_without_auth_replay`,
 ## Supersession conditions
 
 Replace this sequencing decision through a numbered ADR if immediate-delivery scope, required current-policy behavior, or authenticated release and rollback requirements change.
+
+## Linux current-policy evidence
+
+The implementation-first native Linux journey passed authenticated exact-argv success, intentional failure with exactly one protected effect and no replay, and manually requested cancellation with a canceled saved task result and settled protected process group. The targeted ADR lifecycle/regression contract passed. Controlled-executable sudo scenarios remain synthetic evidence. Terminal-scoped, parent-scoped, no-cache and NOPASSWD matrix lanes remain NOT RUN; the sequencing decision in ADR 0029 does not invent those results.
