@@ -142,20 +142,29 @@ fn emit_git_rerun_paths(root: &Path) {
 
 fn git_rerun_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    // Do not watch .git/index here. git status can refresh it while this build
-    // script computes UPDATE_ALL_GIT_DIRTY, making release builds self-stale.
-    for pathspec in ["HEAD", "packed-refs"] {
-        if let Some(path) = git_path(root, pathspec) {
+    // Cargo treats an absent watched path as permanently stale. Watch existing
+    // ref storage instead: the refs directory also observes loose-ref creation
+    // after packing, while deletion of a watched file triggers fresh discovery.
+    // Do not watch the whole Git directory or index: git status can refresh the
+    // index while computing UPDATE_ALL_GIT_DIRTY and make the build self-stale.
+    for pathspec in ["HEAD", "packed-refs", "refs", "reftable"] {
+        if let Some(path) = git_path(root, pathspec).filter(|path| path.exists()) {
             paths.push(path);
         }
     }
 
-    if let Some(branch) = git_output(root, &["branch", "--show-current"]) {
-        if let Some(path) = git_path(root, &format!("refs/heads/{branch}")) {
-            paths.push(path);
+    // Linked worktrees have private HEAD/reftable state but share branch refs.
+    // --git-path resolves the file-backed refs into their common directory;
+    // reftable additionally needs that common store as well as the private one.
+    if let Some(common) = git_output(root, &["rev-parse", "--git-common-dir"]) {
+        let reftable = expand_git_path(root, &common).join("reftable");
+        if reftable.exists() {
+            paths.push(reftable);
         }
     }
 
+    paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -195,15 +204,4 @@ fn build_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-fn target_dir() -> Option<String> {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").ok()?);
-    let build_dir = out_dir
-        .ancestors()
-        .find(|path| path.file_name().is_some_and(|name| name == "build"))?;
-    build_dir
-        .parent()
-        .and_then(Path::parent)
-        .map(|path| path.to_string_lossy().into_owned())
 }

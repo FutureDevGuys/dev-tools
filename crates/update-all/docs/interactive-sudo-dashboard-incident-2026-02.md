@@ -76,5 +76,10 @@ Look for these markers to validate expected behavior:
 - Custom updater tasks now support:
   - `needs_sudo_session = true|false`
 - This is separate from `requires_elevation`:
-  - `requires_elevation` controls command wrapping with `sudo -n -- ...`
+  - `requires_elevation` controls command wrapping with `sudo -n -- ...` for noninteractive tasks and a single `sudo -- ...` invocation for interactive tasks.
   - `needs_sudo_session` requests pre-auth + keepalive session ownership for task flows that rely on ambient sudo credentials.
+
+Interactive tasks may require authentication in their own terminal even after
+successful preflight. [ADR 0028](adr/0028-task-terminal-sudo-authentication.md)
+removes the separate authentication wrapper and automatic interactive-elevation
+replay; review the task log before explicitly retrying a failed task.

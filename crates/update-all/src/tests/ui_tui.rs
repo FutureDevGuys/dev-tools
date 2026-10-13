@@ -2229,6 +2229,109 @@ fn first_enter_answers_visible_prompt_exactly_once() {
 }
 
 #[test]
+fn submitted_prompt_preserves_cancel_and_quit_controls_without_resubmission() {
+    let layout = layout_for(
+        Rect::new(0, 0, 120, 40),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    for key in ['k', 'K', 'q', 'Q'] {
+        let mut model = Model::new(200, true, true);
+        model.register_task("fixture/task".into(), "Fixture".into(), Vec::new(), true);
+        model.set_task_state("fixture/task", TaskState::Running, None);
+        model.set_task_input_state("fixture/task", true);
+        model.set_prompt_request(
+            "fixture/task".into(),
+            7,
+            "[sudo] password for fixture:".into(),
+        );
+        model.mark_prompt_submitted("fixture/task", 7);
+        let (tx, rx) = std::sync::mpsc::channel::<UiControlEvent>();
+
+        assert!(!handle_key_event(
+            &mut model,
+            KeyEvent::from(KeyCode::Char(key)),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::CancelAll,
+        ));
+        let event = rx
+            .try_recv()
+            .expect("submitted prompt must allow cancellation");
+        if key == 'k' {
+            assert!(matches!(event, UiControlEvent::CancelTask { id } if id == "fixture/task"));
+        } else {
+            assert!(matches!(event, UiControlEvent::CancelAll));
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(model.prompt_is_submitted());
+        assert!(model.prompt_edit.is_none());
+    }
+
+    for key in ['q', 'Q'] {
+        let mut model = Model::new(200, true, true);
+        model.register_task("fixture/task".into(), "Fixture".into(), Vec::new(), true);
+        model.set_task_state("fixture/task", TaskState::Running, None);
+        model.set_task_input_state("fixture/task", true);
+        model.set_prompt_request("fixture/task".into(), 7, "Continue?".into());
+        model.mark_prompt_submitted("fixture/task", 7);
+        let (tx, rx) = std::sync::mpsc::channel::<UiControlEvent>();
+        assert!(handle_key_event(
+            &mut model,
+            KeyEvent::from(KeyCode::Char(key)),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::Detach,
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn unsubmitted_prompt_keeps_cancel_control_characters_as_input() {
+    let mut model = Model::new(200, true, true);
+    model.register_task("fixture/task".into(), "Fixture".into(), Vec::new(), true);
+    model.set_task_state("fixture/task", TaskState::Running, None);
+    model.set_task_input_state("fixture/task", true);
+    model.set_prompt_request(
+        "fixture/task".into(),
+        8,
+        "[sudo] password for fixture:".into(),
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<UiControlEvent>();
+    let layout = layout_for(
+        Rect::new(0, 0, 120, 40),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    for key in ['k', 'K', 'q', 'Q'] {
+        assert!(!handle_key_event(
+            &mut model,
+            KeyEvent::from(KeyCode::Char(key)),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::CancelAll,
+        ));
+    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(model.prompt_edit.as_ref().unwrap().buffer, "kKqQ");
+    assert!(!handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Enter),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::CancelAll,
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(UiControlEvent::SendStdin { id, generation: 8, line }) if id == "fixture/task" && line == "kKqQ"
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn sequential_prompt_generations_replace_submitted_state_without_log_heuristics() {
     let mut model = Model::new(200, true, true);
     model.register_task(
