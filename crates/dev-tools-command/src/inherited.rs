@@ -42,15 +42,30 @@ pub fn run_prepared_inherited_command<'a>(
     command: impl Into<OwnedPreparedCommand<'a>>,
     continue_running: impl FnMut() -> bool,
 ) -> anyhow::Result<InheritedCommandOutput> {
+    run_prepared_inherited_command_after_spawn(command, |_| Ok(()), continue_running)
+}
+
+/// Observe a successful final native spawn before entering the supervision
+/// loop. The fallible, bounded callback runs in the owning parent; an error
+/// terminalizes the owned process group through the existing cleanup path.
+/// The callback does not receive child ownership or confer execution authority.
+/// Its immutable Child borrow is valid only during the callback; it must not
+/// reap, transfer or concurrently wait for that child. Non-reaping native
+/// observations preserve the runner's exclusive identity and cleanup custody.
+pub fn run_prepared_inherited_command_after_spawn<'a>(
+    command: impl Into<OwnedPreparedCommand<'a>>,
+    after_spawn: impl FnOnce(&std::process::Child) -> anyhow::Result<()>,
+    continue_running: impl FnMut() -> bool,
+) -> anyhow::Result<InheritedCommandOutput> {
     #[cfg(target_os = "linux")]
     {
         let mut owned = command.into();
-        linux::run(owned.command_mut(), continue_running)
+        linux::run(owned.command_mut(), after_spawn, continue_running)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let mut owned = command.into();
-        let _ = (owned.command_mut(), continue_running);
+        let _ = (owned.command_mut(), after_spawn, continue_running);
         anyhow::bail!("inherited native execution is unavailable on this platform")
     }
 }
@@ -58,180 +73,12 @@ pub fn run_prepared_inherited_command<'a>(
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::terminal_custody::{signal_group, Signals, Terminal};
     use anyhow::{bail, Context, Result};
-    use std::fs::File;
-    use std::io::{self, Read};
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::Child;
     use std::time::{Duration, Instant};
-
-    struct Signals {
-        previous: libc::sigset_t,
-        input: File,
-    }
-
-    impl Signals {
-        fn block() -> Result<Self> {
-            // SAFETY: sigset_t is a libc POD output object; sigemptyset initializes
-            // it before use. pthread_sigmask writes the complete previous mask.
-            let (mut mask, mut previous) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
-            // SAFETY: both pointers are live sigset_t objects; no pointer is retained.
-            unsafe {
-                libc::sigemptyset(&mut mask);
-                for signal in [
-                    libc::SIGINT,
-                    libc::SIGTERM,
-                    libc::SIGQUIT,
-                    libc::SIGHUP,
-                    libc::SIGCHLD,
-                    libc::SIGTTOU,
-                ] {
-                    libc::sigaddset(&mut mask, signal);
-                }
-                let error = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous);
-                if error != 0 {
-                    return Err(io::Error::from_raw_os_error(error).into());
-                }
-            }
-            // SAFETY: mask is initialized and borrowed only during signalfd. A
-            // successful call transfers one new descriptor to this owner.
-            let fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                // SAFETY: previous was initialized by successful pthread_sigmask.
-                unsafe {
-                    libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
-                }
-                return Err(error.into());
-            }
-            // SAFETY: fd is a fresh owned descriptor returned above, not aliased
-            // by another Rust owner. File closes it exactly once.
-            Ok(Self {
-                previous,
-                input: unsafe { File::from_raw_fd(fd) },
-            })
-        }
-
-        fn forward(&mut self, child: i32) -> Result<()> {
-            let mut bytes = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
-            for _ in 0..64 {
-                match self.input.read(&mut bytes) {
-                    Ok(length) if length == bytes.len() => {
-                        let signal = u32::from_ne_bytes(
-                            bytes[..4]
-                                .try_into()
-                                .context("invalid native signal field")?,
-                        );
-                        if matches!(
-                            signal as i32,
-                            libc::SIGINT | libc::SIGTERM | libc::SIGQUIT | libc::SIGHUP
-                        ) {
-                            signal_group(child, signal as i32)?;
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    _ => bail!("native signal observation failed"),
-                }
-            }
-            Ok(())
-        }
-
-        fn restore(&mut self) -> Result<()> {
-            // SAFETY: previous was initialized by this calling thread's mask exchange.
-            let error = unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
-            };
-            if error != 0 {
-                return Err(io::Error::from_raw_os_error(error).into());
-            }
-            Ok(())
-        }
-    }
-
-    impl Drop for Signals {
-        fn drop(&mut self) {
-            // SAFETY: previous belongs to this thread's successful mask exchange.
-            // Restoration changes no process-wide signal disposition or handler.
-            unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
-            }
-        }
-    }
-
-    struct Terminal {
-        file: File,
-        parent: i32,
-        changed: bool,
-    }
-
-    impl Terminal {
-        fn open() -> Result<Option<Self>> {
-            let file = match File::options()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOCTTY)
-                .open("/dev/tty")
-            {
-                Ok(file) => file,
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::ENXIO | libc::ENOENT | libc::ENODEV)
-                    ) =>
-                {
-                    return Ok(None)
-                }
-                Err(error) => return Err(error).context("open inherited controlling terminal"),
-            };
-            // SAFETY: getpgrp has no pointer arguments or memory preconditions.
-            Ok(Some(Self {
-                file,
-                parent: unsafe { libc::getpgrp() },
-                changed: false,
-            }))
-        }
-
-        fn give_to(&mut self, child: i32) -> Result<()> {
-            // SAFETY: file retains a live controlling-terminal descriptor.
-            let foreground = unsafe { libc::tcgetpgrp(self.file.as_raw_fd()) };
-            if foreground < 0 {
-                return Err(io::Error::last_os_error())
-                    .context("observe terminal foreground group");
-            }
-            if foreground == self.parent {
-                // SAFETY: this process is in the terminal's session and child is
-                // its retained process group. SIGTTOU is blocked on this thread.
-                if unsafe { libc::tcsetpgrp(self.file.as_raw_fd(), child) } != 0 {
-                    return Err(io::Error::last_os_error())
-                        .context("transfer terminal foreground group");
-                }
-                self.changed = true;
-            }
-            Ok(())
-        }
-
-        fn restore(&mut self) -> Result<()> {
-            if self.changed {
-                // SAFETY: parent is the original native process group and the
-                // retained terminal descriptor remains open. SIGTTOU is blocked.
-                if unsafe { libc::tcsetpgrp(self.file.as_raw_fd(), self.parent) } != 0 {
-                    return Err(io::Error::last_os_error())
-                        .context("restore terminal foreground group");
-                }
-                self.changed = false;
-            }
-            Ok(())
-        }
-    }
-
-    impl Drop for Terminal {
-        fn drop(&mut self) {
-            let _ = self.restore();
-        }
-    }
 
     struct OwnedChild(Option<Child>);
 
@@ -264,27 +111,9 @@ mod linux {
         }
     }
 
-    fn signal_group(group: i32, signal: i32) -> Result<()> {
-        let domain = ProcessDomain {
-            group: rustix::process::Pid::from_raw(group),
-        };
-        // A WNOWAIT observation must still identify our retained direct child.
-        // Never signal a bare numeric group after wait ownership was lost.
-        super::super::process_exit_observed(domain)
-            .context("native child wait ownership unavailable")?;
-        // SAFETY: group is a positive unreaped child PID made into its own group
-        // before exec; negation selects only that owned native group.
-        if unsafe { libc::kill(-group, signal) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error.into());
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn run(
         command: &mut Command,
+        after_spawn: impl FnOnce(&Child) -> Result<()>,
         mut continue_running: impl FnMut() -> bool,
     ) -> Result<InheritedCommandOutput> {
         if !continue_running() {
@@ -319,12 +148,19 @@ mod linux {
         let mut child = OwnedChild(Some(
             command.spawn().context("start inherited native command")?,
         ));
-        let result = observe(
-            &mut child,
-            &mut signals,
-            &mut terminal,
-            &mut continue_running,
-        );
+        let result = child
+            .0
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native child ownership was lost"))
+            .and_then(after_spawn)
+            .and_then(|()| {
+                observe(
+                    &mut child,
+                    &mut signals,
+                    &mut terminal,
+                    &mut continue_running,
+                )
+            });
         // Errors before leader completion still need bounded termination.
         let cleanup = if let Some(mut pending) = child.0.take() {
             let domain = ProcessDomain::for_child(&pending);

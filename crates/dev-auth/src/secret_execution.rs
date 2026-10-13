@@ -108,7 +108,30 @@ impl Prepared {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        for (request, value) in requests.iter().zip(values) {
+        // Assign every target before allocating retained sources. A later file
+        // projection must not select a descriptor holding an earlier source.
+        let targets = requests
+            .iter()
+            .map(|request| match &request.target {
+                Target::Descriptor(fd) => Ok(Some(*fd)),
+                Target::File(name) => {
+                    let target = (64..=1024)
+                        .find(|fd| !selected.contains(fd))
+                        .context("projection descriptors are exhausted")?;
+                    selected.insert(target);
+                    command.env(name, format!("/proc/self/fd/{target}"));
+                    Ok(Some(target))
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source_floor = selected
+            .last()
+            .copied()
+            .unwrap_or(2)
+            .checked_add(1)
+            .context("projection source descriptor floor exceeds the native range")?;
+        for ((request, value), target) in requests.iter().zip(values).zip(targets) {
             if let Target::Environment(name) = &request.target {
                 if value.expose().contains(&0) {
                     bail!("environment projection cannot represent this material");
@@ -135,21 +158,15 @@ impl Prepared {
                 command.stdin(std::process::Stdio::from(file));
                 continue;
             }
-            let target = match &request.target {
-                Target::Descriptor(fd) => *fd,
-                Target::File(name) => {
-                    let target = (64..=1024)
-                        .find(|fd| !selected.contains(fd))
-                        .context("projection descriptors are exhausted")?;
-                    selected.insert(target);
-                    command.env(name, format!("/proc/self/fd/{target}"));
-                    target
-                }
-                _ => bail!("projection kind was not handled before descriptor preparation"),
-            };
-            // Retain sources above every allowed target so dup2 cannot destroy a
-            // later source. These descriptors remain CLOEXEC in the parent.
-            let source = File::from(rustix::io::fcntl_dupfd_cloexec(&file, 1025)?);
+            let target =
+                target.context("projection kind was not handled before descriptor preparation")?;
+            // Retain sources above every selected target so dup2 cannot destroy
+            // a later source. Do not require unused descriptors above the whole
+            // allowed range. Sources remain CLOEXEC in the parent.
+            let source = File::from(
+                rustix::io::fcntl_dupfd_cloexec(&file, source_floor)
+                    .context("retain projection source above selected target descriptors")?,
+            );
             descriptors.push((source.as_raw_fd(), target));
             files.push(source);
         }
