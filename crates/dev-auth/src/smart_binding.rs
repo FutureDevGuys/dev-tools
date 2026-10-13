@@ -12,6 +12,53 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v2";
 const MAX_BINDING_TARGET_BYTES: u64 = 512 * 1024 * 1024;
 
+// Native identities must not pass through JCS/IEEE-754 number rounding or
+// TOML's signed-integer Value range. New documents write exact decimal strings;
+// existing integral documents still decode and undergo full native comparison.
+mod identity_integer {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<u64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Decimal(String),
+            LegacyInteger(u64),
+        }
+        Option::<Representation>::deserialize(deserializer)?
+            .map(|value| match value {
+                Representation::LegacyInteger(value) => Ok(value),
+                Representation::Decimal(value) => {
+                    if value.is_empty()
+                        || value.len() > 20
+                        || !value.bytes().all(|b| b.is_ascii_digit())
+                        || (value.len() > 1 && value.starts_with('0'))
+                    {
+                        return Err(serde::de::Error::custom(
+                            "native identity must be canonical decimal u64",
+                        ));
+                    }
+                    value
+                        .parse()
+                        .map_err(|_| serde::de::Error::custom("native identity exceeds u64"))
+                }
+            })
+            .transpose()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BindingMode {
@@ -67,9 +114,17 @@ pub struct ExecutableIdentity {
     pub length: u64,
     pub sha256: String,
     pub authority: BindingAuthority,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "identity_integer"
+    )]
     pub device: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "identity_integer"
+    )]
     pub inode: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,

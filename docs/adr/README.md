@@ -26,6 +26,7 @@ Read the applicable records before changing a public product contract or cross-p
 | [0015](0015-dev-cache-read-only-root-observation.md) | Dev Cache read-only root observation | proposed | pending |
 | [0016](0016-artifact-update-common-doctor-result.md) | Artifact Update common doctor result | proposed | pending |
 | [0017](0017-binding-target-specific-resolution.md) | Binding target-specific resolution | proposed | pending |
+| [0113](0113-exact-native-binding-identity-encoding.md) | Exact native binding identity encoding | proposed | pending |
 | [0018](0018-journal-owned-initial-directory-publication.md) | Journal-owned initial-directory publication | proposed | pending |
 | [0019](0019-truthful-common-update-mutation-results.md) | Truthful common update mutation results | proposed | pending |
 | [0020](0020-separate-update-artifact-preparation.md) | Separate update artifact preparation | proposed | pending |
