@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
 use dev_auth::smart_binding::{
-    advance_binding, build_binding_plan, canonical_binding_plan, classify_binding_change,
-    default_proxy_directories, require_automatic_refresh, resolve_continuation,
-    resolve_structured_target, validate_binding_receipt_structure, write_binding_plan,
-    BindingAuthority, BindingChange, BindingIntent, BindingMode, BindingPlanChange, BindingReceipt,
-    BindingResolution, BindingTargetIntent,
+    advance_binding, binding_plan_sha256, build_binding_plan, canonical_binding_plan,
+    classify_binding_change, default_proxy_directories, require_automatic_refresh,
+    resolve_continuation, resolve_structured_target, validate_binding_receipt_structure,
+    write_binding_plan, BindingAuthority, BindingChange, BindingIntent, BindingMode,
+    BindingPlanChange, BindingReceipt, BindingResolution, BindingTargetIntent, ExecutableIdentity,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,6 +15,227 @@ use std::process::Command;
 fn executable(path: &Path, body: &[u8]) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn native_identity(device: Option<u64>, inode: Option<u64>) -> ExecutableIdentity {
+    ExecutableIdentity {
+        canonical_path: "/unused/binding-target".into(),
+        length: 7,
+        sha256: "a".repeat(64),
+        authority: BindingAuthority::UserOwned,
+        device,
+        inode,
+        mode: Some(0o755),
+        owner: Some(1000),
+        group: Some(1000),
+    }
+}
+
+#[test]
+fn native_binding_identity_json_and_jcs_preserve_the_full_unsigned_range() {
+    use sha2::{Digest, Sha256};
+
+    let identity = native_identity(Some((1_u64 << 53) + 1), Some(u64::MAX));
+    let canonical = serde_jcs::to_vec(&identity).unwrap();
+    assert_eq!(
+        canonical.as_slice(),
+        br#"{"authority":"user-owned","canonical_path":"/unused/binding-target","device":"9007199254740993","group":1000,"inode":"18446744073709551615","length":7,"mode":493,"owner":1000,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+    );
+    let mut adjacent = identity.clone();
+    adjacent.device = Some(1_u64 << 53);
+    let adjacent_canonical = serde_jcs::to_vec(&adjacent).unwrap();
+    assert_ne!(canonical, adjacent_canonical);
+    assert_ne!(
+        Sha256::digest(&canonical),
+        Sha256::digest(&adjacent_canonical)
+    );
+
+    for (device, inode) in [
+        (0, 1),
+        ((1_u64 << 53) + 1, u64::MAX),
+        (u64::MAX, (1_u64 << 53) + 1),
+    ] {
+        let identity = native_identity(Some(device), Some(inode));
+        let document = serde_json::to_value(&identity).unwrap();
+        assert_eq!(document["device"], device.to_string());
+        assert_eq!(document["inode"], inode.to_string());
+        assert_eq!(document["length"], 7);
+        assert_eq!(document["mode"], 0o755);
+        assert_eq!(document["owner"], 1000);
+        assert_eq!(document["group"], 1000);
+        for encoded in [
+            serde_json::to_vec(&identity).unwrap(),
+            serde_jcs::to_vec(&identity).unwrap(),
+        ] {
+            let decoded: ExecutableIdentity = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, identity);
+        }
+    }
+    let absent = native_identity(None, None);
+    let document = serde_json::to_value(&absent).unwrap();
+    assert!(document.get("device").is_none());
+    assert!(document.get("inode").is_none());
+    assert_eq!(
+        serde_json::from_value::<ExecutableIdentity>(document).unwrap(),
+        absent
+    );
+    let mut explicit_null = serde_json::to_value(&absent).unwrap();
+    explicit_null["device"] = serde_json::Value::Null;
+    explicit_null["inode"] = serde_json::Value::Null;
+    assert_eq!(
+        serde_json::from_value::<ExecutableIdentity>(explicit_null).unwrap(),
+        absent
+    );
+}
+
+#[test]
+fn native_binding_identity_toml_preserves_values_beyond_the_signed_range() {
+    for (device, inode) in [((1_u64 << 53) + 1, u64::MAX), (u64::MAX, (1_u64 << 53) + 1)] {
+        let identity = native_identity(Some(device), Some(inode));
+        let document = toml::Value::try_from(&identity).unwrap();
+        let encoded = toml::to_string(&document).unwrap();
+        assert_eq!(
+            document["device"].as_str(),
+            Some(device.to_string().as_str())
+        );
+        assert_eq!(document["inode"].as_str(), Some(inode.to_string().as_str()));
+        assert_eq!(
+            toml::from_str::<ExecutableIdentity>(&encoded).unwrap(),
+            identity
+        );
+    }
+    let absent = native_identity(None, None);
+    let encoded = toml::to_string(&absent).unwrap();
+    let document: toml::Value = toml::from_str(&encoded).unwrap();
+    assert!(document.get("device").is_none());
+    assert!(document.get("inode").is_none());
+    assert_eq!(
+        toml::from_str::<ExecutableIdentity>(&encoded).unwrap(),
+        absent
+    );
+}
+
+#[test]
+fn native_binding_identity_accepts_legacy_integral_values_and_rewrites_them_exactly() {
+    let identity = native_identity(Some((1_u64 << 53) + 1), Some(u64::MAX));
+    let mut document = serde_json::to_value(&identity).unwrap();
+    document["device"] = serde_json::json!(identity.device.unwrap());
+    document["inode"] = serde_json::json!(identity.inode.unwrap());
+    let decoded: ExecutableIdentity =
+        serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(decoded, identity);
+    let rewritten = serde_json::to_value(&decoded).unwrap();
+    assert_eq!(rewritten["device"], "9007199254740993");
+    assert_eq!(rewritten["inode"], "18446744073709551615");
+
+    let identity = native_identity(Some(i64::MAX as u64), Some(0));
+    let mut document: toml::Value = toml::from_str(&toml::to_string(&identity).unwrap()).unwrap();
+    document["device"] = toml::Value::Integer(i64::MAX);
+    document["inode"] = toml::Value::Integer(0);
+    let decoded: ExecutableIdentity = toml::from_str(&toml::to_string(&document).unwrap()).unwrap();
+    assert_eq!(decoded, identity);
+    let rewritten: toml::Value = toml::from_str(&toml::to_string(&decoded).unwrap()).unwrap();
+    assert_eq!(rewritten["device"].as_str(), Some("9223372036854775807"));
+    assert_eq!(rewritten["inode"].as_str(), Some("0"));
+}
+
+#[test]
+fn native_binding_identity_rejects_floats_and_noncanonical_decimal_strings() {
+    let identity = native_identity(Some(1), Some(2));
+    for field in ["device", "inode"] {
+        for invalid in [
+            "0.0",
+            "1.0",
+            "1e0",
+            "9007199254740993.0",
+            "18446744073709551616",
+            "-1",
+            "true",
+            "[]",
+            "{}",
+        ] {
+            let document = format!(
+                r#"{{"canonical_path":"/unused/binding-target","length":7,"sha256":"{}","authority":"user-owned","{field}":{invalid}}}"#,
+                "a".repeat(64)
+            );
+            assert!(
+                serde_json::from_str::<ExecutableIdentity>(&document).is_err(),
+                "{field} accepted {invalid}"
+            );
+        }
+        for invalid in [
+            "",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1.0",
+            "1e3",
+            "0x10",
+            "１",
+            "18446744073709551616",
+            "000000000000000000000",
+        ] {
+            let mut json = serde_json::to_value(&identity).unwrap();
+            json[field] = serde_json::json!(invalid);
+            assert!(
+                serde_json::from_value::<ExecutableIdentity>(json).is_err(),
+                "JSON {field} accepted {invalid:?}"
+            );
+            let mut document: toml::Value =
+                toml::from_str(&toml::to_string(&identity).unwrap()).unwrap();
+            document[field] = toml::Value::String(invalid.into());
+            assert!(
+                toml::from_str::<ExecutableIdentity>(&toml::to_string(&document).unwrap()).is_err(),
+                "TOML {field} accepted {invalid:?}"
+            );
+        }
+        for invalid in [toml::Value::Float(1.0), toml::Value::Integer(-1)] {
+            let mut document: toml::Value =
+                toml::from_str(&toml::to_string(&identity).unwrap()).unwrap();
+            document[field] = invalid.clone();
+            assert!(
+                toml::from_str::<ExecutableIdentity>(&toml::to_string(&document).unwrap()).is_err(),
+                "TOML {field} accepted {invalid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_binding_identity_requires_regenerated_numeric_predecessor_hashes() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("agent");
+    executable(&target, b"runtime");
+    let intent = BindingIntent::structured("agent", "automation", &target, ["fixed"]).unwrap();
+    let resolved = resolve_structured_target(&target).unwrap();
+    let receipt = BindingReceipt::new(intent.clone(), resolved.clone()).unwrap();
+    let BindingResolution::Structured { identity } = &receipt.active.resolved else {
+        unreachable!()
+    };
+    let mut legacy = serde_json::to_value(&receipt).unwrap();
+    legacy["active"]["resolved"]["identity"]["device"] =
+        serde_json::json!(identity.device.unwrap());
+    legacy["active"]["resolved"]["identity"]["inode"] = serde_json::json!(identity.inode.unwrap());
+    let legacy_hash = format!("{:x}", Sha256::digest(serde_jcs::to_vec(&legacy).unwrap()));
+    let mut plan = build_binding_plan("binding", intent, resolved, Some(&receipt)).unwrap();
+    let canonical = canonical_binding_plan(&plan).unwrap();
+    let decoded: dev_auth::smart_binding::BindingPlan = serde_json::from_slice(&canonical).unwrap();
+    assert_eq!(decoded, plan);
+    assert_eq!(canonical_binding_plan(&decoded).unwrap(), canonical);
+    assert_eq!(
+        binding_plan_sha256(&decoded).unwrap(),
+        binding_plan_sha256(&plan).unwrap()
+    );
+    plan.current_receipt_sha256 = Some(legacy_hash);
+    assert!(
+        canonical_binding_plan(&plan).is_err(),
+        "an old numeric predecessor digest must require a regenerated draft plan"
+    );
 }
 
 #[test]
@@ -80,7 +301,7 @@ fn argument_assembly_rejects_invalid_positions_and_unimplemented_shell_targets()
 #[cfg(target_os = "linux")]
 #[test]
 fn binding_snapshot_is_digest_verified_sealed_and_independent_of_in_place_writes() {
-    use dev_auth::smart_binding::snapshot_binding_executable;
+    use dev_auth::smart_binding::{retain_binding_executable, snapshot_binding_executable};
     use std::io::{Read, Write};
 
     let root = tempfile::tempdir().unwrap();
@@ -94,6 +315,16 @@ fn binding_snapshot_is_digest_verified_sealed_and_independent_of_in_place_writes
     let mut wrong = identity.clone();
     wrong.sha256 = "0".repeat(64);
     assert!(snapshot_binding_executable(&wrong).is_err());
+    for (device, inode) in [
+        (identity.device.unwrap() ^ 1, identity.inode.unwrap()),
+        (identity.device.unwrap(), identity.inode.unwrap() ^ 1),
+    ] {
+        let mut wrong_native_identity = identity.clone();
+        wrong_native_identity.device = Some(device);
+        wrong_native_identity.inode = Some(inode);
+        assert!(retain_binding_executable(&wrong_native_identity).is_err());
+        assert!(snapshot_binding_executable(&wrong_native_identity).is_err());
+    }
     let mut snapshot = snapshot_binding_executable(&identity).unwrap();
     assert!(rustix::fs::fcntl_get_seals(&snapshot).unwrap().contains(
         rustix::fs::SealFlags::SEAL
