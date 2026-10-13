@@ -1,7 +1,9 @@
 //! Isolated single-threaded signal acceptance; no libtest worker exists here.
 #[cfg(target_os = "linux")]
 mod linux {
-    use dev_tools_command::{run_prepared_inherited_command, HeldExecutable};
+    use dev_tools_command::{
+        run_prepared_inherited_command, run_prepared_inherited_command_after_spawn, HeldExecutable,
+    };
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -27,6 +29,8 @@ mod linux {
                 libc::SIGHUP,
                 libc::SIGCHLD,
                 libc::SIGTTOU,
+                libc::SIGTSTP,
+                libc::SIGCONT,
             ]
             .map(|signal| libc::sigismember(&set, signal) == 1)
             .to_vec()
@@ -52,10 +56,412 @@ mod linux {
                     | libc::SA_SIGINFO),
         )
     }
+    fn graph_node<'a>(
+        command: impl Into<dev_tools_command::OwnedPreparedCommand<'a>>,
+        after: Vec<usize>,
+        pipe_from: Option<usize>,
+    ) -> dev_tools_command::CommandGraphNode<'a> {
+        dev_tools_command::CommandGraphNode {
+            command: command.into(),
+            dependencies: dev_tools_command::GraphDependencies { after, pipe_from },
+        }
+    }
+
+    fn graph_run(
+        nodes: Vec<dev_tools_command::CommandGraphNode<'_>>,
+        policy: dev_tools_command::GraphExitPolicy,
+        keep_running: impl FnMut() -> bool,
+    ) -> anyhow::Result<dev_tools_command::CommandGraphOutput> {
+        dev_tools_command::run_prepared_terminal_command_graph(
+            nodes,
+            policy,
+            dev_tools_command::TerminalGraphSignalMask::RestoreEntry,
+            keep_running,
+        )
+    }
+
+    fn assert_gone(path: &std::path::Path) {
+        let pid: i32 = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        // The fixture has a completed owned-child reap. Signal zero only observes;
+        // it cannot affect a reused process identity.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    fn terminal_graph_case(name: &str) {
+        use dev_tools_command::{
+            CommandGraphNode, GraphDependencies, GraphExitPolicy, TerminalGraphSignalMask,
+        };
+        let original = if name != "terminal-graph-no-tty" {
+            unsafe { libc::tcgetpgrp(0) }
+        } else {
+            -1
+        };
+        match name {
+            "terminal-graph-pipe" => {
+                let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+                let held = HeldExecutable::open(&executable).unwrap();
+                for policy in [
+                    GraphExitPolicy::Last,
+                    GraphExitPolicy::All,
+                    GraphExitPolicy::Pipefail,
+                ] {
+                    for file in [
+                        "graph-producer-done",
+                        "graph-consumer-done",
+                        "graph-dependent-done",
+                    ] {
+                        let _ = std::fs::remove_file(fixture_root().join(file));
+                    }
+                    let mut producer = held
+                        .command(std::ffi::OsStr::new("terminal-graph-fixture"))
+                        .unwrap();
+                    producer.args(["child", "graph-producer"]);
+                    let output = graph_run(
+                        vec![
+                            CommandGraphNode {
+                                command: producer.into(),
+                                dependencies: GraphDependencies::default(),
+                            },
+                            graph_node(child("graph-consumer"), vec![], Some(0)),
+                            graph_node(child("graph-dependent"), vec![0], None),
+                        ],
+                        policy,
+                        || true,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        output
+                            .statuses
+                            .iter()
+                            .map(|status| status.code())
+                            .collect::<Vec<_>>(),
+                        vec![Some(7), Some(23), Some(0)]
+                    );
+                    assert_eq!(
+                        output.status.code(),
+                        Some(match policy {
+                            GraphExitPolicy::Last => 0,
+                            GraphExitPolicy::All => 7,
+                            GraphExitPolicy::Pipefail => 23,
+                        })
+                    );
+                    let producer_group =
+                        std::fs::read_to_string(fixture_root().join("graph-producer-group"))
+                            .unwrap();
+                    let consumer_group =
+                        std::fs::read_to_string(fixture_root().join("graph-consumer-group"))
+                            .unwrap();
+                    assert_eq!(
+                        producer_group, consumer_group,
+                        "one foreground group per pipe component"
+                    );
+                    assert_eq!(
+                        std::fs::read(fixture_root().join("graph-binary")).unwrap(),
+                        b"\0\xffnative\0pipe"
+                    );
+                    assert!(fixture_root().join("graph-dependent-done").exists());
+                }
+            }
+            "terminal-graph-jobcontrol" | "terminal-graph-stop-expiry" => {
+                let result = graph_run(
+                    vec![
+                        graph_node(child("graph-stop-producer"), vec![], None),
+                        graph_node(child("graph-stop-consumer"), vec![], Some(0)),
+                    ],
+                    GraphExitPolicy::All,
+                    || !fixture_root().join("expired").exists(),
+                );
+                if name == "terminal-graph-jobcontrol" {
+                    assert!(result.unwrap().status.success());
+                    assert!(fixture_root().join("graph-resumed").exists());
+                } else {
+                    assert!(result.is_err());
+                    assert!(
+                        !fixture_root().join("graph-resumed").exists(),
+                        "expired stopped payload must never continue"
+                    );
+                }
+                assert_gone(&fixture_root().join("graph-stop-producer-pid"));
+                // The consumer may have been stopped before its first instruction;
+                // when present, its receipt also binds native child cleanup.
+                let consumer = fixture_root().join("graph-stop-consumer-pid");
+                if consumer.exists() {
+                    assert_gone(&consumer);
+                }
+            }
+            "terminal-graph-interrupt" => {
+                let output = graph_run(
+                    vec![graph_node(child("graph-interrupt"), vec![], None)],
+                    GraphExitPolicy::Last,
+                    || true,
+                )
+                .unwrap();
+                assert_eq!(output.status.signal(), Some(libc::SIGINT));
+                assert_gone(&fixture_root().join("graph-interrupt-pid"));
+            }
+            "terminal-graph-partial" => {
+                let mut absent = Command::new(fixture_root().join("absent-terminal-node"));
+                // Read the producer's byte before attempting the absent exec.
+                // This kernel pipe handshake proves actual producer admission;
+                // the fixture driver supplies the independent bounded watchdog.
+                unsafe {
+                    absent.pre_exec(|| {
+                        let mut byte = 0u8;
+                        loop {
+                            let read = libc::read(0, (&mut byte as *mut u8).cast(), 1);
+                            if read == 1 {
+                                return Ok(());
+                            }
+                            if read < 0
+                                && std::io::Error::last_os_error().kind()
+                                    == std::io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            return Err(std::io::Error::other("fixture producer handshake absent"));
+                        }
+                    });
+                }
+                assert!(graph_run(
+                    vec![
+                        graph_node(child("graph-partial-producer"), vec![], None),
+                        graph_node(absent, vec![], Some(0))
+                    ],
+                    GraphExitPolicy::All,
+                    || true
+                )
+                .is_err());
+                assert_gone(&fixture_root().join("graph-partial-producer-pid"));
+            }
+            "terminal-graph-cancel" => {
+                assert!(graph_run(
+                    vec![graph_node(child("graph-cancel"), vec![], None)],
+                    GraphExitPolicy::Last,
+                    || !fixture_root().join("graph-cancel-ready").exists()
+                )
+                .is_err());
+                assert_gone(&fixture_root().join("graph-cancel-pid"));
+            }
+            "terminal-graph-mask" => {
+                let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+                let mut payload: libc::sigset_t = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::sigemptyset(&mut blocked);
+                    libc::sigaddset(&mut blocked, libc::SIGTERM);
+                }
+                assert_eq!(
+                    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut payload) },
+                    0
+                );
+                let mut command = child("graph-mask");
+                // The caller's already-prepared payload mask must survive the
+                // graph worker's intentionally blocked transport/helper mask.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::sigprocmask(libc::SIG_SETMASK, &payload, std::ptr::null_mut()) == 0
+                        {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    });
+                }
+                let result = dev_tools_command::run_prepared_terminal_command_graph(
+                    vec![graph_node(command, vec![], None)],
+                    GraphExitPolicy::Last,
+                    TerminalGraphSignalMask::PreservePrepared,
+                    || true,
+                );
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &payload, std::ptr::null_mut())
+                    },
+                    0
+                );
+                assert_eq!(result.unwrap().status.code(), Some(23));
+            }
+            "terminal-graph-no-tty" => {
+                assert!(graph_run(
+                    vec![graph_node(child("exit"), vec![], None)],
+                    GraphExitPolicy::Last,
+                    || true
+                )
+                .is_err());
+                assert!(!fixture_root().join("spawned").exists());
+            }
+            "terminal-graph-background" => {
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args(["case", "terminal-graph-background-refuse"])
+                    .process_group(0)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                assert!(!fixture_root().join("spawned").exists());
+            }
+            "terminal-graph-background-refuse" => {
+                assert!(original > 0);
+                assert_ne!(original, unsafe { libc::getpgrp() });
+                assert!(graph_run(
+                    vec![graph_node(child("exit"), vec![], None)],
+                    GraphExitPolicy::Last,
+                    || true
+                )
+                .is_err());
+                assert!(!fixture_root().join("spawned").exists());
+            }
+            _ => panic!("unknown terminal graph case"),
+        }
+        if original > 0 {
+            assert_eq!(
+                unsafe { libc::tcgetpgrp(0) },
+                original,
+                "terminal foreground restored"
+            );
+        }
+    }
+
+    fn terminal_graph_child(mode: &str) -> bool {
+        use std::io::{Read, Write};
+        let root = fixture_root();
+        if !mode.starts_with("graph-") {
+            return false;
+        }
+        std::fs::write(
+            root.join(format!("{mode}-pid")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let terminal_ready = || {
+            // A real native read cannot complete in a background terminal group;
+            // SIGTTIN/foreground continuation, not elapsed time, proves admission.
+            std::io::stdin().read_exact(&mut [0u8]).unwrap();
+            assert_eq!(unsafe { libc::tcgetpgrp(0) }, unsafe { libc::getpgrp() });
+        };
+        let group_receipt = |name: &str| {
+            std::fs::write(root.join(name), unsafe { libc::getpgrp() }.to_string()).unwrap();
+        };
+        match mode {
+            "graph-producer" => {
+                terminal_ready();
+                group_receipt("graph-producer-group");
+                std::io::stdout().write_all(b"\0\xffnative\0pipe").unwrap();
+                std::io::stdout().flush().unwrap();
+                std::fs::write(root.join("graph-producer-done"), b"1").unwrap();
+                std::process::exit(7);
+            }
+            "graph-consumer" => {
+                let mut bytes = Vec::new();
+                std::io::stdin().read_to_end(&mut bytes).unwrap();
+                let tty = std::fs::File::open("/dev/tty").unwrap();
+                use std::os::fd::AsRawFd;
+                assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, unsafe {
+                    libc::getpgrp()
+                });
+                group_receipt("graph-consumer-group");
+                std::fs::write(root.join("graph-binary"), bytes).unwrap();
+                std::fs::write(root.join("graph-consumer-done"), b"1").unwrap();
+                std::process::exit(23);
+            }
+            "graph-dependent" => {
+                assert!(root.join("graph-producer-done").exists());
+                assert!(root.join("graph-consumer-done").exists());
+                std::fs::write(root.join("graph-dependent-done"), b"1").unwrap();
+            }
+            "graph-stop-producer" => {
+                terminal_ready();
+                std::io::stdout().write_all(b"1").unwrap();
+                std::io::stdout().flush().unwrap();
+                assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+                assert_eq!(unsafe { libc::tcgetpgrp(0) }, unsafe { libc::getpgrp() });
+                std::fs::write(root.join("graph-resumed"), b"1").unwrap();
+            }
+            "graph-stop-consumer" => {
+                let mut bytes = Vec::new();
+                std::io::stdin().read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"1");
+            }
+            "graph-interrupt" => {
+                terminal_ready();
+                std::fs::write(root.join("graph-terminal-ready"), b"1").unwrap();
+                loop {
+                    unsafe {
+                        libc::pause();
+                    }
+                }
+            }
+            "graph-partial-producer" => {
+                std::io::stdout().write_all(b"1").unwrap();
+                std::io::stdout().flush().unwrap();
+                loop {
+                    unsafe {
+                        libc::pause();
+                    }
+                }
+            }
+            "graph-cancel" => {
+                std::fs::write(root.join("graph-cancel-ready"), b"1").unwrap();
+                loop {
+                    unsafe {
+                        libc::pause();
+                    }
+                }
+            }
+            "graph-mask" => {
+                let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut current)
+                    },
+                    0
+                );
+                assert_eq!(unsafe { libc::sigismember(&current, libc::SIGTERM) }, 0);
+                std::process::exit(23);
+            }
+            _ => panic!("unknown terminal graph child"),
+        }
+        true
+    }
+
     fn case(name: &str) {
         let before = mask();
         let disposition_before = disposition();
         match name {
+            "startup-observer-failure" => {
+                let started = Instant::now();
+                let calls = std::cell::Cell::new(0);
+                let result = run_prepared_inherited_command_after_spawn(
+                    child("sleep"),
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        Err(anyhow::anyhow!("fixture startup observation rejected"))
+                    },
+                    || true,
+                );
+                assert_eq!(calls.get(), 1);
+                assert!(result
+                    .err()
+                    .expect("startup observation rejection must fail")
+                    .to_string()
+                    .contains("fixture startup observation rejected"));
+                assert!(started.elapsed() < Duration::from_secs(5));
+            }
+            "failed-spawn-no-observer" => {
+                let calls = std::cell::Cell::new(0);
+                let result = run_prepared_inherited_command_after_spawn(
+                    Command::new(fixture_root().join("absent-native-command")),
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                    || true,
+                );
+                assert!(result.is_err());
+                assert_eq!(calls.get(), 0);
+            }
             "exit" => {
                 let output = run_prepared_inherited_command(child("exit"), || true).unwrap();
                 assert_eq!(output.status.code(), Some(23));
@@ -228,6 +634,18 @@ mod linux {
                 .err()
                 .unwrap();
                 assert!(error.to_string().contains("automatic child reaping"));
+                let graph_error = graph_run(
+                    vec![graph_node(
+                        Command::new("/absent-inherited-fixture"),
+                        vec![],
+                        None,
+                    )],
+                    dev_tools_command::GraphExitPolicy::Last,
+                    || true,
+                )
+                .err()
+                .expect("terminal graph must reject automatic reaping before tty/spawn");
+                assert!(graph_error.to_string().contains("automatic child reaping"));
                 assert_eq!(
                     unsafe { libc::sigaction(libc::SIGCHLD, &previous, std::ptr::null_mut()) },
                     0
@@ -235,6 +653,12 @@ mod linux {
             }
             "precancel" => {
                 assert!(run_prepared_inherited_command(child("exit"), || false).is_err());
+                assert!(graph_run(
+                    vec![graph_node(child("exit"), vec![], None)],
+                    dev_tools_command::GraphExitPolicy::Last,
+                    || false
+                )
+                .is_err());
                 assert!(!fixture_root().join("spawned").exists());
             }
             "spawnfailure" => {
@@ -312,6 +736,7 @@ mod linux {
                 assert_eq!(output.status.signal(), Some(signal));
                 assert!(!output.cancelled);
             }
+            value if value.starts_with("terminal-graph-") => terminal_graph_case(value),
             _ => panic!("unknown fixture"),
         }
         assert_eq!(mask(), before, "calling thread mask must be restored");
@@ -340,6 +765,9 @@ mod linux {
                 let prepared = root.join(format!("spawned-{}", std::process::id()));
                 std::fs::write(&prepared, std::process::id().to_string()).unwrap();
                 std::fs::rename(prepared, root.join("spawned")).unwrap();
+            }
+            if terminal_graph_child(args.get(2).map(String::as_str).unwrap_or("")) {
+                return;
             }
             if args.get(2).map(String::as_str) == Some("exit") {
                 std::process::exit(23);
@@ -403,13 +831,9 @@ mod linux {
             case(&args[2]);
             return;
         }
-        // SAFETY: this isolated fixture driver adopts only its own descendants.
-        assert_eq!(
-            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
-            0
-        );
-        let _cleanup = DriverCleanup;
-        for name in [
+        const FIXTURES: &[&str] = &[
+            "startup-observer-failure",
+            "failed-spawn-no-observer",
             "exit",
             "held",
             "precancel",
@@ -431,14 +855,48 @@ mod linux {
             "entry-mask",
             "resistant-cancel",
             "held-validation",
-        ] {
+            "terminal-graph-pipe",
+            "terminal-graph-jobcontrol",
+            "terminal-graph-stop-expiry",
+            "terminal-graph-interrupt",
+            "terminal-graph-partial",
+            "terminal-graph-cancel",
+            "terminal-graph-mask",
+            "terminal-graph-no-tty",
+            "terminal-graph-background",
+        ];
+        // Select the outer driver, retaining its native PTY/session setup,
+        // ownership, stop observation and finite watchdog. Internal case/child
+        // dispatch above remains private to that driver and unchanged.
+        let selected = match args.as_slice() {
+            [_] => FIXTURES.to_vec(),
+            [_, selector, name] if selector == "--fixture" && FIXTURES.contains(&name.as_str()) => {
+                vec![name.as_str()]
+            }
+            _ => {
+                eprintln!("expected --fixture and one declared inherited fixture name");
+                std::process::exit(2);
+            }
+        };
+        // SAFETY: this isolated fixture driver adopts only its own descendants.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let _cleanup = DriverCleanup;
+        for name in selected {
+            // Fresh private tempfile authority is the existing driver contract.
+            // A caller-supplied fixture-root is never adopted by this driver;
+            // root may select its parent through the existing TMPDIR facility.
             let root = tempfile::tempdir().unwrap();
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args(["case", name])
                 .env("INHERITED_FIXTURE_ROOT", root.path());
             let mut terminal = None;
-            if matches!(name, "terminal" | "jobcontrol") {
+            if matches!(name, "terminal" | "jobcontrol")
+                || (name.starts_with("terminal-graph-") && name != "terminal-graph-no-tty")
+            {
                 use std::os::fd::{AsRawFd, FromRawFd};
                 let (mut master, mut slave) = (-1, -1);
                 // SAFETY: fresh descriptor outputs; default termios/window size.
@@ -471,13 +929,48 @@ mod linux {
                     });
                 }
                 terminal = Some((master, slave));
+            } else if name == "terminal-graph-no-tty" {
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+                command.stdin(std::process::Stdio::null());
             } else {
                 command.process_group(0);
             }
             let mut process = command.spawn().unwrap();
+            if matches!(
+                name,
+                "terminal-graph-pipe"
+                    | "terminal-graph-jobcontrol"
+                    | "terminal-graph-stop-expiry"
+                    | "terminal-graph-interrupt"
+            ) {
+                use std::io::Write;
+                terminal
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .write_all(b"x\nx\nx\n")
+                    .unwrap();
+            }
             let start = Instant::now();
             let mut resumed = false;
+            let mut interrupt_sent = false;
             loop {
+                if name == "terminal-graph-interrupt"
+                    && !interrupt_sent
+                    && root.path().join("graph-terminal-ready").exists()
+                {
+                    use std::io::Write;
+                    terminal.as_mut().unwrap().0.write_all(&[3]).unwrap();
+                    interrupt_sent = true;
+                }
                 // Reap adopted descendants, but preserve the case worker's status.
                 if name != "unreaped" {
                     reap_adopted(process.id() as i32);
@@ -487,19 +980,75 @@ mod linux {
                     break;
                 }
                 let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                assert_eq!(
-                    unsafe {
-                        libc::waitid(
-                            libc::P_PID,
-                            process.id(),
-                            &mut info,
-                            libc::WSTOPPED | libc::WNOHANG,
-                        )
-                    },
-                    0
-                );
+                // SAFETY: initialized output for this driver's exclusively
+                // owned, unreaped direct case child; the stop query cannot reap
+                // an exit between try_wait and this observation.
+                let observed = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        process.id(),
+                        &mut info,
+                        libc::WSTOPPED | libc::WNOHANG,
+                    )
+                };
+                if observed != 0 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(libc::ECHILD),
+                        "observe owned fixture stop: {error}"
+                    );
+                    let mut exited: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // SAFETY: same retained child; WNOWAIT preserves the exact
+                    // exit/PID so the next try_wait owns its normal status/reap.
+                    assert_eq!(
+                        unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                process.id(),
+                                &mut exited,
+                                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                            )
+                        },
+                        0,
+                        "fixture exit wait custody must remain owned"
+                    );
+                    assert_eq!(unsafe { exited.si_pid() }, process.id() as i32);
+                    assert!(matches!(
+                        exited.si_code,
+                        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                    ));
+                    continue;
+                }
                 if unsafe { info.si_pid() } != 0 {
-                    assert_eq!(name, "jobcontrol");
+                    assert!(matches!(
+                        name,
+                        "jobcontrol" | "terminal-graph-jobcontrol" | "terminal-graph-stop-expiry"
+                    ));
+                    if name.starts_with("terminal-graph-") {
+                        use std::os::fd::AsRawFd;
+                        // The driver is outside the case's controlling session.
+                        // Linux permits foreground observation through our owned
+                        // PTY master; querying its slave here fails with ENOTTY.
+                        // SAFETY: the driver retains this live PTY master until
+                        // the exclusively owned, unreaped case child settles.
+                        let foreground = unsafe {
+                            libc::tcgetpgrp(terminal.as_ref().unwrap().0.as_raw_fd())
+                        };
+                        assert!(
+                            foreground >= 0,
+                            "query owned PTY master foreground: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        assert_eq!(
+                            foreground,
+                            process.id() as i32,
+                            "foreground returned before owner stop"
+                        );
+                    }
+                    if name == "terminal-graph-stop-expiry" {
+                        std::fs::write(root.path().join("expired"), b"1").unwrap();
+                    }
                     assert_eq!(unsafe { libc::kill(process.id() as i32, libc::SIGCONT) }, 0);
                     resumed = true;
                 }
@@ -509,8 +1058,14 @@ mod linux {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            if name == "jobcontrol" {
+            if matches!(
+                name,
+                "jobcontrol" | "terminal-graph-jobcontrol" | "terminal-graph-stop-expiry"
+            ) {
                 assert!(resumed);
+            }
+            if name == "terminal-graph-interrupt" {
+                assert!(interrupt_sent);
             }
             reap_adopted(-1);
             drop(terminal);

@@ -65,7 +65,7 @@ pub fn validate_command_graph_dependencies(nodes: &[GraphDependencies]) -> Resul
     components(nodes).map(|_| ())
 }
 
-fn components(nodes: &[GraphDependencies]) -> Result<Vec<usize>> {
+pub(super) fn components(nodes: &[GraphDependencies]) -> Result<Vec<usize>> {
     let count = nodes.len();
     if count == 0 || count > MAX_GRAPH_NODES {
         bail!("native command graph exceeds its node bound");

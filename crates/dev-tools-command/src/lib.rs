@@ -4,8 +4,15 @@ mod owned_prepared;
 #[cfg(target_os = "linux")]
 mod public_file_stdout;
 pub use owned_prepared::OwnedPreparedCommand;
+#[cfg(target_os = "linux")]
+mod terminal_custody;
+mod terminal_graph;
+pub use terminal_graph::{run_prepared_terminal_command_graph, TerminalGraphSignalMask};
 mod inherited;
-pub use inherited::{run_prepared_inherited_command, InheritedCommandOutput};
+pub use inherited::{
+    run_prepared_inherited_command, run_prepared_inherited_command_after_spawn,
+    InheritedCommandOutput,
+};
 
 mod graph;
 pub use graph::{
@@ -191,6 +198,79 @@ impl HeldExecutable {
         })
     }
 
+    /// Consume the complete held identity into a configured command owner.
+    ///
+    /// The command retains the executable, source ancestors and validated
+    /// procfs directory through every spawn or exec attempt. The execution
+    /// descriptor is duplicated above standard streams, and the command
+    /// uses that retained procfs identity with the caller-selected argv[0].
+    /// Callers retain argument, environment, I/O and process-lifetime policy;
+    /// this does not freeze bytes against an authorized in-place writer.
+    pub fn into_command(self, argv0: &OsStr) -> AnyhowResult<Command> {
+        self.into_command_above(argv0, 3)
+    }
+
+    /// Keep executable ownership above a caller's separately owned descriptor
+    /// slots. The foundation accepts the floor; the product defines its layout.
+    pub fn into_command_above(
+        self,
+        argv0: &OsStr,
+        minimum_descriptor: i32,
+    ) -> AnyhowResult<Command> {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::process::CommandExt as _;
+
+        if minimum_descriptor < 3 {
+            bail!("owned executable descriptor floor must preserve standard streams");
+        }
+        let execution_descriptor =
+            rustix::io::fcntl_dupfd_cloexec(&self.executable, minimum_descriptor)
+                .context("duplicate retained executable above low descriptor slots")?;
+        let descriptor_name = execution_descriptor.as_raw_fd().to_string();
+        let retained = rustix::fs::fstat(&self.executable)
+            .context("inspect retained executable descriptor")?;
+        {
+            let checked_descriptor = rustix::fs::openat(
+                &self._proc_fd_directory,
+                &descriptor_name,
+                rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .context("open duplicated executable through retained procfs directory")?;
+            let checked = rustix::fs::fstat(&checked_descriptor)
+                .context("inspect duplicated executable procfs identity")?;
+            if retained.st_dev != checked.st_dev || retained.st_ino != checked.st_ino {
+                bail!("duplicated executable procfs handle has a different identity");
+            }
+        }
+        let execution_path = self.execution_path.with_file_name(descriptor_name);
+        let execution_metadata = fs::metadata(&execution_path)
+            .context("inspect duplicated executable through process file-descriptor path")?;
+        if execution_metadata.dev() != retained.st_dev
+            || execution_metadata.ino() != retained.st_ino
+        {
+            bail!("duplicated executable descriptor identity is inconsistent");
+        }
+        let mut command = Command::new(&execution_path);
+        command.arg0(argv0);
+        // SAFETY: the closure captures the whole HeldExecutable and the new
+        // owned descriptor, keeping both live for as long as Command stores the
+        // callback and through a forked child's exec or Command::exec in the
+        // current process.
+        // The callback only borrows that owner and calls async-signal-safe
+        // fcntl; it allocates and destroys nothing. Clearing FD_CLOEXEC lets a
+        // script interpreter reopen the same retained identity. A spawn changes
+        // only child flags; Command::exec changes the current process's flags.
+        unsafe {
+            command.pre_exec(move || {
+                let _held = &self;
+                rustix::io::fcntl_setfd(&execution_descriptor, rustix::io::FdFlags::empty())
+                    .map_err(io::Error::from)
+            });
+        }
+        Ok(command)
+    }
+
     pub fn is_cloexec(&self) -> bool {
         rustix::io::fcntl_getfd(&self.executable)
             .is_ok_and(|flags| flags.contains(rustix::io::FdFlags::CLOEXEC))
@@ -208,6 +288,18 @@ impl HeldExecutable {
     }
 
     pub fn command<'a>(&'a self, _argv0: &OsStr) -> AnyhowResult<HeldCommand<'a>> {
+        bail!("held executable identity is not accepted on this platform")
+    }
+
+    pub fn into_command(self, _argv0: &OsStr) -> AnyhowResult<Command> {
+        bail!("held executable identity is not accepted on this platform")
+    }
+
+    pub fn into_command_above(
+        self,
+        _argv0: &OsStr,
+        _minimum_descriptor: i32,
+    ) -> AnyhowResult<Command> {
         bail!("held executable identity is not accepted on this platform")
     }
 }
@@ -1820,6 +1912,42 @@ pub fn is_executable_file(path: &Path) -> bool {
 ))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_held_command_keeps_the_original_executable_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("program");
+        fs::copy("/usr/bin/printf", &source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldExecutable::open(&source).unwrap();
+        let mut command = held
+            .into_command_above(OsStr::new("owned-fixture"), 6)
+            .unwrap();
+        let descriptor = Path::new(command.get_program())
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(descriptor >= 6);
+        command
+            .env_clear()
+            .args(["%s", "original-held-image"])
+            .current_dir(root.path());
+
+        fs::rename(&source, root.path().join("retained-original")).unwrap();
+        fs::copy("/usr/bin/false", &source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = run_prepared_bounded_command(&mut command, Duration::from_secs(2), 64)
+            .expect("owned command must execute its retained identity");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"original-held-image");
+        assert!(output.stderr.is_empty());
+    }
 
     #[test]
     fn discarded_capture_buffers_are_zeroized_on_failure() {
