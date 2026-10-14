@@ -117,7 +117,7 @@ struct RetainedLink {
     identity: Option<(u128, u128)>,
 }
 
-fn inspect_link(
+pub(super) fn inspect_link(
     parent: &OwnedFd,
     name: &OsStr,
     target: &Path,
@@ -142,7 +142,11 @@ fn inspect_link(
     Ok(Some((metadata.st_dev as u128, metadata.st_ino as u128)))
 }
 
-fn verify_named_parent(path: &Path, held: &OwnedFd, layout: &VersionedLayout) -> Result<()> {
+pub(super) fn verify_named_parent(
+    path: &Path,
+    held: &OwnedFd,
+    layout: &VersionedLayout,
+) -> Result<()> {
     let retained = rustix::fs::fstat(held).context("inspect retained activation directory")?;
     let named = fs::symlink_metadata(path).context("reinspect activation directory")?;
     if !named.is_dir()

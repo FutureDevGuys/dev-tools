@@ -1,0 +1,10 @@
+schema = "dev-auth-deployment-v2"
+purpose = "privilege_only"
+mode = "strong"
+channel = "stable"
+activation = "inactive"
+administrator_policy = "/etc/dev-auth/administrator-grants-v1.json"
+
+# No credential provider, Git/gh executable, user configuration or enrollment.
+# The policy template starts with no authorized subjects. Activation and each
+# administrator grant remain separate explicit approvals.

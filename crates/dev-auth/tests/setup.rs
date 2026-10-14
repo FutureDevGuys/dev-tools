@@ -36,6 +36,7 @@ fn fixture() -> (tempfile::TempDir, SetupPaths, InstallRequest) {
     executable(&gh, "native-gh");
     let paths = SetupPaths::user_only(&home);
     let request = InstallRequest {
+        purpose: Default::default(),
         mode: InstallMode::UserOnly,
         version: "0.3.0-test".into(),
         source_executable: source,

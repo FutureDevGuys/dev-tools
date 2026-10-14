@@ -17,6 +17,19 @@ pub(super) fn specification() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("privilege-scope")
+                .long("privilege-scope")
+                .value_parser(["user", "workload"])
+                .requires("privilege-duration")
+                .help("Request fresh administrator approval in this scope before starting the workload"),
+        )
+        .arg(
+            Arg::new("privilege-duration")
+                .long("privilege-duration")
+                .requires("privilege-scope")
+                .help("Explicit finite administrator-grant duration, for example 30m or 12h"),
+        )
+        .arg(
             Arg::new("result-file")
                 .long("result-file")
                 .help("Write a separate value-free execution result to a new private file")
@@ -73,6 +86,34 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         eprintln!("dev-auth: invalid workload name");
         return Ok(2);
     }
+    let privilege = match parsed.get_one::<String>("privilege-scope") {
+        Some(scope) => {
+            let duration = parsed
+                .get_one::<String>("privilege-duration")
+                .and_then(|value| dev_auth::privilege::grants::parse_duration(value).ok());
+            let Some(duration) = duration else {
+                eprintln!("dev-auth: invalid administrator launch duration");
+                return Ok(2);
+            };
+            let request = dev_auth::privilege::grants::GrantRequest {
+                scope: if scope == "workload" {
+                    dev_auth::privilege::grants::GrantScope::Workload
+                } else {
+                    dev_auth::privilege::grants::GrantScope::User
+                },
+                authority: dev_auth::privilege::grants::Authority::Administrator,
+                duration_seconds: duration.as_secs(),
+                idle_seconds: None,
+                uses: None,
+            };
+            if request.validate().is_err() {
+                eprintln!("dev-auth: invalid administrator launch duration");
+                return Ok(2);
+            }
+            Some(request)
+        }
+        None => None,
+    };
     let destination = parsed.get_one::<OsString>("result-file");
     let result_sink = match destination
         .map(|path| ResultDestination::reserve(Path::new(path)))
@@ -95,6 +136,7 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         &arguments,
         parsed.get_flag("non-interactive"),
         result_sink,
+        privilege.as_ref(),
     )
 }
 
@@ -122,18 +164,26 @@ fn execute(
     arguments: &[OsString],
     noninteractive: bool,
     sink: Option<ResultDestination>,
+    privilege: Option<&dev_auth::privilege::grants::GrantRequest>,
 ) -> anyhow::Result<i32> {
+    if noninteractive && privilege.is_some() {
+        return finish(
+            ExecutionResult::launch("approval_required", Some(false), 3).error("approval_required"),
+            sink,
+        );
+    }
     if !dev_auth::setup::running_executable_has_version_layout()? {
         return finish(
             ExecutionResult::launch("requires_setup", Some(false), 3).error("requires_setup"),
             sink,
         );
     }
-    let outcome = dev_auth::supervisor::run_workload_alias_request(
+    let outcome = dev_auth::supervisor::run_workload_alias_request_with_grant(
         name,
         arguments,
         noninteractive,
         sink.is_some(),
+        privilege,
     );
     finish_native_outcome(outcome, sink)
 }
@@ -175,12 +225,8 @@ fn finish_native_outcome(
             }
             crate::workload_status_code(status)
         }
-        Err(error) => finish(
-            ExecutionResult::launch("failed", None, 1).error(
-                error
-                    .downcast_ref::<dev_auth::supervisor::WorkloadLaunchFailure>()
-                    .map_or("operational", |failure| failure.error_kind()),
-            ),
+        Err(_) => finish(
+            ExecutionResult::launch("failed", None, 1).error("operational"),
             sink,
         ),
     }
@@ -192,6 +238,7 @@ fn execute(
     _arguments: &[OsString],
     _noninteractive: bool,
     sink: Option<ResultDestination>,
+    _privilege: Option<&dev_auth::privilege::grants::GrantRequest>,
 ) -> anyhow::Result<i32> {
     finish(
         ExecutionResult::launch("unsupported", Some(false), 3).error("unsupported"),
@@ -202,6 +249,78 @@ fn execute(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privilege_launch_requires_both_explicit_scope_and_finite_duration() {
+        for arguments in [
+            vec!["launch", "tool", "--privilege-scope", "workload", "--"],
+            vec!["launch", "tool", "--privilege-duration", "1h", "--"],
+            vec![
+                "launch",
+                "tool",
+                "--privilege-scope",
+                "process",
+                "--privilege-duration",
+                "1h",
+                "--",
+            ],
+        ] {
+            assert!(specification().try_get_matches_from(arguments).is_err());
+        }
+        let parsed = specification()
+            .try_get_matches_from([
+                "launch",
+                "tool",
+                "--privilege-scope",
+                "workload",
+                "--privilege-duration",
+                "12h",
+                "--",
+                "--privilege-duration",
+                "spoofed",
+            ])
+            .unwrap();
+        assert_eq!(
+            parsed.get_one::<String>("privilege-duration").unwrap(),
+            "12h"
+        );
+        assert_eq!(
+            parsed
+                .get_many::<OsString>("arguments")
+                .unwrap()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                OsString::from("--privilege-duration"),
+                OsString::from("spoofed")
+            ]
+        );
+    }
+
+    #[test]
+    fn noninteractive_fresh_grant_reports_no_start_without_setup_or_authorization() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = root.path().join("result.json");
+        let code = run(vec![
+            "unconfigured-workload".into(),
+            "--non-interactive".into(),
+            "--privilege-scope".into(),
+            "workload".into(),
+            "--privilege-duration".into(),
+            "30m".into(),
+            "--result-file".into(),
+            result.as_os_str().to_owned(),
+            "--".into(),
+        ])
+        .unwrap();
+        assert_eq!(code, 3);
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(result).unwrap()).unwrap();
+        assert_eq!(result["started"], false);
+        assert_eq!(result["outcome"], "approval_required");
+    }
 
     #[test]
     fn unavailable_enrollment_reports_blocked_without_starting_a_child() {

@@ -2,6 +2,8 @@ use super::*;
 use crate::setup::restoration::{InitialInstallationRestoration, RetainedInstallationRestoration};
 use crate::setup_transition::Phase;
 
+#[cfg(target_os = "linux")]
+mod binding;
 mod configuration;
 mod integration;
 #[cfg(test)]
@@ -43,6 +45,32 @@ pub(super) fn retire_user_integrations(
         retirement.verify_retired()?;
     }
     Ok(changed)
+}
+
+pub(super) fn observe_user_integrations(
+    generation: &RetainedSetupGeneration,
+    executable: &Path,
+) -> Result<()> {
+    for retirement in integration::workload_retirements(generation, executable)? {
+        retirement.observe()?;
+    }
+    for retirement in integration::desktop_retirements(generation)? {
+        retirement.observe()?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_user_integrations_retired(
+    generation: &RetainedSetupGeneration,
+    executable: &Path,
+) -> Result<()> {
+    for retirement in integration::workload_retirements(generation, executable)? {
+        retirement.verify_retired()?;
+    }
+    for retirement in integration::desktop_retirements(generation)? {
+        retirement.verify_retired()?;
+    }
+    Ok(())
 }
 
 enum InstallationRestoration {
@@ -286,6 +314,13 @@ fn restore_owned_inner(
         progress.blocked("create_setup_plan");
         bail!("restoration requires a retained generation");
     };
+    if matches!(
+        transition.phase,
+        Phase::Repairing | Phase::Uninstalling | Phase::UninstalledInactive
+    ) {
+        progress.blocked("finish_setup_maintenance");
+        bail!("setup restoration cannot reverse maintenance direction");
+    }
     let generation: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes)?;
     let plan = &generation.plan;
     if generation.schema != "dev-auth-retained-setup-generation-v1"
@@ -346,10 +381,60 @@ fn restore_owned_inner(
         Ok(())
     })?;
     let configurations = restoration_documents(&generation)?;
-    validate_prior_configuration(&generation)?;
     for document in &configurations {
         document.observe()?;
     }
+    if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        if transition.phase == Phase::RestoredInactive {
+            for document in &configurations {
+                document.verify_restored()?;
+            }
+            grants::verify_restored(&generation)?;
+            installation.verify_restored()?;
+            return Ok(restored_report(false));
+        }
+        progress.enter_mutation();
+        progress.next_action = "retry_setup_restoration";
+        let mut changed = crate::setup_transition::advance(
+            &paths,
+            owner,
+            &transition.plan_sha256,
+            Phase::Restoring,
+        )?;
+        progress.record_change(changed);
+        progress.next_action = "retry_grant_file_restoration";
+        changed |= grants::restore(&generation)?;
+        progress.record_change(changed);
+        progress.next_action = "retry_core_deactivation";
+        changed |= installation.deactivate()?;
+        progress.record_change(changed);
+        // Strong installation owns these definitions regardless of whether
+        // credential configuration is selected. Restore them only after the
+        // core services are stopped, before withdrawing their native helpers.
+        progress.next_action = "retry_core_definition_restoration";
+        for document in &configurations {
+            changed |= document.restore()?;
+            progress.record_change(changed);
+        }
+        progress.next_action = "retry_core_restoration";
+        changed |= installation.restore()?;
+        progress.record_change(changed);
+        for document in &configurations {
+            document.verify_restored()?;
+        }
+        progress.next_action = "verify_grant_restoration";
+        grants::verify_restored(&generation)?;
+        progress.next_action = "verify_core_restoration";
+        installation.verify_restored()?;
+        changed |= crate::setup_transition::advance(
+            &paths,
+            owner,
+            &transition.plan_sha256,
+            Phase::RestoredInactive,
+        )?;
+        return Ok(restored_report(changed));
+    }
+    validate_prior_configuration(&generation)?;
     let integration_executable = installation.integration_executable()?;
     let workload_retirements =
         integration::workload_retirements(&generation, &integration_executable)?;
@@ -360,15 +445,28 @@ fn restore_owned_inner(
     for retirement in &desktop_retirements {
         retirement.observe()?;
     }
+    #[cfg(target_os = "linux")]
+    let binding_restorations = binding::binding_restorations(&generation)?;
+    #[cfg(target_os = "linux")]
+    for restoration in &binding_restorations {
+        restoration.observe()?;
+    }
     if deployment_mode == DeploymentMode::UserOnly {
         crate::setup::require_user_sessions_absent()?;
     }
     if transition.phase == Phase::RestoredInactive {
+        if plan.intent.grant_policy.is_some() {
+            grants::verify_restored(&generation)?;
+        }
         for retirement in &workload_retirements {
             retirement.verify_retired()?;
         }
         for retirement in &desktop_retirements {
             retirement.verify_retired()?;
+        }
+        #[cfg(target_os = "linux")]
+        for restoration in &binding_restorations {
+            restoration.verify_restored()?;
         }
         for document in &configurations {
             document.verify_restored()?;
@@ -380,6 +478,11 @@ fn restore_owned_inner(
     progress.next_action = "retry_setup_restoration";
     let mut changed =
         crate::setup_transition::advance(&paths, owner, &transition.plan_sha256, Phase::Restoring)?;
+    if plan.intent.grant_policy.is_some() {
+        progress.next_action = "retry_grant_file_restoration";
+        changed |= grants::restore(&generation)?;
+        progress.record_change(changed);
+    }
     changed |= installation.deactivate()?;
     // Receipt-owned removal also handles a previous interrupted deactivation.
     // It neither reinstalls old launchers nor treats arbitrary files as owned.
@@ -389,12 +492,23 @@ fn restore_owned_inner(
     for retirement in &desktop_retirements {
         changed |= retirement.retire()?;
     }
+    #[cfg(target_os = "linux")]
+    for restoration in &binding_restorations {
+        changed |= restoration.restore()?;
+    }
     for document in &configurations {
         changed |= document.restore()?;
     }
     changed |= installation.restore()?;
+    if plan.intent.grant_policy.is_some() {
+        grants::verify_restored(&generation)?;
+    }
     for document in &configurations {
         document.verify_restored()?;
+    }
+    #[cfg(target_os = "linux")]
+    for restoration in &binding_restorations {
+        restoration.verify_restored()?;
     }
     // restore() verified the exact binary postcondition; configuration reads
     // above do not mutate installation state and the exclusive lease remains held.
@@ -425,7 +539,7 @@ fn restored_report(changed: bool) -> SetupApplyReportV3 {
     }
 }
 
-fn require_retained_native_accounts<'a>(
+pub(super) fn require_retained_native_accounts<'a>(
     accounts: impl Iterator<Item = &'a NativeAccountIdentity>,
 ) -> Result<()> {
     for expected in accounts {
@@ -637,6 +751,9 @@ fn restoration_documents(
     if plan.intent.mode == DeploymentMode::Strong {
         let mut documents = system_asset_documents(generation)?;
         documents.extend(maintenance_documents(generation)?);
+        if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+            return Ok(documents);
+        }
         for spec in configuration::strong_configuration_specs(generation)? {
             documents.push(RestorationDocument::new(
                 spec.prior,

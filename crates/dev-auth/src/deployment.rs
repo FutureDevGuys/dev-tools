@@ -10,6 +10,21 @@ use std::str::FromStr;
 
 const DOCUMENT_LIMIT: usize = 1024 * 1024;
 
+/// Product feature selection is separate from installation ownership.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupPurpose {
+    #[default]
+    Credentials,
+    PrivilegeOnly,
+}
+
+impl SetupPurpose {
+    pub fn is_credentials(&self) -> bool {
+        *self == Self::Credentials
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeploymentMode {
@@ -55,9 +70,20 @@ pub struct DeploymentCredential {
     pub intent: CredentialIntent,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentBinding {
+    pub user: String,
+    pub name: String,
+    pub plan: PathBuf,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentDocument {
+    #[serde(default)]
+    pub purpose: SetupPurpose,
     pub schema: String,
     pub mode: DeploymentMode,
     pub channel: Channel,
@@ -66,34 +92,53 @@ pub struct DeploymentDocument {
     pub activation: Activation,
     pub administrator_policy: PathBuf,
     #[serde(default)]
+    pub grant_policy: Option<PathBuf>,
+    #[serde(default)]
     pub users: Vec<DeploymentUser>,
     #[serde(default)]
     pub credentials: Vec<DeploymentCredential>,
+    #[serde(default)]
+    pub bindings: Vec<DeploymentBinding>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeploymentCliInput {
+    pub purpose: Option<SetupPurpose>,
     pub mode: Option<DeploymentMode>,
     pub channel: Option<Channel>,
     pub offline: Option<bool>,
     pub activation: Option<Activation>,
     pub administrator_policy: Option<PathBuf>,
+    pub grant_policy: Option<PathBuf>,
     pub user_configs: Vec<(String, PathBuf)>,
     pub user_policies: Vec<(String, PathBuf)>,
     pub credential_intents: Vec<(String, CredentialIntent)>,
+    pub bindings: Vec<DeploymentBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentIntent {
+    #[serde(default, skip_serializing_if = "SetupPurpose::is_credentials")]
+    pub purpose: SetupPurpose,
     pub schema: String,
     pub mode: DeploymentMode,
     pub channel: Channel,
     pub offline: bool,
     pub activation: Activation,
     pub administrator_policy: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_policy: Option<PathBuf>,
     pub users: Vec<DeploymentUser>,
     pub credentials: Vec<DeploymentCredential>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<DeploymentBinding>,
+}
+
+impl DeploymentIntent {
+    pub fn has_grants(&self) -> bool {
+        self.purpose == SetupPurpose::PrivilegeOnly || self.grant_policy.is_some()
+    }
 }
 
 pub fn parse_deployment_document(input: &[u8]) -> Result<DeploymentDocument> {
@@ -101,6 +146,13 @@ pub fn parse_deployment_document(input: &[u8]) -> Result<DeploymentDocument> {
         bail!("dev-auth deployment document is empty or exceeds its public size bound");
     }
     let text = std::str::from_utf8(input).context("deployment document is not UTF-8")?;
+    let raw: toml::Value =
+        toml::from_str(text).map_err(|_| anyhow::anyhow!("parse dev-auth deployment document"))?;
+    if raw.get("bindings").is_some()
+        && raw.get("schema").and_then(toml::Value::as_str) != Some("dev-auth-deployment-v3")
+    {
+        bail!("binding selection requires an explicit deployment v3 document");
+    }
     let document: DeploymentDocument =
         toml::from_str(text).map_err(|_| anyhow::anyhow!("parse dev-auth deployment document"))?;
     validate_document(&document)?;
@@ -151,6 +203,13 @@ pub fn normalize_deployment(
     if let Some(document) = &document {
         validate_document(document)?;
     }
+    let purpose = match (document.as_ref().map(|value| value.purpose), cli.purpose) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("setup purpose conflicts between deployment document and CLI")
+        }
+        (Some(value), _) | (_, Some(value)) => value,
+        (None, None) => SetupPurpose::Credentials,
+    };
     let cli_users = cli_users(&cli)?;
     let cli_credentials = unique_credentials(&cli.credential_intents, "CLI")?;
 
@@ -176,13 +235,48 @@ pub fn normalize_deployment(
         cli.activation,
         "launcher activation",
     )?;
+    let selected_grant_policy = match (
+        document
+            .as_ref()
+            .and_then(|value| value.grant_policy.clone()),
+        cli.grant_policy,
+    ) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("grant policy conflicts between deployment document and CLI")
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    };
     let administrator_policy = agree(
         document
             .as_ref()
             .map(|value| value.administrator_policy.clone()),
-        cli.administrator_policy,
+        if purpose == SetupPurpose::PrivilegeOnly {
+            match (cli.administrator_policy, selected_grant_policy.clone()) {
+                (Some(left), Some(right)) if left != right => {
+                    bail!("privilege-only policy source selections conflict")
+                }
+                (Some(value), _) | (_, Some(value)) => Some(value),
+                (None, None) => None,
+            }
+        } else {
+            cli.administrator_policy
+        },
         "administrator policy",
     )?;
+    let grant_policy = if purpose == SetupPurpose::PrivilegeOnly {
+        if selected_grant_policy
+            .as_ref()
+            .is_some_and(|path| *path != administrator_policy)
+        {
+            bail!("privilege-only policy source selections conflict");
+        }
+        None
+    } else {
+        selected_grant_policy
+            .map(|path| normalized_absolute_path(&path, "grant policy"))
+            .transpose()?
+    };
 
     let mut users = document
         .as_ref()
@@ -196,15 +290,33 @@ pub fn normalize_deployment(
         .transpose()?
         .unwrap_or_default();
     merge_maps(&mut credentials, cli_credentials, "credential slot")?;
+    let mut bindings = document
+        .as_ref()
+        .map(|value| binding_map(&value.bindings, "deployment document"))
+        .transpose()?
+        .unwrap_or_default();
+    merge_maps(&mut bindings, binding_map(&cli.bindings, "CLI")?, "binding")?;
 
-    if users.is_empty() {
+    if purpose.is_credentials() && users.is_empty() {
         bail!("deployment intent must declare at least one native user");
     }
     if mode == DeploymentMode::Strong && users.values().any(|user| user.policy.is_some()) {
         bail!("strong mode does not accept per-user policy authority");
     }
     let intent = DeploymentIntent {
-        schema: "dev-auth-deployment-intent-v1".into(),
+        purpose,
+        schema: if !bindings.is_empty()
+            || document
+                .as_ref()
+                .is_some_and(|document| document.schema == "dev-auth-deployment-v3")
+        {
+            "dev-auth-deployment-intent-v3"
+        } else if purpose.is_credentials() && grant_policy.is_none() {
+            "dev-auth-deployment-intent-v1"
+        } else {
+            "dev-auth-deployment-intent-v2"
+        }
+        .into(),
         mode,
         channel,
         offline,
@@ -213,8 +325,10 @@ pub fn normalize_deployment(
             &administrator_policy,
             "administrator policy",
         )?,
+        grant_policy,
         users: users.into_values().collect(),
         credentials: credentials.into_values().collect(),
+        bindings: bindings.into_values().collect(),
     };
     validate_intent(&intent)?;
     Ok(intent)
@@ -341,33 +455,170 @@ fn merge_maps<T: PartialEq>(
 }
 
 fn validate_document(document: &DeploymentDocument) -> Result<()> {
-    if document.schema != "dev-auth-deployment-v1" {
+    let expected = if !document.bindings.is_empty()
+        || (document.schema == "dev-auth-deployment-v3" && document.purpose.is_credentials())
+    {
+        "dev-auth-deployment-v3"
+    } else if document.purpose.is_credentials() && document.grant_policy.is_none() {
+        "dev-auth-deployment-v1"
+    } else {
+        "dev-auth-deployment-v2"
+    };
+    if document.schema != expected {
         bail!("dev-auth deployment document schema is unsupported");
     }
     normalized_absolute_path(&document.administrator_policy, "administrator policy")?;
     let users = user_map(&document.users, "deployment document")?;
-    if users.is_empty() {
+    if document.purpose.is_credentials() && users.is_empty() {
         bail!("deployment document must declare at least one native user");
     }
     if document.mode == DeploymentMode::Strong && users.values().any(|user| user.policy.is_some()) {
         bail!("strong mode does not accept per-user policy authority");
     }
     credential_map(&document.credentials, "deployment document")?;
+    let bindings = binding_map(&document.bindings, "deployment document")?;
+    if bindings
+        .values()
+        .any(|binding| !users.contains_key(&binding.user))
+    {
+        bail!("binding names a user outside the deployment");
+    }
+    if document.purpose == SetupPurpose::PrivilegeOnly && !document.bindings.is_empty() {
+        bail!("privilege-only setup cannot select workload bindings");
+    }
+    if let Some(path) = &document.grant_policy {
+        normalized_absolute_path(path, "grant policy")?;
+    }
+    validate_purpose(
+        document.purpose,
+        document.mode,
+        &document.users,
+        &document.credentials,
+        document.grant_policy.as_deref(),
+        &document.administrator_policy,
+    )?;
     Ok(())
 }
 
 fn validate_intent(intent: &DeploymentIntent) -> Result<()> {
-    if intent.schema != "dev-auth-deployment-intent-v1" {
+    if intent.purpose == SetupPurpose::PrivilegeOnly && intent.grant_policy.is_some() {
+        bail!("privilege-only intent must use one canonical policy source");
+    }
+    let expected = if !intent.bindings.is_empty()
+        || (intent.schema == "dev-auth-deployment-intent-v3" && intent.purpose.is_credentials())
+    {
+        "dev-auth-deployment-intent-v3"
+    } else if intent.purpose.is_credentials() && intent.grant_policy.is_none() {
+        "dev-auth-deployment-intent-v1"
+    } else {
+        "dev-auth-deployment-intent-v2"
+    };
+    if intent.schema != expected {
         bail!("dev-auth deployment intent schema is unsupported");
     }
     normalized_absolute_path(&intent.administrator_policy, "administrator policy")?;
     let users = user_map(&intent.users, "deployment intent")?;
     credential_map(&intent.credentials, "deployment intent")?;
-    if users.is_empty() {
+    let bindings = binding_map(&intent.bindings, "deployment intent")?;
+    if bindings
+        .values()
+        .any(|binding| !users.contains_key(&binding.user))
+    {
+        bail!("binding names a user outside the deployment");
+    }
+    if intent.purpose == SetupPurpose::PrivilegeOnly && !intent.bindings.is_empty() {
+        bail!("privilege-only setup cannot select workload bindings");
+    }
+    if intent.purpose.is_credentials() && users.is_empty() {
         bail!("deployment intent must declare at least one native user");
     }
     if intent.mode == DeploymentMode::Strong && users.values().any(|user| user.policy.is_some()) {
         bail!("strong mode does not accept per-user policy authority");
+    }
+    if let Some(path) = &intent.grant_policy {
+        normalized_absolute_path(path, "grant policy")?;
+    }
+    validate_purpose(
+        intent.purpose,
+        intent.mode,
+        &intent.users,
+        &intent.credentials,
+        intent.grant_policy.as_deref(),
+        &intent.administrator_policy,
+    )?;
+    Ok(())
+}
+
+fn binding_map(
+    bindings: &[DeploymentBinding],
+    source: &str,
+) -> Result<BTreeMap<String, DeploymentBinding>> {
+    if bindings.len() > 128 {
+        bail!("binding selection exceeds its bound");
+    }
+    let mut mapped = BTreeMap::new();
+    for binding in bindings {
+        validate_identifier(&binding.user, "binding native user")?;
+        if binding.name.is_empty()
+            || binding.name.len() > 64
+            || !binding.name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+        {
+            bail!("binding name is invalid");
+        }
+        if !binding.plan.is_absolute()
+            || binding.plan == Path::new("/")
+            || binding
+                .plan
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+            || normalized_absolute_path(&binding.plan, "binding plan")?.as_os_str()
+                != binding.plan.as_os_str()
+        {
+            bail!("binding plan path must be absolute and normalized");
+        }
+        if binding.sha256.len() != 64
+            || !binding
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            bail!("binding plan SHA-256 is invalid");
+        }
+        if mapped
+            .insert(
+                format!("{}/{}", binding.user, binding.name),
+                binding.clone(),
+            )
+            .is_some()
+        {
+            bail!("duplicate binding selection in {source}");
+        }
+    }
+    Ok(mapped)
+}
+
+fn validate_purpose(
+    purpose: SetupPurpose,
+    mode: DeploymentMode,
+    users: &[DeploymentUser],
+    credentials: &[DeploymentCredential],
+    grant_policy: Option<&Path>,
+    administrator_policy: &Path,
+) -> Result<()> {
+    if purpose == SetupPurpose::PrivilegeOnly
+        && (mode != DeploymentMode::Strong
+            || !users.is_empty()
+            || !credentials.is_empty()
+            || grant_policy.is_some_and(|path| path != administrator_policy))
+    {
+        bail!(
+            "privilege-only setup requires system ownership and no credential or user-configuration actions"
+        );
+    }
+    if purpose.is_credentials() && grant_policy.is_some() && mode != DeploymentMode::Strong {
+        bail!("combined credential and administrator-grant setup requires strong ownership");
     }
     Ok(())
 }

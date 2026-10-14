@@ -348,7 +348,9 @@ pub(super) fn prepare_install(
         || shared.previous_version.as_deref() != prior.map(|receipt| receipt.version.as_str())
         || shared.previous_identity != prior.map(release_identity)
     {
-        bail!("unreceipted maintenance artifacts are outside exact interrupted installation authority");
+        bail!(
+            "unreceipted maintenance artifacts are outside exact interrupted installation authority"
+        );
     }
     Ok(())
 }
@@ -371,9 +373,11 @@ pub(super) fn reconcile(
 pub(super) fn require_absent() -> Result<()> {
     for path in [HELPER_PATH, RECEIPT_PATH, POLKIT_PATH] {
         match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
-            Ok(_) => bail!("pre-maintenance release retains unexpected maintenance artifacts; use exact retained recovery"),
+            Ok(_) => bail!(
+                "pre-maintenance release retains unexpected maintenance artifacts; use exact retained recovery"
+            ),
         }
     }
     Ok(())
@@ -747,7 +751,7 @@ pub(super) fn resume_rollback(
             if metadata.file_type().is_symlink()
                 && fs::read_link(&active)? == Path::new(&installed.executable) =>
         {
-            return Ok(None)
+            return Ok(None);
         }
         Ok(_) => {}
     }
@@ -868,6 +872,7 @@ mod tests {
             let identity = bytes_identity(&fs::read(&source).unwrap());
             let owner = fs::metadata(&data).unwrap().uid();
             let receipt = InstallReceipt {
+                purpose: Default::default(),
                 schema: RECEIPT_SCHEMA.into(),
                 mode: InstallMode::Strong,
                 version: "0.5.0".into(),

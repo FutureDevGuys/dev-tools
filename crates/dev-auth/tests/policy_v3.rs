@@ -53,6 +53,18 @@ fn explicit_v3_document_accepts_named_provider_and_bounded_overnight_authority()
     assert!(parse_system_policy_v3(policy_text().as_bytes()).is_ok());
 }
 
+#[test]
+fn public_shell_permission_defaults_closed_and_cannot_be_widened_by_narrowing() {
+    let upper = parse_system_policy_v3(policy_text().as_bytes()).unwrap();
+    assert!(!upper.workload_caps["build"].allow_pinned_shell);
+    let permitted = parse_system_policy_v3(
+        format!("{}\nallow_pinned_shell = true\n", policy_text()).as_bytes(),
+    )
+    .unwrap();
+    assert!(dev_auth::policy_v3::require_system_policy_narrows(&upper, &permitted).is_err());
+    assert!(dev_auth::policy_v3::require_system_policy_narrows(&permitted, &upper).is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn shipped_v3_templates_resolve_without_enabling_automatic_admission() {

@@ -236,8 +236,11 @@ pub(super) mod tests {
             for prior_logical in [false, true] {
                 let mut generation = generation(candidate_logical);
                 let (policy, original_user, config) = if prior_logical {
-                    (include_str!("../../../policy-v3.example.toml"), "automation",
-                        "schema = \"dev-auth-user-config-v3\"\nworkloads = []\n[authority_profiles]\n")
+                    (
+                        include_str!("../../../policy-v3.example.toml"),
+                        "automation",
+                        "schema = \"dev-auth-user-config-v3\"\nworkloads = []\n[authority_profiles]\n",
+                    )
                 } else {
                     (
                         include_str!("../../../policy-v2.example.toml"),
@@ -355,6 +358,7 @@ pub(super) mod tests {
             schema: "dev-auth-setup-plan-v2".into(),
             paths: crate::setup::SetupPaths::strong(),
             request: crate::setup::InstallRequest {
+                purpose: Default::default(),
                 mode: crate::setup::InstallMode::Strong,
                 version: "0.4.0".into(),
                 source_executable: "/fixture/candidate".into(),
@@ -367,6 +371,9 @@ pub(super) mod tests {
             verified_release: None,
         };
         let intent = DeploymentIntent {
+            bindings: Vec::new(),
+            purpose: Default::default(),
+            grant_policy: None,
             schema: "dev-auth-deployment-v1".into(),
             mode: DeploymentMode::Strong,
             channel: crate::deployment::Channel::Stable,
@@ -386,6 +393,7 @@ pub(super) mod tests {
             &retiring_accounts,
             authority_schema,
         )
+        .expect("fixture has valid retained path identities")
         .into_iter()
         .filter(|(kind, _, _)| {
             matches!(
@@ -439,6 +447,10 @@ pub(super) mod tests {
             schema: "dev-auth-retained-setup-generation-v1".into(),
             plan_sha256: String::new(),
             plan: SetupPlanV3 {
+                credential_preservation: None,
+                grant_previous_block: None,
+                grant_current_state: None,
+                grant_payload: BTreeMap::new(),
                 schema: "dev-auth-setup-plan-v3".into(),
                 authority_schema: authority_schema.map(str::to_owned),
                 intent,

@@ -10,10 +10,13 @@ mod completion;
 mod doctor;
 mod execution_result;
 #[cfg(target_os = "linux")]
+mod grant_cli;
+#[cfg(target_os = "linux")]
 mod linux_input;
 mod product_cli;
 mod secret_cli;
 mod secret_execution;
+mod update_cli;
 mod validation_cli;
 mod workload_cli;
 
@@ -60,22 +63,23 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn base_usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|privilege-deployment|credential-grant-deployment|administrator-grant-policy\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--grant-policy PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 fn usage() -> String {
     let commands = format!(
-        "{}\n\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         base_usage(),
         doctor::help(),
         workload_cli::help(),
         secret_cli::help(),
         validation_cli::specification().render_long_help(),
         completion::setup_recovery_command().render_long_help(),
-        completion::setup_restoration_command().render_long_help()
+        completion::setup_restoration_command().render_long_help(),
+        update_cli::specification().render_long_help()
     );
     format!(
-        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth privilege plan|request|execute|execute-plan|status|revoke [OPTIONS]\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
+        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth privilege plan|request|execute|execute-plan|status|revoke [OPTIONS]\n  dev-auth privilege grant request|status|inspect|exec|delegate|revoke|leave [OPTIONS]\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
         commands
     )
 }
@@ -103,186 +107,18 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
     if arguments.next().as_deref() != Some("bind") {
         bail!("workload management requires bind; launch is available on strong Linux")
     }
-    match arguments.next().as_deref() {
-        Some("discover") => {
-            let command_name = arguments
-                .next()
-                .context("workload bind discover requires a command name")?;
-            let json = match arguments.next().as_deref() {
-                None => false,
-                Some("--json") if arguments.next().is_none() => true,
-                _ => bail!("workload bind discover accepts only COMMAND [--json]"),
-            };
-            let search_path = std::env::var_os("PATH").context("PATH is not set")?;
-            let excluded = dev_auth::smart_binding::default_proxy_directories()?;
-            let resolved = dev_auth::smart_binding::resolve_continuation(
-                &command_name,
-                &search_path,
-                &excluded,
-            )?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "schema": "dev-auth-workload-binding-discovery-v1",
-                        "command_name": command_name,
-                        "resolved": resolved,
-                    }))?
-                );
-            } else {
-                println!("command_name={command_name}");
-                println!("visible_path={}", resolved.visible_path.display());
-                println!("canonical_path={}", resolved.canonical_path.display());
-                println!("authority={:?}", resolved.identity.authority);
-            }
-            Ok(0)
-        }
-        Some("plan") => {
-            let name = arguments
-                .next()
-                .context("workload bind plan requires a binding name")?;
-            let mut workload = None;
-            let mut command_name = None;
-            let mut target = None;
-            let mut executable = None;
-            let mut fixed_arguments = Vec::new();
-            let mut caller_argument_index = None;
-            let mut output = None;
-            let mut json = false;
-            while let Some(argument) = arguments.next() {
-                match argument.as_str() {
-                    "--workload" if workload.is_none() => {
-                        workload = Some(
-                            arguments
-                                .next()
-                                .context("--workload requires a workload name")?,
-                        );
-                    }
-                    "--command-name" if command_name.is_none() => {
-                        command_name = Some(
-                            arguments
-                                .next()
-                                .context("--command-name requires a command name")?,
-                        );
-                    }
-                    "--target" if target.is_none() => {
-                        target = Some(
-                            arguments
-                                .next()
-                                .context("--target requires a target kind")?,
-                        );
-                    }
-                    "--output" if output.is_none() => {
-                        output = Some(std::path::PathBuf::from(
-                            arguments.next().context("--output requires a path")?,
-                        ));
-                    }
-                    "--executable" if executable.is_none() => {
-                        executable = Some(std::path::PathBuf::from(
-                            arguments.next().context("--executable requires a path")?,
-                        ));
-                    }
-                    "--arg" => {
-                        fixed_arguments.push(arguments.next().context("--arg requires a value")?);
-                    }
-                    "--caller-argument-index" if caller_argument_index.is_none() => {
-                        caller_argument_index = Some(
-                            arguments
-                                .next()
-                                .context("--caller-argument-index requires an index")?
-                                .parse::<usize>()
-                                .context("caller argument index is invalid")?,
-                        );
-                    }
-                    "--json" if !json => json = true,
-                    _ => bail!("workload bind plan contains a duplicate or unknown argument"),
-                }
-            }
-            let workload = workload.context("workload bind plan requires --workload")?;
-            let command_name =
-                command_name.context("workload bind plan requires --command-name")?;
-            let output = output.context("workload bind plan requires --output")?;
-            if !output.is_absolute() {
-                bail!("workload binding plan output must be absolute")
-            }
-            let (intent, resolved) = match target.as_deref() {
-                Some("current-resolution") => {
-                    if executable.is_some()
-                        || !fixed_arguments.is_empty()
-                        || caller_argument_index.is_some()
-                    {
-                        bail!("structured arguments require --target structured");
-                    }
-                    let search_path = std::env::var_os("PATH").context("PATH is not set")?;
-                    let excluded = dev_auth::smart_binding::default_proxy_directories()?;
-                    let resolved = dev_auth::smart_binding::resolve_continuation(
-                        &command_name,
-                        &search_path,
-                        &excluded,
-                    )?;
-                    (
-                        dev_auth::smart_binding::BindingIntent::continuation(
-                            command_name,
-                            workload,
-                        )?,
-                        resolved.into(),
-                    )
-                }
-                Some("structured") => {
-                    let executable =
-                        executable.context("structured target requires --executable")?;
-                    let excluded = dev_auth::smart_binding::default_proxy_directories()?;
-                    let resolved = dev_auth::smart_binding::resolve_structured_target_excluding(
-                        &executable,
-                        &excluded,
-                    )?;
-                    let mut intent = dev_auth::smart_binding::BindingIntent::structured(
-                        command_name,
-                        workload,
-                        executable,
-                        fixed_arguments,
-                    )?;
-                    if let (
-                        Some(index),
-                        dev_auth::smart_binding::BindingTargetIntent::Structured {
-                            caller_argument_index,
-                            ..
-                        },
-                    ) = (caller_argument_index, &mut intent.target)
-                    {
-                        *caller_argument_index = index;
-                    }
-                    (intent, resolved)
-                }
-                _ => bail!("binding plan requires --target current-resolution or structured"),
-            };
-            let plan = dev_auth::smart_binding::build_binding_plan(name, intent, resolved, None)?;
-            let digest = dev_auth::smart_binding::write_binding_plan(&output, &plan)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "schema": "dev-auth-workload-binding-plan-result-v1",
-                        "plan": output,
-                        "sha256": digest,
-                        "change": plan.change,
-                    }))?
-                );
-            } else {
-                println!("binding_plan={}", output.display());
-                println!("binding_plan_sha256={digest}");
-                println!("change={:?}", plan.change);
-            }
-            Ok(0)
-        }
-        _ => bail!("workload bind requires discover or plan"),
-    }
+    dev_auth::binding_cli::run(&arguments.collect::<Vec<_>>())
 }
 
 #[cfg(target_os = "linux")]
 fn run_workload_alias_os(workload: &str) -> Result<i32> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let status = dev_auth::supervisor::run_workload_alias(workload, &arguments)?;
+    let binding = dev_auth::binding_activation::resolve_current_alias(workload, &arguments)?;
+    let (workload, arguments) = match binding.as_ref() {
+        Some(binding) => (binding.workload.as_str(), binding.arguments.as_slice()),
+        None => (workload, arguments.as_slice()),
+    };
+    let status = dev_auth::supervisor::run_workload_alias(workload, arguments)?;
     workload_status_code(status)
 }
 
@@ -393,12 +229,34 @@ fn run_supervisor_arguments(
         );
         (None, None, Some(boundary_socket))
     };
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let mut separator = arguments.next();
+    let privilege = if separator.as_deref() == Some(std::ffi::OsStr::new("--privilege-request")) {
+        if operation == "dispatch-enrolled" {
+            bail!("administrator launch requires independent interactive dispatch");
+        }
+        let value = arguments
+            .next()
+            .context("administrator launch request is missing")?;
+        let value = value
+            .to_str()
+            .filter(|value| value.len() <= 16 * 1024)
+            .context("administrator launch request is invalid")?;
+        let request: dev_auth::privilege::grants::GrantRequest = serde_json::from_str(value)
+            .map_err(|_| anyhow::anyhow!("administrator launch request is invalid"))?;
+        request
+            .validate()
+            .map_err(|_| anyhow::anyhow!("administrator launch request is invalid"))?;
+        separator = arguments.next();
+        Some(request)
+    } else {
+        None
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("supervisor requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
     if let Some(session_id) = session_id {
-        let status = dev_auth::supervisor::run_root_supervisor(
+        let status = dev_auth::supervisor::run_root_supervisor_with_grant(
             owner_uid,
             &workload,
             &cwd,
@@ -409,14 +267,17 @@ fn run_supervisor_arguments(
             boundary_socket
                 .as_deref()
                 .context("strong supervisor boundary socket is missing")?,
-            &arguments,
+            dev_auth::supervisor::StrongWorkloadLaunchInputs {
+                arguments: &arguments,
+                privilege: privilege.as_ref(),
+            },
         )?;
         Ok(exit_status_code(status))
     } else {
         let dispatch = if operation == "dispatch-enrolled" {
-            dev_auth::supervisor::run_enrolled_dispatcher
+            dev_auth::supervisor::run_enrolled_dispatcher_with_grant
         } else {
-            dev_auth::supervisor::run_root_dispatcher
+            dev_auth::supervisor::run_root_dispatcher_with_grant
         };
         let status = dispatch(
             owner_uid,
@@ -427,9 +288,28 @@ fn run_supervisor_arguments(
                 .as_deref()
                 .context("privileged dispatcher environment socket is missing")?,
             &arguments,
+            privilege.as_ref(),
         )?;
         Ok(exit_status_code(status))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn take_inherited_startup_descriptor(
+    descriptor: std::os::fd::RawFd,
+) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if descriptor < 3 {
+        bail!("startup proof descriptor is invalid");
+    }
+    // SAFETY: this read-only syscall accepts the numeric descriptor, no pointer.
+    // No owning Rust handle exists for an inherited entry-point descriptor yet.
+    if unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) } < 0 {
+        bail!("startup proof descriptor is unavailable");
+    }
+    // SAFETY: a private single-threaded process entry point claims this valid
+    // inherited descriptor exactly once; it is then owned through cleanup.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) })
 }
 
 #[cfg(target_os = "linux")]
@@ -499,6 +379,9 @@ fn run_supervisor_child_os() -> Result<i32> {
             Some(dev_auth::supervisor::SandboxLaunch {
                 executable,
                 arguments: adapter_arguments,
+                // The admitted native child derives this declaration from its
+                // current policy; private argv supplies no template authority.
+                inherited_descriptor_arguments: Vec::new(),
                 argument_separator,
                 network_namespace,
             })
@@ -515,20 +398,92 @@ fn run_supervisor_child_os() -> Result<i32> {
         .map_err(|_| anyhow::anyhow!("supervisor child admission gate is not UTF-8"))?
         .parse::<std::os::fd::RawFd>()
         .context("supervisor child admission gate is invalid")?;
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let mut separator = arguments.next();
+    let startup_fd = if separator.as_deref() == Some(std::ffi::OsStr::new("--startup-fd")) {
+        let value = arguments
+            .next()
+            .context("supervisor child startup descriptor is missing")?;
+        let descriptor = value
+            .to_str()
+            .context("supervisor child startup descriptor is invalid")?
+            .parse::<std::os::fd::RawFd>()
+            .context("supervisor child startup descriptor is invalid")?;
+        separator = arguments.next();
+        Some(take_inherited_startup_descriptor(descriptor)?)
+    } else {
+        None
+    };
+    let execution_release_fd = if startup_fd.is_some() {
+        if separator.as_deref() != Some(std::ffi::OsStr::new("--exec-release-fd")) {
+            bail!("paired execution release descriptor is missing");
+        }
+        let value = arguments
+            .next()
+            .context("execution release descriptor is missing")?;
+        let raw = value
+            .to_str()
+            .context("execution release descriptor is invalid")?
+            .parse::<std::os::fd::RawFd>()
+            .context("execution release descriptor is invalid")?;
+        if startup_fd
+            .as_ref()
+            .is_some_and(|fd| std::os::fd::AsRawFd::as_raw_fd(fd) == raw)
+        {
+            bail!("execution release aliases startup proof");
+        }
+        separator = arguments.next();
+        Some(take_inherited_startup_descriptor(raw)?)
+    } else {
+        None
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("supervisor child requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
-    dev_auth::supervisor::run_supervisor_child(
+    let status = dev_auth::supervisor::run_supervisor_child_with_descriptors(
         &session_id,
         &workload,
         &cgroup,
         &launcher,
         sandbox.as_ref(),
-        gate_fd,
+        dev_auth::supervisor::SupervisorChildDescriptors {
+            gate: gate_fd,
+            startup: startup_fd,
+            execution_release: execution_release_fd,
+        },
         &arguments,
     )?;
-    bail!("supervisor child returned unexpectedly")
+    workload_status_code(status)
+}
+
+#[cfg(target_os = "linux")]
+fn run_sandbox_adapter_os() -> Result<i32> {
+    let mut arguments = std::env::args_os().skip(2);
+    let selector = |arguments: &mut std::iter::Skip<std::env::ArgsOs>, name: &str| {
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new(name)) {
+            bail!("sandbox intermediate selector is invalid");
+        }
+        arguments
+            .next()
+            .context("sandbox intermediate selector value is missing")
+    };
+    let session = selector(&mut arguments, "--session")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("sandbox intermediate session is not UTF-8"))?;
+    let workload = selector(&mut arguments, "--workload")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("sandbox intermediate workload is not UTF-8"))?;
+    let launcher = std::path::PathBuf::from(selector(&mut arguments, "--launcher")?);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+        bail!("sandbox intermediate requires -- before workload arguments");
+    }
+    dev_auth::supervisor::run_sandbox_adapter(
+        &session,
+        &workload,
+        &launcher,
+        &arguments.collect::<Vec<_>>(),
+    )?;
+    bail!("sandbox intermediate returned unexpectedly")
 }
 
 #[cfg(target_os = "linux")]
@@ -578,19 +533,61 @@ fn run_sandbox_child_os() -> Result<i32> {
         .map_err(|_| anyhow::anyhow!("parent network namespace is not UTF-8"))?
         .parse::<u64>()
         .context("sandbox child parent network namespace is invalid")?;
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let mut separator = arguments.next();
+    let startup_fd = if separator.as_deref() == Some(std::ffi::OsStr::new("--startup-fd")) {
+        let value = arguments
+            .next()
+            .context("sandbox child startup descriptor is missing")?;
+        let descriptor = value
+            .to_str()
+            .context("sandbox child startup descriptor is invalid")?
+            .parse::<std::os::fd::RawFd>()
+            .context("sandbox child startup descriptor is invalid")?;
+        separator = arguments.next();
+        Some(take_inherited_startup_descriptor(descriptor)?)
+    } else {
+        None
+    };
+    let execution_release_fd = if startup_fd.is_some() {
+        if separator.as_deref() != Some(std::ffi::OsStr::new("--exec-release-fd")) {
+            bail!("paired execution release descriptor is missing");
+        }
+        let value = arguments
+            .next()
+            .context("execution release descriptor is missing")?;
+        let raw = value
+            .to_str()
+            .context("execution release descriptor is invalid")?
+            .parse::<std::os::fd::RawFd>()
+            .context("execution release descriptor is invalid")?;
+        if startup_fd
+            .as_ref()
+            .is_some_and(|fd| std::os::fd::AsRawFd::as_raw_fd(fd) == raw)
+        {
+            bail!("execution release aliases startup proof");
+        }
+        separator = arguments.next();
+        Some(take_inherited_startup_descriptor(raw)?)
+    } else {
+        None
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("sandbox child requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
-    dev_auth::supervisor::run_sandbox_child(
+    let status = dev_auth::supervisor::run_sandbox_child_with_startup(
         &session_id,
         &workload,
         &launcher,
         network_namespace,
         parent_network_namespace,
+        dev_auth::supervisor::WorkloadStartupDescriptors {
+            proof: startup_fd,
+            release: execution_release_fd,
+        },
         &arguments,
     )?;
-    bail!("sandbox child returned unexpectedly")
+    workload_status_code(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -851,7 +848,7 @@ fn run_setup_helper_os() -> Result<i32> {
 
     let request = parse_setup_helper_apply(std::env::args_os().skip(1))?;
     let plan = dev_auth::setup_v3::read_root_setup_plan_v3_at(&request.plan)
-        .context("setup helper accepts only a root-custodied full setup plan v3")?;
+        .context("setup helper accepts only a root-custodied full setup plan")?;
     if plan.intent.mode != dev_auth::deployment::DeploymentMode::Strong {
         bail!("setup helper accepts only strong setup plans")
     }
@@ -1085,6 +1082,20 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 match argument.as_str() {
                     "--deployment" if deployment.is_none() => {
                         deployment = Some(arguments.next().context("--deployment requires a path")?)
+                    }
+                    "--purpose" if cli.purpose.is_none() => {
+                        cli.purpose = Some(match arguments.next().as_deref() {
+                            Some("credentials") => dev_auth::deployment::SetupPurpose::Credentials,
+                            Some("privilege-only") => {
+                                dev_auth::deployment::SetupPurpose::PrivilegeOnly
+                            }
+                            _ => bail!("setup purpose must be credentials or privilege-only"),
+                        });
+                    }
+                    "--grant-policy" if cli.grant_policy.is_none() => {
+                        cli.grant_policy = Some(std::path::PathBuf::from(
+                            arguments.next().context("--grant-policy requires a path")?,
+                        ));
                     }
                     "--mode" if cli.mode.is_none() => {
                         cli.mode = Some(
@@ -1360,8 +1371,8 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if let Some(authorize) = authorize {
                 #[cfg(target_os = "linux")]
                 {
-                    if authorize != "sudo" {
-                        bail!("setup apply authorization must be sudo");
+                    if !matches!(authorize.as_str(), "sudo" | "polkit") {
+                        bail!("setup apply authorization must be sudo or polkit");
                     }
                     let request =
                         dev_auth::setup_authorization::StrongSetupApplyAuthorization::new(
@@ -1373,6 +1384,13 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     dev_auth::setup::validate_installed_setup_helper().context(
                         "validate the receipt-owned setup helper before requesting privilege; bootstrap strong setup as root when the helper is not installed",
                     )?;
+                    if authorize == "polkit" {
+                        return authorized_setup_exit_code(
+                            dev_auth::setup_authorization::authorize_strong_apply_via_polkit(
+                                &request,
+                            )?,
+                        );
+                    }
                     let authorizer = dev_tools_privilege::SudoAuthorizer::new("/usr/bin/sudo")
                         .context(
                             "prepare strong setup authorization; bootstrap the receipt-owned setup helper as root when it is not installed",
@@ -1388,7 +1406,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 bail!("setup apply authorization is unavailable on this platform");
             }
             let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan_path)
-                .context("setup apply accepts only a full setup plan v3")?;
+                .context("setup apply accepts only a full setup plan")?;
             if let Some(candidate) = dev_auth::setup_v3::setup_apply_candidate_path(&plan, &digest)?
             {
                 #[cfg(unix)]
@@ -1623,7 +1641,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                     bail!("setup verify format must be human or json");
                 }
                 let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan)
-                    .context("setup verify accepts only a full setup plan v3")?;
+                    .context("setup verify accepts only a full setup plan")?;
                 let report = dev_auth::setup_v3::verify_setup_plan_v3(
                     &plan,
                     &digest.context("setup verify requires --sha256 HEX with --plan")?,
@@ -1659,6 +1677,19 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             }
             let mode = setup_mode(mode.as_deref())?;
             let paths = setup_paths(mode)?;
+            #[cfg(target_os = "linux")]
+            if matches!(operation.as_str(), "repair" | "uninstall")
+                && dev_auth::setup_v3::full_setup_maintenance_required_at(&paths)
+            {
+                let report = if operation == "repair" {
+                    dev_auth::setup_v3::repair_setup_v3(mode)
+                } else {
+                    dev_auth::setup_v3::uninstall_setup_v3(mode)
+                };
+                let code = report.exit_code;
+                println!("{}", serde_json::to_string(&report)?);
+                return Ok(code);
+            }
             if operation == "uninstall" {
                 let report = dev_auth::setup::uninstall_native(mode)?;
                 println!("{}", serde_json::to_string(&report)?);
@@ -1921,6 +1952,9 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         "setup" => run_setup(arguments),
+        "update" => Ok(update_cli::run(
+            arguments.map(std::ffi::OsString::from).collect(),
+        )),
         "reconcile" => run_reconcile(arguments),
         "workload" => run_workload_management(arguments),
         "broker" => {
@@ -2444,9 +2478,53 @@ fn main() {
             if is_core_frontend(frontend)
                 && core_operation.as_deref() == Some(std::ffi::OsStr::new("privilege")) =>
         {
-            Ok(dev_auth::privilege::cli::run(
-                std::env::args_os().skip(2).collect(),
-            ))
+            if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("grant")) {
+                Ok(grant_cli::run(std::env::args_os().skip(3).collect()))
+            } else if std::env::args_os().nth(2).as_deref().is_some_and(|name| {
+                dev_auth::privilege::grants::DirectGrantCommand::from_name(name).is_some()
+            }) {
+                Ok(grant_cli::run_direct(std::env::args_os().skip(2).collect()))
+            } else {
+                Ok(dev_auth::privilege::cli::run(
+                    std::env::args_os().skip(2).collect(),
+                ))
+            }
+        }
+        #[cfg(target_os = "linux")]
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("grant-plan-worker")) =>
+        {
+            Ok(dev_auth::privilege::grants::run_plan_worker())
+        }
+        #[cfg(target_os = "linux")]
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref()
+                    == Some(std::ffi::OsStr::new("grant-output-relay")) =>
+        {
+            Ok(dev_auth::privilege::grants::run_output_relay())
+        }
+        #[cfg(target_os = "linux")]
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("grant-daemon")) =>
+        {
+            Ok(grant_cli::daemon(std::env::args_os().skip(2).collect()))
+        }
+        #[cfg(target_os = "linux")]
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("grant-sudo-relay")) =>
+        {
+            Ok(grant_cli::sudo_relay(std::env::args_os().skip(2).collect()))
+        }
+        #[cfg(target_os = "linux")]
+        (frontend, false, false)
+            if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("grant-payload")) =>
+        {
+            Ok(grant_cli::payload(std::env::args_os().skip(2).collect()))
         }
         #[cfg(target_os = "linux")]
         ("dev-auth-maintenance-helper", false, false) => Ok(dev_auth::privilege::cli::private(
@@ -2470,6 +2548,12 @@ fn main() {
         ("ssh-keygen-dev-auth", _, _) => run_ssh_keygen_frontend(),
         (frontend, false, false)
             if is_core_frontend(frontend)
+                && core_operation.as_deref() == Some(std::ffi::OsStr::new("update")) =>
+        {
+            Ok(update_cli::run(std::env::args_os().skip(2).collect()))
+        }
+        (frontend, false, false)
+            if is_core_frontend(frontend)
                 && core_operation.as_deref() == Some(std::ffi::OsStr::new("doctor")) =>
         {
             Ok(doctor::run(std::env::args_os().skip(2).collect()))
@@ -2479,6 +2563,12 @@ fn main() {
                 && core_operation.as_deref() == Some(std::ffi::OsStr::new("validate")) =>
         {
             Ok(validation_cli::run(std::env::args_os().skip(2).collect()))
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("update-worker")) =>
+        {
+            Ok(update_cli::worker(std::env::args_os().skip(2).collect()))
         }
         #[cfg(target_os = "linux")]
         ("dev-auth-provider-exec", false, false) => dev_auth::run_provider_exec_child(),
@@ -2503,6 +2593,12 @@ fn main() {
             if core_operation.as_deref() == Some(std::ffi::OsStr::new("supervisor-child")) =>
         {
             run_supervisor_child_os()
+        }
+        #[cfg(target_os = "linux")]
+        ("dev-auth", false, false)
+            if core_operation.as_deref() == Some(std::ffi::OsStr::new("sandbox-adapter")) =>
+        {
+            run_sandbox_adapter_os()
         }
         #[cfg(target_os = "linux")]
         ("dev-auth", false, false)

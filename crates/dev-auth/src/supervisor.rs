@@ -23,6 +23,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod dispatch_diagnostics;
+mod exec_barrier;
+#[cfg(test)]
+mod launch_grant_tests;
+pub(crate) mod startup_proof;
 pub use dispatch_diagnostics::enrolled_dispatch_diagnostic;
 use dispatch_diagnostics::{observe_dispatch, EnrolledDispatchStage};
 
@@ -36,6 +40,7 @@ const SESSION_RENEW_SECONDS: u64 = 5;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ENVIRONMENT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_MAGIC: &[u8; 4] = b"DAT1";
+const STARTUP_PROOF_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Fixed outer-launch observations, not policy decisions or proof of execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +109,8 @@ struct TransientServiceRequest<'a> {
     tool_bin: &'a Path,
     arguments: &'a [OsString],
     duration_seconds: Option<u64>,
+    pinned_projection: Option<(&'a Path, &'a Path)>,
+    privilege: Option<&'a crate::privilege::grants::GrantRequest>,
 }
 
 struct GatedChildRequest<'a> {
@@ -119,11 +126,29 @@ struct GatedChildRequest<'a> {
     environment: BTreeMap<OsString, OsString>,
     sandbox: Option<SandboxLaunch>,
     identity_already_set: bool,
+    shell_source: Option<File>,
+    startup_proof: bool,
 }
 
 struct GatedChild {
     child: Child,
     release: OwnedFd,
+    startup: Option<OwnedFd>,
+    execution_release: Option<OwnedFd>,
+    startup_owner: Option<OwnedFd>,
+}
+
+/// Inherited descriptors owned by the private supervisor child, never authority hints.
+#[derive(Default)]
+pub struct WorkloadStartupDescriptors {
+    pub proof: Option<OwnedFd>,
+    pub release: Option<OwnedFd>,
+}
+
+pub struct SupervisorChildDescriptors {
+    pub gate: RawFd,
+    pub startup: Option<OwnedFd>,
+    pub execution_release: Option<OwnedFd>,
 }
 
 struct AgentProxyProcess {
@@ -141,13 +166,26 @@ struct SandboxBrokerIdentity {
 struct WorkloadToolPlane {
     directory: PathBuf,
     executable: PathBuf,
+    binding_aliases: Vec<String>,
 }
 
 impl WorkloadToolPlane {
+    #[cfg(test)]
     fn create(parent: &Path, executable: &Path, owner_uid: u32, mode: u32) -> Result<Self> {
+        Self::create_bound(parent, executable, owner_uid, mode, &[])
+    }
+
+    fn create_bound(
+        parent: &Path,
+        executable: &Path,
+        owner_uid: u32,
+        mode: u32,
+        binding_aliases: &[String],
+    ) -> Result<Self> {
         if !matches!(mode, 0o700 | 0o755) {
             bail!("workload tool-plane mode is invalid");
         }
+        crate::setup::validate_workload_alias_names(binding_aliases)?;
         let parent_metadata =
             fs::symlink_metadata(parent).context("inspect workload tool-plane parent directory")?;
         if !parent_metadata.file_type().is_dir()
@@ -179,6 +217,7 @@ impl WorkloadToolPlane {
         let plane = Self {
             directory,
             executable,
+            binding_aliases: binding_aliases.to_vec(),
         };
         if let Err(error) = plane.populate_and_validate(owner_uid, mode) {
             let _ = plane.remove_owned_artifacts();
@@ -192,7 +231,10 @@ impl WorkloadToolPlane {
     }
 
     fn populate_and_validate(&self, owner_uid: u32, mode: u32) -> Result<()> {
-        for alias in ["git", "gh"] {
+        for alias in ["git", "gh"]
+            .into_iter()
+            .chain(self.binding_aliases.iter().map(String::as_str))
+        {
             symlink(&self.executable, self.directory.join(alias))
                 .with_context(|| format!("create private workload {alias} launcher"))?;
         }
@@ -200,7 +242,13 @@ impl WorkloadToolPlane {
     }
 
     fn validate_artifacts(&self, owner_uid: u32, mode: u32) -> Result<()> {
-        Self::validate_artifacts_at(&self.directory, &self.executable, owner_uid, mode)
+        Self::validate_artifacts_at(
+            &self.directory,
+            &self.executable,
+            owner_uid,
+            mode,
+            &self.binding_aliases,
+        )
     }
 
     fn validate_artifacts_at(
@@ -208,6 +256,7 @@ impl WorkloadToolPlane {
         executable: &Path,
         owner_uid: u32,
         mode: u32,
+        binding_aliases: &[String],
     ) -> Result<()> {
         let metadata =
             fs::symlink_metadata(directory).context("inspect workload tool-plane directory")?;
@@ -218,7 +267,10 @@ impl WorkloadToolPlane {
         {
             bail!("workload tool-plane directory has unsafe authority");
         }
-        for alias in ["git", "gh"] {
+        for alias in ["git", "gh"]
+            .into_iter()
+            .chain(binding_aliases.iter().map(String::as_str))
+        {
             let path = directory.join(alias);
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect private workload {alias} launcher"))?;
@@ -232,7 +284,10 @@ impl WorkloadToolPlane {
     }
 
     fn remove_owned_artifacts(&self) -> Result<()> {
-        for alias in ["git", "gh"] {
+        for alias in ["git", "gh"]
+            .into_iter()
+            .chain(self.binding_aliases.iter().map(String::as_str))
+        {
             let path = self.directory.join(alias);
             match fs::symlink_metadata(&path) {
                 Ok(metadata)
@@ -368,6 +423,7 @@ fn validate_runtime_directory(path: &Path, mode: u32, owner_uid: u32) -> Result<
 pub struct SandboxLaunch {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
+    pub inherited_descriptor_arguments: Vec<String>,
     pub argument_separator: bool,
     pub network_namespace: SandboxNetworkNamespace,
 }
@@ -380,6 +436,8 @@ struct SandboxedWorkloadRequest<'a> {
     workload: &'a str,
     launcher: &'a Path,
     workload_arguments: &'a [OsString],
+    startup_fd: Option<RawFd>,
+    execution_release_fd: Option<RawFd>,
 }
 
 fn encode_workload_environment(environment: &BTreeMap<OsString, OsString>) -> Result<Vec<u8>> {
@@ -578,6 +636,16 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
         request.boundary_socket.as_os_str().to_os_string(),
         OsString::from("--"),
     ];
+    if let Some((source, target)) = request.pinned_projection {
+        command.insert(
+            0,
+            OsString::from(format!(
+                "--property=BindReadOnlyPaths={}:{}",
+                validate_pinned_mount_path(source)?,
+                validate_pinned_mount_path(target)?
+            )),
+        );
+    }
     if let Some(seconds) = request.duration_seconds {
         if seconds == 0 {
             bail!("transient workload duration must be positive");
@@ -587,8 +655,39 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
             OsString::from(format!("--property=RuntimeMaxSec={seconds}s")),
         );
     }
+    if let Some(privilege) = request.privilege {
+        privilege
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid administrator launch request"))?;
+        let position = command.len() - 1;
+        command.splice(
+            position..position,
+            [
+                OsString::from("--privilege-request"),
+                OsString::from(serde_json::to_string(privilege)?),
+            ],
+        );
+    }
     command.extend_from_slice(request.arguments);
     Ok(command)
+}
+
+pub(crate) fn validate_pinned_mount_path(path: &Path) -> Result<String> {
+    let text = path.to_str().context("pinned path is not native UTF-8")?;
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        bail!("pinned projection path cannot be encoded as one systemd property");
+    }
+    Ok(text.to_owned())
 }
 
 fn create_environment_listener(owner_uid: u32) -> Result<(UnixListener, PathBuf, Vec<u8>)> {
@@ -826,7 +925,7 @@ fn accept_strong_boundary(
 fn connect_strong_boundary(
     session_id: &str,
     path: &Path,
-) -> Result<(BTreeMap<OsString, OsString>, UnixStream)> {
+) -> Result<(BTreeMap<OsString, OsString>, UnixStream, Option<File>)> {
     let expected = PathBuf::from(format!("/run/dev-auth/workloads/{session_id}.sock"));
     if path != expected {
         bail!("strong workload boundary socket is outside the product runtime");
@@ -861,8 +960,9 @@ fn connect_strong_boundary(
     if credentials.uid() != 0 {
         bail!("strong workload dispatcher is not root-owned");
     }
+    let shell_source = crate::binding_activation::launch_shell::receive_source(&mut stream)?;
     let environment = read_environment_frame(&mut stream)?;
-    Ok((environment, stream))
+    Ok((environment, stream, shell_source))
 }
 
 fn strong_workload_runtime_directory(session_id: &str) -> Result<PathBuf> {
@@ -944,7 +1044,11 @@ fn load_strong_workload_policy(
         .get(workload_name)
         .with_context(|| format!("workload {workload_name} is not configured"))?;
     validate_workload_root_scope(cwd, &workload.workspace_roots)?;
-    validate_root_owned_launcher(Path::new(&workload.launcher_path))?;
+    validate_strong_workload_launcher(
+        owner_uid,
+        workload_name,
+        Path::new(&workload.launcher_path),
+    )?;
     if owner.uid.as_raw() != owner_uid {
         bail!("workload owner identity changed during admission");
     }
@@ -973,6 +1077,7 @@ fn select_sandbox_launch(
             Ok(Some(SandboxLaunch {
                 executable,
                 arguments: expand_sandbox_adapter_arguments(adapter, &workload.workspace_roots)?,
+                inherited_descriptor_arguments: adapter.inherited_descriptor_arguments.clone(),
                 argument_separator: adapter.argument_separator,
                 network_namespace: adapter.network_namespace,
             }))
@@ -981,13 +1086,14 @@ fn select_sandbox_launch(
 }
 
 pub fn launch_via_pkexec(workload: &str, arguments: &[OsString]) -> Result<ExitStatus> {
-    launch_via_native_helper(workload, arguments, false)
+    launch_via_native_helper(workload, arguments, false, None)
 }
 
 fn launch_via_native_helper(
     workload: &str,
     arguments: &[OsString],
     enrolled: bool,
+    privilege: Option<&crate::privilege::grants::GrantRequest>,
 ) -> Result<ExitStatus> {
     validate_identifier(workload, "workload")?;
     if nix::unistd::Uid::effective().is_root() {
@@ -1016,9 +1122,16 @@ fn launch_via_native_helper(
         .arg("--launcher-pid")
         .arg(launcher_pid)
         .arg("--environment-socket")
-        .arg(&environment_socket)
-        .arg("--")
-        .args(arguments);
+        .arg(&environment_socket);
+    if let Some(privilege) = privilege {
+        privilege
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid administrator launch request"))?;
+        command
+            .arg("--privilege-request")
+            .arg(serde_json::to_string(privilege)?);
+    }
+    command.arg("--").args(arguments);
     let mut child = command
         .spawn()
         .context(WorkloadLaunchFailure::DispatcherStart)?;
@@ -1077,15 +1190,38 @@ pub fn run_workload_alias_request(
     noninteractive: bool,
     record_result: bool,
 ) -> Result<WorkloadLaunchOutcome> {
+    run_workload_alias_request_with_grant(workload, arguments, noninteractive, record_result, None)
+}
+
+/// A separately selected administrator grant requires fresh native approval.
+/// Existing workload admission and its hard deadline are retained independently.
+pub fn run_workload_alias_request_with_grant(
+    workload: &str,
+    arguments: &[OsString],
+    noninteractive: bool,
+    record_result: bool,
+    privilege: Option<&crate::privilege::grants::GrantRequest>,
+) -> Result<WorkloadLaunchOutcome> {
+    if let Some(request) = privilege {
+        request
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid administrator launch request"))?;
+        if noninteractive {
+            return Ok(WorkloadLaunchOutcome::ApprovalRequired);
+        }
+    }
     let resolved = crate::setup::resolve_current_workload_alias(workload)?;
     let (_, receipt) = crate::setup::current_runtime_installation()?;
+    if privilege.is_some() && receipt.mode != crate::setup::InstallMode::Strong {
+        bail!("launch-with-grant requires the registered strong workload boundary");
+    }
     let (claim, probe) = crate::broker_client::active_claim_and_probe()?;
     match claim {
         crate::broker_protocol::LocalSessionClaim::Absent => {
             match outer_admission(receipt.mode, resolved.admission, noninteractive) {
                 OuterAdmission::ApprovalRequired => Ok(WorkloadLaunchOutcome::ApprovalRequired),
                 OuterAdmission::Enrolled if receipt.mode == crate::setup::InstallMode::Strong => {
-                    launch_via_native_helper(workload, arguments, true)
+                    launch_via_native_helper(workload, arguments, privilege.is_none(), privilege)
                         .map(WorkloadLaunchOutcome::Exited)
                 }
                 OuterAdmission::Enrolled => match launch_user_only(
@@ -1102,7 +1238,8 @@ pub fn run_workload_alias_request(
                 OuterAdmission::Interactive
                     if receipt.mode == crate::setup::InstallMode::Strong =>
                 {
-                    launch_via_pkexec(workload, arguments).map(WorkloadLaunchOutcome::Exited)
+                    launch_via_native_helper(workload, arguments, false, privilege)
+                        .map(WorkloadLaunchOutcome::Exited)
                 }
                 OuterAdmission::Interactive => launch_user_only(
                     workload,
@@ -1121,15 +1258,21 @@ pub fn run_workload_alias_request(
                 &resolved.authority_profile,
             )?;
             match receipt.mode {
-                crate::setup::InstallMode::Strong => {
-                    validate_root_owned_launcher(Path::new(&resolved.launcher_path))?
-                }
+                crate::setup::InstallMode::Strong => validate_strong_workload_launcher(
+                    caller_uid,
+                    workload,
+                    Path::new(&resolved.launcher_path),
+                )?,
                 crate::setup::InstallMode::UserOnly => validate_user_or_root_launcher(
                     Path::new(&resolved.launcher_path),
                     nix::unistd::Uid::effective().as_raw(),
                 )?,
             }
-            if record_result {
+            if privilege.is_some() {
+                protect_launch_monitor()?;
+            }
+            let mut launch_grant = PendingLaunchGrant::request(privilege)?;
+            if record_result || privilege.is_some() {
                 let deadline = nested_deadline_for_workload(
                     crate::broker_client::request_active(
                         crate::broker_protocol::BrokerRequest::Probe,
@@ -1139,19 +1282,42 @@ pub fn run_workload_alias_request(
                     caller_uid,
                     &resolved.authority_profile,
                 )?;
-                let mut command = Command::new(&resolved.launcher_path);
-                command.args(arguments);
-                let output = dev_tools_command::run_prepared_inherited_command(command, || {
-                    deadline.is_none_or(|deadline| {
-                        crate::linux_platform::boot_time_millis().is_ok_and(|now| now < deadline)
-                    })
-                })?;
+                let mut command = crate::binding_activation::launch_shell::command(
+                    caller_uid, workload, &resolved, arguments,
+                )?;
+                if privilege.is_some() {
+                    exec_barrier::prepare(&mut command)?;
+                }
+                let output = dev_tools_command::run_prepared_inherited_command_after_spawn(
+                    command,
+                    |child| {
+                        if privilege.is_some() {
+                            exec_barrier::await_exec(child)?;
+                        }
+                        launch_grant.activate()?;
+                        if privilege.is_some() {
+                            exec_barrier::release(child)?;
+                            launch_grant.commit_release()?;
+                        }
+                        launch_grant.commit();
+                        Ok(())
+                    },
+                    || {
+                        deadline.is_none_or(|deadline| {
+                            crate::linux_platform::boot_time_millis()
+                                .is_ok_and(|now| now < deadline)
+                        })
+                    },
+                )?;
                 if output.cancelled {
                     bail!("nested workload authority expired");
                 }
                 return Ok(WorkloadLaunchOutcome::ChildExited(output.status));
             }
-            let error = Command::new(&resolved.launcher_path).args(arguments).exec();
+            let error = crate::binding_activation::launch_shell::command(
+                caller_uid, workload, &resolved, arguments,
+            )?
+            .exec();
             Err(error).context("replace nested workload alias with its configured launcher")
         }
     }
@@ -1216,6 +1382,108 @@ fn nested_deadline_for_workload(
     }
 }
 
+struct PendingLaunchGrant(Option<String>);
+
+impl PendingLaunchGrant {
+    fn request(request: Option<&crate::privilege::grants::GrantRequest>) -> Result<Self> {
+        let Some(request) = request else {
+            return Ok(Self(None));
+        };
+        let response = crate::privilege::grants::control(
+            crate::privilege::grants::ControlRequest::LaunchRequest {
+                request: request.clone(),
+            },
+        );
+        if let Some(failure) = response.error_kind {
+            bail!(
+                "native administrator approval did not complete ({}); workload was not started",
+                failure.message()
+            );
+        }
+        let grant = response
+            .grant
+            .context("approved administrator grant is absent")?;
+        Ok(Self(Some(grant.id)))
+    }
+
+    fn activate(&mut self) -> Result<()> {
+        if let Some(grant) = &self.0 {
+            let result = crate::privilege::grants::control(
+                crate::privilege::grants::ControlRequest::ActivateLaunch {
+                    grant: grant.clone(),
+                    bootstrap: false,
+                },
+            );
+            if result.exit_code() != 0 || result.error_kind.is_some() {
+                self.revoke()?;
+                bail!("proved launch grant could not be activated");
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_bootstrap(
+        &mut self,
+        proof: &OwnedFd,
+        spawn: &OwnedFd,
+        release: &OwnedFd,
+    ) -> Result<()> {
+        let grant = self
+            .0
+            .as_ref()
+            .context("pending bootstrap grant is absent")?;
+        let response =
+            crate::privilege::grants::activate_bootstrap(grant.clone(), proof, spawn, release);
+        if response.error_kind.is_some() || response.exit_code() != 0 {
+            self.revoke()?;
+            bail!("kernel-authenticated launch grant could not be activated");
+        }
+        Ok(())
+    }
+
+    fn commit_release(&mut self) -> Result<()> {
+        if let Some(grant) = &self.0 {
+            let response = crate::privilege::grants::control(
+                crate::privilege::grants::ControlRequest::CommitLaunch {
+                    grant: grant.clone(),
+                },
+            );
+            if response.error_kind.is_some() || response.exit_code() != 0 {
+                self.revoke()?;
+                bail!("released launch grant could not be committed");
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) {
+        self.0 = None;
+    }
+
+    fn revoke(&mut self) -> Result<()> {
+        let Some(grant) = self.0.as_ref() else {
+            return Ok(());
+        };
+        let result =
+            crate::privilege::grants::control(crate::privilege::grants::ControlRequest::Revoke {
+                grant: grant.clone(),
+            });
+        if result.exit_code() != 0 || result.error_kind.is_some() {
+            bail!("new administrator grant could not be revoked after failed launch");
+        }
+        self.0 = None;
+        Ok(())
+    }
+}
+
+impl Drop for PendingLaunchGrant {
+    fn drop(&mut self) {
+        if self.revoke().is_err() {
+            eprintln!("dev-auth: failed launch grant cleanup needs operator inspection");
+        }
+    }
+}
+
 fn launch_user_only(
     workload_name: &str,
     arguments: &[OsString],
@@ -1242,6 +1510,8 @@ fn launch_user_only(
         .context("user-only workload authority profile is unresolved")?;
     let launcher = Path::new(&workload.launcher_path);
     validate_user_or_root_launcher(launcher, owner_uid)?;
+    let binding_aliases =
+        crate::binding_activation::active_aliases_for_workload(owner_uid, workload_name, launcher)?;
     let cwd = std::env::current_dir().context("read workload launch directory")?;
     validate_workload_cwd(&cwd, owner_uid)?;
     validate_workload_root_scope(&cwd, &workload.workspace_roots)?;
@@ -1288,18 +1558,23 @@ fn launch_user_only(
         .collect::<BTreeMap<_, _>>();
     let executable = fs::canonicalize(std::env::current_exe()?)
         .context("resolve installed workload tool-plane executable")?;
-    let tool_plane =
-        match WorkloadToolPlane::create(&session_directory, &executable, owner_uid, 0o700) {
-            Ok(plane) => plane,
-            Err(error) => {
-                stop.store(true, std::sync::atomic::Ordering::Release);
-                let _ = UnixStream::connect(&socket);
-                let _ = broker.join();
-                let _ = fs::remove_file(&socket);
-                let _ = fs::remove_dir(&session_directory);
-                return Err(error).context("create user-only workload tool plane");
-            }
-        };
+    let tool_plane = match WorkloadToolPlane::create_bound(
+        &session_directory,
+        &executable,
+        owner_uid,
+        0o700,
+        &binding_aliases,
+    ) {
+        Ok(plane) => plane,
+        Err(error) => {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = UnixStream::connect(&socket);
+            let _ = broker.join();
+            let _ = fs::remove_file(&socket);
+            let _ = fs::remove_dir(&session_directory);
+            return Err(error).context("create user-only workload tool plane");
+        }
+    };
     prepend_managed_bin_to_path(&mut environment, tool_plane.path())?;
     apply_workload_command_safety(&mut environment);
     environment.insert(
@@ -1332,35 +1607,68 @@ fn launch_user_only(
     };
     let status = (|| -> Result<ExitStatus> {
         let sandbox = select_user_sandbox_launch(&policy, workload, owner_uid)?;
-        let mut command = if let Some(sandbox) = sandbox {
+        let through_adapter = sandbox.is_some();
+        let shell_source = crate::binding_activation::launch_shell::outer_source(
+            owner_uid,
+            workload_name,
+            workload,
+        )?;
+        let mut command = if sandbox.is_some() {
+            // Spawn the installed native intermediate without compact mapping.
+            // It proves broker/policy authority and then execs the adapter, so
+            // compact slots cannot overwrite std::process's spawn error pipe.
             let executable = fs::canonicalize(std::env::current_exe()?)
-                .context("resolve user-only sandbox probe executable")?;
-            let sandbox_arguments = sandboxed_workload_arguments(&SandboxedWorkloadRequest {
-                sandbox: &sandbox,
-                parent_network_namespace: current_network_namespace_inode()?,
-                dev_auth_executable: &executable,
-                session_id: &session_id,
-                workload: workload_name,
-                launcher,
-                workload_arguments: arguments,
-            })?;
-            let mut command = Command::new(sandbox.executable);
-            command.args(sandbox_arguments);
+                .context("resolve user-only sandbox intermediate executable")?;
+            let mut command = Command::new(executable);
+            command
+                .args([
+                    OsString::from("sandbox-adapter"),
+                    OsString::from("--session"),
+                    OsString::from(&session_id),
+                    OsString::from("--workload"),
+                    OsString::from(workload_name),
+                    OsString::from("--launcher"),
+                    launcher.as_os_str().to_os_string(),
+                    OsString::from("--"),
+                ])
+                .args(arguments);
             command
         } else {
-            let mut command = Command::new(launcher);
-            command.args(arguments);
-            command
+            Command::new(launcher)
         };
-        let mut child = command
+        crate::binding_activation::launch_shell::configure_outer(
+            &mut command,
+            shell_source,
+            owner_uid,
+            workload_name,
+            workload,
+            arguments,
+            through_adapter,
+        )?;
+        let source_hint = command.get_envs().find_map(|(name, value)| {
+            (name == OsStr::new(crate::binding_activation::launch_shell::SOURCE_FD_ENV))
+                .then(|| value.map(OsStr::to_os_string))
+                .flatten()
+        });
+        command
             .env_clear()
             .envs(environment)
             .current_dir(cwd)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .context("run user-only admitted workload")?;
+            .stderr(std::process::Stdio::inherit());
+        if let Some(source_hint) = source_hint {
+            command.env(
+                crate::binding_activation::launch_shell::SOURCE_FD_ENV,
+                source_hint,
+            );
+            for name in ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "ZDOTDIR"] {
+                command.env_remove(name);
+            }
+        } else {
+            command.env_remove(crate::binding_activation::launch_shell::SOURCE_FD_ENV);
+        }
+        let mut child = command.spawn().context("run user-only admitted workload")?;
         loop {
             if let Some(status) = child.try_wait().context("poll user-only workload")? {
                 break Ok(status);
@@ -1408,7 +1716,7 @@ pub fn run_root_dispatcher(
         launcher_pid,
         environment_socket,
         arguments,
-        false,
+        DispatchAdmission::Interactive(None),
     )
 }
 
@@ -1433,8 +1741,57 @@ pub fn run_enrolled_dispatcher(
         launcher_pid,
         environment_socket,
         arguments,
-        true,
+        DispatchAdmission::Enrolled,
     )
+}
+
+/// Explicit optional grant input is validated separately from workload argv.
+pub fn run_root_dispatcher_with_grant(
+    owner_uid: u32,
+    workload: &str,
+    cwd: &Path,
+    launcher_pid: u32,
+    environment_socket: &Path,
+    arguments: &[OsString],
+    privilege: Option<&crate::privilege::grants::GrantRequest>,
+) -> Result<ExitStatus> {
+    run_authorized_dispatcher(
+        owner_uid,
+        workload,
+        cwd,
+        launcher_pid,
+        environment_socket,
+        arguments,
+        DispatchAdmission::Interactive(privilege),
+    )
+}
+
+pub fn run_enrolled_dispatcher_with_grant(
+    owner_uid: u32,
+    workload: &str,
+    cwd: &Path,
+    launcher_pid: u32,
+    environment_socket: &Path,
+    arguments: &[OsString],
+    privilege: Option<&crate::privilege::grants::GrantRequest>,
+) -> Result<ExitStatus> {
+    // Enrolled dispatch never accepts a fresh-approval request through its set-ID surface.
+    if privilege.is_some() {
+        bail!("administrator launch requires independent interactive dispatch");
+    }
+    run_enrolled_dispatcher(
+        owner_uid,
+        workload,
+        cwd,
+        launcher_pid,
+        environment_socket,
+        arguments,
+    )
+}
+
+enum DispatchAdmission<'a> {
+    Interactive(Option<&'a crate::privilege::grants::GrantRequest>),
+    Enrolled,
 }
 
 fn run_authorized_dispatcher(
@@ -1444,8 +1801,12 @@ fn run_authorized_dispatcher(
     launcher_pid: u32,
     environment_socket: &Path,
     arguments: &[OsString],
-    enrolled: bool,
+    admission: DispatchAdmission<'_>,
 ) -> Result<ExitStatus> {
+    let (enrolled, privilege) = match admission {
+        DispatchAdmission::Interactive(privilege) => (false, privilege),
+        DispatchAdmission::Enrolled => (true, None),
+    };
     observe_dispatch(enrolled, |stage| {
         if !nix::unistd::Uid::effective().is_root() {
             bail!("strong workload dispatch requires root");
@@ -1508,6 +1869,16 @@ fn run_authorized_dispatcher(
             "{}/dev-auth-workload-{session_id}.service",
             crate::linux_admission::WORKLOAD_CGROUP_ROOT
         ));
+        let shell_source = crate::binding_activation::launch_shell::outer_source(
+            owner_uid,
+            workload_name,
+            workload,
+        )?;
+        let pinned_source = crate::binding_activation::strong_pinned_mount_source(
+            owner_uid,
+            workload_name,
+            Path::new(&workload.launcher_path),
+        )?;
         *stage = EnrolledDispatchStage::ServiceStart;
         let systemd_arguments = match transient_service_arguments(&TransientServiceRequest {
             session_id: &session_id,
@@ -1520,6 +1891,10 @@ fn run_authorized_dispatcher(
             tool_bin: &tool_bin,
             arguments,
             duration_seconds: workload.duration_seconds,
+            pinned_projection: pinned_source
+                .as_deref()
+                .map(|source| (source, Path::new(&workload.launcher_path))),
+            privilege,
         }) {
             Ok(arguments) => arguments,
             Err(error) => {
@@ -1573,7 +1948,12 @@ fn run_authorized_dispatcher(
         }
         *stage = EnrolledDispatchStage::SupervisorRelease;
         let frame = encode_workload_environment(&environment)?;
-        if let Err(error) = write_environment_frame(&mut workload_handoff, &frame) {
+        if let Err(error) = crate::binding_activation::launch_shell::send_source(
+            &workload_handoff,
+            shell_source.as_ref(),
+        )
+        .and_then(|_| write_environment_frame(&mut workload_handoff, &frame))
+        {
             let _ = systemd_run.kill();
             let _ = systemd_run.wait();
             let _ = revoke_session(&session_id);
@@ -1614,6 +1994,40 @@ pub fn run_root_supervisor(
     boundary_socket: &Path,
     arguments: &[OsString],
 ) -> Result<ExitStatus> {
+    run_root_supervisor_with_grant(
+        owner_uid,
+        workload_name,
+        cwd,
+        session_id,
+        tool_bin,
+        boundary_socket,
+        StrongWorkloadLaunchInputs {
+            arguments,
+            privilege: None,
+        },
+    )
+}
+
+/// Separate native launch selection from workload argv and preserve the
+/// compatibility supervisor's existing public signature.
+pub struct StrongWorkloadLaunchInputs<'a> {
+    pub arguments: &'a [OsString],
+    pub privilege: Option<&'a crate::privilege::grants::GrantRequest>,
+}
+
+pub fn run_root_supervisor_with_grant(
+    owner_uid: u32,
+    workload_name: &str,
+    cwd: &Path,
+    session_id: &str,
+    tool_bin: &Path,
+    boundary_socket: &Path,
+    inputs: StrongWorkloadLaunchInputs<'_>,
+) -> Result<ExitStatus> {
+    let StrongWorkloadLaunchInputs {
+        arguments,
+        privilege,
+    } = inputs;
     crate::linux_platform::IdentityUserNamespace::from_current_process()
         .context("strong workload requires a systemd identity user namespace")?;
     validate_identifier(workload_name, "workload")?;
@@ -1631,8 +2045,14 @@ pub fn run_root_supervisor(
         .authority_profiles
         .get(&workload.authority_profile)
         .context("workload authority profile is unresolved")?;
-    let (mut environment, mut boundary_handoff) =
+    let (mut environment, mut boundary_handoff, shell_source) =
         connect_strong_boundary(session_id, boundary_socket)?;
+    let shell_source = crate::binding_activation::launch_shell::verify_handoff_source(
+        shell_source,
+        owner_uid,
+        workload_name,
+        workload,
+    )?;
     let dispatcher_pidfd = getsockopt(&boundary_handoff, sockopt::PeerPidfd)
         .context("retain the authenticated workload dispatcher identity")?;
     let cgroup = crate::linux_admission::current_workload_cgroup(session_id)?;
@@ -1652,7 +2072,13 @@ pub fn run_root_supervisor(
     {
         bail!("strong workload private runtime has unsafe authority");
     }
-    let tool_plane = WorkloadToolPlane::create(&runtime, &executable, owner_uid, 0o700)?;
+    let binding_aliases = crate::binding_activation::active_aliases_for_workload(
+        owner_uid,
+        workload_name,
+        Path::new(&workload.launcher_path),
+    )?;
+    let tool_plane =
+        WorkloadToolPlane::create_bound(&runtime, &executable, owner_uid, 0o700, &binding_aliases)?;
     let hard_deadline = activate_session(
         session_id,
         owner_uid,
@@ -1660,6 +2086,16 @@ pub fn run_root_supervisor(
         workload_name,
         &workload.authority_profile,
     )?;
+    if privilege.is_some() {
+        protect_launch_monitor()?;
+    }
+    let mut launch_grant = match PendingLaunchGrant::request(privilege) {
+        Ok(grant) => grant,
+        Err(error) => {
+            let _ = end_active_session(session_id);
+            return Err(error);
+        }
+    };
     let mut agent_proxies = match start_agent_proxies(
         &owner,
         session_id,
@@ -1671,7 +2107,9 @@ pub fn run_root_supervisor(
     ) {
         Ok(proxies) => proxies,
         Err(error) => {
+            let grant_cleanup = launch_grant.revoke();
             let _ = end_active_session(session_id);
+            grant_cleanup?;
             return Err(error).context("start strong workload capability frontends");
         }
     };
@@ -1688,24 +2126,59 @@ pub fn run_root_supervisor(
         environment,
         sandbox,
         identity_already_set: true,
+        shell_source,
+        startup_proof: privilege.is_some(),
     });
     let mut gated = match gated {
         Ok(gated) => gated,
         Err(error) => {
+            let grant_cleanup = launch_grant.revoke();
             stop_agent_proxies(&mut agent_proxies);
             let _ = end_active_session(session_id);
+            grant_cleanup?;
             return Err(error);
         }
     };
-    if let Err(error) = nix::unistd::write(&gated.release, &[1]) {
+    let release = nix::unistd::write(&gated.release, &[1]).and_then(|written| {
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(nix::errno::Errno::EIO)
+        }
+    });
+    if let Err(error) = release {
+        let _ = gated.child.kill();
+        let _ = gated.child.wait();
+        let grant_cleanup = launch_grant.revoke();
+        stop_agent_proxies(&mut agent_proxies);
+        let _ = end_active_session(session_id);
+        grant_cleanup?;
+        return Err(error).context("release the admitted workload process");
+    }
+    drop(gated.release);
+    let activation = if let (Some(startup), Some(spawn), Some(release)) = (
+        gated.startup.take(),
+        gated.startup_owner.take(),
+        gated.execution_release.take(),
+    ) {
+        // The coordinator owns release while launch custody is retained.
+        launch_grant.activate_bootstrap(&startup, &spawn, &release)
+    } else if privilege.is_none() {
+        launch_grant.activate()
+    } else {
+        Err(anyhow::anyhow!(
+            "native startup proof/release custody is incomplete"
+        ))
+    };
+    if let Err(error) = activation {
         let _ = gated.child.kill();
         let _ = gated.child.wait();
         stop_agent_proxies(&mut agent_proxies);
         let _ = end_active_session(session_id);
-        return Err(error).context("release the admitted workload process");
+        launch_grant.revoke()?;
+        return Err(error).context("configured workload did not prove startup after approval");
     }
-    drop(gated.release);
-
+    launch_grant.commit();
     let result = supervise_active_child(
         &mut gated.child,
         session_id,
@@ -1732,9 +2205,48 @@ pub fn run_supervisor_child(
     gate_fd: RawFd,
     arguments: &[OsString],
 ) -> Result<()> {
+    run_supervisor_child_with_descriptors(
+        session_id,
+        workload,
+        expected_cgroup,
+        launcher,
+        sandbox,
+        SupervisorChildDescriptors {
+            gate: gate_fd,
+            startup: None,
+            execution_release: None,
+        },
+        arguments,
+    )?;
+    bail!("supervisor child returned unexpectedly")
+}
+
+pub fn run_supervisor_child_with_descriptors(
+    session_id: &str,
+    workload: &str,
+    expected_cgroup: &Path,
+    launcher: &Path,
+    sandbox: Option<&SandboxLaunch>,
+    descriptors: SupervisorChildDescriptors,
+    arguments: &[OsString],
+) -> Result<ExitStatus> {
+    let startup = descriptors.startup.map(File::from);
+    let execution_release = descriptors.execution_release.map(File::from);
+    if startup.is_some() != execution_release.is_some() {
+        bail!("startup proof and release descriptors must be paired");
+    }
+    if let Some(file) = &startup {
+        if execution_release.is_some() {
+            startup_proof::validate_writer(file)?;
+        } else {
+            validate_startup_descriptor(file)?;
+        }
+        if file.as_raw_fd() == descriptors.gate {
+            bail!("supervisor child startup descriptor aliases its admission gate");
+        }
+    }
     validate_identifier(session_id, "session identifier")?;
-    validate_root_owned_launcher(launcher)?;
-    wait_for_admission_gate(gate_fd)?;
+    wait_for_admission_gate(descriptors.gate)?;
     let claim = crate::linux_admission::local_session_claim()?;
     let expected_marker = format!("strong:{}", expected_cgroup.display());
     if claim
@@ -1744,38 +2256,364 @@ pub fn run_supervisor_child(
     {
         bail!("supervised child is outside its registered workload boundary");
     }
-    match crate::broker_client::probe_system_broker() {
-        crate::broker_protocol::BrokerSessionProbe::Verified {
-            session_id: verified,
-            workload: verified_workload,
-            ..
-        } if verified == session_id && verified_workload == workload => {}
-        crate::broker_protocol::BrokerSessionProbe::Verified { .. }
-        | crate::broker_protocol::BrokerSessionProbe::NoSession
-        | crate::broker_protocol::BrokerSessionProbe::Invalid { .. }
-        | crate::broker_protocol::BrokerSessionProbe::Unavailable { .. } => {
-            bail!("supervised child session is not admitted by the broker")
-        }
+    let identity = require_sandbox_broker_identity(
+        crate::broker_client::probe_system_broker(),
+        session_id,
+        workload,
+    )?;
+    let policy = crate::policy_store::load_resolved_policy_for_uid(identity.owner_uid)?;
+    let resolved = policy
+        .workloads
+        .get(workload)
+        .context("supervised workload is no longer configured")?;
+    if resolved.authority_profile != identity.profile
+        || Path::new(&resolved.launcher_path) != launcher
+    {
+        bail!("supervised workload differs from its admitted identity");
     }
-    if let Some(sandbox) = sandbox {
+    validate_strong_workload_launcher(identity.owner_uid, workload, launcher)?;
+    let current_sandbox = select_sandbox_launch(&policy, resolved)?;
+    require_current_sandbox_launch(sandbox, current_sandbox.as_ref())?;
+    if let Some(sandbox) = current_sandbox.as_ref() {
         validate_root_owned_launcher(&sandbox.executable)?;
         let executable = fs::canonicalize(std::env::current_exe()?)
             .context("resolve the sandbox probe executable")?;
-        let sandbox_arguments = sandboxed_workload_arguments(&SandboxedWorkloadRequest {
-            sandbox,
+        // The installed supervisor-child replaces itself with the adapter.
+        // Compact mapping must never run under spawn's private exec-error pipe.
+        let source = crate::binding_activation::launch_shell::source_for_adapter(
+            identity.owner_uid,
+            workload,
+            resolved,
+        )?;
+        let has_source = source.is_some();
+        let has_startup = startup.is_some();
+        let source_index = if has_startup { 2 } else { 0 };
+        let mut retained = Vec::new();
+        if let (Some(proof), Some(release)) = (startup, execution_release) {
+            retained.push(OwnedFd::from(proof));
+            retained.push(OwnedFd::from(release));
+        }
+        if let Some(source) = source {
+            retained.push(OwnedFd::from(source));
+        }
+        let descriptors = crate::supervisor_descriptors::AdapterDescriptors::new(retained)?;
+        let descriptor_arguments =
+            descriptors.expanded_arguments(&sandbox.inherited_descriptor_arguments)?;
+        let slots = descriptors.slots();
+        let sandbox_arguments = sandboxed_workload_arguments(
+            &SandboxedWorkloadRequest {
+                sandbox,
+                parent_network_namespace: current_network_namespace_inode()?,
+                dev_auth_executable: &executable,
+                session_id,
+                workload,
+                launcher,
+                workload_arguments: arguments,
+                startup_fd: has_startup.then(|| slots[0]),
+                execution_release_fd: has_startup.then(|| slots[1]),
+            },
+            &descriptor_arguments,
+        )?;
+        let mut command = Command::new(&sandbox.executable);
+        command.args(sandbox_arguments);
+        if has_source {
+            command.env(
+                crate::binding_activation::launch_shell::SOURCE_FD_ENV,
+                slots[source_index].to_string(),
+            );
+        } else {
+            command.env_remove(crate::binding_activation::launch_shell::SOURCE_FD_ENV);
+        }
+        let _descriptor_guard = descriptors.prepare_exec_command(&mut command)?;
+        let error = command.exec();
+        return Err(error).context("replace supervisor gate with the sandbox adapter");
+    }
+    let command = crate::binding_activation::launch_shell::command(
+        identity.owner_uid,
+        workload,
+        resolved,
+        arguments,
+    )?;
+    launch_prepared_workload_with_release(command, startup, execution_release)
+}
+
+/// The user-only outer supervisor spawns this installed native intermediate.
+/// Compact FD mapping happens only during its adapter exec replacement.
+pub fn run_sandbox_adapter(
+    session_id: &str,
+    workload_name: &str,
+    launcher: &Path,
+    arguments: &[OsString],
+) -> Result<()> {
+    validate_identifier(session_id, "session identifier")?;
+    validate_identifier(workload_name, "workload")?;
+    let (claim, probe) = crate::broker_client::active_claim_and_probe()?;
+    if matches!(claim, crate::broker_protocol::LocalSessionClaim::Absent) {
+        bail!("sandbox intermediate is outside native workload admission");
+    }
+    let identity = require_sandbox_broker_identity(probe, session_id, workload_name)?;
+    let (_, receipt) = crate::setup::current_runtime_installation()?;
+    if receipt.mode != crate::setup::InstallMode::UserOnly
+        || identity.owner_uid != nix::unistd::Uid::effective().as_raw()
+    {
+        bail!("sandbox intermediate requires its exact user-only native account");
+    }
+    let policy = crate::policy_store::load_user_only_resolved_policy_for_uid(identity.owner_uid)?;
+    let workload = policy
+        .workloads
+        .get(workload_name)
+        .context("sandbox intermediate workload is no longer configured")?;
+    if workload.authority_profile != identity.profile
+        || Path::new(&workload.launcher_path) != launcher
+    {
+        bail!("sandbox intermediate differs from current admitted authority");
+    }
+    let sandbox = select_user_sandbox_launch(&policy, workload, identity.owner_uid)?
+        .context("sandbox intermediate requires a currently declared adapter")?;
+    let source = crate::binding_activation::launch_shell::source_for_adapter(
+        identity.owner_uid,
+        workload_name,
+        workload,
+    )?;
+    let has_source = source.is_some();
+    let descriptors = crate::supervisor_descriptors::AdapterDescriptors::new(
+        source.into_iter().map(Into::into).collect(),
+    )?;
+    let descriptor_arguments =
+        descriptors.expanded_arguments(&sandbox.inherited_descriptor_arguments)?;
+    let executable = fs::canonicalize(std::env::current_exe()?)
+        .context("resolve installed sandbox probe executable")?;
+    let sandbox_arguments = sandboxed_workload_arguments(
+        &SandboxedWorkloadRequest {
+            sandbox: &sandbox,
             parent_network_namespace: current_network_namespace_inode()?,
             dev_auth_executable: &executable,
             session_id,
-            workload,
+            workload: workload_name,
             launcher,
             workload_arguments: arguments,
-        })?;
-        let error = Command::new(&sandbox.executable)
-            .args(sandbox_arguments)
-            .exec();
-        return Err(error).context("replace supervisor gate with the sandbox adapter");
+            startup_fd: None,
+            execution_release_fd: None,
+        },
+        &descriptor_arguments,
+    )?;
+    let mut command = Command::new(&sandbox.executable);
+    command.args(sandbox_arguments);
+    if has_source {
+        command.env(
+            crate::binding_activation::launch_shell::SOURCE_FD_ENV,
+            descriptors.slots()[0].to_string(),
+        );
+    } else {
+        command.env_remove(crate::binding_activation::launch_shell::SOURCE_FD_ENV);
     }
-    let error = Command::new(launcher).args(arguments).exec();
+    let _descriptor_guard = descriptors.prepare_exec_command(&mut command)?;
+    Err(command.exec()).context("replace native sandbox intermediate with its declared adapter")
+}
+
+fn require_current_sandbox_launch(
+    transported: Option<&SandboxLaunch>,
+    current: Option<&SandboxLaunch>,
+) -> Result<()> {
+    match (transported, current) {
+        (None, None) => Ok(()),
+        (Some(transported), Some(current))
+            if transported.executable == current.executable
+                && transported.arguments == current.arguments
+                && transported.argument_separator == current.argument_separator
+                && transported.network_namespace == current.network_namespace =>
+        {
+            Ok(())
+        }
+        _ => bail!("supervised sandbox differs from current administrator authority"),
+    }
+}
+
+fn protect_launch_monitor() -> Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes a scalar value and no pointers. This
+    // installed-core monitor retains approval/startup descriptors, and ordinary
+    // same-account processes must not borrow them through procfs or ptrace.
+    if unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("protect native launch monitor custody");
+    }
+    Ok(())
+}
+
+fn await_execution_release(reader: &File) -> Result<()> {
+    let flags = nix::fcntl::fcntl(reader, nix::fcntl::FcntlArg::F_GETFL)?;
+    if !reader.metadata()?.file_type().is_fifo()
+        || flags & nix::libc::O_ACCMODE != nix::libc::O_RDONLY
+    {
+        bail!("execution release requires an owned read-only pipe");
+    }
+    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("execution release timed out");
+        }
+        let mut descriptors = [PollFd::new(
+            reader.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP,
+        )];
+        poll(&mut descriptors, 20_u16)?;
+        if descriptors[0]
+            .revents()
+            .is_some_and(|flags| flags.intersects(PollFlags::POLLIN | PollFlags::POLLHUP))
+        {
+            let mut byte = [0_u8];
+            match nix::unistd::read(reader, &mut byte) {
+                Ok(1) if byte[0] == 1 => return Ok(()),
+                Err(nix::errno::Errno::EINTR) => continue,
+                _ => bail!("execution release closed without activation"),
+            }
+        }
+    }
+}
+
+fn validate_startup_descriptor(file: &File) -> Result<()> {
+    let flags = nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETFL)
+        .context("inspect startup proof descriptor flags")?;
+    if file.as_raw_fd() < 3
+        || !file.metadata()?.file_type().is_fifo()
+        || flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
+    {
+        bail!("startup proof requires a retained write-only pipe descriptor");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn launch_configured_workload(
+    launcher: &Path,
+    arguments: &[OsString],
+    startup: Option<File>,
+) -> Result<ExitStatus> {
+    launch_configured_workload_with_release(launcher, arguments, startup, None)
+}
+
+#[cfg(test)]
+fn launch_configured_workload_with_release(
+    launcher: &Path,
+    arguments: &[OsString],
+    startup: Option<File>,
+    release: Option<File>,
+) -> Result<ExitStatus> {
+    let mut command = Command::new(launcher);
+    command.args(arguments);
+    launch_prepared_workload_with_release(command, startup, release)
+}
+
+/// Consume the configured owner's entire command, including held executable,
+/// shell-source and child preparation custody. Never reconstruct it from argv.
+pub(crate) fn launch_prepared_workload_with_release(
+    mut command: Command,
+    startup: Option<File>,
+    release: Option<File>,
+) -> Result<ExitStatus> {
+    if release.is_some() {
+        protect_launch_monitor()?;
+    }
+    if let Some(mut writer) = startup {
+        let authenticated_proof = nix::sys::socket::getsockopt(&writer, sockopt::SockType)
+            .is_ok_and(|kind| kind == nix::sys::socket::SockType::SeqPacket);
+        #[cfg(not(test))]
+        if release.is_some() && !authenticated_proof {
+            bail!("paired release requires kernel-authenticated startup proof");
+        }
+        if let Some(reader) = &release {
+            nix::fcntl::fcntl(
+                reader,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )?;
+        }
+        let monitor_pid = std::process::id();
+        // SAFETY: the callback only makes async-signal-safe libc calls in the
+        // child. A proved target must not outlive a failed or interrupted
+        // startup monitor before the outer workload domain is torn down.
+        unsafe {
+            command.pre_exec(move || {
+                if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nix::libc::getppid() != monitor_pid as nix::libc::pid_t {
+                    return Err(std::io::Error::from_raw_os_error(nix::libc::EPIPE));
+                }
+                Ok(())
+            });
+        }
+        nix::fcntl::fcntl(
+            &writer,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .context("arm configured launcher startup proof")?;
+        if release.is_some() {
+            exec_barrier::prepare(&mut command)?;
+        }
+        let mut target = match command.spawn() {
+            Ok(target) => target,
+            Err(error) => {
+                if authenticated_proof {
+                    let _ = startup_proof::send_byte(&writer, 2);
+                } else {
+                    let _ = writer.write_all(&[2]);
+                }
+                return Err(error).context("start the configured workload launcher");
+            }
+        };
+        if release.is_some() {
+            if let Err(error) = exec_barrier::await_exec(&target) {
+                let _ = target.kill();
+                let _ = target.wait();
+                if authenticated_proof {
+                    let _ = startup_proof::send_byte(&writer, 2);
+                } else {
+                    let _ = writer.write_all(&[2]);
+                }
+                return Err(error);
+            }
+        }
+        let ready = if authenticated_proof {
+            startup_proof::send_byte(&writer, 1)
+        } else {
+            writer.write_all(&[1]).map_err(Into::into)
+        };
+        if let Err(error) = ready {
+            let _ = target.kill();
+            let _ = target.wait();
+            return Err(error).context("announce started configured workload launcher");
+        }
+        let proof_writer = if authenticated_proof {
+            Some(writer)
+        } else {
+            drop(writer);
+            None
+        };
+        if let Some(release) = release {
+            let released = await_execution_release(&release)
+                .and_then(|()| exec_barrier::release(&target))
+                .and_then(|()| {
+                    if let Some(writer) = &proof_writer {
+                        // Native DETACH succeeded. Retain this exact monitor
+                        // until its authenticated witness is committed, even
+                        // when the released target immediately exits.
+                        startup_proof::send_byte(writer, 3)?;
+                        startup_proof::await_commit_receipt(writer)?;
+                    }
+                    Ok(())
+                });
+            if let Err(error) = released {
+                let _ = target.kill();
+                let _ = target.wait();
+                return Err(error);
+            }
+        }
+        drop(proof_writer);
+        return target
+            .wait()
+            .context("wait for configured workload launcher");
+    }
+    let error = command.exec();
     Err(error).context("replace supervisor gate with the configured workload launcher")
 }
 
@@ -1787,6 +2625,39 @@ pub fn run_sandbox_child(
     parent_network_namespace: u64,
     arguments: &[OsString],
 ) -> Result<()> {
+    run_sandbox_child_with_startup(
+        session_id,
+        workload_name,
+        launcher,
+        network_namespace,
+        parent_network_namespace,
+        WorkloadStartupDescriptors::default(),
+        arguments,
+    )?;
+    bail!("sandbox child returned unexpectedly")
+}
+
+pub fn run_sandbox_child_with_startup(
+    session_id: &str,
+    workload_name: &str,
+    launcher: &Path,
+    network_namespace: SandboxNetworkNamespace,
+    parent_network_namespace: u64,
+    descriptors: WorkloadStartupDescriptors,
+    arguments: &[OsString],
+) -> Result<ExitStatus> {
+    let startup = descriptors.proof.map(File::from);
+    let release = descriptors.release.map(File::from);
+    if startup.is_some() != release.is_some() {
+        bail!("sandbox startup proof and release must be paired");
+    }
+    if let Some(file) = &startup {
+        if release.is_some() {
+            startup_proof::validate_writer(file)?;
+        } else {
+            validate_startup_descriptor(file)?;
+        }
+    }
     validate_identifier(session_id, "session identifier")?;
     validate_identifier(workload_name, "workload")?;
     let (claim, probe) = crate::broker_client::active_claim_and_probe()?;
@@ -1821,11 +2692,18 @@ pub fn run_sandbox_child(
     }
     validate_sandbox_workspace_mounts(&workload.workspace_roots)?;
     match receipt.mode {
-        crate::setup::InstallMode::Strong => validate_root_owned_launcher(launcher)?,
+        crate::setup::InstallMode::Strong => {
+            validate_strong_workload_launcher(owner_uid, workload_name, launcher)?
+        }
         crate::setup::InstallMode::UserOnly => validate_user_or_root_launcher(launcher, owner_uid)?,
     }
-    let error = Command::new(launcher).args(arguments).exec();
-    Err(error).context("replace sandbox probe with the configured workload launcher")
+    let command = crate::binding_activation::launch_shell::command(
+        owner_uid,
+        workload_name,
+        workload,
+        arguments,
+    )?;
+    launch_prepared_workload_with_release(command, startup, release)
 }
 
 fn require_sandbox_network_namespace(
@@ -1948,7 +2826,31 @@ fn validate_workload_root_scope(
     bail!("workload current directory is outside its configured roots")
 }
 
-fn validate_root_owned_launcher(path: &Path) -> Result<()> {
+/// Same-user mutable ancestry is selected by an active root-owned binding
+/// receipt and exact owned alias. Unbound strong launchers keep root custody;
+/// copied pins retain their independent projected-artifact postcondition.
+fn validate_strong_workload_launcher(
+    owner_uid: u32,
+    workload: &str,
+    launcher: &Path,
+) -> Result<()> {
+    if validate_root_owned_launcher(launcher).is_ok() {
+        if nix::unistd::Uid::effective().as_raw() == owner_uid {
+            crate::binding_activation::verify_strong_pinned_projection(
+                owner_uid, workload, launcher,
+            )?;
+        }
+        return Ok(());
+    }
+    validate_user_or_root_launcher(launcher, owner_uid)?;
+    if !crate::binding_activation::approves_strong_mutable_launcher(owner_uid, workload, launcher)?
+    {
+        bail!("strong user-owned launcher lacks an active mutable binding generation");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_root_owned_launcher(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("trusted workload launcher path is not absolute");
     }
@@ -1969,7 +2871,7 @@ fn validate_root_owned_launcher(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_user_or_root_launcher(path: &Path, owner_uid: u32) -> Result<()> {
+pub(crate) fn validate_user_or_root_launcher(path: &Path, owner_uid: u32) -> Result<()> {
     if owner_uid == 0 || !path.is_absolute() {
         bail!("user-only workload launcher authority is invalid");
     }
@@ -2258,6 +3160,7 @@ fn select_user_sandbox_launch(
             Ok(Some(SandboxLaunch {
                 executable,
                 arguments: expand_sandbox_adapter_arguments(adapter, &workload.workspace_roots)?,
+                inherited_descriptor_arguments: adapter.inherited_descriptor_arguments.clone(),
                 argument_separator: adapter.argument_separator,
                 network_namespace: adapter.network_namespace,
             }))
@@ -2342,6 +3245,11 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         .context("resolve installed supervisor executable")?;
     prepend_managed_bin_to_path(&mut request.environment, request.tool_bin)?;
     apply_workload_command_safety(&mut request.environment);
+    if request.shell_source.is_some() {
+        for name in ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "ZDOTDIR"] {
+            request.environment.remove(OsStr::new(name));
+        }
+    }
     let username =
         CString::new(request.owner.name.as_bytes()).context("workload username is invalid")?;
     let groups = nix::unistd::getgrouplist(&username, request.owner.gid)
@@ -2352,6 +3260,44 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         nix::unistd::pipe().context("create workload admission gate")?;
     let gate_read_fd = gate_reader.as_raw_fd();
     let gate_write_fd = gate_writer.as_raw_fd();
+    let (startup_reader, startup_writer) = if request.startup_proof {
+        let (reader, writer) = startup_proof::pair()?;
+        // The first exec enters our own supervisor-child. It retains this
+        // writer until native spawn establishes the configured launcher.
+        nix::fcntl::fcntl(
+            &writer,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .context("retain workload startup proof across supervisor exec")?;
+        (Some(reader), Some(writer))
+    } else {
+        (None, None)
+    };
+    let (execution_reader, execution_writer) = if request.startup_proof {
+        let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        let flags = nix::fcntl::fcntl(&writer, nix::fcntl::FcntlArg::F_GETFL)?;
+        nix::fcntl::fcntl(
+            &writer,
+            nix::fcntl::FcntlArg::F_SETFL(
+                nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+            ),
+        )?;
+        let reader: OwnedFd =
+            crate::supervisor_descriptors::normalize_source_descriptor(File::from(reader))?.into();
+        let writer: OwnedFd =
+            crate::supervisor_descriptors::normalize_source_descriptor(File::from(writer))?.into();
+        nix::fcntl::fcntl(
+            &reader,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )?;
+        (Some(reader), Some(writer))
+    } else {
+        (None, None)
+    };
+    let execution_read_fd = execution_reader.as_ref().map(AsRawFd::as_raw_fd);
+    let execution_write_fd = execution_writer.as_ref().map(AsRawFd::as_raw_fd);
+    let startup_read_fd = startup_reader.as_ref().map(AsRawFd::as_raw_fd);
+    let startup_write_fd = startup_writer.as_ref().map(AsRawFd::as_raw_fd);
     nix::fcntl::fcntl(
         &gate_reader,
         nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
@@ -2382,9 +3328,16 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
             .arg(sandbox.arguments.len().to_string())
             .args(&sandbox.arguments);
     }
+    command.arg("--gate-fd").arg(gate_read_fd.to_string());
+    if let Some(fd) = startup_write_fd {
+        command.arg("--startup-fd").arg(fd.to_string());
+        command.arg("--exec-release-fd").arg(
+            execution_read_fd
+                .ok_or_else(|| anyhow::anyhow!("missing execution release"))?
+                .to_string(),
+        );
+    }
     command
-        .arg("--gate-fd")
-        .arg(gate_read_fd.to_string())
         .arg("--")
         .args(request.arguments)
         .current_dir(request.cwd)
@@ -2400,6 +3353,12 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         unsafe {
             command.pre_exec(move || {
                 nix::libc::close(gate_write_fd);
+                if let Some(fd) = execution_write_fd {
+                    nix::libc::close(fd);
+                }
+                if let Some(fd) = startup_read_fd {
+                    nix::libc::close(fd);
+                }
                 Ok(())
             });
         }
@@ -2411,6 +3370,12 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
         unsafe {
             command.pre_exec(move || {
                 nix::libc::close(gate_write_fd);
+                if let Some(fd) = execution_write_fd {
+                    nix::libc::close(fd);
+                }
+                if let Some(fd) = startup_read_fd {
+                    nix::libc::close(fd);
+                }
                 nix::unistd::setgroups(&groups).map_err(std::io::Error::from)?;
                 nix::unistd::setgid(owner_gid).map_err(std::io::Error::from)?;
                 nix::unistd::setuid(owner_uid).map_err(std::io::Error::from)?;
@@ -2418,21 +3383,97 @@ fn spawn_gated_child(mut request: GatedChildRequest<'_>) -> Result<GatedChild> {
             });
         }
     }
-    let child = command.spawn().context("start gated workload process")?;
+    if let Some(source) = request.shell_source.take() {
+        crate::smart_binding::shell::retain_descriptor(&mut command, source)?;
+    }
+    let mut child = command.spawn().context("start gated workload process")?;
+    let startup_owner = if request.startup_proof {
+        match rustix::process::Pid::from_raw(child.id() as i32)
+            .ok_or_else(|| anyhow::anyhow!("owned startup PID is invalid"))
+            .and_then(|pid| {
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                    .map_err(Into::into)
+            }) {
+            Ok(pidfd) => Some(pidfd),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     drop(gate_reader);
+    drop(startup_writer);
+    drop(execution_reader);
     Ok(GatedChild {
         child,
         release: gate_writer,
+        startup: startup_reader,
+        execution_release: execution_writer,
+        startup_owner,
     })
 }
 
-fn sandboxed_workload_arguments(request: &SandboxedWorkloadRequest<'_>) -> Result<Vec<OsString>> {
+/// A private child announces success only after spawning the exact configured
+/// launcher. Native spawn returns an error when the final exec fails, including
+/// a missing script interpreter. Missing, malformed, failed or timed-out proof
+/// keeps the new grant pending for revocation.
+#[cfg(test)]
+fn await_startup_proof(reader: &OwnedFd) -> Result<()> {
+    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
+    let mut announced = false;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("configured workload startup proof timed out");
+        }
+        let mut descriptors = [PollFd::new(
+            reader.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        poll(&mut descriptors, PollTimeout::from(20_u16))
+            .context("wait for configured workload startup proof")?;
+        let events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+        if events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+            bail!("configured workload startup proof pipe failed");
+        }
+        if !events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+            continue;
+        }
+        let mut bytes = [0_u8; 2];
+        match nix::unistd::read(reader, &mut bytes) {
+            Ok(0) if announced => return Ok(()),
+            Ok(0) => bail!("configured workload did not announce its final exec"),
+            Ok(length) => {
+                for byte in &bytes[..length] {
+                    if !announced && *byte == 1 {
+                        announced = true;
+                    } else {
+                        bail!("configured workload reported an unsuccessful final exec");
+                    }
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(error).context("read configured workload startup proof"),
+        }
+    }
+}
+
+fn sandboxed_workload_arguments(
+    request: &SandboxedWorkloadRequest<'_>,
+    descriptor_arguments: &[OsString],
+) -> Result<Vec<OsString>> {
     validate_identifier(request.session_id, "session identifier")?;
     validate_identifier(request.workload, "workload")?;
+    if request.startup_fd.is_some() != request.execution_release_fd.is_some() {
+        bail!("sandbox startup proof and execution release must be paired");
+    }
     if !request.dev_auth_executable.is_absolute() || !request.launcher.is_absolute() {
         bail!("sandbox launch paths must be absolute");
     }
     let mut arguments = request.sandbox.arguments.clone();
+    arguments.extend_from_slice(descriptor_arguments);
     if request.sandbox.argument_separator {
         arguments.push(OsString::from("--"));
     }
@@ -2449,8 +3490,22 @@ fn sandboxed_workload_arguments(request: &SandboxedWorkloadRequest<'_>) -> Resul
         OsString::from(request.sandbox.network_namespace.as_str()),
         OsString::from("--parent-network-namespace"),
         OsString::from(request.parent_network_namespace.to_string()),
-        OsString::from("--"),
     ]);
+    if let Some(fd) = request.startup_fd {
+        if fd < 3 {
+            bail!("sandbox startup proof descriptor is invalid");
+        }
+        arguments.push(OsString::from("--startup-fd"));
+        arguments.push(OsString::from(fd.to_string()));
+        if let Some(release) = request.execution_release_fd {
+            if release < 3 || release == fd {
+                bail!("sandbox execution release descriptor is invalid");
+            }
+            arguments.push(OsString::from("--exec-release-fd"));
+            arguments.push(OsString::from(release.to_string()));
+        }
+    }
+    arguments.push(OsString::from("--"));
     arguments.extend_from_slice(request.workload_arguments);
     Ok(arguments)
 }
@@ -2789,6 +3844,33 @@ fn validate_identifier(value: &str, description: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enrolled_dispatch_rejects_interactive_grant_before_native_admission() {
+        let request = crate::privilege::grants::GrantRequest {
+            scope: crate::privilege::grants::GrantScope::Workload,
+            authority: crate::privilege::grants::Authority::Administrator,
+            duration_seconds: 1,
+            idle_seconds: None,
+            uses: None,
+        };
+        // Owner zero also fails ordinary enrolled admission, keeping this
+        // rejection test independent of the executing UID and native setup.
+        let error = super::run_enrolled_dispatcher_with_grant(
+            0,
+            "fixture",
+            std::path::Path::new("/"),
+            0,
+            std::path::Path::new("/unused-fixture-socket"),
+            &[],
+            Some(&request),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "administrator launch requires independent interactive dispatch"
+        );
+    }
+
     #[test]
     fn nested_admission_cannot_switch_to_a_different_workload() {
         let mut probe = crate::broker_protocol::BrokerSessionProbe::Verified {
@@ -3350,6 +4432,8 @@ mod tests {
     fn transient_systemd_boundary_is_exact_and_kills_the_whole_workload_on_supervisor_exit() {
         let arguments = transient_service_arguments(&TransientServiceRequest {
             duration_seconds: None,
+            pinned_projection: None,
+            privilege: None,
             session_id: "0123456789abcdef0123456789abcdef",
             owner_uid: 1000,
             owner_gid: 1001,
@@ -3448,19 +4532,25 @@ mod tests {
         let sandbox = SandboxLaunch {
             executable: PathBuf::from("/usr/bin/bwrap"),
             arguments: vec!["--unshare-all".into(), "--share-net".into()],
+            inherited_descriptor_arguments: Vec::new(),
             argument_separator: true,
             network_namespace: crate::policy_v2::SandboxNetworkNamespace::Inherit,
         };
         let workload_arguments = [OsString::from("--future-flag"), OsString::from("value")];
-        let arguments = sandboxed_workload_arguments(&SandboxedWorkloadRequest {
-            sandbox: &sandbox,
-            parent_network_namespace: 42,
-            dev_auth_executable: Path::new("/usr/local/lib/dev-auth/versions/0.3.0/dev-auth"),
-            session_id: "0123456789abcdef0123456789abcdef",
-            workload: "codex",
-            launcher: Path::new("/opt/codex/bin/codex"),
-            workload_arguments: &workload_arguments,
-        })
+        let arguments = sandboxed_workload_arguments(
+            &SandboxedWorkloadRequest {
+                sandbox: &sandbox,
+                parent_network_namespace: 42,
+                dev_auth_executable: Path::new("/usr/local/lib/dev-auth/versions/0.3.0/dev-auth"),
+                session_id: "0123456789abcdef0123456789abcdef",
+                workload: "codex",
+                launcher: Path::new("/opt/codex/bin/codex"),
+                workload_arguments: &workload_arguments,
+                startup_fd: None,
+                execution_release_fd: None,
+            },
+            &[],
+        )
         .unwrap();
         assert_eq!(
             arguments,
@@ -3538,6 +4628,27 @@ mod tests {
     }
 
     #[test]
+    fn private_sandbox_transport_uses_current_descriptor_declaration() {
+        let current = SandboxLaunch {
+            executable: "/usr/bin/true".into(),
+            arguments: vec!["literal".into()],
+            inherited_descriptor_arguments: vec!["--preserve-fds".into(), "{count}".into()],
+            argument_separator: true,
+            network_namespace: SandboxNetworkNamespace::Inherit,
+        };
+        let mut transported = current.clone();
+        transported.inherited_descriptor_arguments.clear();
+        require_current_sandbox_launch(Some(&transported), Some(&current)).unwrap();
+        assert_eq!(
+            current.inherited_descriptor_arguments,
+            vec!["--preserve-fds", "{count}"]
+        );
+        assert!(require_current_sandbox_launch(None, Some(&current)).is_err());
+        transported.arguments.push("unapproved".into());
+        assert!(require_current_sandbox_launch(Some(&transported), Some(&current)).is_err());
+    }
+
+    #[test]
     fn sandbox_network_namespace_must_match_its_declared_contract() {
         require_sandbox_network_namespace(
             crate::policy_v2::SandboxNetworkNamespace::Inherit,
@@ -3574,6 +4685,7 @@ mod tests {
         let adapter = crate::policy_v2::SandboxAdapterCap {
             executable: "/usr/bin/bwrap".into(),
             arguments: vec!["--ro-bind".into(), "/".into(), "/".into()],
+            inherited_descriptor_arguments: Vec::new(),
             argument_separator: true,
             launcher_visibility: crate::policy_v2::SandboxVisibility::Required,
             broker_socket_visibility: crate::policy_v2::SandboxVisibility::Required,

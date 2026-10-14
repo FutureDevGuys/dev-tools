@@ -225,10 +225,11 @@ pub(in crate::setup_v3::restoration) fn desktop_retirements(
             .as_deref()
             .map(serde_json::from_slice)
             .transpose()?;
-        let desired = crate::setup::desired_desktop_entries(
-            &account.home,
-            &candidate_workloads(generation, account)?,
-        )?;
+        let workloads = candidate_workloads(generation, account)?;
+        let bindings = candidate_binding_intents(generation, account)?;
+        let desktop_workloads =
+            crate::setup_v3::desktop_workloads_with_bindings(&workloads, &bindings)?;
+        let desired = crate::setup::desired_desktop_entries(&account.home, &desktop_workloads)?;
         let candidate = DesktopEntryReceipt {
             schema: DESKTOP_ENTRY_RECEIPT_SCHEMA.into(),
             entries: desired

@@ -3,6 +3,7 @@ pub mod adapter;
 pub mod cli;
 pub mod custody;
 pub mod deadline;
+pub mod grants;
 pub mod launch;
 pub mod login;
 pub mod platform;

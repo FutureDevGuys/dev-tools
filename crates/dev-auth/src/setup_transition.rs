@@ -18,6 +18,9 @@ pub(crate) enum Phase {
     Accepted,
     Restoring,
     RestoredInactive,
+    Repairing,
+    Uninstalling,
+    UninstalledInactive,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -27,12 +30,15 @@ struct Transition {
     plan_sha256: String,
     phase: Phase,
     retained_generation: ArtifactIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintenance_generation: Option<ArtifactIdentity>,
 }
 
 pub(crate) struct RetainedTransition {
     pub plan_sha256: String,
     pub bytes: Vec<u8>,
     pub phase: Phase,
+    pub maintenance_bytes: Option<Vec<u8>>,
 }
 
 pub(crate) fn retained_transition(
@@ -44,10 +50,12 @@ pub(crate) fn retained_transition(
     };
     let state = parse(&document.bytes)?;
     let bytes = read_generation(paths, owner_uid, &state)?;
+    let maintenance_bytes = read_maintenance_generation(paths, owner_uid, &state)?;
     Ok(Some(RetainedTransition {
         plan_sha256: state.plan_sha256,
         bytes,
         phase: state.phase,
+        maintenance_bytes,
     }))
 }
 
@@ -92,6 +100,21 @@ fn parse(bytes: &[u8]) -> Result<Transition> {
     {
         bail!("setup admission state has invalid authority");
     }
+    if state
+        .maintenance_generation
+        .as_ref()
+        .is_some_and(|identity| {
+            identity.length == 0
+                || identity.length > 32 * 1024 * 1024
+                || identity.sha256.len() != 64
+                || !identity
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        bail!("setup maintenance state has invalid retention authority");
+    }
     Ok(state)
 }
 
@@ -107,8 +130,13 @@ pub(crate) fn begin(
     let current = read_atomic_document(&path, &authority)?;
     if let Some(document) = &current {
         let state = parse(&document.bytes)?;
-        if state.phase == Phase::Restoring
-            || (state.phase == Phase::RestoredInactive && state.plan_sha256 == digest)
+        if matches!(
+            state.phase,
+            Phase::Restoring | Phase::Repairing | Phase::Uninstalling
+        ) || (matches!(
+            state.phase,
+            Phase::RestoredInactive | Phase::UninstalledInactive
+        ) && state.plan_sha256 == digest)
         {
             bail!(
                 "restored setup cannot resume forward; finish restoration and approve a new plan"
@@ -137,6 +165,7 @@ pub(crate) fn begin(
         plan_sha256: digest.into(),
         phase: Phase::Pending,
         retained_generation: identity,
+        maintenance_generation: None,
     };
     let bytes = serde_jcs::to_vec(&state)?;
     parse(&bytes)?;
@@ -196,12 +225,20 @@ pub(crate) fn pending_generation(
         return Ok(None);
     };
     let state = parse(&document.bytes)?;
-    if state.phase == Phase::Restoring
-        || (state.phase == Phase::RestoredInactive && state.plan_sha256 == digest)
+    if matches!(
+        state.phase,
+        Phase::Restoring | Phase::Repairing | Phase::Uninstalling
+    ) || (matches!(
+        state.phase,
+        Phase::RestoredInactive | Phase::UninstalledInactive
+    ) && state.plan_sha256 == digest)
     {
         bail!("setup restoration cannot resume forward");
     }
-    if matches!(state.phase, Phase::Accepted | Phase::RestoredInactive) {
+    if matches!(
+        state.phase,
+        Phase::Accepted | Phase::RestoredInactive | Phase::UninstalledInactive
+    ) {
         return Ok(None);
     }
     if state.plan_sha256 != digest {
@@ -235,6 +272,7 @@ pub(crate) fn advance(
     };
     let mut state = parse(&document.bytes)?;
     read_generation(paths, owner_uid, &state)?;
+    read_maintenance_generation(paths, owner_uid, &state)?;
     if state.plan_sha256 != digest {
         bail!("setup acceptance does not match the retained transition");
     }
@@ -245,6 +283,12 @@ pub(crate) fn advance(
             Phase::Accepted | Phase::Restoring
         ) | (Phase::Restoring, Phase::Restoring | Phase::RestoredInactive)
             | (Phase::RestoredInactive, Phase::RestoredInactive)
+            | (Phase::Repairing, Phase::Repairing | Phase::Accepted)
+            | (
+                Phase::Uninstalling,
+                Phase::Uninstalling | Phase::UninstalledInactive
+            )
+            | (Phase::UninstalledInactive, Phase::UninstalledInactive)
     ) {
         bail!("setup transition cannot change to the requested phase");
     }
@@ -252,6 +296,93 @@ pub(crate) fn advance(
         return write_atomic_document(&path, &document.bytes, &authority, Some(&document.identity));
     }
     state.phase = phase;
+    if phase == Phase::Accepted {
+        state.maintenance_generation = None;
+    }
+    write_atomic_document(
+        &path,
+        &serde_jcs::to_vec(&state)?,
+        &authority,
+        Some(&document.identity),
+    )
+}
+
+fn maintenance_generation_path(paths: &SetupPaths, identity: &ArtifactIdentity) -> PathBuf {
+    paths
+        .data_root
+        .join("setup-maintenance")
+        .join(format!("{}.json", identity.sha256))
+}
+
+fn read_maintenance_generation(
+    paths: &SetupPaths,
+    owner_uid: u32,
+    state: &Transition,
+) -> Result<Option<Vec<u8>>> {
+    let Some(identity) = &state.maintenance_generation else {
+        if matches!(
+            state.phase,
+            Phase::Repairing | Phase::Uninstalling | Phase::UninstalledInactive
+        ) {
+            bail!("setup maintenance has no retained authority");
+        }
+        return Ok(None);
+    };
+    let document = read_atomic_document(
+        &maintenance_generation_path(paths, identity),
+        &generation_authority(owner_uid),
+    )?
+    .context("retained setup maintenance generation is absent")?;
+    if &document.identity != identity {
+        bail!("retained setup maintenance generation changed");
+    }
+    Ok(Some(document.bytes))
+}
+
+/// The native exclusive owner retains a separate immutable maintenance snapshot
+/// before closing admission. The original setup generation is never recaptured.
+pub(crate) fn begin_maintenance(
+    paths: &SetupPaths,
+    owner_uid: u32,
+    digest: &str,
+    phase: Phase,
+    capture: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<bool> {
+    if !matches!(phase, Phase::Repairing | Phase::Uninstalling) {
+        bail!("unsupported setup maintenance direction");
+    }
+    let path = state_path(paths);
+    let authority = authority(owner_uid);
+    let document = read_atomic_document(&path, &authority)?
+        .context("setup maintenance requires retained setup")?;
+    let mut state = parse(&document.bytes)?;
+    read_generation(paths, owner_uid, &state)?;
+    if state.plan_sha256 != digest {
+        bail!("setup maintenance does not match the retained generation");
+    }
+    if state.phase == phase {
+        read_maintenance_generation(paths, owner_uid, &state)?;
+        return write_atomic_document(&path, &document.bytes, &authority, Some(&document.identity));
+    }
+    if state.phase != Phase::Accepted {
+        bail!("finish the existing setup direction before maintenance");
+    }
+    let bytes = capture()?;
+    let identity = ArtifactIdentity {
+        length: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    if identity.length == 0 || identity.length > 32 * 1024 * 1024 {
+        bail!("setup maintenance retention exceeds its bound");
+    }
+    write_atomic_document(
+        &maintenance_generation_path(paths, &identity),
+        &bytes,
+        &generation_authority(owner_uid),
+        None,
+    )?;
+    state.phase = phase;
+    state.maintenance_generation = Some(identity);
     write_atomic_document(
         &path,
         &serde_jcs::to_vec(&state)?,
@@ -323,6 +454,41 @@ pub(crate) fn admit(mode: InstallMode) -> Result<InstallationLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grant_admission_requires_accepted_retention_and_a_short_shared_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: root.path().join("data"),
+            bin_dir: root.path().join("bin"),
+        };
+        let lock = root.path().join("setup.lock");
+        let owner = nix::unistd::geteuid().as_raw();
+        let digest = "d".repeat(64);
+        assert!(try_admit_at(&lock, &paths, owner).unwrap().is_none());
+        begin(&paths, owner, &digest, || {
+            Ok(b"fixed retained grant setup".to_vec())
+        })
+        .unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).unwrap().is_none());
+        accept(&paths, owner, &digest).unwrap();
+        let generation = generation_path(&paths, &digest);
+        let retained = std::fs::read(&generation).unwrap();
+        std::fs::remove_file(&generation).unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).is_err());
+        std::fs::write(&generation, retained).unwrap();
+        let lease = try_admit_at(&lock, &paths, owner).unwrap().unwrap();
+        assert!(InstallationLock::try_acquire(&lock).unwrap().is_none());
+        drop(lease);
+        let writer = InstallationLock::try_acquire(&lock).unwrap().unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).unwrap().is_none());
+        drop(writer);
+        advance(&paths, owner, &digest, Phase::Restoring).unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).unwrap().is_none());
+        advance(&paths, owner, &digest, Phase::RestoredInactive).unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).unwrap().is_none());
+    }
 
     #[test]
     #[ignore = "child fixture invoked only by admission_owner_process_death_releases_setup_exclusion"]
@@ -439,6 +605,104 @@ mod tests {
                 b"retained generation"
             );
         }
+    }
+
+    #[test]
+    fn preserving_maintenance_retains_original_bytes_and_requires_its_exact_snapshot() {
+        for phase in [Phase::Repairing, Phase::Uninstalling] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = SetupPaths {
+                data_root: temp.path().join("data"),
+                bin_dir: temp.path().join("bin"),
+            };
+            let uid = nix::unistd::Uid::effective().as_raw();
+            let digest = "a".repeat(64);
+            begin(&paths, uid, &digest, || {
+                Ok(b"original immutable setup".to_vec())
+            })
+            .unwrap();
+            accept(&paths, uid, &digest).unwrap();
+            assert!(
+                begin_maintenance(&paths, uid, &"b".repeat(64), phase, || panic!(
+                    "wrong digest must not capture"
+                ))
+                .is_err()
+            );
+            assert!(begin_maintenance(&paths, uid, &digest, phase, || Ok(
+                b"exact maintenance snapshot".to_vec()
+            ))
+            .unwrap());
+            assert!(!begin_maintenance(&paths, uid, &digest, phase, || panic!(
+                "retry must never recapture"
+            ))
+            .unwrap());
+            let retained = retained_transition(&paths, uid).unwrap().unwrap();
+            assert_eq!(retained.bytes, b"original immutable setup");
+            assert_eq!(
+                retained.maintenance_bytes.unwrap(),
+                b"exact maintenance snapshot"
+            );
+            assert!(require_accepted(&paths, uid).is_err());
+            assert!(begin(&paths, uid, &digest, || panic!(
+                "maintenance cannot become ordinary setup"
+            ))
+            .is_err());
+            assert!(advance(&paths, uid, &digest, Phase::Restoring).is_err());
+            if phase == Phase::Repairing {
+                assert!(advance(&paths, uid, &digest, Phase::UninstalledInactive).is_err());
+                assert!(accept(&paths, uid, &digest).unwrap());
+                assert!(retained_transition(&paths, uid)
+                    .unwrap()
+                    .unwrap()
+                    .maintenance_bytes
+                    .is_none());
+            } else {
+                assert!(accept(&paths, uid, &digest).is_err());
+                assert!(advance(&paths, uid, &digest, Phase::UninstalledInactive).unwrap());
+                assert!(!advance(&paths, uid, &digest, Phase::UninstalledInactive).unwrap());
+                assert!(begin(&paths, uid, &digest, || panic!(
+                    "uninstalled generation cannot replay"
+                ))
+                .is_err());
+                assert!(begin(&paths, uid, &"b".repeat(64), || Ok(
+                    b"new approved setup".to_vec()
+                ))
+                .unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_snapshot_drift_prevents_terminal_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: temp.path().join("data"),
+            bin_dir: temp.path().join("bin"),
+        };
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let digest = "c".repeat(64);
+        begin(&paths, uid, &digest, || Ok(b"original setup".to_vec())).unwrap();
+        accept(&paths, uid, &digest).unwrap();
+        begin_maintenance(&paths, uid, &digest, Phase::Uninstalling, || {
+            Ok(b"retained maintenance".to_vec())
+        })
+        .unwrap();
+        let document = read_atomic_document(&state_path(&paths), &authority(uid))
+            .unwrap()
+            .unwrap();
+        let state = parse(&document.bytes).unwrap();
+        std::fs::write(
+            maintenance_generation_path(&paths, state.maintenance_generation.as_ref().unwrap()),
+            b"foreign replacement",
+        )
+        .unwrap();
+        assert!(retained_transition(&paths, uid).is_err());
+        assert!(advance(&paths, uid, &digest, Phase::UninstalledInactive).is_err());
+        assert_eq!(std::fs::read(state_path(&paths)).unwrap(), document.bytes);
+        assert_eq!(
+            std::fs::read(generation_path(&paths, &digest)).unwrap(),
+            b"original setup"
+        );
     }
 
     #[test]
@@ -576,4 +840,36 @@ mod tests {
         drop(_writer);
         assert!(admit_at(&lock, &state_path(&paths), uid).is_ok());
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn try_grant_admission() -> Result<Option<InstallationLock>> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("privilege admission requires its native coordinator");
+    }
+    try_admit_at(
+        &lock_path(DeploymentMode::Strong, None)?,
+        &SetupPaths::strong(),
+        0,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn try_admit_at(
+    lock: &Path,
+    paths: &SetupPaths,
+    owner_uid: u32,
+) -> Result<Option<InstallationLock>> {
+    let Some(lease) = InstallationLock::try_acquire_shared(lock)? else {
+        return Ok(None);
+    };
+    let Some(document) = read_atomic_document(&state_path(paths), &authority(owner_uid))? else {
+        return Ok(None);
+    };
+    let transition = parse(&document.bytes)?;
+    if transition.phase != Phase::Accepted {
+        return Ok(None);
+    }
+    read_generation(paths, owner_uid, &transition)?;
+    Ok(Some(lease))
 }

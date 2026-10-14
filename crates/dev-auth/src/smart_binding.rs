@@ -9,8 +9,13 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v2";
+const BINDING_RECEIPT_SCHEMA: &str = "dev-auth-workload-binding-receipt-v3";
 const MAX_BINDING_TARGET_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PUBLIC_SHELL_BYTES: usize = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+pub mod shell;
+pub mod source;
 
 // Native identities must not pass through JCS/IEEE-754 number rounding or
 // TOML's signed-integer Value range. New documents write exact decimal strings;
@@ -71,6 +76,13 @@ pub enum BindingMode {
 pub enum BindingAuthority {
     RootOwned,
     UserOwned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingCodeTrust {
+    Pinned,
+    Mutable,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,8 +160,25 @@ pub struct ResolvedContinuation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BindingResolution {
-    Continuation { resolution: ResolvedContinuation },
-    Structured { identity: ExecutableIdentity },
+    Continuation {
+        resolution: ResolvedContinuation,
+    },
+    Structured {
+        identity: ExecutableIdentity,
+    },
+    PinnedShell {
+        identity: ExecutableIdentity,
+        source: String,
+        acknowledged_public_source: bool,
+    },
+    /// Source-free installed evidence. The text stays in a separately owned
+    /// private payload and enters native execution only as a sealed descriptor.
+    PinnedShellSource {
+        identity: ExecutableIdentity,
+        source_sha256: String,
+        source_length: u64,
+        acknowledged_public_source: bool,
+    },
 }
 
 impl From<ResolvedContinuation> for BindingResolution {
@@ -159,10 +188,12 @@ impl From<ResolvedContinuation> for BindingResolution {
 }
 
 impl BindingResolution {
-    fn identity(&self) -> &ExecutableIdentity {
+    pub fn identity(&self) -> &ExecutableIdentity {
         match self {
             Self::Continuation { resolution } => &resolution.identity,
-            Self::Structured { identity } => identity,
+            Self::Structured { identity }
+            | Self::PinnedShell { identity, .. }
+            | Self::PinnedShellSource { identity, .. } => identity,
         }
     }
 }
@@ -250,7 +281,14 @@ impl BindingTargetIntent {
 pub struct BindingIntent {
     pub command_name: String,
     pub workload: String,
+    pub code_trust: BindingCodeTrust,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub desktop_entry: bool,
     pub target: BindingTargetIntent,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BindingIntent {
@@ -296,8 +334,20 @@ impl BindingIntent {
         Ok(Self {
             command_name,
             workload,
+            code_trust: BindingCodeTrust::Pinned,
+            desktop_entry: false,
             target,
         })
+    }
+
+    pub fn with_code_trust(mut self, code_trust: BindingCodeTrust) -> Self {
+        self.code_trust = code_trust;
+        self
+    }
+
+    pub fn with_desktop_entry(mut self, desktop_entry: bool) -> Self {
+        self.desktop_entry = desktop_entry;
+        self
     }
 }
 
@@ -360,10 +410,22 @@ pub fn build_binding_plan(
     resolved: impl Into<BindingResolution>,
     current: Option<&BindingReceipt>,
 ) -> Result<BindingPlan> {
-    let resolved = resolved.into();
-    let name = name.into();
+    build_binding_plan_inner(name.into(), intent, resolved.into(), current, true)
+}
+
+fn build_binding_plan_inner(
+    name: String,
+    intent: BindingIntent,
+    resolved: BindingResolution,
+    current: Option<&BindingReceipt>,
+    check_source: bool,
+) -> Result<BindingPlan> {
     require_simple_name(&name, "binding name")?;
-    validate_intent_resolution(&intent, &resolved)?;
+    if check_source {
+        validate_intent_resolution(&intent, &resolved)?;
+    } else {
+        validate_intent_resolution_structure(&intent, &resolved)?;
+    }
     let (current_generation, current_receipt_sha256, change) = match current {
         Some(receipt) => {
             validate_binding_receipt_structure(receipt)?;
@@ -407,7 +469,7 @@ pub fn build_binding_plan(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(BindingPlan {
-        schema: "dev-auth-workload-binding-plan-v2".to_owned(),
+        schema: "dev-auth-workload-binding-plan-v3".to_owned(),
         platform: current_platform(),
         name,
         intent,
@@ -421,8 +483,43 @@ pub fn build_binding_plan(
 }
 
 pub fn canonical_binding_plan(plan: &BindingPlan) -> Result<Vec<u8>> {
-    validate_binding_plan(plan)?;
+    validate_binding_plan(plan, true)?;
     serde_jcs::to_vec(plan).context("canonicalize workload binding plan")
+}
+
+/// Validate a previously captured exact plan without reopening its original
+/// pathname after acceptance. Mutable bindings admit later edits; pinned
+/// bindings instead require their separate retained artifact postcondition.
+/// Only retained setup authority may use this path to check prior plan bytes.
+#[cfg(unix)]
+pub(crate) fn canonical_retained_binding_plan(plan: &BindingPlan) -> Result<Vec<u8>> {
+    validate_binding_plan(plan, false)?;
+    serde_jcs::to_vec(plan).context("canonicalize retained binding plan")
+}
+
+/// Rebase a retained, unchanged pin against its current receipt without
+/// reopening the original pathname. The setup owner must separately verify
+/// the receipt-owned copied artifact before publishing this as a new plan.
+#[cfg(target_os = "linux")]
+pub(crate) fn rebase_retained_pinned_plan(
+    plan: &BindingPlan,
+    current: &BindingReceipt,
+) -> Result<BindingPlan> {
+    if plan.intent.code_trust != BindingCodeTrust::Pinned
+        || plan.intent != current.active.intent
+        || normalized_binding_resolution(&plan.resolved)?
+            != normalized_binding_resolution(&current.active.resolved)?
+    {
+        bail!("retained pin differs from the current approved generation");
+    }
+    validate_binding_plan(plan, false)?;
+    build_binding_plan_inner(
+        plan.name.clone(),
+        plan.intent.clone(),
+        plan.resolved.clone(),
+        Some(current),
+        false,
+    )
 }
 
 pub fn binding_plan_sha256(plan: &BindingPlan) -> Result<String> {
@@ -448,20 +545,20 @@ pub fn write_binding_plan(path: &Path, plan: &BindingPlan) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-fn validate_binding_plan(plan: &BindingPlan) -> Result<()> {
-    if plan.schema != "dev-auth-workload-binding-plan-v2" {
+fn validate_binding_plan(plan: &BindingPlan, check_source: bool) -> Result<()> {
+    if plan.schema != "dev-auth-workload-binding-plan-v3" {
         bail!("workload binding plan schema is not supported");
     }
     if plan.platform != current_platform() {
         bail!("workload binding plan belongs to a different native platform");
     }
     require_simple_name(&plan.name, "binding name")?;
-    validate_intent_resolution(&plan.intent, &plan.resolved)?;
-    let expected = build_binding_plan(
+    let expected = build_binding_plan_inner(
         plan.name.clone(),
         plan.intent.clone(),
         plan.resolved.clone(),
         plan.current_receipt.as_ref(),
+        check_source,
     )?;
     if &expected != plan {
         bail!("workload binding plan is not canonical for its current-state snapshot");
@@ -594,7 +691,9 @@ fn classify_resolved_binding_change(
 ) -> BindingChange {
     if current.active.intent != *desired_intent {
         BindingChange::Rebind
-    } else if current.active.resolved != *desired_resolution {
+    } else if normalized_binding_resolution(&current.active.resolved).ok()
+        != normalized_binding_resolution(desired_resolution).ok()
+    {
         BindingChange::Refresh
     } else {
         BindingChange::Unchanged
@@ -681,7 +780,7 @@ pub fn validate_binding_receipt_structure(receipt: &BindingReceipt) -> Result<()
     Ok(())
 }
 
-fn validate_binding_generation(generation: &BindingGeneration) -> Result<()> {
+pub(crate) fn validate_binding_generation(generation: &BindingGeneration) -> Result<()> {
     if generation.generation == 0 {
         bail!("binding generation must be positive");
     }
@@ -690,6 +789,14 @@ fn validate_binding_generation(generation: &BindingGeneration) -> Result<()> {
 
 fn validate_intent_resolution(intent: &BindingIntent, resolved: &BindingResolution) -> Result<()> {
     validate_intent_resolution_structure(intent, resolved)?;
+    if matches!(resolved, BindingResolution::PinnedShellSource { .. }) {
+        bail!("new pinned-shell approval requires the exact privately captured source");
+    }
+    if intent.code_trust == BindingCodeTrust::Pinned
+        && resolved.identity().authority != BindingAuthority::RootOwned
+    {
+        bail!("pinned binding requires root-custodied executable ancestry; select mutable trust explicitly");
+    }
     verify_executable_identity(resolved.identity())
 }
 
@@ -731,8 +838,49 @@ fn validate_intent_resolution_structure(
                 bail!("structured binding caller position is outside its fixed arguments");
             }
         }
-        (BindingTargetIntent::PinnedShell { .. }, _) => {
-            bail!("pinned-shell planning requires source custody and explicit policy permission; this planning contract does not support it");
+        (
+            BindingTargetIntent::PinnedShell {
+                shell,
+                source_sha256,
+            },
+            BindingResolution::PinnedShell {
+                identity,
+                source,
+                acknowledged_public_source,
+            },
+        ) => {
+            validate_public_shell_source(source, *acknowledged_public_source)?;
+            require_absolute_normal_path(shell, "pinned shell")?;
+            if intent.code_trust != BindingCodeTrust::Pinned
+                || shell != &identity.canonical_path
+                || *source_sha256 != format!("{:x}", Sha256::digest(source.as_bytes()))
+            {
+                bail!("pinned shell differs from its pinned source or executable identity");
+            }
+        }
+        (
+            BindingTargetIntent::PinnedShell {
+                shell,
+                source_sha256,
+            },
+            BindingResolution::PinnedShellSource {
+                identity,
+                source_sha256: retained_sha256,
+                source_length,
+                acknowledged_public_source,
+            },
+        ) => {
+            require_absolute_normal_path(shell, "pinned shell")?;
+            if intent.code_trust != BindingCodeTrust::Pinned
+                || shell != &identity.canonical_path
+                || source_sha256 != retained_sha256
+                || !source::is_canonical_digest(retained_sha256)
+                || *source_length == 0
+                || *source_length > MAX_PUBLIC_SHELL_BYTES as u64
+                || !acknowledged_public_source
+            {
+                bail!("installed shell source reference differs from its exact approved identity");
+            }
         }
         _ => bail!("binding target kind does not match its resolution evidence"),
     }
@@ -826,7 +974,8 @@ pub fn snapshot_binding_executable(identity: &ExecutableIdentity) -> Result<fs::
             rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
         )
         .context("create anonymous binding snapshot")?;
-        let mut snapshot = fs::File::from(descriptor);
+        let mut snapshot =
+            crate::supervisor_descriptors::normalize_source_descriptor(fs::File::from(descriptor))?;
         rustix::fs::fchmod(&snapshot, rustix::fs::Mode::from_bits_truncate(0o600))
             .context("restrict anonymous binding snapshot")?;
         let observed = inspect_open_executable_identity(
@@ -1048,6 +1197,262 @@ pub fn default_proxy_directories() -> Result<Vec<PathBuf>> {
     }
     directories.push(base.data_local_dir().join("dev-auth/workload-bindings/bin"));
     Ok(directories)
+}
+
+/// Re-observe one explicitly selected target without changing binding intent.
+/// A different continuation location is an explicit rebind, not a refresh.
+pub fn refresh_binding_plan(
+    name: &str,
+    receipt: &BindingReceipt,
+    excluded: &[PathBuf],
+) -> Result<BindingPlan> {
+    validate_binding_receipt_structure(receipt)?;
+    let intent = receipt.active.intent.clone();
+    let resolved = match &receipt.active.resolved {
+        BindingResolution::Continuation { resolution } => {
+            let observed = resolve_continuation(
+                &intent.command_name,
+                &resolution.continuation_path,
+                excluded,
+            )?;
+            if observed.visible_path != resolution.visible_path
+                || observed.canonical_path != resolution.canonical_path
+            {
+                bail!(
+                    "binding refresh changed its approved location; an explicit rebind is required"
+                );
+            }
+            observed.into()
+        }
+        BindingResolution::Structured { identity } => {
+            resolve_structured_target_excluding(&identity.canonical_path, excluded)?
+        }
+        BindingResolution::PinnedShell {
+            identity,
+            source,
+            acknowledged_public_source,
+        } => {
+            pinned_shell_binding(
+                &intent.command_name,
+                &intent.workload,
+                &identity.canonical_path,
+                source.clone(),
+                *acknowledged_public_source,
+                excluded,
+            )?
+            .1
+        }
+        BindingResolution::PinnedShellSource { .. } => {
+            bail!("pinned-shell refresh requires its selected private source plan");
+        }
+    };
+    build_binding_plan(name, intent, resolved, Some(receipt))
+}
+
+pub fn is_pinned_shell_resolution(resolved: &BindingResolution) -> bool {
+    matches!(
+        resolved,
+        BindingResolution::PinnedShell { .. } | BindingResolution::PinnedShellSource { .. }
+    )
+}
+
+/// Preserve source identity while excluding private text from an installed
+/// readable manifest. This does not read a private payload or grant admission.
+pub fn normalized_binding_resolution(resolved: &BindingResolution) -> Result<BindingResolution> {
+    match resolved {
+        BindingResolution::PinnedShell {
+            identity,
+            source,
+            acknowledged_public_source,
+        } => {
+            validate_public_shell_source(source, *acknowledged_public_source)?;
+            Ok(BindingResolution::PinnedShellSource {
+                identity: identity.clone(),
+                source_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
+                source_length: source.len() as u64,
+                acknowledged_public_source: *acknowledged_public_source,
+            })
+        }
+        _ => Ok(resolved.clone()),
+    }
+}
+
+/// Restoring predecessor intent is a newly approved generation; it never
+/// reinstates an old session, moves a third-party target or edits it in place.
+pub fn rollback_binding_plan(name: &str, receipt: &BindingReceipt) -> Result<BindingPlan> {
+    validate_binding_receipt_structure(receipt)?;
+    let previous = receipt
+        .previous
+        .as_ref()
+        .context("binding has no retained predecessor")?;
+    build_binding_plan(
+        name,
+        previous.intent.clone(),
+        previous.resolved.clone(),
+        Some(receipt),
+    )
+}
+
+fn validate_public_shell_source(source: &str, acknowledged: bool) -> Result<()> {
+    if !acknowledged
+        || source.is_empty()
+        || source.len() > MAX_PUBLIC_SHELL_BYTES
+        || source.contains('\0')
+    {
+        bail!("pinned shell requires bounded public UTF-8 source and explicit acknowledgement");
+    }
+    Ok(())
+}
+
+/// Draft a public shell definition. Workload administrator permission and
+/// private setup receipt custody are independently checked before activation.
+pub fn pinned_shell_binding(
+    command_name: &str,
+    workload: &str,
+    shell: &Path,
+    source: String,
+    acknowledged: bool,
+    excluded: &[PathBuf],
+) -> Result<(BindingIntent, BindingResolution)> {
+    validate_public_shell_source(&source, acknowledged)?;
+    let identity = resolve_structured_target_excluding(shell, excluded)?
+        .identity()
+        .clone();
+    let intent = BindingIntent::new(
+        command_name.to_owned(),
+        workload.to_owned(),
+        BindingTargetIntent::PinnedShell {
+            shell: identity.canonical_path.clone(),
+            source_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
+        },
+    )?;
+    let resolved = BindingResolution::PinnedShell {
+        identity,
+        source,
+        acknowledged_public_source: acknowledged,
+    };
+    validate_intent_resolution(&intent, &resolved)?;
+    Ok((intent, resolved))
+}
+
+/// Retain the approved public definition as sealed nonexecutable data. The
+/// admitted native launcher owns descriptor inheritance and shell argv. Source
+/// bytes must never be substituted into argv or the environment.
+#[cfg(target_os = "linux")]
+pub fn sealed_shell_source(receipt: &BindingReceipt) -> Result<Option<fs::File>> {
+    validate_binding_receipt_structure(receipt)?;
+    let BindingResolution::PinnedShell { source, .. } = &receipt.active.resolved else {
+        return Ok(None);
+    };
+    let descriptor = rustix::fs::memfd_create(
+        "dev-auth-public-shell-source",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )?;
+    let mut file =
+        crate::supervisor_descriptors::normalize_source_descriptor(fs::File::from(descriptor))?;
+    rustix::fs::fchmod(&file, rustix::fs::Mode::from_bits_truncate(0o600))?;
+    file.write_all(source.as_bytes())?;
+    file.seek(SeekFrom::Start(0))?;
+    rustix::fs::fcntl_add_seals(
+        &file,
+        rustix::fs::SealFlags::SEAL
+            | rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::WRITE,
+    )?;
+    Ok(Some(file))
+}
+
+#[cfg(all(test, unix))]
+mod retained_plan_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn retained_mutable_plan_keeps_approved_structure_after_source_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("agent");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let intent =
+            BindingIntent::structured("agent", "automation", &target, Vec::<String>::new())
+                .unwrap()
+                .with_code_trust(BindingCodeTrust::Mutable);
+        let plan = build_binding_plan(
+            "agent-binding",
+            intent,
+            resolve_structured_target(&target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let approved = canonical_binding_plan(&plan).unwrap();
+        fs::write(&target, b"#!/bin/sh\nexit 7\n").unwrap();
+        assert!(canonical_binding_plan(&plan).is_err());
+        assert_eq!(canonical_retained_binding_plan(&plan).unwrap(), approved);
+        let mut tampered = plan;
+        tampered.actions.pop();
+        assert!(canonical_retained_binding_plan(&tampered).is_err());
+    }
+
+    #[test]
+    fn retained_root_pin_preserves_the_exact_approved_plan_structure() {
+        let target = Path::new("/usr/bin/true");
+        let plan = build_binding_plan(
+            "root-pin",
+            BindingIntent::structured("bound-true", "automation", target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(target).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.intent.code_trust, BindingCodeTrust::Pinned);
+        assert_eq!(
+            plan.resolved.identity().authority,
+            BindingAuthority::RootOwned
+        );
+        assert_eq!(
+            canonical_retained_binding_plan(&plan).unwrap(),
+            canonical_binding_plan(&plan).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepted_pin_rebases_without_reopening_original_target() {
+        let target = Path::new("/usr/bin/true");
+        let intent =
+            BindingIntent::structured("bound-true", "automation", target, Vec::<String>::new())
+                .unwrap();
+        let original = build_binding_plan(
+            "root-pin",
+            intent.clone(),
+            resolve_structured_target(target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut identity = original.resolved.identity().clone();
+        identity.sha256 = "0".repeat(64);
+        let resolved = BindingResolution::Structured { identity };
+        let retained =
+            build_binding_plan_inner(original.name, intent.clone(), resolved.clone(), None, false)
+                .unwrap();
+        let current = BindingReceipt {
+            schema: BINDING_RECEIPT_SCHEMA.into(),
+            platform: current_platform(),
+            active: BindingGeneration {
+                generation: 1,
+                intent,
+                resolved,
+            },
+            previous: None,
+        };
+        assert!(canonical_binding_plan(&retained).is_err());
+        let rebased = rebase_retained_pinned_plan(&retained, &current).unwrap();
+        assert_eq!(rebased.change, BindingPlanChange::Unchanged);
+        assert_eq!(rebased.current_receipt, Some(current));
+        assert!(canonical_binding_plan(&rebased).is_err());
+        canonical_retained_binding_plan(&rebased).unwrap();
+    }
 }
 
 #[cfg(unix)]

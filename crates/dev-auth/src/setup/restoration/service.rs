@@ -626,3 +626,7 @@ mod tests {
         );
     }
 }
+
+pub(super) fn require_grant_domain_empty() -> Result<()> {
+    cgroup::require_grant_empty()
+}
