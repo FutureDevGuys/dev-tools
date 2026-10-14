@@ -48,16 +48,23 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
         .signal()
         .context("workload termination did not contain an exit code or signal")?;
     let signal = Signal::try_from(signal).context("workload returned an unsupported signal")?;
-    // SAFETY: this launcher has finished all cleanup and intentionally restores
-    // the workload's terminating signal to its default disposition immediately
-    // before raising it in this process. No Rust code is expected to continue.
-    unsafe {
-        sigaction(
-            signal,
-            &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
-        )
+    if signal != Signal::SIGKILL {
+        // SAFETY: this launcher has finished all cleanup and intentionally
+        // restores the terminating signal before unblocking and raising it.
+        // SIGKILL already has its immutable terminating disposition.
+        unsafe {
+            sigaction(
+                signal,
+                &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+            )
+        }
+        .context("restore the workload termination signal")?;
     }
-    .context("restore the workload termination signal")?;
+    let mut terminating_signal = SigSet::empty();
+    terminating_signal.add(signal);
+    terminating_signal
+        .thread_unblock()
+        .context("unblock the workload termination signal")?;
     raise(signal).context("re-raise the workload termination signal")?;
     bail!("workload termination signal unexpectedly returned")
 }
@@ -1996,7 +2003,7 @@ fn run() -> Result<i32> {
                     return Ok(3);
                 }
                 Err(error) => {
-                    return Err(error).context("read release manifest from standard input")
+                    return Err(error).context("read release manifest from standard input");
                 }
             };
             #[cfg(not(target_os = "linux"))]
@@ -2648,6 +2655,52 @@ mod enrolled_dispatch_tests {
                 dev_auth::supervisor::enrolled_dispatch_diagnostic(&error),
                 "dev-auth: enrolled workload launch denied: request"
             );
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod termination_signal_tests {
+    #[test]
+    fn native_termination_preserves_sigkill_and_blocked_sigterm() {
+        use nix::sys::signal::{SigSet, Signal};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, ExitStatus, Stdio};
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+
+        const CHILD_SIGNAL: &str = "DEV_AUTH_TEST_TERMINATION_SIGNAL";
+        if let Ok(value) = std::env::var(CHILD_SIGNAL) {
+            let signal = Signal::try_from(value.parse::<i32>().unwrap()).unwrap();
+            let mut mask = SigSet::empty();
+            mask.add(signal);
+            mask.thread_block().unwrap();
+            let result = super::workload_status_code(ExitStatus::from_raw(signal as i32));
+            panic!("native termination unexpectedly returned: {result:?}");
+        }
+
+        for signal in [Signal::SIGKILL, Signal::SIGTERM] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "termination_signal_tests::native_termination_preserves_sigkill_and_blocked_sigterm",
+                ])
+                .env_clear()
+                .env(CHILD_SIGNAL, (signal as i32).to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let status = match child.wait_timeout(Duration::from_secs(5)) {
+                Ok(Some(status)) => status,
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("native termination did not settle: {result:?}");
+                }
+            };
+            assert_eq!(status.signal(), Some(signal as i32));
         }
     }
 }
