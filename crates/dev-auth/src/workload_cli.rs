@@ -225,10 +225,12 @@ fn finish_native_outcome(
             }
             crate::workload_status_code(status)
         }
-        Err(_) => finish(
-            ExecutionResult::launch("failed", None, 1).error("operational"),
-            sink,
-        ),
+        Err(error) => {
+            let kind = error
+                .downcast_ref::<dev_auth::supervisor::WorkloadLaunchFailure>()
+                .map_or("operational", |failure| failure.error_kind());
+            finish(ExecutionResult::launch("failed", None, 1).error(kind), sink)
+        }
     }
 }
 
