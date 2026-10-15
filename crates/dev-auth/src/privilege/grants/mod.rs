@@ -43,6 +43,8 @@ pub use graph::run_worker as run_plan_worker;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use output::run_worker as run_output_relay;
+#[cfg(target_os = "linux")]
+pub(crate) use tty_agent::TtyAgent;
 
 pub const SYSTEM_SOCKET: &str = "/run/dev-auth-grants/control.sock";
 pub const SYSTEM_POLICY: &str = "/etc/dev-auth/administrator-grants-v1.json";

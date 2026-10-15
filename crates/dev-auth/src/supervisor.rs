@@ -1929,6 +1929,26 @@ fn run_authorized_dispatcher(
                 return Err(error).context("establish the strong workload boundary handoff");
             }
         };
+        // With mixed terminal/pipe streams systemd preserves the streams but
+        // gives the service no controlling TTY. Keep its native approval UI on
+        // this dispatcher's foreground terminal, scoped to the held peer.
+        let _approval_agent = if privilege.is_some() {
+            match crate::privilege::grants::TtyAgent::for_workload_request(
+                &boundary_peer,
+                &executable,
+            ) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    let _ = systemd_run.kill();
+                    let _ = systemd_run.wait();
+                    let _ = revoke_session(&session_id);
+                    return Err(anyhow::anyhow!(error.message()))
+                        .context("prepare native workload approval agent");
+                }
+            }
+        } else {
+            None
+        };
         *stage = EnrolledDispatchStage::BrokerPrepare;
         if let Err(error) = prepare_session(crate::linux_admission::PendingSessionRegistration {
             session_id: session_id.clone(),
