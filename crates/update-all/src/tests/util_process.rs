@@ -60,6 +60,7 @@ fn cancellation_drain_keeps_exited_status_and_releases_descendant_pipes() {
             &mut child,
             true,
             [&reader, &None],
+            None,
             (!guard_cleanup).then_some(&cancellation),
             guard_cleanup.then_some(&guard),
         );

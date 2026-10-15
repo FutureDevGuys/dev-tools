@@ -941,21 +941,22 @@ where
         terminate_child(&mut child, managed_process_group);
         let _ = child.wait();
     }
-    if let Some(handle) = stdin_writer {
-        let _ = handle.join();
-    }
-
     // The direct child may exit while its descendants still hold the pipes.
     // Retain its observed status, but keep owning cancellation of that group
-    // until capture drains; cancel-one must not strand those descendants.
+    // until capture drains and pending input settles; a blocked input writer
+    // must not prevent cancel-one from releasing those descendants.
     if status.is_ok() {
         wait_for_pipe_readers(
             &mut child,
             managed_process_group,
             [&stdout_reader, &stderr_reader],
+            stdin_writer.as_ref(),
             cancel_check.as_ref(),
             guard_state.as_ref(),
         );
+    }
+    if let Some(handle) = stdin_writer {
+        let _ = handle.join();
     }
     let out_bytes = stdout_reader.map(join_pipe_reader).unwrap_or_default();
     let err_bytes = stderr_reader.map(join_pipe_reader).unwrap_or_default();
@@ -1104,7 +1105,6 @@ where
         terminate_child(&mut child, managed_process_group);
         let _ = child.wait();
     }
-    let _ = stdin_writer.join();
     reader_stop.store(true, Ordering::SeqCst);
 
     let reader = Some(reader);
@@ -1113,10 +1113,12 @@ where
             &mut child,
             managed_process_group,
             [&reader, &None],
+            Some(&stdin_writer),
             Some(&cancel_check),
             Some(&guard_state),
         );
     }
+    let _ = stdin_writer.join();
     let out_bytes = reader.map(join_pipe_reader).unwrap_or_default();
     let out = String::from_utf8_lossy(&out_bytes).to_string();
     let status = match status {
@@ -1595,6 +1597,7 @@ fn wait_for_pipe_readers(
     child: &mut std::process::Child,
     managed_process_group: bool,
     readers: [&Option<JoinHandle<Vec<u8>>>; 2],
+    stdin_writer: Option<&JoinHandle<()>>,
     cancel_check: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
     guard_state: Option<&Arc<CaptureGuardState>>,
 ) {
@@ -1602,6 +1605,7 @@ fn wait_for_pipe_readers(
     while readers
         .iter()
         .any(|reader| reader.as_ref().is_some_and(|handle| !handle.is_finished()))
+        || stdin_writer.is_some_and(|handle| !handle.is_finished())
     {
         if !cleanup_requested
             && (cancel::is_cancel_requested()
