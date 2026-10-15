@@ -107,6 +107,87 @@ fn stdout_capture_failure_keeps_both_streams_in_error_context() {
         process_exit_output(&error),
         Some("partial result\nerror: failed")
     );
+    assert_eq!(process_error_stderr(&error), Some("error: failed"));
+    let detail = error.to_string();
+    assert!(detail.contains("output: error: failed"));
+    assert!(!detail.contains("partial result"));
+}
+
+#[test]
+fn capture_timeout_preserves_partial_output_and_settles_owned_io() {
+    let temp = TempDir::new().unwrap();
+    let tool = temp.path().join("timeout-fixture");
+    write_executable(
+        &tool,
+        "#!/bin/sh\ntrap '' TERM\nprintf 'observed package progress\\n'\nprintf 'child diagnostic\\n' >&2\nexec /bin/sleep 20\n",
+    );
+    for use_pty in [false, true] {
+        let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let spawned = pid.clone();
+        let on_spawn: Arc<dyn Fn(u32) + Send + Sync> =
+            Arc::new(move |value| spawned.store(value, Ordering::SeqCst));
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit_callback = exited.clone();
+        let on_exit: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || exit_callback.store(true, Ordering::SeqCst));
+        let (sender, receiver) = mpsc::channel();
+        let error = if use_pty {
+            run_capture_with_pty_options(
+                tool.to_str().unwrap(),
+                std::iter::empty::<&str>(),
+                Some(Duration::from_millis(500)),
+                Arc::new(|_, _| {}),
+                Arc::new(|| false),
+                on_spawn,
+                on_exit,
+                CaptureGuard {
+                    stall_timeout: Duration::ZERO,
+                    max_line_bytes: 1024,
+                    max_capture_bytes: 4096,
+                },
+                receiver,
+                true,
+            )
+            .unwrap_err()
+        } else {
+            run_capture_output_with_options(
+                tool.to_str().unwrap(),
+                std::iter::empty::<&str>(),
+                Some(Duration::from_millis(500)),
+                &[],
+                false,
+                false,
+                None,
+                None,
+                Some(on_spawn),
+                Some(on_exit),
+                true,
+                None,
+                Some(receiver),
+            )
+            .err()
+            .expect("runner deadline must remain failure")
+        };
+        assert!(process_timed_out(&error));
+        assert_eq!(
+            error.to_string(),
+            format!("timeout running {}", tool.display())
+        );
+        let partial = process_exit_output(&error).unwrap();
+        assert!(partial.contains("observed package progress"));
+        assert!(partial.contains("child diagnostic"));
+        assert_eq!(
+            process_error_stderr(&error),
+            if use_pty {
+                None
+            } else {
+                Some("child diagnostic")
+            }
+        );
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(sender.send("not delivered".to_string()).is_err());
+        assert!(!pid_exists(pid.load(Ordering::SeqCst) as i32));
+    }
 }
 
 struct EnvVarGuard {

@@ -923,6 +923,11 @@ fn output_diagnostic_levels_agree_across_streams_and_reports() {
             "error",
         ),
         (
+            "gup:ERROR: [1/7] mcp-filesystem-server: can't install github.com/mark3labs/mcp-filesystem-server:",
+            LogLevel::Error,
+            "error",
+        ),
+        (
             " -> error making: package-exit status 4",
             LogLevel::Error,
             "error",
@@ -1082,15 +1087,49 @@ fn task_failure_summary_prefers_a_late_error_over_earlier_warnings() {
     let output = "warning: first warning\nwarning: second warning\nerror: final operation failed\n";
     let result = failed_command_result_with_report_sections(
         "Fixture",
-        format!("command failed: {output}"),
+        format!(
+            "command failed: {} (see task log for full output)",
+            concise_command_failure_text(output)
+        ),
         &command,
         output,
+        None,
     );
     assert!(result
         .primary_detail()
         .starts_with("command failed: error: final operation failed"));
     assert!(result.primary_detail().contains("task log"));
     assert!(!result.primary_detail().contains("first warning"));
+}
+
+#[test]
+fn command_failure_summary_keeps_causal_stderr_and_explicit_error_precedence() {
+    for (stdout, stderr, expected) in [
+        (
+            "updated an unrelated package\n",
+            "native linker cannot load target\n",
+            "native linker cannot load target",
+        ),
+        (
+            "error: actual operation failed\n",
+            "warning: fallback selected\n",
+            "error: actual operation failed",
+        ),
+        (
+            "error: unrelated output\n",
+            "error: causal stderr failure\n",
+            "error: causal stderr failure",
+        ),
+    ] {
+        let error = anyhow::anyhow!(ProcessExitError {
+            program: "fixture".to_string(),
+            code: "1".to_string(),
+            output: Some(join_command_outputs(stdout, stderr)),
+            stderr: Some(stderr.to_string()),
+        });
+        assert_eq!(command_error_summary(&error), expected);
+        assert_eq!(report_command_failure_summary(&error), expected);
+    }
 }
 
 #[test]
@@ -3571,6 +3610,85 @@ fn command_state_report_sections_diff_before_after_probe_output() {
 }
 
 #[test]
+fn failed_command_report_retains_pipx_before_inventory_without_claiming_refresh() {
+    let task = crate::updaters::builtin_catalog()
+        .expect("builtin catalog")
+        .into_iter()
+        .find(|task| task.id == "builtin/pipx")
+        .expect("pipx task");
+    let TaskKind::Command(cmd) = builtin_to_task_spec(task, false).kind else {
+        panic!("pipx should be a command task");
+    };
+    let pattern = cmd.report_commands[0].state_pattern.as_ref().unwrap();
+    // Only public package inventory and progress from the retained native run.
+    let versions = parse_command_state_report_versions(
+        pattern,
+        r#"
+   package markitdown 0.1.8, installed using Python 3.14.2
+   package mcpo 0.0.20, installed using Python 3.14.2
+   package pip-autoremove 0.10.0, installed using Python 3.14.6
+   package py2puml 0.11.0, installed using Python 3.14.6
+   package supabase-mcp-server 0.4, installed using Python 3.14.2
+   package xxh-xxh 0.8.14, installed using Python 3.14.2
+"#,
+    );
+    assert_eq!(versions.len(), 6);
+    let before = CommandReportOutput {
+        input: String::new(),
+        probe_rows: Vec::new(),
+        state_samples: vec![CommandStateReportSample {
+            command_index: 0,
+            command_label: "pipx list".to_string(),
+            phase: CommandReportPhase::Before,
+            section_key: pattern.section_key.clone(),
+            section_title: pattern.section_title.clone(),
+            include_unchanged: false,
+            versions: versions.clone(),
+        }],
+    };
+    let result = failed_command_result_with_report_sections(
+        "Pipx",
+        "timeout running pipx (see task log for partial output)",
+        &cmd,
+        "upgrading shared libraries...\nupgrading supabase-mcp-server...\nupgrading pip-autoremove...\n",
+        Some(&before),
+    );
+    assert_eq!(result.status, TaskStatus::Failed);
+    let rows = &result.report_sections[0].rows;
+    assert_eq!(rows.len(), 7);
+    assert!(rows
+        .iter()
+        .all(|row| row.status == TaskReportStatus::Blocked));
+    for (name, version) in versions {
+        let row = rows.iter().find(|row| row.name == name).unwrap();
+        assert_eq!(row.before.as_deref(), Some(version.as_str()));
+        assert_eq!(row.after.as_deref(), Some("-"));
+        assert!(row.note.as_deref().unwrap().contains("not confirmed"));
+    }
+    assert_eq!(summarize_task_items(&result), "blocked=7");
+
+    // A package completion observed before a later timeout remains an update
+    // even when the final inventory is unavailable.
+    let mut partial = result;
+    let updated = partial.report_sections[0]
+        .rows
+        .iter_mut()
+        .find(|row| row.name == "markitdown")
+        .unwrap();
+    updated.status = TaskReportStatus::Updated;
+    updated.after = Some("0.1.9".to_string());
+    attach_unconfirmed_before_report(&mut partial, &before);
+    let updated = partial.report_sections[0]
+        .rows
+        .iter()
+        .find(|row| row.name == "markitdown")
+        .unwrap();
+    assert_eq!(updated.status, TaskReportStatus::Updated);
+    assert_eq!(updated.before.as_deref(), Some("0.1.8"));
+    assert_eq!(updated.after.as_deref(), Some("0.1.9"));
+}
+
+#[test]
 fn command_state_report_ignores_available_annotation_when_version_is_unchanged() {
     let pattern = CommandStateReportPattern {
         regex: Regex::new(r"^(?P<name>\S+) (?P<version>.+)$").unwrap(),
@@ -3787,6 +3905,68 @@ Overall updated 1 packages.
     assert_eq!(wasm_pack.status, TaskReportStatus::Updated);
     assert_eq!(wasm_pack.before.as_deref(), Some("v0.15.0"));
     assert_eq!(wasm_pack.after.as_deref(), Some("v0.16.0"));
+}
+
+#[test]
+fn cargo_catalog_report_preserves_updates_with_available_prereleases() {
+    let task = crate::updaters::builtin_catalog()
+        .expect("builtin catalog")
+        .into_iter()
+        .find(|task| task.id == "builtin/cargo")
+        .expect("cargo task");
+    let TaskKind::Command(cmd) = builtin_to_task_spec(task, false).kind else {
+        panic!("cargo should be a command task");
+    };
+    // Public command output replayed from the retained native run.
+    let output = r#"
+Package           Installed  Latest                              Needs update
+tauri-cli         v2.12.1    v2.12.2 (v3.0.0-alpha.4 available)  Yes
+cargo-audit       v0.22.2    v0.22.2                             No
+cargo-auditable   v0.7.7     v0.7.7                              No
+cargo-deny        v0.20.2    v0.20.2                             No
+cargo-llvm-cov    v0.9.1     v0.9.1                              No
+cargo-make        v0.37.24   v0.37.24                            No
+cargo-vet         v0.10.2    v0.10.2                             No
+cargo-xwin        v0.23.1    v0.23.1                             No
+cargo-zigbuild    v0.23.4    v0.23.4                             No
+cross             v0.2.5     v0.2.5                              No
+rust-script       v0.36.0    v0.36.0                             No
+trunk             v0.21.14   v0.21.14 (v0.22.0-rc.2 available)   No
+wasm-bindgen-cli  v0.2.129   v0.2.129                            No
+wasm-pack         v0.15.0    v0.15.0                             No
+Updated 1 package.
+Overall updated 1 package: tauri-cli.
+"#;
+    let mut result = TaskResult::completed("Cargo");
+    result.report_sections = build_command_report_sections_for_command(&cmd, output);
+    assert_eq!(summarize_task_items(&result), "updated=1 unchanged=13");
+    let rows = &result.report_sections[0].rows;
+    assert_eq!(rows.len(), 14);
+    let updated = rows.iter().find(|row| row.name == "tauri-cli").unwrap();
+    assert_eq!(updated.status, TaskReportStatus::Updated);
+    assert_eq!(updated.before.as_deref(), Some("v2.12.1"));
+    assert_eq!(updated.after.as_deref(), Some("v2.12.2"));
+    assert_eq!(updated.note.as_deref(), Some("v3.0.0-alpha.4 available"));
+    assert!(rows
+        .iter()
+        .filter(|row| row.name != "tauri-cli")
+        .all(|row| { row.status == TaskReportStatus::Unchanged && row.before == row.after }));
+
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    write_task_result_artifact(Some(&log), "cargo", &result);
+    let artifact: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(log.run_dir().join("task-cargo.json")).unwrap())
+            .unwrap();
+    assert_eq!(artifact["status"], "completed");
+    assert_eq!(
+        artifact["report_sections"][0]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        14
+    );
+    assert_eq!(artifact["detail"], "updated=1 unchanged=13");
 }
 
 #[test]
@@ -4167,6 +4347,106 @@ go: module golang.org/x/tools/gopls: Get "https://proxy.golang.org/golang.org/x/
     assert_eq!(row.before.as_deref(), Some("-"));
     assert_eq!(row.after.as_deref(), Some("-"));
     assert_eq!(row.note.as_deref(), Some("gopls: check failed"));
+}
+
+#[test]
+fn go_catalog_report_preserves_mixed_versions_and_partial_failure() {
+    let task = crate::updaters::builtin_catalog()
+        .expect("builtin catalog")
+        .into_iter()
+        .find(|task| task.id == "builtin/go")
+        .expect("go task");
+    let TaskKind::Command(cmd) = builtin_to_task_spec(task, false).kind else {
+        panic!("go should be a command task");
+    };
+    // Preserve the observed public package/toolchain lines and transport failure.
+    let output = r#"update binary under $GOPATH/bin or $GOBIN
+[2/7] github.com/junegunn/fzf (v0.74.4 to v0.74.5, go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5)
+[3/7] github.com/Hyaxia/blogwatcher/cmd/blogwatcher (go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5)
+[4/7] golang.org/x/tools/gopls (go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5)
+[5/7] github.com/sammcj/gollama (go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5)
+[6/7] honnef.co/go/tools/cmd/staticcheck (v0.8.1 to v0.8.2, go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5)
+[7/7] github.com/EvilBit-Labs/opnDossier (go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5)
+gup:ERROR: [1/7] mcp-filesystem-server: can't install github.com/mark3labs/mcp-filesystem-server:
+github.com/mark3labs/mcp-go@v0.32.0: verifying module: github.com/mark3labs/mcp-go@v0.32.0: checking tree#62974059 against tree#69017649: reading https://sum.golang.org/tile/8/0/x245/992: stream error: stream ID 1; INTERNAL_ERROR; received from peer
+"#;
+    let result = failed_command_result_with_report_sections(
+        "Go Tools",
+        format!(
+            "command failed: {} (see task log for full output)",
+            concise_command_failure_text(output)
+        ),
+        &cmd,
+        output,
+        None,
+    );
+    assert_eq!(result.status, TaskStatus::Failed);
+    assert_eq!(summarize_task_items(&result), "updated=6 failed=1");
+    let rows = &result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "go_tools")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 7);
+    for (name, before, after) in [
+        ("github.com/junegunn/fzf", "v0.74.4", "v0.74.5"),
+        ("honnef.co/go/tools/cmd/staticcheck", "v0.8.1", "v0.8.2"),
+    ] {
+        let row = rows.iter().find(|row| row.name == name).unwrap();
+        assert_eq!(row.status, TaskReportStatus::Updated);
+        assert_eq!(row.before.as_deref(), Some(before));
+        assert_eq!(row.after.as_deref(), Some(after));
+        assert_eq!(
+            row.note.as_deref(),
+            Some("go1.27.1-X:nodwarf5 to go1.27.2-X:nodwarf5")
+        );
+    }
+    let failed = rows
+        .iter()
+        .find(|row| row.status == TaskReportStatus::Failed)
+        .unwrap();
+    assert_eq!(failed.name, "github.com/mark3labs/mcp-filesystem-server");
+    assert_eq!(
+        failed.note.as_deref(),
+        Some("mcp-filesystem-server: install failed")
+    );
+    assert!(result
+        .primary_detail()
+        .starts_with("command failed: gup:ERROR:"));
+    assert!(!result.primary_detail().contains("update binary under"));
+    assert!(result.primary_detail().len() <= STRUCTURED_TEXT_LIMIT_BYTES);
+
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    write_task_result_artifact(Some(&log), "go", &result);
+    let artifact: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(log.run_dir().join("task-go.json")).unwrap())
+            .unwrap();
+    assert_eq!(artifact["status"], "failed");
+    let package_rows = artifact["report_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|section| section["key"] == "go_tools")
+        .unwrap()["rows"]
+        .as_array()
+        .unwrap();
+    assert_eq!(package_rows.len(), 7);
+    assert_eq!(
+        package_rows
+            .iter()
+            .filter(|row| row["status"] == "updated")
+            .count(),
+        6
+    );
+    assert_eq!(
+        package_rows
+            .iter()
+            .filter(|row| row["status"] == "failed")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -5477,7 +5757,7 @@ fn structured_command_result_marks_a_successful_process_as_deferred() {
     let mut result = TaskResult::completed("Example Tool");
     assert!(apply_structured_command_result(
         &mut result,
-        "deferred: still running\nUPDATE_ALL_RESULT {\"outcome\":\"deferred\",\"detail\":\"quit the background process\",\"current\":\"3.0.2\",\"latest\":\"3.0.3\"}\n",
+        "deferred: still running\nUPDATE_ALL_RESULT {\"outcome\":\"deferred\",\"detail\":\"quit the background process\",\"current\":\"3.0.2\",\"latest\":\"6.1.9\"}\n",
     ));
 
     assert_eq!(result.status, TaskStatus::Completed);
@@ -5485,7 +5765,18 @@ fn structured_command_result_marks_a_successful_process_as_deferred() {
     assert_eq!(result.details[0], "quit the background process");
     assert!(result
         .details
-        .contains(&"version: 3.0.2 -> 3.0.3".to_string()));
+        .contains(&"installed: 3.0.2; available: 6.1.9 (deferred)".to_string()));
+    assert!(!result.details.iter().any(|detail| detail.contains("->")));
+
+    let mut updated = TaskResult::completed("Example Tool");
+    assert!(apply_structured_command_result(
+        &mut updated,
+        "UPDATE_ALL_RESULT {\"outcome\":\"updated\",\"current\":\"3.0.2\",\"latest\":\"6.1.9\"}\n",
+    ));
+    assert!(updated
+        .details
+        .contains(&"version: 3.0.2 -> 6.1.9".to_string()));
+    assert!(!updated.is_deferred());
 }
 
 #[test]
@@ -6970,7 +7261,6 @@ fn classify_runtime_failure_detects_transient_network_failures() {
         "fatal: early EOF",
         "fetch-pack: unexpected disconnect while reading sideband packet",
         "Operation too slow. Less than 1 bytes/sec transferred the last 10 seconds",
-        "timeout running pipx",
     ] {
         let class = classify_runtime_failure(msg, false);
         assert_eq!(class, RuntimeFailureClass::TransientNetwork, "{msg}");
@@ -6984,6 +7274,8 @@ fn classify_runtime_failure_keeps_deterministic_package_errors_non_transient() {
         "error: failed to commit transaction (conflicting files)",
         "The term 'winget' is not recognized as the name of a cmdlet",
         "sudo: a password is required",
+        "timeout running pipx",
+        "download timed out",
     ] {
         let class = classify_runtime_failure(msg, false);
         assert_ne!(class, RuntimeFailureClass::TransientNetwork, "{msg}");
@@ -7333,11 +7625,11 @@ fn transient_retry_backoff_uses_default_when_base_is_zero() {
 }
 
 #[test]
-fn effective_retry_budget_adds_one_retry_for_transient_network_failures() {
+fn effective_retry_budget_respects_explicit_policy_for_transient_network_failures() {
     let policy = TaskPolicy::new(60, 0, 0);
     assert_eq!(
         effective_retry_budget(&policy, "npm error code ETIMEDOUT"),
-        1
+        0
     );
     assert_eq!(
         effective_retry_budget(
@@ -7345,6 +7637,10 @@ fn effective_retry_budget_adds_one_retry_for_transient_network_failures() {
             "==> ERROR: One or more files did not pass the validity check!"
         ),
         0
+    );
+    assert_eq!(
+        effective_retry_budget(&TaskPolicy::new(60, 2, 0), "npm error code ETIMEDOUT"),
+        2
     );
 }
 
@@ -7462,6 +7758,6 @@ fn sudo_authentication_failures_never_receive_automatic_retry_budget() {
     assert_eq!(effective_retry_budget(&policy, "download timed out"), 5);
     assert_eq!(
         effective_retry_budget(&TaskPolicy::new(30, 0, 0), "connection reset by peer"),
-        1
+        0
     );
 }
