@@ -31,7 +31,7 @@ fn cancellation_does_not_replace_an_observed_process_exit() {
 #[test]
 fn cancellation_drain_keeps_exited_status_and_releases_descendant_pipes() {
     use std::os::unix::process::CommandExt;
-    for code in [0, 42] {
+    for (code, guard_cleanup) in [(0, false), (42, false), (0, true), (42, true)] {
         let mut child = Command::new("/bin/sh")
             .args(["-c", &format!("/bin/sleep 5 & exit {code}")])
             .stdout(Stdio::piped())
@@ -49,8 +49,20 @@ fn cancellation_drain_keeps_exited_status_and_releases_descendant_pipes() {
         assert_eq!(observed.code(), Some(code));
         assert!(!reader.as_ref().unwrap().is_finished());
         let cancellation: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| true);
+        let guard = Arc::new(CaptureGuardState::new(CaptureGuard {
+            stall_timeout: Duration::ZERO,
+            max_line_bytes: 1024,
+            max_capture_bytes: 4096,
+        }));
+        guard.mark_reason(CaptureGuardReason::CaptureLimitExceeded);
         let started = std::time::Instant::now();
-        wait_for_pipe_readers(&mut child, true, [&reader, &None], Some(&cancellation));
+        wait_for_pipe_readers(
+            &mut child,
+            true,
+            [&reader, &None],
+            (!guard_cleanup).then_some(&cancellation),
+            guard_cleanup.then_some(&guard),
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(child.try_wait().unwrap(), Some(observed));
         assert!(join_pipe_reader(reader.unwrap()).is_empty());

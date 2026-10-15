@@ -948,12 +948,15 @@ where
     // The direct child may exit while its descendants still hold the pipes.
     // Retain its observed status, but keep owning cancellation of that group
     // until capture drains; cancel-one must not strand those descendants.
-    wait_for_pipe_readers(
-        &mut child,
-        managed_process_group,
-        [&stdout_reader, &stderr_reader],
-        cancel_check.as_ref(),
-    );
+    if status.is_ok() {
+        wait_for_pipe_readers(
+            &mut child,
+            managed_process_group,
+            [&stdout_reader, &stderr_reader],
+            cancel_check.as_ref(),
+            guard_state.as_ref(),
+        );
+    }
     let out_bytes = stdout_reader.map(join_pipe_reader).unwrap_or_default();
     let err_bytes = stderr_reader.map(join_pipe_reader).unwrap_or_default();
     let output = CapturedOutput {
@@ -1093,7 +1096,7 @@ where
     let status = wait_with_cancel_timeout(
         &mut child,
         timeout,
-        Some(cancel_check),
+        Some(cancel_check.clone()),
         Some(guard_state.clone()),
     );
     stdin_writer_stop.store(true, Ordering::SeqCst);
@@ -1104,7 +1107,17 @@ where
     let _ = stdin_writer.join();
     reader_stop.store(true, Ordering::SeqCst);
 
-    let out_bytes = join_pipe_reader(reader);
+    let reader = Some(reader);
+    if status.is_ok() {
+        wait_for_pipe_readers(
+            &mut child,
+            managed_process_group,
+            [&reader, &None],
+            Some(&cancel_check),
+            Some(&guard_state),
+        );
+    }
+    let out_bytes = reader.map(join_pipe_reader).unwrap_or_default();
     let out = String::from_utf8_lossy(&out_bytes).to_string();
     let status = match status {
         Ok(status) => status,
@@ -1583,6 +1596,7 @@ fn wait_for_pipe_readers(
     managed_process_group: bool,
     readers: [&Option<JoinHandle<Vec<u8>>>; 2],
     cancel_check: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
+    guard_state: Option<&Arc<CaptureGuardState>>,
 ) {
     let mut cleanup_requested = false;
     while readers
@@ -1590,7 +1604,9 @@ fn wait_for_pipe_readers(
         .any(|reader| reader.as_ref().is_some_and(|handle| !handle.is_finished()))
     {
         if !cleanup_requested
-            && (cancel::is_cancel_requested() || cancel_check.is_some_and(|cb| cb()))
+            && (cancel::is_cancel_requested()
+                || cancel_check.is_some_and(|cb| cb())
+                || guard_state.is_some_and(|state| state.reason().is_some()))
         {
             terminate_child(child, managed_process_group);
             cleanup_requested = true;
