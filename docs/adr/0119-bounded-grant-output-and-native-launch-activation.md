@@ -47,6 +47,18 @@ One typed product-owned descriptor set has at most three owners in proof, releas
 
 ## Qualification and composition
 
+For a strong launch with terminal stdin and redirected output, systemd preserves
+the selected streams through its pipe mode, which provides no controlling terminal
+inside the service. The existing root dispatcher retains the request-owned native
+PolicyKit terminal agent on its real foreground terminal, registered for the
+authenticated inner supervisor's PID and start time. Its held pidfd, current
+cgroup and installed executable are checked around agent readiness before the
+existing environment handoff releases that supervisor. This agent supplies UI
+only; the coordinator still authenticates the request and requires fresh approval.
+The inner client declines a local terminal agent when `/dev/tty` reports no
+controlling terminal. All-terminal and noninteractive launches retain their
+existing agent selection. No stream, approval or grant-lifetime contract changes.
+
 Source fixtures cover aliases, unchanged maintenance grammar/default bytes, exact cap digests/bounds, aggregate overflow, channel separation, blocked sinks, descriptor flags and failed-exec restoration, bounded drain settlement, disconnects, atomic foreign-sender rejection during the monitor entry window, rejected ancillary-rights cleanup, user-controller death after routing publication but before release commit, native spawn proof and a target marker that cannot appear before release. Ignored native fixtures target actual owned cgroup cleanup with a blocked sink and an unaffected sibling. These definitions and formatting do not establish runtime support.
 
 Required native acceptance includes both launch scopes with real fresh approval, first-instruction Sudo after activation, failed/missing-interpreter startup, activation expiry/failure, stopped/dead controller or monitor including after activation publication before release witness/commit, immediate target exit and first-instruction Sudo, sandbox descriptor custody and authenticated native descendant proof, per-message sender-pidfd capability failure, cap/terminal/run-as behavior, blocked/disconnected sinks, positive job teardown and preserved unrelated grants/non-root work. Signed setup/helper payload, interruption/recovery/rollback/removal, binding/source/pinned-shell composition and setup-aware updates remain separate qualification slices. ADR0115/0116 maintenance and setup retention contracts remain in force. No other platform is qualified by this source change.

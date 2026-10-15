@@ -110,6 +110,8 @@ fn setup() -> Command {
         .subcommand(command("plan").args([
             path("deployment"),
             mode(),
+            choice("purpose", ["credentials", "privilege-only"]),
+            path("grant-policy"),
             choice("channel", ["stable"]),
             flag("offline"),
             path("release-root"),
@@ -126,7 +128,7 @@ fn setup() -> Command {
         .subcommand(command("apply").args([
             path("plan"),
             value("sha256"),
-            choice("authorize", ["sudo"]),
+            choice("authorize", ["sudo", "polkit"]),
             value("credential-stdin"),
             value("credential-fd"),
             value("credential-file"),
@@ -152,7 +154,16 @@ fn setup() -> Command {
             ]));
     }
     for name in ["readiness", "repair", "rollback", "deactivate", "uninstall"] {
-        setup = setup.subcommand(command(name).arg(mode()));
+        let mut operation = command(name).arg(mode());
+        if name == "repair" {
+            operation =
+                operation.about("Repair exact retained owned state while preserving credentials");
+        }
+        if name == "uninstall" {
+            operation = operation
+                .about("Retire owned enforcement while preserving policy and credential state");
+        }
+        setup = setup.subcommand(operation);
     }
     for name in [
         "install-policy",
@@ -201,6 +212,7 @@ fn specification() -> Command {
             "powershell",
         ])))
         .subcommand(setup())
+        .subcommand(crate::update_cli::specification())
         .subcommand(crate::doctor::specification())
         .subcommand(crate::secret_cli::specification())
         .subcommand(command("broker").subcommand(command("serve")))
@@ -219,29 +231,7 @@ fn specification() -> Command {
         .subcommand(
             command("workload")
                 .subcommand(crate::workload_cli::specification())
-                .subcommand(
-                    command("bind")
-                        .subcommand(
-                            command("discover")
-                                .arg(positional("command"))
-                                .arg(flag("json")),
-                        )
-                        .subcommand(
-                            command("plan").args([
-                                positional("name"),
-                                value("workload"),
-                                value("command-name"),
-                                choice("target", ["current-resolution", "structured"]),
-                                path("executable"),
-                                value("arg")
-                                    .action(clap::ArgAction::Append)
-                                    .allow_hyphen_values(true),
-                                value("caller-argument-index"),
-                                path("output"),
-                                flag("json"),
-                            ]),
-                        ),
-                ),
+                .subcommand(dev_auth::binding_cli::specification()),
         )
         .subcommand(
             command("reconcile")

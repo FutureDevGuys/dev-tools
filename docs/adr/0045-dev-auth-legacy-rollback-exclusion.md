@@ -8,6 +8,13 @@ owner: dev-auth
 status: proposed
 verification: pending
 
+## Successor
+
+[ADR 0120](0120-setup-owned-updates-and-preserving-maintenance.md) adds the
+transaction-aware Accepted-generation public repair/uninstall source route.
+The legacy native library guard and binary-only full-generation rollback refusal
+remain intact. The successor still requires independent signed/native acceptance.
+
 ## Decision
 
 The public Linux `setup repair`, `setup rollback` and `setup uninstall` commands resolve their installation and stable setup lock from the effective native account and explicit installation mode, not ambient home or path variables. Strong mode requires root and user-only mode requires a non-root native owner. Each obtains the same nonblocking exclusive lease used by full setup before inspecting or changing installation state and retains it through nested helper and receipt recovery. An admitted workload or another setup operation therefore blocks maintenance promptly. User-only legacy-session absence remains required because older executables did not hold admission leases. Native coordination on other platforms remains unavailable rather than falling back to uncoordinated mutation.

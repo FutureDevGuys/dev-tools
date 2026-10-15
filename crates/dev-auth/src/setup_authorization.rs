@@ -177,6 +177,18 @@ impl StrongSetupApplyAuthorization {
         arguments.push(OsString::from(self.format.as_str()));
         arguments
     }
+    pub fn require_polkit_safe_input(&self) -> Result<()> {
+        if self
+            .credentials
+            .values()
+            .any(|source| *source == CanonicalCredentialSource::Stdin)
+        {
+            bail!(
+                "PolicyKit setup authorization cannot forward credential stdin; use an explicit protected credential file or direct native setup"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,4 +250,51 @@ fn validate_normalized_absolute_path(path: &Path, description: &str) -> Result<(
         bail!("{description} path must be absolute and normalized");
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn authorize_strong_apply_via_polkit(
+    request: &StrongSetupApplyAuthorization,
+) -> Result<StrongSetupApplyAuthorizationOutcome> {
+    request.require_polkit_safe_input()?;
+    crate::setup::validate_installed_setup_helper()?;
+    crate::setup::validate_root_owned_executable(
+        Path::new("/usr/bin/pkexec"),
+        "native setup authorization",
+    )?;
+    let authorizer = dev_tools_privilege::PkexecAuthorizer::new("/usr/bin/pkexec")?;
+    authorize_strong_apply_with(&authorizer, request)
+}
+
+#[cfg(test)]
+mod polkit_input_tests {
+    use super::*;
+
+    #[test]
+    fn polkit_input_rejects_credential_stdin_before_native_authorization() {
+        let digest = "a".repeat(64);
+        let stdin = StrongSetupApplyAuthorization::new(
+            "/run/dev-auth/setup/plan.json",
+            &digest,
+            "json",
+            [SetupApplyCredentialInput::stdin("automation")],
+        )
+        .unwrap();
+        assert!(stdin.require_polkit_safe_input().is_err());
+        let file = StrongSetupApplyAuthorization::new(
+            "/run/dev-auth/setup/plan.json",
+            &digest,
+            "json",
+            [SetupApplyCredentialInput::file(
+                "automation",
+                "/run/dev-auth/input/token",
+            )],
+        )
+        .unwrap();
+        file.require_polkit_safe_input().unwrap();
+        assert!(file
+            .native_arguments()
+            .iter()
+            .any(|value| value == "--credential-file"));
+    }
 }

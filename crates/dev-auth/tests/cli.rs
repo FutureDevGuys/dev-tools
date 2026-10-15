@@ -1642,6 +1642,7 @@ config = "{}"
     let installation = build_plan(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.3.0-clean-device-test".into(),
             source_executable: candidate,
@@ -1916,8 +1917,12 @@ config = "{}"
             !busy.status.success(),
             "{operation} bypassed an admitted workload"
         );
-        assert!(String::from_utf8_lossy(&busy.stderr)
-            .contains("requires active workloads and setup to finish"));
+        assert_eq!(busy.status.code(), Some(3));
+        assert!(busy.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&busy.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-auth-setup-maintenance-report-v1");
+        assert_eq!(report["changed"], false);
+        assert_eq!(report["next_action"], "wait_for_active_workloads_or_setup");
         assert_eq!(
             fs::read(paths.data_root.join("install-v2.json")).unwrap(),
             receipt_before
@@ -1937,28 +1942,118 @@ config = "{}"
         fs::read(paths.data_root.join("install-v2.json")).unwrap(),
         receipt_before
     );
-    for operation in ["repair", "uninstall"] {
-        let refused = Command::new(user.dir.join(".local/bin/dev-auth"))
-            .args(["setup", operation, "--mode", "user-only"])
-            .env_clear()
-            .output()
-            .unwrap();
-        assert!(
-            !refused.status.success(),
-            "{operation} bypassed retained setup"
-        );
-        assert!(String::from_utf8_lossy(&refused.stderr)
-            .contains("full setup generation requires transaction-aware maintenance"));
-        assert_eq!(
-            fs::read(paths.data_root.join("install-v2.json")).unwrap(),
-            receipt_before
-        );
-    }
+    let retained_candidate = serde_json::from_slice::<serde_json::Value>(&receipt_before).unwrap()
+        ["executable"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let preserved_actions = fs::read(paths.data_root.join("credential-actions-v2.json")).unwrap();
+    let installed_policy = user
+        .dir
+        .join(dev_auth::policy_store::USER_POLICY_RELATIVE_PATH);
+    let installed_config = user
+        .dir
+        .join(dev_auth::policy_store::USER_CONFIG_RELATIVE_PATH);
+    let preserved_policy = fs::read(&installed_policy).unwrap();
+    let preserved_config = fs::read(&installed_config).unwrap();
+    let repair = |executable: &Path| {
+        bounded_output(
+            Command::new(executable)
+                .args(["setup", "repair", "--mode", "user-only"])
+                .env_clear(),
+        )
+    };
+    let healthy = repair(Path::new(&retained_candidate));
+    assert_eq!(
+        healthy.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&healthy.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-auth-setup-maintenance-report-v1");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["verified"], true);
+    let owned_alias = user.dir.join(".local/bin/gh-dev-auth");
+    fs::remove_file(&owned_alias).unwrap();
+    let repaired = repair(Path::new(&retained_candidate));
+    assert_eq!(
+        repaired.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&repaired.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(report["changed"], true);
+    assert_eq!(report["verified"], true);
+    assert!(owned_alias.exists());
+    assert_eq!(
+        fs::read(paths.data_root.join("credential-actions-v2.json")).unwrap(),
+        preserved_actions
+    );
+    assert_eq!(fs::read(&installed_policy).unwrap(), preserved_policy);
+    assert_eq!(fs::read(&installed_config).unwrap(), preserved_config);
     assert!(user.dir.join(".local/bin/git").exists());
     let deactivated = deactivate_transparent_launchers_at(&paths).unwrap();
     assert!(!deactivated.transparent_launchers_active);
     assert!(!user.dir.join(".local/bin/git").exists());
     assert!(!user.dir.join(".local/bin/gh").exists());
+    for expected_changed in [true, false] {
+        let uninstalled = bounded_output(
+            Command::new(&retained_candidate)
+                .args(["setup", "uninstall", "--mode", "user-only"])
+                .env_clear(),
+        );
+        assert_eq!(
+            uninstalled.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&uninstalled.stdout)
+        );
+        assert!(uninstalled.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&uninstalled.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-auth-setup-maintenance-report-v1");
+        assert_eq!(report["changed"], expected_changed);
+        assert_eq!(report["verified"], true);
+        assert_eq!(report["next_action"], "create_setup_plan");
+        assert_eq!(report["retry_executable"], retained_candidate);
+        assert!(!paths.data_root.join("install-v2.json").exists());
+        assert!(!paths.bin_dir.join("dev-auth").exists());
+        assert!(Path::new(&retained_candidate).exists());
+        assert_eq!(
+            fs::read(paths.data_root.join("credential-actions-v2.json")).unwrap(),
+            preserved_actions
+        );
+        assert_eq!(fs::read(&installed_policy).unwrap(), preserved_policy);
+        assert_eq!(fs::read(&installed_config).unwrap(), preserved_config);
+        assert!(Path::new(&plan.installation.request.native_git).exists());
+        assert!(Path::new(&plan.installation.request.native_gh).exists());
+        let transition: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.data_root.join("setup-transition-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transition["phase"], "uninstalled_inactive");
+    }
+    let marker_path = paths.data_root.join("setup-transition-v1.json");
+    let marker = fs::read(&marker_path).unwrap();
+    fs::write(
+        &marker_path,
+        b"malformed full authority must not select legacy maintenance",
+    )
+    .unwrap();
+    let refused = repair(Path::new(&retained_candidate));
+    assert_eq!(refused.status.code(), Some(4));
+    assert!(refused.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(report["schema"], "dev-auth-setup-maintenance-report-v1");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["error_kind"], "setup_maintenance_authority");
+    assert_eq!(fs::read(&installed_policy).unwrap(), preserved_policy);
+    assert_eq!(
+        fs::read(paths.data_root.join("credential-actions-v2.json")).unwrap(),
+        preserved_actions
+    );
+    fs::write(&marker_path, marker).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -2039,6 +2134,7 @@ fn run_installed_user_reconcile_child() {
     install_at(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.4.0".into(),
             source_executable: user.dir.parent().unwrap().join("product"),
@@ -2424,6 +2520,7 @@ mode = "none"
         dev_auth::setup::install_at(
             &SetupPaths::user_only(&user.dir),
             &InstallRequest {
+                purpose: Default::default(),
                 mode: InstallMode::UserOnly,
                 version: "0.3.11".into(),
                 source_executable: prior_source,
@@ -2533,6 +2630,7 @@ intent = "enroll-if-absent"
     let installation = build_plan(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: if logical {
                 "0.4.0"
@@ -2951,7 +3049,11 @@ intent = "enroll-if-absent"
                 prior_policy
             );
             assert_eq!(
-                fs::read(user.dir.join(".config/dev-auth/config-v2.toml")).unwrap(),
+                fs::read(
+                    user.dir
+                        .join(dev_auth::policy_store::USER_CONFIG_RELATIVE_PATH)
+                )
+                .unwrap(),
                 prior_config
             );
             let installed = dev_auth::setup::verify_at_read_only(&paths).unwrap();
@@ -2960,7 +3062,8 @@ intent = "enroll-if-absent"
         } else {
             for path in [
                 user.dir.join(".config/dev-auth/policy-v2.toml"),
-                user.dir.join(".config/dev-auth/config-v2.toml"),
+                user.dir
+                    .join(dev_auth::policy_store::USER_CONFIG_RELATIVE_PATH),
                 paths.data_root.join("install-v2.json"),
                 paths.data_root.join("installation-receipt-v1.json"),
                 paths.data_root.join("active"),
@@ -3032,7 +3135,10 @@ intent = "enroll-if-absent"
         assert!(user.dir.join(".config/dev-auth/policy-v3.toml").is_file());
         assert!(user.dir.join(".config/dev-auth/config-v3.toml").is_file());
         assert!(!user.dir.join(".config/dev-auth/policy-v2.toml").exists());
-        assert!(!user.dir.join(".config/dev-auth/config-v2.toml").exists());
+        assert!(!user
+            .dir
+            .join(dev_auth::policy_store::USER_CONFIG_RELATIVE_PATH)
+            .exists());
         for source in plan
             .source_documents
             .iter()
@@ -3302,6 +3408,7 @@ fn standalone_legacy_setup_keeps_native_repair_rollback_and_uninstall() {
         install_at(
             &paths,
             &InstallRequest {
+                purpose: Default::default(),
                 mode: InstallMode::UserOnly,
                 version: env!("CARGO_PKG_VERSION").into(),
                 source_executable: user.dir.parent().unwrap().join("artifact"),
@@ -3705,6 +3812,7 @@ products = ["fixture"]
     let receipt = install_at(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.4.0".into(),
             source_executable: user.dir.parent().unwrap().join("product"),
@@ -5607,6 +5715,7 @@ resources = {}
     let receipt = install_at(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.5.0-launcher-fixture".into(),
             source_executable: user.dir.parent().unwrap().join("product"),
@@ -5625,4 +5734,102 @@ resources = {}
     .unwrap();
     assert_installed_launcher_identity(&paths.bin_dir, &user.dir);
     assert!(!marker.exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn uninstalled_update_observation_is_external_and_does_not_fetch_or_create_state() {
+    let root = tempfile::tempdir().unwrap();
+    for operation in ["status", "check"] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .env("HOME", root.path())
+                .env("PATH", "/missing")
+                .current_dir(root.path())
+                .args(["update", operation, "--json"]),
+        );
+        assert!(output.status.success(), "{operation}");
+        assert!(output.stderr.is_empty(), "{operation}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-tools-operation-result-v2");
+        assert_eq!(report["operation"], format!("update_{operation}"));
+        assert_eq!(report["outcome"], "external");
+        assert_eq!(report["changed"], false);
+        assert_eq!(report["installation_state"], "external");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    let apply = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["update", "apply", "--json"]),
+    );
+    assert_eq!(apply.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&apply.stdout).unwrap()["outcome"],
+        "external"
+    );
+    let install = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["update", "install", "--offline", "--json"]),
+    );
+    assert_eq!(install.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&install.stdout).unwrap()["outcome"],
+        "requires_setup"
+    );
+}
+
+#[test]
+fn common_update_invalid_json_invocation_is_one_value_free_result() {
+    for arguments in [
+        vec!["update", "apply", "--offline", "--offline", "--json"],
+        vec!["update", "status", "--offline", "--json"],
+        vec!["update", "rollback", "--offline", "--json"],
+        vec![
+            "update",
+            "check",
+            "private-input-must-not-be-echoed",
+            "--json",
+        ],
+        vec!["update", "--json"],
+    ] {
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .env_clear()
+                .args(arguments),
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "dev-tools-operation-result-v2");
+        assert_eq!(report["changed"], false);
+        assert_eq!(report["error_kind"], "invalid_invocation");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-input"));
+    }
+}
+
+#[test]
+fn common_update_grammar_is_public_and_staging_worker_is_private() {
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["update", "--help"]),
+    );
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    for operation in ["status", "check", "install", "apply", "rollback"] {
+        assert!(help.contains(operation));
+    }
+    assert!(!help.contains("update-worker"));
+    let output = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .args(["completion", "bash"]),
+    );
+    assert!(output.status.success());
+    let completion = String::from_utf8(output.stdout).unwrap();
+    assert!(completion.contains("update"));
+    assert!(!completion.contains("update-worker"));
 }

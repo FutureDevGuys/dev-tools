@@ -1,0 +1,19 @@
+[package]
+name = "dev-auth-sudo"
+version = "0.5.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Receipt-owned native sudo bridge for Dev Auth; not a standalone product"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "socket", "time", "uio", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

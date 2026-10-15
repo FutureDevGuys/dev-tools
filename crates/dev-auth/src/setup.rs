@@ -39,6 +39,13 @@ pub fn setup_template(name: &str) -> Result<&'static str> {
         "administrator-policy-v3" => Ok(include_str!("../policy-v3.example.toml")),
         "user-only-policy-v3" => Ok(include_str!("../policy-v3-user-only.example.toml")),
         "user-config-v3" => Ok(include_str!("../config-v3.example.toml")),
+        "administrator-grant-policy" => {
+            Ok(include_str!("../administrator-grant-policy.example.json"))
+        }
+        "privilege-deployment" => Ok(include_str!("../privilege-deployment.example.toml")),
+        "credential-grant-deployment" => {
+            Ok(include_str!("../credential-grant-deployment.example.toml"))
+        }
         _ => bail!(
             "setup template must be one of: {}",
             crate::SETUP_TEMPLATE_NAMES.join(", ")
@@ -339,7 +346,7 @@ impl SetupPaths {
         self.data_root.join("install-v2.json")
     }
 
-    fn versioned_binary(&self, version: &str) -> PathBuf {
+    pub(crate) fn versioned_binary(&self, version: &str) -> PathBuf {
         self.data_root
             .join("versions")
             .join(version)
@@ -402,6 +409,11 @@ fn require_shared_receipt_agreement(
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::deployment::SetupPurpose::is_credentials"
+    )]
+    pub purpose: crate::deployment::SetupPurpose,
     pub mode: InstallMode,
     pub version: String,
     pub source_executable: PathBuf,
@@ -425,6 +437,11 @@ pub struct SetupPlan {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstallReceipt {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::deployment::SetupPurpose::is_credentials"
+    )]
+    pub purpose: crate::deployment::SetupPurpose,
     pub schema: String,
     pub mode: InstallMode,
     pub version: String,
@@ -651,7 +668,7 @@ pub fn build_plan(paths: &SetupPaths, request: &InstallRequest) -> Result<SetupP
     validate_install_request(paths, request)?;
     let (source_length, source_sha256) = file_identity(&request.source_executable)?;
     Ok(SetupPlan {
-        schema: "dev-auth-setup-plan-v2".into(),
+        schema: binary_plan_schema(request.purpose).into(),
         paths: paths.clone(),
         request: request.clone(),
         source_length,
@@ -692,6 +709,7 @@ pub fn build_verified_release_plan_with_native_programs(
         }
     };
     let request = InstallRequest {
+        purpose: Default::default(),
         mode,
         version: verified.version.clone(),
         source_executable: artifact,
@@ -734,6 +752,7 @@ pub fn discover_plan(mode: InstallMode, activate_transparent_launchers: bool) ->
     build_plan(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode,
             version: env!("CARGO_PKG_VERSION").into(),
             source_executable,
@@ -1431,7 +1450,7 @@ pub fn transparent_launchers_resolve_first_at(
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspect {command} from PATH"))
+                    return Err(error).with_context(|| format!("inspect {command} from PATH"));
                 }
             }
         }
@@ -1921,6 +1940,9 @@ fn install_at_with_release(
     {
         bail!("installation mode cannot change in place");
     }
+    if let Some(prior) = &prior_receipt {
+        require_preserving_purpose(prior.purpose, request.purpose)?;
+    }
     if prior_receipt.as_ref().is_some_and(|prior| {
         prior.version != request.version && !prior.transparent_aliases.is_empty()
     }) {
@@ -2085,6 +2107,7 @@ fn selected_installation_receipt(
         None => None,
     };
     InstallReceipt {
+        purpose: request.purpose,
         schema: RECEIPT_SCHEMA.into(),
         mode: request.mode,
         version: request.version.clone(),
@@ -2126,6 +2149,7 @@ fn validate_release_transition(
     requested_source_sha256: &str,
     verified_release: Option<&crate::release_manifest::VerifiedDevAuthRelease>,
 ) -> Result<()> {
+    require_preserving_purpose(prior.purpose, request.purpose)?;
     let prior_authenticated = prior.source_commit.is_some()
         || prior.root_generation.is_some()
         || prior.manifest_generation.is_some();
@@ -2288,6 +2312,30 @@ fn verify_receipted_installation_read_only(
     }
 }
 
+/// Observe only the installed binary identity after a candidate-owned update.
+/// The old process cannot validate successor helper text against its own
+/// compiled payload. Complete native acceptance belongs to the candidate;
+/// receipt, bytes, aliases and shared ledger are still freshly observed here.
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_update_installation_identity_at(
+    paths: &SetupPaths,
+) -> Result<InstallReceipt> {
+    let receipt = read_receipt(&paths.receipt_path())?;
+    let shared = dev_tools_installation::observe_versioned_installation(
+        &shared_installation_layout(paths, receipt.mode),
+        BINARY_LIMIT,
+    )?
+    .context("updated shared installation receipt is absent")?;
+    require_shared_receipt_agreement(&receipt, &shared)?;
+    verify_receipted_installation_components(
+        paths,
+        &receipt,
+        false,
+        StrongAssetVerification::None,
+    )?;
+    Ok(receipt)
+}
+
 /// Revalidate an already-approved setup candidate without disposable release
 /// inputs. The caller must first establish the exact private transition record.
 /// The returned proof can complete only this retained installation generation.
@@ -2368,7 +2416,8 @@ pub(crate) fn retained_candidate_validation_from_source(
     } else {
         None
     };
-    if plan.schema != "dev-auth-setup-plan-v2"
+    if plan.schema != binary_plan_schema(plan.request.purpose)
+        || receipt.purpose != plan.request.purpose
         || receipt.mode != plan.request.mode
         || receipt.version != plan.request.version
         || receipt.executable_length != plan.source_length
@@ -3025,8 +3074,7 @@ fn verify_forward_binary_candidate(
         &TRANSPARENT_ALIASES,
         true,
     )?;
-    validate_native_program(Path::new(&receipt.native_git), "native Git")?;
-    validate_native_program(Path::new(&receipt.native_gh), "native GitHub CLI")?;
+    validate_receipted_native_tools(receipt)?;
     Ok(())
 }
 
@@ -3184,8 +3232,7 @@ fn verify_receipted_installation_components(
         &TRANSPARENT_ALIASES,
         true,
     )?;
-    validate_native_program(Path::new(&receipt.native_git), "native Git")?;
-    validate_native_program(Path::new(&receipt.native_gh), "native GitHub CLI")?;
+    validate_receipted_native_tools(receipt)?;
     if receipt.mode == InstallMode::Strong {
         if match strong {
             StrongAssetVerification::Complete => true,
@@ -3242,6 +3289,7 @@ pub fn repair_at(paths: &SetupPaths) -> Result<SetupReport> {
         sha256: receipt.executable_sha256.clone(),
     };
     let request = InstallRequest {
+        purpose: receipt.purpose,
         mode: receipt.mode,
         version: receipt.version,
         source_executable: PathBuf::from(receipt.executable),
@@ -3330,6 +3378,11 @@ fn native_setup_exclusion(
     let lease = dev_tools_installation::InstallationLock::try_acquire(&lock)?
         .with_context(|| format!("{operation} requires active workloads and setup to finish"))?;
     require_strong_maintenance_quiescence(&paths, mode)?;
+    #[cfg(target_os = "linux")]
+    if mode == InstallMode::Strong {
+        require_independent_setup_execution()?;
+        restoration::require_grant_domain_empty()?;
+    }
     if mode == InstallMode::UserOnly {
         require_user_sessions_absent()?;
     }
@@ -3883,14 +3936,8 @@ pub fn privileged_launcher_path() -> &'static Path {
 }
 
 pub fn validate_running_privileged_launcher() -> Result<PathBuf> {
-    let current = std::env::current_exe().context("resolve privileged workload launcher")?;
-    if current != Path::new(PRIVILEGED_LAUNCHER_PATH) {
-        bail!("privileged workload dispatch requires the dedicated launcher identity");
-    }
-    let (paths, receipt) = current_installation_from_privileged_launcher(&current)?;
-    let executable = paths.versioned_binary(&receipt.version);
-    verify_privileged_launcher(&executable, &receipt)?;
-    Ok(executable)
+    let (paths, receipt) = validated_privileged_launcher_installation()?;
+    Ok(paths.versioned_binary(&receipt.version))
 }
 
 fn current_installation_from_privileged_launcher(
@@ -4147,11 +4194,18 @@ fn validate_install_request(paths: &SetupPaths, request: &InstallRequest) -> Res
         bail!("dev-auth data and launcher directories must not contain one another");
     }
     validate_native_program(&request.source_executable, "setup executable")?;
-    validate_native_program(&request.native_git, "native Git")?;
-    validate_native_program(&request.native_gh, "native GitHub CLI")?;
-    if request.native_git == request.native_gh
-        || request.native_git.starts_with(&paths.bin_dir)
-        || request.native_gh.starts_with(&paths.bin_dir)
+    validate_native_tool_selection(
+        request.purpose,
+        request.mode,
+        &request.version,
+        &request.native_git,
+        &request.native_gh,
+        request.activate_transparent_launchers,
+    )?;
+    if request.purpose.is_credentials()
+        && (request.native_git == request.native_gh
+            || request.native_git.starts_with(&paths.bin_dir)
+            || request.native_gh.starts_with(&paths.bin_dir))
     {
         bail!("native programs must be distinct and outside the managed launcher directory");
     }
@@ -4159,8 +4213,10 @@ fn validate_install_request(paths: &SetupPaths, request: &InstallRequest) -> Res
         bail!("strong setup activates same-name launchers only after broker readiness");
     }
     if request.mode == InstallMode::Strong {
-        validate_root_owned_executable(&request.native_git, "native Git")?;
-        validate_root_owned_executable(&request.native_gh, "native GitHub CLI")?;
+        if request.purpose.is_credentials() {
+            validate_root_owned_executable(&request.native_git, "native Git")?;
+            validate_root_owned_executable(&request.native_gh, "native GitHub CLI")?;
+        }
         for (path, description) in [
             (Path::new("/usr/bin/pkexec"), "polkit workload launcher"),
             (
@@ -4404,28 +4460,13 @@ pub fn reconcile_system_policy_at(
     approved_sha256: &str,
     current_sha256: Option<&str>,
 ) -> Result<PathBuf> {
-    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
-        bail!("administrator policy installation requires root and the system layout");
-    }
-    let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
-    validate_system_policy_programs(&policy)?;
-    let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
-    match (fs::symlink_metadata(&destination), current_sha256) {
-        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
-            install_policy_document(&destination, &bytes, 0, 0o644)?;
-        }
-        (Err(error), _) => return Err(error).context("inspect administrator policy"),
-        (Ok(_), _) if fs::read(&destination)? == bytes => {
-            install_policy_document(&destination, &bytes, 0, 0o644)?;
-        }
-        (Ok(_), Some(current)) => {
-            require_stopped_strong_installation_at(paths)?;
-            replace_policy_document(&destination, &bytes, 0, 0o644, current)?;
-        }
-        (Ok(_), None) => install_policy_document(&destination, &bytes, 0, 0o644)?,
-    }
-    Ok(destination)
+    reconcile_system_policy_with_bound_launchers_at(
+        paths,
+        source,
+        approved_sha256,
+        current_sha256,
+        &BTreeMap::new(),
+    )
 }
 
 pub fn update_system_policy(
@@ -4705,7 +4746,9 @@ fn reconcile_user_config_for_account_with_integrations_at(
             let desktop_rollback =
                 reconcile_desktop_entries_at(&user.dir, &old_workloads, owner_uid);
             if alias_rollback.is_err() || desktop_rollback.is_err() {
-                bail!("user configuration apply failed and integration rollback was incomplete: {error:#}");
+                bail!(
+                    "user configuration apply failed and integration rollback was incomplete: {error:#}"
+                );
             }
         }
         return Err(error).context("apply user configuration transaction");
@@ -4826,7 +4869,17 @@ pub fn verify_user_integrations_at(
     owner_uid: u32,
 ) -> Result<UserIntegrationReport> {
     let aliases = workloads.keys().cloned().collect::<Vec<_>>();
-    validate_workload_alias_names(&aliases)?;
+    verify_user_integrations_with_aliases_at(home, executable, workloads, &aliases, owner_uid)
+}
+
+pub fn verify_user_integrations_with_aliases_at(
+    home: &Path,
+    executable: &Path,
+    workloads: &BTreeMap<String, crate::policy_v2::ResolvedWorkload>,
+    aliases: &[String],
+    owner_uid: u32,
+) -> Result<UserIntegrationReport> {
+    validate_workload_alias_names(aliases)?;
     validate_native_program(executable, "workload broker executable")?;
     let workload_receipt = read_workload_alias_receipt(home, owner_uid)?;
     if aliases.is_empty() {
@@ -4840,10 +4893,12 @@ pub fn verify_user_integrations_at(
         let receipt = workload_receipt
             .as_ref()
             .context("workload launcher receipt is not installed")?;
-        if receipt.executable != executable.display().to_string() || receipt.aliases != aliases {
+        if receipt.executable != executable.display().to_string()
+            || receipt.aliases.as_slice() != aliases
+        {
             bail!("workload launcher receipt does not match the resolved policy");
         }
-        for alias in &aliases {
+        for alias in aliases {
             let path = home.join(".local/bin").join(alias);
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspect workload launcher {}", path.display()))?;
@@ -5431,18 +5486,7 @@ pub fn resolve_current_workload_alias(alias: &str) -> Result<crate::policy_v2::R
         .context("native user account does not exist")?;
     let (_, installation) = current_runtime_installation()?;
     let executable = PathBuf::from(&installation.executable);
-    let receipt = read_workload_alias_receipt(&user.dir, owner_uid)?
-        .context("workload launcher receipt is not installed")?;
-    if !receipt.aliases.iter().any(|value| value == alias)
-        || Path::new(&receipt.executable) != executable
-    {
-        bail!("workload launcher is outside the installed alias set");
-    }
-    let path = user.dir.join(".local/bin").join(alias);
-    let metadata = fs::symlink_metadata(&path).context("inspect current workload launcher")?;
-    if !metadata.file_type().is_symlink() || fs::read_link(&path)? != executable {
-        bail!("current workload launcher does not match its receipt");
-    }
+    verify_current_workload_alias_link(alias, &user.dir, owner_uid, &executable)?;
     let policy = match installation.mode {
         InstallMode::Strong => crate::policy_store::load_resolved_policy_for_uid(owner_uid)?,
         InstallMode::UserOnly => {
@@ -6063,7 +6107,7 @@ fn discover_native_program(
 }
 
 fn validate_plan(plan: &SetupPlan) -> Result<()> {
-    if plan.schema != "dev-auth-setup-plan-v2" {
+    if plan.schema != binary_plan_schema(plan.request.purpose) {
         bail!("dev-auth setup plan schema is unsupported");
     }
     if plan.source_length == 0
@@ -6617,7 +6661,9 @@ fn prepare_setup_helper_install_recovery(
     }
     let Some(interrupted) = inspect_interrupted_setup_helper_release(paths, committed)? else {
         if artifacts_present {
-            bail!("pre-helper installation contains setup helper artifacts without an interrupted-transition receipt");
+            bail!(
+                "pre-helper installation contains setup helper artifacts without an interrupted-transition receipt"
+            );
         }
         return Ok(false);
     };
@@ -7101,7 +7147,9 @@ pub(crate) fn validated_setup_helper_path(
         bail!("setup helper is available only for the strong system installation");
     }
     if !release_supports_setup_helper(receipt) {
-        bail!("this pre-helper dev-auth release requires one authenticated package or deployment-client bootstrap before privileged setup can be self-hosted");
+        bail!(
+            "this pre-helper dev-auth release requires one authenticated package or deployment-client bootstrap before privileged setup can be self-hosted"
+        );
     }
     verify_setup_helper(paths, receipt)?;
     Ok(PathBuf::from(SETUP_HELPER_PATH))
@@ -7271,7 +7319,7 @@ fn publish_executable_copy(
         Ok(_) => bail!("interrupted {description} temporary has unsafe authority"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("inspect {description} temporary"))
+            return Err(error).with_context(|| format!("inspect {description} temporary"));
         }
     }
     stage_executable_copy(source, &temporary, &expected)?;
@@ -7355,7 +7403,7 @@ fn install_aliases(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).with_context(|| format!("inspect launcher {}", alias.display()))
+                return Err(error).with_context(|| format!("inspect launcher {}", alias.display()));
             }
         }
     }
@@ -7526,6 +7574,7 @@ mod tests {
         }
         let paths = SetupPaths::user_only(&root.path().join("home"));
         let request = InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.4.0".into(),
             source_executable: source,
@@ -8341,6 +8390,7 @@ mod tests {
         let authority = dev_tools_installation::ArtifactIdentity { length, sha256 };
         let paths = SetupPaths::user_only(&root.path().join("home"));
         let request = InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.4.0".into(),
             source_executable: source.clone(),
@@ -8575,6 +8625,7 @@ mod tests {
     ) -> InstallReceipt {
         let (executable_length, executable_sha256) = file_identity(source).unwrap();
         InstallReceipt {
+            purpose: Default::default(),
             schema: RECEIPT_SCHEMA.into(),
             mode: InstallMode::Strong,
             version: version.into(),
@@ -8623,6 +8674,7 @@ mod tests {
             schema: "dev-auth-setup-plan-v2".into(),
             paths,
             request: InstallRequest {
+                purpose: Default::default(),
                 mode: InstallMode::UserOnly,
                 version: prior.version.clone(),
                 source_executable: source,
@@ -9498,6 +9550,7 @@ adapters = []
     #[test]
     fn authenticated_installations_reject_unsigned_and_generation_rollback_updates() {
         let prior = InstallReceipt {
+            purpose: Default::default(),
             schema: RECEIPT_SCHEMA.into(),
             mode: InstallMode::UserOnly,
             version: "0.3.0".into(),
@@ -9517,6 +9570,7 @@ adapters = []
             previous_release: None,
         };
         let mut request = InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.3.1".into(),
             source_executable: PathBuf::from("/opt/candidate/dev-auth"),
@@ -9867,4 +9921,237 @@ adapters = []
                 .is_err()
         );
     }
+}
+
+pub(crate) fn binary_plan_schema(purpose: crate::deployment::SetupPurpose) -> &'static str {
+    if purpose.is_credentials() {
+        "dev-auth-setup-plan-v2"
+    } else {
+        "dev-auth-setup-binary-plan-v3"
+    }
+}
+
+fn validate_native_tool_selection(
+    purpose: crate::deployment::SetupPurpose,
+    mode: InstallMode,
+    version: &str,
+    git: &Path,
+    gh: &Path,
+    transparent: bool,
+) -> Result<()> {
+    if purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        if !cfg!(target_os = "linux")
+            || mode != InstallMode::Strong
+            || semver::Version::parse(version)? < semver::Version::new(0, 5, 0)
+            || !git.as_os_str().is_empty()
+            || !gh.as_os_str().is_empty()
+            || transparent
+        {
+            bail!("privilege-only installation has incompatible credential-tool authority");
+        }
+        return Ok(());
+    }
+    validate_native_program(git, "native Git")?;
+    validate_native_program(gh, "native GitHub CLI")?;
+    Ok(())
+}
+
+fn validate_receipted_native_tools(receipt: &InstallReceipt) -> Result<()> {
+    validate_native_tool_selection(
+        receipt.purpose,
+        receipt.mode,
+        &receipt.version,
+        Path::new(&receipt.native_git),
+        Path::new(&receipt.native_gh),
+        !receipt.transparent_aliases.is_empty(),
+    )
+}
+
+pub(crate) fn build_verified_privilege_release_plan(
+    verified: crate::release_manifest::VerifiedDevAuthRelease,
+) -> Result<SetupPlan> {
+    let request = InstallRequest {
+        purpose: crate::deployment::SetupPurpose::PrivilegeOnly,
+        mode: InstallMode::Strong,
+        version: verified.version.clone(),
+        source_executable: fs::canonicalize(&verified.artifact_path)?,
+        native_git: PathBuf::new(),
+        native_gh: PathBuf::new(),
+        activate_transparent_launchers: false,
+    };
+    let mut plan = build_plan(&SetupPaths::strong(), &request)?;
+    if plan.source_length != verified.artifact_length
+        || plan.source_sha256 != verified.artifact_sha256
+    {
+        bail!("privilege release changed before planning");
+    }
+    plan.verified_release = Some(verified);
+    validate_plan(&plan)?;
+    Ok(plan)
+}
+
+pub(crate) fn require_preserving_purpose(
+    prior: crate::deployment::SetupPurpose,
+    next: crate::deployment::SetupPurpose,
+) -> Result<()> {
+    if prior != next {
+        bail!("installation purpose changes require a complete preserving setup transition");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn require_independent_setup_execution() -> Result<()> {
+    let group = crate::linux_admission::read_unified_cgroup(std::process::id())?;
+    if setup_is_in_privilege_domain(&group) {
+        bail!(
+            "setup and recovery require independent native approval outside administrator-grant execution; use --authorize polkit from an ordinary terminal"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn setup_is_in_privilege_domain(group: &Path) -> bool {
+    group.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name.starts_with("dev-auth-maintenance-")
+            || name == "dev-auth-grants.service"
+            || name
+                .strip_prefix("dev-auth-grants-accept-")
+                .and_then(|name| name.strip_suffix(".service"))
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
+}
+
+pub(crate) fn read_install_receipt_at(paths: &SetupPaths) -> Result<Option<InstallReceipt>> {
+    match fs::symlink_metadata(paths.receipt_path()) {
+        Ok(_) => read_receipt(&paths.receipt_path()).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect current installation receipt"),
+    }
+}
+
+pub(crate) fn validated_privileged_launcher_installation() -> Result<(SetupPaths, InstallReceipt)> {
+    let current = std::env::current_exe().context("resolve privileged workload launcher")?;
+    if current != Path::new(PRIVILEGED_LAUNCHER_PATH) {
+        bail!("privileged workload dispatch requires the dedicated launcher identity");
+    }
+    let (paths, receipt) = current_installation_from_privileged_launcher(&current)?;
+    let executable = paths.versioned_binary(&receipt.version);
+    verify_privileged_launcher(&executable, &receipt)?;
+    Ok((paths, receipt))
+}
+
+pub(crate) fn verify_current_workload_alias_link(
+    alias: &str,
+    home: &Path,
+    owner_uid: u32,
+    executable: &Path,
+) -> Result<()> {
+    validate_workload_alias_names(&[alias.to_owned()])?;
+    let receipt = read_workload_alias_receipt(home, owner_uid)?
+        .context("workload launcher receipt is not installed")?;
+    if !receipt.aliases.iter().any(|value| value == alias)
+        || Path::new(&receipt.executable) != executable
+    {
+        bail!("workload launcher is outside the installed alias set");
+    }
+    let path = home.join(".local/bin").join(alias);
+    let metadata = fs::symlink_metadata(&path).context("inspect current workload launcher")?;
+    if !metadata.file_type().is_symlink() || fs::read_link(&path)? != executable {
+        bail!("current workload launcher does not match its receipt");
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_system_policy_with_bound_launchers_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    current_sha256: Option<&str>,
+    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
+) -> Result<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        bail!("strong administrator policy mutation requires a native platform backend");
+    }
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("administrator policy installation requires root and the system layout");
+    }
+    if !selected_mutable_launchers.is_empty() {
+        #[cfg(target_os = "linux")]
+        crate::setup_v3::require_pending_binding_policy_selection(
+            paths,
+            approved_sha256,
+            selected_mutable_launchers,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        bail!("mutable binding publication requires a native Linux backend");
+    }
+    let bytes = read_approved_public_document(source, approved_sha256)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
+    validate_system_policy_programs_with_bindings(&policy, selected_mutable_launchers)?;
+    let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
+    match (fs::symlink_metadata(&destination), current_sha256) {
+        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+            install_policy_document(&destination, &bytes, 0, 0o644)?;
+        }
+        (Err(error), _) => return Err(error).context("inspect administrator policy"),
+        (Ok(_), _) if fs::read(&destination)? == bytes => {
+            install_policy_document(&destination, &bytes, 0, 0o644)?;
+        }
+        (Ok(_), Some(current)) => {
+            require_stopped_strong_installation_at(paths)?;
+            replace_policy_document(&destination, &bytes, 0, 0o644, current)?;
+        }
+        (Ok(_), None) => install_policy_document(&destination, &bytes, 0, 0o644)?,
+    }
+    Ok(destination)
+}
+
+fn validate_system_policy_programs_with_bindings(
+    policy: &crate::runtime_policy::RuntimeAdministrator,
+    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
+) -> Result<()> {
+    if policy.mode() != crate::policy_v2::SystemMode::Strong {
+        bail!("administrator policy document has the wrong mode");
+    }
+    for (description, path) in policy
+        .programs()
+        .into_iter()
+        .chain(policy.provider_programs())
+    {
+        validate_root_owned_executable(Path::new(path), description)?;
+    }
+    for path in policy.trusted_launchers().values() {
+        match selected_mutable_launchers.get(Path::new(path)) {
+            Some(uid) if *uid > 0 => validate_user_or_root_executable(
+                Path::new(path),
+                *uid,
+                "setup-bound mutable workload launcher",
+            )?,
+            Some(_) => bail!("setup-bound mutable launcher has no native owner"),
+            None => validate_root_owned_executable(Path::new(path), "trusted workload launcher")?,
+        }
+    }
+    if selected_mutable_launchers.keys().any(|path| {
+        !policy
+            .trusted_launchers()
+            .values()
+            .any(|trusted| Path::new(trusted) == path)
+    }) {
+        bail!("setup-bound mutable launcher is outside administrator policy");
+    }
+    for adapter in policy.sandbox_adapters().values() {
+        validate_root_owned_executable(
+            Path::new(&adapter.executable),
+            "sandbox adapter executable",
+        )?;
+    }
+    Ok(())
 }

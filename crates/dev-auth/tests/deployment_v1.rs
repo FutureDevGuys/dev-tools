@@ -2,7 +2,7 @@
 
 use dev_auth::deployment::{
     canonical_deployment_intent, normalize_deployment, parse_deployment_document, Activation,
-    Channel, CredentialIntent, DeploymentCliInput, DeploymentMode,
+    Channel, CredentialIntent, DeploymentBinding, DeploymentCliInput, DeploymentMode,
 };
 use dev_auth::setup::{build_plan, InstallMode, InstallRequest, SetupPaths};
 use dev_auth::setup_v3::{
@@ -107,6 +107,9 @@ fn setup_plan_rejects_fifo_deployment_without_waiting_for_a_writer() {
 
 fn cli_equivalent() -> DeploymentCliInput {
     DeploymentCliInput {
+        purpose: None,
+        grant_policy: None,
+        bindings: Vec::new(),
         mode: Some(DeploymentMode::Strong),
         channel: Some(Channel::Stable),
         offline: Some(true),
@@ -119,6 +122,309 @@ fn cli_equivalent() -> DeploymentCliInput {
         user_policies: Vec::new(),
         credential_intents: vec![("automation".into(), CredentialIntent::EnrollIfAbsent)],
     }
+}
+
+#[test]
+fn credential_intent_preserves_the_legacy_canonical_document() {
+    let intent = normalize_deployment(
+        Some(parse_deployment_document(DEPLOYMENT.as_bytes()).unwrap()),
+        DeploymentCliInput::default(),
+    )
+    .unwrap();
+    let expected = serde_json::json!({
+        "schema": "dev-auth-deployment-intent-v1",
+        "mode": "strong", "channel": "stable", "offline": true,
+        "activation": "transparent", "administrator_policy": "/srv/dev-auth/policy.toml",
+        "users": [
+            {"name": "alice", "config": "/srv/dev-auth/alice.toml"},
+            {"name": "bob", "config": "/srv/dev-auth/bob.toml"}
+        ],
+        "credentials": [{"slot": "automation", "intent": "enroll-if-absent"}]
+    });
+    assert_eq!(
+        canonical_deployment_intent(&intent).unwrap(),
+        serde_jcs::to_vec(&expected).unwrap()
+    );
+}
+
+fn privilege_cli() -> DeploymentCliInput {
+    DeploymentCliInput {
+        purpose: Some(dev_auth::deployment::SetupPurpose::PrivilegeOnly),
+        mode: Some(DeploymentMode::Strong),
+        channel: Some(Channel::Stable),
+        activation: Some(Activation::Inactive),
+        grant_policy: Some("/fixture/administrator-grants-v1.json".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn privilege_only_normalizes_one_policy_source_without_credential_dependencies() {
+    let intent = normalize_deployment(None, privilege_cli()).unwrap();
+    assert_eq!(intent.schema, "dev-auth-deployment-intent-v2");
+    assert_eq!(
+        intent.administrator_policy,
+        PathBuf::from("/fixture/administrator-grants-v1.json")
+    );
+    assert!(intent.grant_policy.is_none());
+    assert!(intent.users.is_empty() && intent.credentials.is_empty());
+    let bytes = canonical_deployment_intent(&intent).unwrap();
+    assert!(String::from_utf8(bytes)
+        .unwrap()
+        .contains("\"purpose\":\"privilege_only\""));
+    let mut conflict = privilege_cli();
+    conflict.administrator_policy = Some("/fixture/different.json".into());
+    assert!(normalize_deployment(None, conflict).is_err());
+    let mut user_only = privilege_cli();
+    user_only.mode = Some(DeploymentMode::UserOnly);
+    assert!(normalize_deployment(None, user_only).is_err());
+    let mut credentials = privilege_cli();
+    credentials
+        .credential_intents
+        .push(("automation".into(), CredentialIntent::Preserve));
+    assert!(normalize_deployment(None, credentials).is_err());
+}
+
+#[test]
+fn combined_grants_preserve_credential_selection_and_require_strong_ownership() {
+    let mut cli = cli_equivalent();
+    cli.grant_policy = Some("/fixture/administrator-grants-v1.json".into());
+    let intent = normalize_deployment(None, cli.clone()).unwrap();
+    assert_eq!(
+        intent.purpose,
+        dev_auth::deployment::SetupPurpose::Credentials
+    );
+    assert_eq!(intent.schema, "dev-auth-deployment-intent-v2");
+    assert_eq!(
+        intent.credentials,
+        normalize_deployment(None, cli_equivalent())
+            .unwrap()
+            .credentials
+    );
+    assert_eq!(intent.grant_policy, cli.grant_policy);
+    cli.mode = Some(DeploymentMode::UserOnly);
+    assert!(normalize_deployment(None, cli).is_err());
+    assert!(parse_deployment_document(
+        DEPLOYMENT
+            .replace("dev-auth-deployment-v1", "dev-auth-deployment-v2")
+            .as_bytes()
+    )
+    .is_err());
+}
+
+fn binding(user: &str, name: &str) -> DeploymentBinding {
+    DeploymentBinding {
+        user: user.into(),
+        name: name.into(),
+        plan: format!("/srv/dev-auth/bindings/{user}-{name}.json").into(),
+        sha256: "a".repeat(64),
+    }
+}
+
+fn deployment_with_bindings(bindings: &[DeploymentBinding]) -> String {
+    let mut document = DEPLOYMENT.replace("dev-auth-deployment-v1", "dev-auth-deployment-v3");
+    for binding in bindings {
+        document.push_str(&format!(
+            r#"
+[[bindings]]
+user = "{}"
+name = "{}"
+plan = "{}"
+sha256 = "{}"
+"#,
+            binding.user,
+            binding.name,
+            binding.plan.display(),
+            binding.sha256,
+        ));
+    }
+    document
+}
+
+#[test]
+fn binding_declarations_from_toml_and_cli_share_one_canonical_intent() {
+    let root = tempfile::tempdir().unwrap();
+    let mut alice = binding("alice", "agent");
+    alice.plan = root.path().join("alice-plan.json");
+    let mut bob = binding("bob", "agent");
+    bob.plan = root.path().join("bob-plan.json");
+    bob.sha256 = "b".repeat(64);
+    let document = parse_deployment_document(
+        deployment_with_bindings(&[bob.clone(), alice.clone()]).as_bytes(),
+    )
+    .unwrap();
+    let mut cli = cli_equivalent();
+    cli.bindings = vec![bob.clone(), alice.clone()];
+    let from_document =
+        normalize_deployment(Some(document.clone()), DeploymentCliInput::default()).unwrap();
+    let from_cli = normalize_deployment(None, cli.clone()).unwrap();
+    let mixed = normalize_deployment(Some(document), cli).unwrap();
+
+    assert_eq!(from_document.schema, "dev-auth-deployment-intent-v3");
+    assert_eq!(from_document.bindings, vec![alice.clone(), bob.clone()]);
+    assert_eq!(from_document, from_cli);
+    assert_eq!(mixed, from_cli);
+    assert_eq!(
+        canonical_deployment_intent(&from_document).unwrap(),
+        canonical_deployment_intent(&from_cli).unwrap()
+    );
+    assert!(!alice.plan.exists() && !bob.plan.exists());
+    for schema in [
+        "dev-auth-deployment-intent-v1",
+        "dev-auth-deployment-intent-v2",
+    ] {
+        let mut downgraded = from_document.clone();
+        downgraded.schema = schema.into();
+        assert!(canonical_deployment_intent(&downgraded).is_err());
+    }
+}
+
+#[test]
+fn older_deployment_schemas_reject_binding_fields_even_when_empty() {
+    for schema in ["dev-auth-deployment-v1", "dev-auth-deployment-v2"] {
+        let mut document = DEPLOYMENT.replace("dev-auth-deployment-v1", schema);
+        if schema == "dev-auth-deployment-v2" {
+            document = document.replacen(
+                "mode =",
+                "grant_policy = \"/srv/dev-auth/administrator-grants-v1.json\"\nmode =",
+                1,
+            );
+        }
+        parse_deployment_document(document.as_bytes()).unwrap();
+        let empty = document.replacen("mode =", "bindings = []\nmode =", 1);
+        assert!(parse_deployment_document(empty.as_bytes()).is_err());
+        let bound = deployment_with_bindings(&[binding("alice", "agent")])
+            .replace("dev-auth-deployment-v3", schema);
+        let bound = if schema == "dev-auth-deployment-v2" {
+            bound.replacen(
+                "mode =",
+                "grant_policy = \"/srv/dev-auth/administrator-grants-v1.json\"\nmode =",
+                1,
+            )
+        } else {
+            bound
+        };
+        assert!(parse_deployment_document(bound.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn an_explicit_empty_v3_deployment_keeps_its_schema_without_changing_credential_fields() {
+    let legacy = normalize_deployment(None, cli_equivalent()).unwrap();
+    for document in [
+        deployment_with_bindings(&[]),
+        deployment_with_bindings(&[]).replacen("mode =", "bindings = []\nmode =", 1),
+    ] {
+        let intent = normalize_deployment(
+            Some(parse_deployment_document(document.as_bytes()).unwrap()),
+            DeploymentCliInput::default(),
+        )
+        .unwrap();
+        assert_eq!(intent.schema, "dev-auth-deployment-intent-v3");
+        assert!(intent.bindings.is_empty());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&canonical_deployment_intent(&intent).unwrap()).unwrap();
+        assert!(value.get("bindings").is_none());
+        value["schema"] = legacy.schema.clone().into();
+        assert_eq!(value, serde_json::to_value(&legacy).unwrap());
+    }
+}
+
+#[test]
+fn binding_selection_rejects_invalid_identity_paths_digests_and_undeclared_users() {
+    let valid = binding("alice", "agent");
+    let mut invalid = Vec::new();
+    for name in ["Agent", "agent.name", "agent/name", ""]
+        .map(str::to_owned)
+        .into_iter()
+        .chain(["a".repeat(65)])
+    {
+        let mut changed = valid.clone();
+        changed.name = name;
+        invalid.push(changed);
+    }
+    for plan in [
+        "relative.json",
+        "/srv/dev-auth/./plan.json",
+        "/srv/dev-auth/../plan.json",
+    ] {
+        let mut changed = valid.clone();
+        changed.plan = plan.into();
+        invalid.push(changed);
+    }
+    for sha256 in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+        let mut changed = valid.clone();
+        changed.sha256 = sha256;
+        invalid.push(changed);
+    }
+    let mut changed = valid;
+    changed.user = "undeclared".into();
+    invalid.push(changed);
+    for binding in invalid {
+        let mut cli = cli_equivalent();
+        cli.bindings.push(binding.clone());
+        assert!(
+            normalize_deployment(None, cli).is_err(),
+            "accepted {binding:?}"
+        );
+        assert!(
+            parse_deployment_document(deployment_with_bindings(&[binding]).as_bytes()).is_err()
+        );
+    }
+}
+
+#[test]
+fn binding_duplicates_and_disagreeing_source_selections_fail_before_plan_intake() {
+    let selected = binding("alice", "agent");
+    let mut duplicate = cli_equivalent();
+    duplicate.bindings = vec![selected.clone(), selected.clone()];
+    assert!(normalize_deployment(None, duplicate).is_err());
+    assert!(parse_deployment_document(
+        deployment_with_bindings(&[selected.clone(), selected.clone()]).as_bytes()
+    )
+    .is_err());
+
+    let document =
+        parse_deployment_document(deployment_with_bindings(&[selected.clone()]).as_bytes())
+            .unwrap();
+    let mut conflicting = cli_equivalent();
+    let mut changed = selected;
+    changed.sha256 = "b".repeat(64);
+    conflicting.bindings.push(changed);
+    assert!(normalize_deployment(Some(document), conflicting).is_err());
+}
+
+#[test]
+fn binding_authority_rejects_unknown_fields_with_value_free_diagnostics() {
+    let document = format!(
+        "{}\nautomatic_approval = \"private-binding-marker\"\n",
+        deployment_with_bindings(&[binding("alice", "agent")])
+    );
+    let error = parse_deployment_document(document.as_bytes()).unwrap_err();
+    for diagnostic in [
+        format!("{error}"),
+        format!("{error:#}"),
+        format!("{error:?}"),
+    ] {
+        assert!(!diagnostic.contains("private-binding-marker"));
+    }
+}
+
+#[test]
+fn privilege_only_deployments_do_not_acquire_binding_authority() {
+    let mut cli = privilege_cli();
+    cli.bindings.push(binding("alice", "agent"));
+    assert!(normalize_deployment(None, cli).is_err());
+    let document = r#"
+schema = "dev-auth-deployment-v3"
+purpose = "privilege_only"
+mode = "strong"
+channel = "stable"
+activation = "inactive"
+administrator_policy = "/srv/dev-auth/administrator-grants-v1.json"
+bindings = []
+"#;
+    assert!(parse_deployment_document(document.as_bytes()).is_err());
 }
 
 #[test]
@@ -346,6 +652,7 @@ executable = "{}"
     let installation = build_plan(
         &paths,
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: if logical { "0.4.0" } else { "0.3.0-test" }.into(),
             source_executable: candidate,
@@ -378,6 +685,9 @@ config = "{}"
     let intent_from_cli = normalize_deployment(
         None,
         DeploymentCliInput {
+            purpose: None,
+            grant_policy: None,
+            bindings: Vec::new(),
             mode: Some(DeploymentMode::UserOnly),
             channel: Some(Channel::Stable),
             offline: Some(false),
@@ -559,6 +869,7 @@ ssh_keygen = "{}"
     let mut installation = build_plan(
         &SetupPaths::user_only(&user.dir),
         &InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::UserOnly,
             version: "0.3.0-test".into(),
             source_executable: candidate,

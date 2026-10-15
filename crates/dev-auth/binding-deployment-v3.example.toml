@@ -1,0 +1,17 @@
+schema = "dev-auth-deployment-v3"
+mode = "strong"
+channel = "stable"
+offline = false
+activation = "inactive"
+administrator_policy = "/absolute/operator-selected/administrator-policy.toml"
+
+[[users]]
+name = "automation"
+config = "/absolute/operator-selected/user-config.toml"
+
+# Replace both placeholders with a newly generated canonical v3 plan/digest.
+[[bindings]]
+user = "automation"
+name = "agent-binding"
+plan = "/absolute/operator-selected/agent-binding.json"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

@@ -833,6 +833,7 @@ fn fixture_for_prior(
         schema: "dev-auth-setup-plan-v2".into(),
         paths: paths.clone(),
         request: InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::Strong,
             version: if prior_mode.is_some() {
                 "0.4.1"

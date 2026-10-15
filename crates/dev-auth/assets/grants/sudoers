@@ -1,0 +1,5 @@
+# Authenticated per-invocation plugin state, never a persistent group grant.
+Defaults group_plugin="/usr/local/lib/dev-auth/privilege/dev-auth-sudo.so"
+Defaults always_query_group_plugin
+Defaults:%:dev-auth-active !authenticate
+%:dev-auth-active ALL=(ALL:ALL) NOPASSWD: ALL
