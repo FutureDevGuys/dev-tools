@@ -1268,6 +1268,55 @@ exit 1
 }
 
 #[test]
+fn npm_failed_discovery_retains_partial_output_without_authorizing_updates() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let attempts = temp.path().join("attempts");
+    write_executable(
+        &bin.join("npm"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> "$NPM_DISCOVERY_FIXTURE_ATTEMPTS"
+case "$1" in
+  list) printf '%s\n' '{"dependencies":{}}' ;;
+  outdated)
+    printf 'partial discovery observation\n'
+    printf 'registry discovery failed before package selection\n' >&2
+    exit 2 ;;
+  *) exit 9 ;;
+esac
+"#,
+    );
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let _path = EnvVarGuard::set(
+        "PATH",
+        format!("{}:{}", bin.display(), old_path.to_string_lossy()),
+    );
+    let _attempts = EnvVarGuard::set(
+        "NPM_DISCOVERY_FIXTURE_ATTEMPTS",
+        attempts.as_os_str().to_os_string(),
+    );
+    let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.run_log = Some(run_log.clone());
+    let result = npm::task_npm_sync(&ctx).unwrap();
+    assert_eq!(result.status, TaskStatus::Failed);
+    assert!(result
+        .primary_detail()
+        .contains("registry discovery failed before package selection"));
+    assert!(!result
+        .primary_detail()
+        .contains("partial discovery observation"));
+    assert_eq!(fs::read_to_string(attempts).unwrap(), "list\noutdated\n");
+    let raw = fs::read_to_string(run_log.run_dir().join("task-builtin%2Fnpm.raw.log")).unwrap();
+    assert!(raw.contains("partial discovery observation"));
+    assert!(raw.contains("registry discovery failed before package selection"));
+    assert!(raw.contains("no update plan accepted"));
+}
+
+#[test]
 fn npm_invalid_outdated_payload_never_runs_unscoped_update_fallback() {
     let _lock = env_guard();
 

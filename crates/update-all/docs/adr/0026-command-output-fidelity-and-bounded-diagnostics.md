@@ -73,6 +73,7 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 - `command_policy_does_not_retry_transient_network_failure_without_policy_retry`
 - `command_policy_timeout_never_retries_even_with_transient_partial_output`
 - `command_task_failure_preserves_causal_evidence_and_before_inventory`
+- `npm_failed_discovery_retains_partial_output_without_authorizing_updates`
 - `npm_global_path_ignores_stderr_diagnostics`
 - `npm_silent_install_does_not_report_a_broken_executable_as_updated`
 - `does_not_coalesce_diagnostics_or_package_messages_containing_byte_counts`

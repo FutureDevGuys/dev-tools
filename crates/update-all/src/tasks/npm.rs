@@ -1,11 +1,11 @@
 use crate::tasks::package_authority;
 use crate::tasks::recovery::{PackageManagerKind, RecoveryAction, RecoveryCause, RecoveryPlan};
 use crate::tasks::{
-    AdvisorySeverity, SyncContext, TaskAdvisory, TaskReportRow, TaskReportSection,
-    TaskReportStatus, TaskResult, TaskStatus, TASK_NPM,
+    command_error_summary, AdvisorySeverity, SyncContext, TaskAdvisory, TaskReportRow,
+    TaskReportSection, TaskReportStatus, TaskResult, TaskStatus, TASK_NPM,
 };
 use crate::ui::{LogLevel, LogStream};
-use crate::util::process::{run_capture_stdout_allow_exit_codes, which};
+use crate::util::process::{process_exit_output, run_capture_stdout_allow_exit_codes, which};
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -817,7 +817,15 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
     ) {
         Ok(output) => output,
         Err(e) => {
-            let detail = format!("npm outdated failed: {e}");
+            if let Some(output) = process_exit_output(&e) {
+                ctx.log_line(
+                    TASK_NPM,
+                    LogLevel::Info,
+                    LogStream::Meta,
+                    format!("incomplete npm discovery output; no update plan accepted:\n{output}"),
+                );
+            }
+            let detail = format!("npm outdated failed: {}", command_error_summary(&e));
             ctx.log_line(TASK_NPM, LogLevel::Error, LogStream::Meta, detail.clone());
             let rows = vec![TaskReportRow {
                 name: "npm outdated".to_string(),
