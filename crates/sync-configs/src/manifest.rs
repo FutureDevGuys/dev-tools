@@ -247,12 +247,20 @@ pub enum StatePrecondition {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DefaultProfileMap {
+    pub path: PathBuf,
+    pub host: String,
+    pub field: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub path: PathBuf,
     pub override_path: Option<PathBuf>,
     pub schema_version: u32,
     pub required_capabilities: Vec<Capability>,
     pub default_mode: Mode,
+    pub default_profile_map: Option<DefaultProfileMap>,
     pub entries: Vec<Entry>,
     pub reconcilers: Vec<Reconciler>,
     pub state_preconditions: Vec<StatePrecondition>,
@@ -346,6 +354,8 @@ struct RawManifest {
     #[serde(default)]
     default_mode: Option<Mode>,
     #[serde(default)]
+    default_profile_map: Option<RawDefaultProfileMap>,
+    #[serde(default)]
     entries_dir: Option<String>,
     #[serde(default)]
     entries: Vec<RawEntry>,
@@ -353,6 +363,15 @@ struct RawManifest {
     reconcilers: Vec<RawReconciler>,
     #[serde(default)]
     state_preconditions: Vec<RawStatePrecondition>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDefaultProfileMap {
+    path: String,
+    host: String,
+    #[serde(default)]
+    field: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,6 +514,7 @@ struct PartialManifest {
     schema_version: u32,
     required_capabilities: Vec<Capability>,
     default_mode: Mode,
+    default_profile_map: Option<DefaultProfileMap>,
     entries: Vec<Entry>,
     reconcilers: Vec<Reconciler>,
     state_preconditions: Vec<StatePrecondition>,
@@ -1230,6 +1250,20 @@ fn load_partial(path: &Path, options: &LoadOptions) -> Result<PartialManifest, M
         .or(raw.default_mode)
         .unwrap_or(Mode::Symlink);
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let default_profile_map = raw
+        .default_profile_map
+        .map(|raw| -> Result<_, ManifestError> {
+            Ok(DefaultProfileMap {
+                path: resolve_against(
+                    &nonempty(path, "default profile map", "path", raw.path)?,
+                    config_dir,
+                    &options.path_context,
+                )?,
+                host: nonempty(path, "default profile map", "host", raw.host)?,
+                field: optional_nonempty(path, "default profile map", "field", raw.field)?,
+            })
+        })
+        .transpose()?;
     let mut entries = Vec::new();
     for raw in raw.entries {
         entries.push(parse_entry(
@@ -1272,6 +1306,7 @@ fn load_partial(path: &Path, options: &LoadOptions) -> Result<PartialManifest, M
         schema_version,
         required_capabilities,
         default_mode,
+        default_profile_map,
         entries,
         reconcilers,
         state_preconditions,
@@ -1387,15 +1422,23 @@ fn resolve_input_path(path: &Path, context: &PathContext) -> Result<PathBuf, Man
 }
 
 pub fn load_manifest(path: &Path, options: &LoadOptions) -> Result<Manifest, ManifestError> {
-    let path = resolve_input_path(path, &options.path_context)?;
+    let input_path = resolve_input_path(path, &options.path_context)?;
+    let path = canonical_manifest_path(&input_path)?;
     let base = load_partial(&path, options)?;
     let mut required_capabilities = base.required_capabilities;
+    let mut default_profile_map = base.default_profile_map;
     let mut entries = base.entries;
     let mut reconcilers = base.reconcilers;
     let mut state_preconditions = base.state_preconditions;
-    let override_candidate = manifest_override_path(&path);
+    // The installed link's adjacent override remains machine-local. Sources and
+    // profile-map paths resolve beside the document that declares them.
+    let override_candidate = manifest_override_path(&input_path);
     let override_path = if options.include_manifest_override && override_candidate.exists() {
-        let override_manifest = load_partial(&override_candidate, options)?;
+        let override_manifest =
+            load_partial(&canonical_manifest_path(&override_candidate)?, options)?;
+        if override_manifest.default_profile_map.is_some() {
+            default_profile_map = override_manifest.default_profile_map;
+        }
         entries = merge_manifest_entries(entries, override_manifest.entries, &override_candidate)?;
         let mut names: BTreeSet<String> = reconcilers
             .iter()
@@ -1433,9 +1476,18 @@ pub fn load_manifest(path: &Path, options: &LoadOptions) -> Result<Manifest, Man
         schema_version: base.schema_version,
         required_capabilities,
         default_mode: base.default_mode,
+        default_profile_map,
         entries,
         reconcilers,
         state_preconditions,
+    })
+}
+
+fn canonical_manifest_path(path: &Path) -> Result<PathBuf, ManifestError> {
+    fs::canonicalize(path).map_err(|source| ManifestError::Read {
+        kind: "manifest",
+        path: path.to_path_buf(),
+        source,
     })
 }
 

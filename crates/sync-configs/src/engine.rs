@@ -288,7 +288,20 @@ fn load_request(
     options.mode_override = cli.mode.map(mode_from_cli);
     options.prefer_source_overrides = !cli.no_source_overrides;
     let manifest = load_manifest(&config, &options)?;
-    let profiles = resolve_profiles(cli, &path_context)?;
+    let profiles =
+        if cli.profile.is_empty() && cli.profile_map.is_none() && cli.host_profile.is_none() {
+            match &manifest.default_profile_map {
+                Some(selection) => load_profile_map(
+                    &selection.path,
+                    &selection.host,
+                    selection.field.as_deref(),
+                    &path_context,
+                )?,
+                None => resolve_profiles(cli, &path_context)?,
+            }
+        } else {
+            resolve_profiles(cli, &path_context)?
+        };
 
     Ok(LoadedRequest {
         manifest,
