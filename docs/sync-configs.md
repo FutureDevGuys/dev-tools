@@ -10,6 +10,21 @@ Dry-run performs no desired-state writes and executes no hooks; unless logging i
 
 Normal convergence and validation return `0` when the selected operation completes, `1` for a validated convergence/check failure, and `2` for CLI parsing or invalid invocation. Ctrl-C requests orderly cancellation and returns `130` after owned hook/reconciler processes and temporary state are settled; repeated interrupts coalesce during cleanup, and an interrupt arriving after terminal finalization begins does not rewrite the published outcome. JSON convergence output uses one value-free document with `schema_version`, `outcome`, `exit_code`, `dry_run`, `profiles`, and, when present, structured reconciler results; an interrupted JSON run reports `outcome: interrupted` and `error_kind: interrupted`. Schema additions are additive within a major product line.
 
+## Default configuration and profiles
+
+Without arguments, SyncConfigs reads `$XDG_CONFIG_HOME/sync-configs/manifest.yaml`, falling back to `~/.config/sync-configs/manifest.yaml` on POSIX; Windows uses `%APPDATA%/sync-configs/manifest.yaml`. A manifest may select its normal profiles through the existing external profile-map format:
+
+```yaml
+default_profile_map:
+  path: ./profiles.yaml
+  host: workstation
+  field: config_profiles
+```
+
+This default applies only when no CLI profile or host/profile-map selection is supplied. Explicit selections replace it. The referenced map remains the authority for profile membership; the manifest does not copy that list. Omission preserves the existing unprofiled-only behavior. Invalid active defaults fail before hooks or desired-state writes.
+
+A manifest symlink resolves relative sources, entry directories and hook working directories beside the actual target manifest. Its adjacent `manifest.override.yaml` remains beside the supplied link, so a machine-local override can select its default profile map without editing shared configuration. A default declared in that override replaces the base default. These additive contracts first appear in the unreleased 0.3.0 source; 0.2.1 does not support them. [ADR 0002](../crates/sync-configs/docs/adr/0002-default-profile-map-and-linked-manifests.md) records the behavior and required verification.
+
 ## Bounded diagnostics
 
 Normal convergence creates one owner-only run directory beneath `$XDG_STATE_HOME/sync-configs/runs` on accepted Unix runtimes. Root precedence is `--log-root`, `SYNC_CONFIGS_LOG_ROOT`, then the platform default; an explicit root must be absolute. `run.json` records lifecycle, selected logging policy, outcome, and value-free counts. The default `events` style also writes `events.jsonl`; `transcript` writes `console.log`; and `both` writes both payloads. `off` creates nothing. Windows reserves `%LOCALAPPDATA%\sync-configs\runs` as its future root, but recording and log-management commands currently fail closed before storage access because inherited ACLs are not proof of owner-only custody; normal convergence degrades that diagnostic failure to a value-free warning. Windows logging remains disabled until an audited native DACL boundary and runtime acceptance exist.
