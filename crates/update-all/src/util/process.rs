@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -215,11 +215,12 @@ pub struct ProcessExitError {
     pub program: String,
     pub code: String,
     pub output: Option<String>,
+    pub stderr: Option<String>,
 }
 
 impl std::fmt::Display for ProcessExitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(output) = &self.output {
+        if let Some(output) = self.stderr.as_ref().or(self.output.as_ref()) {
             let msg = summarize_error_output(output.trim(), 500);
             write!(
                 f,
@@ -234,6 +235,25 @@ impl std::fmt::Display for ProcessExitError {
 
 impl std::error::Error for ProcessExitError {}
 
+#[derive(Debug)]
+pub struct ProcessTimeoutError {
+    pub program: String,
+    pub output: Option<String>,
+    pub stderr: Option<String>,
+}
+
+impl std::fmt::Display for ProcessTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timeout running {}", self.program)
+    }
+}
+
+impl std::error::Error for ProcessTimeoutError {}
+
+pub fn process_timed_out(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ProcessTimeoutError>().is_some()
+}
+
 pub fn capture_guard_reason(err: &anyhow::Error) -> Option<CaptureGuardReason> {
     err.downcast_ref::<CaptureGuardError>().map(|e| e.reason)
 }
@@ -241,6 +261,19 @@ pub fn capture_guard_reason(err: &anyhow::Error) -> Option<CaptureGuardReason> {
 pub fn process_exit_output(err: &anyhow::Error) -> Option<&str> {
     err.downcast_ref::<ProcessExitError>()
         .and_then(|e| e.output.as_deref())
+        .or_else(|| {
+            err.downcast_ref::<ProcessTimeoutError>()
+                .and_then(|e| e.output.as_deref())
+        })
+}
+
+pub fn process_error_stderr(err: &anyhow::Error) -> Option<&str> {
+    err.downcast_ref::<ProcessExitError>()
+        .and_then(|e| e.stderr.as_deref())
+        .or_else(|| {
+            err.downcast_ref::<ProcessTimeoutError>()
+                .and_then(|e| e.stderr.as_deref())
+        })
 }
 
 pub fn run_capture<I, S>(program: &str, args: I, timeout: Option<Duration>) -> Result<String>
@@ -782,6 +815,13 @@ impl CapturedOutput {
         }
         output
     }
+
+    fn failure_output(self) -> (Option<String>, Option<String>) {
+        let stderr = (!self.stderr.trim().is_empty()).then(|| self.stderr.trim().to_string());
+        let combined = self.combined();
+        let output = (!combined.trim().is_empty()).then(|| combined.trim().to_string());
+        (output, stderr)
+    }
 }
 
 fn run_capture_output_with_options<I, S>(
@@ -887,54 +927,63 @@ where
         None
     };
 
-    let status = match wait_with_cancel_timeout(
+    let status = wait_with_cancel_timeout(
         &mut child,
         timeout,
         cancel_check.clone(),
         guard_state.clone(),
-    ) {
-        Ok(s) => s,
-        Err(WaitOutcome::Cancelled) => {
-            terminate_child(&mut child, managed_process_group);
-            let _ = child.wait();
-            return Err(anyhow!(Cancelled));
-        }
-        Err(WaitOutcome::TimedOut) => {
-            terminate_child(&mut child, managed_process_group);
-            let _ = child.wait();
-            bail!("timeout running {program}");
-        }
-        Err(WaitOutcome::GuardTriggered(reason)) => {
-            terminate_child(&mut child, managed_process_group);
-            let _ = child.wait();
-            return Err(anyhow!(CaptureGuardError { reason }));
-        }
-        Err(WaitOutcome::Other(e)) => return Err(e),
-    };
-
-    if let Some(reason) = guard_state.as_ref().and_then(|state| state.reason()) {
-        return Err(anyhow!(CaptureGuardError { reason }));
+    );
+    // Settle the same owners on failure as on success. In particular, a
+    // deadline must not abandon captured progress or an input writer before
+    // the caller decides whether to run another command.
+    stdin_writer_stop.store(true, Ordering::SeqCst);
+    if status.is_err() {
+        terminate_child(&mut child, managed_process_group);
+        let _ = child.wait();
     }
-
     // The direct child may exit while its descendants still hold the pipes.
     // Retain its observed status, but keep owning cancellation of that group
-    // until capture drains; cancel-one must not strand those descendants.
-    wait_for_pipe_readers(
-        &mut child,
-        managed_process_group,
-        [&stdout_reader, &stderr_reader],
-        cancel_check.as_ref(),
-    );
-    let out_bytes = stdout_reader.map(join_pipe_reader).unwrap_or_default();
-    let err_bytes = stderr_reader.map(join_pipe_reader).unwrap_or_default();
-    stdin_writer_stop.store(true, Ordering::SeqCst);
+    // until capture drains and pending input settles; a blocked input writer
+    // must not prevent cancel-one from releasing those descendants.
+    if status.is_ok() {
+        wait_for_pipe_readers(
+            &mut child,
+            managed_process_group,
+            [&stdout_reader, &stderr_reader],
+            stdin_writer.as_ref(),
+            cancel_check.as_ref(),
+            guard_state.as_ref(),
+        );
+    }
     if let Some(handle) = stdin_writer {
         let _ = handle.join();
     }
+    let out_bytes = stdout_reader.map(join_pipe_reader).unwrap_or_default();
+    let err_bytes = stderr_reader.map(join_pipe_reader).unwrap_or_default();
     let output = CapturedOutput {
         stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
     };
+
+    let status = match status {
+        Ok(status) => status,
+        Err(WaitOutcome::Cancelled) => return Err(anyhow!(Cancelled)),
+        Err(WaitOutcome::TimedOut) => {
+            let (output, stderr) = output.failure_output();
+            return Err(anyhow!(ProcessTimeoutError {
+                program: program.to_string(),
+                output,
+                stderr,
+            }));
+        }
+        Err(WaitOutcome::GuardTriggered(reason)) => {
+            return Err(anyhow!(CaptureGuardError { reason }));
+        }
+        Err(WaitOutcome::Other(error)) => return Err(error),
+    };
+    if let Some(reason) = guard_state.as_ref().and_then(|state| state.reason()) {
+        return Err(anyhow!(CaptureGuardError { reason }));
+    }
 
     if status.success()
         || status
@@ -947,21 +996,13 @@ where
             .code()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "terminated-by-signal".to_string());
-        let combined = output.combined();
-        let trimmed = combined.trim();
-        if trimmed.is_empty() {
-            Err(anyhow!(ProcessExitError {
-                program: program.to_string(),
-                code,
-                output: None,
-            }))
-        } else {
-            Err(anyhow!(ProcessExitError {
-                program: program.to_string(),
-                code,
-                output: Some(trimmed.to_string()),
-            }))
-        }
+        let (output, stderr) = output.failure_output();
+        Err(anyhow!(ProcessExitError {
+            program: program.to_string(),
+            code,
+            output,
+            stderr,
+        }))
     }
 }
 
@@ -1053,55 +1094,51 @@ where
         })
     };
 
-    let status = match wait_with_cancel_timeout(
+    let status = wait_with_cancel_timeout(
         &mut child,
         timeout,
-        Some(cancel_check),
+        Some(cancel_check.clone()),
         Some(guard_state.clone()),
-    ) {
-        Ok(s) => s,
-        Err(WaitOutcome::Cancelled) => {
-            terminate_child(&mut child, managed_process_group);
-            let _ = child.wait();
-            stdin_writer_stop.store(true, Ordering::SeqCst);
-            let _ = stdin_writer.join();
-            reader_stop.store(true, Ordering::SeqCst);
-            return Err(anyhow!(Cancelled));
-        }
-        Err(WaitOutcome::TimedOut) => {
-            terminate_child(&mut child, managed_process_group);
-            let _ = child.wait();
-            stdin_writer_stop.store(true, Ordering::SeqCst);
-            let _ = stdin_writer.join();
-            reader_stop.store(true, Ordering::SeqCst);
-            bail!("timeout running {program}");
-        }
-        Err(WaitOutcome::GuardTriggered(reason)) => {
-            terminate_child(&mut child, managed_process_group);
-            let _ = child.wait();
-            stdin_writer_stop.store(true, Ordering::SeqCst);
-            let _ = stdin_writer.join();
-            reader_stop.store(true, Ordering::SeqCst);
-            return Err(anyhow!(CaptureGuardError { reason }));
-        }
-        Err(WaitOutcome::Other(e)) => {
-            stdin_writer_stop.store(true, Ordering::SeqCst);
-            let _ = stdin_writer.join();
-            reader_stop.store(true, Ordering::SeqCst);
-            return Err(e);
-        }
-    };
-
+    );
     stdin_writer_stop.store(true, Ordering::SeqCst);
-    let _ = stdin_writer.join();
+    if status.is_err() {
+        terminate_child(&mut child, managed_process_group);
+        let _ = child.wait();
+    }
     reader_stop.store(true, Ordering::SeqCst);
 
+    let reader = Some(reader);
+    if status.is_ok() {
+        wait_for_pipe_readers(
+            &mut child,
+            managed_process_group,
+            [&reader, &None],
+            Some(&stdin_writer),
+            Some(&cancel_check),
+            Some(&guard_state),
+        );
+    }
+    let _ = stdin_writer.join();
+    let out_bytes = reader.map(join_pipe_reader).unwrap_or_default();
+    let out = String::from_utf8_lossy(&out_bytes).to_string();
+    let status = match status {
+        Ok(status) => status,
+        Err(WaitOutcome::Cancelled) => return Err(anyhow!(Cancelled)),
+        Err(WaitOutcome::TimedOut) => {
+            return Err(anyhow!(ProcessTimeoutError {
+                program: program.to_string(),
+                output: (!out.trim().is_empty()).then(|| out.trim().to_string()),
+                stderr: None, // A PTY deliberately merges both native channels.
+            }));
+        }
+        Err(WaitOutcome::GuardTriggered(reason)) => {
+            return Err(anyhow!(CaptureGuardError { reason }));
+        }
+        Err(WaitOutcome::Other(error)) => return Err(error),
+    };
     if let Some(reason) = guard_state.reason() {
         return Err(anyhow!(CaptureGuardError { reason }));
     }
-
-    let out_bytes = join_pipe_reader(reader);
-    let out = String::from_utf8_lossy(&out_bytes).to_string();
 
     if status.success() {
         Ok(out)
@@ -1116,12 +1153,14 @@ where
                 program: program.to_string(),
                 code,
                 output: None,
+                stderr: None,
             }))
         } else {
             Err(anyhow!(ProcessExitError {
                 program: program.to_string(),
                 code,
                 output: Some(trimmed.to_string()),
+                stderr: None,
             }))
         }
     }
@@ -1558,15 +1597,20 @@ fn wait_for_pipe_readers(
     child: &mut std::process::Child,
     managed_process_group: bool,
     readers: [&Option<JoinHandle<Vec<u8>>>; 2],
+    stdin_writer: Option<&JoinHandle<()>>,
     cancel_check: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
+    guard_state: Option<&Arc<CaptureGuardState>>,
 ) {
     let mut cleanup_requested = false;
     while readers
         .iter()
         .any(|reader| reader.as_ref().is_some_and(|handle| !handle.is_finished()))
+        || stdin_writer.is_some_and(|handle| !handle.is_finished())
     {
         if !cleanup_requested
-            && (cancel::is_cancel_requested() || cancel_check.is_some_and(|cb| cb()))
+            && (cancel::is_cancel_requested()
+                || cancel_check.is_some_and(|cb| cb())
+                || guard_state.is_some_and(|state| state.reason().is_some()))
         {
             terminate_child(child, managed_process_group);
             cleanup_requested = true;
@@ -1646,7 +1690,12 @@ fn terminate_child(child: &mut std::process::Child, managed_process_group: bool)
     #[cfg(unix)]
     {
         if managed_process_group {
-            terminate_process_group(child.id());
+            // This execution owner retains its Child until both signals have
+            // been sent. A detached delayed kill could outlive its caller and
+            // race a subsequent command after the leader has been reaped.
+            signal_process_group(child.id(), libc::SIGTERM);
+            std::thread::sleep(Duration::from_millis(250));
+            signal_process_group(child.id(), libc::SIGKILL);
         } else {
             let _ = child.kill();
         }

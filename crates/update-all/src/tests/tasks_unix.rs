@@ -457,7 +457,7 @@ exit 2
 }
 
 #[test]
-fn command_policy_retries_transient_network_failure_once_by_default() {
+fn command_policy_retries_transient_network_failure_when_explicitly_configured() {
     let temp = TempDir::new().unwrap();
     let script = temp.path().join("flaky-network");
     let counter = temp.path().join("counter");
@@ -484,13 +484,208 @@ printf '%s\n' 'ok'
             "demo",
             script.to_str().unwrap(),
             vec![counter.to_string_lossy().to_string()],
-            &TaskPolicy::new(10, 0, 0),
+            &TaskPolicy::new(10, 1, 0),
             false,
         )
         .unwrap();
 
     assert!(out.contains("ok"));
     assert_eq!(read_counter(&counter).trim(), "2");
+}
+
+#[test]
+fn command_policy_does_not_retry_transient_network_failure_without_policy_retry() {
+    let temp = TempDir::new().unwrap();
+    let script = temp.path().join("network-failure");
+    let attempts = temp.path().join("attempts");
+    write_executable(
+        &script,
+        r#"#!/bin/sh
+printf 'attempt\n' >> "$1"
+printf 'npm error code ETIMEDOUT\n' >&2
+exit 1
+"#,
+    );
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let error = ctx
+        .run_command_with_policy(
+            "demo",
+            script.to_str().unwrap(),
+            vec![attempts.to_string_lossy().to_string()],
+            &TaskPolicy::new(10, 0, 0),
+            false,
+        )
+        .expect_err("network failure must remain failed with no configured retries");
+
+    assert!(process_exit_output(&error).is_some_and(|output| output.contains("ETIMEDOUT")));
+    assert_eq!(fs::read_to_string(&attempts).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn command_policy_timeout_never_retries_even_with_transient_partial_output() {
+    for diagnostic in ["resource busy", "npm error code ETIMEDOUT"] {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("timeout-after-effect");
+        let attempts = temp.path().join("attempts");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+printf 'attempt\n' >> "$1"
+printf 'installed fixture-tool 2.0.0\n'
+printf '%s\n' "$2" >&2
+exec /bin/sleep 20
+"#,
+        );
+        let ctx = test_context(Arc::new(PrivilegeSession::default()));
+        let error = ctx
+            .run_command_with_policy(
+                "demo",
+                script.to_str().unwrap(),
+                vec![
+                    attempts.to_string_lossy().to_string(),
+                    diagnostic.to_string(),
+                ],
+                &TaskPolicy::new(1, 2, 0),
+                false,
+            )
+            .expect_err("an execution deadline must remain a timeout");
+
+        assert!(crate::util::process::process_timed_out(&error), "{error:#}");
+        let output = process_exit_output(&error).expect("partial timeout output");
+        assert!(output.contains("installed fixture-tool 2.0.0"));
+        assert!(output.contains(diagnostic));
+        assert_eq!(
+            fs::read_to_string(&attempts).unwrap().lines().count(),
+            1,
+            "timeout replayed effects after diagnostic {diagnostic}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn command_task_failure_preserves_causal_evidence_and_before_inventory() {
+    for failure in ["timeout", "exit"] {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("inventory-fixture");
+        let invocations = temp.path().join("invocations");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' "$1" >> "$2"
+if [ "$1" = list ]; then
+  printf 'fixture-tool 1.2.3\n'
+  exit 0
+fi
+printf 'installed fixture-tool 2.0.0\n'
+printf 'fixture compiler cannot load native target\n' >&2
+if [ "$1" = timeout ]; then
+  exec /bin/sleep 20
+fi
+exit 7
+"#,
+        );
+        let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+        let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+        ctx.run_log = Some(run_log.clone());
+        ctx.task_policies.tool_update = TaskPolicy::new(1, 0, 0);
+        let command = CommandTask {
+            program: script.to_string_lossy().to_string(),
+            args: vec![
+                failure.to_string(),
+                invocations.to_string_lossy().to_string(),
+            ],
+            mode: None,
+            command_candidates: Vec::new(),
+            pre_commands: Vec::new(),
+            report_commands: vec![CommandReportCommand {
+                program: script.to_string_lossy().to_string(),
+                args: vec![
+                    "list".to_string(),
+                    invocations.to_string_lossy().to_string(),
+                ],
+                when: CommandReportWhen::BeforeAfter,
+                allow_exit_codes: vec![0],
+                state_pattern: Some(CommandStateReportPattern {
+                    regex: Regex::new(r"^(?P<name>\S+) (?P<version>\S+)$").unwrap(),
+                    section_key: "fixture_inventory".to_string(),
+                    section_title: "Fixture Inventory".to_string(),
+                    name: None,
+                    version: None,
+                    include_unchanged: true,
+                }),
+            }],
+            report_patterns: Vec::new(),
+            report_scoped_deltas: Vec::new(),
+            policy_key: "tool_update".to_string(),
+            requires_elevation: false,
+            needs_sudo_session: false,
+            interactive: false,
+            external_window: false,
+            shell: false,
+            windows_bridge: false,
+            report_parser: None,
+            plain_header: None,
+            plain_start: None,
+            success_details: Vec::new(),
+            external_manager_skip: false,
+            result_protocol: None,
+        };
+        let spec = TaskSpec {
+            id: "failure-inventory-fixture".to_string(),
+            label: "Failure inventory fixture".to_string(),
+            depends_on: Vec::new(),
+            kind: TaskKind::Command(command.clone()),
+            category: "maintenance".to_string(),
+            resource_locks: BTreeSet::new(),
+        };
+
+        let result = run_command_task(&ctx, &spec, &command).expect("failed task result");
+
+        assert_eq!(result.status, TaskStatus::Failed, "{failure}: {result:?}");
+        let row = result
+            .report_sections
+            .iter()
+            .find(|section| section.key == "fixture_inventory")
+            .expect("before inventory must survive command failure")
+            .rows
+            .iter()
+            .find(|row| row.name == "fixture-tool")
+            .expect("observed installed package");
+        assert_eq!(row.status, TaskReportStatus::Blocked);
+        assert_eq!(row.before.as_deref(), Some("1.2.3"));
+        assert_eq!(row.after.as_deref(), Some("-"));
+        assert_eq!(
+            row.note.as_deref(),
+            Some("after-state not observed; update not confirmed")
+        );
+        assert!(!result
+            .primary_detail()
+            .contains("installed fixture-tool 2.0.0"));
+        if failure == "timeout" {
+            assert!(result.primary_detail().contains("timeout running"));
+            assert!(!result
+                .primary_detail()
+                .to_ascii_lowercase()
+                .contains("network"));
+        } else {
+            assert!(result
+                .primary_detail()
+                .contains("fixture compiler cannot load native target"));
+        }
+        assert_eq!(
+            fs::read_to_string(&invocations).unwrap(),
+            format!("list\n{failure}\n"),
+            "failed mutation must not run an after-state probe or replay"
+        );
+        let raw = fs::read_to_string(
+            run_log
+                .run_dir()
+                .join("task-failure-inventory-fixture.raw.log"),
+        )
+        .unwrap();
+        assert!(raw.contains("installed fixture-tool 2.0.0"));
+        assert!(raw.contains("fixture compiler cannot load native target"));
+    }
 }
 
 #[test]
@@ -1070,6 +1265,55 @@ exit 1
             .is_some_and(|note| note.contains("not mutated")),
         "{rows:#?}"
     );
+}
+
+#[test]
+fn npm_failed_discovery_retains_partial_output_without_authorizing_updates() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let attempts = temp.path().join("attempts");
+    write_executable(
+        &bin.join("npm"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> "$NPM_DISCOVERY_FIXTURE_ATTEMPTS"
+case "$1" in
+  list) printf '%s\n' '{"dependencies":{}}' ;;
+  outdated)
+    printf 'partial discovery observation\n'
+    printf 'registry discovery failed before package selection\n' >&2
+    exit 2 ;;
+  *) exit 9 ;;
+esac
+"#,
+    );
+    let old_path = env::var_os("PATH").unwrap_or_default();
+    let _path = EnvVarGuard::set(
+        "PATH",
+        format!("{}:{}", bin.display(), old_path.to_string_lossy()),
+    );
+    let _attempts = EnvVarGuard::set(
+        "NPM_DISCOVERY_FIXTURE_ATTEMPTS",
+        attempts.as_os_str().to_os_string(),
+    );
+    let run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.run_log = Some(run_log.clone());
+    let result = npm::task_npm_sync(&ctx).unwrap();
+    assert_eq!(result.status, TaskStatus::Failed);
+    assert!(result
+        .primary_detail()
+        .contains("registry discovery failed before package selection"));
+    assert!(!result
+        .primary_detail()
+        .contains("partial discovery observation"));
+    assert_eq!(fs::read_to_string(attempts).unwrap(), "list\noutdated\n");
+    let raw = fs::read_to_string(run_log.run_dir().join("task-builtin%2Fnpm.raw.log")).unwrap();
+    assert!(raw.contains("partial discovery observation"));
+    assert!(raw.contains("registry discovery failed before package selection"));
+    assert!(raw.contains("no update plan accepted"));
 }
 
 #[test]
