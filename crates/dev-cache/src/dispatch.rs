@@ -9,7 +9,22 @@ pub enum Dispatch {
 }
 
 pub fn classify_invocation(command: &str, args: &[OsString]) -> Dispatch {
-    let adapter = match entrypoint::spec_for(command).map(|spec| spec.mode) {
+    let spec = entrypoint::spec_for(command);
+    // Static completion generation needs no cache routing or maintenance. Match
+    // only the native root command, never a tool/script argument with that name.
+    let completion = match spec.map(|spec| spec.command) {
+        Some("uv") => args
+            .first()
+            .is_some_and(|arg| arg == "generate-shell-completion"),
+        Some("uvx") => args
+            .first()
+            .is_some_and(|arg| arg == "--generate-shell-completion"),
+        _ => false,
+    };
+    if completion {
+        return Dispatch::Delegate;
+    }
+    let adapter = match spec.map(|spec| spec.mode) {
         Some(EntrypointMode::Direct(adapter)) => Some(adapter),
         Some(EntrypointMode::Python) => classify_python(args),
         Some(EntrypointMode::PyLauncher) => classify_py(args),

@@ -116,6 +116,8 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0104](0104-dev-cache-experimental-native-cache-gate.md) | Default-off experimental native cache | proposed | pending |
 
 | [0105](0105-retained-cargo-final-outputs.md) | Opt-in retained Cargo final-output routing | proposed | pending |
+| [0106](0106-dev-cache-bounded-catalog-inventory.md) | Bounded read-only resource catalog inventory | proposed | pending |
+| [0107](0107-owner-linked-cargo-orphan-gc.md) | Owner-linked Cargo orphan collection | proposed | pending |
 
 | [0114](0114-admitted-value-free-resource-metadata.md) | Admitted value-free resource metadata | proposed | pending |
 
@@ -133,3 +135,4 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 
 | [0121](0121-terminal-command-graph-custody.md) | Foreground terminal command graph custody | proposed | pending |
 | [0122](0122-exact-plan-node-identity-and-streams.md) | Exact plan node identity and streams | proposed | pending |
+| [0123](0123-completion-intercept-passthrough.md) | Native completion intercept passthrough | proposed | pending |
