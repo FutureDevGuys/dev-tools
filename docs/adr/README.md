@@ -7,8 +7,11 @@ owner: dev-tools
 
 Read the applicable records before changing a public product contract or cross-product foundation. The normative current behavior is defined by [the product standard](../product-standard.md).
 
+SyncConfigs also maintains product-local records, including [durable overlay publication](../../crates/sync-configs/docs/adr/0003-durable-overlay-publication.md), which selects the focused installation file boundary and records pending source-only verification.
+
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0125](0125-descriptor-relative-ordinary-files-and-locks.md) | Descriptor-relative ordinary files and resource locks | proposed | pending |
 | [0001](0001-standalone-products-and-shared-rust-foundations.md) | Standalone products and shared Rust foundations | proposed | pending |
 | [0002](0002-common-product-cli-and-explicit-network-boundaries.md) | Common product CLI and explicit network boundaries | proposed | pending |
 | [0003](0003-native-release-administration-and-separated-authority.md) | Native release administration and separated authority | proposed | pending |

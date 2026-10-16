@@ -3,6 +3,8 @@
 pub mod json;
 pub mod ownership;
 pub mod toml;
+#[cfg(target_os = "linux")]
+pub(crate) mod transaction;
 
 /// A structured configuration path. Each component is an exact object/table key.
 pub type PathKey = Vec<String>;

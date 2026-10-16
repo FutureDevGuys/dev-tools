@@ -231,6 +231,49 @@ impl Drop for TemporaryDirectory<'_> {
 }
 
 impl ExistingDocumentDirectory {
+    /// Retain a permanent nonblocking resource lock through this selected
+    /// directory. Opening and named-identity validation are descriptor-relative;
+    /// callers must keep its name while cooperating writers can still run.
+    pub fn try_lock(&self, name: &OsStr) -> Result<Option<InstallationLock>> {
+        validate_name(name)?;
+        self.validate()?;
+        let file = File::from(rustix::fs::openat(
+            &self.directory,
+            name,
+            rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != self.owner_uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.len() != 0
+        {
+            bail!("held resource lock has unsafe custody");
+        }
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error).context("acquire held resource lock"),
+        }
+        let lock = InstallationLock {
+            file,
+            shared: false,
+        };
+        require_named_file(&self.directory, name, &metadata)?;
+        self.validate()?;
+        lock.file.sync_all().context("sync held resource lock")?;
+        rustix::fs::fsync(&self.directory).context("sync held resource lock parent")?;
+        require_named_file(&self.directory, name, &metadata)?;
+        self.validate()?;
+        Ok(Some(lock))
+    }
+
     /// Observe a leaf's native metadata without following it or reading its
     /// contents. This does not grant document or removal authority; callers
     /// must still select an exact supported object through the other APIs.
@@ -350,6 +393,60 @@ impl ExistingDocumentDirectory {
         Ok(current.map(|current| current.document))
     }
 
+    /// Read a bounded ordinary file, permitting empty content and requiring
+    /// its exact native group. Custody and descriptor guarantees match read.
+    pub fn read_file(
+        &self,
+        name: &OsStr,
+        authority: &FileAuthority,
+    ) -> Result<Option<AtomicDocument>> {
+        validate_name(name)?;
+        let document_authority = authority.document_authority();
+        validate_document_authority(&document_authority)?;
+        self.validate()?;
+        let current = self.open_file(name, &document_authority, true, Some(authority.group_gid))?;
+        self.require_named_current(name, current.as_ref())?;
+        self.validate()?;
+        Ok(current.map(|current| current.document))
+    }
+
+    /// Publish an ordinary file, including empty content, preserving explicitly
+    /// selected UID/GID/mode together. Different bytes require exact current
+    /// identity; publication and its parent are synchronized before return.
+    pub fn write_file(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        authority: &FileAuthority,
+        expected_current: Option<&ArtifactIdentity>,
+    ) -> Result<bool> {
+        let document_authority = authority.document_authority();
+        self.write_with_current_authority(
+            name,
+            bytes,
+            &document_authority,
+            &document_authority,
+            expected_current,
+            Some(authority.group_gid),
+        )
+    }
+
+    /// Durably remove only an exact ordinary file, including a zero-byte file.
+    pub fn remove_file(
+        &self,
+        name: &OsStr,
+        authority: &FileAuthority,
+        expected: &ArtifactIdentity,
+    ) -> Result<bool> {
+        self.remove_with_options(
+            name,
+            &authority.document_authority(),
+            expected,
+            true,
+            Some(authority.group_gid),
+        )
+    }
+
     /// Replace an exact current document while selecting different ordinary
     /// permission bits. The owner does not change; both states are bounded.
     pub fn replace(
@@ -366,6 +463,7 @@ impl ExistingDocumentDirectory {
             authority,
             current_authority,
             Some(expected_current),
+            None,
         )
     }
 
@@ -379,7 +477,7 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected_current: Option<&ArtifactIdentity>,
     ) -> Result<bool> {
-        self.write_with_current_authority(name, bytes, authority, authority, expected_current)
+        self.write_with_current_authority(name, bytes, authority, authority, expected_current, None)
     }
 
     fn write_with_current_authority(
@@ -389,18 +487,20 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         current_authority: &DocumentAuthority,
         expected_current: Option<&ArtifactIdentity>,
+        group_gid: Option<u32>,
     ) -> Result<bool> {
+        let allow_empty = group_gid.is_some();
         validate_name(name)?;
         validate_document_authority(authority)?;
         validate_document_authority(current_authority)?;
         if authority.owner_uid != current_authority.owner_uid {
             bail!("document replacement cannot change its native owner");
         }
-        if bytes.is_empty() || bytes.len() as u64 > authority.limit {
+        if (!allow_empty && bytes.is_empty()) || bytes.len() as u64 > authority.limit {
             bail!("document publication exceeds its content bounds");
         }
         self.validate()?;
-        let current = self.open_document(name, current_authority)?;
+        let current = self.open_file(name, current_authority, allow_empty, group_gid)?;
         if let Some(current) = &current {
             if current.document.bytes == bytes && authority.mode == current_authority.mode {
                 self.require_named_current(name, Some(current))?;
@@ -427,11 +527,14 @@ impl ExistingDocumentDirectory {
             .file
             .flush()
             .context("flush held document staging file")?;
-        if temporary.file.metadata()?.uid() != authority.owner_uid {
+        let temporary_metadata = temporary.file.metadata()?;
+        if temporary_metadata.uid() != authority.owner_uid
+            || group_gid.is_some_and(|group| temporary_metadata.gid() != group)
+        {
             rustix::fs::fchown(
                 &temporary.file,
                 Some(rustix::fs::Uid::from_raw(authority.owner_uid)),
-                None,
+                group_gid.map(rustix::fs::Gid::from_raw),
             )
             .context("assign held document owner")?;
         }
@@ -444,10 +547,12 @@ impl ExistingDocumentDirectory {
             .sync_all()
             .context("sync held document data and metadata")?;
         temporary.file.rewind()?;
-        let staged = read_atomic_document_file(
+        let staged = read_atomic_file(
             temporary.file.try_clone()?,
             &self.path.join(&temporary.name),
             authority,
+            allow_empty,
+            group_gid,
         )?;
         if staged.bytes != bytes {
             bail!("held document staging bytes changed");
@@ -473,7 +578,7 @@ impl ExistingDocumentDirectory {
         rustix::fs::fsync(&self.directory).context("sync published held document parent")?;
         self.validate()?;
         let published = self
-            .open_document(name, authority)?
+            .open_file(name, authority, allow_empty, group_gid)?
             .context("published document disappeared")?;
         if published.document.bytes != bytes {
             bail!("published held document changed before acknowledgement");
@@ -490,9 +595,20 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected: &ArtifactIdentity,
     ) -> Result<bool> {
+        self.remove_with_options(name, authority, expected, false, None)
+    }
+
+    fn remove_with_options(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+        expected: &ArtifactIdentity,
+        allow_empty: bool,
+        group_gid: Option<u32>,
+    ) -> Result<bool> {
         validate_name(name)?;
         validate_document_authority(authority)?;
-        if expected.length == 0
+        if (!allow_empty && expected.length == 0)
             || expected.length > authority.limit
             || expected.sha256.len() != 64
             || !expected
@@ -503,7 +619,7 @@ impl ExistingDocumentDirectory {
             bail!("held document removal identity is invalid");
         }
         self.validate()?;
-        let current = self.open_document(name, authority)?;
+        let current = self.open_file(name, authority, allow_empty, group_gid)?;
         if let Some(current) = &current {
             if current.document.identity != *expected {
                 bail!("held document removal does not match expected content");
@@ -539,6 +655,16 @@ impl ExistingDocumentDirectory {
         name: &OsStr,
         authority: &DocumentAuthority,
     ) -> Result<Option<OpenedDocument>> {
+        self.open_file(name, authority, false, None)
+    }
+
+    fn open_file(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+        allow_empty: bool,
+        group_gid: Option<u32>,
+    ) -> Result<Option<OpenedDocument>> {
         let file = match rustix::fs::openat(
             &self.directory,
             name,
@@ -555,8 +681,13 @@ impl ExistingDocumentDirectory {
         if metadata.mode() & 0o7777 != authority.mode {
             bail!("held document has unexpected permission bits");
         }
-        let document =
-            read_atomic_document_file(file.try_clone()?, &self.path.join(name), authority)?;
+        let document = read_atomic_file(
+            file.try_clone()?,
+            &self.path.join(name),
+            authority,
+            allow_empty,
+            group_gid,
+        )?;
         require_named_file(&self.directory, name, &metadata)?;
         Ok(Some(OpenedDocument {
             file,
