@@ -8,7 +8,7 @@ use std::io;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::os::unix::ffi::OsStringExt;
 
-const API: c_uint = (1 << 16) | 22;
+const API: c_uint = crate::SUDO_PLUGIN_API_VERSION;
 const DENIAL: &[u8] = b"Dev Auth managed administrator admission denied; inspect the grant or explicitly leave managed routing.\0";
 type Strings = *const *mut c_char;
 type ErrorText = *mut *const c_char;
@@ -97,7 +97,7 @@ pub static mut dev_auth_sudo_approval: ApprovalPlugin = ApprovalPlugin {
 };
 #[no_mangle]
 pub static mut group_plugin: GroupPlugin = GroupPlugin {
-    version: 1 << 16,
+    version: crate::SUDO_GROUP_API_VERSION,
     init: Some(group_init),
     cleanup: Some(group_cleanup),
     query: Some(group_query),
@@ -173,7 +173,7 @@ unsafe extern "C" fn audit_open(
     error: ErrorText,
 ) -> c_int {
     guarded(error, || {
-        if version >> 16 != 1 || version & 0xffff < 22 {
+        if (version >> 16) != (API >> 16) || (version & 0xffff) < (API & 0xffff) {
             return Err(native::invalid());
         }
         // SAFETY: these arrays have the native callback's borrowed lifetime.
@@ -223,7 +223,7 @@ unsafe extern "C" fn approval_open(
     error: ErrorText,
 ) -> c_int {
     guarded(error, || {
-        if version >> 16 != 1 || version & 0xffff < 22 {
+        if (version >> 16) != (API >> 16) || (version & 0xffff) < (API & 0xffff) {
             return Err(native::invalid());
         }
         Ok(1)
@@ -286,7 +286,7 @@ unsafe extern "C" fn show_version(_verbose: c_int) -> c_int {
     1
 }
 unsafe extern "C" fn group_init(version: c_int, _print: Print, _argv: Strings) -> c_int {
-    if version >> 16 == 1 {
+    if ((version as c_uint) >> 16) == (crate::SUDO_GROUP_API_VERSION >> 16) {
         1
     } else {
         -1

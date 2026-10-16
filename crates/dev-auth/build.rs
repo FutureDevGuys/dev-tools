@@ -5,9 +5,13 @@ mod identity {
     }
 }
 
+#[path = "../dev-auth-sudo/abi_identity.rs"]
+mod sudo_abi_identity;
+
 fn main() {
     identity::emit();
     println!("cargo:rerun-if-env-changed=DEV_AUTH_SUDO_ARTIFACT");
+    println!("cargo:rerun-if-changed=../dev-auth-sudo/abi_identity.rs");
     let output =
         std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
             .join("dev-auth-sudo.so");
@@ -46,14 +50,15 @@ fn main() {
     );
     let commit = std::env::var("DEV_TOOLS_GIT_COMMIT").unwrap_or_else(|_| "unknown".into());
     let expected = format!(
-        "dev-auth-sudo-build-v1:{}:{commit}:{target}:end",
-        std::env::var("CARGO_PKG_VERSION").expect("Cargo provides version")
+        "dev-auth-sudo-build-v2:{}:{commit}:{target}:{}:end",
+        std::env::var("CARGO_PKG_VERSION").expect("Cargo provides version"),
+        sudo_abi_identity::identity(),
     );
     assert!(
         bytes
             .windows(expected.len())
             .any(|window| window == expected.as_bytes()),
-        "sudo helper version, target or source identity does not match"
+        "sudo helper version, target, source or ABI identity does not match"
     );
     std::fs::write(output, bytes).expect("embed matched sudo helper");
 }

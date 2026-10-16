@@ -4,17 +4,21 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+include!(concat!(env!("OUT_DIR"), "/dev-auth-sudo-abi.rs"));
+
 // SAFETY: one immutable exported build-identity symbol belongs to this helper.
 // The outer signed product embeds these exact bytes, not an ambient library.
 #[used]
 #[no_mangle]
 pub static DEV_AUTH_SUDO_BUILD_ID: &str = concat!(
-    "dev-auth-sudo-build-v1:",
+    "dev-auth-sudo-build-v2:",
     env!("CARGO_PKG_VERSION"),
     ":",
     env!("DEV_TOOLS_GIT_COMMIT"),
     ":",
     env!("DEV_TOOLS_BUILD_TARGET"),
+    ":",
+    env!("DEV_AUTH_SUDO_ABI_ID"),
     ":end"
 );
 
