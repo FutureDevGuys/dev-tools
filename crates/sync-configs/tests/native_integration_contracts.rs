@@ -676,6 +676,7 @@ fn unknown_manifest_fields_fail_closed_end_to_end() {
     let value = json_output(&output);
     assert_eq!(value["outcome"], "failed");
     assert_eq!(value["error_kind"], "convergence_failed");
+    assert_eq!(value["failure"]["kind"], "convergence_failed");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("source\n"));
 }
 

@@ -3,10 +3,34 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use crate::hooks::HookPhase;
+use crate::privilege::AuthenticationStage;
 
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 pub const RECONCILER_RESULT_SCHEMA: &str = "dev-tools-reconcile-result-v1";
+
+/// Closed fatal-run evidence, without command, path, output or error text.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FailureDiagnostic {
+    HookTimedOut {
+        phase: HookPhase,
+    },
+    PrivilegedCommandTimedOut,
+    AuthenticationProcess {
+        stage: AuthenticationStage,
+        os_code: Option<i32>,
+    },
+    AuthenticationExit {
+        stage: AuthenticationStage,
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    #[serde(other)]
+    ConvergenceFailed,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
