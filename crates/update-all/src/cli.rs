@@ -1848,7 +1848,7 @@ impl ProductCli {
                     }
                 }
                 if result.exit_code != 0 {
-                    return Err(crate::CommonOperationExit(result.exit_code).into());
+                    return Err(crate::CommonOperationExit(i32::from(result.exit_code)).into());
                 }
             }
         }

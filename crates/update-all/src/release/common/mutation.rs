@@ -459,7 +459,7 @@ impl UpdateAdapter for MutationAdapter {
         if verified != *candidate.verified() {
             return Err(authority("candidate changed"));
         }
-        let bytes = fetch_release_artifact(&Artifact {
+        let bytes = super::super::fetch_artifact(&Artifact {
             url: verified.artifact_url.clone(),
             length: verified.artifact_length,
             sha256: verified.artifact_sha256.clone(),
