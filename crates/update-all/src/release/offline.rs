@@ -12,6 +12,10 @@ pub(crate) struct OfflineBundlePaths {
 pub(crate) fn install(product: Product, bundle: &OfflineBundlePaths) -> Result<Activation> {
     validate_paths(bundle)?;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if product == Product::UpdateAll {
+        return super::common::bundle(bundle);
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let paths = Paths::resolve(product)?;
         let mut authority = release_authority(product);
@@ -26,7 +30,7 @@ pub(crate) fn install(product: Product, bundle: &OfflineBundlePaths) -> Result<A
     }
 }
 
-fn validate_paths(bundle: &OfflineBundlePaths) -> Result<()> {
+pub(super) fn validate_paths(bundle: &OfflineBundlePaths) -> Result<()> {
     for path in [&bundle.root_document, &bundle.manifest, &bundle.artifact] {
         if !path.is_absolute()
             || path
@@ -39,8 +43,8 @@ fn validate_paths(bundle: &OfflineBundlePaths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn current_uid() -> u32 {
+#[cfg(target_os = "linux")]
+pub(super) fn current_uid() -> u32 {
     // SAFETY: geteuid has no arguments, borrowed memory or failure state.
     #[allow(unsafe_code)]
     unsafe {
@@ -48,8 +52,8 @@ fn current_uid() -> u32 {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn read_input(path: &Path, limit: u64, uid: u32) -> Result<Vec<u8>> {
+#[cfg(target_os = "linux")]
+pub(super) fn read_input(path: &Path, limit: u64, uid: u32) -> Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
     // The shared reader traverses every component by nofollow descriptors.
     // These policy checks additionally reject foreign/writable authority.

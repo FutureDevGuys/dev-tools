@@ -1,7 +1,9 @@
 use crate::IntegrityFailure;
 mod common;
 mod offline;
+mod retention;
 pub(crate) use offline::{install as install_offline, OfflineBundlePaths};
+pub(crate) use retention::retain as retain_offline;
 #[cfg(target_os = "linux")]
 mod protocol;
 
@@ -12,6 +14,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 pub(crate) use common::check as common_check;
 pub(crate) use common::status as common_status;
+pub(crate) use common::{
+    apply as common_apply, install as common_install, rollback as common_rollback,
+};
 #[cfg(unix)]
 use dev_tools_installation::{
     adopt_two_level_versioned_installation, adopt_versioned_installation,
@@ -48,6 +53,17 @@ const RELEASES_URL: &str =
     "https://api.github.com/repos/FutureDevGuys/dev-tools/releases?per_page=100";
 const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/FutureDevGuys/dev-tools/releases/download/";
 const METADATA_LIMIT: u64 = 512 * 1024;
+
+#[derive(Debug)]
+struct CandidateHealthFailure;
+
+impl std::fmt::Display for CandidateHealthFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("candidate health verification failed")
+    }
+}
+
+impl std::error::Error for CandidateHealthFailure {}
 const RELEASE_STATE_LIMIT: u64 = 64 * 1024;
 const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
 const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
@@ -292,6 +308,27 @@ struct GitHubAsset {
 
 pub(crate) fn status(product: Product) -> Result<Status> {
     let paths = Paths::resolve(product)?;
+    #[cfg(target_os = "linux")]
+    if product == Product::UpdateAll {
+        let result = common_status()?;
+        require_common_success(&result)?;
+        let initialized = dev_tools_installation::versioned_v2::read_receipt_metadata(
+            &shared_installation_layout(product, &paths)?,
+        )
+        .is_ok();
+        if initialized {
+            let receipt = protocol::observe_authenticated(&paths)?;
+            return Ok(Status {
+                product,
+                installed_version: result.installed_version,
+                engine_version: env!("CARGO_PKG_VERSION").into(),
+                previous_version: receipt.and_then(|receipt| receipt.previous_version),
+                managed: result.installation_state
+                    == Some(dev_tools_product::InstallationState::Managed),
+                last_successful_check_unix: None,
+            });
+        }
+    }
     let state = load_state(&paths)?;
     Ok(Status {
         product,
@@ -304,6 +341,21 @@ pub(crate) fn status(product: Product) -> Result<Status> {
 }
 
 pub(crate) fn check(product: Product) -> Result<Check> {
+    #[cfg(target_os = "linux")]
+    if product == Product::UpdateAll {
+        let result = common_check()?;
+        require_common_success(&result)?;
+        let latest = result
+            .available_version
+            .context("no authenticated release is available")?;
+        return Ok(Check {
+            product,
+            installed_version: result.installed_version,
+            update_available: result.outcome == dev_tools_product::OperationOutcome::Stale,
+            latest_version: latest,
+            target: target_id(),
+        });
+    }
     require_current_runtime(product)?;
     check_after_runtime_gate(product)
 }
@@ -327,6 +379,15 @@ fn check_after_runtime_gate(product: Product) -> Result<Check> {
 
 pub(crate) fn update(product: Product) -> Result<Activation> {
     let paths = Paths::resolve(product)?;
+    #[cfg(target_os = "linux")]
+    if product == Product::UpdateAll {
+        let result = if classify_install(product, &paths)? == InstallClassification::Absent {
+            common_install(false)?
+        } else {
+            common_apply(false)?
+        };
+        return legacy_common_activation(&paths, result);
+    }
     if classify_install(product, &paths)? == InstallClassification::External {
         return Ok(externally_managed(product, &paths));
     }
@@ -492,6 +553,10 @@ pub(crate) fn update_if_installed(product: Product) -> Result<Activation> {
         }),
         InstallClassification::External => Ok(externally_managed(product, &paths)),
         InstallClassification::Managed => {
+            #[cfg(target_os = "linux")]
+            if product == Product::UpdateAll {
+                return update(product);
+            }
             require_current_runtime(product)?;
             update_managed(product, &paths)
         }
@@ -499,11 +564,58 @@ pub(crate) fn update_if_installed(product: Product) -> Result<Activation> {
 }
 
 pub(crate) fn rollback(product: Product) -> Result<Activation> {
+    #[cfg(target_os = "linux")]
+    if product == Product::UpdateAll {
+        return legacy_common_activation(&Paths::resolve(product)?, common_rollback()?);
+    }
     if product == Product::SyncConfigs {
         let runtime = RuntimeObservation::current();
         return rollback_with_runtime_policy(product, Some(&runtime));
     }
     rollback_with_runtime_policy(product, None)
+}
+
+#[cfg(target_os = "linux")]
+fn require_common_success(result: &dev_tools_product::OperationResultV2) -> Result<()> {
+    if result.exit_code != 0 {
+        return Err(crate::CommonOperationExit(result.exit_code).into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_common_activation(
+    paths: &Paths,
+    result: dev_tools_product::OperationResultV2,
+) -> Result<Activation> {
+    require_common_success(&result)?;
+    let changed = result
+        .changed
+        .context("completed operation has unknown installation progress")?;
+    let managed = result.installation_state == Some(dev_tools_product::InstallationState::Managed);
+    let path = if managed {
+        result
+            .installed_version
+            .as_deref()
+            .map(|version| version_binary(paths, version))
+    } else {
+        Some(paths.public_binary.clone())
+    };
+    let outcome = match result.outcome {
+        dev_tools_product::OperationOutcome::Installed => "installed",
+        dev_tools_product::OperationOutcome::Updated => "updated",
+        dev_tools_product::OperationOutcome::RolledBack => "rolled_back",
+        dev_tools_product::OperationOutcome::External => "external",
+        _ => "no_op",
+    };
+    Ok(Activation {
+        product: Product::UpdateAll,
+        version: result.installed_version,
+        changed,
+        managed,
+        outcome: outcome.into(),
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -1969,7 +2081,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Paths {
     product_root: PathBuf,
     versions: PathBuf,

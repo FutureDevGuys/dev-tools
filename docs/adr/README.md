@@ -136,3 +136,5 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0121](0121-terminal-command-graph-custody.md) | Foreground terminal command graph custody | proposed | pending |
 | [0122](0122-exact-plan-node-identity-and-streams.md) | Exact plan node identity and streams | proposed | pending |
 | [0123](0123-completion-intercept-passthrough.md) | Native completion intercept passthrough | proposed | pending |
+| [0124](0124-explicit-pending-update-recovery.md) | Explicit pending update recovery | proposed | pending |
+| [0126](0126-owned-version-retention-pins.md) | Owned version retention pins | proposed | pending |

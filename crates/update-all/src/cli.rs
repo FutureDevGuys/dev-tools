@@ -97,7 +97,7 @@ pub struct RunCli {
 
 #[derive(clap::Subcommand, Debug)]
 enum RunSubcommand {
-    /// Observe common update state (remaining common operations are pending).
+    /// Inspect or mutate this product's authenticated managed installation.
     Update(CommonUpdateCli),
     /// Show checkout-independent product build information.
     BuildInfo(BuildInfoCli),
@@ -250,19 +250,8 @@ impl RunCli {
             load_runtime_config(self.config.clone())
                 .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?,
         );
-        if startup_cfg
-            .as_ref()
-            .is_some_and(|config| config.install.auto_update)
-        {
-            if let Some(activation) = crate::release::maybe_auto_update()? {
-                if activation.changed {
-                    crate::ua_outln!(
-                        "Authenticated update-all {} and activated it for the next invocation.",
-                        activation.version.as_deref().unwrap_or("<unknown>")
-                    );
-                }
-            }
-        }
+        // Ordinary work never refreshes or activates the executable. The legacy
+        // auto_update field remains readable; explicit update commands own those effects.
 
         if self.dashboard && self.plain {
             bail!("--dashboard and --plain are mutually exclusive");
@@ -1518,6 +1507,24 @@ enum CommonUpdateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Opt this product into its authenticated managed installation.
+    Install(CommonUpdateMutationCli),
+    /// Apply an authenticated release to the existing managed installation.
+    Apply(CommonUpdateMutationCli),
+    /// Activate only the authenticated receipt-owned previous version, without network.
+    Rollback {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct CommonUpdateMutationCli {
+    #[arg(long)]
+    json: bool,
+    /// Use authenticated local candidate evidence and payloads only.
+    #[arg(long)]
+    offline: bool,
 }
 
 impl CommonUpdateCli {
@@ -1527,6 +1534,19 @@ impl CommonUpdateCli {
                 (json, "status", crate::release::common_status()?)
             }
             CommonUpdateCommand::Check { json } => (json, "check", crate::release::common_check()?),
+            CommonUpdateCommand::Install(cli) => (
+                cli.json,
+                "install",
+                crate::release::common_install(cli.offline)?,
+            ),
+            CommonUpdateCommand::Apply(cli) => (
+                cli.json,
+                "apply",
+                crate::release::common_apply(cli.offline)?,
+            ),
+            CommonUpdateCommand::Rollback { json } => {
+                (json, "rollback", crate::release::common_rollback()?)
+            }
         };
         if json {
             crate::ua_outln!("{}", serde_json::to_string(&result)?);
@@ -1700,6 +1720,23 @@ enum ProductCmd {
     UpdateIfInstalled(ProductOutputCli),
     /// Atomically reactivate the retained previous version.
     Rollback(ProductOutputCli),
+    /// Authenticate and retain a historical native artifact without activation.
+    Retain(ProductRetentionCli),
+}
+
+#[derive(clap::Args, Debug)]
+struct ProductRetentionCli {
+    #[command(flatten)]
+    output: ProductOutputCli,
+    /// Absolute path to the CURRENT accepted signed root document.
+    #[arg(long, value_name = "ABS")]
+    root_document: PathBuf,
+    /// Absolute path to the original source-bound historical product manifest.
+    #[arg(long, value_name = "ABS")]
+    manifest: PathBuf,
+    /// Absolute path to the native artifact authenticated by the manifest.
+    #[arg(long, value_name = "ABS")]
+    artifact: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1792,6 +1829,27 @@ impl ProductCli {
             ),
             ProductCmd::Rollback(cli) => {
                 emit_release_result(crate::release::rollback(cli.product.into())?, cli.json)
+            }
+            ProductCmd::Retain(cli) => {
+                let result = crate::release::retain_offline(
+                    cli.output.product.into(),
+                    &crate::release::OfflineBundlePaths {
+                        root_document: cli.root_document,
+                        manifest: cli.manifest,
+                        artifact: cli.artifact,
+                    },
+                );
+                if cli.output.json {
+                    crate::ua_outln!("{}", serde_json::to_string(&result)?);
+                } else {
+                    crate::ua_outln!("{} product retain: {}", result.product, result.outcome);
+                    if let Some(kind) = result.error_kind {
+                        crate::ua_errln!("retention failed: {kind:?}");
+                    }
+                }
+                if result.exit_code != 0 {
+                    return Err(crate::CommonOperationExit(i32::from(result.exit_code)).into());
+                }
             }
         }
         Ok(())

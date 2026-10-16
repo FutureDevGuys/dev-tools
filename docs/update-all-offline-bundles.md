@@ -29,6 +29,13 @@ newer release exists online. Both install and update use the same offline
 activation operation. An externally managed public command retains the existing
 external/no-change outcome and is not replaced.
 
+The unreleased Update All common-lifecycle integration routes explicit
+`product install/update update-all` bundles through the same v2 transaction as
+canonical common mutation. It preserves complete-input and fixed-trust admission;
+legacy migration additionally needs local original accepted/active/previous
+proofs. Missing proof blocks offline migration rather than downloading it or
+inventing ownership. Other products retain their existing scoped adapters.
+
 ## Accepted inputs
 
 - Supply the original signed root document, source-bound product-v2 manifest and
@@ -81,3 +88,51 @@ manufacture receipts or replace signed bytes to force a retry.
 
 The implementation and pending native acceptance contract are recorded in
 [Update All ADR 0025](../crates/update-all/docs/adr/0025-explicit-offline-signed-bundle-intake.md).
+
+## Retain a historical artifact without activation
+
+The separate unreleased retention operation restores or retains one exact
+historical native artifact in an existing managed product store:
+
+```text
+update-all product retain update-all --root-document /absolute/bundle/current-root.json --manifest /absolute/bundle/historical-manifest.json --artifact /absolute/bundle/update-all --json
+```
+
+The root must exactly match the product's **current accepted root**. Supply the
+original historical stable source-bound manifest and artifact. An old release's
+original root is insufficient when the accepted root has advanced. Current key
+revocations, fixed product/target/URL policy, protocol, source identity, exact
+length and digest are checked offline. This operation never downloads metadata
+or bytes and never uses a raw key or destination supplied by the caller.
+
+`retain` is explicit new retention authority, not proof that this historical
+release was previously accepted. It does not activate the file, create rollback
+eligibility, lower or advance accepted history, change trust or caches, invoke
+setup or privilege, or execute the artifact. Active/previous versions and all
+public pointers remain unchanged. Normal install/update still reject a
+historical downgrade; rollback still requires the existing previous-version
+receipt. Other registered products use the same retention contract.
+
+The operation requires a valid existing managed installation and accepted
+history. It fails closed for external/unknown installation state, unsafe inputs,
+foreign or drifting storage, and any unowned destination, including equal-byte
+files. The destination is derived only from the typed product layout and signed
+version. Already owned active/previous bytes can gain separate explicit retention
+ownership; the first request therefore changes retention state. A fully retained
+exact repeat verifies custody and synchronizes without republishing.
+
+A bounded product journal precedes publication. Private proof receipts and
+content-bound ownership pins preserve explicitly retained files during ordinary
+v1/v2 managed upgrades; pins grant no activation authority. Older updater writers
+must be quiescent; explicit uninstall is outside pin protection. After
+interruption, repeat the exact manifest/artifact inputs
+with the then-current accepted root to resume the same intent. A pending other
+bundle blocks rather than being discarded. Do not copy files into the managed
+store, edit receipts or remove journals manually.
+
+JSON uses `update-all-product-retention-v1`, fixed value-free errors and nullable
+`changed`: false before established mutation, true for established retention
+change, null for entered uncertain progress. Its successful identity describes
+the retained artifact, not the running command. This implementation is source
+only; native durability, interruption, collision and upgrade/rollback preservation
+acceptance remain pending under [ADR 0031](../crates/update-all/docs/adr/0031-nonactivating-authenticated-artifact-retention.md).

@@ -329,6 +329,22 @@ pub(super) fn initialize(
     paths: &Paths,
     evidence: &[ReleaseMetadata],
 ) -> Result<(bool, Option<VersionedReceipt>)> {
+    let layout = shared_installation_layout(product, paths)?;
+    dev_tools_installation::ensure_owned_directory(
+        &layout.data_root,
+        layout.owner_uid,
+        layout.directory_mode,
+    )?;
+    let lease = acquire_release_writer(paths)?;
+    initialize_under_lease(product, paths, evidence, &lease)
+}
+
+fn initialize_under_lease(
+    product: Product,
+    paths: &Paths,
+    evidence: &[ReleaseMetadata],
+    _lease: &dev_tools_installation::InstallationLock,
+) -> Result<(bool, Option<VersionedReceipt>)> {
     if evidence.len() > PROOF_COUNT_LIMIT {
         bail!("too many retained release proofs");
     }
@@ -338,62 +354,380 @@ pub(super) fn initialize(
         layout.owner_uid,
         layout.directory_mode,
     )?;
-    let _lease = acquire_release_writer(paths)?;
     let result = versioned_v2::initialize(&layout, ARTIFACT_LIMIT, |receipt| {
-        let (_, captured) = retire_atomic_document(
-            &paths.state,
-            &state_document_authority(paths)?,
-            receipt.is_none(),
-        )?;
-        let captured_identity = captured.as_ref().map(|document| document.identity.clone());
-        let destination = paths.product_root.join(STATE_NAME);
-        if read_atomic_document(&destination, &document_authority(paths)?)?.is_some() {
-            let accepted = load(product, paths)?;
-            if accepted.document.captured_identity != captured_identity {
-                bail!("release authority differs from captured legacy history");
-            }
-            return accepted.verify_receipt(receipt);
-        }
-        let state: ReleaseState = match captured {
-            Some(document) => parse_json(&document.bytes, "captured release state")?,
-            None => ReleaseState::default(),
-        };
-        let ledger = ManifestLedger::import_release_state(
-            &migration_authority(product),
-            SharedReleaseState {
-                accepted_root_generation: state.accepted_root_generation,
-                accepted_root_sha256: state.accepted_root_sha256,
-                accepted_generation: state.accepted_generation,
-                accepted_version: state.accepted_version,
-                accepted_manifest_sha256: state.accepted_manifest_sha256,
-                accepted_binary_sha256: state.accepted_binary_sha256,
-            },
-        )?;
-        let accepted = AcceptedAuthority::validate(
-            AuthorityDocument {
-                schema: SCHEMA.into(),
-                captured_identity,
-                ledger: String::from_utf8(ledger.to_bytes()?)?,
-                proofs: evidence
-                    .iter()
-                    .map(Proof::from_metadata)
-                    .collect::<Result<_>>()?,
-            },
-            product,
-        )?;
-        accepted.verify_receipt(receipt)?;
-        write_atomic_document(
-            &destination,
-            &serde_json::to_vec(&accepted.document)?,
-            &document_authority(paths)?,
-            None,
-        )?;
-        Ok(())
+        publish_captured_authority(product, paths, receipt, evidence)
     })?;
-    // The installation primitive skips its callback on an initialized repeat.
-    // Absence or corruption here must never be treated as fresh initialization.
+    // An initialized repeat must still authenticate the independent product authority.
     load(product, paths)?.verify_receipt(result.1.as_ref())?;
     Ok(result)
+}
+
+fn publish_captured_authority(
+    product: Product,
+    paths: &Paths,
+    receipt: Option<&VersionedReceipt>,
+    evidence: &[ReleaseMetadata],
+) -> Result<()> {
+    let (_, captured) = retire_atomic_document(
+        &paths.state,
+        &state_document_authority(paths)?,
+        receipt.is_none(),
+    )?;
+    let captured_identity = captured.as_ref().map(|document| document.identity.clone());
+    let destination = paths.product_root.join(STATE_NAME);
+    if read_atomic_document(&destination, &document_authority(paths)?)?.is_some() {
+        let accepted = load(product, paths)?;
+        if accepted.document.captured_identity != captured_identity {
+            bail!("release authority differs from captured legacy history");
+        }
+        return accepted.verify_receipt(receipt);
+    }
+    let state: ReleaseState = match captured {
+        Some(document) => parse_json(&document.bytes, "captured release state")?,
+        None => ReleaseState::default(),
+    };
+    let ledger = ManifestLedger::import_release_state(
+        &migration_authority(product),
+        SharedReleaseState {
+            accepted_root_generation: state.accepted_root_generation,
+            accepted_root_sha256: state.accepted_root_sha256,
+            accepted_generation: state.accepted_generation,
+            accepted_version: state.accepted_version,
+            accepted_manifest_sha256: state.accepted_manifest_sha256,
+            accepted_binary_sha256: state.accepted_binary_sha256,
+        },
+    )?;
+    let accepted = AcceptedAuthority::validate(
+        AuthorityDocument {
+            schema: SCHEMA.into(),
+            captured_identity,
+            ledger: String::from_utf8(ledger.to_bytes()?)?,
+            proofs: evidence
+                .iter()
+                .map(Proof::from_metadata)
+                .collect::<Result<_>>()?,
+        },
+        product,
+    )?;
+    accepted.verify_receipt(receipt)?;
+    write_atomic_document(
+        &destination,
+        &serde_json::to_vec(&accepted.document)?,
+        &document_authority(paths)?,
+        None,
+    )?;
+    Ok(())
+}
+
+/// Original signed evidence is selected before mutation. Legacy metadata may
+/// select proof versions, but never supplies artifact identities by itself.
+pub(super) fn gather_evidence(
+    paths: &Paths,
+    mut local: Vec<ReleaseMetadata>,
+    mut fetch: Option<&mut dyn FnMut(&str) -> Result<ReleaseMetadata>>,
+) -> Result<Vec<ReleaseMetadata>> {
+    let layout = shared_installation_layout(Product::UpdateAll, paths)?;
+    if versioned_v2::read_receipt_metadata(&layout).is_ok() {
+        return load(Product::UpdateAll, paths)?
+            .document
+            .proofs
+            .iter()
+            .map(Proof::metadata)
+            .collect();
+    }
+    let state = migration_history(paths)?;
+    let ledger = legacy_ledger(&state)?;
+    let Some(accepted_version) = state.accepted_version.as_deref() else {
+        if state.active_version.is_some() || state.previous_version.is_some() {
+            bail!("legacy installation lacks accepted release history");
+        }
+        return Ok(Vec::new());
+    };
+    let mut versions = std::collections::BTreeSet::from([accepted_version.to_owned()]);
+    let pending = versioned_v2::pending_recovery(&layout)?;
+    let receipts = if pending.is_some() {
+        versioned_v2::read_pending_receipts(&layout)?
+    } else {
+        read_versioned_installation_receipt(&layout)?
+            .into_iter()
+            .collect()
+    };
+    for receipt in &receipts {
+        versions.insert(receipt.active_version.clone());
+        versions.extend(receipt.previous_version.iter().cloned());
+    }
+    if receipts.is_empty() {
+        versions.extend(state.active_version.iter().cloned());
+        versions.extend(state.previous_version.iter().cloned());
+    }
+    if versions.len() > PROOF_COUNT_LIMIT {
+        bail!("legacy installation exceeds the retained proof bound");
+    }
+    // URL-bound HTTP cache bodies are merely candidate proof inputs. Signatures,
+    // exact accepted root and the independent ledger are reapplied below.
+    let mut bodies = Vec::new();
+    for path in [&paths.root_cache, &paths.manifest_cache] {
+        let authority = DocumentAuthority {
+            limit: 4 * METADATA_LIMIT + 12 * HTTP_CACHE_TEXT_LIMIT as u64 + 1024,
+            ..state_document_authority(paths)?
+        };
+        if let Some(document) = read_atomic_document(path, &authority)? {
+            let cache: MetadataHttpCache = serde_json::from_slice(&document.bytes)?;
+            cache.validate(METADATA_LIMIT)?;
+            bodies.push(cache.bytes);
+        }
+    }
+    if bodies.len() == 2 {
+        local.push(ReleaseMetadata {
+            root: bodies.remove(0),
+            manifest: bodies.remove(0),
+        });
+    }
+    let root = match local.iter().find(|metadata| {
+        Some(sha256_hex(&metadata.root)).as_ref() == state.accepted_root_sha256.as_ref()
+    }) {
+        Some(metadata) => metadata.root.clone(),
+        None => {
+            let metadata = fetch
+                .as_mut()
+                .context("authenticated retained proof is unavailable offline")?(
+                accepted_version
+            )?;
+            if Some(sha256_hex(&metadata.root)).as_ref() != state.accepted_root_sha256.as_ref() {
+                bail!("retained proof does not contain the exact accepted root");
+            }
+            let root = metadata.root.clone();
+            local.push(metadata);
+            root
+        }
+    };
+    let authority = migration_authority(Product::UpdateAll);
+    let mut result = Vec::new();
+    for version in versions {
+        let found = local.iter().find_map(|metadata| {
+            let rebound = ReleaseMetadata {
+                root: root.clone(),
+                manifest: metadata.manifest.clone(),
+            };
+            ledger
+                .verify_retained_with_authority(&authority, &rebound)
+                .ok()
+                .filter(|verified| verified.version.to_string() == version)
+                .map(|_| rebound)
+        });
+        let metadata = match found {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = fetch
+                    .as_mut()
+                    .context("authenticated retained proof is unavailable offline")?(
+                    &version
+                )?;
+                ReleaseMetadata {
+                    root: root.clone(),
+                    manifest: metadata.manifest,
+                }
+            }
+        };
+        let verified = ledger.verify_retained_with_authority(&authority, &metadata)?;
+        if verified.version.to_string() != version {
+            bail!("retained proof version mismatch");
+        }
+        result.push(metadata);
+    }
+    Ok(result)
+}
+
+/// Explicit local recovery/cutover. The caller retains the outer release lease;
+/// callbacks only authenticate original evidence and publish product authority.
+pub(super) fn prepare_mutation(
+    paths: &Paths,
+    evidence: &[ReleaseMetadata],
+    lease: &dev_tools_installation::InstallationLock,
+) -> Result<bool> {
+    let product = Product::UpdateAll;
+    let layout = shared_installation_layout(product, paths)?;
+    let pending = versioned_v2::pending_recovery(&layout)?;
+    if pending == Some(versioned_v2::PendingRecovery::Activation) {
+        let authority = load(product, paths)?;
+        return Ok(versioned_v2::recover(&layout, ARTIFACT_LIMIT, |receipt| {
+            authority.verify_receipt(Some(receipt))
+        })?
+        .0);
+    }
+    let migration = AcceptedAuthority::validate(
+        AuthorityDocument {
+            schema: SCHEMA.into(),
+            captured_identity: None,
+            ledger: String::from_utf8(observation_ledger(paths)?.to_bytes()?)?,
+            proofs: evidence
+                .iter()
+                .map(Proof::from_metadata)
+                .collect::<Result<_>>()?,
+        },
+        product,
+    )?;
+    if pending.is_some() {
+        for receipt in versioned_v2::read_pending_receipts(&layout)? {
+            migration.verify_receipt(Some(&receipt))?;
+        }
+    }
+    if pending == Some(versioned_v2::PendingRecovery::LegacyAdoption) {
+        versioned_v2::legacy_adoption::resume(&layout, ARTIFACT_LIMIT, |receipt| {
+            publish_captured_authority(product, paths, Some(receipt), evidence)
+        })?;
+        return Ok(true);
+    }
+    if pending == Some(versioned_v2::PendingRecovery::ProtocolUpgrade) {
+        return Ok(initialize_under_lease(product, paths, evidence, lease)?.0);
+    }
+    if versioned_v2::read_receipt_metadata(&layout).is_ok() {
+        observe_authenticated(paths)?;
+        return Ok(false);
+    }
+    if let Some(receipt) = read_versioned_installation_receipt(&layout)? {
+        // Proof binding precedes legacy link repair; no candidate is executed
+        // during local mutation preparation.
+        migration.verify_receipt(Some(&receipt))?;
+        let repair = repair_versioned_installation(&layout, |_| Ok(()))?;
+        return Ok(initialize_under_lease(product, paths, evidence, lease)?.0 || repair.changed);
+    }
+    let state = migration_history(paths)?;
+    let topology = observe_legacy_topology(product, paths)?;
+    if topology.present {
+        let ledger = legacy_ledger(&state)?;
+        let authority = migration_authority(product);
+        let releases = evidence
+            .iter()
+            .map(|metadata| ledger.verify_retained_with_authority(&authority, metadata))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let active = state
+            .active_version
+            .as_ref()
+            .context("legacy active identity is unavailable")?;
+        if topology.version.as_ref() != Some(active) {
+            bail!("legacy active topology changed");
+        }
+        let identity = |version: &str| -> Result<ArtifactIdentity> {
+            let release = releases
+                .iter()
+                .find(|release| release.version.to_string() == version)
+                .context("legacy version lacks authenticated proof")?;
+            Ok(ArtifactIdentity {
+                length: release.artifact_length,
+                sha256: release.artifact_sha256.clone(),
+            })
+        };
+        let next = VersionedReceipt {
+            schema: "dev-tools-versioned-installation-v1".into(),
+            product: product.id().into(),
+            data_root: layout.data_root.clone(),
+            bin_dir: layout.bin_dir.clone(),
+            artifact_name: layout.artifact_name.clone(),
+            active_version: active.clone(),
+            active_identity: identity(active)?,
+            previous_version: state.previous_version.clone(),
+            previous_identity: state
+                .previous_version
+                .as_deref()
+                .map(identity)
+                .transpose()?,
+            aliases: vec![paths.executable_name.clone()],
+        };
+        let prepared = versioned_v2::legacy_adoption::prepare(
+            &VersionedTwoLevelAdoption {
+                adoption: VersionedAdoption {
+                    layout,
+                    version: active.clone(),
+                    identity: next.active_identity.clone(),
+                    aliases: next.aliases.clone(),
+                },
+                version_pointer: paths.current.clone(),
+            },
+            &next,
+            ARTIFACT_LIMIT,
+        )?;
+        prepared.commit(|receipt| {
+            publish_captured_authority(product, paths, Some(receipt), evidence)
+        })?;
+        return Ok(true);
+    }
+    Ok(initialize_under_lease(product, paths, evidence, lease)?.0)
+}
+
+pub(super) fn activate(
+    paths: &Paths,
+    candidate: &SharedVerifiedRelease,
+    source: &Path,
+) -> Result<bool> {
+    let layout = shared_installation_layout(Product::UpdateAll, paths)?;
+    let receipt = observe_authenticated(paths)?;
+    let accepted = load(Product::UpdateAll, paths)?;
+    let mut ledger = accepted.ledger.clone();
+    // Activation cannot accept a different candidate or recreate lost history.
+    let metadata = accepted
+        .document
+        .proofs
+        .iter()
+        .find_map(|proof| {
+            let metadata = proof.metadata().ok()?;
+            let verified = ledger
+                .accept_release_metadata(&super::common::candidate_authority(), &metadata)
+                .ok()?;
+            (verified.0 == *candidate && !verified.1).then_some(metadata)
+        })
+        .context("activation candidate is not independently accepted")?;
+    dev_tools_release::verify_artifact_bytes(
+        candidate,
+        &read_atomic_document(
+            source,
+            &DocumentAuthority {
+                owner_uid: layout.owner_uid,
+                mode: 0o700,
+                limit: ARTIFACT_LIMIT,
+            },
+        )?
+        .context("authenticated payload is absent")?
+        .bytes,
+    )?;
+    let _ = metadata;
+    let report = versioned_v2::apply_if_unchanged(
+        &VersionedInstallRequest {
+            layout,
+            version: candidate.version.to_string(),
+            source: source.to_path_buf(),
+            identity: ArtifactIdentity {
+                length: candidate.artifact_length,
+                sha256: candidate.artifact_sha256.clone(),
+            },
+            aliases: vec![paths.executable_name.clone()],
+        },
+        receipt.as_ref(),
+        |path| {
+            verify_candidate_health(Product::UpdateAll, path, &candidate.version.to_string())
+                .map_err(|_| CandidateHealthFailure.into())
+        },
+    )?;
+    Ok(report.changed)
+}
+
+pub(super) fn rollback(paths: &Paths) -> Result<bool> {
+    let layout = shared_installation_layout(Product::UpdateAll, paths)?;
+    let receipt = observe_authenticated(paths)?.context("installation receipt is empty")?;
+    Ok(
+        versioned_v2::rollback_if_unchanged(&layout, &receipt, |path| {
+            verify_candidate_health(
+                Product::UpdateAll,
+                path,
+                receipt
+                    .previous_version
+                    .as_deref()
+                    .context("no retained previous version")?,
+            )
+            .map_err(|_| CandidateHealthFailure.into())
+        })?
+        .changed,
+    )
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
