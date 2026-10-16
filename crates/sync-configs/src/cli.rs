@@ -732,6 +732,8 @@ fn run_main(cli: Cli) -> i32 {
             }
         }
         Err(error) => {
+            let diagnostic = error.failure_diagnostic();
+            recorder.record_failure(diagnostic);
             if cli.format == OutputFormat::Json {
                 let failure = serde_json::json!({
                     "schema_version": crate::report::REPORT_SCHEMA_VERSION,
@@ -740,6 +742,7 @@ fn run_main(cli: Cli) -> i32 {
                     "dry_run": cli.dry_run,
                     "profiles": output_profiles,
                     "error_kind": "convergence_failed",
+                    "failure": diagnostic,
                 });
                 let mut rendered = serde_json::to_vec(&failure).unwrap_or_else(|_| {
                     b"{\"schema_version\":1,\"outcome\":\"failed\",\"exit_code\":1}\n".to_vec()

@@ -15,6 +15,7 @@ use dev_tools_command::{
     is_executable_file, run_bounded_command, run_bounded_command_with_cancellation, BoundedCommand,
     BoundedCommandError, BoundedCommandErrorKind,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_PRIVILEGED_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -49,7 +50,8 @@ pub enum PrivilegeError {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthenticationStage {
     CachedCheck,
     Prompt,

@@ -37,7 +37,9 @@ use crate::paths::{
     canonical_target_key, is_absolute_for, resolve_config_path, PathContext, PathError,
     PathPlatform,
 };
-use crate::privilege::{discover_trusted_sudo, PrivilegeError, PrivilegeSession};
+use crate::privilege::{
+    discover_trusted_sudo, AuthenticationFailure, PrivilegeError, PrivilegeSession,
+};
 use crate::privileged_target::{
     apply_privileged_plans, plan_selected_privileged_entries, revalidate_privileged_plans,
     PrivilegedCommands, PrivilegedCopyPlan, PrivilegedTargetError, PrivilegedTargetOutcome,
@@ -47,7 +49,7 @@ use crate::reconciler::{
     resolve_executable as resolve_reconciler_executable, ReconcilerError, ReconcilerPrivilege,
     ReconcilerRunner, ReconcilerSpec,
 };
-use crate::report::{ReconcilerSummary, Record, Report, Status};
+use crate::report::{FailureDiagnostic, ReconcilerSummary, Record, Report, Status};
 use crate::scaffold::{initialize, render_examples, ScaffoldError, ScaffoldPaths};
 
 const RECONCILER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -116,6 +118,41 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Project only established typed causes; never infer one from elapsed time
+    /// or parse arbitrary error text. Interruption handling takes precedence.
+    pub fn failure_diagnostic(&self) -> FailureDiagnostic {
+        match self {
+            Self::Hook(crate::hooks::HookError::TimedOut { phase }) => {
+                FailureDiagnostic::HookTimedOut { phase: *phase }
+            }
+            Self::Privilege(source)
+            | Self::Hook(crate::hooks::HookError::Privilege(source))
+            | Self::PrivilegedTarget(PrivilegedTargetError::PrivilegedCommand {
+                source,
+                ..
+            }) => match source {
+                PrivilegeError::TimedOut => FailureDiagnostic::PrivilegedCommandTimedOut,
+                PrivilegeError::Authentication { stage, failure } => match failure {
+                    AuthenticationFailure::Process { os_code, .. } => {
+                        FailureDiagnostic::AuthenticationProcess {
+                            stage: *stage,
+                            os_code: *os_code,
+                        }
+                    }
+                    AuthenticationFailure::Exit { code, signal } => {
+                        FailureDiagnostic::AuthenticationExit {
+                            stage: *stage,
+                            code: *code,
+                            signal: *signal,
+                        }
+                    }
+                },
+                _ => FailureDiagnostic::ConvergenceFailed,
+            },
+            _ => FailureDiagnostic::ConvergenceFailed,
+        }
+    }
+
     pub const fn is_interrupted(&self) -> bool {
         matches!(
             self,
