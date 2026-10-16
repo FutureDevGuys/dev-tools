@@ -22,6 +22,8 @@ use crate::resources::{self, CleanupStrategy, ResourceKind, ResourceRecord};
 use crate::root::RootHandle;
 use crate::util::{directory_size, now_unix, write_json_atomic};
 
+mod orphan;
+
 #[derive(Clone, Debug, Default)]
 pub struct GcOverrides {
     pub max_bytes: Option<u64>,
@@ -231,10 +233,31 @@ fn collect_with_lease(
         artifact_actions(root, now, artifact_stale_after_days)?;
     actions.extend(artifact_actions);
     abstentions.extend(artifact_abstentions);
-    let (resource_actions, resource_abstentions) =
-        resource_actions(root, now, stale_days, policy, &active_resource_ids)?;
+    let (records, catalog_issues) = resources::scan(root)?;
+    let catalog_complete = catalog_issues.is_empty();
+    let (resource_actions, resource_abstentions) = resource_actions(
+        root,
+        now,
+        stale_days,
+        policy,
+        &active_resource_ids,
+        &records,
+        catalog_issues,
+    )?;
     actions.extend(resource_actions);
     abstentions.extend(resource_abstentions);
+    let orphan_groups = orphan::link_actions(
+        &orphan::Admission {
+            root,
+            policy,
+            now,
+            active_paths: &active_paths,
+        },
+        &records,
+        catalog_complete,
+        &mut actions,
+        &mut abstentions,
+    );
     remove_nested_actions(&mut actions);
     let bytes_before = measure_action_sizes(root, &mut actions, progress)?;
     let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
@@ -275,7 +298,19 @@ fn collect_with_lease(
     let mut failures = Vec::new();
     if apply {
         for action in &actions {
-            if let Err(error) = apply_action(root, action) {
+            let result = if action.kind == orphan::ACTION_KIND {
+                orphan::apply(
+                    root,
+                    policy,
+                    action,
+                    orphan_groups
+                        .get(&action.path)
+                        .context("missing current orphan admission")?,
+                )
+            } else {
+                apply_action(root, action)
+            };
+            if let Err(error) = result {
                 failures.push(GcFailure {
                     resource_id: action.resource_id.clone(),
                     path: action.path.clone(),
@@ -342,18 +377,34 @@ fn measure_action_sizes(
     let paths = actions
         .iter()
         .filter(|action| measured_action(action))
-        .map(|action| action.path.clone())
+        .flat_map(|action| measured_paths(action).iter().cloned())
         .collect::<Vec<_>>();
     let measurement = crate::space::measure_paths_with_progress(root, &paths, progress)
         .map_err(anyhow::Error::msg)
         .context("observe cache sizes before collection actions")?;
     for action in actions.iter_mut().filter(|action| measured_action(action)) {
-        action.bytes = *measurement
-            .paths
-            .get(&action.path)
-            .context("missing admitted cache size observation")?;
+        action.bytes = measured_paths(action)
+            .iter()
+            .try_fold(0_u64, |total, path| {
+                total
+                    .checked_add(
+                        *measurement
+                            .paths
+                            .get(path)
+                            .context("missing admitted cache size observation")?,
+                    )
+                    .context("compound cache size overflow")
+            })?;
     }
     Ok(measurement.total)
+}
+
+fn measured_paths(action: &GcAction) -> &[PathBuf] {
+    if action.kind == orphan::ACTION_KIND {
+        &action.companion_paths
+    } else {
+        std::slice::from_ref(&action.path)
+    }
 }
 
 fn selected_bytes(actions: &[GcAction]) -> Result<u64> {
@@ -369,8 +420,9 @@ fn resource_actions(
     stale_days: u64,
     policy: &GcConfig,
     active_resource_ids: &std::collections::BTreeSet<String>,
+    records: &[ResourceRecord],
+    issues: Vec<resources::CatalogIssue>,
 ) -> Result<(Vec<GcAction>, Vec<GcAbstention>)> {
-    let (records, issues) = resources::scan(root)?;
     let mut actions = Vec::new();
     let mut abstentions = issues
         .into_iter()
@@ -381,7 +433,7 @@ fn resource_actions(
         })
         .collect::<Vec<_>>();
     for record in records {
-        let path = match resources::absolute_path(root, &record) {
+        let path = match resources::absolute_path(root, record) {
             Ok(path) => path,
             Err(error) => {
                 abstentions.push(GcAbstention {
@@ -696,8 +748,8 @@ fn remove_nested_actions(actions: &mut Vec<GcAction>) {
     // scanning every repository for every action.
     let repository_roots = actions
         .iter()
-        .filter(|action| action.kind == "repository")
-        .map(|action| action.path.clone())
+        .filter(|action| action.kind == "repository" || action.kind == orphan::ACTION_KIND)
+        .flat_map(|action| measured_paths(action).iter().cloned())
         .collect::<std::collections::BTreeSet<_>>();
     let covers_all_paths = repository_roots.contains(Path::new(""));
     actions.retain(|action| {
@@ -710,6 +762,7 @@ fn remove_nested_actions(actions: &mut Vec<GcAction>) {
             _ => false,
         };
         action.kind == "repository"
+            || action.kind == orphan::ACTION_KIND
             || (!covers_all_paths
                 && !prefix_is_root
                 && !action
@@ -734,7 +787,11 @@ fn apply_action(root: &RootHandle, action: &GcAction) -> Result<()> {
     if action.kind == "repository-identity-duplicate" {
         return remove_empty_identity_duplicate(root, action);
     }
-    if !action.path.exists() && action.companion_paths.iter().all(|path| !path.exists()) {
+    let mut all_absent = true;
+    for path in std::iter::once(&action.path).chain(&action.companion_paths) {
+        all_absent &= observe_path(path)?.is_none();
+    }
+    if all_absent {
         return Ok(());
     }
     let record = if matches!(action.kind.as_str(), "artifact" | "repository") {
@@ -1082,19 +1139,22 @@ fn owned_transaction(root: &RootHandle, action: &GcAction) -> Result<()> {
     write_json_atomic(&journal_path, &journal)?;
     fs::create_dir_all(&trash_path)?;
     for (index, path) in paths.iter().enumerate() {
-        if !path.exists() {
-            continue;
-        }
-        if let Err(error) = fs::rename(path, trash_path.join(index.to_string())) {
+        let staged = observe_path(path).and_then(|metadata| {
+            if metadata.is_none() {
+                return Ok(());
+            }
+            fs::rename(path, trash_path.join(index.to_string()))
+                .with_context(|| format!("move {} into owned GC trash", path.display()))
+        });
+        if let Err(error) = staged {
             if let Err(rollback) = restore_uncommitted(root, &journal) {
                 bail!(
-                    "move {} into owned GC trash failed: {error}; rollback also failed: {rollback:#}",
+                    "move {} into owned GC trash failed: {error:#}; rollback also failed: {rollback:#}",
                     path.display()
                 );
             }
             fs::remove_file(&journal_path)?;
-            return Err(error)
-                .with_context(|| format!("move {} into owned GC trash", path.display()));
+            return Err(error);
         }
     }
     journal.committed = true;
@@ -1106,8 +1166,15 @@ fn owned_transaction(root: &RootHandle, action: &GcAction) -> Result<()> {
 
 fn recover_trash(root: &RootHandle) -> Result<()> {
     let directory = root.control().join("gc-journal");
-    if !directory.is_dir() {
+    validate_action_path(root, &directory)?;
+    let Some(metadata) = observe_path(&directory)? else {
         return Ok(());
+    };
+    if !metadata.is_dir() {
+        bail!(
+            "GC journal path is not a directory: {}",
+            directory.display()
+        );
     }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -1123,14 +1190,15 @@ fn recover_trash(root: &RootHandle) -> Result<()> {
         {
             bail!("invalid GC journal {}", entry.path().display());
         }
-        if journal.trash_path.exists() {
+        validate_action_path(root, &journal.trash_path)?;
+        if observe_path(&journal.trash_path)?.is_some() {
             if journal.committed {
                 remove_path(&journal.trash_path)?;
             } else {
                 restore_uncommitted(root, &journal)?;
             }
         }
-        if !journal.trash_path.exists() {
+        if observe_path(&journal.trash_path)?.is_none() {
             fs::remove_file(entry.path())?;
         }
     }
@@ -1144,10 +1212,10 @@ fn restore_uncommitted(root: &RootHandle, journal: &TrashJournal) -> Result<()> 
     for (index, original) in journal.original_paths.iter().enumerate().rev() {
         validate_action_path(root, original)?;
         let staged = journal.trash_path.join(index.to_string());
-        if !staged.exists() {
+        if observe_path(&staged)?.is_none() {
             continue;
         }
-        if original.exists() {
+        if observe_path(original)?.is_some() {
             bail!(
                 "cannot restore uncommitted GC transaction because {} already exists",
                 original.display()
@@ -1344,7 +1412,7 @@ fn validate_action_path(root: &RootHandle, path: &Path) -> Result<()> {
             bail!("GC candidate contains a non-normal component");
         }
         current.push(component.as_os_str());
-        if fs::symlink_metadata(&current).ok().is_some_and(|metadata| {
+        if observe_path(&current)?.is_some_and(|metadata| {
             metadata.file_type().is_symlink() || is_reparse_point(&metadata)
         }) {
             bail!(
@@ -1357,7 +1425,7 @@ fn validate_action_path(root: &RootHandle, path: &Path) -> Result<()> {
 }
 
 fn remove_path(path: &Path) -> Result<()> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
+    let Some(metadata) = observe_path(path)? else {
         return Ok(());
     };
     if metadata.is_dir() {
@@ -1366,6 +1434,14 @@ fn remove_path(path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn observe_path(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect GC path {}", path.display())),
+    }
 }
 
 #[cfg(windows)]
@@ -1380,10 +1456,15 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 }
 
 fn trash_backlog(root: &RootHandle) -> Result<usize> {
-    if !root.trash().is_dir() {
+    let trash = root.trash();
+    validate_action_path(root, &trash)?;
+    let Some(metadata) = observe_path(&trash)? else {
         return Ok(0);
+    };
+    if !metadata.is_dir() {
+        bail!("GC trash path is not a directory: {}", trash.display());
     }
-    Ok(fs::read_dir(root.trash())?.count())
+    Ok(fs::read_dir(trash)?.count())
 }
 
 fn action_age_rank(action: &GcAction) -> u8 {

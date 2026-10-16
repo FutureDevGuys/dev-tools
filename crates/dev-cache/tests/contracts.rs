@@ -162,6 +162,45 @@ fn indirect_dispatch_matches_only_exact_supported_command_grammar() {
     ] {
         assert_eq!(classify_invocation(command, &args), Dispatch::Delegate);
     }
+    for (command, args, expected) in [
+        (
+            "uv",
+            vec!["generate-shell-completion".into(), "zsh".into()],
+            Dispatch::Delegate,
+        ),
+        (
+            "uvx",
+            vec!["--generate-shell-completion".into(), "fish".into()],
+            Dispatch::Delegate,
+        ),
+        (
+            "uv.exe",
+            vec!["generate-shell-completion".into(), "powershell".into()],
+            Dispatch::Delegate,
+        ),
+        (
+            "uv",
+            vec!["run".into(), "generate-shell-completion".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+        (
+            "uvx",
+            vec!["generate-shell-completion".into(), "zsh".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+        (
+            "uv",
+            vec!["--".into(), "generate-shell-completion".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+        (
+            "uvx",
+            vec!["tool".into(), "--generate-shell-completion".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+    ] {
+        assert_eq!(classify_invocation(command, &args), expected, "{command}");
+    }
 }
 
 #[test]
