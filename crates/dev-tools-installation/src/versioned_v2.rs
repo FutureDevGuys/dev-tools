@@ -292,6 +292,43 @@ pub fn pending_recovery(layout: &VersionedLayout) -> Result<Option<PendingRecove
     Ok(Some(PendingRecovery::Activation))
 }
 
+/// Read strict pending endpoint metadata for product-owned proof selection.
+/// This authenticates no release, verifies no artifact custody, grants no recovery
+/// permission, and performs no creation or repair. Mutation must revalidate the
+/// exact journal under its existing installation lock.
+pub fn read_pending_receipts(layout: &VersionedLayout) -> Result<Vec<VersionedReceipt>> {
+    match pending_recovery(layout)?.context("installation has no pending recovery")? {
+        PendingRecovery::LegacyAdoption => Ok(vec![legacy_adoption::read_pending_receipt(layout)?]),
+        PendingRecovery::ProtocolUpgrade => {
+            let document =
+                read_atomic_document(&layout.journal_path(), &receipt_authority(layout))?
+                    .context("protocol upgrade disappeared")?;
+            let upgrade: UpgradeJournal = serde_json::from_slice(&document.bytes)?;
+            if upgrade.schema != UPGRADE_SCHEMA || upgrade.layout != *layout {
+                bail!("installation protocol upgrade does not match its layout");
+            }
+            validate_optional(layout, upgrade.prior.as_ref())?;
+            Ok(upgrade.prior.into_iter().collect())
+        }
+        PendingRecovery::Activation => {
+            let document =
+                read_atomic_document(&layout.journal_path(), &receipt_authority(layout))?
+                    .context("activation transition disappeared")?;
+            let journal: TransitionJournal = serde_json::from_slice(&document.bytes)?;
+            if journal.schema != TRANSITION_SCHEMA || journal.layout != *layout {
+                bail!("installation transition does not match its layout");
+            }
+            validate_transition_journal(layout, &journal.transition)?;
+            if journal.transition.legacy.is_some() {
+                bail!("v2 transition cannot contain legacy adoption");
+            }
+            let mut receipts: Vec<_> = journal.transition.prior.into_iter().collect();
+            receipts.push(journal.transition.next);
+            Ok(receipts)
+        }
+    }
+}
+
 /// Apply only if the initialized receipt equals the caller's observation.
 /// Pending journals, link drift and receipt changes fail before candidate
 /// publication. Product authentication and candidate health remain caller-owned.

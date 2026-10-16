@@ -23,6 +23,10 @@ mod existing_document_directory;
 #[cfg(target_os = "linux")]
 pub use existing_document_directory::{DocumentDirectoryPreparation, ExistingDocumentDirectory};
 #[cfg(target_os = "linux")]
+mod retention_pin;
+#[cfg(target_os = "linux")]
+pub use retention_pin::{retain_versioned_artifact, versioned_artifact_is_retained};
+#[cfg(target_os = "linux")]
 mod directory_publication;
 #[cfg(target_os = "linux")]
 mod staging;
@@ -2315,6 +2319,13 @@ fn remove_superseded_version(
         .previous_identity
         .as_ref()
         .context("prior receipt omitted its previous identity")?;
+    // An exact product-published pin survives normal activation pruning. A
+    // malformed or drifted pin is an error, never authority to keep/delete an
+    // arbitrary version. Both v1 and v2 activation use this helper.
+    #[cfg(target_os = "linux")]
+    if versioned_artifact_is_retained(layout, version, identity)? {
+        return Ok(());
+    }
     remove_owned_file(&layout.version_artifact(version), identity)?;
     remove_directory_if_empty(&layout.versions_dir().join(version))
 }

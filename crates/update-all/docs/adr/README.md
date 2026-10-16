@@ -39,6 +39,8 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0027](0027-execution-owned-cancellation-outcomes.md) | Execution-owned cancellation outcomes | proposed | pending |
 | [0028](0028-task-terminal-sudo-authentication.md) | Task-terminal sudo authentication | proposed | pending |
 | [0029](0029-implementation-first-linux-sudo-delivery.md) | Implementation-first Linux sudo delivery | proposed | pending |
+| [0030](0030-common-managed-update-lifecycle.md) | Common managed update lifecycle | proposed | pending |
+| [0031](0031-nonactivating-authenticated-artifact-retention.md) | Nonactivating authenticated artifact retention | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

@@ -105,6 +105,7 @@ pub struct InstallationSnapshot {
     state: InstallationState,
     version: Option<Version>,
     setup_required: bool,
+    recovery_required: bool,
 }
 
 impl InstallationSnapshot {
@@ -113,6 +114,7 @@ impl InstallationSnapshot {
             state: InstallationState::Absent,
             version: None,
             setup_required: false,
+            recovery_required: false,
         }
     }
 
@@ -121,6 +123,7 @@ impl InstallationSnapshot {
             state: InstallationState::Managed,
             version,
             setup_required: false,
+            recovery_required: false,
         }
     }
 
@@ -129,6 +132,7 @@ impl InstallationSnapshot {
             state: InstallationState::External,
             version,
             setup_required: false,
+            recovery_required: false,
         }
     }
 
@@ -137,6 +141,7 @@ impl InstallationSnapshot {
             state: InstallationState::Unknown,
             version,
             setup_required: false,
+            recovery_required: false,
         }
     }
 
@@ -145,6 +150,20 @@ impl InstallationSnapshot {
             state: InstallationState::Unknown,
             version,
             setup_required: true,
+            recovery_required: false,
+        }
+    }
+
+    /// A product-recognized pending installation protocol. This is deliberately
+    /// unknown, not a managed identity or permission to recover. Explicit mutation
+    /// may reach prepare_mutation, which must independently authenticate all
+    /// endpoints before any effect. Status/check never enter recovery.
+    pub fn pending_recovery() -> Self {
+        Self {
+            state: InstallationState::Unknown,
+            version: None,
+            setup_required: false,
+            recovery_required: true,
         }
     }
 
@@ -352,19 +371,19 @@ pub fn execute<A: UpdateAdapter>(
         CommonOperation::UpdateStatus => status(policy, request, now_unix, adapter, installation),
         CommonOperation::UpdateCheck => check(policy, request, now_unix, adapter, installation),
         CommonOperation::UpdateInstall => {
-            if installation.state != InstallationState::Absent {
+            if installation.state != InstallationState::Absent && !installation.recovery_required {
                 return blocked_state(policy, request.operation, &installation);
             }
             mutate(policy, request, now_unix, adapter, installation, true)
         }
         CommonOperation::UpdateApply => {
-            if installation.state != InstallationState::Managed {
+            if installation.state != InstallationState::Managed && !installation.recovery_required {
                 return blocked_state(policy, request.operation, &installation);
             }
             mutate(policy, request, now_unix, adapter, installation, false)
         }
         CommonOperation::UpdateRollback => {
-            if installation.state != InstallationState::Managed {
+            if installation.state != InstallationState::Managed && !installation.recovery_required {
                 return blocked_state(policy, request.operation, &installation);
             }
             with_prepared_mutation(
@@ -645,6 +664,9 @@ fn with_prepared_mutation<A: UpdateAdapter>(
     continue_mutation: impl FnOnce(&mut A, InstallationSnapshot) -> OperationResult,
 ) -> OperationResult {
     match adapter.prepare_mutation(request, candidate) {
+        Ok(false) if installation.recovery_required => {
+            blocked_state(policy, request.operation, &installation)
+        }
         Ok(false) => continue_mutation(adapter, installation),
         Err(error) => finish_mutation(
             adapter,

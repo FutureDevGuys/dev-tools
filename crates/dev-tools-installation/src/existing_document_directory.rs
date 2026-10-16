@@ -366,6 +366,7 @@ impl ExistingDocumentDirectory {
             authority,
             current_authority,
             Some(expected_current),
+            false,
         )
     }
 
@@ -379,7 +380,30 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected_current: Option<&ArtifactIdentity>,
     ) -> Result<bool> {
-        self.write_with_current_authority(name, bytes, authority, authority, expected_current)
+        self.write_with_current_authority(
+            name,
+            bytes,
+            authority,
+            authority,
+            expected_current,
+            false,
+        )
+    }
+
+    /// Publish only into an absent ordinary leaf. Unlike `write`, an existing
+    /// matching file is a collision, not permission to adopt its ownership.
+    /// Publication is descriptor-relative and uses no-replace rename; final
+    /// file data/metadata and the parent are synchronized before success.
+    /// The caller owns serialization, content authority and recovery after an
+    /// error whose publication progress may be uncertain.
+    pub fn publish_new(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        authority: &DocumentAuthority,
+    ) -> Result<()> {
+        self.write_with_current_authority(name, bytes, authority, authority, None, true)?;
+        Ok(())
     }
 
     fn write_with_current_authority(
@@ -389,6 +413,7 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         current_authority: &DocumentAuthority,
         expected_current: Option<&ArtifactIdentity>,
+        require_absent: bool,
     ) -> Result<bool> {
         validate_name(name)?;
         validate_document_authority(authority)?;
@@ -401,6 +426,9 @@ impl ExistingDocumentDirectory {
         }
         self.validate()?;
         let current = self.open_document(name, current_authority)?;
+        if require_absent && current.is_some() {
+            bail!("new document destination is already occupied");
+        }
         if let Some(current) = &current {
             if current.document.bytes == bytes && authority.mode == current_authority.mode {
                 self.require_named_current(name, Some(current))?;

@@ -1,6 +1,7 @@
-//! Common observation and metadata-only refresh. Installation mutation remains
-//! on legacy routes until the common mutation adapter is qualified.
+//! Common product update lifecycle. Native release qualification remains separate.
 use super::*;
+#[cfg(target_os = "linux")]
+mod mutation;
 use dev_tools_product::{OperationResultV2, ProductId};
 use dev_tools_update::{
     execute, AuthenticatedCandidate, InstallationSnapshot, OperationRequest, UpdateAdapter,
@@ -15,10 +16,41 @@ pub(crate) fn check() -> Result<OperationResultV2> {
     run(OperationRequest::check())
 }
 
+pub(crate) fn install(offline: bool) -> Result<OperationResultV2> {
+    run(OperationRequest::install(offline))
+}
+
+pub(crate) fn apply(offline: bool) -> Result<OperationResultV2> {
+    run(OperationRequest::apply(offline))
+}
+
+pub(crate) fn rollback() -> Result<OperationResultV2> {
+    run(OperationRequest::rollback())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn bundle(bundle: &OfflineBundlePaths) -> Result<Activation> {
+    mutation::bundle(bundle)
+}
+
 fn run(request: OperationRequest) -> Result<OperationResultV2> {
     let policy = UpdatePolicy::standard(ProductId::parse("update-all")?);
     let paths = Paths::resolve(Product::UpdateAll);
     let checked_at_unix = now_unix();
+    #[cfg(target_os = "linux")]
+    if matches!(
+        request.operation(),
+        dev_tools_product::CommonOperation::UpdateInstall
+            | dev_tools_product::CommonOperation::UpdateApply
+            | dev_tools_product::CommonOperation::UpdateRollback
+    ) {
+        return Ok(execute(
+            &policy,
+            request,
+            checked_at_unix,
+            &mut mutation::MutationAdapter::new(paths, checked_at_unix, request),
+        ));
+    }
     Ok(execute(
         &policy,
         request,
@@ -47,7 +79,7 @@ struct CandidateCache {
     checked_at_unix: u64,
 }
 
-fn candidate_authority() -> ReleaseAuthority {
+pub(super) fn candidate_authority() -> ReleaseAuthority {
     ReleaseAuthority {
         trusted_root_key: env!("UPDATE_ALL_TRUST_ROOT_PUBLIC_KEY").into(),
         product: Product::UpdateAll.id().into(),
