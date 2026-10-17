@@ -5617,7 +5617,9 @@ fn concise_command_text(output: &str) -> String {
 fn concise_command_failure_text(output: &str) -> String {
     let clean = strip_progress_output(output);
     let cause = last_command_error_line(&clean)
-        .or_else(|| clean.lines().find(|line| !line.trim().is_empty()))
+        // Without explicit error syntax, retain terminal context instead of an
+        // earlier startup/progress line. This does not classify prose as failure.
+        .or_else(|| clean.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("command failed");
     bounded_structured_text(cause)
 }
@@ -9670,6 +9672,7 @@ struct RunTaskArtifact<'a> {
 #[derive(Serialize)]
 struct RunArtifact<'a> {
     schema_version: u32,
+    build_info: &'a dev_tools_product::BuildInfo,
     run_id: &'a str,
     display_name: String,
     started_unix_ms: u64,
@@ -9769,6 +9772,7 @@ fn write_run_artifact<'a>(
     let runtime_advisories = run_runtime_advisories(run_log);
     let payload = RunArtifact {
         schema_version: 1,
+        build_info: run_log.build_info(),
         run_id: run_log.run_id(),
         display_name: run_log.display_name(),
         started_unix_ms,

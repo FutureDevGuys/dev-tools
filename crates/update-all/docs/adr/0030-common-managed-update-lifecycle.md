@@ -8,6 +8,12 @@ owner: update-all
 status: proposed
 verification: pending
 
+## Context
+
+The common update surface and legacy Update All entrypoints need one managed
+mutation lifecycle that preserves existing observation, proof and ownership
+boundaries.
+
 ## Decision
 
 The source adapter extends canonical `update` with `install [--offline]`,
@@ -15,6 +21,8 @@ The source adapter extends canonical `update` with `install [--offline]`,
 operation loop and v2 nullable managed-change result. Status and check retain
 their read-only/metadata-only boundaries. An external command is never adopted;
 no setup, enrollment, policy or privilege is manufactured by an update.
+
+## Invariants
 
 The product retains one release-writer lease from mutation metadata admission
 through local recovery, accepted-history publication and activation. Installation
@@ -64,7 +72,14 @@ is emitted only for established completed outcomes. Unknown progress is never
 translated into false. Their initialized local status no longer reads retired
 legacy state or promotes its old timestamp to common freshness.
 
-## Compatibility and limits
+## Rejected alternatives
+
+Implicit external-command adoption, pending snapshots used as recovery authority,
+and rollback that lowers accepted history violate the ownership and proof
+requirements above. Continuing from a stale snapshot after preparation reports
+no change would misreport an intervening writer's managed change.
+
+## Consequences and known limitations
 
 This completes source integration only. Signed release bytes and registry
 archives are unchanged. This branch is unreleased and must receive a new product
@@ -83,7 +98,16 @@ entrypoints now use this backend; its complete-input, trust and offline boundari
 remain unchanged. The implicit automatic-update compatibility noted in ADR 0022
 ends here; parsed old configuration does not revive that authority.
 
-## Required qualification
+## Verification
+
+Existing regression contracts include
+`common_status_observes_absence_without_initializing`,
+`common_status_preserves_external_command_and_emits_one_error_document`, and
+`offline_signed_bundle_installs_repeats_upgrades_and_rolls_back`.
+These cover local observation, external preservation and the existing signed-bundle
+lifecycle; they do not establish the pending qualification below.
+
+## Runtime acceptance
 
 Existing conformance coverage and native qualification remain pending. Before a release claims
 support, qualify the standalone binary's initial install, repeat, online payload
@@ -92,3 +116,9 @@ rollback, missing-proof rejection and actual interruption at product retirement,
 history publication and installation journal boundaries. Check nullable change
 and fresh identity after every entered mutation and failed observation. Source
 integration does not establish compiler or runtime acceptance.
+
+## Supersession conditions
+
+Supersede this record if common mutation entrypoints, lock ownership,
+authenticated-history ordering, payload/network boundaries or rollback authority
+change. Preserve proof-bound receipt ownership and honest change/identity results.

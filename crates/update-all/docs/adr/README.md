@@ -41,6 +41,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0029](0029-implementation-first-linux-sudo-delivery.md) | Implementation-first Linux sudo delivery | proposed | pending |
 | [0030](0030-common-managed-update-lifecycle.md) | Common managed update lifecycle | proposed | pending |
 | [0031](0031-nonactivating-authenticated-artifact-retention.md) | Nonactivating authenticated artifact retention | proposed | pending |
+| [0032](0032-executing-build-run-provenance.md) | Executing-build run provenance | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

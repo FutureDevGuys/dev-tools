@@ -11,7 +11,6 @@ use crate::ui::{MouseRowStride, UiModeResolved};
 use crate::updaters::{detected_builtin_tasks, HostOs};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use dev_tools_product::{BuildInfo, ProductId};
 use is_terminal::IsTerminal;
 use std::env;
 use std::fs;
@@ -465,15 +464,7 @@ impl RunCli {
 
 impl BuildInfoCli {
     fn run(self) -> Result<()> {
-        let info = BuildInfo::from_build_values(
-            ProductId::parse("update-all")?,
-            env!("CARGO_PKG_VERSION"),
-            option_env!("UPDATE_ALL_GIT_COMMIT"),
-            option_env!("UPDATE_ALL_GIT_DIRTY"),
-            option_env!("UPDATE_ALL_BUILD_TARGET"),
-            option_env!("UPDATE_ALL_BUILD_PROFILE"),
-            option_env!("UPDATE_ALL_BUILD_UNIX"),
-        )?;
+        let info = crate::build_info::current_product_build_info()?;
         if self.json {
             crate::ua_outln!("{}", serde_json::to_string_pretty(&info)?);
         } else {

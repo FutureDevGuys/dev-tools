@@ -1,6 +1,20 @@
 use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
+
+pub fn current_product_build_info(
+) -> Result<dev_tools_product::BuildInfo, dev_tools_product::ContractError> {
+    dev_tools_product::BuildInfo::from_build_values(
+        dev_tools_product::ProductId::parse("update-all")?,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("UPDATE_ALL_GIT_COMMIT"),
+        option_env!("UPDATE_ALL_GIT_DIRTY"),
+        option_env!("UPDATE_ALL_BUILD_TARGET"),
+        option_env!("UPDATE_ALL_BUILD_PROFILE"),
+        option_env!("UPDATE_ALL_BUILD_UNIX"),
+    )
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BuildInfo {
     pub profile: String,
