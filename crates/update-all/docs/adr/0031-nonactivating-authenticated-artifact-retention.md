@@ -8,6 +8,12 @@ owner: update-all
 status: proposed
 verification: pending
 
+## Context
+
+An operator may need to retain an original authenticated historical artifact
+without activating a downgrade or changing accepted release history. Existing
+candidate intake and rollback do not provide that separate custody operation.
+
 ## Decision
 
 Add the explicitly offline operation:
@@ -23,6 +29,8 @@ the historical release. Its present key revocations and the current fixed
 product/target/URL/protocol policy authenticate the original stable source-bound
 product-v2 manifest. Future versions/generations and equivocation at accepted
 boundaries remain rejected. Artifact length and SHA-256 must match exactly.
+
+## Invariants
 
 This is explicit new retention authority. It does not assert prior historical
 acceptance and does not install a downgrade. It neither advances nor resets the
@@ -80,7 +88,14 @@ the original manifest and content binding stay exact. A different pending
 bundle is blocked, never cancelled or reinterpreted. Partial candidate staging
 left by process death is neither age-selected nor removed by a broad cleanup.
 
-## Result and compatibility
+## Rejected alternatives
+
+Lowering accepted history to install historical content, treating retention as
+activation authority, or adopting an equal-byte unowned destination would violate
+the decision. Broad cleanup of interrupted staging cannot replace exact retained
+journal and receipt ownership.
+
+## Consequences and known limitations
 
 The additive `update-all-product-retention-v1` JSON document reports product,
 operation, fixed outcome/error kind, exit code, nullable `changed`, and the
@@ -101,7 +116,15 @@ source prepares unreleased Update All 0.1.13; accepted 0.1.12 remains immutable.
 Source-bound dependency publication remains required for external crate users.
 This source record claims no compiler, native or platform acceptance.
 
-## Required qualification
+## Verification
+
+Related existing intake regression contracts are
+`offline_signed_bundle_rejects_invalid_signed_authority_before_activation` and
+`offline_signed_bundle_rejects_unsafe_and_bounded_inputs`.
+They cover signed-input rejection and custody boundaries, not the new retention
+operation. Retain-specific conformance changes and execution remain pending.
+
+## Runtime acceptance
 
 Under the current no-tests source-only instruction, conformance changes and
 execution remain pending. Before release, qualify signed native retention of a
@@ -114,3 +137,9 @@ retirement boundaries. Verify every activation/ledger/trust/cache byte and
 pointer is preserved by retain, value-free failure/nullable progress, native
 filesystem durability and network isolation. Old writers require a separately
 established quiescent cutover; source formatting is not acceptance evidence.
+
+## Supersession conditions
+
+Supersede this record if retention changes activation, accepted-history or trust
+authority, destination ownership, participating-writer rules, or supported native
+scope. Preserve explicit nonactivating custody and exact interrupted-intent binding.
