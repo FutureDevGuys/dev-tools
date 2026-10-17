@@ -8,6 +8,8 @@ owner: dev-tools
 status: proposed
 verification: pending
 
+The release-after-publication lease lifetime below is superseded by [ADR 0127](0127-active-workload-root-coordination.md). Compiler automatic-maintenance exclusion and the remaining resource lifecycle rules are unchanged.
+
 ## Context and decision
 
 [Issue 40](https://github.com/FutureDevGuys/dev-tools/issues/40) reports compiler probes returning their expected diagnostics immediately but remaining in Dev Cache while unrelated caches are scanned. Automatic maintenance ran before and after each compiler delegation. Even an interval-skipped invocation first calculated pressure through a full cache-tree size walk, so interval throttling did not bound the per-compiler cost.

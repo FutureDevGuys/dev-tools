@@ -5,7 +5,7 @@ use dev_cache::lease::{active_resource_ids, RootLease};
 use dev_cache::root::RootHandle;
 
 #[test]
-fn setup_lease_excludes_collection_without_publishing_unscoped_activity() {
+fn setup_and_active_leases_exclude_collection_until_nested_work_finishes() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = RootHandle::initialize(&temp.path().join("root")).expect("cache root");
     let directory = root.control().join("leases");
@@ -20,18 +20,42 @@ fn setup_lease_excludes_collection_without_publishing_unscoped_activity() {
 
     let active = lease
         .into_active(&["second".into(), "first".into(), "first".into()])
-        .expect("publish scoped activity before releasing setup lock");
-    let collector = RootLease::try_exclusive(&root)
-        .unwrap()
-        .expect("resource activity does not block unrelated collection");
+        .expect("publish scoped activity while retaining coordination");
+    assert!(
+        RootLease::try_exclusive(&root).unwrap().is_none(),
+        "maintenance cannot enter after admission and before nested setup"
+    );
     assert_eq!(
         active_resource_ids(&root).unwrap(),
         BTreeSet::from(["first".into(), "second".into()])
     );
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
-    drop(collector);
+
+    let nested_setup = RootLease::shared(&root, "nested-compiler-setup")
+        .expect("nested setup shares the admitted workload's coordination");
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    let nested = nested_setup
+        .into_active(&["nested-resource".into()])
+        .expect("publish independently owned nested activity");
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+    assert!(RootLease::try_exclusive(&root).unwrap().is_none());
     drop(active);
+    assert_eq!(
+        active_resource_ids(&root).unwrap(),
+        BTreeSet::from(["nested-resource".into()])
+    );
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    assert!(
+        RootLease::try_exclusive(&root).unwrap().is_none(),
+        "nested activity retains coordination after its outer activity ends"
+    );
+    drop(nested);
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    assert!(active_resource_ids(&root).unwrap().is_empty());
+    assert!(
+        RootLease::try_exclusive(&root).unwrap().is_some(),
+        "maintenance can start after every activity has finished"
+    );
 }
 
 #[test]

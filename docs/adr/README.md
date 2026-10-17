@@ -136,3 +136,4 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0121](0121-terminal-command-graph-custody.md) | Foreground terminal command graph custody | proposed | pending |
 | [0122](0122-exact-plan-node-identity-and-streams.md) | Exact plan node identity and streams | proposed | pending |
 | [0123](0123-completion-intercept-passthrough.md) | Native completion intercept passthrough | proposed | pending |
+| [0127](0127-active-workload-root-coordination.md) | Active workload root coordination | proposed | pending |

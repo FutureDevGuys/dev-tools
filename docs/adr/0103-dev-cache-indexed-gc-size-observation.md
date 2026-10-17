@@ -8,6 +8,8 @@ owner: dev-cache
 status: proposed
 verification: pending
 
+[ADR 0127](0127-active-workload-root-coordination.md) extends routed shared coordination through the active workload, deferring applied collection until those leases finish. The size-observation and mutation-authority rules below remain unchanged.
+
 ## Decision
 
 GC admits candidate metadata using its existing workspace identity, catalog, artifact, age, hazard and active-resource checks, removes nested resource actions already covered by repository actions, and then observes payload sizes. One traversal of the runtime domain supplies both `bytes_before` and the inclusive apparent-file sizes of directory/file-backed candidates. A component-wise ancestor index retains only candidate paths and counters rather than every payload path. Duplicate candidates reuse one measurement; overlapping candidates each retain their inclusive subtree size, preserving the previous per-action accounting. Existing age ordering, pressure selection, action bounds and action kinds remain unchanged.
