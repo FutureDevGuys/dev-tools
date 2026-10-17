@@ -8,6 +8,8 @@ owner: dev-cache
 status: proposed
 verification: pending
 
+[ADR 0127](0127-active-workload-root-coordination.md) extends routed shared coordination through the active workload. Nonblocking acquisition, read-only preview and exclusive mutation rules below remain in effect.
+
 ## Decision
 
 A read-only GC preview takes a nonblocking shared observation lease on the existing root coordination file. It can coexist with routed setup and active workloads. The preview neither creates coordination nor publishes activity, removes stale records, recovers trash or mutates cache data. Missing, redirected and non-regular coordination still fails closed. This supersedes only the exclusive preview-lock decision in ADR 0015.

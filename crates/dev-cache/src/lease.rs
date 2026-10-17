@@ -15,6 +15,8 @@ pub struct RootLease {
 }
 
 pub struct ActiveLease {
+    // Keep maintenance excluded while this workload may launch nested setup.
+    _root_lease: RootLease,
     record: Option<PathBuf>,
 }
 
@@ -46,8 +48,8 @@ impl RootLease {
         }
         let id = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
         let record = root.control().join("leases").join(format!("{id}.json"));
-        // The held root lock excludes collection throughout setup. Publish only
-        // the scoped activity record, durably, before releasing that lock.
+        // The held root lock excludes collection throughout setup and activity.
+        // Publish only the scoped activity record when setup is complete.
         Ok(Self {
             file,
             record: Some((
@@ -75,11 +77,10 @@ impl RootLease {
         record.resource_ids.sort();
         record.resource_ids.dedup();
         write_json_atomic(&record_path, &record)?;
-        let active = ActiveLease {
+        Ok(ActiveLease {
+            _root_lease: self,
             record: Some(record_path),
-        };
-        FileExt::unlock(&self.file).context("release cache-root setup lease")?;
-        Ok(active)
+        })
     }
 
     pub fn exclusive(root: &RootHandle) -> Result<Self> {
