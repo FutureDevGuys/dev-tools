@@ -24,7 +24,11 @@ additional non-timeout retries require the configured task policy. Failed tasks
 retain known before-state and observed outcomes, with unavailable after-state
 explicitly unconfirmed. Deferred results distinguish installed and available
 versions; availability is not an installed transition. Compact failure details
-prefer causal stderr while complete output remains in the task log.
+prefer causal stderr while complete output remains in the task log. Explicit
+error syntax retains precedence. When it is absent, the compact failure summary
+uses the final non-progress record instead of an earlier startup/progress line.
+That record is terminal context, not proof of the underlying cause; it does not
+reclassify a successful command, change diagnostic severity, or authorize replay.
 
 Before reporting a planned npm root as updated, verify its installed version, manifest and declared executable health even when npm printed no lifecycle warning. Share version and root observations across the planned batch. An isolated recovery invocation requests warning output without changing persistent npm configuration; lifecycle authorization continues to follow ADR 0002.
 
@@ -69,6 +73,8 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 - `go_catalog_report_preserves_mixed_versions_and_partial_failure`
 - `failed_command_report_retains_pipx_before_inventory_without_claiming_refresh`
 - `command_failure_summary_keeps_causal_stderr_and_explicit_error_precedence`
+- `command_failure_summary_uses_terminal_context_without_explicit_errors`
+- `controlled_catalog_failure_summary_keeps_terminal_context`
 - `structured_command_result_marks_a_successful_process_as_deferred`
 - `command_policy_does_not_retry_transient_network_failure_without_policy_retry`
 - `command_policy_timeout_never_retries_even_with_transient_partial_output`

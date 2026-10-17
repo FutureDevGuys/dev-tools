@@ -1133,6 +1133,35 @@ fn command_failure_summary_keeps_causal_stderr_and_explicit_error_precedence() {
 }
 
 #[test]
+fn command_failure_summary_uses_terminal_context_without_explicit_errors() {
+    for (output, expected) in [
+        (
+            "preparing transaction...\nresource is busy; operation did not start\n",
+            "resource is busy; operation did not start",
+        ),
+        (
+            "fixture-tool current version\nfailed fixture-plugin: bounded observation timed out\n",
+            "failed fixture-plugin: bounded observation timed out",
+        ),
+        (
+            "error: primary operation failed\npost-failure cleanup finished\n",
+            "error: primary operation failed",
+        ),
+    ] {
+        assert_eq!(concise_command_failure_text(output), expected);
+        let error = anyhow::anyhow!(ProcessExitError {
+            program: "fixture".to_string(),
+            code: "1".to_string(),
+            output: Some(output.to_string()),
+            stderr: Some(output.to_string()),
+        });
+        assert_eq!(command_error_summary(&error), expected);
+        assert_eq!(report_command_failure_summary(&error), expected);
+    }
+    assert_eq!(concise_command_failure_text("\n \r\n"), "command failed");
+}
+
+#[test]
 fn diagnostic_samples_are_not_counted_as_package_transaction_items() {
     let mut result = TaskResult::completed("Diagnostics");
     attach_command_output_diagnostics(
@@ -5304,6 +5333,11 @@ fn run_artifact_records_task_end_and_ui_wait_timing() {
     let payload: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(run_log.run_dir().join("run.json")).unwrap())
             .unwrap();
+    assert_eq!(payload["build_info"], first_payload["build_info"]);
+    assert_eq!(
+        payload["build_info"],
+        serde_json::to_value(run_log.build_info()).unwrap()
+    );
     assert_eq!(
         payload["tasks_ended_unix_ms"].as_u64(),
         Some(tasks_ended_unix_ms)
