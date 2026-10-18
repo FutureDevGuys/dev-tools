@@ -138,3 +138,4 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0123](0123-completion-intercept-passthrough.md) | Native completion intercept passthrough | proposed | pending |
 | [0124](0124-explicit-pending-update-recovery.md) | Explicit pending update recovery | proposed | pending |
 | [0126](0126-owned-version-retention-pins.md) | Owned version retention pins | proposed | pending |
+| [0127](0127-active-workload-root-coordination.md) | Active workload root coordination | proposed | pending |

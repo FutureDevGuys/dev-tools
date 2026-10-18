@@ -70,7 +70,6 @@ fn admitted_fixture() -> (tempfile::TempDir, RootHandle, GcConfig, GcAction, Evi
 fn mutation_rechecks_generation_owner_source_and_activity() {
     for change in ["generation", "owner", "source", "activity", "companion"] {
         let (_temp, root, policy, mut action, evidence) = admitted_fixture();
-        let mut active = None;
         match change {
             "generation" => {
                 let mut record = evidence.resource.clone();
@@ -88,12 +87,19 @@ fn mutation_rechecks_generation_owner_source_and_activity() {
             }
             "source" => fs::create_dir(&evidence.owner.canonical_worktree).unwrap(),
             "activity" => {
-                active = Some(
-                    RootLease::shared(&root, "new-work")
-                        .unwrap()
-                        .into_active(std::slice::from_ref(&evidence.resource.resource_id))
-                        .unwrap(),
-                );
+                // Older participants publish activity then release root
+                // coordination. Mutation must still reject that live record.
+                write_json_atomic(
+                    &root.control().join("leases/legacy-active.json"),
+                    &serde_json::json!({
+                        "schema_version": 1,
+                        "pid": std::process::id(),
+                        "started_unix": now_unix(),
+                        "operation": "legacy-work",
+                        "resource_ids": [&evidence.resource.resource_id],
+                    }),
+                )
+                .unwrap();
             }
             "companion" => {
                 action.companion_paths.pop();
@@ -111,7 +117,6 @@ fn mutation_rechecks_generation_owner_source_and_activity() {
             b"owned bytes",
             "{change}"
         );
-        drop(active);
     }
 }
 

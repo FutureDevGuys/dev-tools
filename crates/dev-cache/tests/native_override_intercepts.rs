@@ -331,7 +331,7 @@ fn empty_resource_delegation_releases_setup_without_publishing_activity() {
 }
 
 #[test]
-fn nonempty_routing_keeps_resource_specific_collection_protection() {
+fn nonempty_routing_defers_collection_and_preserves_preview_protection() {
     for (name, kind, variable) in [
         ("sccache", ResourceKind::SccacheLocal, None),
         ("zig", ResourceKind::ZigLocal, Some("ZIG_GLOBAL_CACHE_DIR")),
@@ -366,19 +366,52 @@ fn nonempty_routing_keeps_resource_specific_collection_protection() {
                 stale_after_days: Some(0),
                 ..GcOverrides::default()
             },
-            true,
+            false,
         )
         .unwrap();
+        assert!(!report.applied);
         assert!(report.abstentions.iter().any(|item| {
             item.resource_id.as_ref() == Some(&records[0].resource_id)
                 && item.reason.contains("active routed command")
         }));
+        assert!(gc::collect_if_idle(
+            &fixture.root,
+            &fixture.config.gc,
+            120,
+            &GcOverrides::default(),
+            true,
+        )
+        .unwrap()
+        .is_none());
+        let busy = gc::collect(
+            &fixture.root,
+            &fixture.config.gc,
+            120,
+            &GcOverrides::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(busy.to_string().contains("busy"));
         assert_eq!(fs::read(&sentinel).unwrap(), b"active cache");
         assert!(!native.exists());
         child.finish();
         assert!(active_resource_ids(&fixture.root).unwrap().is_empty());
         let completed = resources::list(&fixture.root).unwrap();
         assert!(completed[0].last_completed_unix.is_some());
+        let collected = gc::collect_if_idle(
+            &fixture.root,
+            &fixture.config.gc,
+            120,
+            &GcOverrides::default(),
+            true,
+        )
+        .unwrap()
+        .expect("maintenance starts after the native child and lease settle");
+        assert!(collected.applied);
+        assert!(collected.complete);
+        assert!(collected.actions.is_empty());
+        assert!(collected.failures.is_empty());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"active cache");
     }
 }
 

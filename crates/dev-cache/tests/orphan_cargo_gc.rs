@@ -461,11 +461,54 @@ fn unavailable_or_redirected_worktree_parent_is_not_absence_evidence() {
 fn active_cargo_lease_preserves_owner_and_payload() {
     let fixture = Fixture::new();
     fixture.orphan();
-    let _active = RootLease::shared(&fixture.root, "synthetic-work")
+    let active = RootLease::shared(&fixture.root, "synthetic-work")
         .unwrap()
         .into_active(std::slice::from_ref(&fixture.id))
         .unwrap();
-    fixture.assert_preserved("active routed command");
+    let owner_before = fs::read(fixture.repo.cache_dir.join("identity.json")).unwrap();
+    let preview = fixture.collect(false, None);
+    assert!(!preview.applied);
+    assert!(preview.actions.is_empty());
+    assert!(preview.failures.is_empty());
+    assert!(preview
+        .abstentions
+        .iter()
+        .any(|item| item.reason.contains("active routed command")));
+    assert!(gc::collect_if_idle(
+        &fixture.root,
+        &fixture.policy,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .unwrap()
+    .is_none());
+    let busy = gc::collect(
+        &fixture.root,
+        &fixture.policy,
+        120,
+        &GcOverrides::default(),
+        true,
+    )
+    .unwrap_err();
+    assert!(busy.to_string().contains("busy"));
+    assert_eq!(
+        fs::read(fixture.repo.cache_dir.join("identity.json")).unwrap(),
+        owner_before
+    );
+    assert_eq!(
+        fs::read(fixture.cargo.join("object")).unwrap(),
+        b"disposable Cargo object"
+    );
+    drop(active);
+    let collected = fixture.collect(true, None);
+    assert!(collected.applied);
+    assert!(collected.complete);
+    assert!(collected.failures.is_empty());
+    assert_eq!(collected.actions.len(), 1);
+    assert_eq!(collected.actions[0].kind, "orphan-workspace-cargo");
+    assert!(!fixture.repo.cache_dir.exists());
+    assert!(!fixture.cargo.exists());
 }
 
 #[test]
