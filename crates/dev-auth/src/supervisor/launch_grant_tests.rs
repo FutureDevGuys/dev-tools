@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Local startup-proof fixtures; these do not authorize grants or exercise cgroups.
 use super::*;
 use std::process::Stdio;

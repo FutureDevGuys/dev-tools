@@ -71,7 +71,7 @@ pub enum UpdateOperation {
 }
 
 pub fn execute(operation: UpdateOperation) -> dev_tools_product::OperationResultV2 {
-    let policy = UpdatePolicy::standard(ProductId::parse("dev-auth").expect("fixed product id"));
+    let policy = UpdatePolicy::standard(ProductId::parse("dev-auth").expect("fixed product id")); // INVARIANT: this literal satisfies the product ID grammar.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |time| time.as_secs());

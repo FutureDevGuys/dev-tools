@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Exercise an existing credential installation gaining receipt-owned privilege
 //! without changing its installation purpose or credential authority.
 use super::*;

@@ -12,6 +12,18 @@ The 0.4.1 source corrects local diagnostic readiness to use explicit runtime aut
 
 The signed Linux gates are `setup_v3::recovery_native::signed::native_disposable_signed_fresh_install_workload_and_restore` and `setup_v3::recovery_native::signed::native_disposable_signed_legacy_upgrade_and_restore`. Run each only in a separate explicitly owned, rootful, network-free, host-mount-free disposable systemd container with private PID/cgroup/IPC/UTS namespaces and `DEV_AUTH_NATIVE_SYSTEMD_FIXTURE=disposable`. Supply the exact clean signed product release directory at `/signed/candidate` and the authenticated 0.3.11 release directory at `/signed/prior`; do not strip or otherwise modify signed artifact bytes. Both gates use public release verification, plan/apply/verify, a second plan/apply no-op and inactive restoration. Provider material is synthetic. These gates are not satisfied merely by compiling their ignored tests.
 
+These signed setup cases belong to the library test target: `src/lib.rs`
+declares `setup_v3`, which declares the Linux test-only recovery module. Build
+the source-bound fixture with `cargo test -p dev-auth --lib --release --locked
+--offline -j1 --no-run`, retaining the matching selected sudo payload and the
+normal source/build identity inputs. Capture Cargo's library test executable,
+then require its `--list --exact` output to name the selected case before
+transport or execution. Zero matching tests is a failed harness selection,
+not successful qualification. `--bin dev-auth` selects the separate frontend
+harness and does not contain these setup cases. Preserve any wrong-target
+construction result; do not substitute the ordinary signed product executable
+for the library test harness.
+
 | Capability | Executable evidence | Remaining qualification |
 | --- | --- | --- |
 | Installed strong workload, lifecycle and public restoration | The signed 0.4.0 public artifact in disposable systemd roots completes native set-ID dispatch, non-root broker admission, encrypted synthetic enrollment, provider validation, logical read and stdin projection. Expiry, revocation, dispatcher death and broker death each terminalize the worker and detached TERM-ignoring descendant, clean units and release setup exclusion. Signed public setup, unchanged repeat and initial restoration pass. A separate fresh-container fixture upgrades authenticated 0.3.11, performs an enrolled operation and restores its exact prior generation with public unchanged retry. See [ADR 0085](adr/0085-linux-workload-lifecycle-and-public-restoration.md). | Container provider material is synthetic. Power-loss, every interruption boundary and non-Linux acceptance remain separate. This composition advances the narrower component rows below without replacing their independent gates. |

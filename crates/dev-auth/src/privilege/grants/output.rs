@@ -50,9 +50,9 @@ struct Mapping {
 // SAFETY: the fixed mapping is never moved, resized or unmapped while any Arc
 // owner exists. Every shared field is an AtomicU64; no borrowed payload pointer
 // or non-atomic mutation is exposed. Supported targets are gated in map().
-unsafe impl Send for Mapping {}
-// SAFETY: same atomic-only access and Arc-owned lifetime as Send above.
-unsafe impl Sync for Mapping {}
+unsafe impl Send for Mapping {} // SAFETY: Arc retains the fixed mapping; all exposed shared fields are atomic.
+
+unsafe impl Sync for Mapping {} // SAFETY: shared access exposes only atomics within the Arc-owned mapping.
 
 impl Mapping {
     fn map(descriptor: OwnedFd, initialize: bool) -> io::Result<Self> {

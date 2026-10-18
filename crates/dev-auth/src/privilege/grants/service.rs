@@ -2112,7 +2112,7 @@ fn execution_authority(
                 })
             })
             .collect(),
-        Authority::Administrator => unreachable!(),
+        Authority::Administrator => unreachable!(), // INVARIANT: the administrator authority returned before this match.
     };
     for (authority, plan) in candidates {
         // Selected plan effects are never equivalent to direct argv/native sudo:

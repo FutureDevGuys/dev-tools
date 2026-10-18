@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Fixed, no-password native acceptance. The fixture establishes synthetic
 //! prior approval; public recovery/restoration perform all installed mutations.
 //! This does not claim signed release intake or a real administrator grant.

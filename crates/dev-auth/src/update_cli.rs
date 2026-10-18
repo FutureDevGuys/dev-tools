@@ -38,7 +38,7 @@ pub(super) fn run(arguments: Vec<OsString>) -> i32 {
             .as_ref()
             .is_err_and(|error| error.kind() == clap::error::ErrorKind::DisplayHelp)
     {
-        let help = matches.unwrap_err().to_string();
+        let help = matches.unwrap_err().to_string(); // INVARIANT: the preceding guard established Err(DisplayHelp).
         return if std::io::stdout().lock().write_all(help.as_bytes()).is_ok() {
             0
         } else {
@@ -47,7 +47,7 @@ pub(super) fn run(arguments: Vec<OsString>) -> i32 {
     }
     let report = match matches {
         Ok(matches) => {
-            let (name, arguments) = matches.subcommand().expect("required update subcommand");
+            let (name, arguments) = matches.subcommand().expect("required update subcommand"); // INVARIANT: Clap requires a subcommand before returning successful matches.
             #[cfg(target_os = "linux")]
             {
                 use dev_auth::update_status::UpdateOperation;
@@ -61,7 +61,7 @@ pub(super) fn run(arguments: Vec<OsString>) -> i32 {
                         offline: arguments.get_flag("offline"),
                     },
                     "rollback" => UpdateOperation::Rollback,
-                    _ => unreachable!("closed update grammar"),
+                    _ => unreachable!("closed update grammar"), // INVARIANT: Clap admits only the five subcommands declared by specification().
                 };
                 dev_auth::update_status::execute(operation)
             }
@@ -138,7 +138,7 @@ fn result(
 ) -> OperationResultV2 {
     OperationResultV2 {
         schema: dev_tools_product::OPERATION_RESULT_V2_SCHEMA,
-        product: ProductId::parse("dev-auth").expect("fixed product id"),
+        product: ProductId::parse("dev-auth").expect("fixed product id"), // INVARIANT: this literal satisfies the product ID grammar.
         operation,
         outcome,
         changed: Some(false),
