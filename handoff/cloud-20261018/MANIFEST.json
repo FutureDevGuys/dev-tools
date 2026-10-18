@@ -1,0 +1,517 @@
+{
+  "candidate_A_B_transport_semantics": "One byte set retained per artifact; historical independent equality proof is not a new A/B construction.",
+  "evidence_semantics": "Path-normalized derivatives retain original SHA256. Original inodes, clocks and custody are historical and not portable. Exact binaries/root/manifests/public keys are byte-identical. No credentials, private keys, raw user logs, policy or enrollment material are included.",
+  "files": [
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 9839,
+      "origin_label": "ACTUAL-COMPLETE-SCOPE-SETTLEMENT.json",
+      "original_sha256": "62b4bdb83bd5c9172112c9c9ca50ff6ce75fa7e13b48b2a9f156b7392ead7604",
+      "path": "handoff/cloud-20261018/evidence/construction-A.json",
+      "sha256": "cbdeeda7da47ac7cc863635d28b7cc2c1191504622932c8eba2e05ae7744d55c"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 6265,
+      "origin_label": "ACTUAL-COMPLETE-SCOPE-SETTLEMENT.json",
+      "original_sha256": "d13d35e569eec74a3903d283fd94a73387d6b943f5f198d3a3e9105024b13268",
+      "path": "handoff/cloud-20261018/evidence/construction-B-and-compare.json",
+      "sha256": "c6802ee92e845972d7d46cc9e085bbab5ef2018027dbcb6e58d898755a91a1b5"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 9582,
+      "origin_label": "SIGNED-BUNDLE-QUALIFICATION.json",
+      "original_sha256": "d8dd1b7f9959022e2e722642ae8333dc50eae760e4916c43550b9eb4b4bf5c35",
+      "path": "handoff/cloud-20261018/evidence/signed-bundle-qualification.json",
+      "sha256": "49b17be252272d08abc875325bfa527db8670cd1e84749039cac0160f0383f2f"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1221,
+      "origin_label": "ACTUAL-BOTH-SIGNED-USER-LIFECYCLE-ACCEPTANCE.json",
+      "original_sha256": "4743df7c64c5b4041609c6cbb46a6777849bcaa0328744491185bda23a1cfff2",
+      "path": "handoff/cloud-20261018/evidence/private-user-lifecycle.json",
+      "sha256": "cb2d4e009cf8b114d87e736c2c9651a153d3a4648f46a69adb6864c24bcc478a"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1881,
+      "origin_label": "ACTUAL-SYNC032-NATIVE-RECOVERY-AND-SETTLEMENT.json",
+      "original_sha256": "3e58f88ca1e1d6ad6a73638f9730083df6518fe923da5c906d2924a605ea2b31",
+      "path": "handoff/cloud-20261018/evidence/sync032-native-recovery.json",
+      "sha256": "03efa5c5d570636d267fe98b6f34aa8fd63a03b695f0f44f1c4dcbe28e133235"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1282,
+      "origin_label": "ACTUAL-SYNC032-LIVE-INSTALLATION-AND-SETTLEMENT.json",
+      "original_sha256": "a621068e7a31ff42e81a1efd94be69942bf9f56fd674bf83c16ef3f3d18829e8",
+      "path": "handoff/cloud-20261018/evidence/sync032-live-installation.json",
+      "sha256": "ef39fdf4d9ae9d41c26ff2ba65172392f7b0821f42026d03aba332dbcbc55293"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 2755,
+      "origin_label": "ACTUAL-PUBLIC-RELEASE-DOWNLOAD-TAG-AND-SIGNATURE-ACCEPTANCE.json",
+      "original_sha256": "f3e3755197df74c021504141ada4df042df4f573a3531aab8ca2c7a96e3ab439",
+      "path": "handoff/cloud-20261018/evidence/sync032-public-release.json",
+      "sha256": "57a9701f7c42094bb9378367580bf0c70cf2d527e02d82b16a6a763806f2c0aa"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "path-normalized historical evidence",
+      "length": 1262,
+      "origin_label": "ACTUAL-COMPLETE-PUBLICATION-SETTLEMENT-FOR-TRANSFER.json",
+      "original_sha256": "43ed372fe3a960a5fdb11be5b9fbba67565421680b5c39a91425ecf9cbd3c814",
+      "path": "handoff/cloud-20261018/evidence/sync032-complete-publication-settlement.json",
+      "sha256": "43ed372fe3a960a5fdb11be5b9fbba67565421680b5c39a91425ecf9cbd3c814"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1797,
+      "origin_label": "ACTUAL-SIGNED-INTAKE.json",
+      "original_sha256": "b8209743fa1449c619f5711cb5e85d4dcbb8d29e6d353a8dd7656652a402d1f9",
+      "path": "handoff/cloud-20261018/evidence/devauth053-public-intake.json",
+      "sha256": "27581a4d8c3febc23bc5270ae4729e54ce24d340a5947ea4c3213a5cfcd48bf7"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 7767,
+      "origin_label": "ACTUAL-NATIVE-ACCEPTANCE-FAILURE-AND-COMPLETE-SETTLEMENT.json",
+      "original_sha256": "87e60979a9c1d1f497b346030875e775a63fb67203a3868ef820c14bd750e1a9",
+      "path": "handoff/cloud-20261018/evidence/cache-original-observer-failure.json",
+      "sha256": "7e73d90e8158dbc7797e227f847ce7ff3cdd1c21ffe396acd0251bb40b959ffb"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 4282,
+      "origin_label": "ACTUAL-REMAINING-NATIVE-FAILURE-AND-COMPLETE-SETTLEMENT.json",
+      "original_sha256": "5a715b467bc4eba985706b1ea7274b1901e08faca7f2ce476d238e8a7bf175f2",
+      "path": "handoff/cloud-20261018/evidence/cache-status-observer-failure.json",
+      "sha256": "6170ee8ab3d84e150bfb563d0506d1e9c4c4c4c11ae9e88a4f3f0a4b856e553b"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 4551,
+      "origin_label": "READY-REMAINING-NATIVE-ACCEPTANCE.json",
+      "original_sha256": "0b6fd9b0de128b056dc3d6de0427d486205bc84d8630bdf270d5adf2de213f41",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/ready-unrun.json",
+      "sha256": "f205e45be20014385c7b3bdfa865c9d10010c8a918471189aed90461a211c3a1"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 13569,
+      "origin_label": "CAPTURED-ASSERTION-REPLAY-AND-WHOLE-RUNNER-REVIEW.json",
+      "original_sha256": "e34005249f35fb8a302098518306421e4285e05e9bca5a00942f5af7e1c3106f",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/captured-observer-replay-review.json",
+      "sha256": "b6537d60ed70a0f628750ab808c6b1500cb49d69e37018f29496a502e1487d54"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1253,
+      "origin_label": "ACTUAL-CONDITIONAL-BINDING-REFUSAL.json",
+      "original_sha256": "c08fb115b9251bb5ebcc6852d0163a28b481951d5a7124f802f64310de4ec5ac",
+      "path": "handoff/cloud-20261018/evidence/cache-conditional-binding-refusal.json",
+      "sha256": "4f4dabb8eb8da93d1c4b1fb45d3e76984b51fa2dc846cfbcd28654304fcf12ef"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 12118,
+      "origin_label": "EXACT-FIXTURE-BUILD-INPUTS-AND-COMMAND.json",
+      "original_sha256": "c4d80cd4456cd9801190e7d21b03cde520096b55d04fbe2f07228c30341bb403",
+      "path": "handoff/cloud-20261018/local-only-preparations/devauth/exact-fixture-build-unrun.json",
+      "sha256": "aaa33a924998cee5f05781b78989061d15ea3b2c697edc836b3ad3d1b7234d91"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 2040,
+      "origin_label": "AUTHENTICATED-OFFICIAL-GUEST-IMAGE-SOURCE.json",
+      "original_sha256": "82468964d2756da69167bc1e0a865750fd4566151e1f8eaa32f3ece4c62a0b40",
+      "path": "handoff/cloud-20261018/evidence/guest-image-authentication.json",
+      "sha256": "23af95e0821007e837f00e630a8462fe8aa243b350a1e5969aeb04031e65284f"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1451,
+      "origin_label": "ACTUAL-IMAGE-DOWNLOAD-AND-CHECKSUM.json",
+      "original_sha256": "986f87101c540212c881eff5a3d7f2513f344ed17b629dd6d90767cbdfb52b98",
+      "path": "handoff/cloud-20261018/evidence/guest-image-download.json",
+      "sha256": "52a88304466720afc80775d78aa7cc6f6b5b25d9de032a336d2f26402205e6aa"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1603,
+      "origin_label": "READONLY-QCOW2-IDENTITY.json",
+      "original_sha256": "7a9f462294d90e7d52ca7a67523ca9dcae07af4c7036861e9736384afa73cef5",
+      "path": "handoff/cloud-20261018/evidence/guest-image-readonly-identity.json",
+      "sha256": "63f5e6631872e35769c62c6ab6b5796bdcafa7e75df19c8973c3be6c589aa0a5"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 7597,
+      "origin_label": "SUPPORTED-GUEST-ROUTE-AND-EXACT-HARNESS-PREREQUISITES.json",
+      "original_sha256": "c02672a61617311102ed125a13d6ecaf52b9bbb4e1365af4340798e1f1d32c24",
+      "path": "handoff/cloud-20261018/local-only-preparations/devauth/guest-route-prerequisites.json",
+      "sha256": "af1a3fed30c30f91cea1982887c9aa85e3cdc5c8e634cc3e60a40e750a0582f4"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 1592,
+      "origin_label": "AUTHENTICATED-PREDECESSOR-BUNDLES.json",
+      "original_sha256": "36cf39a53a0d1a574ca02ddb2981ae2ba9678fcb1b178a4b1459a3723f86d36b",
+      "path": "handoff/cloud-20261018/evidence/authenticated-predecessor-bundles.json",
+      "sha256": "dc2bf9cf5cb214c535560b5b3cc7bcfdfe29e2e830969e8b0cab368468a37794"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 23635,
+      "origin_label": "NATIVE-INSTALLED-ACCEPTANCE-PLAN.json",
+      "original_sha256": "0a99da39fcf506ca1177032b1b885a4d1505c85083b081028d5e0528b011e8ac",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/NATIVE-INSTALLED-ACCEPTANCE-PLAN.json",
+      "sha256": "70ae3b102de8f695d2692fdb6f564813be44138b6af45e47bcb843e8d45fa55b"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 10231,
+      "origin_label": "NATIVE-TOOL-BINDINGS.json",
+      "original_sha256": "cac5a13f5d9b5ec9acdd43b8a689a525bb6f1f475b7492f73f4f88cfcb504c2a",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/NATIVE-TOOL-BINDINGS.json",
+      "sha256": "1b91d3e118881e57c08ada55d0491c3725e657b117ee67b3f996a7a0c3608490"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 3284,
+      "origin_label": "ROOT-SOURCE-AND-CUSTODY-REVIEW.json",
+      "original_sha256": "250c7d67dbd91f290413c2bfb4cfb9ade89ae3b6aad3eaf76614ec36d2198783",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/ROOT-SOURCE-AND-CUSTODY-REVIEW.json",
+      "sha256": "132362d13c303d48389613a11f6511506e19de857d04425cea1c4cd086a71be0"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 3297,
+      "origin_label": "SOURCE-ONLY-REMAINING-PREPARATION.json",
+      "original_sha256": "406c081dceb4fb9ef7c52307859e08d8df70d056b60d9e1a1672ded0c98e87dd",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/SOURCE-ONLY-REMAINING-PREPARATION.json",
+      "sha256": "ac22e1929816a45d0028f459af767bca0bb4e15ab9bcfb35f4fe288f8d725106"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "non-executable path-normalized task-runner snapshot",
+      "length": 559,
+      "origin_label": "dev-cache-native-acceptance-entry.py",
+      "original_sha256": "0cb9d1ee7ea2f82a7feac77ecdc83037077ec243dd7cefa652e0586eb718c4a7",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/dev-cache-native-acceptance-entry.py.review.txt",
+      "sha256": "0161434b2049091ba55d48d03047b9bf4d6b5af4b7a236d2d62a22114dcd438e"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "non-executable path-normalized task-runner snapshot",
+      "length": 27566,
+      "origin_label": "dev-cache-native-acceptance-guard.py",
+      "original_sha256": "fc7efac6e14198a295dd3b03f789713cb33e040d8b1fe469b56ee6e3507b397b",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/dev-cache-native-acceptance-guard.py.review.txt",
+      "sha256": "db33744223d53f57840ffc675606b750a2f0af8ffcc53e774de7822b1480b988"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "non-executable path-normalized task-runner snapshot",
+      "length": 38263,
+      "origin_label": "dev-cache-native-installed-acceptance.py",
+      "original_sha256": "16974a0578101a0b9dafc6fb793a5e826e0bbcafb13ac3437b3946df2ceeedc8",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/dev-cache-native-installed-acceptance.py.review.txt",
+      "sha256": "4f5ec7aadbc17903522381b59be09b99d479e2435c04ff5c44b4a5c887f99c55"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "non-executable path-normalized task-runner snapshot",
+      "length": 18745,
+      "origin_label": "outer-workload.py",
+      "original_sha256": "4e448ee0e7e49a7267cb7e717a0bc9864b67ad1829dd3e8a1295df4cc009b8ed",
+      "path": "handoff/cloud-20261018/local-only-preparations/cache/outer-workload.py.review.txt",
+      "sha256": "4e448ee0e7e49a7267cb7e717a0bc9864b67ad1829dd3e8a1295df4cc009b8ed"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 29387016,
+      "origin_label": "dev-auth-0.5.3-linux-x86_64",
+      "original_sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-auth/dev-auth-0.5.3-linux-x86_64",
+      "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 575,
+      "origin_label": "dev-auth-stable.json",
+      "original_sha256": "5c26aef2154519537c163143e5c6e1b77b05de89e6125d6cc37fd23d15f6831c",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-auth/dev-auth-stable.json",
+      "sha256": "5c26aef2154519537c163143e5c6e1b77b05de89e6125d6cc37fd23d15f6831c"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 361,
+      "origin_label": "dev-tools-root.json",
+      "original_sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-auth/dev-tools-root.json",
+      "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 4325824,
+      "origin_label": "dev-cache-0.1.13-linux-x86_64",
+      "original_sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-cache/dev-cache-0.1.13-linux-x86_64",
+      "sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 580,
+      "origin_label": "dev-cache-stable.json",
+      "original_sha256": "25e38c20b72138a0c923d9a33cdb9ec19ebb765553b6533339f1d9c0e8a251e5",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-cache/dev-cache-stable.json",
+      "sha256": "25e38c20b72138a0c923d9a33cdb9ec19ebb765553b6533339f1d9c0e8a251e5"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 361,
+      "origin_label": "dev-tools-root.json",
+      "original_sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-cache/dev-tools-root.json",
+      "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 361,
+      "origin_label": "dev-tools-root.json",
+      "original_sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72",
+      "path": "handoff/cloud-20261018/signed-inputs/sync-configs/dev-tools-root.json",
+      "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 7391696,
+      "origin_label": "sync-configs-0.3.2-linux-x86_64",
+      "original_sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65",
+      "path": "handoff/cloud-20261018/signed-inputs/sync-configs/sync-configs-0.3.2-linux-x86_64",
+      "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 586,
+      "origin_label": "sync-configs-stable.json",
+      "original_sha256": "e937e9b9d2f289759dd8dc65f2844d0c6d4d2d442a28e0f608124b5fd77accef",
+      "path": "handoff/cloud-20261018/signed-inputs/sync-configs/sync-configs-stable.json",
+      "sha256": "e937e9b9d2f289759dd8dc65f2844d0c6d4d2d442a28e0f608124b5fd77accef"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 662376,
+      "origin_label": "libdev_auth_sudo.so",
+      "original_sha256": "24c7fa052de58efdfd8624ea4722c2a3921bbaea0e5bcff7effc3cbad306727b",
+      "path": "handoff/cloud-20261018/signed-inputs/dev-auth/libdev_auth_sudo.so",
+      "sha256": "24c7fa052de58efdfd8624ea4722c2a3921bbaea0e5bcff7effc3cbad306727b"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact qualified offline public verification tool",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 7244296,
+      "origin_label": "release-admin",
+      "original_sha256": "7a4779b99073692c32fb8856b4f11a1f11ffbdc72d4e87f3f0995ee71e28de22",
+      "path": "handoff/cloud-20261018/verification-tools/release-admin",
+      "sha256": "7a4779b99073692c32fb8856b4f11a1f11ffbdc72d4e87f3f0995ee71e28de22"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "length": 65,
+      "origin_label": "root-public-key.txt",
+      "original_sha256": "034adb19bd28ee666fbcd8c8d3ed491c0e4412d6c53f598e5d0e84dc13b33005",
+      "path": "handoff/cloud-20261018/public-authority/root-public-key.txt",
+      "sha256": "034adb19bd28ee666fbcd8c8d3ed491c0e4412d6c53f598e5d0e84dc13b33005"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "length": 115,
+      "origin_label": "source-signing-allowed-signers",
+      "original_sha256": "786418ed8f0ff3c7513e9b9c04ff5c245cb1bed6c24180f56529afd8f93f5b98",
+      "path": "handoff/cloud-20261018/public-authority/source-signing-allowed-signers",
+      "sha256": "786418ed8f0ff3c7513e9b9c04ff5c245cb1bed6c24180f56529afd8f93f5b98"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 4323528,
+      "origin_label": "dev-cache-0.1.12-linux-x86_64",
+      "original_sha256": "e5089c52e1a2ddbe8250a786aff78342e0e8bc2aa54b71cfb245fdbd56e16731",
+      "path": "handoff/cloud-20261018/signed-inputs/predecessors/dev-cache/dev-cache-0.1.12-linux-x86_64",
+      "sha256": "e5089c52e1a2ddbe8250a786aff78342e0e8bc2aa54b71cfb245fdbd56e16731"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 580,
+      "origin_label": "dev-cache-stable.json",
+      "original_sha256": "d20250e14155986b78a52a2719d58056f94482822c936ecea363fd72c07576f1",
+      "path": "handoff/cloud-20261018/signed-inputs/predecessors/dev-cache/dev-cache-stable.json",
+      "sha256": "d20250e14155986b78a52a2719d58056f94482822c936ecea363fd72c07576f1"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 361,
+      "origin_label": "dev-tools-root.json",
+      "original_sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72",
+      "path": "handoff/cloud-20261018/signed-inputs/predecessors/dev-cache/dev-tools-root.json",
+      "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 361,
+      "origin_label": "dev-tools-root.json",
+      "original_sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72",
+      "path": "handoff/cloud-20261018/signed-inputs/predecessors/sync-configs/dev-tools-root.json",
+      "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0700",
+      "length": 7231464,
+      "origin_label": "sync-configs-0.3.1-linux-x86_64",
+      "original_sha256": "79a7d01980931caa2307fe3f6f76b0750ba6ff17c212415a2882aca94afb34a5",
+      "path": "handoff/cloud-20261018/signed-inputs/predecessors/sync-configs/sync-configs-0.3.1-linux-x86_64",
+      "sha256": "79a7d01980931caa2307fe3f6f76b0750ba6ff17c212415a2882aca94afb34a5"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact non-secret signed/public input",
+      "deliberate_use_mode_after_verification": "0600",
+      "length": 586,
+      "origin_label": "sync-configs-stable.json",
+      "original_sha256": "60cd3bd638933c68a265acdb03aea8916b57a907c030dee518f5d4660ef43f65",
+      "path": "handoff/cloud-20261018/signed-inputs/predecessors/sync-configs/sync-configs-stable.json",
+      "sha256": "60cd3bd638933c68a265acdb03aea8916b57a907c030dee518f5d4660ef43f65"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact public official image authentication input",
+      "length": 7843,
+      "origin_label": "SHA256SUMS",
+      "original_sha256": "0449a33b78dddb301a3ce2b80398984bc3e1f7880e27b86a31e58bdcbd3d3816",
+      "path": "handoff/cloud-20261018/public-authority/ubuntu-image/SHA256SUMS",
+      "sha256": "0449a33b78dddb301a3ce2b80398984bc3e1f7880e27b86a31e58bdcbd3d3816"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact public official image authentication input",
+      "length": 833,
+      "origin_label": "SHA256SUMS.gpg",
+      "original_sha256": "68aae716a548e466e58afddd8b767c54c791f40f1d20d1d12e27c471edb535e5",
+      "path": "handoff/cloud-20261018/public-authority/ubuntu-image/SHA256SUMS.gpg",
+      "sha256": "68aae716a548e466e58afddd8b767c54c791f40f1d20d1d12e27c471edb535e5"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact public official image authentication input",
+      "length": 2363,
+      "origin_label": "ubuntu-cloud-image-keyring.gpg",
+      "original_sha256": "80347fcd3a3de83cff782b9de657b48394b49ad83887268445a54d5beee69b4e",
+      "path": "handoff/cloud-20261018/public-authority/ubuntu-image/ubuntu-cloud-image-keyring.gpg",
+      "sha256": "80347fcd3a3de83cff782b9de657b48394b49ad83887268445a54d5beee69b4e"
+    },
+    {
+      "byte_identical_to_original": true,
+      "class": "exact public official image authentication input",
+      "length": 21275,
+      "origin_label": "ubuntu-24.04-server-cloudimg-amd64.manifest",
+      "original_sha256": "78d7da6ab1556daa6c0f685bf4e0e3da36395f170e8fad411d7ba032f14d08c2",
+      "path": "handoff/cloud-20261018/public-authority/ubuntu-image/ubuntu-24.04-server-cloudimg-amd64.manifest",
+      "sha256": "78d7da6ab1556daa6c0f685bf4e0e3da36395f170e8fad411d7ba032f14d08c2"
+    },
+    {
+      "class": "sanitized selected product-run audit snapshot",
+      "length": 5601,
+      "path": "handoff/cloud-20261018/evidence/updateall-user-run-audit.json",
+      "sha256": "90305b183102082c15d0e0a2e5208352e31fb00bec13365079d6193d71da10ab"
+    },
+    {
+      "byte_identical_to_original": false,
+      "class": "path-normalized historical evidence",
+      "length": 223192,
+      "origin_label": "OFFLINE-CARGO-ARCHIVE-READBACK.json",
+      "original_sha256": "fb90a4e02d133397e885101f91fc63f583adf8761374908b68f4342c7f28ac3a",
+      "path": "handoff/cloud-20261018/local-only-preparations/devauth/offline-archive-readback.json",
+      "sha256": "228ba22de22093a5297962aaeecf3ddc10c6c882a157d94366c5fd21824bdf9c"
+    },
+    {
+      "class": "new transfer documentation",
+      "length": 1676,
+      "path": "handoff/cloud-20261018/README.md",
+      "sha256": "05a3a4bc0426499b1e7f984d3e923e81076f9aeaa5b958aea871184a6b02f662"
+    }
+  ],
+  "handoff_branch": "handoff/devtools-cloud-20261018",
+  "local_image_excluded": {
+    "immutable_url": "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img",
+    "length": 621284352,
+    "sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94"
+  },
+  "purpose": "Recoverable Git transfer; no installation, workload admission, source acceptance or new independent build",
+  "qualified_source": {
+    "commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+    "source_date_epoch": 1792291519,
+    "tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f"
+  },
+  "recorded_utc": "2026-10-18T06:48:33.046775+00:00",
+  "schema": 1
+}

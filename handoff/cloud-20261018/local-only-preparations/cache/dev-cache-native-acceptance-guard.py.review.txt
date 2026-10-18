@@ -1,0 +1,575 @@
+"""Installed native coordination acceptance; separate owner-user600+60 allocation, no authentication."""
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import subprocess
+import time
+
+E = Path('${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018')
+SOURCE = Path('${QUALIFIED_SOURCE_ROOT}')
+TIP = '81338f23a8cf45c30caf3e95937b8d42c6ee8e0e'
+QUIET = Path('/tmp/codex-rust-build-quiet-window.json')
+MEMORY_FLOOR = 16 * 1024**3
+STORAGE_FLOOR = 100 * 1024**3
+TMP_FLOOR = 8 * 1024**3
+PYTHON_SHA256 = '375532f83be620283ab780c14ca6bcc5907dc379d2b621de0c5d0a112cf5458b'
+BINDINGS_SHA256 = 'cac5a13f5d9b5ec9acdd43b8a689a525bb6f1f475b7492f73f4f88cfcb504c2a'
+NATIVE = frozenset(('dev-auth', 'op-ssh-sign'))
+MEMORY_LIMIT = 12 * 1024**3
+
+
+def health():
+    available = next(int(line.split()[1]) * 1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
+    fs = os.statvfs('${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018')
+    free = fs.f_bavail * fs.f_frsize
+    tmp_fs = os.statvfs('/tmp')
+    tmp_free = tmp_fs.f_bavail * tmp_fs.f_frsize
+    pressure = {}
+    for line in Path('/proc/pressure/memory').read_text().splitlines():
+        words = line.split()
+        pressure[words[0]] = next(float(word.split('=')[1]) for word in words[1:] if word.startswith('avg10='))
+    return {'memory_bytes': available, 'storage_bytes': free, 'tmp_bytes': tmp_free, 'some': pressure['some'], 'full': pressure['full']}
+
+def unsafe_capacity(h):
+    return h['memory_bytes'] < MEMORY_FLOOR or h['storage_bytes'] < STORAGE_FLOOR or h['tmp_bytes'] < TMP_FLOOR
+
+def pressured(h):
+    return h['some'] >= 5.0 or h['full'] >= 1.0
+
+
+def _json(path):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 1024**2:
+            raise RuntimeError('invalid task metadata')
+        return json.load(stream)
+
+
+def allocation(acquired):
+    turn_path = E / 'native-acceptance-turn.json'
+    turn = _json(turn_path)
+    if (turn.get('owner') != 'DevTools' or turn.get('source') != TIP
+            or turn.get('tree') != 'dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f'
+            or turn.get('state') != 'prepared' or turn.get('allocated') is not True
+            or turn.get('execution_seconds') != 600 or turn.get('settlement_seconds') != 60):
+        raise RuntimeError('native acceptance allocation is absent or consumed')
+    deadline, final_deadline = acquired + 600, acquired + 660
+    me = _identity(os.getpid())
+    turn.update(state='running', reservation_acquired_monotonic=acquired,
+                reservation_acquired_unix=time.time(), compiler_lock_acquired=True,
+                admitted=False, boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                wrapper_pid=os.getpid(), wrapper_start=me['start'],
+                execution_deadline_monotonic=deadline, final_deadline_monotonic=final_deadline)
+    write_turn(turn)
+    return deadline, final_deadline
+
+
+def write_turn(turn):
+    target = E / 'native-acceptance-turn.json'
+    temporary = target.with_suffix('.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(turn, stream, indent=2)
+        stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+    os.replace(temporary, target)
+
+
+def file_hash(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or info.st_size > 64 * 1024**2):
+            raise RuntimeError('candidate custody mismatch')
+        return hashlib.file_digest(stream, 'sha256').hexdigest(), info.st_size
+
+
+def admit_payload(group_text, group_identity):
+    turn = _json(E / 'native-acceptance-turn.json')
+    if time.monotonic() >= turn['execution_deadline_monotonic']:
+        raise RuntimeError('native acceptance allocation expired')
+    bindings_digest, _ = file_hash(E / 'NATIVE-TOOL-BINDINGS.json')
+    if bindings_digest != BINDINGS_SHA256:
+        raise RuntimeError('frozen native bindings changed')
+    bindings = _json(E / 'NATIVE-TOOL-BINDINGS.json')
+    for key in ('runner', 'outer'):
+        item = bindings['payloads'][key]
+        digest, _ = file_hash(item['path'])
+        if digest != item['sha256']:
+            raise RuntimeError('payload identity changed')
+    record = bindings['signed_qualification']
+    if file_hash(record['path'])[0] != record['sha256']:
+        raise RuntimeError('signed qualification record changed')
+    producer = _json(Path(record['path']))
+    if (producer.get('source_head') != TIP or producer.get('source_tree') != turn['tree']
+            or producer.get('state') != 'SIGNED_BOTH_VERIFIED_FULLY_SETTLED'
+            or producer.get('A_B_byte_equal') is not True
+            or producer.get('all_signing_clients_reaped') is not True
+            or producer.get('all_signing_units_settled') is not True):
+        raise RuntimeError('source-bound signed qualification missing')
+    identities = []
+    for label in ('a', 'b'):
+        proof = producer['verifications']['candidate-' + label]['dev-cache']
+        if (proof.get('schema') != 'release-admin-set-verify-v1' or proof.get('verified') is not True
+                or proof.get('product') != 'dev-cache' or proof.get('version') != '0.1.13'
+                or proof.get('source_commit') != TIP or proof.get('targets') != 1):
+            raise RuntimeError('native release signature qualification failed')
+        release = E.parent / ('signed-bundles/candidate-' + label + '/releases/dev-cache')
+        artifact = release / 'dev-cache-0.1.13-linux-x86_64'
+        digest, size = file_hash(artifact)
+        root_hash, _ = file_hash(release / 'dev-tools-root.json')
+        manifest_hash, _ = file_hash(release / 'dev-cache-stable.json')
+        identities.append({'path': str(artifact), 'sha256': digest, 'bytes': size,
+                           'root_sha256': root_hash, 'manifest_sha256': manifest_hash,
+                           'root_document': str(release / 'dev-tools-root.json'),
+                           'manifest': str(release / 'dev-cache-stable.json')})
+    if any(identities[0][k] != identities[1][k] for k in ('sha256', 'bytes', 'root_sha256', 'manifest_sha256')):
+        raise RuntimeError('qualified candidates changed or differ')
+    turn.update(admitted=True, candidate=identities[0],
+                qualification={'verified': True, 'product': 'dev-cache', 'version': '0.1.13',
+                               'source_commit': TIP, 'root_sha256': identities[0]['root_sha256'],
+                               'manifest_sha256': identities[0]['manifest_sha256']},
+                cgroup=group_text, cgroup_path=group_text.removeprefix('0::'),
+                cgroup_device=group_identity[0], cgroup_inode=group_identity[1])
+    write_turn(turn)
+
+
+def _identity(pid):
+    try:
+        raw = Path(f'/proc/{pid}/stat').read_text()
+        tail = raw[raw.rfind(')') + 2:].split()
+        uid = Path(f'/proc/{pid}').stat().st_uid
+        role = ''
+        same_user_namespace = False
+        try:
+            same_user_namespace = (os.readlink(f'/proc/{pid}/ns/user')
+                                   == os.readlink('/proc/self/ns/user'))
+            if same_user_namespace:
+                role = Path(os.readlink(f'/proc/{pid}/exe').removesuffix(' (deleted)')).name
+        except OSError:
+            pass
+        if not role and same_user_namespace:
+            # Read only argv[0], one byte at a time through its first NUL.
+            # Never read, retain, or report remaining argv or environment.
+            try:
+                first = bytearray()
+                with open(f'/proc/{pid}/cmdline', 'rb', buffering=0) as stream:
+                    while len(first) < 4096:
+                        byte = stream.read(1)
+                        if byte in (b'', b'\0'):
+                            role = Path(os.fsdecode(bytes(first))).name if first else ''
+                            break
+                        first.extend(byte)
+            except OSError:
+                pass
+        return {'start': int(tail[19]), 'state': tail[0], 'uid': uid,
+                'comm': raw[raw.find('(') + 1:raw.rfind(')')], 'role': role}
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def _cgroup_text():
+    unified = [line for line in Path('/proc/self/cgroup').read_text().splitlines()
+               if line.startswith('0::')]
+    if len(unified) != 1:
+        raise RuntimeError('unified cgroup membership is absent or ambiguous')
+    return unified[0]
+
+
+def run(argv, label):
+    """Run one fixed candidate; all inherited terminal streams remain untouched."""
+    if label != 'acceptance':
+        raise ValueError('invalid candidate')
+    status_path = E / 'native-acceptance-resource-status.json'
+    status = {'source': TIP, 'candidate': label, 'state': 'preparing',
+              'result': None, 'exit': None, 'ra_child_pid': None,
+              'ra_child_reaped': False, 'settled': False, 'deadline_met': False,
+              'native_boundary_held': False, 'memory_abort_threshold': MEMORY_LIMIT,
+              'memory_limit_kind': 'polling_threshold_not_kernel_MemoryMax',
+              'terminal_streams_captured': False}
+    child = None
+    lock = None
+    group_fd = None
+    owned = {}
+    stopped = set()
+    handlers = {}
+    cancelled = [False]
+    attempted = False
+    reason = None
+    paused = False
+    group = None
+    baseline = {}
+    deadline = final_deadline = 0.0
+
+    def save():
+        temporary = status_path.with_name(status_path.name + f'.{os.getpid()}.tmp')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(status, stream, sort_keys=True)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, status_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def group_read(name):
+        fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=group_fd)
+        with os.fdopen(fd, 'r') as stream:
+            return stream.read(1024**2)
+
+    def members():
+        if _cgroup_text() != bound_group_text:
+            raise RuntimeError('native workload cgroup changed')
+        current = group.stat()
+        if (current.st_dev, current.st_ino) != group_identity:
+            raise RuntimeError('native workload cgroup identity changed')
+        return {int(value) for value in group_read('cgroup.procs').split()}
+
+    def discover():
+        for pid in members():
+            info = _identity(pid)
+            if info is None or info['uid'] != os.getuid() or info['state'] in ('Z', 'X'):
+                continue
+            key = (pid, info['start'])
+            if baseline.get(pid) == info['start'] or key in owned:
+                continue
+            try:
+                fd = os.pidfd_open(pid, 0)
+            except ProcessLookupError:
+                continue
+            after = _identity(pid)
+            if after is None or after['start'] != info['start'] or after['uid'] != os.getuid() or pid not in members():
+                os.close(fd)
+                continue
+            owned[key] = fd
+            status.setdefault('known_owned_identities', []).append({'pid': pid, 'start': info['start'], 'role': info['role']})
+
+    def active():
+        discover()
+        live = []
+        for (pid, start), fd in list(owned.items()):
+            poll = select.poll()
+            poll.register(fd, select.POLLIN)
+            if poll.poll(0):
+                os.close(fd)
+                del owned[(pid, start)]
+                stopped.discard((pid, start))
+                continue
+            info = _identity(pid)
+            if info is None or info['start'] != start:
+                if poll.poll(0):
+                    os.close(fd)
+                    del owned[(pid, start)]
+                    stopped.discard((pid, start))
+                    continue
+                raise RuntimeError('retained payload identity is uncertain')
+            if info['state'] not in ('Z', 'X'):
+                live.append((pid, fd, info))
+        return live
+
+    def native(rows):
+        return any(info['comm'] in NATIVE or info['role'] in NATIVE for _, _, info in rows)
+
+    def send(rows, number):
+        for pid, fd, info in rows:
+            current = _identity(pid)
+            key = (pid, info['start'])
+            if current is None or current['start'] != info['start']:
+                continue
+            if number == signal.SIGCONT:
+                if key not in stopped:
+                    continue
+            elif current['comm'] in NATIVE or current['role'] in NATIVE:
+                continue
+            try:
+                signal.pidfd_send_signal(fd, number)
+                if number == signal.SIGSTOP:
+                    stopped.add(key)
+                elif number == signal.SIGCONT:
+                    stopped.discard(key)
+            except ProcessLookupError:
+                pass
+
+    def quiet_owned():
+        value = _json(QUIET)
+        return (value.get('owner') == 'DevTools' and value.get('active') is False
+                and value.get('root_held') is False and value.get('source_head') == TIP
+                and value.get('explicitly_released_to') == 'DevTools'
+                and value.get('released_to') == 'DevTools'
+                and value.get('source_tree') == 'dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f'
+                and value.get('allocated_scope', {}).get('operation') == 'native installed active workload coordination acceptance')
+
+    def stop_owned():
+        # Reach a stable stopped closure before killing: a newly discovered
+        # runnable child must never be killed across an exec-to-signer race.
+        previous = None
+        for _ in range(30):
+            rows = active()
+            if native(rows):
+                send(rows, signal.SIGCONT)
+                return False
+            send(rows, signal.SIGSTOP)
+            time.sleep(0.01)
+            rows = active()
+            if native(rows):
+                send(rows, signal.SIGCONT)
+                return False
+            current = {(pid, info['start']) for pid, _, info in rows}
+            if current == previous and all(info['state'] in ('T', 't') for _, _, info in rows):
+                send(rows, signal.SIGKILL)
+                send(rows, signal.SIGCONT)
+                return True
+            previous = current
+        return False
+
+    try:
+        if not all(os.isatty(fd) for fd in (0, 1, 2)):
+            raise RuntimeError('native TTY streams required')
+        if not quiet_owned():
+            raise RuntimeError('exact source compiler turn is not owned')
+        for command, expected in ((['rev-parse', 'HEAD'], TIP),
+                                  (['rev-parse', 'HEAD^{tree}'], 'dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f'),
+                                  (['status', '--porcelain'], '')):
+            result = subprocess.run(['/usr/bin/git', '--no-optional-locks', '-C', str(SOURCE), *command],
+                                    capture_output=True, check=True, text=True, timeout=5)
+            if result.stdout.strip() != expected:
+                raise RuntimeError('exact clean signed source changed')
+        if argv[:3] != ['/usr/bin/taskset', '-c', '0']:
+            raise RuntimeError('fixed one CPU constructor argv required')
+        with open(argv[3], 'rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != PYTHON_SHA256:
+                raise RuntimeError('release constructor identity changed')
+        bound_group_text = _cgroup_text()
+        expected_group = '/user.slice/user-1000.slice/user@1000.service/app.slice/devtools-cache013-81338f23-native-status-remaining.service'
+        if os.getuid() != 1000 or bound_group_text != '0::' + expected_group:
+            raise RuntimeError('exact owned user service required')
+        group = Path('/sys/fs/cgroup') / expected_group.lstrip('/')
+        if group.name != 'devtools-cache013-81338f23-native-status-remaining.service':
+            raise RuntimeError('exact owned user unit basename required')
+        group_fd = os.open(group, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(group_fd)
+        group_identity = (info.st_dev, info.st_ino)
+        status.update(cgroup=expected_group, control_group=expected_group,
+                      cgroup_path=expected_group, cgroup_unit=group.name,
+                      execution_authority='owner_user_native_acceptance',
+                      native_release_admission_claimed=False,
+                      cgroup_device=group_identity[0], cgroup_inode=group_identity[1])
+        for pid in members():
+            info = _identity(pid)
+            if info is not None:
+                baseline[pid] = info['start']
+        lock = os.open('/tmp/codex-rust-build.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise RuntimeError('invalid shared compiler lock')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline, final_deadline = allocation(time.monotonic())
+        attempt_fd = os.open(status_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        os.close(attempt_fd)
+        attempted = True
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            handlers[number] = signal.signal(number, lambda *_: cancelled.__setitem__(0, True))
+        output_parent = E / 'native-acceptance-scratch'
+        output_parent.mkdir(mode=0o700, exist_ok=True)
+        info = output_parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or output_parent.resolve() != output_parent):
+            raise RuntimeError('invalid storage output parent')
+        healthy = 0
+        while True:
+            while healthy < 10:
+                h = health()
+                if cancelled[0] or time.monotonic() >= deadline or not quiet_owned():
+                    raise RuntimeError('admission cancelled or expired')
+                if unsafe_capacity(h) or int(group_read('memory.current')) >= MEMORY_LIMIT:
+                    raise RuntimeError('admission capacity floor or memory threshold')
+                healthy = healthy + 1 if not pressured(h) else 0
+                status.update(state='admission', healthy_samples=healthy)
+                save()
+                time.sleep(1)
+            h = health()
+            memory = int(group_read('memory.current'))
+            owned_turn = quiet_owned()
+            now = time.monotonic()
+            predicates = {
+                'not_cancelled': not cancelled[0],
+                'deadline_valid': now < deadline,
+                'ownership_valid': owned_turn,
+                'capacity_safe': not unsafe_capacity(h),
+                'memory_safe': memory < MEMORY_LIMIT,
+                'psi_healthy': not pressured(h),
+            }
+            observation = {'predicates': predicates, 'health': h,
+                           'memory_current': memory,
+                           'execution_deadline_remaining_seconds': deadline - now}
+            status.update(state='final_admission', final_admission=observation,
+                          health=h, memory_current=memory, healthy_samples=healthy)
+            if not all(predicates[key] for key in (
+                    'not_cancelled', 'deadline_valid', 'ownership_valid',
+                    'capacity_safe', 'memory_safe')):
+                save()
+                raise RuntimeError('final native admission predicate changed')
+            if not predicates['psi_healthy']:
+                # A transient final PSI sample restarts admission only, never
+                # payload work or this turn's original aggregate clock.
+                healthy = 0
+                status.update(state='admission', healthy_samples=0,
+                              final_psi_rewaits=status.get('final_psi_rewaits', 0) + 1,
+                              last_psi_rewait=observation)
+                save()
+                continue
+            break
+        admit_payload(bound_group_text, group_identity)
+        child = subprocess.Popen(argv, cwd=SOURCE, stdin=None, stdout=None, stderr=None, close_fds=True)
+        discover()
+        status.update(ra_child_pid=child.pid, state='running')
+        healthy = 0
+        while True:
+            rows = active()
+            rc = child.poll()
+            if rc is not None:
+                child.wait(timeout=0)
+                status.update(ra_child_reaped=True, exit=rc)
+            now = time.monotonic()
+            h = health()
+            memory = int(group_read('memory.current'))
+            if reason is None:
+                if cancelled[0]:
+                    reason = 'cancelled'
+                elif now >= deadline:
+                    reason = 'aggregate_execution_deadline'
+                elif not quiet_owned():
+                    reason = 'compiler_turn_changed'
+                elif unsafe_capacity(h) or memory >= MEMORY_LIMIT:
+                    reason = 'resource_floor_or_memory_threshold'
+                elif rc is not None and rc != 0:
+                    reason = 'constructor_failed'
+            status.update(memory_current=memory, health=h, deadline_met=now <= deadline,
+                          ra_child_reaped=rc is not None, exit=rc)
+            if reason is not None:
+                if native(rows):
+                    # User explicitly forbids interrupting active native signing.
+                    # Retain this guard/native owner even beyond the final budget.
+                    status.update(state='native_boundary_hold', result=reason,
+                                  native_boundary_held=True, settled=False,
+                                  deadline_met=False, final_deadline_exceeded=now >= final_deadline)
+                    send(rows, signal.SIGCONT)
+                    paused = False
+                    save()
+                    time.sleep(0.5)
+                    continue
+                status.update(state='settling', result=reason)
+                if rows:
+                    stop_owned()
+                    save()
+                    time.sleep(0.1)
+                    if now >= final_deadline:
+                        # Preserve the lock/native owner until actual settlement;
+                        # a failed budget does not establish kernel termination.
+                        status.update(state='ownership_uncertain', settled=False,
+                                      final_deadline_exceeded=True, deadline_met=False)
+                        save()
+                    continue
+                if rc is None:
+                    time.sleep(0.1)
+                    continue
+                break
+            if rc is not None and not rows:
+                break
+            blocked = pressured(h)
+            if blocked and not native(rows):
+                send(rows, signal.SIGSTOP)
+                paused = True
+                healthy = 0
+            elif paused:
+                healthy = healthy + 1 if not blocked else 0
+                if healthy >= 10 or native(rows):
+                    send(rows, signal.SIGCONT)
+                    paused = False
+                    healthy = 0
+            status.update(state='paused' if paused else 'running', healthy_samples=healthy)
+            save()
+            time.sleep(1)
+        rows = active()
+        rc = child.poll()
+        if rc is not None:
+            child.wait(timeout=0)
+        status.update(settled=not rows and rc is not None, ra_child_reaped=rc is not None,
+                      exit=rc, deadline_met=time.monotonic() <= deadline and reason is None,
+                      state='finished', result=reason or ('completed' if rc == 0 else 'constructor_failed'))
+        save()
+        return 0 if status['settled'] and status['result'] == 'completed' and status['deadline_met'] else 75
+    except Exception as error:
+        status.update(result='supervision_error', error_kind=type(error).__name__, state='failed')
+        if child is None:
+            # No payload child was created; native-unit settlement is still
+            # independently established by the outer owner after this returns.
+            status.update(settled=True, deadline_met=False)
+        if isinstance(error, RuntimeError):
+            status['failure_reason'] = str(error)
+        # An active native boundary must retain the admitted owner until natural
+        # settlement, even when supervision itself fails.
+        if child is not None:
+            while True:
+                try:
+                    rows = active()
+                    if native(rows):
+                        status.update(state='native_boundary_hold', native_boundary_held=True, deadline_met=False)
+                        send(rows, signal.SIGCONT)
+                        paused = False
+                        if attempted:
+                            save()
+                        time.sleep(0.5)
+                        continue
+                    stop_owned()
+                    if child.poll() is not None and not active():
+                        child.wait(timeout=0)
+                        status.update(settled=True, ra_child_reaped=True, exit=child.returncode)
+                        break
+                    if time.monotonic() >= final_deadline:
+                        status.update(settled=False, state='ownership_uncertain',
+                                      deadline_met=False, final_deadline_exceeded=True)
+                        if attempted:
+                            save()
+                    time.sleep(0.1)
+                except Exception:
+                    status.update(settled=False, state='ownership_uncertain')
+                    if attempted:
+                        try:
+                            save()
+                        except OSError:
+                            pass
+                    # Do not exit the admitted native owner on an unobserved
+                    # signing/child boundary; retry observation, never work.
+                    time.sleep(0.5)
+        if attempted:
+            save()
+        else:
+            try:
+                fd = os.open(status_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+                os.close(fd)
+                status.update(settled=child is None, deadline_met=False)
+                save()
+            except FileExistsError:
+                pass
+            print('release resource guard refused admission: ' + type(error).__name__, flush=True)
+        return 75
+    finally:
+        for number, handler in handlers.items():
+            signal.signal(number, handler)
+        for fd in owned.values():
+            os.close(fd)
+        if group_fd is not None:
+            os.close(group_fd)
+        if lock is not None:
+            os.close(lock)

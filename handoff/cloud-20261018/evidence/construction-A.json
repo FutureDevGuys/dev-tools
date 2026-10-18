@@ -1,0 +1,303 @@
+{
+  "all_recorded_direct_clients_reaped_exit0": true,
+  "auth_privilege_expansion_hosted_CI_install_publish_push": false,
+  "direct_client_count": 16,
+  "evidence_sha256": {
+    "ACTUAL-PAYLOAD-RESULT.json": "4d6922716a37b5ad5d3ea9e0a215b114fb2595be116fff99502618cd366813da",
+    "BINDING-VERIFIED-BY-OWNER.json": "6d820b15f27431811e6c4a767292a7ebcadf8aa00a7101b6acd501d35b8b7915",
+    "FINAL-SOURCE-CHECKPOINT.json": "612d91ea042c523443d5fe8d193d0a88fe7564d257733cc01c8ab53bed320e7f",
+    "NEXT-RUNTIME-REQUEST.json": "e25c668c8c8978350ee982c67b5be09f935ca41043b9899de19fae95e5d8d01c",
+    "PARENT-NAMED-ALLOCATION.json": "e9dc00efd2d8b4dfa7587047f67bb99a311e17542aaa56e69929f63384f9721b",
+    "PRELAUNCH-PROGRAM-REVIEW.json": "976e54cd50f0f60ba6e829f35f65488b6ef493027bbef3ae49211a0daad85886",
+    "STAGE-RESULTS.json": "18aafd6e942320d99d5e131c0b60353dcff6c8491ab6a9a055b7b3f3d103eed7",
+    "cargo-diagnostic-turn.json": "279dc7bb24d516cc8be31d127ce2ca2d6276aeaac6682d0a059cd3817094f0f8",
+    "owner-user-phase-a-resource-status.json": "5b5a950172ffded632ec533ecffe3c8a73be06fc9319b2b2d8b473535537574a"
+  },
+  "exec_client_exit": 0,
+  "exec_client_reaped": true,
+  "exec_session": 69710,
+  "execution_and_settlement_deadlines_met": true,
+  "explicit_native_sudo_header_Rust_layout": "PASS_1",
+  "fresh_settlement_elapsed_seconds": 802.577705769043,
+  "installed_UpdateAll014_and_rollback013_unchanged": {
+    "0.1.13": {
+      "path": "${USER_HOME}/.local/state/dev-tools/products/update-all/versions/0.1.13/update-all",
+      "sha256": "a71e3f475b55c57186ff4b959ec97d09d996e8ef42f7e674855ddf981a8b295a"
+    },
+    "0.1.14": {
+      "path": "${USER_HOME}/.local/state/dev-tools/products/update-all/versions/0.1.14/update-all",
+      "sha256": "544a3ac13f0bbaeebeda6495e3d00ebde6cf9d216554086bf72201b9881de7b5"
+    }
+  },
+  "known_pid_observations": [
+    {
+      "expected_start_ticks": 26393245,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 2997320
+    },
+    {
+      "expected_start_ticks": 26393281,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 2997335
+    },
+    {
+      "expected_start_ticks": null,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 2997463
+    },
+    {
+      "expected_start_ticks": 26394562,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 2997467
+    },
+    {
+      "expected_start_ticks": 26396833,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 2998128
+    },
+    {
+      "expected_start_ticks": 26419519,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3005300
+    },
+    {
+      "expected_start_ticks": 26455445,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3012176
+    },
+    {
+      "expected_start_ticks": 26458404,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3012828
+    },
+    {
+      "expected_start_ticks": 26458454,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3012836
+    },
+    {
+      "expected_start_ticks": 26458489,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3012843
+    },
+    {
+      "expected_start_ticks": 26458511,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3012852
+    },
+    {
+      "expected_start_ticks": 26458533,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3012860
+    },
+    {
+      "expected_start_ticks": 26460621,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013371
+    },
+    {
+      "expected_start_ticks": 26461299,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013565
+    },
+    {
+      "expected_start_ticks": 26461678,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013650
+    },
+    {
+      "expected_start_ticks": 26461782,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013695
+    },
+    {
+      "expected_start_ticks": 26461977,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013717
+    },
+    {
+      "expected_start_ticks": 26462015,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013736
+    },
+    {
+      "expected_start_ticks": 26462111,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013747
+    },
+    {
+      "expected_start_ticks": 26462183,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013758
+    },
+    {
+      "expected_start_ticks": 26462351,
+      "original_identity_absent": true,
+      "path_absent": true,
+      "pid": 3013797
+    }
+  ],
+  "matched_helper": {
+    "bytes": 662376,
+    "path": "${FUNCTIONAL_EVIDENCE_ROOT}/target/release/libdev_auth_sudo.so",
+    "sha256": "24c7fa052de58efdfd8624ea4722c2a3921bbaea0e5bcff7effc3cbad306727b"
+  },
+  "original_clock": {
+    "authentication": false,
+    "execution_deadline_monotonic": 265732.506618579,
+    "execution_seconds": 1800,
+    "final_deadline_monotonic": 265792.506618579,
+    "owner": "DevTools",
+    "scope": "functional-integration-construction-and-focused-native-acceptance",
+    "settlement_seconds": 60,
+    "source": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+    "started_monotonic": 263932.506618579,
+    "started_utc": "2026-10-18T02:57:03.025386+00:00",
+    "state": "running",
+    "tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f"
+  },
+  "private_JSON_and_TOML": [
+    {
+      "all_four_direct_clients_passed": true,
+      "final_managed_paths": [
+        [
+          "managed",
+          "keep"
+        ]
+      ],
+      "kind": "json",
+      "target_only_values_and_uid_gid_mode_preserved": true
+    },
+    {
+      "all_four_direct_clients_passed": true,
+      "final_managed_paths": [
+        [
+          "managed",
+          "keep"
+        ]
+      ],
+      "kind": "toml",
+      "target_only_values_and_uid_gid_mode_preserved": true
+    }
+  ],
+  "products": {
+    "dev-auth": {
+      "artifact": {
+        "bytes": 29387016,
+        "path": "${FUNCTIONAL_EVIDENCE_ROOT}/target/release/dev-auth",
+        "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+      },
+      "build_info": {
+        "built_unix": 1792291519,
+        "product": "dev-auth",
+        "profile": "release",
+        "schema": "dev-tools-build-info-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "source_state": "clean",
+        "target": "x86_64-unknown-linux-gnu",
+        "version": "0.5.3"
+      }
+    },
+    "dev-cache": {
+      "artifact": {
+        "bytes": 4325824,
+        "path": "${FUNCTIONAL_EVIDENCE_ROOT}/target/release/dev-cache",
+        "sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758"
+      },
+      "build_info": {
+        "built_unix": 1792291519,
+        "native_container_cache": "disabled",
+        "product": "dev-cache",
+        "profile": "release",
+        "schema": "dev-tools-build-info-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "source_state": "clean",
+        "target": "x86_64-unknown-linux-gnu",
+        "version": "0.1.13"
+      }
+    },
+    "sync-configs": {
+      "artifact": {
+        "bytes": 7391696,
+        "path": "${FUNCTIONAL_EVIDENCE_ROOT}/target/release/sync-configs",
+        "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+      },
+      "build_info": {
+        "built_unix": 1792291519,
+        "product": "sync-configs",
+        "profile": "release",
+        "schema": "dev-tools-build-info-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "source_state": "clean",
+        "target": "x86_64-unknown-linux-gnu",
+        "version": "0.3.2"
+      }
+    },
+    "update-all": {
+      "artifact": {
+        "bytes": 16856552,
+        "path": "${FUNCTIONAL_EVIDENCE_ROOT}/target/release/update-all",
+        "sha256": "71ff6a04a5c0ebc4c8e6fd73d539c06744441d76c148b6c7662bf74f9e56d4ab"
+      },
+      "build_info": {
+        "built_unix": 1792291519,
+        "product": "update-all",
+        "profile": "release",
+        "schema": "dev-tools-build-info-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "source_state": "clean",
+        "target": "x86_64-unknown-linux-gnu",
+        "version": "0.1.14"
+      }
+    }
+  },
+  "recorded_utc": "2026-10-18T03:10:25.603077+00:00",
+  "remaining_owned_original_identities": [],
+  "remaining_product_gates": [
+    "Independent release reproduction, signatures and native install/rollback acceptance for intended releases",
+    "DevAuth administrator grants/mixed-terminal/setup acceptance; header layout does not qualify those operations",
+    "Complete SyncConfigs crash-recovery and DevCache signed native routed coordination acceptance",
+    "No release or replacement of the integration-only UpdateAll014 candidate"
+  ],
+  "resource_disposition": "CONSUMED; relinquished ONLY to parent01a11861; no successor selected or allocated",
+  "shared_terminal_or_sudo_pane_accessed": false,
+  "signature": "G",
+  "six_public_document_file_contracts": "PASS_6",
+  "source_and_all_frozen_postimages_unchanged": true,
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "PASS_FULLY_SETTLED_RETURNED_ONLY_TO_PARENT",
+  "unit": {
+    "exact_cgroup_absent": true,
+    "fields": {
+      "ActiveState": "inactive",
+      "ControlGroup": "",
+      "ExecMainStatus": "0",
+      "LoadState": "not-found",
+      "MainPID": "0",
+      "Result": "success",
+      "SubState": "dead"
+    },
+    "name": "devtools-functional-81338f23.service"
+  }
+}

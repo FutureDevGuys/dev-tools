@@ -1,0 +1,188 @@
+{
+  "A_rebuilt": false,
+  "all_recorded_direct_clients_reaped_exit0": true,
+  "artifacts": {
+    "dev-auth": {
+      "a": {
+        "bytes": 29387016,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/dev-auth",
+        "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+      },
+      "b": {
+        "bytes": 29387016,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-b/dev-auth",
+        "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+      },
+      "every_byte_equal": true
+    },
+    "dev-cache": {
+      "a": {
+        "bytes": 4325824,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/dev-cache",
+        "sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758"
+      },
+      "b": {
+        "bytes": 4325824,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-b/dev-cache",
+        "sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758"
+      },
+      "every_byte_equal": true
+    },
+    "libdev_auth_sudo.so": {
+      "a": {
+        "bytes": 662376,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/libdev_auth_sudo.so",
+        "sha256": "24c7fa052de58efdfd8624ea4722c2a3921bbaea0e5bcff7effc3cbad306727b"
+      },
+      "b": {
+        "bytes": 662376,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-b/libdev_auth_sudo.so",
+        "sha256": "24c7fa052de58efdfd8624ea4722c2a3921bbaea0e5bcff7effc3cbad306727b"
+      },
+      "every_byte_equal": true
+    },
+    "sync-configs": {
+      "a": {
+        "bytes": 7391696,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/sync-configs",
+        "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+      },
+      "b": {
+        "bytes": 7391696,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-b/sync-configs",
+        "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+      },
+      "every_byte_equal": true
+    },
+    "update-all": {
+      "a": {
+        "bytes": 16856552,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/update-all",
+        "sha256": "71ff6a04a5c0ebc4c8e6fd73d539c06744441d76c148b6c7662bf74f9e56d4ab"
+      },
+      "b": {
+        "bytes": 16856552,
+        "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-b/update-all",
+        "sha256": "71ff6a04a5c0ebc4c8e6fd73d539c06744441d76c148b6c7662bf74f9e56d4ab"
+      },
+      "every_byte_equal": true
+    }
+  },
+  "byte_for_byte_equal": true,
+  "direct_client_count": 7,
+  "evidence_sha256": {
+    "ACTUAL-OWNED-LAUNCH-CLIENTS.json": "cfad09fb5fa51420217f881911187e58b5f9a369e9527e25e5db4b68adf2c8cd",
+    "ACTUAL-REPRODUCTION-RESULT.json": "781d813e6937241034a06fde6829d9015e89855c209c4b16f204def094538342",
+    "STAGE-RESULTS.json": "8f80cfe1e940d5575a5ffb8a198bf08d27fb381e127a54cd0eda6ed915a66c44",
+    "owner-user-phase-a-resource-status.json": "aecca805d53ec684c726337f1c78495f150e9ae15706d5aef284a0c7ba1aefc8"
+  },
+  "exec_client_exit": 0,
+  "exec_client_reaped": true,
+  "exec_session": 62226,
+  "execution_and_settlement_deadlines_met": true,
+  "fresh_settlement_elapsed_seconds": 850.3254802310257,
+  "independent_B_only": true,
+  "installed_UpdateAll014_and_rollback013_unchanged": true,
+  "known_pid_observations": [
+    {
+      "original_start_ticks": 26523999,
+      "pid": 3031543,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26525819,
+      "pid": 3032452,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26602445,
+      "pid": 3049843,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26602557,
+      "pid": 3049852,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26602619,
+      "pid": 3049863,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26602682,
+      "pid": 3049873,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26603069,
+      "pid": 3049933,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": 26522856,
+      "pid": 3031171,
+      "state": "PATH_ABSENT"
+    },
+    {
+      "original_start_ticks": null,
+      "pid": 3031525,
+      "state": "PATH_ABSENT"
+    }
+  ],
+  "native_raw_set_compare": {
+    "bytes": 58623464,
+    "files": 5,
+    "identical": true,
+    "schema": "release-admin-set-compare-v1"
+  },
+  "no_auth_install_publish_push_or_shared_terminal": true,
+  "original_clock": {
+    "authentication": false,
+    "execution_deadline_monotonic": 267028.617218823,
+    "execution_seconds": 1800,
+    "final_deadline_monotonic": 267088.617218823,
+    "owner": "DevTools",
+    "scope": "independent-release-reproduction-B-and-exact-comparison",
+    "settlement_seconds": 60,
+    "source": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+    "started_monotonic": 265228.617218823,
+    "started_utc": "2026-10-18T03:18:39.135987+00:00",
+    "state": "running",
+    "tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f"
+  },
+  "recorded_utc": "2026-10-18T03:32:49.461472+00:00",
+  "remaining_owned_original_identities": [],
+  "resource_disposition": "consumed; returned only to parent; no successor allocated",
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_readbacks": [
+    {
+      "head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+      "root": "${QUALIFIED_SOURCE_ROOT}",
+      "signature": "G",
+      "status": "",
+      "tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f"
+    },
+    {
+      "head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+      "root": "${REPRODUCTION_EVIDENCE_ROOT}/source",
+      "signature": "G",
+      "status": "",
+      "tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f"
+    }
+  ],
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "PASS_FULLY_SETTLED_RETURNED_ONLY_TO_PARENT",
+  "unit": {
+    "exact_cgroup_absent": true,
+    "fields": {
+      "ActiveState": "inactive",
+      "ControlGroup": "",
+      "LoadState": "not-found",
+      "MainPID": "0",
+      "Result": "success",
+      "SubState": "dead"
+    },
+    "unit": "devtools-reproduction-81338f23.service"
+  }
+}

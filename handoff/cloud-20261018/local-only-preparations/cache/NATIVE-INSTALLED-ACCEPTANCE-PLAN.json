@@ -1,0 +1,459 @@
+{
+  "allocation": {
+    "all_admission_preparation_fixture_creation_native_operations_and_optional_managed_steps_share_this_one_clock": true,
+    "allocated": false,
+    "automatic_retries": 0,
+    "clock_started": false,
+    "execution_seconds": 600,
+    "first_failure_stops": true,
+    "guards": "Retain existing coordinator resource, PSI, one-CPU/job, native identity and shared compiler-lock requirements. These are not new or relaxed thresholds. No source/candidate construction is part of acceptance.",
+    "requires_parent_compiler_allocation_for_real_cc": true,
+    "separate_from_release_construction_1800_seconds": true,
+    "settlement_seconds": 60
+  },
+  "configuration": {
+    "content_template": "version = 2\nenabled = true\nroot = \"${ROOT}\"\n\n[cargo]\nenabled = false\nfinal_outputs = false\n\n[sccache]\nenabled = false\n\n[adapters]\ngo = false\nnpm = false\npnpm = false\nuv = false\npip = false\nccache = true\nzig = false\nmeson = false\nbun = false\nyarn = false\ntemp = true\n\n[gc]\nmin_free_bytes = 0\ntarget_free_bytes = 0\nstale_after_days = 120\npressure_min_age_hours = 24\norphan_grace_days = 7\ntemp_grace_hours = 24\n\n[artifacts]\nenabled = false\nstale_after_days = 120\n\n[maintenance]\nautomatic = true\ninterval_hours = 1\n",
+    "format": "TOML",
+    "maintenance_intent": "No free-space or size pressure on this tiny root; pre-workload pressure-only automatic GC should skip. First post-workload automatic GC is due because no previous success exists; require the existing success metadata to establish actual automatic maintenance, not merely explicit gc availability. Later rounds may be throttled by interval_hours=1.",
+    "path": "${CONFIG}",
+    "source": "crates/dev-cache/src/config.rs Config/AdapterConfig/GcConfig/MaintenanceConfig and serde(default, deny_unknown_fields)",
+    "write_timing": "Only after later allocated config init-root creates the product-owned root/config, replace the task-owned generated config with this documented schema then config check; no host config changes. max_bytes, cargo.real_path and sccache.cache_size are omitted Option fields, not invented null TOML values."
+  },
+  "environment": {
+    "controlled_allowlist_only": true,
+    "omit_ambient": [
+      "DEV_CACHE_ROOT",
+      "DEV_CACHE_MODE",
+      "DEV_CACHE_REAL_CARGO",
+      "TMPDIR",
+      "TEMP",
+      "TMP",
+      "CCACHE_DIR",
+      "CCACHE_TEMPDIR",
+      "CCACHE_DISABLE",
+      "CCACHE_CONFIGPATH",
+      "CCACHE_PREFIX",
+      "CCACHE_COMPILER",
+      "RUSTC_WRAPPER",
+      "RUSTC_WORKSPACE_WRAPPER"
+    ],
+    "pre_activation_PATH": "${NATIVE_PATH}",
+    "reason": "Unmanaged inherited native cache overrides are intentionally respected by the product and would invalidate this routed-lease case. Do not read user configuration to find them; create the explicit case environment. No policy/credential values are copied.",
+    "values": {
+      "DEV_CACHE_CONFIG": "${CONFIG}",
+      "HOME": "${HOME}",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PATH": "${INTERCEPTS}:${NATIVE_PATH}",
+      "XDG_CACHE_HOME": "${XDG_CACHE_HOME}",
+      "XDG_CONFIG_HOME": "${XDG_CONFIG_HOME}",
+      "XDG_DATA_HOME": "${XDG_DATA_HOME}",
+      "XDG_RUNTIME_DIR": "${XDG_RUNTIME_DIR}",
+      "XDG_STATE_HOME": "${XDG_STATE_HOME}"
+    }
+  },
+  "gc_observations": {
+    "after_each_outer_reaped": {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "gc",
+        "--apply"
+      ],
+      "expected_exit": 0,
+      "require": "applied=true, complete=true, failures=[], no active task lease records, stable root-lock inode, public output payload retained by the normal120-day policy. This demonstrates normal exclusive maintenance became available."
+    },
+    "automatic_followthrough": "Require the existing control/last-automatic-gc.json first success after success-outer: complete=true/last_success_unix present/pressure=false. Derive exact platform control location from product observation/source layout. Record marker absence before first outer and success afterward; merely returning outer exit0 is insufficient because automatic-GC errors are best effort.",
+    "during_each_gate": [
+      {
+        "argv": [
+          "${INSTALLED}",
+          "--config",
+          "${CONFIG}",
+          "--json",
+          "gc",
+          "--apply"
+        ],
+        "expected_exit": 12,
+        "require": "Prompt coordinated busy failure before mutation, not command timeout. Product currently maps busy errors to12; do not substitute standard generic3.",
+        "stdout": "No successful JSON document required for the error path; current main_entry reports busy on stderr."
+      },
+      {
+        "argv": [
+          "${INSTALLED}",
+          "--config",
+          "${CONFIG}",
+          "--json",
+          "gc"
+        ],
+        "expected_exit": 0,
+        "require": "applied=false; complete=true on this small clean root; failures=[]; abstentions contain active-resource reason for the routed temp sentinel. Preserve exact sentinel hash/payload and stable control/root.lock device+inode. Preview may report hypothetical actions elsewhere; it must not apply them."
+      }
+    ],
+    "optional_decisive_preview_eligibility": {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "gc",
+        "--stale-after-days",
+        "0"
+      ],
+      "use": "Source-grounded stronger active-resource preview only, if needed to make the sentinel an eligible candidate absent its lease. It is never used for applied maintenance and never changes config. Existing active-resource abstention is checked before selection; do not infer broader cleanup authority."
+    },
+    "timing": "Proposed per busy/preview observation budget10s, both real native compiler/linker invocations max60s each, all still bounded by the one600s execution clock. A miss is failure/stop, never proof of safety."
+  },
+  "known_limits": [
+    "No native acceptance has run and no source/installation support is newly qualified by this JSON.",
+    "No escaped/background-descendant, abrupt-parent-death, preexisting exclusive holder or mixed-old-binary lifetime guarantee.",
+    "No Windows/WSL/macOS qualification, cold-cache performance claim or broad workload coverage.",
+    "No native root/kernel metadata I/O duration guarantee; full activity cleanup must be observed, not inferred solely from direct-client reap.",
+    "Task toolchain/runner/runtime binding and gate/capture implementation remain pending; this is not turnkey."
+  ],
+  "operations": [
+    {
+      "argv": [
+        "${CANDIDATE}",
+        "build-info",
+        "--json"
+      ],
+      "cwd": "${WORK}",
+      "id": "identity",
+      "require": "Exact schema dev-tools-build-info-v1/product dev-cache/version 0.1.13/source commit above/source_state clean/profile release/native target from qualified release; validate artifact custody/hash against the authenticated manifest before invocation."
+    },
+    {
+      "argv": [
+        "${CANDIDATE}",
+        "install",
+        "--bin-dir",
+        "${BIN_DIR}",
+        "--activate",
+        "--intercept-dir",
+        "${INTERCEPTS}",
+        "--json"
+      ],
+      "cwd": "${WORK}",
+      "id": "standalone-own-install",
+      "require": "Fresh private bin/intercept destinations only. Real cc and ccache must already be discoverable on NATIVE_PATH at activation; inspect ownership output. This does not overwrite the host UpdateAll-managed alias."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "activate",
+        "--bin-dir",
+        "${BIN_DIR}",
+        "--intercept-dir",
+        "${INTERCEPTS}",
+        "--json"
+      ],
+      "cwd": "${WORK}",
+      "id": "idempotent-activate",
+      "require": "activated=false on repeat; installed cc and ccache intercepts resolve to this candidate with no recursion."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "config",
+        "init-root",
+        "${ROOT}"
+      ],
+      "cwd": "${WORK}",
+      "id": "init-task-root",
+      "require": "Fresh unmarked empty ROOT only; no --force-config. This command is dispatched before effective Config::load, so an absent explicit CONFIG is supported here."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "config",
+        "check"
+      ],
+      "cwd": "${WORK}",
+      "id": "check-task-config",
+      "require": "valid=true after writing only the task TOML template."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "status"
+      ],
+      "cwd": "${WORK}",
+      "id": "status",
+      "require": "enabled/root_valid true, configured_root ROOT, intercept directory INTERCEPTS, worktree equals outside-checkout WORK, ccache/temp route actually active. Do not require unrelated disabled adapters/tools to be healthy."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "path",
+        "temp",
+        "--repo",
+        "${WORK}"
+      ],
+      "cwd": "${WORK}",
+      "id": "temp-path",
+      "require": "Returned path TMP_RESOURCE lies within this task-owned root; select it from JSON rather than guessing platform/runtime layout."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "exec",
+        "temp",
+        "--",
+        "${PYTHON}",
+        "-u",
+        "${OUTER_SCRIPT}",
+        "success"
+      ],
+      "cwd": "${WORK}",
+      "id": "success-outer",
+      "require": "Future task-only script implements the foreground gate protocol below. DevCache itself invokes no interpreter: Python is the explicitly user-owned child workload only."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "exec",
+        "temp",
+        "--",
+        "${PYTHON}",
+        "-u",
+        "${OUTER_SCRIPT}",
+        "failure"
+      ],
+      "cwd": "${WORK}",
+      "id": "failure-outer",
+      "require": "One intentional invalid-C compiler failure, not a retry of success. The script and outer DevCache return exactly that native compiler exit status; no fake tool replacement."
+    },
+    {
+      "argv": [
+        "${INSTALLED}",
+        "--config",
+        "${CONFIG}",
+        "--json",
+        "status",
+        "--full"
+      ],
+      "cwd": "${WORK}",
+      "id": "post-status",
+      "require": "No task active lease remains after direct children are reaped; runtime-root identity unchanged; resource completion metadata reflects settled foreground work."
+    }
+  ],
+  "optional_existing_updateall_owner_lane": {
+    "clock": "If included, these native operations consume this same separately allocated600s. If not ready or insufficient remaining time, leave UNRUN; no automatic second clock.",
+    "commands": [
+      [
+        "${UPDATE_ALL}",
+        "product",
+        "status",
+        "dev-cache",
+        "--json"
+      ],
+      [
+        "${UPDATE_ALL}",
+        "product",
+        "update",
+        "dev-cache",
+        "--offline",
+        "--root-document",
+        "${RELEASE}/dev-tools-root.json",
+        "--manifest",
+        "${RELEASE}/dev-cache-stable.json",
+        "--artifact",
+        "${CANDIDATE}",
+        "--json"
+      ],
+      [
+        "${UPDATE_ALL}",
+        "product",
+        "rollback",
+        "dev-cache",
+        "--json"
+      ],
+      [
+        "${UPDATE_ALL}",
+        "product",
+        "status",
+        "dev-cache",
+        "--json"
+      ],
+      [
+        "${UPDATE_ALL}",
+        "product",
+        "update",
+        "dev-cache",
+        "--offline",
+        "--root-document",
+        "${RELEASE}/dev-tools-root.json",
+        "--manifest",
+        "${RELEASE}/dev-cache-stable.json",
+        "--artifact",
+        "${CANDIDATE}",
+        "--json"
+      ],
+      [
+        "${UPDATE_ALL}",
+        "product",
+        "status",
+        "dev-cache",
+        "--json"
+      ]
+    ],
+    "conditional": "Only if parent selects the existing UpdateAll-managed host installation and a freshly verified receipt shows previous0.1.12/active0.1.13 as required. It is not necessary to make standalone DevCache install/activate work. Do not run both competing owners on the same alias.",
+    "host_activate_if_selected": [
+      "${HOST_INSTALLED_DEV_CACHE}",
+      "activate",
+      "--bin-dir",
+      "${HOST_BIN_DIR}",
+      "--intercept-dir",
+      "${HOST_INTERCEPT_DIR}",
+      "--json"
+    ],
+    "host_operands": "HOST_* are deliberately unbound until normal fresh owner/receipt discovery. Never reuse case HOME/env to mutate the host lane or use task self-install over its managed alias.",
+    "require": "Fresh selected updater identity and normal receipt/journal admission. After update require installed013 with retained012; rollback must restore the receipt-owned012, preserve accepted013 authority and retain013; exact same signed013 offline reapply restores013/previous012. Verify alias/binary hashes/build-info and owned intercept targets after each. No forced receipt rewrite, accepted-generation reset, old-version manifest intake, cleanup of rollback bytes, or network."
+  },
+  "outer_workload_protocol": {
+    "fixed_child_argv": {
+      "direct_failure_baseline": [
+        "${REAL_CC}",
+        "-O0",
+        "-c",
+        "${WORK}/failure.c",
+        "-o",
+        "${WORK}/failure.o"
+      ],
+      "failure_compile": [
+        "${INTERCEPTS}/cc",
+        "-O0",
+        "-c",
+        "${WORK}/failure.c",
+        "-o",
+        "${WORK}/failure.o"
+      ],
+      "success_compile": [
+        "${INTERCEPTS}/cc",
+        "-O0",
+        "-c",
+        "${WORK}/success.c",
+        "-o",
+        "${WORK}/success.o"
+      ],
+      "success_link": [
+        "${INTERCEPTS}/cc",
+        "${WORK}/success.o",
+        "-o",
+        "${WORK}/success-program"
+      ],
+      "success_program": [
+        "${WORK}/success-program"
+      ]
+    },
+    "implementation_state": "UNPREPARED; these are exact fixed future child argv and protocol requirements, not an executable runner or proof of runtime behavior.",
+    "proof_limits": "Tiny cc may finish before a concurrent observation. Before/after gated observations prove outer exclusion spanning the nested launch; nested activity and real route are corroborated by product resource/activity metadata and resulting real executable. This is not a claim that a tiny compiler was observed active at a particular sampling instant.",
+    "public_sources": {
+      "failure.c": "#error dev_cache_013_expected_native_failure\n",
+      "success.c": "#include <stdio.h>\nint main(void) { puts(\"dev-cache-013-native-ok\"); return 0; }\n"
+    },
+    "schedule": [
+      "Start one foreground outer through exec temp. Future outer script creates only one public sentinel at inherited TMPDIR/acceptance-sentinel and announces READY_BEFORE_NESTED; then blocks on a pipe gate owned by the orchestrator. This proves the outer lease is active before nested setup.",
+      "At READY_BEFORE_NESTED, run the concurrent GC pair below and hash sentinel plus relevant task payload/lock identities before and after each command.",
+      "Release the gate. Success invokes the installed cc intercept for real compile and separate real link, drains/reaps each, runs the new program, requires exactly dev-cache-013-native-ok\\n and exit0. Failure invokes the real invalid-C compilation once, records the real nonzero code/diagnostics, drains/reaps it, and later exits with that same code.",
+      "After nested command settlement, outer announces READY_AFTER_NESTED and remains foreground/active behind the second pipe gate. Run the GC pair again before permitting outer exit. No sleeps are evidence of active lifetime.",
+      "Release second gate, outer emits fixed success/failure completion metadata and returns preserved native status; reap outer and its owned child chain. Check automatic maintenance metadata after success, then explicit post-settlement GC.",
+      "For failure, compare exact public compiler stdout/stderr and status to one direct REAL_CC baseline with same source/output operands and LC_ALL=C. Expected compiler error is successful observation only if identities/status/output match; any unexpected mismatch stops. Do not classify arbitrary nonzero as the intended failure."
+    ],
+    "stdio": "Task protocol/status and pure public compiler diagnostics may be bounded and retained. Never pipe/capture native auth streams. Build bounded output/drain and owned-child settlement into the later small task script before execution. No background children or detached jobs."
+  },
+  "product": "dev-cache",
+  "purpose": "Native installed acceptance of full active-workload shared root lease across nested real compiler/linker setup; not a test suite or performance campaign.",
+  "readiness": {
+    "C_files_created": false,
+    "candidate_existence_or_authenticity_probed": false,
+    "case_directories_created": false,
+    "native_tool_paths_probed": false,
+    "new_release_or_install_claimed": false,
+    "outer_workload_prepared": false,
+    "remaining_before_execution": [
+      "Parent allocate distinct 600+60 native acceptance scope and reconcile shared compiler owner.",
+      "Require actual exact-source signed candidate A/B qualification and release verification; PREPARATION.json candidate path is only a future selector.",
+      "Bind existing real native cc/ccache/linker and task Python identities, ensure they are native upstream rather than existing intercepts, and verify no ambient cache override causes abstention.",
+      "Prepare only this small task-local foreground orchestrator/outer script, gate protocol and public C inputs; none is written by this plan.",
+      "Require a fresh private canonical outside-checkout case root with current UID, no existing case results, no foreign cache/installation state."
+    ],
+    "runner_prepared": false
+  },
+  "settlement_and_evidence": {
+    "deadline": "600 is the requested execution bound,60 settlement allowance; kernel-blocked I/O and uncertain external ownership can exceed this. Then keep logical ownership and explicitly report unsettled/unknown; never claim a hard kernel bound or free-lock release.",
+    "failure": "Stop launching subsequent steps at first unexpected outcome or deadline. Preserve partial files/results and any product-owned journals. Close task-owned gates and settle only known owned foreground clients/children under existing controller rules; do not kill an uncertain install/auth owner. No broad PGID/cgroup/foreign process signals or lock-file deletion.",
+    "keep": [
+      "Exact source/build identity and authenticated input hashes",
+      "Native argv/executable identities/custody selected for this public case",
+      "Per-step elapsed/status and bounded public diagnostics",
+      "Gates, sentinel/payload hashes, activity/resource evidence, root lock device+inode before/after",
+      "GC structured reports and fixed busy outcome",
+      "Automatic maintenance success record and final installed/rollback receipt state if selected"
+    ],
+    "standalone_claim": "Product binaries and native compiler prerequisites operate outside a checkout with no private consumer/code/config, interpreter hook or sibling product requirement. The optional Python task orchestrator and optional UpdateAll management are acceptance tools, not mandatory DevCache runtime dependencies."
+  },
+  "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_references": [
+    "docs/product-standard.md standalone/product-owned prerequisites/native support and bounded direct process contracts",
+    "docs/adr/0127-active-workload-root-coordination.md decision, consequences, native acceptance",
+    "docs/dev-cache-compiler-performance.md signed Linux native C/C++/Autoconf and managed rollback precedent",
+    "crates/dev-cache/src/cli.rs:36-46 global flags;66-173 install/activate/status/exec/config grammar;175-192 GC flags;265-291 busy exit12;322-426 early install/init dispatch;553-588 init-root;1338-1416 exec lifetime;1593-1739 cc routing/lifetime;2638-2709 automatic GC",
+    "crates/dev-cache/src/config.rs:8-80 TOML schema;90-173 defaults;214-227 validation",
+    "crates/dev-cache/src/adapter.rs Temp and Ccache environment mapping",
+    "crates/dev-cache/src/install.rs:371-423 ownership-checked install;428-486 activate;552-577 only native-available aliases",
+    "crates/dev-cache/src/lease.rs RootLease shared/into_active/exclusive/ActiveLease Drop and stable lock file",
+    "crates/dev-cache/src/gc.rs:67-85 report;440-453 active resource abstention",
+    "crates/update-all/src/cli.rs:1683-1753 exact optional product update/rollback/offline grammar"
+  ],
+  "source_root": "${QUALIFIED_SOURCE_ROOT}",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "REBOUND_SOURCE_PREPARING_AWAITING_REAL_SIGNATURE_QUALIFICATION",
+  "substitution": "Every ${NAME} is one argv element/path value or an explicitly described PATH list substitution, never shell evaluation. ROOT substitution into TOML requires normal TOML string escaping. RUNTIME_BIND_REQUIRED operands are unbound and must be resolved during later authorized preparation/admission.",
+  "this_preparation": {
+    "no_workload_fixture_clock_build_auth_runtime_network_or_resource_probe": true,
+    "only_written_file": "${RELEASE_EVIDENCE_ROOT}/cache-native/NATIVE-INSTALLED-ACCEPTANCE-PLAN.json",
+    "release_scripts_and_public_code_unchanged": true
+  },
+  "variables": {
+    "BIN_DIR": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/home/.local/bin",
+    "CANDIDATE": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-cache/dev-cache-0.1.13-linux-x86_64",
+    "CASE": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance",
+    "CONFIG": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/config/dev-cache/config.toml",
+    "HOME": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/home",
+    "INSTALLED": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/home/.local/bin/dev-cache",
+    "INTERCEPTS": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts",
+    "NATIVE_PATH": "RUNTIME_BIND_REQUIRED: approved native tool directories with real cc, ccache and linker; excludes all DevCache/foreign compiler wrappers",
+    "OUTER_SCRIPT": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/outer-workload.py",
+    "PYTHON": "RUNTIME_BIND_REQUIRED: absolute task-runner Python executable, not a DevCache dependency",
+    "REAL_CC": "RUNTIME_BIND_REQUIRED: exact resolved real cc executable selected from NATIVE_PATH",
+    "RELEASE": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-cache",
+    "ROOT": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root",
+    "UPDATE_ALL": "${USER_HOME}/.local/bin/update-all",
+    "WORK": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/work",
+    "XDG_CACHE_HOME": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/cache",
+    "XDG_CONFIG_HOME": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/config",
+    "XDG_DATA_HOME": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data",
+    "XDG_RUNTIME_DIR": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/runtime",
+    "XDG_STATE_HOME": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/state"
+  },
+  "version": "0.1.13"
+}

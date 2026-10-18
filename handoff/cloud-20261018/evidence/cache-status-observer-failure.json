@@ -1,0 +1,115 @@
+{
+  "actual_stages": [
+    [
+      "idempotent-activate",
+      0,
+      true
+    ],
+    [
+      "init-root",
+      0,
+      true
+    ],
+    [
+      "config-check",
+      0,
+      true
+    ],
+    [
+      "status",
+      0,
+      true
+    ]
+  ],
+  "actual_status": {
+    "abstentions": [
+      "cargo: disabled by configuration",
+      "sccache: disabled by configuration",
+      "go: disabled by configuration",
+      "npm: disabled by configuration",
+      "pnpm: disabled by configuration",
+      "uv: disabled by configuration",
+      "pip: disabled by configuration",
+      "zig: disabled by configuration",
+      "meson: disabled by configuration",
+      "bun: disabled by configuration",
+      "yarn: disabled by configuration"
+    ],
+    "adapter_versions": {
+      "ccache": "ccache version 4.14.1"
+    },
+    "configured_root": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root",
+    "domain_id": "699b3a33a3154fa7b15cf193ab8c4a52",
+    "effective_paths": {
+      "ccache": [
+        "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/cache/ccache",
+        "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/workspaces/97/978feb9edb3220c01a8cbb7745f8ddb13706890b7a9345b8e9a2d2bf14b5d2f6/temp/ccache"
+      ],
+      "temp": [
+        "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/workspaces/97/978feb9edb3220c01a8cbb7745f8ddb13706890b7a9345b8e9a2d2bf14b5d2f6/temp/generic"
+      ]
+    },
+    "enabled": true,
+    "intercept_directory": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts",
+    "maintenance": null,
+    "maintenance_scope": "not_observed",
+    "override_reasons": [],
+    "path_entries": [
+      "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts",
+      "/usr/bin",
+      "/bin"
+    ],
+    "physical_root_id": "d2f95cd8e6ea412dbec7ad4cba0404eb",
+    "platform": "linux",
+    "provenance": null,
+    "real_executables": {
+      "ccache": "/usr/bin/ccache"
+    },
+    "root_valid": true,
+    "routed_adapters": [
+      "ccache"
+    ],
+    "routing_complete": true,
+    "worktree": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/work",
+    "worktree_cache": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/workspaces/97/978feb9edb3220c01a8cbb7745f8ddb13706890b7a9345b8e9a2d2bf14b5d2f6"
+  },
+  "all_known_pid_paths_absent": [
+    3157927,
+    3158123,
+    3158211,
+    3158243,
+    3158246,
+    3158358,
+    3158374
+  ],
+  "clock_acquired": 270566.711377859,
+  "deadline_exhausted": false,
+  "earlier_original_install_and_hardlink_failure_unchanged": true,
+  "exact_cgroup_absent": true,
+  "exact_wrong_predicate": "Runner required both ccache and temp labels in routed_adapters. Actual public status lists ccache as tool adapter, with generic temp correctly present in effective_paths.temp, root valid and routing_complete true.",
+  "execution_deadline": 271166.711377859,
+  "native_C_compile_and_lease_GC_journeys": "UNRUN_FIRST_FAILURE",
+  "no_authentication_or_heavy_rebuild": true,
+  "no_peer_messages_or_peer_binding": true,
+  "original_allocation": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-corrected-20261018/NAMED-NATIVE-ACCEPTANCE-ALLOCATION.json",
+    "sha256": "cc06fa7ff126f90f70bb6262e7c9f981a2bf650aa058b8562e376846afd362f1"
+  },
+  "outer_exec90358_reaped_exit75": true,
+  "product_status_or_config_failure": false,
+  "raw_guard_deadline_met_false_is_not_timeout": false,
+  "recorded_utc": "2026-10-18T04:50:53.415071+00:00",
+  "remaining": [],
+  "resource_returned_only_to_parent": true,
+  "settlement_deadline": 271226.711377859,
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "FAILED_SECOND_TASK_OBSERVER_CONTRACT_FULLY_SETTLED_RETURNED_ONLY_PARENT",
+  "user_unit": {
+    "ActiveState": "inactive",
+    "ControlGroup": "",
+    "LoadState": "not-found",
+    "MainPID": "0",
+    "SubState": "dead"
+  }
+}

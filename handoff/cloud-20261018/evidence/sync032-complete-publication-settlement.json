@@ -1,0 +1,38 @@
+{
+  "all_owned_descendants_settled": true,
+  "auth_transcript_retained": false,
+  "foreground_Kitty_PID_absent": true,
+  "foreground_Kitty_exit_not_retained": true,
+  "foreground_exec_session_already_collected": true,
+  "fresh_known_owned_pid_paths_absent": [
+    3289710,
+    3289911,
+    3289958,
+    3289977,
+    3289984
+  ],
+  "native_client_exit": 0,
+  "native_client_reaped": true,
+  "native_unit": {
+    "cgroup_empty": true,
+    "cgroup_removed": true,
+    "fields": {
+      "ActiveState": "inactive",
+      "ControlGroup": "",
+      "LoadState": "not-found",
+      "MainPID": "0",
+      "SubState": "dead"
+    },
+    "unit": "dev-auth-workload-f68a16d08a0ba27e9ceaf731ea9fba49.service"
+  },
+  "no_compiler_resource_reservation": true,
+  "no_rebuild_reinstall_resign": true,
+  "own_prompt_or_uncertain_publication_remaining": false,
+  "public_download_verification_client_exit": 0,
+  "public_download_verification_client_reaped": true,
+  "public_release_proof_original_sha256": "f3e3755197df74c021504141ada4df042df4f573a3531aab8ca2c7a96e3ab439",
+  "recorded_utc": "2026-10-18T06:45:43.807915+00:00",
+  "schema": 1,
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "state": "SYNC032_PUBLICATION_PASS_FULLY_SETTLED_PAUSED_FOR_GIT_TRANSFER"
+}

@@ -1,0 +1,259 @@
+{
+  "actual_expected_self_install_layout": [
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/home/.local/bin/dev-cache",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/c++",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/cargo",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/cc",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/ccache",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/clang",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/clang++",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/g++",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/gcc",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/go",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/meson",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/npm",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/npx",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/pip",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/pip3",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/pnpm",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/pnpx",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/python",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/python3",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/python3.14",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/rustup",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/sccache",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/uv",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/uvx",
+      "uid": 1000
+    },
+    {
+      "device": 64772,
+      "inode": 22043647,
+      "mode": "0o755",
+      "nlink": 25,
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts/zig",
+      "uid": 1000
+    }
+  ],
+  "actual_installed_digest": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758",
+  "actual_product_stages": [
+    [
+      "fresh-release-verify",
+      0,
+      true
+    ],
+    [
+      "candidate-build-info",
+      0,
+      true
+    ],
+    [
+      "own-install",
+      0,
+      true
+    ]
+  ],
+  "all_five_known_pid_paths_absent": [
+    3136266,
+    3136481,
+    3136488,
+    3136493,
+    3136497
+  ],
+  "deadline_was_not_exhausted": true,
+  "exact_cgroup_absent": true,
+  "exact_user_unit": {
+    "ActiveState": "inactive",
+    "ControlGroup": "",
+    "LoadState": "not-found",
+    "MainPID": "0",
+    "SubState": "dead"
+  },
+  "guard_raw_deadline_met_false_is_not_timeout_evidence": false,
+  "guard_result": "constructor_failed",
+  "host_installation_UpdateAll_rollback_and_signed_bundles_unchanged": true,
+  "no_authentication_or_heavy_Rust_build": true,
+  "no_successor_selected_or_new_clock": true,
+  "original_clock": {
+    "acquired": 269638.45923969,
+    "execution_deadline": 270238.45923969,
+    "settlement_deadline": 270298.45923969
+  },
+  "original_payload_failure": "installed_file_custody_changed",
+  "outer_exec59465_exit": 75,
+  "outer_exec_reaped": true,
+  "real_C_compile_link_active_lease_and_GC_journeys": "UNRUN_FIRST_FAILURE",
+  "recorded_utc": "2026-10-18T04:33:58.146855+00:00",
+  "remaining": [],
+  "resource_returned_only_to_parent": true,
+  "source_grounding": "crates/dev-cache/src/install.rs activate_alias uses fs::hard_link(installed,target), with copy fallback; normal activation creates24 fixed intercept names. Runner incorrectly demanded nlink1 for the already activated executable.",
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "FAILED_TASK_OBSERVER_AFTER_SUCCESSFUL_OWN_INSTALL_FULLY_SETTLED"
+}

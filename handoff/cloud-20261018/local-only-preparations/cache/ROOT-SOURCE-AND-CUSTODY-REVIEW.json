@@ -1,0 +1,64 @@
+{
+  "actual_native_journey_methods_AST_unchanged": [
+    "outer",
+    "observe_gate",
+    "snapshot",
+    "assert_idle",
+    "execute",
+    "check",
+    "cleanup"
+  ],
+  "all_five_root_owned_native_tools_exact": true,
+  "all_four_task_programs_AST_parsed_without_execution": true,
+  "guard_byte_equivalence_after_only_path_unit_binding_literals": true,
+  "installed_alias_bytes_sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758",
+  "installed_alias_group_sizes": [
+    25
+  ],
+  "no_suite_lint_compilation_auth_or_shared_metadata_write": true,
+  "no_unresolved_added_static_finding": true,
+  "outer_byte_equivalence_after_only_new_cancel_marker": true,
+  "prepare_product_commands": [
+    "status-admission-recheck (read-only)"
+  ],
+  "recorded_utc": "2026-10-18T04:59:50.886213+00:00",
+  "reviewer": "same task root; no independent-agent or runtime acceptance claim",
+  "runtime_journeys": "UNRUN; new parent allocation and fresh guard admission still required",
+  "seven_original_passed_commands_inherited_without_replay": true,
+  "source_contracts": {
+    "active_coordination": "lease.rs keeps shared root lease with activity until outer termination; applied GC cannot obtain exclusive lock and main entry maps busy to12; read-only preview recognizes exact active-resource abstention.",
+    "automatic_followthrough": "cli.rs exec finishes resource records and drops activity before maybe_automatic_gc(false); collect_if_idle cannot collect while nested/outer activity remains; complete marker names match existing source.",
+    "normal_maintenance": "gc.rs report applied/complete/failures and configured120-day resource/24h temp ages preserve newly written sentinels.",
+    "resource_catalog": "resources.rs ResourceKind kebab-case ccache-local/ccache-temp and integer last_completed_unix match nested observations.",
+    "status": "cli.rs enabled_adapter_names excludes generic Temp, while status_adapter_details includes Temp effective paths; require complete routing plus exact ccache and generic temp paths."
+  },
+  "source_files": [
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/cli.rs",
+      "sha256": "6f5ead4a85b9c1952cab53a36cf1af6b8f97285f4b10b6440081ee711b6c6edd"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/install.rs",
+      "sha256": "9e38405eb602f38e98b687673cd388e0ef1e63b80fe2a86031e4a433b1d228e9"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/lease.rs",
+      "sha256": "171462c849c460d8d0f9b9e89bfe48a0e0128f8761cd4a8f6d491b65d28bb2cd"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/gc.rs",
+      "sha256": "a3be19a67af76df34e796e52671e85bd5a7814dd58e420d00ba411f6f3926b69"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/resources.rs",
+      "sha256": "128f7aad5df4afa4ca1b250cc001e6944dfde3ead46410bb62a7c39f54e8694a"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/root.rs",
+      "sha256": "f5e5703ee787ccaac4fbdd40162872fcbc79ede9bb2151ae31449d9c3c6ec3ec"
+    }
+  ],
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "ROOT_COMPLETE_SOURCE_AND_CUSTODY_READBACK_NO_ADDED_STATIC_BLOCKER"
+}

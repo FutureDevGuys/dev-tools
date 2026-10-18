@@ -1,0 +1,36 @@
+{
+  "UpdateAll014_and_rollback013_unchanged": true,
+  "actual_installation_and_idempotence_proof": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/sync032-live-offline-install/ACTUAL-LIVE-INSTALLED-ACCEPTANCE.json",
+    "sha256": "cb4da72b5b2f6a2559ab98c69657d0628e8bc9ab126f71fcdb24e6f0452aea90"
+  },
+  "all_six_direct_clients_reaped": true,
+  "compiler_network_authentication": false,
+  "installed_executable": "${USER_HOME}/.local/state/dev-tools/products/sync-configs/versions/0.3.2/sync-configs",
+  "installed_identity": {
+    "gid": 984,
+    "length": 7391696,
+    "mode": "0o755",
+    "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65",
+    "uid": 1000
+  },
+  "known_pid_paths": [
+    3126741,
+    3126743,
+    3126794,
+    3126796,
+    3126797,
+    3126812
+  ],
+  "manifest_generation": 18,
+  "no_private_consumer_code_or_hooks_accessed": true,
+  "pinned_historical021_unchanged": true,
+  "public_publication": "INCOMPLETE_NATIVE_HANDOFF_TIMED_OUT_BEFORE_RECORDED_RELEASE_STAGE",
+  "recorded_utc": "2026-10-18T04:25:14.618110+00:00",
+  "remaining_pid_paths": [],
+  "retained_pin_documents_unchanged": true,
+  "retained_rollback": "0.3.1",
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "state": "PASS_FULLY_SETTLED",
+  "version": "0.3.2"
+}

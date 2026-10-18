@@ -1,0 +1,30 @@
+{
+  "no_installed_write_or_activation": true,
+  "products": {
+    "dev-cache": {
+      "artifact": "${LOCAL_WORK_ROOT}/dev-cache-0.1.12-delivery/dev-cache-authenticated-105f02e2/candidate-a/releases/dev-cache/dev-cache-0.1.12-linux-x86_64",
+      "artifact_sha256": "e5089c52e1a2ddbe8250a786aff78342e0e8bc2aa54b71cfb245fdbd56e16731",
+      "exit": 0,
+      "generation": 13,
+      "proof": "${RELEASE_EVIDENCE_ROOT}/baseline-verification/dev-cache.json",
+      "proof_sha256": "6a385fa9a1162f877fc2cfa4a094c05fb89cf145ecfd34269cf6fed448714ccb",
+      "reaped": true,
+      "root": "${LOCAL_WORK_ROOT}/dev-cache-0.1.12-delivery/dev-cache-authenticated-105f02e2/candidate-a/releases/dev-cache",
+      "source": "105f02e274646adbebfadc3971654c765bb222b0",
+      "version": "0.1.12"
+    },
+    "sync-configs": {
+      "artifact": "${LOCAL_WORK_ROOT}/sync-configs-0.3.1-delivery/sync-configs-authenticated-687cd79c/candidate-a/releases/sync-configs/sync-configs-0.3.1-linux-x86_64",
+      "artifact_sha256": "79a7d01980931caa2307fe3f6f76b0750ba6ff17c212415a2882aca94afb34a5",
+      "exit": 0,
+      "generation": 17,
+      "proof": "${RELEASE_EVIDENCE_ROOT}/baseline-verification/sync-configs.json",
+      "proof_sha256": "61d27a822d285fa7b0a6023bf52664b2545cb47988ed89bcf535a4002fcdc8c4",
+      "reaped": true,
+      "root": "${LOCAL_WORK_ROOT}/sync-configs-0.3.1-delivery/sync-configs-authenticated-687cd79c/candidate-a/releases/sync-configs",
+      "source": "687cd79cdacef79bdec73262e4fb172ac61570c0",
+      "version": "0.3.1"
+    }
+  },
+  "recorded_utc": "2026-10-18T03:28:53.791991+00:00"
+}

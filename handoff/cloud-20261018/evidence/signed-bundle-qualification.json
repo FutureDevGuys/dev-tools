@@ -1,0 +1,271 @@
+{
+  "A_B_byte_equal": true,
+  "Kitty_client_exit": 0,
+  "Kitty_client_reaped": true,
+  "Kitty_exec_session": 84705,
+  "Kitty_scope_absent": true,
+  "actual_inner_entry_and_13_stages_prove_execution_despite_legacy_started_null": true,
+  "all_signing_clients_reaped": true,
+  "all_signing_units_settled": true,
+  "heavy_compilation_slot_retained": false,
+  "known_owned_PID_paths_freshly_absent": [
+    3079589,
+    3079621,
+    3079911,
+    3079912,
+    3080012,
+    3080020,
+    3080042,
+    3080100,
+    3080125,
+    3080153,
+    3080184,
+    3080211,
+    3080272,
+    3080280,
+    3080323,
+    3080333,
+    3080341,
+    3080349,
+    3080356
+  ],
+  "native_result": {
+    "exit_code": 0,
+    "operation": "workload_launch",
+    "outcome": "exited",
+    "product": "dev-auth",
+    "schema": "dev-auth-execution-result-v1",
+    "started": null
+  },
+  "native_unit": {
+    "cgroup_absent": true,
+    "fields": {
+      "ActiveState": "inactive",
+      "ControlGroup": "",
+      "LoadState": "not-found",
+      "MainPID": "0",
+      "SubState": "dead"
+    },
+    "unit": "dev-auth-workload-eacadd6f77f9fa819e6af0bd978ae653.service"
+  },
+  "no_auth_transcript_or_credential_material_retained": true,
+  "only_one_authorized_retry_run": true,
+  "original_unknown_cause_timeout_unchanged": true,
+  "product_installed_acceptance_or_publication_claimed": false,
+  "public_crypto_readback_clients": [
+    {
+      "elapsed": 0.07244850095594302,
+      "exit": 0,
+      "label": "signed-set-compare",
+      "reaped": true
+    },
+    {
+      "elapsed": 0.03301623201696202,
+      "exit": 0,
+      "label": "verify_candidate-a_dev-auth",
+      "reaped": true
+    },
+    {
+      "elapsed": 0.004785202967468649,
+      "exit": 0,
+      "label": "verify_candidate-a_dev-cache",
+      "reaped": true
+    },
+    {
+      "elapsed": 0.006883929017931223,
+      "exit": 0,
+      "label": "verify_candidate-a_sync-configs",
+      "reaped": true
+    },
+    {
+      "elapsed": 0.032352784008253366,
+      "exit": 0,
+      "label": "verify_candidate-b_dev-auth",
+      "reaped": true
+    },
+    {
+      "elapsed": 0.007113022962585092,
+      "exit": 0,
+      "label": "verify_candidate-b_dev-cache",
+      "reaped": true
+    },
+    {
+      "elapsed": 0.009795368008781224,
+      "exit": 0,
+      "label": "verify_candidate-b_sync-configs",
+      "reaped": true
+    }
+  ],
+  "recorded_utc": "2026-10-18T03:56:11.526971+00:00",
+  "signed_bundles": {
+    "candidate-a": {
+      "dev-auth": {
+        "dev-auth-0.5.3-linux-x86_64": {
+          "bytes": 29387016,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-0.5.3-linux-x86_64",
+          "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+        },
+        "dev-auth-stable.json": {
+          "bytes": 575,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-stable.json",
+          "sha256": "5c26aef2154519537c163143e5c6e1b77b05de89e6125d6cc37fd23d15f6831c"
+        },
+        "dev-tools-root.json": {
+          "bytes": 361,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-tools-root.json",
+          "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+        }
+      },
+      "dev-cache": {
+        "dev-cache-0.1.13-linux-x86_64": {
+          "bytes": 4325824,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-cache/dev-cache-0.1.13-linux-x86_64",
+          "sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758"
+        },
+        "dev-cache-stable.json": {
+          "bytes": 580,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-cache/dev-cache-stable.json",
+          "sha256": "25e38c20b72138a0c923d9a33cdb9ec19ebb765553b6533339f1d9c0e8a251e5"
+        },
+        "dev-tools-root.json": {
+          "bytes": 361,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-cache/dev-tools-root.json",
+          "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+        }
+      },
+      "sync-configs": {
+        "dev-tools-root.json": {
+          "bytes": 361,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/sync-configs/dev-tools-root.json",
+          "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+        },
+        "sync-configs-0.3.2-linux-x86_64": {
+          "bytes": 7391696,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/sync-configs/sync-configs-0.3.2-linux-x86_64",
+          "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+        },
+        "sync-configs-stable.json": {
+          "bytes": 586,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/sync-configs/sync-configs-stable.json",
+          "sha256": "e937e9b9d2f289759dd8dc65f2844d0c6d4d2d442a28e0f608124b5fd77accef"
+        }
+      }
+    },
+    "candidate-b": {
+      "dev-auth": {
+        "dev-auth-0.5.3-linux-x86_64": {
+          "bytes": 29387016,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/dev-auth/dev-auth-0.5.3-linux-x86_64",
+          "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+        },
+        "dev-auth-stable.json": {
+          "bytes": 575,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/dev-auth/dev-auth-stable.json",
+          "sha256": "5c26aef2154519537c163143e5c6e1b77b05de89e6125d6cc37fd23d15f6831c"
+        },
+        "dev-tools-root.json": {
+          "bytes": 361,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/dev-auth/dev-tools-root.json",
+          "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+        }
+      },
+      "dev-cache": {
+        "dev-cache-0.1.13-linux-x86_64": {
+          "bytes": 4325824,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/dev-cache/dev-cache-0.1.13-linux-x86_64",
+          "sha256": "45aa2b5c6a17c197c4897225cf3b22ad61af597de930b81d1c9be0ec3cfbe758"
+        },
+        "dev-cache-stable.json": {
+          "bytes": 580,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/dev-cache/dev-cache-stable.json",
+          "sha256": "25e38c20b72138a0c923d9a33cdb9ec19ebb765553b6533339f1d9c0e8a251e5"
+        },
+        "dev-tools-root.json": {
+          "bytes": 361,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/dev-cache/dev-tools-root.json",
+          "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+        }
+      },
+      "sync-configs": {
+        "dev-tools-root.json": {
+          "bytes": 361,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/sync-configs/dev-tools-root.json",
+          "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+        },
+        "sync-configs-0.3.2-linux-x86_64": {
+          "bytes": 7391696,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/sync-configs/sync-configs-0.3.2-linux-x86_64",
+          "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+        },
+        "sync-configs-stable.json": {
+          "bytes": 586,
+          "path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-b/releases/sync-configs/sync-configs-stable.json",
+          "sha256": "e937e9b9d2f289759dd8dc65f2844d0c6d4d2d442a28e0f608124b5fd77accef"
+        }
+      }
+    }
+  },
+  "signed_set_compare": {
+    "bytes": 41107360,
+    "files": 9,
+    "identical": true,
+    "schema": "release-admin-set-compare-v1"
+  },
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "SIGNED_BOTH_VERIFIED_FULLY_SETTLED",
+  "verifications": {
+    "candidate-a": {
+      "dev-auth": {
+        "product": "dev-auth",
+        "schema": "release-admin-set-verify-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "targets": 1,
+        "verified": true,
+        "version": "0.5.3"
+      },
+      "dev-cache": {
+        "product": "dev-cache",
+        "schema": "release-admin-set-verify-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "targets": 1,
+        "verified": true,
+        "version": "0.1.13"
+      },
+      "sync-configs": {
+        "product": "sync-configs",
+        "schema": "release-admin-set-verify-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "targets": 1,
+        "verified": true,
+        "version": "0.3.2"
+      }
+    },
+    "candidate-b": {
+      "dev-auth": {
+        "product": "dev-auth",
+        "schema": "release-admin-set-verify-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "targets": 1,
+        "verified": true,
+        "version": "0.5.3"
+      },
+      "dev-cache": {
+        "product": "dev-cache",
+        "schema": "release-admin-set-verify-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "targets": 1,
+        "verified": true,
+        "version": "0.1.13"
+      },
+      "sync-configs": {
+        "product": "sync-configs",
+        "schema": "release-admin-set-verify-v1",
+        "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+        "targets": 1,
+        "verified": true,
+        "version": "0.3.2"
+      }
+    }
+  }
+}

@@ -1,0 +1,427 @@
+{
+  "all_explicit_failure_sites": [
+    {
+      "failure_expression": "'outer_protocol_line_bound'",
+      "line": 180,
+      "method": "pump",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'outer_protocol_event_bound'",
+      "line": 185,
+      "method": "pump",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'outer_protocol_object_required'",
+      "line": 188,
+      "method": "pump",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'public_command_output_bound'",
+      "line": 220,
+      "method": "wait",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'public_command_deadline'",
+      "line": 216,
+      "method": "wait",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'outer_ended_before_gate'",
+      "line": 233,
+      "method": "event",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'outer_protocol_unexpected_event'",
+      "line": 229,
+      "method": "event",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'outer_gate_write'",
+      "line": 240,
+      "method": "gate",
+      "owner": "Job"
+    },
+    {
+      "failure_expression": "'immutable_acceptance_allocation_invalid'",
+      "line": 285,
+      "method": "check",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'owned_cgroup_changed'",
+      "line": 288,
+      "method": "check",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'owned_cgroup_identity_changed'",
+      "line": 292,
+      "method": "check",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'owned_wrapper_changed'",
+      "line": 297,
+      "method": "check",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'acceptance_cancelled_or_deadline'",
+      "line": 299,
+      "method": "check",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'unexpected_exit_' + label",
+      "line": 311,
+      "method": "run",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'response_object_' + label",
+      "line": 315,
+      "method": "run",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'frozen_plan_or_bindings_changed'",
+      "line": 330,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'native_python_identity_changed'",
+      "line": 338,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'native_path_selection_changed'",
+      "line": 345,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'qualified_candidate_binding'",
+      "line": 354,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'qualified_candidate_bytes_changed'",
+      "line": 357,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'remaining_acceptance_already_started_no_retry'",
+      "line": 363,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_native_installation_proof_changed'",
+      "line": 375,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'original_scope_settlement_changed'",
+      "line": 378,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_native_setup_proof_changed'",
+      "line": 389,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_native_setup_settlement_changed'",
+      "line": 392,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_private_fixture_inputs_changed'",
+      "line": 413,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_path_changed'",
+      "line": 435,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_intercept_set_invalid'",
+      "line": 440,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_intercept_scope_changed'",
+      "line": 444,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_configuration_changed'",
+      "line": 464,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'observed_root_domain'",
+      "line": 469,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'fresh_root_maintenance_baseline'",
+      "line": 476,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'payload_identity_changed'",
+      "line": 336,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'qualified_candidate_metadata_changed'",
+      "line": 361,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_private_state_custody_changed'",
+      "line": 403,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_file_custody_changed'",
+      "line": 450,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_bytes_changed'",
+      "line": 452,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_unaccounted_hardlink'",
+      "line": 456,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'unrun_native_workload_baseline_changed'",
+      "line": 479,
+      "method": "prepare",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'installed_routing_not_active'",
+      "line": 492,
+      "method": "validate_status",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'observed_root_domain'",
+      "line": 498,
+      "method": "validate_status",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'native_effective_paths_changed'",
+      "line": 505,
+      "method": "validate_status",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'inherited_route_identity_changed'",
+      "line": 495,
+      "method": "validate_status",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'owned_foreground_work_not_settled'",
+      "line": 510,
+      "method": "assert_idle",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'sentinel_changed'",
+      "line": 519,
+      "method": "snapshot",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'stable_root_lock_replaced'",
+      "line": 522,
+      "method": "snapshot",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'outer_lease_not_active'",
+      "line": 530,
+      "method": "snapshot",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'task_metadata_count_bound'",
+      "line": 527,
+      "method": "snapshot",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'applied_gc_not_nonmutating_busy'",
+      "line": 549,
+      "method": "observe_gate",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'active_preview_protection_failed'",
+      "line": 557,
+      "method": "observe_gate",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'nested_native_route_completion_not_observed'",
+      "line": 546,
+      "method": "observe_gate",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'outer_identity_gate'",
+      "line": 573,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'nested_settlement_gate'",
+      "line": 580,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'outer_completion_status'",
+      "line": 586,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'native_steps_not_settled'",
+      "line": 590,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'normal_gc_not_restored'",
+      "line": 616,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'normal_policy_removed_public_payload'",
+      "line": 618,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'real_compile_link_failed'",
+      "line": 593,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'automatic_post_workload_gc_not_complete'",
+      "line": 597,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'expected_native_compiler_failure_not_preserved'",
+      "line": 601,
+      "method": "outer",
+      "owner": "Acceptance"
+    },
+    {
+      "failure_expression": "'native_failure_diagnostics_changed'",
+      "line": 612,
+      "method": "outer",
+      "owner": "Acceptance"
+    }
+  ],
+  "no_demonstrated_remaining_runner_mistake_found": true,
+  "no_guard_bypass_clock_admission_or_product_acceptance_claimed": true,
+  "old_failures_and_passed_commands_unchanged": true,
+  "recorded_utc": "2026-10-18T05:07:15.340958+00:00",
+  "remaining_native_C_lease_GC_outputs": "Not yet captured; source protocol/schema reviewed, must be observed during this parent-allocated runtime.",
+  "replayed": {
+    "actual_alias_group_sizes": [
+      25
+    ],
+    "all_five_bound_native_tool_identities": "PASS",
+    "all_seven_completed_command_and_settlement_proof_hashes": "PASS",
+    "configuration_root_marker_stable_lock_and_two_old_cancel_markers": "PASS",
+    "exact_validate_status_method_on_actual_captured_status": "PASS",
+    "original_hardlink_single_link_assertion": "REPRODUCED_FALSE_ASSERTION",
+    "original_temp_in_routed_adapter_assertion": "REPRODUCED_FALSE_ASSERTION",
+    "strict_installed_alias_groups_on_actual_retained_files": "PASS"
+  },
+  "source_references": [
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/docs/adr/0127-active-workload-root-coordination.md",
+      "sha256": "5bad2f156b6570eb48c31a3a886a74f1ea7ab9fe5698d7f6c837b02a79f674bd"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/docs/adr/0100-nonblocking-cache-observation-and-setup.md",
+      "sha256": "81880a8bd389389815012194059dd6e52900d80bb213c5d89a5d3a9c8baf3e55"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/cli.rs",
+      "sha256": "6f5ead4a85b9c1952cab53a36cf1af6b8f97285f4b10b6440081ee711b6c6edd"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/resources.rs",
+      "sha256": "128f7aad5df4afa4ca1b250cc001e6944dfde3ead46410bb62a7c39f54e8694a"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/lease.rs",
+      "sha256": "171462c849c460d8d0f9b9e89bfe48a0e0128f8761cd4a8f6d491b65d28bb2cd"
+    },
+    {
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-cache/src/gc.rs",
+      "sha256": "a3be19a67af76df34e796e52671e85bd5a7814dd58e420d00ba411f6f3926b69"
+    }
+  ],
+  "state": "WHOLE_REMAINING_RUNNER_REVIEW_CAPTURED_ASSERTIONS_REPRODUCED_NO_PRODUCT_EXECUTION",
+  "whole_runner_method_review": {
+    "Job": "Direct child only, closed/bounded stdin,1MiB public streams,24 bounded protocol events, no per-phase budget exceeds owner deadline; EOF+wait required. Construction failure retains child for existing cleanup.",
+    "assert_idle": "Empty task lease catalog and no owned cgroup members except payload/wrapper; runtime observation required.",
+    "check": "Immutable allocated600+60 guard turn, exact boot/wrapper/cgroup/inode/source, firstfailure/cancellation; only a real admitted runtime can satisfy, never replayed as runtime evidence.",
+    "cleanup": "Preserve direct stage streams and reaping; own unique third cancel marker, current owner deadline and bounded final settlement. Existing cgroup/pidfd cleanup unchanged.",
+    "execute": "Success\u2192failure\u2192finalfullstatus only; first failure closes own work. Remaining captured evidence is not a claim of C/lease/GC success.",
+    "observe_gate": "Source ResourceKind kebab-case ccache-local+ccache-temp and integer completion; current public busy exit12/stderr; preview appliedfalse/completetrue/failures[] and exact active-resource reason with unchanged snapshots.",
+    "outer": "Protocol event names and emitted fields match complete outer main; success has3 exited/reaped compile-link-program steps, exact stdout; failure has one nonzero compiler step with direct-native diagnostics comparison; settled before maintenance.",
+    "post_workload": "Exec source completes resources then drops active lease before automatic GC; automatic schema complete/pressure/last_success/failures matches observer; normal explicit maintenance afterward; config ages prevent sentinel removal.",
+    "prepare": "No seven completed mutations replayed; exact inherited source and proof hashes, signed A/B intake, all25 admitted hardlinks/copy groups and existing config/root/lock identities. One fresh readonly status invocation at runtime only.",
+    "snapshot": "Exact task sentinel bytes+inode, stable root lock inode, bounded hashes of task lease/resource records; runtime active lease required.",
+    "validate_status": "Exact method replayed on captured actual JSON; complete activation and ccache route, exact generic temp effective path, domain/root/worktree identities."
+  }
+}

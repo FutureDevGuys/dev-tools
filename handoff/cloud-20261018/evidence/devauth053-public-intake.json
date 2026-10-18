@@ -1,0 +1,35 @@
+{
+  "argv": [
+    "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-0.5.3-linux-x86_64",
+    "setup",
+    "verify-release",
+    "--root",
+    "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-tools-root.json",
+    "--manifest",
+    "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-stable.json",
+    "--artifact",
+    "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-0.5.3-linux-x86_64"
+  ],
+  "exit": 0,
+  "native_strong_setup_or_sudo_callback_qualification": false,
+  "no_root_install_authentication_or_policy_access": true,
+  "operation": "candidate053 public signed release intake",
+  "reaped": true,
+  "recorded_utc": "2026-10-18T04:05:58.034170+00:00",
+  "response": {
+    "artifact_length": 29387016,
+    "artifact_path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-0.5.3-linux-x86_64",
+    "artifact_sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756",
+    "artifact_url": "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.5.3/dev-auth-0.5.3-linux-x86_64",
+    "manifest_generation": 29,
+    "manifest_path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-auth-stable.json",
+    "manifest_sha256": "5c26aef2154519537c163143e5c6e1b77b05de89e6125d6cc37fd23d15f6831c",
+    "root_generation": 1,
+    "root_path": "${RELEASE_EVIDENCE_ROOT}/signed-bundles/candidate-a/releases/dev-auth/dev-tools-root.json",
+    "root_sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72",
+    "schema": "dev-auth-verified-release-v1",
+    "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+    "target": "linux-x86_64",
+    "version": "0.5.3"
+  }
+}

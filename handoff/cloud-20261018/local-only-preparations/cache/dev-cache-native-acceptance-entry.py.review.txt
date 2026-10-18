@@ -1,0 +1,7 @@
+#!/usr/bin/python3
+"""Prepared-only entry for the separately allocated600+60 native acceptance."""
+import runpy
+from pathlib import Path
+E = Path('${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018')
+guard = runpy.run_path(str(E / 'dev-cache-native-acceptance-guard.py'))
+raise SystemExit(guard['run'](['/usr/bin/taskset', '-c', '0', '/usr/bin/python3.14', '-u', str(E / 'dev-cache-native-installed-acceptance.py'), '--identities', str(E / 'NATIVE-TOOL-BINDINGS.json'), '--turn', str(E / 'native-acceptance-turn.json')], 'acceptance'))

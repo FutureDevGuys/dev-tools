@@ -1,0 +1,129 @@
+{
+  "earlier_whitelisted_environment_observation": {
+    "PATH_begins_existing_dev_cache_intercepts": true,
+    "selected_DEV_CACHE_CONFIG_ROOT_MODE_overrides_present": false,
+    "unselected_environment_values_retained": false
+  },
+  "established": {
+    "Sync_offered_older_metadata_was_rejected_without_ledger_downgrade": true,
+    "initial_npm_busy_refusal_preceded_later_routing_activation_noop": true,
+    "private_caller_failures_were_not_investigated_as_product_inputs": true,
+    "several_real_child_errors_recorded": true
+  },
+  "event_snapshot": {
+    "contiguous_sequence": true,
+    "length": 327995,
+    "malformed_rows": 0,
+    "parsed_rows": 1390,
+    "run_completed_event_seen": false,
+    "sha256": "b7330d3caf26ebe524b67fc4fb288a173ce5730071bc16fa9168a7aa7d33f75b"
+  },
+  "installed_source": "7d7bcb1e04c08183aa8dfe0c9854870fe4b114e8",
+  "installed_version": "0.1.14",
+  "no_user_task_replay_interruption_or_mutation": true,
+  "observed_executable_sha256": "544a3ac13f0bbaeebeda6495e3d00ebde6cf9d216554086bf72201b9881de7b5",
+  "observed_process_pid": 3291314,
+  "observed_process_startticks": 27682567,
+  "raw_user_logs_or_private_caller_files_exported": false,
+  "run_id": "run-1792305116194-3291314-fadb1a5c-1d45-4cec-a880-919e24651e7c",
+  "schema": 1,
+  "selected_builtin_task_records": [
+    {
+      "completed_with_issues": false,
+      "detail": "npm outdated failed: dev-cache: cache root is busy with exclusive maintenance; routed setup did not start",
+      "original_task_record_sha256": "11dedb23b810270bf941e4b12cfe7f1f5fb984462689075d0dd6518a9b2e3995",
+      "report_status_counts": {
+        "failed": 1
+      },
+      "status": "failed",
+      "task_id": "builtin/npm"
+    },
+    {
+      "completed_with_issues": false,
+      "detail": "command failed: dev-cache: cache root is busy with exclusive maintenance; routed setup did not start (see task log for full output)",
+      "original_task_record_sha256": "4539e8514e0de909b2006f6127b693ccb06be9e24d3074037b2b5b197e56bbd0",
+      "report_status_counts": {
+        "info": 1
+      },
+      "status": "failed",
+      "task_id": "builtin/uv"
+    },
+    {
+      "completed_with_issues": false,
+      "detail": "command failed: dev-cache: cache root is busy with exclusive maintenance; routed setup did not start (see task log for full output)",
+      "original_task_record_sha256": "11bdb27953419b21d247f3ab7ba5400d2bb06ce986a86c71c678dac9cc5104b9",
+      "report_status_counts": {
+        "failed": 1
+      },
+      "status": "failed",
+      "task_id": "builtin/uv-tools"
+    },
+    {
+      "completed_with_issues": false,
+      "detail": "command failed: The following package(s) failed to upgrade: pip-autoremove,py2puml (see task log for full output)",
+      "original_task_record_sha256": "ddac296ca0e14ffb643302d855d1f3ba8edb61a4d169afe9adb13234224b9109",
+      "report_status_counts": {
+        "blocked": 7
+      },
+      "status": "failed",
+      "task_id": "builtin/pipx"
+    },
+    {
+      "completed_with_issues": false,
+      "detail": "command failed: updater integrity failure: release state rejected metadata: release manifest generation rollback detected: offered generation 16 (version 0.3.0), previously accepted generation 18 (version 0.3.2); retained release state is unchanged (see task log for full output)",
+      "original_task_record_sha256": "69b1520cebc03f4755c58b0616a09e9962efeaa59275b7f0ba4549f846cf54c5",
+      "report_status_counts": {
+        "failed": 1
+      },
+      "status": "failed",
+      "task_id": "builtin/dev-tools-sync-configs"
+    }
+  ],
+  "snapshot_utc": "2026-10-18T06:48:33.045914+00:00",
+  "source_blob_correspondence": [
+    {
+      "installed_source_blob": "94ae6327e4b6e41205ffde850bdfa418da17f033",
+      "integration_source_blob": "94ae6327e4b6e41205ffde850bdfa418da17f033",
+      "path": "crates/update-all/src/tasks/mod.rs",
+      "same": true
+    },
+    {
+      "installed_source_blob": "fca22dc8a24c8b84655d9ebbfdcb1308a6df2da3",
+      "integration_source_blob": "fca22dc8a24c8b84655d9ebbfdcb1308a6df2da3",
+      "path": "crates/update-all/src/tasks/npm.rs",
+      "same": true
+    },
+    {
+      "installed_source_blob": "8865a8095cf7a3dcd53f2917c63652e4cd99d7b8",
+      "integration_source_blob": "8865a8095cf7a3dcd53f2917c63652e4cd99d7b8",
+      "path": "crates/update-all/src/updaters/builtin_tasks.toml",
+      "same": true
+    },
+    {
+      "installed_source_blob": "d6944b213f574a14ffdc289541120ee128b4b207",
+      "integration_source_blob": "d6944b213f574a14ffdc289541120ee128b4b207",
+      "path": "crates/update-all/src/logging.rs",
+      "same": true
+    },
+    {
+      "installed_source_blob": "cfbac47a3d75f1c42822c3116afa62b9e5351f31",
+      "integration_source_blob": "cfbac47a3d75f1c42822c3116afa62b9e5351f31",
+      "path": "crates/update-all/src/runs.rs",
+      "same": true
+    },
+    {
+      "installed_source_blob": "7b78202b10a05f9ea9659fbe215e3efd5c8bf5b7",
+      "integration_source_blob": "7b78202b10a05f9ea9659fbe215e3efd5c8bf5b7",
+      "path": "crates/update-all/src/config.rs",
+      "same": true
+    }
+  ],
+  "state": "CAUSAL_AUDIT_UNFINISHED_PAUSED_FOR_TRANSFER",
+  "unresolved": [
+    "runner environment, scheduling and resource-lock causal responsibility",
+    "timeout/cancellation/owned-process settlement and report aggregation correctness",
+    "why Sync discovery offered generation16/version0.3.0 after accepted generation18/version0.3.2",
+    "recurring exclusive maintenance occupancy after runner assessment",
+    "underlying Yay failure and caller-owned failures are not evidence that the runner is cleared"
+  ]
+}

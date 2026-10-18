@@ -1,0 +1,49 @@
+{
+  "assets": {
+    "dev-tools-root.json": {
+      "asset_ID": 652693909,
+      "browser_download_url": "https://github.com/FutureDevGuys/dev-tools/releases/download/sync-configs/v0.3.2/dev-tools-root.json",
+      "download_path": "${RELEASE_EVIDENCE_ROOT}/sync032-native-publication-attended-20261018T063015Z/published-download/dev-tools-root.json",
+      "length": 361,
+      "matches_exact_accepted_signed_bytes": true,
+      "sha256": "6ce83859ed938fd24716061ec998e5721bb49f7471524e6a6b37cc85b2f79f72"
+    },
+    "sync-configs-0.3.2-linux-x86_64": {
+      "asset_ID": 652693905,
+      "browser_download_url": "https://github.com/FutureDevGuys/dev-tools/releases/download/sync-configs/v0.3.2/sync-configs-0.3.2-linux-x86_64",
+      "download_path": "${RELEASE_EVIDENCE_ROOT}/sync032-native-publication-attended-20261018T063015Z/published-download/sync-configs-0.3.2-linux-x86_64",
+      "length": 7391696,
+      "matches_exact_accepted_signed_bytes": true,
+      "sha256": "692b3cf53325bbbe1474d2181c9a328ecfcd21669516c161a08f9cc20c0f8e65"
+    },
+    "sync-configs-stable.json": {
+      "asset_ID": 652693910,
+      "browser_download_url": "https://github.com/FutureDevGuys/dev-tools/releases/download/sync-configs/v0.3.2/sync-configs-stable.json",
+      "download_path": "${RELEASE_EVIDENCE_ROOT}/sync032-native-publication-attended-20261018T063015Z/published-download/sync-configs-stable.json",
+      "length": 586,
+      "matches_exact_accepted_signed_bytes": true,
+      "sha256": "e937e9b9d2f289759dd8dc65f2844d0c6d4d2d442a28e0f608124b5fd77accef"
+    }
+  },
+  "draft": false,
+  "fresh_downloaded_bundle_RA_verify": {
+    "product": "sync-configs",
+    "schema": "release-admin-set-verify-v1",
+    "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+    "targets": 1,
+    "verified": true,
+    "version": "0.3.2"
+  },
+  "local_and_remote_tag_object_equal": true,
+  "no_rebuild_resign_or_live_installation": true,
+  "recorded_utc": "2026-10-18T06:33:33.489140+00:00",
+  "release_ID": 416276519,
+  "release_url": "https://github.com/FutureDevGuys/dev-tools/releases/tag/sync-configs/v0.3.2",
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "state": "PUBLIC_RELEASE_SIGNED_TAG_AND_ALL_DOWNLOADED_BYTES_CRYPTOGRAPHICALLY_VERIFIED",
+  "tag_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "tag_object": "bb2ce521354170b61813a81fa4a01caa8826ea07",
+  "tag_signature_public_diagnostic": "Good \"git\" signature for * with ED25519 key SHA256:YZD+UWxUaZXOm6yLcXG6moM9/sEsBKWnE8XYeqPimTU\n",
+  "tag_signature_verify_exit": 0,
+  "tag_signer_authority": "Existing frozen API declared public signing key, not extracted from candidate tag. Command-local public allowed-signers only; no user/machine signing configuration changed."
+}

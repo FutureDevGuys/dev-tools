@@ -1,0 +1,22 @@
+{
+  "accepted_six_field_projections_preserved_across_rollback_and_reapply": true,
+  "all_20_clients_reaped_exit0_and_PID_paths_absent": true,
+  "corrected_remaining_steps_only": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/signed-user-lifecycle-remaining-corrected/ACTUAL-SIGNED-USER-LIFECYCLE.json",
+    "sha256": "ba72180ffdc5b0ebda3ec3475ddca36777fba175a805c91baca9b405c5b5c9f3"
+  },
+  "first_observer_failure_and_original_clock_preserved": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/signed-user-lifecycle/ACTUAL-SIGNED-USER-LIFECYCLE.json",
+    "sha256": "5409135db84bc1e6d6e209569cff99fc422d1b2c1a958cd3883f0966ce2c41b9"
+  },
+  "four_initial_passed_clients_inherited_no_mutation_replay": true,
+  "native_mutations": [
+    "DevCache012 baseline\u2192013 upgrade\u2192exact repeat\u2192012 retained rollback\u2192013 reapply",
+    "SyncConfigs031 baseline\u2192032 upgrade\u2192exact repeat\u2192031 retained rollback\u2192032 reapply"
+  ],
+  "no_host_installation_network_or_authentication": true,
+  "recorded_utc": "2026-10-18T04:01:38.420466+00:00",
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "PASS_BOTH_OFFLINE_SIGNED_LIFECYCLES"
+}

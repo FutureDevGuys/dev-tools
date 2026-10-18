@@ -1,0 +1,16 @@
+{
+  "current_execution_root": "${LOCAL_CACHE_ROOT}/retained-native-evidence/edgecourt-native-owning-20261018-47y8ldqe",
+  "current_metadata_sha256": "2833ff23db0e62dbe7e343ca71c8246f2758ccd22151245b02463d7bc26fec03",
+  "current_owner": "EdgeCourt",
+  "current_release_path": "${LOCAL_CACHE_ROOT}/retained-native-evidence/edgecourt-native-owning-20261018-47y8ldqe/PARENT-AUTHORIZED-THREE-NATIVE-HEADLESS-ALLOCATION.json",
+  "current_release_sha256": "5b02c2b337ba38a4ef2ad8a8eb6d7eb6109aa559b8914d81f7dcca4097c74141",
+  "current_scope_consumed": false,
+  "current_state": "ACTUAL_NATIVE_RESERVATION_ACQUIRED_ADMISSION_OR_BUILD_ACTIVE",
+  "expected_consumed_settled_beforeimage": "3bd51cf34c66fbd6d167cfe436716c804e975f33079ba7d6d7f21e7f0b1e2000",
+  "no_Cache_allocation_or_runtime_file_exists": true,
+  "no_peer_message_or_foreign_process_operation": true,
+  "no_shared_mutation_native_clock_compiler_flock_or_process_launch": true,
+  "parent_allocation_still_granted": "Cache remaining-only600+60; requires coordinator resource/binding reconciliation, not another user approval or source readiness cycle.",
+  "recorded_utc": "2026-10-18T05:14:25.353496+00:00",
+  "state": "CONDITIONAL_BINDER_REFUSED_BEFORE_FIRST_MUTATION_SHARED_BEFOREIMAGE_ADVANCED"
+}

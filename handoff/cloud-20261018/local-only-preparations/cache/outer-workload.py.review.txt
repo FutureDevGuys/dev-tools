@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Task-only foreground payload; the caller owns admission and final cgroup checks."""
+
+import argparse
+import base64
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+CAPTURE_BYTES = 64 * 1024
+EXPECTED_OUTPUT = b"dev-cache-013-native-ok\n"
+SOURCES = {
+    "success": b'#include <stdio.h>\nint main(void) { puts("dev-cache-013-native-ok"); return 0; }\n',
+    "failure": b"#error dev_cache_013_expected_native_failure\n",
+}
+CANCELLED = False
+
+
+class Stop(Exception):
+    pass
+
+
+def on_signal(_number, _frame):
+    global CANCELLED
+    CANCELLED = True
+
+
+def emit(event, **fields):
+    print(json.dumps({"event": event, **fields}, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def own_cgroup(pid):
+    # Only this payload and its directly launched, still-unreaped leader are read.
+    raw = Path(f"/proc/{pid}/cgroup").read_bytes()
+    if len(raw) > 64 * 1024:
+        raise Stop("cgroup_metadata_too_large")
+    return raw.decode("utf-8", "strict").splitlines()
+
+
+def leader_identity(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields = raw[raw.rfind(")") + 2 :].split()
+    if len(fields) < 20:
+        raise Stop("invalid_owned_leader_stat")
+    uid_lines = [line for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines() if line.startswith("Uid:")]
+    if len(uid_lines) != 1:
+        raise Stop("invalid_owned_leader_uid")
+    return {
+        "pid": pid,
+        "start_ticks": int(fields[19]),
+        "pgid": int(fields[2]),
+        "session": int(fields[3]),
+        "uids": [int(value) for value in uid_lines[0].split()[1:]],
+        "cgroup": own_cgroup(pid),
+    }
+
+
+def private_dir(path, case=None):
+    if not path.is_absolute() or path.resolve(strict=True) != path:
+        raise Stop("directory_not_absolute_canonical")
+    if case is not None and not path.is_relative_to(case):
+        raise Stop("directory_outside_case")
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise Stop("directory_not_current_user_private")
+    return info
+
+
+def source_file(path, expected):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o022:
+        raise Stop("public_source_has_unsafe_identity")
+    if info.st_size != len(expected) or path.read_bytes() != expected:
+        raise Stop("public_source_bytes_mismatch")
+
+
+def absent(path):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise Stop("native_output_already_exists")
+
+
+def cancel_requested(case):
+    if CANCELLED:
+        return True
+    try:
+        info = (case / "status-remaining-cancel-requested.json").lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise Stop("unsafe_cancellation_marker")
+    return True
+
+
+def gate(case, word, deadline):
+    with selectors.DefaultSelector() as selector:
+        selector.register(sys.stdin.fileno(), selectors.EVENT_READ)
+        pending = bytearray()
+        while True:
+            if cancel_requested(case):
+                raise Stop("cancel_requested")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Stop("gate_deadline")
+            for _key, _event in selector.select(min(0.1, remaining)):
+                part = os.read(sys.stdin.fileno(), 128)
+                if not part:
+                    raise Stop("gate_closed")
+                pending.extend(part)
+                if len(pending) > 128:
+                    raise Stop("oversize_gate")
+                if b"\n" in pending:
+                    if bytes(pending) != word.encode("ascii") + b"\n":
+                        raise Stop("unexpected_gate")
+                    return
+
+
+def make_sentinel(mode, case):
+    raw_tmp = os.environ.get("TMPDIR", "")
+    if not raw_tmp:
+        raise Stop("managed_tmpdir_missing")
+    tmp = Path(raw_tmp)
+    private_dir(tmp, case)
+    directory = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        name = "acceptance-sentinel-" + mode
+        payload = ("dev-cache-013-sentinel-" + mode + "\n").encode("ascii")
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+            info = os.fstat(stream.fileno())
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return {"path": str(tmp / name), "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload), "device": info.st_dev, "inode": info.st_ino}
+
+
+def group_absent(pgid):
+    # Read-only observation only after reap: never signal a potentially reused ID.
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def command(label, argv, case, work, execution_deadline, settlement_deadline, steps):
+    if cancel_requested(case):
+        raise Stop("cancel_requested")
+    started = time.monotonic()
+    if started >= execution_deadline:
+        raise Stop("execution_deadline")
+    command_deadline = min(execution_deadline, started + 60.0)
+    result = {"label": label, "argv": argv, "exit": None, "launched": False, "reaped": False, "process_group_absent": False}
+    steps.append(result)
+    identity = None
+    buffers = {name: {"prefix": bytearray(), "hash": hashlib.sha256(), "bytes": 0} for name in ("stdout", "stderr")}
+    failure = None
+    cleanup_started = None
+    kill_sent = False
+    state_known = False
+    # Acquire the observation resource before creating anything that needs
+    # owned-child cleanup. epoll allocation failure must launch no native work.
+    try:
+        selector = selectors.DefaultSelector()
+    except (OSError, ValueError) as error:
+        result.update(reaped=True, process_group_absent=True, streams_eof=True)
+        raise Stop("native_observation_setup_failed") from error
+    try:
+        child = subprocess.Popen(argv, cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+    except OSError as error:
+        result.update(reaped=True, process_group_absent=True, streams_eof=True)
+        try:
+            selector.close()
+        except (OSError, ValueError):
+            result["observation_close_failed"] = True
+        raise Stop("native_launch_failed") from error
+    result["launched"] = True
+    result["pid"] = child.pid
+
+    def owned_signal(number):
+        if identity is None or leader_identity(child.pid) != identity:
+            raise Stop("owned_leader_identity_uncertain")
+        os.killpg(child.pid, number)
+
+    def start_cleanup(reason):
+        nonlocal failure, cleanup_started
+        if failure is None:
+            failure = reason
+        if cleanup_started is None:
+            cleanup_started = time.monotonic()
+            owned_signal(signal.SIGTERM)
+
+    try:
+        identity = leader_identity(child.pid)
+        if identity["pgid"] != child.pid or identity["session"] != child.pid or identity["uids"] != [os.getuid()] * 4 or identity["cgroup"] != own_cgroup(os.getpid()):
+            raise Stop("launched_group_identity_mismatch")
+        result["identity"] = identity
+        state_known = True
+        for name, stream in (("stdout", child.stdout), ("stderr", child.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        while True:
+            now = time.monotonic()
+            if cleanup_started is None:
+                try:
+                    cancelled = cancel_requested(case)
+                except Stop as error:
+                    start_cleanup(str(error))
+                else:
+                    if cancelled:
+                        start_cleanup("cancel_requested")
+                    elif now >= command_deadline:
+                        start_cleanup("native_command_deadline")
+            if cleanup_started is not None and not kill_sent and now >= min(cleanup_started + 1.0, settlement_deadline - 0.1):
+                owned_signal(signal.SIGKILL)
+                kill_sent = True
+            if now >= settlement_deadline:
+                failure = failure or "settlement_deadline"
+                break
+            # WNOWAIT pins the direct leader, PID/start identity and group number
+            # through all signalling. Popen.poll()/wait() must not reap it early.
+            observation = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            leader_exited = observation is not None
+            if leader_exited and not selector.get_map():
+                # If cleanup began, finish its exact-group SIGKILL before reap,
+                # including pipe-closing descendants that outlived the wrapper.
+                if cleanup_started is not None and not kill_sent:
+                    owned_signal(signal.SIGKILL)
+                    kill_sent = True
+                break
+            for key, _events in selector.select(min(0.1, max(0.0, settlement_deadline - now))):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                item = buffers[key.data]
+                item["hash"].update(chunk)
+                item["bytes"] += len(chunk)
+                remaining = CAPTURE_BYTES - len(item["prefix"])
+                if remaining > 0:
+                    item["prefix"].extend(chunk[:remaining])
+    except (OSError, Stop, UnicodeError, ValueError) as error:
+        failure = failure or (str(error) if isinstance(error, Stop) else "owned_command_observation_failed")
+        # The leader remains unreaped. Never substitute an unverified PID/group
+        # signal if exact ownership could not be established or was lost.
+        if state_known:
+            try:
+                owned_signal(signal.SIGKILL)
+                kill_sent = True
+            except (OSError, Stop, UnicodeError, ValueError):
+                result["cleanup_identity_uncertain"] = True
+    finally:
+        # Drain only owned native output until the original settlement deadline.
+        capture_failed = False
+        try:
+            while selector.get_map() and time.monotonic() < settlement_deadline:
+                for key, _events in selector.select(min(0.05, max(0.0, settlement_deadline - time.monotonic()))):
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    item = buffers[key.data]
+                    item["hash"].update(chunk)
+                    item["bytes"] += len(chunk)
+                    remaining = CAPTURE_BYTES - len(item["prefix"])
+                    if remaining > 0:
+                        item["prefix"].extend(chunk[:remaining])
+        except (OSError, ValueError):
+            # A permanently broken selector/pipe must not spin or bypass reap.
+            capture_failed = True
+            failure = failure or "owned_native_capture_failed"
+            result["capture_failure"] = "owned_native_capture_failed"
+            if state_known and not kill_sent:
+                try:
+                    owned_signal(signal.SIGKILL)
+                    kill_sent = True
+                except (OSError, Stop, UnicodeError, ValueError):
+                    result["cleanup_identity_uncertain"] = True
+        result["streams_eof"] = not capture_failed and not selector.get_map()
+        try:
+            selector.close()
+        except (OSError, ValueError):
+            result["streams_eof"] = False
+            result["capture_failure"] = "owned_native_capture_failed"
+            failure = failure or "owned_native_capture_failed"
+        for stream in (child.stdout, child.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                result["streams_eof"] = False
+                result["capture_failure"] = "owned_native_capture_failed"
+                failure = failure or "owned_native_capture_failed"
+        while time.monotonic() < settlement_deadline:
+            try:
+                waited_pid, status = os.waitpid(child.pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except (OSError, ValueError):
+                failure = failure or "owned_child_reap_uncertain"
+                result["reap_uncertain"] = True
+                break
+            if waited_pid == child.pid:
+                child.returncode = os.waitstatus_to_exitcode(status)
+                result["exit"] = child.returncode
+                result["reaped"] = True
+                try:
+                    result["process_group_absent"] = group_absent(child.pid)
+                except (OSError, ValueError):
+                    failure = failure or "owned_group_settlement_uncertain"
+                break
+            # No new workload is launched during this bounded settlement wait.
+            time.sleep(min(0.05, max(0.0, settlement_deadline - time.monotonic())))
+        for name, item in buffers.items():
+            result[name] = {"base64": base64.b64encode(item["prefix"]).decode("ascii"), "bytes": item["bytes"], "sha256": item["hash"].hexdigest(), "truncated": item["bytes"] > CAPTURE_BYTES}
+        result["elapsed_seconds"] = time.monotonic() - started
+        result["cleanup_requested"] = cleanup_started is not None or kill_sent
+    if not result["reaped"] or not result["process_group_absent"] or not result["streams_eof"]:
+        raise Stop("owned_command_settlement_unproven")
+    if failure is not None:
+        raise Stop(failure)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("success", "failure"))
+    parser.add_argument("--case", required=True, type=Path)
+    parser.add_argument("--cc", required=True, type=Path)
+    parser.add_argument("--real-cc", required=True, type=Path)
+    parser.add_argument("--deadline-monotonic", required=True, type=float)
+    parser.add_argument("--settlement-deadline-monotonic", required=True, type=float)
+    args = parser.parse_args()
+    steps = []
+    metadata = {"mode": args.mode, "pid": os.getpid(), "uid": os.getuid()}
+    phase = "admission"
+    try:
+        if not math.isfinite(args.deadline_monotonic) or not math.isfinite(args.settlement_deadline_monotonic) or args.settlement_deadline_monotonic <= args.deadline_monotonic or time.monotonic() >= args.deadline_monotonic:
+            raise Stop("invalid_original_deadlines")
+        private_dir(args.case)
+        work = args.case / "work"
+        private_dir(work, args.case)
+        if not args.cc.is_absolute() or not args.cc.is_relative_to(args.case) or not args.cc.resolve(strict=True).is_relative_to(args.case) or not args.real_cc.is_absolute():
+            raise Stop("invalid_bound_compiler_paths")
+        source = work / (args.mode + ".c")
+        source_file(source, SOURCES[args.mode])
+        metadata["cgroup"] = own_cgroup(os.getpid())
+        metadata["sentinel"] = make_sentinel(args.mode, args.case)
+        phase = "before_nested_gate"
+        emit("READY_BEFORE_NESTED", **metadata, children_settled=True, steps=steps)
+        gate(args.case, "release-before-nested", args.deadline_monotonic)
+        phase = "nested_native"
+        output = work / (args.mode + ".o")
+        absent(output)
+        compile_result = command(args.mode + "_compile", [str(args.cc), "-O0", "-c", str(source), "-o", str(output)], args.case, work, args.deadline_monotonic, args.settlement_deadline_monotonic, steps)
+        native_exit = compile_result["exit"]
+        if args.mode == "success":
+            if native_exit != 0:
+                raise Stop("success_compile_failed")
+            program = work / "success-program"
+            absent(program)
+            linked = command("success_link", [str(args.cc), str(output), "-o", str(program)], args.case, work, args.deadline_monotonic, args.settlement_deadline_monotonic, steps)
+            if linked["exit"] != 0:
+                raise Stop("success_link_failed")
+            program_info = program.lstat()
+            if not stat.S_ISREG(program_info.st_mode) or program_info.st_uid != os.getuid() or program_info.st_nlink != 1 or program_info.st_mode & 0o022:
+                raise Stop("native_program_identity_unsafe")
+            ran = command("success_program", [str(program)], args.case, work, args.deadline_monotonic, args.settlement_deadline_monotonic, steps)
+            if ran["exit"] != 0 or ran["stdout"]["truncated"] or base64.b64decode(ran["stdout"]["base64"]) != EXPECTED_OUTPUT or ran["stderr"]["bytes"] != 0:
+                raise Stop("native_program_output_mismatch")
+            native_exit = 0
+        elif native_exit is None or native_exit <= 0 or native_exit > 255:
+            raise Stop("expected_compile_failure_missing")
+        phase = "after_nested_gate"
+        emit("READY_AFTER_NESTED", **metadata, native_exit=native_exit, children_settled=True, steps=steps)
+        gate(args.case, "release-after-nested", args.deadline_monotonic)
+        emit("COMPLETE", **metadata, native_exit=native_exit, children_settled=True, steps=steps, proof_limit="Parent-owned final cgroup and product activity checks remain required; escaped or background descendants are not qualified.")
+        return native_exit
+    except (OSError, Stop, UnicodeError, ValueError) as error:
+        settled = all(step.get("reaped") and step.get("streams_eof") and step.get("process_group_absent") for step in steps)
+        try:
+            emit("ERROR", **metadata, phase=phase, error=str(error) if isinstance(error, Stop) else type(error).__name__, children_settled=settled, steps=steps)
+        except (BrokenPipeError, OSError):
+            pass
+        return 70
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+    sys.exit(main())

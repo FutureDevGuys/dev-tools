@@ -1,0 +1,151 @@
+{
+  "actual_capability": {
+    "bytes": 1010,
+    "path": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/ACTUAL-AVAILABLE-GUEST-TOOLS-AND-KVM.json",
+    "sha256": "0b17567b55c86d0aea332e7520beeddccd33bba77223f605a644b252bfd51672"
+  },
+  "candidate_ELF_GLIBC_versions": [
+    "GLIBC_2.2.5",
+    "GLIBC_2.3",
+    "GLIBC_2.3.2",
+    "GLIBC_2.3.4",
+    "GLIBC_2.4",
+    "GLIBC_2.5",
+    "GLIBC_2.7",
+    "GLIBC_2.8",
+    "GLIBC_2.9",
+    "GLIBC_2.10",
+    "GLIBC_2.14",
+    "GLIBC_2.15",
+    "GLIBC_2.16",
+    "GLIBC_2.17",
+    "GLIBC_2.18",
+    "GLIBC_2.25",
+    "GLIBC_2.27",
+    "GLIBC_2.28",
+    "GLIBC_2.29",
+    "GLIBC_2.30",
+    "GLIBC_2.32",
+    "GLIBC_2.33",
+    "GLIBC_2.34",
+    "GLIBC_2.39"
+  ],
+  "exact_signed_guest_inputs": {
+    "bytes": 59453440,
+    "path": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/exact-signed-candidate-inputs.tar",
+    "sha256": "3d09f9ef3cdc7d5381e5881c1d6ea177c02d8f66546dcfdc5a6ecc871eb9f9e6"
+  },
+  "exact_unexecuted_harness_construction": {
+    "argv": [
+      "${USER_HOME}/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+      "test",
+      "-p",
+      "dev-auth",
+      "--bin",
+      "dev-auth",
+      "--release",
+      "--locked",
+      "--offline",
+      "-j1",
+      "--no-run"
+    ],
+    "cwd": "${QUALIFIED_SOURCE_ROOT}",
+    "environment_replaced_not_merged": {
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_ENCODED_RUSTFLAGS": "--remap-path-prefix=${QUALIFIED_SOURCE_ROOT}=/dev-tools/source\u001f--remap-path-prefix=${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/fixture-harness-target=/dev-tools/output\u001f--remap-path-prefix=${USER_HOME}/Documents/Codex/2026-10-10/task-3/private-cargo-cache=/dev-tools/cargo-home",
+      "CARGO_HOME": "${USER_HOME}/Documents/Codex/2026-10-10/task-3/private-cargo-cache",
+      "CARGO_NET_OFFLINE": "true",
+      "CARGO_TARGET_DIR": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/fixture-harness-target",
+      "CARGO_TERM_COLOR": "never",
+      "DEV_AUTH_SOURCE_COMMIT": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+      "DEV_AUTH_SUDO_ARTIFACT": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/libdev_auth_sudo.so",
+      "DEV_TOOLS_GIT_COMMIT": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+      "DEV_TOOLS_GIT_DIRTY": "0",
+      "HOME": "${FUNCTIONAL_EVIDENCE_ROOT}/home",
+      "LC_ALL": "C",
+      "PATH": "${USER_HOME}/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/usr/bin:/bin",
+      "SOURCE_DATE_EPOCH": "1792291519",
+      "TMPDIR": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/fixture-harness-tmp"
+    },
+    "fresh_target_and_tmp_absent": true,
+    "invoked": false,
+    "requires_separately_named_compiler_allocation": true,
+    "source_package_target": "dev-auth Cargo.toml [[bin]] name=dev-auth; the separate feature-gated privilege-native-fixture binary is not this cfg(test) harness.",
+    "sudo_embedding_prerequisite": {
+      "bytes": 662376,
+      "path": "${REPRODUCTION_EVIDENCE_ROOT}/raw-reproduction/candidate-a/libdev_auth_sudo.so",
+      "sha256": "24c7fa052de58efdfd8624ea4722c2a3921bbaea0e5bcff7effc3cbad306727b"
+    },
+    "why_required": "build.rs validates selected helper version/source/target before embedding; native grant fixture requires available matching sudo payload."
+  },
+  "first_exact_native_case": {
+    "argv": [
+      "<new exact cfg(test) dev-auth executable>",
+      "--ignored",
+      "--exact",
+      "--nocapture",
+      "setup_v3::recovery_native::signed::native_disposable_signed_fresh_install_workload_and_restore"
+    ],
+    "environment": {
+      "DEV_AUTH_NATIVE_SYSTEMD_FIXTURE": "disposable"
+    },
+    "fresh_candidate_bundle_sufficient": true,
+    "prior_upgrade_cases": "Require genuine corresponding signed prior release sets, default0.3.11/0.4.0/maintenance0.5.0 or explicit supported maintenance prior; none synthesized."
+  },
+  "fixture_harness_absence": "The only retained executable dev_auth-e8ce482e32bd4ac8 is byte-identical to signed ordinary product f6116a... and therefore is not a cfg(test) native fixture executable.",
+  "host052_release_and_rollback_preserved": true,
+  "host_capability": "UID1000 can access /dev/kvm; read-only KVM API version12; qemu-system-x86_64 11.1.2 supports kvm; guestfish and virt-make-fs present. No task-owned image appeared in machinectl list-images.",
+  "native_support_or_deployment_accepted": false,
+  "no_guest_boot_image_download_harness_compile_auth_or_live_host_fixture_action": true,
+  "recorded_utc": "2026-10-18T05:00:42.471707+00:00",
+  "required_image_properties": [
+    "Independently authenticated x86_64 GNU/Linux bootable image with systemd as PID1, private guest kernel/PID/cgroup/IPC/UTS/network and root within the guest.",
+    "Guest libc must satisfy the exact signed product ELF requirement GLIBC_2.39; loader /lib64/ld-linux-x86-64.so.2, libgcc_s.so.1 and libc.so.6 are required.",
+    "Fresh per-case guest disk without installed DevAuth, system policy or fixture test account; guest-only native systemd,useradd,bash,setsid,sleep and case-specific sudo/git/gh native integration tools.",
+    "Extract only the already-hashed public signed archive and the new exact compiled native fixture harness into guest-owned input paths; no host source/config/credential mounts.",
+    "Create /run/.containerenv inside the guest solely to satisfy the existing harness marker after isolation is established; that marker alone is not evidence of isolation."
+  ],
+  "retained_dev_auth_executables": [
+    {
+      "bytes": 29387016,
+      "path": "${FUNCTIONAL_EVIDENCE_ROOT}/target/release/deps/dev_auth-e8ce482e32bd4ac8",
+      "sha256": "f6116a325e1e434c04f2195bc07b65363c700034fc2ef606ad62c37be79f1756"
+    }
+  ],
+  "reviewed_public_sources": [
+    {
+      "bytes": 2969,
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-auth/Cargo.toml",
+      "sha256": "d142f5d05ef57cb1b6489e734f0307eae6bbac3faf4b0a27d73abe71beee13f3"
+    },
+    {
+      "bytes": 1659,
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-auth/build.rs",
+      "sha256": "3b5f74e3826ecaa62bc56039361d4c0529f4bced1c61935c7ce5fb5e0efb680e"
+    },
+    {
+      "bytes": 6401,
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-auth/sudo_embedding.rs",
+      "sha256": "858865c0042c544c1590ab8e921ade389b5fa9d3ec2b53d41d016323904f84d3"
+    },
+    {
+      "bytes": 22855,
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-auth/src/setup_v3/recovery_native/signed.rs",
+      "sha256": "59b5e4661196450e8ccb60adc463ace66021c4ac4dbb7c12f88d794527709217"
+    },
+    {
+      "bytes": 22461,
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-auth/src/setup_v3/grants/native_acceptance.rs",
+      "sha256": "fb57d74cadb22136b4b8259f400a5fc78dab631edb9f2d33f4a11636b970a605"
+    },
+    {
+      "bytes": 13488,
+      "path": "${QUALIFIED_SOURCE_ROOT}/crates/dev-auth/src/setup_v3/recovery_native/workload.rs",
+      "sha256": "e07e43844ffe0dd67952a46e2a80ce0b00c30a7539acd1137736e5ff69df7491"
+    }
+  ],
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "SUPPORTED_DISPOSABLE_VM_ROUTE_IDENTIFIED_MISSING_BASE_IMAGE_AND_EXACT_FIXTURE_HARNESS",
+  "supported_execution_option": "Task-owned QEMU/KVM systemd VM with its own guest kernel, CPU/memory/absolute-runtime bounds, a private disk overlay, no host-directory mounts, no real credentials and no guest networking during native acceptance. Only QEMU is a UID1000 host process; root operations stay inside the guest. This is a route proposal, not a provisioned or admitted guest."
+}

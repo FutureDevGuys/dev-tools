@@ -1,0 +1,234 @@
+{
+  "candidate_identity_source": "Actual independently reproduced813 artifacts plus genuine signed A/B qualification and fresh cryptographic verify; no constructor authority is simulated.",
+  "executables": {
+    "cc": {
+      "bytes": 1733976,
+      "device": 64770,
+      "inode": 165210,
+      "mode": 493,
+      "path": "/usr/bin/gcc",
+      "selected_alias": "/usr/bin/cc",
+      "sha256": "8aac907d6fbf40394b424b5fa4a2ad1aa291dac7d3a0315c5b415c1f5ace1287",
+      "uid": 0
+    },
+    "ccache": {
+      "bytes": 1485400,
+      "device": 64770,
+      "inode": 134485,
+      "mode": 493,
+      "path": "/usr/bin/ccache",
+      "selected_alias": "/usr/bin/ccache",
+      "sha256": "92247b58bdeb29b7226ca0370bfa838d3d9a5bf995edccf20362d58a4a0c549c",
+      "uid": 0
+    },
+    "linker": {
+      "bytes": 1611760,
+      "device": 64770,
+      "inode": 154926,
+      "mode": 493,
+      "path": "/usr/bin/ld",
+      "selected_alias": "/usr/bin/ld",
+      "sha256": "4d83828f709f0eade25bcae2f4a2508c47db2f01b58daaca5c1c4cefce897847",
+      "uid": 0
+    },
+    "python": {
+      "bytes": 14424,
+      "device": 64770,
+      "inode": 233855,
+      "mode": 493,
+      "path": "/usr/bin/python3.14",
+      "selected_alias": "/usr/bin/python3",
+      "sha256": "375532f83be620283ab780c14ca6bcc5907dc379d2b621de0c5d0a112cf5458b",
+      "uid": 0
+    },
+    "taskset": {
+      "bytes": 30888,
+      "device": 64770,
+      "inode": 146943,
+      "mode": 493,
+      "path": "/usr/bin/taskset",
+      "selected_alias": "/usr/bin/taskset",
+      "sha256": "8bf4947cca932588598aa0b2413f520df438f6964057edff09a112518decc75d",
+      "uid": 0
+    }
+  },
+  "inherited_native_installation": {
+    "completed_steps_never_replayed": [
+      "fresh-release-verify",
+      "candidate-build-info",
+      "own-install"
+    ],
+    "private_case": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance",
+    "settlement": {
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/ACTUAL-NATIVE-ACCEPTANCE-FAILURE-AND-COMPLETE-SETTLEMENT.json",
+      "sha256": "87e60979a9c1d1f497b346030875e775a63fb67203a3868ef820c14bd750e1a9"
+    },
+    "status": {
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance-status.json",
+      "sha256": "778f7babbfced38d0f111b8b6d0ee775b2a3ad7ce184a52959b54f90044b1671"
+    }
+  },
+  "inherited_native_setup": {
+    "baseline_files": {
+      "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/cancel-requested.json": {
+        "bytes": 19,
+        "device": 64772,
+        "gid": 984,
+        "inode": 22043674,
+        "mode": 384,
+        "nlink": 1,
+        "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/cancel-requested.json",
+        "sha256": "fd06b852f213723e45eff83918c1d22d83b103f8bda0a24957fc88acc5fb0ef0",
+        "uid": 1000
+      },
+      "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/config/dev-cache/config.toml": {
+        "bytes": 627,
+        "device": 64772,
+        "gid": 984,
+        "inode": 22043744,
+        "mode": 384,
+        "nlink": 1,
+        "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/config/dev-cache/config.toml",
+        "sha256": "67fbace713d24ba04c40dd2048df23289d236b39f5209474408fa1ee0df76995",
+        "uid": 1000
+      },
+      "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/.dev-cache-root.json": {
+        "bytes": 494,
+        "device": 64772,
+        "gid": 984,
+        "inode": 22043729,
+        "mode": 420,
+        "nlink": 1,
+        "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/.dev-cache-root.json",
+        "sha256": "b77089bc268d6d1654af4f9daca210a2dc03f060aa12fcd1d1804037f6d08374",
+        "uid": 1000
+      },
+      "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/control/root.lock": {
+        "bytes": 0,
+        "device": 64772,
+        "gid": 984,
+        "inode": 22043742,
+        "mode": 384,
+        "nlink": 1,
+        "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/control/root.lock",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "uid": 1000
+      },
+      "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/remaining-cancel-requested.json": {
+        "bytes": 19,
+        "device": 64772,
+        "gid": 984,
+        "inode": 22043745,
+        "mode": 384,
+        "nlink": 1,
+        "path": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/remaining-cancel-requested.json",
+        "sha256": "fd06b852f213723e45eff83918c1d22d83b103f8bda0a24957fc88acc5fb0ef0",
+        "uid": 1000
+      }
+    },
+    "completed_steps_never_replayed": [
+      "idempotent-activate",
+      "init-root",
+      "config-check",
+      "status"
+    ],
+    "observed_status": {
+      "abstentions": [
+        "cargo: disabled by configuration",
+        "sccache: disabled by configuration",
+        "go: disabled by configuration",
+        "npm: disabled by configuration",
+        "pnpm: disabled by configuration",
+        "uv: disabled by configuration",
+        "pip: disabled by configuration",
+        "zig: disabled by configuration",
+        "meson: disabled by configuration",
+        "bun: disabled by configuration",
+        "yarn: disabled by configuration"
+      ],
+      "adapter_versions": {
+        "ccache": "ccache version 4.14.1"
+      },
+      "configured_root": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root",
+      "domain_id": "699b3a33a3154fa7b15cf193ab8c4a52",
+      "effective_paths": {
+        "ccache": [
+          "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/cache/ccache",
+          "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/workspaces/97/978feb9edb3220c01a8cbb7745f8ddb13706890b7a9345b8e9a2d2bf14b5d2f6/temp/ccache"
+        ],
+        "temp": [
+          "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/workspaces/97/978feb9edb3220c01a8cbb7745f8ddb13706890b7a9345b8e9a2d2bf14b5d2f6/temp/generic"
+        ]
+      },
+      "enabled": true,
+      "intercept_directory": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts",
+      "maintenance": null,
+      "maintenance_scope": "not_observed",
+      "override_reasons": [],
+      "path_entries": [
+        "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/data/dev-cache/intercepts",
+        "/usr/bin",
+        "/bin"
+      ],
+      "physical_root_id": "d2f95cd8e6ea412dbec7ad4cba0404eb",
+      "platform": "linux",
+      "provenance": null,
+      "real_executables": {
+        "ccache": "/usr/bin/ccache"
+      },
+      "root_valid": true,
+      "routed_adapters": [
+        "ccache"
+      ],
+      "routing_complete": true,
+      "worktree": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/work",
+      "worktree_cache": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/managed-root/v2/domains/699b3a33a3154fa7b15cf193ab8c4a52/workspaces/97/978feb9edb3220c01a8cbb7745f8ddb13706890b7a9345b8e9a2d2bf14b5d2f6"
+    },
+    "settlement": {
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-corrected-20261018/ACTUAL-REMAINING-NATIVE-FAILURE-AND-COMPLETE-SETTLEMENT.json",
+      "sha256": "5a715b467bc4eba985706b1ea7274b1901e08faca7f2ce476d238e8a7bf175f2"
+    },
+    "status": {
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-corrected-20261018/native-installed-acceptance-status.json",
+      "sha256": "778fd7714b9784c66d2e46b9cb17d407ffb71f70575fdab66e45847f33368e62"
+    }
+  },
+  "native_path": [
+    "/usr/bin",
+    "/bin"
+  ],
+  "payloads": {
+    "outer": {
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/outer-workload.py",
+      "sha256": "4e448ee0e7e49a7267cb7e717a0bc9864b67ad1829dd3e8a1295df4cc009b8ed"
+    },
+    "runner": {
+      "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/dev-cache-native-installed-acceptance.py",
+      "sha256": "16974a0578101a0b9dafc6fb793a5e826e0bbcafb13ac3437b3946df2ceeedc8"
+    }
+  },
+  "plan_path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/NATIVE-INSTALLED-ACCEPTANCE-PLAN.json",
+  "plan_sha256": "0a99da39fcf506ca1177032b1b885a4d1505c85083b081028d5e0528b011e8ac",
+  "preparation_complete": true,
+  "qualified_RA": {
+    "path": "${LOCAL_WORK_ROOT}/sync-configs-e524e11b/release-admin",
+    "sha256": "7a4779b99073692c32fb8856b4f11a1f11ffbdc72d4e87f3f0995ee71e28de22"
+  },
+  "qualified_construction_status_path": "${RELEASE_EVIDENCE_ROOT}/SIGNED-BUNDLE-QUALIFICATION.json",
+  "recorded_utc": "2026-10-18T04:57:53.677110+00:00",
+  "release_root": "${RELEASE_EVIDENCE_ROOT}/signed-bundles",
+  "runtime_candidate_binding": "Existing guard binds actual signed813 candidate A/B identities and source; payload re-verifies signature before any candidate invocation.",
+  "schema": "dev-cache-native-acceptance-identities-v1",
+  "signed_qualification": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/SIGNED-BUNDLE-QUALIFICATION.json",
+    "sha256": "d8dd1b7f9959022e2e722642ae8333dc50eae760e4916c43550b9eb4b4bf5c35"
+  },
+  "source_commit": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "tool_probe_kind": "Resolved root-owned native ELF regular-file metadata and SHA256 only; no tool execution/compiler/auth/resource probe",
+  "trusted_public_key": "${QUALIFIED_SOURCE_ROOT}/crates/update-all/trust/root-public-key.txt",
+  "trusted_public_key_sha256": "034adb19bd28ee666fbcd8c8d3ed491c0e4412d6c53f598e5d0e84dc13b33005",
+  "workload_or_case_created": false,
+  "wrapper_turn_path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/native-acceptance-turn.json",
+  "wrapper_unit": "devtools-cache013-81338f23-native-status-remaining.service"
+}

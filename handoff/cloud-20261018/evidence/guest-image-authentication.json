@@ -1,0 +1,27 @@
+{
+  "downloaded_public_key_fingerprints": [
+    "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+  ],
+  "gpgv_exit": 0,
+  "guest_glibc": "2.39-0ubuntu8.9",
+  "image_sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
+  "image_url": "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img",
+  "independently_documented_signer_fingerprint": "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+  "manifest_authenticated_against_signed_sums": true,
+  "metadata_files": {
+    "SHA256SUMS": "0449a33b78dddb301a3ce2b80398984bc3e1f7880e27b86a31e58bdcbd3d3816",
+    "SHA256SUMS.gpg": "68aae716a548e466e58afddd8b767c54c791f40f1d20d1d12e27c471edb535e5",
+    "ubuntu-24.04-server-cloudimg-amd64.manifest": "78d7da6ab1556daa6c0f685bf4e0e3da36395f170e8fad411d7ba032f14d08c2",
+    "ubuntu-cloud-image-keyring.gpg": "80347fcd3a3de83cff782b9de657b48394b49ad83887268445a54d5beee69b4e",
+    "ubuntu-cloud-image-signing-public-key.asc": "927138de292fac4d861105a052cf56e9c5921987da385c844d88f34d19b39ab0"
+  },
+  "no_image_download_guest_boot_harness_build_product_or_host_keyring_policy_change": true,
+  "public_key_url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xD2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+  "recorded_utc": "2026-10-18T05:09:41.418032+00:00",
+  "required_guest_followthrough": "Base manifest includes systemd,sudo,git and useradd/passwd. gh is absent and must be supplied inside the disposable guest through authenticated guest package input for privilege-only cases requiring its native integration. Guest image must still be downloaded and digest-verified before use.",
+  "state": "OFFICIAL_AUTHENTICATED_IMAGE_SOURCE_AND_PACKAGE_MANIFEST_IDENTIFIED_IMAGE_NOT_DOWNLOADED",
+  "valid_signature_records": [
+    "[GNUPG:] VALIDSIG D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81 2026-10-17 1792269190 0 4 0 1 10 00 D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+  ],
+  "vendor_documentation_url": "https://ubuntu.com/docs/public-images/public-images-how-to/verify-image-checksum/"
+}

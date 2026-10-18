@@ -1,4 +1,17 @@
-# Active work
+# Current transfer checkpoint — 2026-10-18
+
+Implementation/native work is paused for the requested Git transfer. Read [the cloud handoff](handoffs/devtools-cloud-20261018.md) before resuming. Qualified source is signed commit `81338f23a8cf45c30caf3e95937b8d42c6ee8e0e` / tree `dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f`; handoff-only changes do not change the retained artifacts' source identity.
+
+- Independent A/B construction and both signed bundle verifications passed for Dev Auth 0.5.3, Dev Cache 0.1.13 and Sync Configs 0.3.2. Source/build, native, installed and released claims remain separate.
+- Sync Configs 0.3.2 passed private lifecycle, twelve native recovery cases, supported live installation/repeat and normal publication. The signed tag and all three public downloaded assets were independently verified. Its native/foreground clients are fully settled.
+- Dev Cache 0.1.13 remains signed/private-lifecycle qualified, with corrected remaining native coordination acceptance unrun and explicitly held for parent resource disposition. Two task-observer failures are preserved. Host Cache remains 0.1.12; live 0.1.13 and publication remain pending.
+- Dev Auth 0.5.3 remains signed/public-intake qualified. Exact signed inputs, an authenticated official guest-image source and a source-matched binary-harness build recipe are preserved. The harness/guest/Strong native gates have not run; host Dev Auth remains 0.5.2. Publication and supported Strong upgrade remain pending.
+- Austin's real UpdateAll 0.1.14 failure audit is unfinished. Several real child errors are recorded, including Cache busy refusals and older Sync metadata rejection, but the runner's launch/scheduling/resource/timeout/reporting responsibility is not yet established. Do not treat it as cleared or repair unrelated private callers as a substitute.
+- Preserve draft PR 68 and the accepted full Dev Auth completion plan. No broad tests/lint/hosted CI, machine policy changes, stale request/clock reuse or unqualified platform-support claims.
+
+The entries below are the prior historical checkpoint, not the current installed/version inventory.
+
+# Historical checkpoint
 
 - Exact Dev Auth 0.4.1/generation 25 and Dev Cache 0.1.11/generation 12 candidates from `732bf3a` are signed, independently reproducible and offline-verified. Preserve their immutable identities and the prior release sets.
 - Dev Cache is installed on the user's Linux computer at 0.1.11/generation 12. The complete signed offline-intake recipe passed 96 invocations: fresh/repeat, upgrade/repeat, rollback both ways, routing, doctor, delegation, rejection/collisions and four calibrated interruption/recovery cases, with no network syscalls. Host activation verified all 29 intercepts, six doctor checks and fresh repository discovery; prior 0.1.10 is retained for supported rollback. Configuration, storage authority and installed Update All are unchanged. Preserve anti-rollback history; this does not establish other-platform acceptance or a new Update All release.

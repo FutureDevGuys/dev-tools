@@ -1,0 +1,710 @@
+"""One task-local native acceptance payload; its owner supplies the 600+60 turn.
+
+No admission, resource policy, lock acquisition, authentication, release building,
+publication or host-install mutation lives here. All subprocess output is public
+release/product/fixture output. The independent wrapper owns final cgroup cleanup.
+"""
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+E = Path('${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018')
+TIP = '81338f23a8cf45c30caf3e95937b8d42c6ee8e0e'
+TREE = 'dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f'
+PLAN_SHA = '0a99da39fcf506ca1177032b1b885a4d1505c85083b081028d5e0528b011e8ac'
+PLAN = E / 'NATIVE-INSTALLED-ACCEPTANCE-PLAN.json'
+CASE = Path('${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance')
+STATUS = E / 'native-installed-acceptance-status.json'
+SOURCE_GOOD = b'#include <stdio.h>\nint main(void) { puts("dev-cache-013-native-ok"); return 0; }\n'
+SOURCE_BAD = b'#error dev_cache_013_expected_native_failure\n'
+CAP = 1024 * 1024
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_file(path, limit=CAP, private=False):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > limit
+                or info.st_mode & 0o022
+                or (private and info.st_uid != os.getuid())):
+            raise RuntimeError('input_file_custody')
+        data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise RuntimeError('input_file_bound')
+        return data
+
+
+def read_json(path, private=False):
+    data = read_file(path, private=private)
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise RuntimeError('metadata_object_required')
+    return value, digest(data)
+
+
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + '.' + str(os.getpid()) + '.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, sort_keys=True, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_new(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def private_directory(path, create=False):
+    if create:
+        path.mkdir(mode=0o700)
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700 or path.resolve() != path):
+        raise RuntimeError('case_directory_custody')
+
+
+def unified_cgroup(pid='self'):
+    rows = [line for line in (Path('/proc') / str(pid) / 'cgroup').read_text().splitlines()
+            if line.startswith('0::')]
+    if len(rows) != 1:
+        raise RuntimeError('unified_cgroup_absent_or_ambiguous')
+    return rows[0]
+
+
+def proc_identity(pid):
+    try:
+        raw = Path('/proc') / str(pid)
+        text = (raw / 'stat').read_text()
+        tail = text[text.rfind(')') + 2:].split()
+        return {'pid': pid, 'start': int(tail[19]), 'uid': raw.stat().st_uid,
+                'state': tail[0], 'cgroup': unified_cgroup(pid)}
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def require_tool(record):
+    path = Path(record['path'])
+    if not path.is_absolute() or path.resolve() != path:
+        raise RuntimeError('native_tool_path')
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        expected = (record['device'], record['inode'], record['uid'], record['mode'], record['bytes'])
+        actual = (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode), info.st_size)
+        if (not stat.S_ISREG(info.st_mode) or actual != expected
+                or info.st_mode & 0o022 or not info.st_mode & 0o111
+                or hashlib.file_digest(stream, 'sha256').hexdigest() != record['sha256']):
+            raise RuntimeError('native_tool_identity_changed')
+    alias = Path(record['selected_alias'])
+    if not alias.is_absolute() or alias.resolve() != path:
+        raise RuntimeError('native_tool_alias_changed')
+    return str(path)
+
+
+class Job:
+    """Bounded public stream capture with explicit direct-child ownership."""
+    def __init__(self, owner, label, argv, env, interactive=False):
+        owner.check()
+        self.owner, self.label = owner, label
+        self.stage = {'label': label, 'argv': argv, 'state': 'running',
+                      'started_monotonic': time.monotonic(), 'reaped': False}
+        self.output = {'stdout': bytearray(), 'stderr': bytearray()}
+        self.hashes = {name: hashlib.sha256() for name in self.output}
+        self.counts = {name: 0 for name in self.output}
+        self.events, self.line_buffer = [], bytearray()
+        self.interactive = interactive
+        self.process = None
+        self.selector = selectors.DefaultSelector()
+        try:
+            self.process = subprocess.Popen(argv, cwd=owner.work, env=env,
+                                            stdin=subprocess.PIPE if interactive else subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.stage['pid'] = self.process.pid
+            owner.jobs.append(self)
+            owner.state['stages'].append(self.stage)
+            for name in self.output:
+                pipe = getattr(self.process, name)
+                os.set_blocking(pipe.fileno(), False)
+                self.selector.register(pipe, selectors.EVENT_READ, name)
+            owner.save()
+        except BaseException:
+            if self.process is None:
+                self.selector.close()
+            raise
+
+    def pump(self, interval=0.1):
+        for key, _ in self.selector.select(interval):
+            try:
+                data = os.read(key.fd, 65536)
+            except BlockingIOError:
+                continue
+            if not data:
+                self.selector.unregister(key.fileobj)
+                key.fileobj.close()
+                continue
+            name = key.data
+            self.counts[name] += len(data)
+            self.hashes[name].update(data)
+            room = max(0, CAP - len(self.output[name]))
+            self.output[name].extend(data[:room])
+            if self.interactive and name == 'stdout':
+                self.line_buffer.extend(data)
+                if len(self.line_buffer) > CAP:
+                    raise RuntimeError('outer_protocol_line_bound')
+                while b'\n' in self.line_buffer:
+                    line, _, rest = self.line_buffer.partition(b'\n')
+                    self.line_buffer = bytearray(rest)
+                    if len(self.events) >= 24:
+                        raise RuntimeError('outer_protocol_event_bound')
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise RuntimeError('outer_protocol_object_required')
+                    self.events.append(event)
+
+    def terminal(self):
+        return self.process.poll() is not None and not self.selector.get_map()
+
+    def finish_record(self):
+        if not self.terminal():
+            return False
+        code = self.process.wait()
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        self.selector.close()
+        self.stage.update(exit=code, reaped=True, state='exited',
+                          finished_monotonic=time.monotonic(),
+                          streams={name: {'bytes': self.counts[name],
+                                          'sha256': self.hashes[name].hexdigest(),
+                                          'truncated': self.counts[name] > CAP,
+                                          'prefix_base64': base64.b64encode(self.output[name]).decode('ascii')}
+                                   for name in self.output})
+        self.owner.save()
+        return True
+
+    def wait(self, seconds):
+        limit = min(self.owner.deadline, time.monotonic() + seconds)
+        while not self.terminal():
+            self.owner.check()
+            if time.monotonic() >= limit:
+                raise RuntimeError('public_command_deadline')
+            self.pump()
+        self.finish_record()
+        if any(self.counts[name] > CAP for name in self.output):
+            raise RuntimeError('public_command_output_bound')
+        return self.process.returncode
+
+    def event(self, expected):
+        while True:
+            self.owner.check()
+            if self.events:
+                value = self.events.pop(0)
+                if value.get('event') != expected:
+                    raise RuntimeError('outer_protocol_unexpected_event')
+                return value
+            if self.terminal():
+                self.finish_record()
+                raise RuntimeError('outer_ended_before_gate')
+            self.pump()
+
+    def gate(self, value):
+        self.owner.check()
+        data = value.encode('ascii') + b'\n'
+        if os.write(self.process.stdin.fileno(), data) != len(data):
+            raise RuntimeError('outer_gate_write')
+
+
+class Acceptance:
+    def __init__(self, identities_path, turn_path):
+        self.identities_path, self.turn_path = identities_path, turn_path
+        self.bindings, self.bindings_sha = read_json(identities_path, private=True)
+        self.turn, self.turn_sha = read_json(turn_path, private=True)
+        self.state = {'schema': 'dev-cache-native-installed-acceptance-v1',
+                      'product': 'dev-cache', 'version': '0.1.13',
+                      'source_commit': TIP, 'source_tree': TREE,
+                      'state': 'preflight', 'stages': [], 'journeys': [],
+                      'all_direct_clients_reaped': False, 'all_owned_descendants_settled': False,
+                      'managed_host_install_run': False, 'native_auth_run': False,
+                      'tests_or_lint_run': False, 'clock_created_or_extended': False,
+                      'identities_sha256': self.bindings_sha, 'turn_sha256': self.turn_sha}
+        self.jobs, self.cancelled, self.started, self.case_created = [], False, False, False
+        self.deadline = float(self.turn['execution_deadline_monotonic'])
+        self.final_deadline = float(self.turn['final_deadline_monotonic'])
+        self.work = CASE / 'work'
+        self.root = CASE / 'managed-root'
+        self.config = CASE / 'config/dev-cache/config.toml'
+        self.bin_dir = CASE / 'home/.local/bin'
+        self.intercepts = CASE / 'data/dev-cache/intercepts'
+        self.installed = self.bin_dir / 'dev-cache'
+        self.cancel_path = CASE / 'status-remaining-cancel-requested.json'
+
+    def save(self):
+        if self.started:
+            self.state['updated_utc'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            atomic_json(STATUS, self.state)
+
+    def check(self, settlement=False):
+        current, checksum = read_json(self.turn_path, private=True)
+        now = time.monotonic()
+        if (checksum != self.turn_sha or current != self.turn
+                or self.turn.get('owner') != 'DevTools' or self.turn.get('source') != TIP
+                or self.turn.get('tree') != TREE or self.turn.get('state') != 'running'
+                or self.turn.get('execution_seconds') != 600 or self.turn.get('settlement_seconds') != 60
+                or self.turn.get('compiler_lock_acquired') is not True
+                or self.turn.get('admitted') is not True
+                or self.turn.get('boot_id') != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                or not math.isfinite(self.deadline) or not math.isfinite(self.final_deadline)
+                or not 0 < self.deadline - float(self.turn['reservation_acquired_monotonic']) <= 600.5
+                or not 0 < self.final_deadline - self.deadline <= 60.5):
+            raise RuntimeError('immutable_acceptance_allocation_invalid')
+        group_text = unified_cgroup()
+        if group_text != self.turn['cgroup'] or group_text != '0::' + self.turn['cgroup_path']:
+            raise RuntimeError('owned_cgroup_changed')
+        group = Path('/sys/fs/cgroup' + self.turn['cgroup_path'])
+        info = group.stat()
+        if (info.st_dev, info.st_ino) != (self.turn['cgroup_device'], self.turn['cgroup_inode']):
+            raise RuntimeError('owned_cgroup_identity_changed')
+        wrapper = proc_identity(self.turn['wrapper_pid'])
+        if (wrapper is None or wrapper['start'] != self.turn['wrapper_start']
+                or wrapper['uid'] != os.getuid() or wrapper['cgroup'] != group_text
+                or os.getppid() != wrapper['pid']):
+            raise RuntimeError('owned_wrapper_changed')
+        if not settlement and (self.cancelled or now >= self.deadline):
+            raise RuntimeError('acceptance_cancelled_or_deadline')
+
+    def no_descendants(self):
+        self.check(settlement=True)
+        group = Path('/sys/fs/cgroup' + self.turn['cgroup_path'])
+        members = {int(value) for value in (group / 'cgroup.procs').read_text().split()}
+        return members <= {os.getpid(), self.turn['wrapper_pid']}
+
+    def run(self, label, argv, expect=0, seconds=30, json_result=True, env=None):
+        job = Job(self, label, argv, self.env if env is None else env)
+        code = job.wait(seconds)
+        if code != expect:
+            raise RuntimeError('unexpected_exit_' + label)
+        if json_result:
+            result = json.loads(bytes(job.output['stdout']))
+            if not isinstance(result, dict):
+                raise RuntimeError('response_object_' + label)
+            job.stage['response'] = result
+            self.save()
+            return result
+        return job
+
+    def product(self, label, args, **kwargs):
+        return self.run(label, [str(self.installed), '--config', str(self.config), '--json'] + args, **kwargs)
+
+    def prepare(self):
+        self.check()
+        b = self.bindings
+        if (b.get('schema') != 'dev-cache-native-acceptance-identities-v1'
+                or b.get('source_commit') != TIP or b.get('source_tree') != TREE
+                or digest(read_file(PLAN, private=True)) != PLAN_SHA or b.get('plan_sha256') != PLAN_SHA):
+            raise RuntimeError('frozen_plan_or_bindings_changed')
+        for key in ('python', 'cc', 'ccache', 'linker', 'taskset'):
+            require_tool(b['executables'][key])
+        for key, filename in (('runner', 'dev-cache-native-installed-acceptance.py'), ('outer', 'outer-workload.py')):
+            record = b['payloads'][key]
+            if Path(record['path']) != E / filename or digest(read_file(record['path'], private=True)) != record['sha256']:
+                raise RuntimeError('payload_identity_changed')
+        if Path(sys.executable).resolve() != Path(b['executables']['python']['path']):
+            raise RuntimeError('native_python_identity_changed')
+        native_dirs = b['native_path']
+        if (native_dirs != ['/usr/bin', '/bin']
+                or Path(shutil.which('cc', path=os.pathsep.join(native_dirs)) or '').resolve()
+                != Path(b['executables']['cc']['path'])
+                or Path(shutil.which('ccache', path=os.pathsep.join(native_dirs)) or '').resolve()
+                != Path(b['executables']['ccache']['path'])):
+            raise RuntimeError('native_path_selection_changed')
+        candidate = self.turn['candidate']
+        expected = E.parent / 'signed-bundles/candidate-a/releases/dev-cache/dev-cache-0.1.13-linux-x86_64'
+        self.candidate = Path(candidate['path'])
+        q = self.turn['qualification']
+        if (self.candidate != expected or q.get('verified') is not True
+                or q.get('product') != 'dev-cache' or q.get('version') != '0.1.13'
+                or q.get('source_commit') != TIP
+                or not all(re.fullmatch('[0-9a-f]{64}', q.get(key, '')) for key in ('root_sha256', 'manifest_sha256'))):
+            raise RuntimeError('qualified_candidate_binding')
+        data = read_file(self.candidate, limit=64 * 1024**2, private=True)
+        if len(data) != candidate['bytes'] or digest(data) != candidate['sha256']:
+            raise RuntimeError('qualified_candidate_bytes_changed')
+        release = self.candidate.parent
+        for key, name in (('root_sha256', 'dev-tools-root.json'), ('manifest_sha256', 'dev-cache-stable.json')):
+            if digest(read_file(release / name, private=True)) != q[key]:
+                raise RuntimeError('qualified_candidate_metadata_changed')
+        if STATUS.exists() or STATUS.is_symlink():
+            raise RuntimeError('remaining_acceptance_already_started_no_retry')
+        private_directory(E)
+        private_directory(CASE)
+        original_record = b['inherited_native_installation']['status']
+        original, checksum = read_json(Path(original_record['path']), private=True)
+        if (checksum != original_record['sha256'] or original.get('source_commit') != TIP
+                or original.get('source_tree') != TREE
+                or original.get('failure') != 'installed_file_custody_changed'
+                or original.get('all_direct_clients_reaped') is not True
+                or original.get('all_owned_descendants_settled') is not True
+                or [(s.get('label'), s.get('exit'), s.get('reaped')) for s in original['stages']]
+                != [('fresh-release-verify', 0, True), ('candidate-build-info', 0, True), ('own-install', 0, True)]):
+            raise RuntimeError('inherited_native_installation_proof_changed')
+        settled = b['inherited_native_installation']['settlement']
+        if digest(read_file(Path(settled['path']), private=True)) != settled['sha256']:
+            raise RuntimeError('original_scope_settlement_changed')
+        setup_binding = b['inherited_native_setup']
+        setup, setup_sha = read_json(Path(setup_binding['status']['path']), private=True)
+        if (setup_sha != setup_binding['status']['sha256']
+                or setup.get('source_commit') != TIP or setup.get('source_tree') != TREE
+                or setup.get('failure') != 'installed_routing_not_active'
+                or setup.get('all_direct_clients_reaped') is not True
+                or setup.get('all_owned_descendants_settled') is not True
+                or [(stage.get('label'), stage.get('exit'), stage.get('reaped')) for stage in setup['stages']]
+                != [('idempotent-activate', 0, True), ('init-root', 0, True),
+                    ('config-check', 0, True), ('status', 0, True)]):
+            raise RuntimeError('inherited_native_setup_proof_changed')
+        settled_setup = setup_binding['settlement']
+        if digest(read_file(Path(settled_setup['path']), private=True)) != settled_setup['sha256']:
+            raise RuntimeError('inherited_native_setup_settlement_changed')
+        for name, expected_file in setup_binding['baseline_files'].items():
+            leaf = Path(name)
+            leaf.relative_to(CASE)
+            info = leaf.lstat()
+            actual = (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                      stat.S_IMODE(info.st_mode), info.st_nlink, info.st_size)
+            expected_file_identity = tuple(expected_file[key] for key in
+                    ('device', 'inode', 'uid', 'gid', 'mode', 'nlink', 'bytes'))
+            if (not stat.S_ISREG(info.st_mode) or actual != expected_file_identity
+                    or digest(read_file(leaf, private=True)) != expected_file['sha256']):
+                raise RuntimeError('inherited_private_state_custody_changed')
+        private_directory(self.root)
+        for relative in ('home', 'home/.local', 'home/.local/bin', 'config', 'config/dev-cache',
+                         'data', 'data/dev-cache', 'state', 'cache', 'runtime', 'work'):
+            private_directory(CASE / relative)
+        if (read_file(self.work / 'success.c', private=True) != SOURCE_GOOD
+                or read_file(self.work / 'failure.c', private=True) != SOURCE_BAD
+                or digest(read_file(CASE / 'outer-workload.py', private=True))
+                != '507310cc2228d9ffb4adca35bd04860957a290a2225cf6174fac0e8341166d41'
+                or self.cancel_path.exists() or self.cancel_path.is_symlink()):
+            raise RuntimeError('inherited_private_fixture_inputs_changed')
+        fd = os.open(STATUS, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        self.started = True
+        self.state.update(state='running', execution_deadline_monotonic=self.deadline,
+                          final_deadline_monotonic=self.final_deadline,
+                          candidate=candidate, preceding_qualification=q,
+                          inherited_successful_stages=original['stages'] + setup['stages'],
+                          original_failure_and_scope_preserved=True,
+                          own_install_replayed=False)
+        self.save()
+        self.case_created = True
+        self.env = {'HOME': str(CASE / 'home'), 'XDG_CONFIG_HOME': str(CASE / 'config'),
+                    'XDG_DATA_HOME': str(CASE / 'data'), 'XDG_STATE_HOME': str(CASE / 'state'),
+                    'XDG_CACHE_HOME': str(CASE / 'cache'), 'XDG_RUNTIME_DIR': str(CASE / 'runtime'),
+                    'DEV_CACHE_CONFIG': str(self.config), 'PATH': str(self.intercepts) + ':/usr/bin:/bin',
+                    'LC_ALL': 'C', 'LANG': 'C'}
+        before = dict(self.env, PATH='/usr/bin:/bin')
+        installation = original['stages'][2]['response']
+        # DevCache deliberately uses hard links, with a copy fallback, for its
+        # activated intercepts. Account for every link through admitted names.
+        if installation.get('installed') != str(self.installed):
+            raise RuntimeError('installed_path_changed')
+        targets = installation.get('activation', {}).get('targets')
+        if (not isinstance(targets, list) or not targets
+                or any(not isinstance(name, str) for name in targets)
+                or len(set(targets)) != len(targets)):
+            raise RuntimeError('installed_intercept_set_invalid')
+        aliases = [Path(name) for name in targets]
+        if (any(alias.parent != self.intercepts or alias.name in ('', '.', '..') for alias in aliases)
+                or not {'cc', 'ccache'} <= {alias.name for alias in aliases}):
+            raise RuntimeError('installed_intercept_scope_changed')
+        groups = {}
+        for leaf in [self.installed, *aliases]:
+            info = leaf.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o755):
+                raise RuntimeError('installed_file_custody_changed')
+            if digest(read_file(leaf, limit=64 * 1024**2, private=True)) != candidate['sha256']:
+                raise RuntimeError('installed_bytes_changed')
+            groups.setdefault((info.st_dev, info.st_ino), []).append((leaf, info.st_nlink))
+        for leaves in groups.values():
+            if any(nlink != len(leaves) for _, nlink in leaves):
+                raise RuntimeError('installed_unaccounted_hardlink')
+        # A copy fallback need not share an inode. Every admitted intercept
+        # above is an owned ordinary executable with exact signed bytes.
+        # The previous scope completed activation, root initialization and
+        # config validation. Adopt those exact settled outputs; never replay.
+        plan, _ = read_json(PLAN, private=True)
+        expected_config = plan['configuration']['content_template'].replace('${ROOT}', str(self.root)).encode('utf-8')
+        if read_file(self.config, private=True) != expected_config:
+            raise RuntimeError('inherited_configuration_changed')
+        status = self.product('status-admission-recheck', ['status'])
+        self.validate_status(status)
+        domain = status.get('domain_id')
+        if not isinstance(domain, str) or not re.fullmatch('[0-9a-f]{32}', domain):
+            raise RuntimeError('observed_root_domain')
+        self.control = self.root / 'v2/domains' / domain / 'control'
+        self.root_lock = self.control / 'root.lock'
+        info = self.root_lock.lstat()
+        self.lock_identity = (info.st_dev, info.st_ino)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or (self.control / 'last-automatic-gc.json').exists()):
+            raise RuntimeError('fresh_root_maintenance_baseline')
+        for directory in ('resources', 'gc-journal'):
+            if list((self.control / directory).iterdir()):
+                raise RuntimeError('unrun_native_workload_baseline_changed')
+        self.assert_idle()
+
+    def validate_status(self, status):
+        expected = self.bindings['inherited_native_setup']['observed_status']
+        if (status.get('enabled') is not True or status.get('root_valid') is not True
+                or status.get('routing_complete') is not True
+                or status.get('configured_root') != str(self.root)
+                or status.get('worktree') != str(self.work)
+                or status.get('intercept_directory') != str(self.intercepts)
+                or 'ccache' not in status.get('routed_adapters', [])
+                or status.get('real_executables', {}).get('ccache')
+                    != self.bindings['executables']['ccache']['path']):
+            raise RuntimeError('installed_routing_not_active')
+        for key in ('domain_id', 'physical_root_id', 'worktree_cache', 'effective_paths'):
+            if status.get(key) != expected.get(key):
+                raise RuntimeError('inherited_route_identity_changed')
+        domain = status.get('domain_id')
+        if not isinstance(domain, str) or not re.fullmatch('[0-9a-f]{32}', domain):
+            raise RuntimeError('observed_root_domain')
+        domain_root = self.root / 'v2/domains' / domain
+        workspace = Path(status.get('worktree_cache', '/invalid'))
+        if (not workspace.is_relative_to(domain_root / 'workspaces')
+                or status.get('effective_paths') != {
+                    'ccache': [str(domain_root / 'cache/ccache'), str(workspace / 'temp/ccache')],
+                    'temp': [str(workspace / 'temp/generic')]}):
+            raise RuntimeError('native_effective_paths_changed')
+
+    def assert_idle(self):
+        self.check()
+        if list((self.control / 'leases').iterdir()) or not self.no_descendants():
+            raise RuntimeError('owned_foreground_work_not_settled')
+
+    def snapshot(self, sentinel):
+        self.check()
+        path = Path(sentinel['path'])
+        path.relative_to(self.root)
+        data = read_file(path, private=True)
+        info = path.lstat()
+        if digest(data) != sentinel['sha256']:
+            raise RuntimeError('sentinel_changed')
+        lock = self.root_lock.lstat()
+        if (lock.st_dev, lock.st_ino) != self.lock_identity:
+            raise RuntimeError('stable_root_lock_replaced')
+        records = {}
+        for directory in ('leases', 'resources'):
+            entries = list((self.control / directory).iterdir())
+            if len(entries) > 64:
+                raise RuntimeError('task_metadata_count_bound')
+            records[directory] = {entry.name: digest(read_file(entry, private=True)) for entry in sorted(entries)}
+        if not records['leases']:
+            raise RuntimeError('outer_lease_not_active')
+        return {'sentinel_sha256': digest(data), 'sentinel_device': info.st_dev,
+                'sentinel_inode': info.st_ino, 'root_lock_identity': list(self.lock_identity),
+                'metadata': records}
+
+    def observe_gate(self, mode, gate, sentinel):
+        before = self.snapshot(sentinel)
+        if gate == 'after-nested':
+            routed = {}
+            for name in before['metadata']['resources']:
+                record, _ = read_json(self.control / 'resources' / name, private=True)
+                if record.get('adapter') == 'ccache':
+                    routed[record.get('kind')] = record
+            if not {'ccache-local', 'ccache-temp'} <= set(routed) or any(
+                    not isinstance(routed[kind].get('last_completed_unix'), int)
+                    for kind in ('ccache-local', 'ccache-temp')):
+                raise RuntimeError('nested_native_route_completion_not_observed')
+        busy = self.product(mode + '-' + gate + '-busy', ['gc', '--apply'], expect=12, seconds=10, json_result=False)
+        if b'busy' not in bytes(busy.output['stderr']) or self.snapshot(sentinel) != before:
+            raise RuntimeError('applied_gc_not_nonmutating_busy')
+        preview = self.product(mode + '-' + gate + '-preview', ['gc'], seconds=10)
+        if (preview.get('applied') is not False or preview.get('complete') is not True
+                or preview.get('failures') != []
+                or not any(item.get('reason') == 'resource is held by an active routed command'
+                           and Path(sentinel['path']).is_relative_to(Path(item.get('path', '/invalid')))
+                           for item in preview.get('abstentions', []))
+                or self.snapshot(sentinel) != before):
+            raise RuntimeError('active_preview_protection_failed')
+        self.state['journeys'].append({'mode': mode, 'gate': gate, 'before_after_unchanged': before})
+        self.save()
+
+    def outer(self, mode):
+        argv = [str(self.installed), '--config', str(self.config), 'exec', 'temp', '--',
+                self.bindings['executables']['python']['path'], '-u', str(E / 'outer-workload.py'), mode,
+                '--case', str(CASE), '--cc', str(self.intercepts / 'cc'),
+                '--real-cc', self.bindings['executables']['cc']['selected_alias'],
+                '--deadline-monotonic', repr(self.deadline),
+                '--settlement-deadline-monotonic', repr(self.final_deadline)]
+        job = Job(self, mode + '-outer', argv, self.env, interactive=True)
+        first = job.event('READY_BEFORE_NESTED')
+        identity = proc_identity(first['pid'])
+        if (first.get('mode') != mode or first.get('uid') != os.getuid() or identity is None
+                or identity['cgroup'] != self.turn['cgroup']):
+            raise RuntimeError('outer_identity_gate')
+        sentinel = first['sentinel']
+        self.observe_gate(mode, 'before-nested', sentinel)
+        job.gate('release-before-nested')
+        second = job.event('READY_AFTER_NESTED')
+        if (second.get('pid') != first['pid'] or second.get('mode') != mode
+                or second.get('children_settled') is not True or second.get('sentinel') != sentinel):
+            raise RuntimeError('nested_settlement_gate')
+        self.observe_gate(mode, 'after-nested', sentinel)
+        job.gate('release-after-nested')
+        complete = job.event('COMPLETE')
+        code = job.wait(30)
+        if complete.get('children_settled') is not True or complete.get('native_exit') != code:
+            raise RuntimeError('outer_completion_status')
+        self.assert_idle()
+        steps = complete.get('steps')
+        if not isinstance(steps, list) or not steps or any(step.get('reaped') is not True for step in steps):
+            raise RuntimeError('native_steps_not_settled')
+        if mode == 'success':
+            if code != 0 or len(steps) != 3 or any(step.get('exit') != 0 for step in steps):
+                raise RuntimeError('real_compile_link_failed')
+            marker, _ = read_json(self.control / 'last-automatic-gc.json', private=True)
+            if (marker.get('complete') is not True or marker.get('pressure') is not False
+                    or not isinstance(marker.get('last_success_unix'), int) or marker.get('failures') != []):
+                raise RuntimeError('automatic_post_workload_gc_not_complete')
+            self.state['automatic_post_workload_gc'] = marker
+        else:
+            if code <= 0 or len(steps) != 1 or steps[0].get('exit') != code:
+                raise RuntimeError('expected_native_compiler_failure_not_preserved')
+            baseline = self.run('direct-native-failure-baseline',
+                                [self.bindings['executables']['cc']['selected_alias'], '-O0', '-c',
+                                 str(self.work / 'failure.c'), '-o', str(self.work / 'failure.o')],
+                                expect=code, seconds=60, json_result=False,
+                                env=dict(self.env, PATH='/usr/bin:/bin'))
+            for name in ('stdout', 'stderr'):
+                native = steps[0].get(name, {})
+                if (native.get('bytes') != baseline.counts[name]
+                        or native.get('sha256') != baseline.hashes[name].hexdigest()
+                        or native.get('truncated') is not False):
+                    raise RuntimeError('native_failure_diagnostics_changed')
+        applied = self.product(mode + '-post-settlement-gc', ['gc', '--apply'], seconds=30)
+        if (applied.get('applied') is not True or applied.get('complete') is not True
+                or applied.get('failures') != []):
+            raise RuntimeError('normal_gc_not_restored')
+        if not Path(sentinel['path']).is_file() or digest(read_file(sentinel['path'], private=True)) != sentinel['sha256']:
+            raise RuntimeError('normal_policy_removed_public_payload')
+        self.assert_idle()
+        self.state['journeys'].append({'mode': mode, 'outer_exit': code,
+                                       'native_steps': steps, 'all_foreground_children_settled': True,
+                                       'post_settlement_gc': applied})
+        self.save()
+
+    def cleanup(self):
+        if self.case_created and not self.cancel_path.exists():
+            try:
+                write_new(self.cancel_path, b'{"cancelled":true}\n')
+            except OSError:
+                pass
+        for job in self.jobs:
+            if job.process.stdin is not None and not job.process.stdin.closed:
+                job.process.stdin.close()
+        # The helper drains/reaps its exact own compiler groups on EOF/cancel.
+        # Never kill a DevCache owner ahead of an uncertain native descendant.
+        while time.monotonic() < self.final_deadline:
+            pending = [job for job in self.jobs if not job.stage.get('reaped')]
+            unobservable = False
+            for job in pending:
+                try:
+                    job.pump(0.02)
+                    job.finish_record()
+                except json.JSONDecodeError:
+                    # Bad protocol is a failure, but public pipes can still be
+                    # drained without attempting to parse another event.
+                    job.interactive = False
+                    job.line_buffer.clear()
+                    job.stage['protocol_decode_failed'] = True
+                except (OSError, ValueError, RuntimeError):
+                    job.stage['drain_observation_failed'] = True
+                    unobservable = True
+            if not pending or unobservable:
+                break
+        self.state['all_direct_clients_reaped'] = all(job.stage.get('reaped') is True for job in self.jobs)
+        try:
+            self.state['all_owned_descendants_settled'] = self.state['all_direct_clients_reaped'] and self.no_descendants()
+        except (OSError, ValueError, RuntimeError):
+            self.state['all_owned_descendants_settled'] = False
+        self.state['logical_ownership_retained_on_uncertainty'] = not self.state['all_owned_descendants_settled']
+        self.save()
+
+    def execute(self):
+        old = {}
+        try:
+            for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                old[number] = signal.signal(number, lambda *_: setattr(self, 'cancelled', True))
+            self.prepare()
+            self.outer('success')
+            self.outer('failure')
+            self.product('final-full-status', ['status', '--full'])
+            self.assert_idle()
+            self.state.update(state='native_installed_acceptance_passed',
+                              all_direct_clients_reaped=True, all_owned_descendants_settled=True,
+                              logical_ownership_retained_on_uncertainty=False,
+                              deadline_met=time.monotonic() <= self.deadline,
+                              optional_managed_lane='UNRUN_existing_separate_managed_driver')
+            self.save()
+            return 0
+        except BaseException as error:
+            self.state.update(state='stopped', failure_kind=type(error).__name__,
+                              failure=str(error) if isinstance(error, RuntimeError) else 'local_observation_or_operation_failed',
+                              deadline_met=time.monotonic() <= self.deadline)
+            self.cleanup()
+            return 1
+        finally:
+            for number, handler in old.items():
+                signal.signal(number, handler)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--identities', type=Path, required=True)
+    parser.add_argument('--turn', type=Path, required=True)
+    args = parser.parse_args()
+    os.umask(0o077)
+    if (args.identities != E / 'NATIVE-TOOL-BINDINGS.json'
+            or args.turn != E / 'native-acceptance-turn.json'):
+        print('DevCache acceptance requires its exact prepared identity and turn paths.', file=sys.stderr)
+        return 1
+    try:
+        task = Acceptance(args.identities, args.turn)
+        return task.execute()
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+        # Before owned status creation, never overwrite a previous outcome.
+        print('DevCache native acceptance preflight refused; no new authority or clock created.', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

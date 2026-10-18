@@ -1,0 +1,78 @@
+{
+  "adopts_exact_existing_private_case": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance",
+  "bounds": {
+    "CPU": 0,
+    "automatic_retries": 0,
+    "execution_seconds": 600,
+    "first_failure_stops": true,
+    "jobs": 1,
+    "settlement_seconds": 60,
+    "unchanged_resource_PSI_sharedflock_pidfd_cgroup_guards": true
+  },
+  "execution_root": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018",
+  "existing_quiet_contract": {
+    "active": false,
+    "allocated_scope.operation": "native installed active workload coordination acceptance",
+    "explicitly_released_to": "DevTools",
+    "owner": "DevTools",
+    "released_to": "DevTools",
+    "root_held": false,
+    "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+    "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f"
+  },
+  "existing_resource_guard_does_not_treat_idle_or_passed_source_review_as_admission": true,
+  "future_entry": [
+    "/usr/bin/python3.14",
+    "-I",
+    "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/dev-cache-native-acceptance-entry.py"
+  ],
+  "future_guard_requires_separate_parent_allocation": true,
+  "future_unit": "devtools-cache013-81338f23-native-status-remaining.service",
+  "inherited_passed_steps_never_replayed": [
+    "fresh-release-verify",
+    "candidate-build-info",
+    "own-install",
+    "idempotent-activate",
+    "init-root",
+    "config-check",
+    "status"
+  ],
+  "new_cancel_marker": "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/status-remaining-cancel-requested.json",
+  "no_product_source_or_installed_host_mutation": true,
+  "no_resource_allocation_clock_lock_program_or_acceptance_execution_created": true,
+  "old_cancel_markers_preserved": [
+    "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/cancel-requested.json",
+    "${RELEASE_EVIDENCE_ROOT}/cache-native/native-installed-acceptance/remaining-cancel-requested.json"
+  ],
+  "preceding_consumed_failure": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-corrected-20261018/ACTUAL-REMAINING-NATIVE-FAILURE-AND-COMPLETE-SETTLEMENT.json",
+    "sha256": "5a715b467bc4eba985706b1ea7274b1901e08faca7f2ce476d238e8a7bf175f2"
+  },
+  "programs": {
+    "NATIVE-INSTALLED-ACCEPTANCE-PLAN.json": "0a99da39fcf506ca1177032b1b885a4d1505c85083b081028d5e0528b011e8ac",
+    "NATIVE-TOOL-BINDINGS.json": "cac5a13f5d9b5ec9acdd43b8a689a525bb6f1f475b7492f73f4f88cfcb504c2a",
+    "ROOT-SOURCE-AND-CUSTODY-REVIEW.json": "250c7d67dbd91f290413c2bfb4cfb9ade89ae3b6aad3eaf76614ec36d2198783",
+    "SOURCE-ONLY-REMAINING-PREPARATION.json": "406c081dceb4fb9ef7c52307859e08d8df70d056b60d9e1a1672ded0c98e87dd",
+    "dev-cache-native-acceptance-entry.py": "0cb9d1ee7ea2f82a7feac77ecdc83037077ec243dd7cefa652e0586eb718c4a7",
+    "dev-cache-native-acceptance-entry.py.diff": "c1a56a6be26848c374d4459c28c87be333005d5bbf0e6c95caf9a0bc6c1a50c7",
+    "dev-cache-native-acceptance-guard.py": "fc7efac6e14198a295dd3b03f789713cb33e040d8b1fe469b56ee6e3507b397b",
+    "dev-cache-native-acceptance-guard.py.diff": "38eda63e4ccb23ad62b7ff33c086c8f15f9158e87418c881d8b4a98bb6c76993",
+    "dev-cache-native-installed-acceptance.py": "16974a0578101a0b9dafc6fb793a5e826e0bbcafb13ac3437b3946df2ceeedc8",
+    "dev-cache-native-installed-acceptance.py.diff": "15f705c878bc3e86b011e32551626b4ce8d9f7d610ba4a215a54b361bdbc92da",
+    "outer-workload.py": "4e448ee0e7e49a7267cb7e717a0bc9864b67ad1829dd3e8a1295df4cc009b8ed",
+    "outer-workload.py.diff": "3f70f90d212939b31646079a47750b6362ce973f166b7efb8e8004e8ae218a81"
+  },
+  "recorded_utc": "2026-10-18T04:59:50.886764+00:00",
+  "remaining_work": "Fresh read-only status admission recheck; actual C compile/link/run and expected compiler failure; active nested lease busy12 and nonmutating preview; automatic post-workload maintenance and normal explicit GC after settlement.",
+  "source_head": "81338f23a8cf45c30caf3e95937b8d42c6ee8e0e",
+  "source_preparation": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/SOURCE-ONLY-REMAINING-PREPARATION.json",
+    "sha256": "406c081dceb4fb9ef7c52307859e08d8df70d056b60d9e1a1672ded0c98e87dd"
+  },
+  "source_review": {
+    "path": "${RELEASE_EVIDENCE_ROOT}/cache-native-remaining-status-corrected-20261018/ROOT-SOURCE-AND-CUSTODY-REVIEW.json",
+    "sha256": "250c7d67dbd91f290413c2bfb4cfb9ade89ae3b6aad3eaf76614ec36d2198783"
+  },
+  "source_tree": "dfb53899dbe65bab8f5b9cc6a7a56b28cd928e6f",
+  "state": "FROZEN_REMAINING_ONLY_NATIVE_ACCEPTANCE_READY_UNALLOCATED_UNRUN"
+}

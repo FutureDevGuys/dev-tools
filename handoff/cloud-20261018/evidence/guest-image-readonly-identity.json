@@ -1,0 +1,51 @@
+{
+  "download_receipt": {
+    "bytes": 1496,
+    "device": 64772,
+    "inode": 22043799,
+    "mode": "0o600",
+    "nlink": 1,
+    "path": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/verified-official-image/ACTUAL-IMAGE-DOWNLOAD-AND-CHECKSUM.json",
+    "sha256": "986f87101c540212c881eff5a3d7f2513f344ed17b629dd6d90767cbdfb52b98",
+    "uid": 1000
+  },
+  "qemu_img_info_exit": 0,
+  "qemu_img_metadata": {
+    "actual-size": 621289472,
+    "children": [
+      {
+        "info": {
+          "actual-size": 621289472,
+          "children": [],
+          "dirty-flag": false,
+          "filename": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/verified-official-image/ubuntu-24.04-server-cloudimg-amd64-release-20261017.img",
+          "format": "file",
+          "format-specific": {
+            "data": {},
+            "type": "file"
+          },
+          "virtual-size": 621284352
+        },
+        "name": "file"
+      }
+    ],
+    "cluster-size": 65536,
+    "dirty-flag": false,
+    "filename": "${RELEASE_EVIDENCE_ROOT}/dev-auth-strong-fixture-preparation/verified-official-image/ubuntu-24.04-server-cloudimg-amd64-release-20261017.img",
+    "format": "qcow2",
+    "format-specific": {
+      "data": {
+        "compat": "1.1",
+        "compression-type": "zlib",
+        "corrupt": false,
+        "extended-l2": false,
+        "lazy-refcounts": false,
+        "refcount-bits": 16
+      },
+      "type": "qcow2"
+    },
+    "virtual-size": 3758096384
+  },
+  "readonly_parser_only_no_boot_mount_or_mutation": true,
+  "recorded_utc": "2026-10-18T05:18:53.030703+00:00"
+}
