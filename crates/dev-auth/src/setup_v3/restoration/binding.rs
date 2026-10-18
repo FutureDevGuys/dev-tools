@@ -546,6 +546,92 @@ pub(super) fn binding_restorations(
     Ok(restorations)
 }
 
+struct ShellRestoration {
+    mode: crate::setup::InstallMode,
+    home: PathBuf,
+    uid: u32,
+    alias: String,
+    prior: Option<crate::smart_binding::BindingReceipt>,
+    candidate: Option<crate::smart_binding::BindingReceipt>,
+}
+
+impl ShellRestoration {
+    fn same_generation(&self) -> Result<bool> {
+        Ok(match self.prior.as_ref().zip(self.candidate.as_ref()) {
+            Some((prior, candidate)) => {
+                crate::binding_activation::normalized_binding_receipt(prior)?.active
+                    == crate::binding_activation::normalized_binding_receipt(candidate)?.active
+            }
+            None => false,
+        })
+    }
+    fn observe(&self, retiring: &[(String, crate::smart_binding::BindingReceipt)]) -> Result<()> {
+        if let Some(prior) = &self.prior {
+            if !crate::binding_activation::observe_shell_payload_for_restoration(
+                self.mode,
+                &self.home,
+                self.uid,
+                &self.alias,
+                prior,
+                crate::binding_activation::ShellRestorationObservation::RetainedComplete,
+                retiring,
+            )? {
+                bail!("retained private shell payload is absent during restoration");
+            }
+        }
+        if !self.same_generation()? {
+            if let Some(candidate) = &self.candidate {
+                crate::binding_activation::observe_shell_payload_for_restoration(
+                    self.mode,
+                    &self.home,
+                    self.uid,
+                    &self.alias,
+                    candidate,
+                    crate::binding_activation::ShellRestorationObservation::CandidatePartial,
+                    retiring,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    fn restore(&self, retiring: &[(String, crate::smart_binding::BindingReceipt)]) -> Result<bool> {
+        self.observe(retiring)?;
+        if self.same_generation()? {
+            return Ok(false);
+        }
+        match &self.candidate {
+            Some(candidate) => crate::binding_activation::retire_shell_payload(
+                self.mode,
+                &self.home,
+                self.uid,
+                &self.alias,
+                candidate,
+            ),
+            None => Ok(false),
+        }
+    }
+    fn verify_restored(
+        &self,
+        retiring: &[(String, crate::smart_binding::BindingReceipt)],
+    ) -> Result<()> {
+        self.observe(retiring)?;
+        if !self.same_generation()? {
+            if let Some(candidate) = &self.candidate {
+                if crate::binding_activation::observe_shell_payload(
+                    self.mode,
+                    &self.home,
+                    self.uid,
+                    &self.alias,
+                    candidate,
+                )? {
+                    bail!("candidate private shell source remains after restoration");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,91 +791,5 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         fs::write(&path, b"foreign binding receipt").unwrap();
         assert!(restoration.observe().is_err());
-    }
-}
-
-struct ShellRestoration {
-    mode: crate::setup::InstallMode,
-    home: PathBuf,
-    uid: u32,
-    alias: String,
-    prior: Option<crate::smart_binding::BindingReceipt>,
-    candidate: Option<crate::smart_binding::BindingReceipt>,
-}
-
-impl ShellRestoration {
-    fn same_generation(&self) -> Result<bool> {
-        Ok(match self.prior.as_ref().zip(self.candidate.as_ref()) {
-            Some((prior, candidate)) => {
-                crate::binding_activation::normalized_binding_receipt(prior)?.active
-                    == crate::binding_activation::normalized_binding_receipt(candidate)?.active
-            }
-            None => false,
-        })
-    }
-    fn observe(&self, retiring: &[(String, crate::smart_binding::BindingReceipt)]) -> Result<()> {
-        if let Some(prior) = &self.prior {
-            if !crate::binding_activation::observe_shell_payload_for_restoration(
-                self.mode,
-                &self.home,
-                self.uid,
-                &self.alias,
-                prior,
-                crate::binding_activation::ShellRestorationObservation::RetainedComplete,
-                retiring,
-            )? {
-                bail!("retained private shell payload is absent during restoration");
-            }
-        }
-        if !self.same_generation()? {
-            if let Some(candidate) = &self.candidate {
-                crate::binding_activation::observe_shell_payload_for_restoration(
-                    self.mode,
-                    &self.home,
-                    self.uid,
-                    &self.alias,
-                    candidate,
-                    crate::binding_activation::ShellRestorationObservation::CandidatePartial,
-                    retiring,
-                )?;
-            }
-        }
-        Ok(())
-    }
-    fn restore(&self, retiring: &[(String, crate::smart_binding::BindingReceipt)]) -> Result<bool> {
-        self.observe(retiring)?;
-        if self.same_generation()? {
-            return Ok(false);
-        }
-        match &self.candidate {
-            Some(candidate) => crate::binding_activation::retire_shell_payload(
-                self.mode,
-                &self.home,
-                self.uid,
-                &self.alias,
-                candidate,
-            ),
-            None => Ok(false),
-        }
-    }
-    fn verify_restored(
-        &self,
-        retiring: &[(String, crate::smart_binding::BindingReceipt)],
-    ) -> Result<()> {
-        self.observe(retiring)?;
-        if !self.same_generation()? {
-            if let Some(candidate) = &self.candidate {
-                if crate::binding_activation::observe_shell_payload(
-                    self.mode,
-                    &self.home,
-                    self.uid,
-                    &self.alias,
-                    candidate,
-                )? {
-                    bail!("candidate private shell source remains after restoration");
-                }
-            }
-        }
-        Ok(())
     }
 }

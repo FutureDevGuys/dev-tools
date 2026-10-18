@@ -203,10 +203,13 @@ fn run_fixture_if_requested() {
         let mut command = Command::new(std::env::var_os(FIXTURE_TARGET).unwrap());
         command.arg(std::env::var_os(FIXTURE_MARKER).unwrap());
         exec_barrier::prepare(&mut command).unwrap();
-        let target = command.spawn().unwrap();
+        let target = FixtureChild(command.spawn().unwrap());
         // Native spawn closed its exec-error pipe, but no await_exec call has
         // applied EXITKILL yet. Retain this Child without reaping it.
-        writer.write_all(&target.id().to_ne_bytes()).unwrap();
+        // The guard reaps on an unexpected unwind. The intended scenario keeps
+        // this target held until the outer test SIGKILLs its monitor; waiting
+        // here would invalidate the pre-EXITKILL tracer-death assertion.
+        writer.write_all(&target.0.id().to_ne_bytes()).unwrap();
         loop {
             std::thread::park();
         }

@@ -760,6 +760,10 @@ impl RetainedInstallationRestoration {
     }
 }
 
+pub(crate) fn require_grant_domain_empty() -> Result<()> {
+    service::require_grant_domain_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1570,8 +1574,4 @@ mod tests {
         assert_eq!(fs::read(journal_path).unwrap(), journal_bytes);
         assert!(!restoration.deactivate().unwrap());
     }
-}
-
-pub(crate) fn require_grant_domain_empty() -> Result<()> {
-    service::require_grant_domain_empty()
 }

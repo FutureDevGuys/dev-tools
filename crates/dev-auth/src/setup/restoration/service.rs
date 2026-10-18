@@ -364,6 +364,10 @@ impl RetainedInstallationRestoration {
     }
 }
 
+pub(super) fn require_grant_domain_empty() -> Result<()> {
+    cgroup::require_grant_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,8 +629,4 @@ mod tests {
             "a successful stop request is not terminal domain evidence"
         );
     }
-}
-
-pub(super) fn require_grant_domain_empty() -> Result<()> {
-    cgroup::require_grant_empty()
 }

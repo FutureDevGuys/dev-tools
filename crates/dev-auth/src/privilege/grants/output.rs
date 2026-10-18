@@ -1210,6 +1210,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Both terminal try_wait observations above have already reaped these
+        // children; wait confirms their cached statuses without another wait.
+        relay.wait().unwrap();
+        producer.wait().unwrap();
         let output = counts.observation(true).unwrap();
         assert!(output.limit_exceeded);
         assert_eq!(output.observed.stdout, 33);

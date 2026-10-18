@@ -451,9 +451,42 @@ pub(crate) fn admit(mode: InstallMode) -> Result<InstallationLock> {
     admit_at(&lock, &state_path(&paths), uid)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn try_grant_admission() -> Result<Option<InstallationLock>> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("privilege admission requires its native coordinator");
+    }
+    try_admit_at(
+        &lock_path(DeploymentMode::Strong, None)?,
+        &SetupPaths::strong(),
+        0,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn try_admit_at(
+    lock: &Path,
+    paths: &SetupPaths,
+    owner_uid: u32,
+) -> Result<Option<InstallationLock>> {
+    let Some(lease) = InstallationLock::try_acquire_shared(lock)? else {
+        return Ok(None);
+    };
+    let Some(document) = read_atomic_document(&state_path(paths), &authority(owner_uid))? else {
+        return Ok(None);
+    };
+    let transition = parse(&document.bytes)?;
+    if transition.phase != Phase::Accepted {
+        return Ok(None);
+    }
+    read_generation(paths, owner_uid, &transition)?;
+    Ok(Some(lease))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -478,6 +511,11 @@ mod tests {
         std::fs::remove_file(&generation).unwrap();
         assert!(try_admit_at(&lock, &paths, owner).is_err());
         std::fs::write(&generation, retained).unwrap();
+        // Recreating the retained document must restore its explicit private
+        // mode, independent of the test runner's inherited umask.
+        std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).is_err());
+        std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o600)).unwrap();
         let lease = try_admit_at(&lock, &paths, owner).unwrap().unwrap();
         assert!(InstallationLock::try_acquire(&lock).unwrap().is_none());
         drop(lease);
@@ -840,36 +878,4 @@ mod tests {
         drop(_writer);
         assert!(admit_at(&lock, &state_path(&paths), uid).is_ok());
     }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn try_grant_admission() -> Result<Option<InstallationLock>> {
-    if !nix::unistd::geteuid().is_root() {
-        bail!("privilege admission requires its native coordinator");
-    }
-    try_admit_at(
-        &lock_path(DeploymentMode::Strong, None)?,
-        &SetupPaths::strong(),
-        0,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn try_admit_at(
-    lock: &Path,
-    paths: &SetupPaths,
-    owner_uid: u32,
-) -> Result<Option<InstallationLock>> {
-    let Some(lease) = InstallationLock::try_acquire_shared(lock)? else {
-        return Ok(None);
-    };
-    let Some(document) = read_atomic_document(&state_path(paths), &authority(owner_uid))? else {
-        return Ok(None);
-    };
-    let transition = parse(&document.bytes)?;
-    if transition.phase != Phase::Accepted {
-        return Ok(None);
-    }
-    read_generation(paths, owner_uid, &transition)?;
-    Ok(Some(lease))
 }
