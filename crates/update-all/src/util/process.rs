@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wait_timeout::ChildExt;
 
 use crate::util::cancel;
@@ -804,6 +804,31 @@ struct CapturedOutput {
     stderr: String,
 }
 
+#[derive(Clone, Copy)]
+struct CommandDeadline {
+    started: Instant,
+    timeout: Option<Duration>,
+}
+
+impl CommandDeadline {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.timeout
+            .map(|timeout| timeout.saturating_sub(self.started.elapsed()))
+    }
+
+    fn expired(self) -> bool {
+        self.remaining()
+            .is_some_and(|remaining| remaining.is_zero())
+    }
+}
+
 impl CapturedOutput {
     fn combined(self) -> String {
         let mut output = self.stdout;
@@ -872,6 +897,7 @@ where
         cmd.process_group(0);
     }
 
+    let deadline = CommandDeadline::new(timeout);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", resolved_program.display()))?;
@@ -927,9 +953,9 @@ where
         None
     };
 
-    let status = wait_with_cancel_timeout(
+    let mut status = wait_with_cancel_timeout(
         &mut child,
-        timeout,
+        deadline,
         cancel_check.clone(),
         guard_state.clone(),
     );
@@ -945,15 +971,18 @@ where
     // Retain its observed status, but keep owning cancellation of that group
     // until capture drains and pending input settles; a blocked input writer
     // must not prevent cancel-one from releasing those descendants.
-    if status.is_ok() {
-        wait_for_pipe_readers(
+    if status.is_ok()
+        && wait_for_pipe_readers(
             &mut child,
             managed_process_group,
             [&stdout_reader, &stderr_reader],
             stdin_writer.as_ref(),
             cancel_check.as_ref(),
             guard_state.as_ref(),
-        );
+            deadline,
+        )
+    {
+        status = Err(WaitOutcome::TimedOut);
     }
     if let Some(handle) = stdin_writer {
         let _ = handle.join();
@@ -1055,6 +1084,7 @@ where
         });
     }
 
+    let deadline = CommandDeadline::new(timeout);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", resolved_program.display()))?;
@@ -1094,9 +1124,9 @@ where
         })
     };
 
-    let status = wait_with_cancel_timeout(
+    let mut status = wait_with_cancel_timeout(
         &mut child,
-        timeout,
+        deadline,
         Some(cancel_check.clone()),
         Some(guard_state.clone()),
     );
@@ -1108,15 +1138,18 @@ where
     reader_stop.store(true, Ordering::SeqCst);
 
     let reader = Some(reader);
-    if status.is_ok() {
-        wait_for_pipe_readers(
+    if status.is_ok()
+        && wait_for_pipe_readers(
             &mut child,
             managed_process_group,
             [&reader, &None],
             Some(&stdin_writer),
             Some(&cancel_check),
             Some(&guard_state),
-        );
+            deadline,
+        )
+    {
+        status = Err(WaitOutcome::TimedOut);
     }
     let _ = stdin_writer.join();
     let out_bytes = reader.map(join_pipe_reader).unwrap_or_default();
@@ -1600,13 +1633,18 @@ fn wait_for_pipe_readers(
     stdin_writer: Option<&JoinHandle<()>>,
     cancel_check: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
     guard_state: Option<&Arc<CaptureGuardState>>,
-) {
+    deadline: CommandDeadline,
+) -> bool {
     let mut cleanup_requested = false;
+    let mut timed_out = false;
     while readers
         .iter()
         .any(|reader| reader.as_ref().is_some_and(|handle| !handle.is_finished()))
         || stdin_writer.is_some_and(|handle| !handle.is_finished())
     {
+        if let Some(state) = guard_state {
+            state.mark_stall_if_needed();
+        }
         if !cleanup_requested
             && (cancel::is_cancel_requested()
                 || cancel_check.is_some_and(|cb| cb())
@@ -1614,9 +1652,16 @@ fn wait_for_pipe_readers(
         {
             terminate_child(child, managed_process_group);
             cleanup_requested = true;
+        } else if !cleanup_requested && deadline.expired() {
+            // The direct child's exit does not settle its captured command.
+            // Keep the original deadline through owned descendant I/O cleanup.
+            timed_out = true;
+            terminate_child(child, managed_process_group);
+            cleanup_requested = true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    timed_out
 }
 
 fn join_pipe_reader(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
@@ -1632,12 +1677,11 @@ enum WaitOutcome {
 
 fn wait_with_cancel_timeout(
     child: &mut std::process::Child,
-    timeout: Option<Duration>,
+    deadline: CommandDeadline,
     cancel_check: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     guard_state: Option<Arc<CaptureGuardState>>,
 ) -> std::result::Result<std::process::ExitStatus, WaitOutcome> {
     let slice = Duration::from_millis(200);
-    let mut elapsed = Duration::from_millis(0);
     loop {
         if cancel::is_cancel_requested() || cancel_check.as_ref().is_some_and(|cb| cb()) {
             // A cancellation request cannot erase an already-observable exit.
@@ -1654,14 +1698,14 @@ fn wait_with_cancel_timeout(
                 return Err(WaitOutcome::GuardTriggered(reason));
             }
         }
-        match child.wait_timeout(slice) {
+        let wait_slice = deadline
+            .remaining()
+            .map_or(slice, |remaining| remaining.min(slice));
+        match child.wait_timeout(wait_slice) {
             Ok(Some(s)) => return Ok(s),
             Ok(None) => {
-                elapsed += slice;
-                if let Some(t) = timeout {
-                    if elapsed >= t {
-                        return Err(WaitOutcome::TimedOut);
-                    }
+                if deadline.expired() {
+                    return Err(WaitOutcome::TimedOut);
                 }
             }
             Err(e) => return Err(WaitOutcome::Other(anyhow!(e))),
