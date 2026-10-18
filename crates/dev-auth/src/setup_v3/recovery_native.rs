@@ -10,19 +10,34 @@ use std::os::unix::fs::PermissionsExt;
 #[test]
 #[ignore = "requires an owned disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_initial_staged_recovery() {
-    exercise(true, false);
+    exercise(true, false, false, false);
 }
 
 #[test]
 #[ignore = "requires an owned disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_initial_unstaged_recovery() {
-    exercise(false, false);
+    exercise(false, false, false, false);
 }
 
 #[test]
 #[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_enrolled_workload() {
-    exercise(false, true);
+    exercise(false, true, false, false);
+}
+
+mod binding;
+mod combined_grants;
+
+#[test]
+#[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
+fn native_disposable_full_v5_binding_recovery_and_restoration() {
+    exercise(false, true, false, true);
+}
+
+#[test]
+#[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
+fn native_disposable_combined_credential_grant_upgrade() {
+    exercise(false, true, true, false);
 }
 
 mod signed;
@@ -67,7 +82,7 @@ fn recover(executable: &Path) -> SetupRecoveryReportV1 {
     report
 }
 
-fn exercise(staged: bool, with_workload: bool) {
+fn exercise(staged: bool, with_workload: bool, with_grants: bool, with_bindings: bool) {
     assert_eq!(
         std::env::var("DEV_AUTH_NATIVE_SYSTEMD_FIXTURE").as_deref(),
         Ok("disposable")
@@ -161,6 +176,16 @@ ssh_keygen = "/usr/bin/true"
                 .to_vec(),
         )
     };
+    let (policy, config) = if with_bindings {
+        binding::prepare_targets_and_policy(&account, policy, config)
+    } else {
+        (policy, config)
+    };
+    let bindings = if with_bindings {
+        binding::prepare(&account)
+    } else {
+        Vec::new()
+    };
     publish(policy_path, &policy, 0o600);
     publish(config_path, &config, 0o600);
     let identity = ArtifactIdentity::from_file(source, 256 * 1024 * 1024).unwrap();
@@ -169,6 +194,7 @@ ssh_keygen = "/usr/bin/true"
         schema: "dev-auth-setup-plan-v2".into(),
         paths: paths.clone(),
         request: crate::setup::InstallRequest {
+            purpose: Default::default(),
             mode: InstallMode::Strong,
             version: version.into(),
             source_executable: source.into(),
@@ -196,7 +222,15 @@ ssh_keygen = "/usr/bin/true"
         }),
     };
     let intent = DeploymentIntent {
-        schema: "dev-auth-deployment-intent-v1".into(),
+        bindings: bindings.clone(),
+        purpose: Default::default(),
+        grant_policy: None,
+        schema: if with_bindings {
+            "dev-auth-deployment-intent-v3"
+        } else {
+            "dev-auth-deployment-intent-v1"
+        }
+        .into(),
         mode: DeploymentMode::Strong,
         channel: crate::deployment::Channel::Stable,
         offline: true,
@@ -227,6 +261,7 @@ ssh_keygen = "/usr/bin/true"
         &read_document,
         &|_| Ok(()),
         None,
+        BindingSourceCheck::NewApproval,
     )
     .unwrap();
     let digest = sha256_hex(&serde_jcs::to_vec(&plan).unwrap());
@@ -290,6 +325,12 @@ ssh_keygen = "/usr/bin/true"
     };
     fs::remove_file(policy_path).unwrap();
     fs::remove_file(config_path).unwrap();
+    for selected in &bindings {
+        fs::remove_file(&selected.plan).unwrap();
+    }
+    if with_bindings {
+        assert_eq!(plan.schema, "dev-auth-setup-plan-v5");
+    }
     let report = recover(invocation);
     if !report.verified {
         // Value-free public results intentionally omit internal context. This
@@ -364,6 +405,14 @@ ssh_keygen = "/usr/bin/true"
     assert!(report.verified);
     assert_eq!(report.changed, Some(false));
     assert!(report.actions.is_empty());
+    if with_bindings {
+        binding::verify_and_restore(&account, &executable);
+        return;
+    }
+    if with_grants {
+        combined_grants::upgrade_and_restore(&plan, &account, &policy, &config, &executable);
+        return;
+    }
     if with_workload {
         workload::exercise(&account, &executable);
         return;

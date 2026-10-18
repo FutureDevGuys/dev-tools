@@ -1,6 +1,6 @@
 [package]
 name = "dev-auth"
-version = "0.5.0"
+version = "0.5.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,6 +21,7 @@ dev-tools-product = { path = "../dev-tools-product" }
 dev-tools-reconcile-protocol = { path = "../dev-tools-reconcile-protocol" }
 dev-tools-release = { path = "../dev-tools-release" }
 dev-tools-secret = { path = "../dev-tools-secret" }
+dev-tools-update = { path = "../dev-tools-update" }
 ed25519-dalek.workspace = true
 fs2 = "0.4"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
@@ -37,7 +38,7 @@ ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "signal", "io-util"] }
 toml = "0.9"
 ureq = { version = "3.4", features = ["json"] }
 zeroize = { version = "1", features = ["derive"] }
@@ -59,7 +60,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "user"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "time", "uio", "user"] }
 
 [dev-dependencies]
 wait-timeout = "0.2"

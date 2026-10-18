@@ -4,8 +4,9 @@ use dev_auth::smart_binding::{
     advance_binding, binding_plan_sha256, build_binding_plan, canonical_binding_plan,
     classify_binding_change, default_proxy_directories, require_automatic_refresh,
     resolve_continuation, resolve_structured_target, validate_binding_receipt_structure,
-    write_binding_plan, BindingAuthority, BindingChange, BindingIntent, BindingMode,
-    BindingPlanChange, BindingReceipt, BindingResolution, BindingTargetIntent, ExecutableIdentity,
+    write_binding_plan, BindingAuthority, BindingChange, BindingCodeTrust, BindingIntent,
+    BindingMode, BindingPlanChange, BindingReceipt, BindingResolution, BindingTargetIntent,
+    ExecutableIdentity,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -211,7 +212,9 @@ fn native_binding_identity_requires_regenerated_numeric_predecessor_hashes() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("agent");
     executable(&target, b"runtime");
-    let intent = BindingIntent::structured("agent", "automation", &target, ["fixed"]).unwrap();
+    let intent = BindingIntent::structured("agent", "automation", &target, ["fixed"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let resolved = resolve_structured_target(&target).unwrap();
     let receipt = BindingReceipt::new(intent.clone(), resolved.clone()).unwrap();
     let BindingResolution::Structured { identity } = &receipt.active.resolved else {
@@ -439,7 +442,9 @@ fn continuation_preserves_missing_search_entries_without_aborting_discovery() {
     assert_eq!(resolved.continuation_path, search_path);
     assert!(!before.exists());
     assert!(!after.exists());
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     assert!(build_binding_plan("binding", intent, resolved, None).is_ok());
 }
 
@@ -499,7 +504,9 @@ fn an_underlying_identity_change_is_a_refresh_but_a_new_target_is_a_rebind() {
     executable(&bin.join("agent"), b"version-one");
     let path = std::env::join_paths([&bin]).unwrap();
     let first = resolve_continuation("agent", &path, &[]).unwrap();
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let active = BindingReceipt::new(intent.clone(), first.clone()).unwrap();
 
     assert_eq!(
@@ -516,7 +523,8 @@ fn an_underlying_identity_change_is_a_refresh_but_a_new_target_is_a_rebind() {
 
     let rebound_intent =
         BindingIntent::structured("agent", "automation", "/opt/agents/agent", ["--managed"])
-            .unwrap();
+            .unwrap()
+            .with_code_trust(BindingCodeTrust::Mutable);
     assert_eq!(
         classify_binding_change(&active, &rebound_intent, &refreshed),
         BindingChange::Rebind
@@ -530,7 +538,9 @@ fn generations_advance_once_and_retain_one_exact_rollback_generation() {
     fs::create_dir(&bin).unwrap();
     executable(&bin.join("agent"), b"one");
     let path = std::env::join_paths([&bin]).unwrap();
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let first = resolve_continuation("agent", &path, &[]).unwrap();
     let receipt = BindingReceipt::new(intent.clone(), first).unwrap();
 
@@ -570,7 +580,9 @@ fn a_tampered_receipt_lineage_cannot_be_advanced() {
     fs::create_dir(&bin).unwrap();
     executable(&bin.join("agent"), b"one");
     let path = std::env::join_paths([&bin]).unwrap();
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let resolution = resolve_continuation("agent", &path, &[]).unwrap();
     let mut receipt = BindingReceipt::new(intent.clone(), resolution.clone()).unwrap();
     receipt.active.generation = 4;
@@ -584,7 +596,9 @@ fn receipt_structure_rejects_malformed_historical_identity_without_reopening_it(
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("agent");
     executable(&target, b"old");
-    let intent = BindingIntent::structured("agent", "automation", &target, ["fixed"]).unwrap();
+    let intent = BindingIntent::structured("agent", "automation", &target, ["fixed"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let first =
         BindingReceipt::new(intent.clone(), resolve_structured_target(&target).unwrap()).unwrap();
     executable(&target, b"replacement");
@@ -622,7 +636,9 @@ fn a_tampered_resolution_cursor_or_identity_cannot_be_accepted() {
     fs::create_dir(&bin).unwrap();
     executable(&bin.join("agent"), b"one");
     let path = std::env::join_paths([&bin]).unwrap();
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let resolution = resolve_continuation("agent", &path, &[]).unwrap();
     let receipt = BindingReceipt::new(intent.clone(), resolution.clone()).unwrap();
 
@@ -654,7 +670,9 @@ fn canonical_binding_plans_are_value_stable_and_create_new() {
     fs::create_dir(&bin).unwrap();
     executable(&bin.join("agent"), b"one");
     let search_path = std::env::join_paths([&bin]).unwrap();
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let resolution = resolve_continuation("agent", &search_path, &[]).unwrap();
     let first =
         build_binding_plan("agent-binding", intent.clone(), resolution.clone(), None).unwrap();
@@ -680,7 +698,7 @@ fn canonical_binding_plans_are_value_stable_and_create_new() {
     assert_eq!(digest.len(), 64);
     assert!(write_binding_plan(&output, &first).is_err());
     let persisted: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
-    assert_eq!(persisted["schema"], "dev-auth-workload-binding-plan-v2");
+    assert_eq!(persisted["schema"], "dev-auth-workload-binding-plan-v3");
     assert_eq!(persisted["resolved"]["kind"], "continuation");
     assert_eq!(persisted["change"], "install");
 }
@@ -691,12 +709,16 @@ fn replacement_plans_require_verification_before_final_activation() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("agent");
     executable(&target, b"old");
-    let intent = BindingIntent::structured("agent", "automation", &target, ["old"]).unwrap();
+    let intent = BindingIntent::structured("agent", "automation", &target, ["old"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let receipt =
         BindingReceipt::new(intent.clone(), resolve_structured_target(&target).unwrap()).unwrap();
     executable(&target, b"new");
     let resolved = resolve_structured_target(&target).unwrap();
-    let rebound = BindingIntent::structured("agent", "automation", &target, ["new"]).unwrap();
+    let rebound = BindingIntent::structured("agent", "automation", &target, ["new"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     for (desired, change) in [
         (intent, BindingPlanChange::Refresh),
         (rebound, BindingPlanChange::Rebind),
@@ -736,7 +758,9 @@ fn non_install_plans_are_recomputed_from_the_embedded_current_receipt() {
     fs::create_dir(&bin).unwrap();
     executable(&bin.join("agent"), b"one");
     let search_path = std::env::join_paths([&bin]).unwrap();
-    let intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let resolution = resolve_continuation("agent", &search_path, &[]).unwrap();
     let receipt = BindingReceipt::new(intent.clone(), resolution.clone()).unwrap();
     let mut plan = build_binding_plan("agent-binding", intent, resolution, Some(&receipt)).unwrap();
@@ -798,6 +822,8 @@ fn cli_discovers_and_plans_the_current_continuation_without_mutation() {
             "agent",
             "--target",
             "current-resolution",
+            "--code-trust",
+            "mutable",
             "--output",
             plan.to_str().unwrap(),
             "--json",
@@ -843,6 +869,8 @@ fn cli_structured_plan_rejects_owned_proxy_targets_before_output() {
             "automation",
             "--target",
             "structured",
+            "--code-trust",
+            "mutable",
             "--executable",
         ])
         .arg(&target)
@@ -890,8 +918,9 @@ fn structured_plans_bind_the_declared_executable_and_argument_position() {
     let target = bin.join("vendor-runtime");
     executable(&target, b"wrapper");
     let resolved = resolve_structured_target(&target).unwrap();
-    let intent =
-        BindingIntent::structured("agent", "automation", &target, ["--mode", "batch"]).unwrap();
+    let intent = BindingIntent::structured("agent", "automation", &target, ["--mode", "batch"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     assert!(build_binding_plan("binding", intent.clone(), resolved.clone(), None).is_ok());
     let mut substituted = intent.clone();
     if let BindingTargetIntent::Structured { executable, .. } = &mut substituted.target {
@@ -931,6 +960,8 @@ fn cli_plans_a_structured_alias_without_path_discovery_or_execution() {
             "automation",
             "--target",
             "structured",
+            "--code-trust",
+            "mutable",
             "--executable",
         ])
         .arg(&target)
@@ -954,7 +985,7 @@ fn cli_plans_a_structured_alias_without_path_discovery_or_execution() {
     );
     let plan: dev_auth::smart_binding::BindingPlan =
         serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
-    assert_eq!(plan.schema, "dev-auth-workload-binding-plan-v2");
+    assert_eq!(plan.schema, "dev-auth-workload-binding-plan-v3");
     assert_eq!(plan.intent.command_name, "agent");
     assert!(matches!(
         plan.resolved,
@@ -983,15 +1014,19 @@ fn structured_resolution_does_not_invent_a_path_slot_and_rejects_kind_confusion(
     let target = root.path().join("vendor-runtime");
     executable(&target, b"runtime");
     let resolved = resolve_structured_target(&target).unwrap();
-    let intent = BindingIntent::structured("agent", "automation", &target, ["--batch"]).unwrap();
+    let intent = BindingIntent::structured("agent", "automation", &target, ["--batch"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let plan = build_binding_plan("agent", intent.clone(), resolved.clone(), None).unwrap();
     let document: serde_json::Value =
         serde_json::from_slice(&canonical_binding_plan(&plan).unwrap()).unwrap();
-    assert_eq!(document["schema"], "dev-auth-workload-binding-plan-v2");
+    assert_eq!(document["schema"], "dev-auth-workload-binding-plan-v3");
     assert_eq!(document["resolved"]["kind"], "structured");
     assert!(document["resolved"].get("search_index").is_none());
     assert!(document["resolved"].get("continuation_path").is_none());
-    let continuation = BindingIntent::continuation("agent", "automation").unwrap();
+    let continuation = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     assert!(build_binding_plan("agent", continuation, resolved.clone(), None).is_err());
     let via_path = resolve_continuation("vendor-runtime", root.path().as_os_str(), &[]).unwrap();
     assert!(build_binding_plan("agent", intent.clone(), via_path, None).is_err());
@@ -1022,6 +1057,8 @@ fn structured_cli_rejects_invalid_shapes_before_writing_a_plan() {
         vec![
             "--target",
             "structured",
+            "--code-trust",
+            "mutable",
             "--executable",
             target.to_str().unwrap(),
             "--caller-argument-index",
@@ -1030,6 +1067,8 @@ fn structured_cli_rejects_invalid_shapes_before_writing_a_plan() {
         vec![
             "--target",
             "structured",
+            "--code-trust",
+            "mutable",
             "--executable",
             target.to_str().unwrap(),
             "--executable",
@@ -1069,7 +1108,9 @@ fn v2_resolution_rejects_extra_fields_and_legacy_schema_relabeling() {
     let mut encoded = serde_json::to_value(&resolved).unwrap();
     encoded["search_index"] = serde_json::json!(0);
     assert!(serde_json::from_value::<BindingResolution>(encoded).is_err());
-    let intent = BindingIntent::structured("agent", "automation", &target, ["--batch"]).unwrap();
+    let intent = BindingIntent::structured("agent", "automation", &target, ["--batch"])
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     let mut plan = build_binding_plan("agent", intent.clone(), resolved.clone(), None).unwrap();
     plan.schema = "dev-auth-workload-binding-plan-v1".into();
     assert!(canonical_binding_plan(&plan).is_err());
@@ -1086,7 +1127,9 @@ fn pinned_shell_cannot_be_planned_without_its_source_and_policy_custody() {
     executable(&bin.join("agent"), b"wrapper");
     let path = std::env::join_paths([&bin]).unwrap();
     let resolved = resolve_continuation("agent", &path, &[]).unwrap();
-    let mut intent = BindingIntent::continuation("agent", "automation").unwrap();
+    let mut intent = BindingIntent::continuation("agent", "automation")
+        .unwrap()
+        .with_code_trust(BindingCodeTrust::Mutable);
     intent.target = BindingTargetIntent::PinnedShell {
         shell: resolved.canonical_path.clone(),
         source_sha256: "a".repeat(64),

@@ -11,10 +11,19 @@
 //! Lifecycle/accounting values start no process, timer or authority. The explicit
 //! Linux module supplies held cgroup, peer and gated-process mechanics only.
 //! Product authorization, independent guardians, sandbox policy and complete
-//! native acceptance remain separate requirements; delegation is not implemented.
+//! native acceptance remain separate requirements. Registry delegation conserves
+//! accounting only; products still own native delegated authority.
 
 mod authority;
 pub use authority::*;
+mod grant;
+mod lifecycle;
+pub use grant::{GrantLifecycle, GrantLimits};
+mod registry;
+pub use registry::{Constraint, GrantId, GrantRegistry, GrantView};
+
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -41,9 +50,10 @@ impl LeaseLimits {
     /// Validates limits selected by trusted administrator policy. This does not
     /// authorize a request to raise the standard limits.
     pub fn from_administrator_policy(idle: Duration, hard: Duration) -> Result<Self, SessionError> {
-        if idle.is_zero() || hard.is_zero() || idle > hard || hard > MAX_HARD_TIMEOUT {
+        if hard > MAX_HARD_TIMEOUT {
             return Err(SessionError::InvalidLimits);
         }
+        GrantLimits::from_administrator_policy(idle, hard)?;
         Ok(Self { idle, hard })
     }
 
@@ -65,6 +75,8 @@ pub enum StopReason {
     ParentRevoked,
     AuthorityChanged,
     BrokerShutdown,
+    WorkloadEnded,
+    Logout,
     /// Explicit normal completion, still requiring positive native cleanup.
     NormalShutdown,
 }
@@ -120,141 +132,59 @@ impl LeaseState {
 /// let duplicate_budget = lease.clone();
 /// ```
 pub struct LeaseLifecycle {
-    limits: LeaseLimits,
-    hard_deadline: Duration,
-    idle_deadline: Duration,
-    last_observed: Duration,
-    remaining: u64,
-    state: LeaseState,
+    core: lifecycle::LifecycleCore,
 }
 
 impl LeaseLifecycle {
     pub fn new(limits: LeaseLimits, now: Duration, uses: NonZeroU64) -> Result<Self, SessionError> {
-        let hard_deadline = now
-            .checked_add(limits.hard)
-            .ok_or(SessionError::InvalidClock)?;
-        let idle_deadline = now
-            .checked_add(limits.idle)
-            .ok_or(SessionError::InvalidClock)?;
         Ok(Self {
-            limits,
-            hard_deadline,
-            idle_deadline,
-            last_observed: now,
-            remaining: uses.get(),
-            state: LeaseState::Active,
+            core: lifecycle::LifecycleCore::new(GrantLimits::from_fixed(limits), now, Some(uses))?,
         })
     }
 
     pub const fn state(&self) -> LeaseState {
-        self.state
+        self.core.state()
     }
+
+    /// This facade always has a finite budget, preserving the existing API.
     pub const fn remaining_uses(&self) -> u64 {
-        self.remaining
+        match self.core.remaining_uses() {
+            Some(remaining) => remaining,
+            None => panic!("fixed lease facade always constructs a finite budget"),
+        }
     }
 
-    /// The coordinator schedules a native expiry check at this deadline. Merely
-    /// owning the lifecycle value installs no timer and stops no process.
+    /// Merely owning a lifecycle installs no timer and stops no process.
     pub fn next_deadline(&self) -> Option<Duration> {
-        (self.state == LeaseState::Active).then(|| self.hard_deadline.min(self.idle_deadline))
+        self.core.next_deadline()
     }
 
-    /// Observe time without accepted activity. Hard expiry wins over idle expiry
-    /// when both are observed together; the first stopping cause is retained.
     pub fn poll(&mut self, now: Duration) -> LeaseState {
-        if self.state == LeaseState::Active {
-            if now < self.last_observed {
-                self.stop(StopReason::ClockRegressed);
-            } else {
-                self.last_observed = now;
-                if now >= self.hard_deadline {
-                    self.stop(StopReason::HardExpired);
-                } else if now >= self.idle_deadline {
-                    self.stop(StopReason::IdleExpired);
-                }
-            }
-        }
-        self.state
+        self.core.poll(now)
     }
 
-    /// Consume one use only after the coordinator validates native identity,
-    /// audience, scope, and exact operation. Failed spawn does not refund it.
-    /// Exhaustion denies new work but does not cancel the last accepted operation.
+    /// Failed spawn does not refund an admitted use.
     pub fn admit(&mut self, now: Duration) -> Result<(), SessionError> {
-        self.require_active(now)?;
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .ok_or(SessionError::UsesExhausted)?;
-        self.touch(now);
-        Ok(())
+        self.core.admit(now)
     }
 
-    /// The trusted coordinator reports useful activity from already-admitted
-    /// work. Status, heartbeat, and untrusted client traffic must not call this.
+    /// Only already-admitted useful activity may reset idle expiry.
     pub fn record_activity(&mut self, now: Duration) -> Result<(), SessionError> {
-        self.require_active(now)?;
-        self.touch(now);
-        Ok(())
+        self.core.record_activity(now)
     }
 
-    fn require_active(&mut self, now: Duration) -> Result<(), SessionError> {
-        if self.poll(now) == LeaseState::Active {
-            Ok(())
-        } else {
-            Err(SessionError::NotActive)
-        }
-    }
-
-    fn touch(&mut self, now: Duration) {
-        // An unrepresentable idle deadline lies beyond the already validated
-        // hard deadline; clamp rather than wrap or extend the lease.
-        self.idle_deadline = now
-            .checked_add(self.limits.idle)
-            .unwrap_or(self.hard_deadline)
-            .min(self.hard_deadline);
-    }
-
-    /// Deny admission immediately. The coordinator must then cancel and join the
-    /// retained native boundary; this transition alone is not revocation success.
     pub fn stop(&mut self, reason: StopReason) {
-        if self.state == LeaseState::Active {
-            self.state = LeaseState::Stopping {
-                reason,
-                cleanup_failed: false,
-            };
-        }
+        self.core.stop(reason);
     }
 
     /// Close admission for normal completion without skipping native cleanup.
-    /// The original stopping reason and cleanup-failure history are preserved.
     pub fn shutdown(&mut self, now: Duration) {
-        self.poll(now);
-        self.stop(StopReason::NormalShutdown);
+        self.core.shutdown(now);
     }
 
-    /// Reports positive cleanup evidence, not a signal-send or leader-exit event.
-    /// Failed cleanup stays nonterminal. A successful retry retains its failure
-    /// history so callers cannot silently report the original operation successful.
+    /// Failed cleanup stays nonterminal and successful retry retains failure history.
     pub fn report_cleanup(&mut self, cleanup: Cleanup) -> Result<(), SessionError> {
-        let LeaseState::Stopping {
-            reason,
-            cleanup_failed,
-        } = self.state
-        else {
-            return Err(SessionError::InvalidTransition);
-        };
-        self.state = match cleanup {
-            Cleanup::Complete => LeaseState::Terminated {
-                reason,
-                cleanup_failed,
-            },
-            Cleanup::Failed => LeaseState::Stopping {
-                reason,
-                cleanup_failed: true,
-            },
-        };
-        Ok(())
+        self.core.report_cleanup(cleanup)
     }
 }
 
@@ -266,6 +196,11 @@ pub enum SessionError {
     NotActive,
     UsesExhausted,
     InvalidTransition,
+    UnknownGrant,
+    DuplicateGrant,
+    Capacity,
+    AuthorityWidened,
+    IdentityMismatch,
 }
 
 impl fmt::Display for SessionError {
@@ -276,6 +211,11 @@ impl fmt::Display for SessionError {
             Self::NotActive => "administrator lease is not active",
             Self::UsesExhausted => "administrator lease use budget is exhausted",
             Self::InvalidTransition => "administrator lease transition is invalid",
+            Self::UnknownGrant => "administrator grant is unknown",
+            Self::DuplicateGrant => "administrator grant identity already exists",
+            Self::Capacity => "administrator grant registry is at capacity",
+            Self::AuthorityWidened => "administrator grant would widen approved authority",
+            Self::IdentityMismatch => "native caller is outside the administrator grant",
         })
     }
 }

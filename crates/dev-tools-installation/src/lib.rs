@@ -19,6 +19,12 @@ pub use document_retirement::{
 #[cfg(target_os = "linux")]
 mod activation_withdrawal;
 #[cfg(target_os = "linux")]
+mod retained_repair;
+#[cfg(target_os = "linux")]
+pub use retained_repair::{
+    observe_retained_versioned_installation_repair, repair_retained_versioned_installation,
+};
+#[cfg(target_os = "linux")]
 mod existing_document_directory;
 #[cfg(target_os = "linux")]
 pub use existing_document_directory::{DocumentDirectoryPreparation, ExistingDocumentDirectory};
@@ -2577,9 +2583,39 @@ pub fn read_atomic_document(
 }
 
 fn read_atomic_document_file(
+    file: File,
+    path: &Path,
+    authority: &DocumentAuthority,
+) -> Result<AtomicDocument> {
+    read_atomic_file_content(file, path, authority, false)
+}
+
+/// Read bounded regular-file bytes, including a deliberately empty file.
+/// Document readers retain their separate nonempty-content requirement.
+pub fn read_atomic_file(
+    path: &Path,
+    authority: &DocumentAuthority,
+) -> Result<Option<AtomicDocument>> {
+    validate_document_authority(authority)?;
+    let file = match open_read_nofollow(path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    read_atomic_file_content(file, path, authority, true).map(Some)
+}
+
+fn read_atomic_file_content(
     mut file: File,
     path: &Path,
     authority: &DocumentAuthority,
+    allow_empty: bool,
 ) -> Result<AtomicDocument> {
     let before = file
         .metadata()
@@ -2589,13 +2625,16 @@ fn read_atomic_document_file(
         || before.nlink() != 1
         || before.uid() != authority.owner_uid
         || before.mode() & 0o777 != authority.mode
-        || before.len() == 0
+        || (!allow_empty && before.len() == 0)
         || before.len() > authority.limit
     {
         bail!("atomic document has unsafe filesystem authority");
     }
     #[cfg(not(unix))]
-    if !before.file_type().is_file() || before.len() == 0 || before.len() > authority.limit {
+    if !before.file_type().is_file()
+        || (!allow_empty && before.len() == 0)
+        || before.len() > authority.limit
+    {
         bail!("atomic document has unsafe filesystem authority");
     }
     let mut bytes = Vec::with_capacity(before.len() as usize);

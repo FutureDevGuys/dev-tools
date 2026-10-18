@@ -19,6 +19,7 @@ fn install_frontends(root: &Path, git: &Path, gh: &Path) -> dev_auth::setup::Set
     dev_auth::setup::install_at(
         &paths,
         &dev_auth::setup::InstallRequest {
+            purpose: dev_auth::deployment::SetupPurpose::Credentials,
             mode: dev_auth::setup::InstallMode::UserOnly,
             version: "0.3.0-test".into(),
             source_executable: candidate,

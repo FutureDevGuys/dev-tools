@@ -83,7 +83,7 @@ impl InitialInstallationRestoration {
                 bail!("initial native helper is outside retained candidate authority");
             }
         }
-        if maintenance::supports_version(&self.candidate.version) {
+        if crate::setup::maintenance::supports_version(&self.candidate.version) {
             let current = self.directory.read(
                 OsStr::new("dev-auth-maintenance-helper"),
                 &DocumentAuthority {
@@ -115,7 +115,8 @@ impl InitialInstallationRestoration {
         // remain removal authority after a receipt or sibling leaf disappears.
         self.observe_initial_native_helpers()?;
         let mut changed = self.retire_initial_privileged_launcher()?;
-        changed |= maintenance::restore_executable(&self.directory, None, &self.candidate)?;
+        changed |=
+            crate::setup::maintenance::restore_executable(&self.directory, None, &self.candidate)?;
         for (name, authority, expected) in self.initial_helper_authorities()? {
             changed |= self
                 .directory

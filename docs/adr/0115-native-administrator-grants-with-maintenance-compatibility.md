@@ -32,6 +32,17 @@ Graph execution uses the consumed-command API in ADR0118, retained executable bo
 
 The product-owned `dev-auth-sudo` helper is an internal native cdylib in the signed product payload. Its source, version, target, ABI and bytes are independently checked during embedding/setup. An ordinary development build can contain an explicit absent marker; it cannot activate a grant component requiring that bridge. No installed sibling product, interpreter, source checkout or private downstream implementation is a prerequisite.
 
+The unreleased helper build identity is `dev-auth-sudo-build-v2`, including the
+exact sudo plugin and group API versions. One product-owned ABI declaration
+generates the helper's exported native record versions and identity; the core
+embedding check consumes that same declaration alongside its existing ELF,
+source, version and target checks. A helper carrying only the older build-v1
+identity is rejected during new construction. Setup continues to bind the exact
+embedded bytes through its existing payload digests. This check identifies the
+selected API versions; it does not prove C structure layout or native callback
+behavior. Those remain separate native qualification gates. Existing signed
+releases, retained artifacts and installed receipts are not rewritten.
+
 Upstream Sudo retains parsing, run-as, environment and terminals. Product-owned audit/approval/group callbacks perform conditional authority observation and final admission into the owned execution boundary. The bridge does not handle passwords, refresh global timestamps, replace the native Sudo implementation, or authorize an operation because a cached ticket exists. Setup publishes only the exact selected receipt-owned asset group and preserves unrelated plugin configuration. Privilege-only and combined setup/recovery are owned by ADR0116, independent of any active grant.
 
 ## Migration and remaining gates

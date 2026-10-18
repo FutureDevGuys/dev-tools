@@ -14,6 +14,7 @@ use dev_tools_release::{
 #[cfg(unix)]
 use dev_tools_release::{
     accept_verified_release_at, cache_verified_release, load_cached_release, load_release_state_at,
+    observe_cached_release,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
@@ -994,6 +995,47 @@ fn verified_release_cache_round_trips_only_authenticated_exact_bytes() {
     .unwrap();
     assert_eq!(loaded.verified, cached.verified);
     assert_eq!(fs::read(loaded.artifact_path).unwrap(), bundle.artifact);
+}
+
+#[test]
+#[cfg(unix)]
+fn read_only_cache_observation_does_not_initialize_and_requires_the_exact_receipt() {
+    let (bundle, authority) = fixture("dev-auth-product-v2", Some(&"f".repeat(40)));
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let version = semver::Version::parse("1.2.3").unwrap();
+    let owner = fs::metadata(root.path()).unwrap().uid();
+    assert!(observe_cached_release(&cache, &authority, &version, owner)
+        .unwrap()
+        .is_none());
+    assert!(!cache.exists());
+    let cached = cache_verified_release(
+        &cache,
+        &authority,
+        &ReleaseMetadata {
+            root: bundle.root,
+            manifest: bundle.manifest,
+        },
+        &bundle.artifact,
+        owner,
+    )
+    .unwrap();
+    let lock = cache.join("release-cache.lock");
+    let lock_before = fs::metadata(&lock).unwrap();
+    assert_eq!(
+        observe_cached_release(&cache, &authority, &version, owner)
+            .unwrap()
+            .unwrap()
+            .verified,
+        cached.verified
+    );
+    assert_eq!(fs::metadata(&lock).unwrap().ino(), lock_before.ino());
+    let entry = cached.root_path.parent().unwrap();
+    fs::remove_file(entry.join("receipt.json")).unwrap();
+    assert!(observe_cached_release(&cache, &authority, &version, owner)
+        .unwrap()
+        .is_none());
+    assert!(!entry.join("receipt.json").exists());
 }
 
 #[test]

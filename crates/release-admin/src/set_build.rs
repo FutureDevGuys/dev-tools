@@ -21,7 +21,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PRODUCTS: [&str; 5] = [
     "update-all",
@@ -444,44 +444,82 @@ fn build_products(
     trusted_root: &str,
     products: &[&str],
 ) -> Result<()> {
+    let started = Instant::now();
     let cargo_bin = cargo_path
         .parent()
         .context("exact Cargo executable has no parent")?;
-    let mut command = cargo
-        .command(cargo_path.as_os_str())
-        .context("prepare exact Cargo identity")?;
-    command
-        .env_clear()
-        .env("CARGO_HOME", cargo_home)
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("CARGO_TERM_COLOR", "never")
-        .env("CARGO_TARGET_DIR", cargo_target)
-        .env(
-            "CARGO_ENCODED_RUSTFLAGS",
-            encoded_remap_flags(checkout, work_root, cargo_home),
-        )
-        .env("DEV_TOOLS_GIT_COMMIT", source_commit)
-        .env("DEV_AUTH_SOURCE_COMMIT", source_commit)
-        .env("DEV_TOOLS_GIT_DIRTY", "0")
-        .env("DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY", trusted_root)
-        .env("SOURCE_DATE_EPOCH", source_timestamp.to_string())
-        .env("LC_ALL", "C")
-        .env("PATH", fixed_build_path(cargo_bin))
-        .current_dir(checkout)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--offline",
-            "--color",
-            "never",
-        ]);
+    let prepare = || {
+        let mut command = cargo
+            .command(cargo_path.as_os_str())
+            .context("prepare exact Cargo identity")?;
+        command
+            .env_clear()
+            .env("CARGO_HOME", cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TERM_COLOR", "never")
+            .env("CARGO_BUILD_JOBS", "1")
+            .env("CARGO_TARGET_DIR", cargo_target)
+            .env(
+                "CARGO_ENCODED_RUSTFLAGS",
+                encoded_remap_flags(checkout, work_root, cargo_home),
+            )
+            .env("DEV_TOOLS_GIT_COMMIT", source_commit)
+            .env("DEV_AUTH_SOURCE_COMMIT", source_commit)
+            .env("DEV_TOOLS_GIT_DIRTY", "0")
+            .env("DEV_TOOLS_TRUST_ROOT_PUBLIC_KEY", trusted_root)
+            .env("SOURCE_DATE_EPOCH", source_timestamp.to_string())
+            .env("LC_ALL", "C")
+            .env("PATH", fixed_build_path(cargo_bin))
+            .current_dir(checkout)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--offline",
+                "--color",
+                "never",
+            ]);
+        Ok::<_, anyhow::Error>(command)
+    };
+
+    // Historical Dev Auth sources have no bridge. New sources construct their
+    // own helper first; no caller-supplied artifact enters either environment.
+    let sudo_artifact = if products.contains(&"dev-auth") && source_has_sudo_helper(checkout)? {
+        let mut helper = prepare()?;
+        helper.args(["--package", "dev-auth-sudo", "--lib"]);
+        run_build_phase(&mut helper, started)
+            .context("construct source-matched Dev Auth sudo helper")?;
+        Some(cargo_target.join("release/libdev_auth_sudo.so"))
+    } else {
+        None
+    };
+
+    let mut command = prepare()?;
+    if let Some(artifact) = sudo_artifact {
+        command.env("DEV_AUTH_SUDO_ARTIFACT", artifact);
+    }
     for product in products {
         command.args([OsStr::new("--bin"), OsStr::new(product)]);
     }
-    let output =
-        run_prepared_bounded_command(&mut command, BINARY_BUILD_TIMEOUT, BUILD_OUTPUT_LIMIT)
-            .map_err(|_| anyhow::anyhow!("bounded Cargo release execution failed"))?;
+    run_build_phase(&mut command, started)
+}
+
+fn source_has_sudo_helper(checkout: &Path) -> Result<bool> {
+    match fs::symlink_metadata(checkout.join("crates/dev-auth-sudo/Cargo.toml")) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => bail!("Dev Auth sudo helper manifest is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect source-owned Dev Auth sudo helper"),
+    }
+}
+
+fn run_build_phase(command: &mut std::process::Command, started: Instant) -> Result<()> {
+    let remaining = BINARY_BUILD_TIMEOUT
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .context("Cargo release build deadline exhausted")?;
+    let output = run_prepared_bounded_command(command, remaining, BUILD_OUTPUT_LIMIT)
+        .map_err(|_| anyhow::anyhow!("bounded Cargo release execution failed"))?;
     require_success(output.status, "Cargo release execution failed")
 }
 

@@ -53,6 +53,8 @@ pub struct WorkloadCap {
     pub sandbox_adapters: Vec<String>,
     #[serde(default)]
     pub require_sandbox: bool,
+    #[serde(default)]
+    pub allow_pinned_shell: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -114,6 +116,7 @@ pub struct ResolvedWorkloadV3 {
     pub launcher_path: String,
     pub admission: Admission,
     pub duration_seconds: u64,
+    pub allow_pinned_shell: bool,
     pub resources: BTreeMap<LogicalSecretName, ResolvedResource>,
     pub operations: crate::policy_v3_operations::ResolvedOperations,
     pub workspace_roots: Vec<ResolvedWorkspaceRoot>,
@@ -218,6 +221,7 @@ pub fn resolve_policy_for_user(
                 launcher_path: system.trusted_launchers[&workload.launcher].clone(),
                 admission: workload.admission,
                 duration_seconds: workload.duration_seconds,
+                allow_pinned_shell: cap.allow_pinned_shell,
                 resources,
                 operations,
                 workspace_roots,
@@ -352,6 +356,7 @@ pub fn resolve_runtime_policy_for_user(
                 desktop: authority.desktop.clone(),
                 admission: Some(authority.admission),
                 duration_seconds: Some(authority.duration_seconds),
+                allow_pinned_shell: authority.allow_pinned_shell,
             },
         );
     }
@@ -576,6 +581,7 @@ pub fn require_system_policy_narrows(upper: &SystemPolicyV3, lower: &SystemPolic
             || !subset(&cap.workspace_caps, &allowed.workspace_caps)
             || !subset(&cap.sandbox_adapters, &allowed.sandbox_adapters)
             || (allowed.require_sandbox && !cap.require_sandbox)
+            || (cap.allow_pinned_shell && !allowed.allow_pinned_shell)
         {
             bail!("narrowing widens workload authority");
         }
