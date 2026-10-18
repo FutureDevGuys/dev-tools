@@ -29,6 +29,7 @@ pub use maintenance::{
 };
 
 const RECEIPT_SCHEMA: &str = "dev-auth-install-v2";
+pub(crate) const INSTALLATION_DIRECTORY_MODE: u32 = 0o755;
 
 pub fn setup_template(name: &str) -> Result<&'static str> {
     match name {
@@ -367,7 +368,7 @@ fn shared_installation_layout(
             InstallMode::Strong => 0,
             InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
         },
-        directory_mode: 0o755,
+        directory_mode: INSTALLATION_DIRECTORY_MODE,
         bin_directory_mode: None,
     }
 }

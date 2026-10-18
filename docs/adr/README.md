@@ -11,6 +11,7 @@ SyncConfigs also maintains product-local records, including [durable overlay pub
 
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0130](0130-mode-bound-setup-transition-root.md) | Dev Auth prepares the exact installation root mode before transition retention | proposed | pending native acceptance |
 | [0125](0125-descriptor-relative-ordinary-files-and-locks.md) | Descriptor-relative ordinary files and resource locks | proposed | pending |
 | [0001](0001-standalone-products-and-shared-rust-foundations.md) | Standalone products and shared Rust foundations | proposed | pending |
 | [0002](0002-common-product-cli-and-explicit-network-boundaries.md) | Common product CLI and explicit network boundaries | proposed | pending |
