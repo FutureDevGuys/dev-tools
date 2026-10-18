@@ -26,6 +26,7 @@ enum Publication {
     Document,
     NewDocument,
     File,
+    GroupedFile(u32),
 }
 
 /// Read-only admission of an existing document parent or an absent suffix below
@@ -254,6 +255,47 @@ impl Drop for TemporaryDirectory<'_> {
 }
 
 impl ExistingDocumentDirectory {
+    /// Acquire a permanent empty resource lock through the held parent.
+    pub fn try_lock(&self, name: &OsStr) -> Result<Option<InstallationLock>> {
+        validate_name(name)?;
+        self.validate()?;
+        let file = File::from(rustix::fs::openat(
+            &self.directory,
+            name,
+            rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != self.owner_uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.len() != 0
+        {
+            bail!("held resource lock has unsafe custody");
+        }
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error).context("acquire held resource lock"),
+        }
+        let lock = InstallationLock {
+            file,
+            shared: false,
+        };
+        require_named_file(&self.directory, name, &metadata)?;
+        self.validate()?;
+        lock.file.sync_all().context("sync held resource lock")?;
+        rustix::fs::fsync(&self.directory).context("sync held resource lock parent")?;
+        require_named_file(&self.directory, name, &metadata)?;
+        self.validate()?;
+        Ok(Some(lock))
+    }
+
     /// Observe a leaf's native metadata without following it or reading its
     /// contents. This does not grant document or removal authority; callers
     /// must still select an exact supported object through the other APIs.
@@ -388,6 +430,58 @@ impl ExistingDocumentDirectory {
         Ok(current.map(|current| current.document))
     }
 
+    /// Read an ordinary file with exact UID/GID/mode, including empty content.
+    pub fn read_file_with_group(
+        &self,
+        name: &OsStr,
+        authority: &FileAuthority,
+    ) -> Result<Option<AtomicDocument>> {
+        validate_name(name)?;
+        let document_authority = authority.document_authority();
+        validate_document_authority(&document_authority)?;
+        self.validate()?;
+        let current =
+            self.open_content(name, &document_authority, true, Some(authority.group_gid))?;
+        self.require_named_current(name, current.as_ref())?;
+        self.validate()?;
+        Ok(current.map(|current| current.document))
+    }
+
+    /// Publish an ordinary file with exact UID/GID/mode and retained identity.
+    pub fn write_file_with_group(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        authority: &FileAuthority,
+        expected_current: Option<&ArtifactIdentity>,
+    ) -> Result<bool> {
+        let document_authority = authority.document_authority();
+        self.write_with_current_authority(
+            name,
+            bytes,
+            &document_authority,
+            &document_authority,
+            expected_current,
+            Publication::GroupedFile(authority.group_gid),
+        )
+    }
+
+    /// Remove an exact ordinary file with its selected native group.
+    pub fn remove_file_with_group(
+        &self,
+        name: &OsStr,
+        authority: &FileAuthority,
+        expected: &ArtifactIdentity,
+    ) -> Result<bool> {
+        self.remove_content(
+            name,
+            &authority.document_authority(),
+            expected,
+            true,
+            Some(authority.group_gid),
+        )
+    }
+
     /// Replace an exact current document while selecting different ordinary
     /// permission bits. The owner does not change; both states are bounded.
     pub fn replace(
@@ -497,7 +591,11 @@ impl ExistingDocumentDirectory {
         expected_current: Option<&ArtifactIdentity>,
         publication: Publication,
     ) -> Result<bool> {
-        let allow_empty = matches!(publication, Publication::File);
+        let (allow_empty, group_gid) = match publication {
+            Publication::Document | Publication::NewDocument => (false, None),
+            Publication::File => (true, None),
+            Publication::GroupedFile(group_gid) => (true, Some(group_gid)),
+        };
         validate_name(name)?;
         validate_document_authority(authority)?;
         validate_document_authority(current_authority)?;
@@ -508,7 +606,7 @@ impl ExistingDocumentDirectory {
             bail!("document publication exceeds its content bounds");
         }
         self.validate()?;
-        let current = self.open_document(name, current_authority, allow_empty)?;
+        let current = self.open_content(name, current_authority, allow_empty, group_gid)?;
         if matches!(publication, Publication::NewDocument) && current.is_some() {
             bail!("new document destination is already occupied");
         }
@@ -538,11 +636,14 @@ impl ExistingDocumentDirectory {
             .file
             .flush()
             .context("flush held document staging file")?;
-        if temporary.file.metadata()?.uid() != authority.owner_uid {
+        let temporary_metadata = temporary.file.metadata()?;
+        if temporary_metadata.uid() != authority.owner_uid
+            || group_gid.is_some_and(|group| temporary_metadata.gid() != group)
+        {
             rustix::fs::fchown(
                 &temporary.file,
                 Some(rustix::fs::Uid::from_raw(authority.owner_uid)),
-                None,
+                group_gid.map(rustix::fs::Gid::from_raw),
             )
             .context("assign held document owner")?;
         }
@@ -560,6 +661,7 @@ impl ExistingDocumentDirectory {
             &self.path.join(&temporary.name),
             authority,
             allow_empty,
+            group_gid,
         )?;
         if staged.bytes != bytes {
             bail!("held document staging bytes changed");
@@ -585,7 +687,7 @@ impl ExistingDocumentDirectory {
         rustix::fs::fsync(&self.directory).context("sync published held document parent")?;
         self.validate()?;
         let published = self
-            .open_document(name, authority, allow_empty)?
+            .open_content(name, authority, allow_empty, group_gid)?
             .context("published document disappeared")?;
         if published.document.bytes != bytes {
             bail!("published held document changed before acknowledgement");
@@ -602,7 +704,7 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected: &ArtifactIdentity,
     ) -> Result<bool> {
-        self.remove_content(name, authority, expected, false)
+        self.remove_content(name, authority, expected, false, None)
     }
 
     /// Remove exact owned file content, including the empty-file identity.
@@ -612,7 +714,7 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected: &ArtifactIdentity,
     ) -> Result<bool> {
-        self.remove_content(name, authority, expected, true)
+        self.remove_content(name, authority, expected, true, None)
     }
 
     fn remove_content(
@@ -621,6 +723,7 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         expected: &ArtifactIdentity,
         allow_empty: bool,
+        group_gid: Option<u32>,
     ) -> Result<bool> {
         validate_name(name)?;
         validate_document_authority(authority)?;
@@ -635,7 +738,7 @@ impl ExistingDocumentDirectory {
             bail!("held document removal identity is invalid");
         }
         self.validate()?;
-        let current = self.open_document(name, authority, allow_empty)?;
+        let current = self.open_content(name, authority, allow_empty, group_gid)?;
         if let Some(current) = &current {
             if current.document.identity != *expected {
                 bail!("held document removal does not match expected content");
@@ -672,6 +775,16 @@ impl ExistingDocumentDirectory {
         authority: &DocumentAuthority,
         allow_empty: bool,
     ) -> Result<Option<OpenedDocument>> {
+        self.open_content(name, authority, allow_empty, None)
+    }
+
+    fn open_content(
+        &self,
+        name: &OsStr,
+        authority: &DocumentAuthority,
+        allow_empty: bool,
+        group_gid: Option<u32>,
+    ) -> Result<Option<OpenedDocument>> {
         let file = match rustix::fs::openat(
             &self.directory,
             name,
@@ -693,6 +806,7 @@ impl ExistingDocumentDirectory {
             &self.path.join(name),
             authority,
             allow_empty,
+            group_gid,
         )?;
         require_named_file(&self.directory, name, &metadata)?;
         Ok(Some(OpenedDocument {

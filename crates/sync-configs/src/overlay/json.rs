@@ -50,6 +50,21 @@ pub fn overlay_json_text(
     let mut pruned_target = target.clone();
     let mut removed = 0;
     for path in retired_paths {
+        let mut value = None;
+        let mut object = &pruned_target;
+        for (index, component) in path.iter().enumerate() {
+            value = object.get(component);
+            if index + 1 < path.len() {
+                let Some(Value::Object(child)) = value else {
+                    value = None;
+                    break;
+                };
+                object = child;
+            }
+        }
+        if matches!(value, Some(Value::Object(object)) if !object.is_empty()) {
+            bail!("owned JSON leaf became a container; normalize the target structure before retrying");
+        }
         removed += usize::from(remove_object_path(&mut pruned_target, path));
     }
 
@@ -91,6 +106,12 @@ pub fn overlay_json_file(
     target_path: &Path,
     options: &JsonOverlayOptions,
 ) -> Result<OverlayResult> {
+    #[cfg(target_os = "linux")]
+    if !options.dry_run {
+        return overlay_json_file_transactional(source_path, target_path, options);
+    }
+    #[cfg(target_os = "linux")]
+    super::transaction::ensure_no_pending(target_path)?;
     let source_text = fs::read_to_string(source_path)
         .with_context(|| format!("cannot read JSON overlay source {}", source_path.display()))?;
     let (target_text, materialize_symlink) = read_optional_target(target_path)?;
@@ -103,6 +124,8 @@ pub fn overlay_json_file(
             anyhow!("managed_overlay_id is required when reconcile_removed_keys is enabled")
         })?;
         let path = ownership::receipt_path(managed_id, options.state_root.as_deref())?;
+        #[cfg(target_os = "linux")]
+        super::transaction::ensure_no_receipt_pending(&path)?;
         prior_paths = ownership::load_paths(&path, managed_id)?;
         let source = load_json_object_text(&source_text, "source")?;
         collect_leaf_paths(&Value::Object(source), &mut Vec::new(), &mut current_paths);
@@ -111,6 +134,11 @@ pub fn overlay_json_file(
 
     let retired_paths = prior_paths
         .difference(&current_paths)
+        .filter(|path| {
+            !current_paths
+                .iter()
+                .any(|current| current.starts_with(path.as_slice()))
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut result = overlay_json_text(
@@ -128,27 +156,61 @@ pub fn overlay_json_file(
         return Ok(result);
     }
 
-    let target_snapshot = ownership::snapshot_file(target_path)?;
-    let write_target = result.text != target_text || materialize_symlink;
-    if write_target {
-        ownership::atomic_write_preserving_target(target_path, result.text.as_bytes())?;
-    }
-    if let Some(path) = ownership_path {
-        let managed_id = options
+    bail!("durable overlay publication is currently available only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn overlay_json_file_transactional(
+    source_path: &Path,
+    target_path: &Path,
+    options: &JsonOverlayOptions,
+) -> Result<OverlayResult> {
+    use super::transaction::{Operation, ReceiptSpec, Transaction};
+    let receipt = if options.reconcile_removed_keys {
+        let id = options
             .managed_overlay_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("managed_overlay_id is required for an ownership receipt"))?;
-        if let Err(error) = ownership::write_paths_atomic(&path, managed_id, &current_paths) {
-            if write_target {
-                ownership::restore_file(target_path, &target_snapshot).with_context(|| {
-                    format!(
-                        "ownership receipt update failed and target rollback also failed: {error:#}"
-                    )
-                })?;
-            }
-            return Err(error);
-        }
+            .as_ref()
+            .context("managed_overlay_id is required when reconcile_removed_keys is enabled")?;
+        Some(ReceiptSpec {
+            id: id.clone(),
+            path: ownership::receipt_path(id, options.state_root.as_deref())?,
+        })
+    } else {
+        None
+    };
+    let mut transaction =
+        Transaction::begin(source_path, target_path, Operation::JsonOverlay, receipt)?;
+    let source_text = transaction.source_text()?.to_owned();
+    let target_text = transaction.target_text()?;
+    let prior_paths = transaction.prior_paths()?;
+    let mut current_paths = BTreeSet::new();
+    if options.reconcile_removed_keys {
+        let source = load_json_object_text(&source_text, "source")?;
+        collect_leaf_paths(&Value::Object(source), &mut Vec::new(), &mut current_paths);
     }
+    let retired_paths = prior_paths
+        .difference(&current_paths)
+        .filter(|path| {
+            !current_paths
+                .iter()
+                .any(|current| current.starts_with(path.as_slice()))
+        })
+        .cloned()
+        .collect();
+    let mut result = overlay_json_text(
+        &source_text,
+        &target_text,
+        &options.replace_json_pointers,
+        &retired_paths,
+    )?;
+    result.materialized_symlink = transaction.is_symlink();
+    result.ownership_changed = options.reconcile_removed_keys && prior_paths != current_paths;
+    result.changed |= result.materialized_symlink || result.ownership_changed;
+    transaction.publish(
+        &mut result,
+        false,
+        options.reconcile_removed_keys.then_some(&current_paths),
+    )?;
     Ok(result)
 }
 

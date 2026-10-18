@@ -54,6 +54,27 @@ pub struct DocumentAuthority {
     pub limit: u64,
 }
 
+/// Exact ordinary-file custody, including empty content and the native group.
+/// Document APIs retain their nonempty contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAuthority {
+    pub owner_uid: u32,
+    pub group_gid: u32,
+    pub mode: u32,
+    pub limit: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl FileAuthority {
+    fn document_authority(&self) -> DocumentAuthority {
+        DocumentAuthority {
+            owner_uid: self.owner_uid,
+            mode: self.mode,
+            limit: self.limit,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomicDocument {
     pub bytes: Vec<u8>,
@@ -2587,7 +2608,7 @@ fn read_atomic_document_file(
     path: &Path,
     authority: &DocumentAuthority,
 ) -> Result<AtomicDocument> {
-    read_atomic_file_content(file, path, authority, false)
+    read_atomic_file_content(file, path, authority, false, None)
 }
 
 /// Read bounded regular-file bytes, including a deliberately empty file.
@@ -2608,7 +2629,7 @@ pub fn read_atomic_file(
         }
         Err(error) => return Err(error),
     };
-    read_atomic_file_content(file, path, authority, true).map(Some)
+    read_atomic_file_content(file, path, authority, true, None).map(Some)
 }
 
 fn read_atomic_file_content(
@@ -2616,7 +2637,10 @@ fn read_atomic_file_content(
     path: &Path,
     authority: &DocumentAuthority,
     allow_empty: bool,
+    group_gid: Option<u32>,
 ) -> Result<AtomicDocument> {
+    #[cfg(not(unix))]
+    let _ = group_gid;
     let before = file
         .metadata()
         .with_context(|| format!("inspect atomic document {}", path.display()))?;
@@ -2624,6 +2648,7 @@ fn read_atomic_file_content(
     if !before.file_type().is_file()
         || before.nlink() != 1
         || before.uid() != authority.owner_uid
+        || group_gid.is_some_and(|group| before.gid() != group)
         || before.mode() & 0o777 != authority.mode
         || (!allow_empty && before.len() == 0)
         || before.len() > authority.limit
@@ -2652,6 +2677,12 @@ fn read_atomic_file_content(
         || before.len() != after.len()
         || before.mtime() != after.mtime()
         || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.uid() != after.uid()
+        || before.gid() != after.gid()
+        || before.mode() != after.mode()
+        || before.nlink() != after.nlink()
     {
         bail!("atomic document changed while being read");
     }

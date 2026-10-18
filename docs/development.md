@@ -1,6 +1,6 @@
 # Development and validation
 
-Rust validation uses formatting, Clippy with warnings denied, workspace tests, and the product integration tests. Python validation remains for support scripts and the retained Python compatibility surfaces, not release administration. Release validation additionally audits source and Git objects, dependencies and licenses, fixtures, metadata, documentation, archives, signatures, links, and platform claims. Native release parity and the retired implementation's test mapping are recorded in [the cutover evidence](native-release-parity.md).
+Exercise changed behavior end to end first, then run affected integration tests and focused unit tests. Select formatting, strict Clippy, workspace and Python checks for the changed surface. Python checks cover support scripts and retained compatibility surfaces, not release administration. Release validation additionally audits source and Git objects, dependencies and licenses, fixtures, metadata, documentation, archives, signatures, links, and platform claims; see [the cutover evidence](native-release-parity.md).
 
 Cross-product work follows the [Dev Tools product standard](product-standard.md) and the applicable [repository architecture decisions](adr/README.md). The complete public gate must succeed from an isolated source tree with private downstream repositories unavailable; public fixtures are synthetic and public product code never discovers a neighboring checkout.
 
@@ -24,7 +24,7 @@ The bounded v0.2 `gh-dev-auth` compatibility frontend remains release-frozen whi
 
 The managed v0.2 `git-dev-auth` grammar remains a rollback security boundary and accepts no new syntax. Dev-auth v0.3 instead forwards all Git argv within an admitted workload and narrows authority through the operating-system session, resolved resource entitlement, provider permissions, command-scoped credential/signing configuration, and terminal denial without human fallback. Platform claims require native routing and child tests; a Windows cross-compile or Wine run is useful implementation evidence but cannot replace current-user ACL, path identity, process isolation, Credential Manager, and named-pipe acceptance on native Windows.
 
-The local validation surface is:
+Validation command reference:
 
 ```sh
 cargo fmt --all -- --check

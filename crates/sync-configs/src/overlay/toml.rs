@@ -52,7 +52,7 @@ pub fn overlay_toml_text(
 ) -> Result<OverlayResult> {
     let mut source_document = parse_document(source_text, "source")?;
     let original_target = parse_document(target_text, "target")?;
-    let source_paths = assignment_paths(&source_document);
+    let source_paths = comment_assignment_paths(&source_document);
     let (commented_assignments, commented_tables) = commented_target_paths(target_text)?;
     let mut suppressed = source_paths
         .iter()
@@ -90,6 +90,9 @@ pub fn overlay_toml_text(
     }
 
     let source_semantic = SemanticValue::Object(table_semantic(source_document.as_table()));
+    for path in retired_paths {
+        validate_owned_retirement(original_target.as_table(), path)?;
+    }
     let mut all_retired = retired_paths.clone();
     all_retired.extend(exclusive_retired_paths(
         &source_semantic,
@@ -160,6 +163,12 @@ pub fn overlay_toml_file(
     target_path: &Path,
     options: &TomlOverlayOptions,
 ) -> Result<OverlayResult> {
+    #[cfg(target_os = "linux")]
+    if !options.dry_run {
+        return overlay_toml_file_transactional(source_path, target_path, options);
+    }
+    #[cfg(target_os = "linux")]
+    super::transaction::ensure_no_pending(target_path)?;
     let source_text = fs::read_to_string(source_path)
         .with_context(|| format!("cannot read TOML overlay source {}", source_path.display()))?;
     let (target_text, materialize_symlink) = read_optional_target(target_path)?;
@@ -172,6 +181,8 @@ pub fn overlay_toml_file(
             anyhow!("managed_overlay_id is required when reconcile_removed_keys is enabled")
         })?;
         let path = ownership::receipt_path(managed_id, options.state_root.as_deref())?;
+        #[cfg(target_os = "linux")]
+        super::transaction::ensure_no_receipt_pending(&path)?;
         prior_paths = ownership::load_paths(&path, managed_id)?;
         current_paths = assignment_paths(&parse_document(&source_text, "source")?);
         ownership_path = Some(path);
@@ -179,11 +190,16 @@ pub fn overlay_toml_file(
 
     let retired_paths = prior_paths
         .difference(&current_paths)
+        .filter(|path| {
+            !current_paths
+                .iter()
+                .any(|current| current.starts_with(path.as_slice()))
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut result = overlay_toml_text(&source_text, &target_text, options, &retired_paths)?;
     for suppressed in &result.suppressed {
-        current_paths.remove(suppressed);
+        current_paths.retain(|path| !path.starts_with(suppressed));
     }
     let ownership_changed = ownership_path.is_some() && prior_paths != current_paths;
     result.materialized_symlink = materialize_symlink;
@@ -194,26 +210,83 @@ pub fn overlay_toml_file(
         return Ok(result);
     }
 
-    let target_snapshot = ownership::snapshot_file(target_path)?;
-    let write_target = result.text != target_text || materialize_symlink;
-    if write_target {
-        ownership::atomic_write_preserving_target(target_path, result.text.as_bytes())?;
-    }
-    if let Some(path) = ownership_path {
-        let managed_id = options
+    bail!("durable overlay publication is currently available only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn overlay_toml_file_transactional(
+    source_path: &Path,
+    target_path: &Path,
+    options: &TomlOverlayOptions,
+) -> Result<OverlayResult> {
+    use super::transaction::{Operation, ReceiptSpec, Transaction};
+    let receipt = if options.reconcile_removed_keys {
+        let id = options
             .managed_overlay_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("managed_overlay_id is required for an ownership receipt"))?;
-        if let Err(error) = ownership::write_paths_atomic(&path, managed_id, &current_paths) {
-            if write_target {
-                ownership::restore_file(target_path, &target_snapshot).with_context(|| {
-                    format!(
-                        "ownership receipt update failed and target rollback also failed: {error:#}"
-                    )
-                })?;
-            }
-            return Err(error);
-        }
+            .as_ref()
+            .context("managed_overlay_id is required when reconcile_removed_keys is enabled")?;
+        Some(ReceiptSpec {
+            id: id.clone(),
+            path: ownership::receipt_path(id, options.state_root.as_deref())?,
+        })
+    } else {
+        None
+    };
+    let mut transaction =
+        Transaction::begin(source_path, target_path, Operation::TomlOverlay, receipt)?;
+    let source_text = transaction.source_text()?.to_owned();
+    let target_text = transaction.target_text()?;
+    let prior_paths = transaction.prior_paths()?;
+    let mut current_paths = if options.reconcile_removed_keys {
+        assignment_paths(&parse_document(&source_text, "source")?)
+    } else {
+        BTreeSet::new()
+    };
+    let retired_paths = prior_paths
+        .difference(&current_paths)
+        .filter(|path| {
+            !current_paths
+                .iter()
+                .any(|current| current.starts_with(path.as_slice()))
+        })
+        .cloned()
+        .collect();
+    let mut result = overlay_toml_text(&source_text, &target_text, options, &retired_paths)?;
+    for suppressed in &result.suppressed {
+        current_paths.retain(|path| !path.starts_with(suppressed));
+    }
+    result.materialized_symlink = transaction.is_symlink();
+    result.ownership_changed = options.reconcile_removed_keys && prior_paths != current_paths;
+    result.changed |= result.materialized_symlink || result.ownership_changed;
+    transaction.publish(
+        &mut result,
+        false,
+        options.reconcile_removed_keys.then_some(&current_paths),
+    )?;
+    Ok(result)
+}
+
+/// Remove exact parser-owned source leaves while retaining target-only leaves
+/// and suppression directives. Structural mismatches never widen retirement.
+pub(crate) fn remove_source_owned_text(
+    source_text: &str,
+    target_text: &str,
+) -> Result<OverlayResult> {
+    let source = parse_document(source_text, "source")?;
+    let retired = assignment_paths(&source);
+    let mut result = overlay_toml_text(
+        "",
+        target_text,
+        &TomlOverlayOptions {
+            preserve_target_layout: true,
+            conflict_policy: TomlConflictPolicy::Target,
+            ..TomlOverlayOptions::default()
+        },
+        &retired,
+    )?;
+    if result.removed > 0 && result.text.trim().is_empty() {
+        result.text.clear();
+        result.changed = result.text != target_text;
     }
     Ok(result)
 }
@@ -335,7 +408,13 @@ fn split_key_components(raw: &str) -> Result<Vec<&str>> {
 
 fn assignment_paths(document: &DocumentMut) -> BTreeSet<PathKey> {
     let mut paths = BTreeSet::new();
-    collect_assignment_paths(document.as_table(), &mut Vec::new(), &mut paths);
+    collect_assignment_paths(document.as_table(), &mut Vec::new(), &mut paths, true);
+    paths
+}
+
+fn comment_assignment_paths(document: &DocumentMut) -> BTreeSet<PathKey> {
+    let mut paths = BTreeSet::new();
+    collect_assignment_paths(document.as_table(), &mut Vec::new(), &mut paths, false);
     paths
 }
 
@@ -343,11 +422,17 @@ fn collect_assignment_paths(
     table: &dyn TableLike,
     path: &mut PathKey,
     output: &mut BTreeSet<PathKey>,
+    inline_leaves: bool,
 ) {
     for (key, item) in table.iter() {
         path.push(key.to_owned());
         if let Item::Table(child) = item {
-            collect_assignment_paths(child, path, output);
+            collect_assignment_paths(child, path, output, inline_leaves);
+        } else if let Some(child) = item
+            .as_table_like()
+            .filter(|child| inline_leaves && !child.is_empty())
+        {
+            collect_assignment_paths(child, path, output, inline_leaves);
         } else if !item.is_none() {
             output.insert(path.clone());
         }
@@ -549,6 +634,23 @@ fn assignment_separator(line: &str) -> Option<usize> {
         }
     }
     None
+}
+
+fn validate_owned_retirement(table: &dyn TableLike, path: &[String]) -> Result<()> {
+    let Some((first, remaining)) = path.split_first() else {
+        return Ok(());
+    };
+    let Some(item) = table.get(first) else {
+        return Ok(());
+    };
+    if remaining.is_empty() {
+        if item.as_table_like().is_some_and(|child| !child.is_empty()) {
+            bail!("owned TOML leaf became a container; normalize the target structure before retrying");
+        }
+    } else if let Some(child) = item.as_table_like() {
+        validate_owned_retirement(child, remaining)?;
+    }
+    Ok(())
 }
 
 fn remove_path(table: &mut dyn TableLike, path: &[String]) -> bool {

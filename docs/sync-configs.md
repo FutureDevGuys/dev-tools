@@ -2,6 +2,8 @@
 
 The [TOML retirement ADR](../crates/sync-configs/docs/adr/0001-toml-suppression-retirement-and-nan.md) records NaN comparison and preservation of disabling comments when receipt-owned keys retire.
 
+The source-only [durable overlay ADR](../crates/sync-configs/docs/adr/0003-durable-overlay-publication.md) defines serialized target/receipt publication and forward recovery. Its verification and native release acceptance remain pending; it does not change the accepted 0.3.1 artifact.
+
 `sync-configs` is a config-only convergence engine. It consumes an explicit trusted manifest and supports symlink and copy realization, recursive expansion and filters, permissions, JSON and TOML overlays, ownership receipts, removed-key reconciliation, trusted hooks, bounded native-sudo hooks and regular-file targets, profiles, external profile maps, dry-run, validation, and structured value-free output.
 
 Results remain buffered into deterministic status groups. Informational records join their own group instead of appearing before the report, and captured hook output uses the same colored, aligned group/name columns as entry results. An interactive terminal receives one immediate value-free line in those same colored, aligned columns before each selected pre- or post-script so a long native or network hook cannot look frozen; the line contains only the phase and declared entry labels. Noninteractive and JSON consumers remain quiet until their normal result, and JSON stdout contains exactly one JSON document.
@@ -10,9 +12,26 @@ Dry-run performs no desired-state writes and executes no hooks; unless logging i
 
 Normal convergence and validation return `0` when the selected operation completes, `1` for a validated convergence/check failure, and `2` for CLI parsing or invalid invocation. Ctrl-C requests orderly cancellation and returns `130` after owned hook/reconciler processes and temporary state are settled; repeated interrupts coalesce during cleanup, and an interrupt arriving after terminal finalization begins does not rewrite the published outcome. JSON convergence output uses one value-free document with `schema_version`, `outcome`, `exit_code`, `dry_run`, `profiles`, and, when present, structured reconciler results; an interrupted JSON run reports `outcome: interrupted` and `error_kind: interrupted`. Schema additions are additive within a major product line.
 
+## Default configuration and profiles
+
+Without arguments, SyncConfigs reads `$XDG_CONFIG_HOME/sync-configs/manifest.yaml`, falling back to `~/.config/sync-configs/manifest.yaml` on POSIX; Windows uses `%APPDATA%/sync-configs/manifest.yaml`. A manifest may select its normal profiles through the existing external profile-map format:
+
+```yaml
+default_profile_map:
+  path: ./profiles.yaml
+  host: workstation
+  field: config_profiles
+```
+
+This default applies only when no CLI profile or host/profile-map selection is supplied. Explicit selections replace it. The referenced map remains the authority for profile membership; the manifest does not copy that list. Omission preserves the existing unprofiled-only behavior. Invalid active defaults fail before hooks or desired-state writes.
+
+A manifest symlink resolves relative sources, entry directories and hook working directories beside the actual target manifest. Its adjacent `manifest.override.yaml` remains beside the supplied link, so a machine-local override can select its default profile map without editing shared configuration. A default declared in that override replaces the base default. These additive contracts first appear in the unreleased 0.3.0 source; 0.2.1 does not support them. [ADR 0002](../crates/sync-configs/docs/adr/0002-default-profile-map-and-linked-manifests.md) records the behavior and required verification.
+
 ## Bounded diagnostics
 
 Normal convergence creates one owner-only run directory beneath `$XDG_STATE_HOME/sync-configs/runs` on accepted Unix runtimes. Root precedence is `--log-root`, `SYNC_CONFIGS_LOG_ROOT`, then the platform default; an explicit root must be absolute. `run.json` records lifecycle, selected logging policy, outcome, and value-free counts. The default `events` style also writes `events.jsonl`; `transcript` writes `console.log`; and `both` writes both payloads. `off` creates nothing. Windows reserves `%LOCALAPPDATA%\sync-configs\runs` as its future root, but recording and log-management commands currently fail closed before storage access because inherited ACLs are not proof of owner-only custody; normal convergence degrades that diagnostic failure to a value-free warning. Windows logging remains disabled until an audited native DACL boundary and runtime acceptance exist.
+
+Fatal engine failures retain the existing JSON `error_kind: convergence_failed` and exit 1, with an additive closed `failure` object shared by terminal `run.json` metadata and an Error-level `run_failure` event. It distinguishes typed hook timeout (including pre/post phase), privileged-command timeout, and authentication process failure or unsuccessful exit (including cached-check/prompt stage and available OS/exit/signal numbers). Other fatal causes use `kind: convergence_failed`; arbitrary error text, paths, commands, environment and captured output are excluded. This projection does not infer a cause from elapsed time, classify aggregate report failures as timeouts, or recover details missing from older runs. Existing interruption precedence, logging filters/limits, diagnostic-failure neutrality and metadata-before-final-event durability stay unchanged. [ADR 0124](adr/0124-sync-configs-fatal-run-diagnostics.md) records the source-only change and pending native qualification.
 
 Orchestrators may set `SYNC_CONFIGS_PARENT_RUN_ID` to another canonical run identifier to correlate child diagnostics. Invalid or free-form values are ignored rather than persisted.
 
@@ -47,6 +66,10 @@ Fresh installations and native steady state have no Python dependency. During a 
 ## Native one-shot operations
 
 The same native executable exposes focused operations for trusted callers that do not need a manifest: `sync-configs json-overlay SOURCE TARGET`, `sync-configs toml-overlay SOURCE TARGET`, and `sync-configs managed-path-policy SOURCE TARGET`. Overlay commands retain `--dry-run` and `--check`; check exits `1` when a write would be required. JSON supports repeatable `--replace-json-pointer` plus receipt-backed removed-key reconciliation. TOML supports source- or target-wins conflicts, comment policy, receipt-backed removed-key reconciliation, and `--remove` for exact source-owned keys. The classifier supports safe, strict, and takeover policies plus an optional recognized skeleton and human or JSON output. These are native subcommands, not Python module entrypoints or compatibility shims.
+
+In the pending durable-overlay source, Linux manifest and standalone writers share permanent locks beside the exact target and optional receipt, regardless of managed ID or receipt-root selection. A private journal retains target and optional receipt candidates before target mutation; a durable receipt reservation prevents another target from reusing that receipt after a crash. Retrying the original source path, target, operation and receipt selection finishes that candidate and then merges current source contents. Drift outside retained states or changed parent custody blocks recovery without overwriting the occupant. Target-only TOML removal enters the same boundary and retains its source-owned leaf scope. Errors after journal entry can follow durable changes; recovery completes forward rather than restoring an in-memory snapshot.
+
+These source-only writers require caller-owned, single-link ordinary targets without special or group/other write bits and caller-owned, nonwritable-by-others real parents. Existing UID/GID/mode are retained; new targets use 0600 and new parents use 0700. Publication inputs/targets are bounded to 16 MiB and receipts to 1 MiB. Transaction names beginning `.sync-configs-overlay-` are reserved; retained lock files must remain present while writers can run. Dry-run/check create no transaction state and report observable pending work for explicit mutating retry. Other runtimes reject required writes until their own durable custody boundary exists. Older writers must be quiesced; this cooperating-writer protocol does not fence them or external editors.
 
 `sync-configs completion bash|zsh|fish|elvish|powershell` emits a first-party completion definition for the complete native CLI.
 

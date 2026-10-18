@@ -2,7 +2,7 @@
 
 use dev_tools_installation::{
     read_atomic_document, read_atomic_file, DocumentAuthority, DocumentDirectoryPreparation,
-    ExistingDocumentDirectory,
+    ExistingDocumentDirectory, FileAuthority,
 };
 use std::ffi::OsStr;
 use std::fs;
@@ -40,6 +40,62 @@ fn empty_file_support_does_not_adopt_occupied_new_document_destinations() {
     assert_eq!(directory.read(name, &authority).unwrap().unwrap(), owned);
     assert!(!directory
         .write(name, b"owned", &authority, Some(&owned.identity))
+        .unwrap());
+}
+
+#[test]
+fn explicit_group_file_authority_preserves_empty_file_and_document_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let metadata = temp.path().metadata().unwrap();
+    let directory = ExistingDocumentDirectory::open(temp.path(), metadata.uid()).unwrap();
+    let document = DocumentAuthority {
+        owner_uid: metadata.uid(),
+        mode: 0o600,
+        limit: 32,
+    };
+    let selected = FileAuthority {
+        owner_uid: document.owner_uid,
+        group_gid: metadata.gid(),
+        mode: document.mode,
+        limit: document.limit,
+    };
+    let wrong_group = FileAuthority {
+        group_gid: selected.group_gid.wrapping_add(1),
+        ..selected.clone()
+    };
+    let name = OsStr::new("selected-group-file");
+    directory
+        .write_file_with_group(name, b"", &selected, None)
+        .unwrap();
+    let empty = directory
+        .read_file_with_group(name, &selected)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        directory.read_file(name, &document).unwrap().unwrap(),
+        empty
+    );
+    assert!(directory.read(name, &document).is_err());
+    assert!(directory.read_file_with_group(name, &wrong_group).is_err());
+    assert!(directory
+        .write_file_with_group(name, b"changed", &wrong_group, Some(&empty.identity))
+        .is_err());
+    assert!(directory
+        .remove_file_with_group(name, &wrong_group, &empty.identity)
+        .is_err());
+    assert!(directory.publish_new(name, b"document", &document).is_err());
+    assert_eq!(
+        directory
+            .read_file_with_group(name, &selected)
+            .unwrap()
+            .unwrap(),
+        empty
+    );
+    assert!(directory
+        .remove_file_with_group(name, &selected, &empty.identity)
+        .unwrap());
+    assert!(!directory
+        .remove_file_with_group(name, &selected, &empty.identity)
         .unwrap());
 }
 

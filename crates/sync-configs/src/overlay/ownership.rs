@@ -3,8 +3,12 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File, Metadata, OpenOptions, Permissions};
-use std::io::{self, Read, Write};
+use std::fs::{self, Metadata, Permissions};
+#[cfg(not(target_os = "linux"))]
+use std::fs::{File, OpenOptions};
+#[cfg(not(target_os = "linux"))]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,6 +19,7 @@ use super::PathKey;
 use crate::paths::{is_absolute_for, platform_join, PathPlatform};
 
 const RECEIPT_SCHEMA_VERSION: u64 = 1;
+pub(crate) const RECEIPT_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +30,7 @@ struct OwnershipReceipt {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum FileSnapshot {
     Missing,
     Symlink(PathBuf),
@@ -44,6 +50,7 @@ pub(crate) struct PreservedMetadata {
 }
 
 impl PreservedMetadata {
+    #[cfg(test)]
     fn from_metadata(metadata: &Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
@@ -158,58 +165,96 @@ pub fn load_paths(path: &Path, managed_id: &str) -> Result<BTreeSet<PathKey>> {
         }
     };
     validate_receipt_metadata(path, &metadata)?;
-    validate_real_parent_chain(path, "overlay ownership receipt")?;
-    let mut file = open_receipt_no_follow(path)?;
-    validate_receipt_metadata(
-        path,
-        &file.metadata().with_context(|| {
-            format!(
-                "cannot inspect opened overlay ownership receipt {}",
-                path.display()
-            )
-        })?,
-    )?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("cannot read overlay ownership receipt {}", path.display()))?;
-    let receipt: OwnershipReceipt = serde_json::from_slice(&bytes).map_err(|_| {
-        anyhow!(
-            "overlay ownership receipt has invalid JSON or fields: {}",
-            path.display()
-        )
-    })?;
+    #[cfg(target_os = "linux")]
+    {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()?.join(path)
+        };
+        let directory = dev_tools_installation::ExistingDocumentDirectory::open(
+            absolute.parent().context("overlay receipt has no parent")?,
+            rustix::process::geteuid().as_raw(),
+        )?;
+        let document = directory
+            .read(
+                absolute
+                    .file_name()
+                    .context("overlay receipt has no name")?,
+                &dev_tools_installation::DocumentAuthority {
+                    owner_uid: rustix::process::geteuid().as_raw(),
+                    mode: 0o600,
+                    limit: RECEIPT_LIMIT,
+                },
+            )?
+            .context("overlay receipt disappeared while being read")?;
+        decode_paths(&document.bytes, managed_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        validate_real_parent_chain(path, "overlay ownership receipt")?;
+        let mut file = open_receipt_no_follow(path)?;
+        validate_receipt_metadata(
+            path,
+            &file.metadata().with_context(|| {
+                format!(
+                    "cannot inspect opened overlay ownership receipt {}",
+                    path.display()
+                )
+            })?,
+        )?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(RECEIPT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read overlay ownership receipt {}", path.display()))?;
+        decode_paths(&bytes, managed_id)
+    }
+}
+
+pub(crate) fn decode_paths(bytes: &[u8], managed_id: &str) -> Result<BTreeSet<PathKey>> {
+    validate_managed_id(managed_id)?;
+    if bytes.len() as u64 > RECEIPT_LIMIT {
+        bail!("overlay ownership receipt exceeds its size bound");
+    }
+    let receipt: OwnershipReceipt = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow!("overlay ownership receipt has invalid JSON or fields"))?;
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
-        bail!(
-            "overlay ownership receipt has an unsupported schema: {}",
-            path.display()
-        );
+        bail!("overlay ownership receipt has an unsupported schema");
     }
     if receipt.managed_overlay_id != managed_id {
-        bail!(
-            "overlay ownership receipt identity does not match: {}",
-            path.display()
-        );
+        bail!("overlay ownership receipt identity does not match");
     }
 
     let mut paths = BTreeSet::new();
     for path_key in receipt.managed_paths {
         if path_key.is_empty() || path_key.iter().any(String::is_empty) {
-            bail!(
-                "overlay ownership receipt contains an invalid managed path: {}",
-                path.display()
-            );
+            bail!("overlay ownership receipt contains an invalid managed path");
         }
         if !paths.insert(path_key) {
-            bail!(
-                "overlay ownership receipt contains a duplicate managed path: {}",
-                path.display()
-            );
+            bail!("overlay ownership receipt contains a duplicate managed path");
         }
     }
     Ok(paths)
 }
 
 pub fn write_paths_atomic(path: &Path, managed_id: &str, paths: &BTreeSet<PathKey>) -> Result<()> {
+    let bytes = encode_paths(managed_id, paths)?;
+    validate_real_parent_chain(path, "overlay ownership receipt")?;
+    ensure_private_parent(path)?;
+    validate_real_parent_chain(path, "overlay ownership receipt")?;
+    reject_non_regular_destination(path, "overlay ownership receipt", false)?;
+    atomic_write(
+        path,
+        bytes.as_bytes(),
+        None,
+        "overlay ownership receipt",
+        false,
+    )
+    .with_context(|| format!("cannot write overlay ownership receipt {}", path.display()))
+}
+
+pub(crate) fn encode_paths(managed_id: &str, paths: &BTreeSet<PathKey>) -> Result<String> {
     validate_managed_id(managed_id)?;
     if paths
         .iter()
@@ -217,23 +262,21 @@ pub fn write_paths_atomic(path: &Path, managed_id: &str, paths: &BTreeSet<PathKe
     {
         bail!("cannot write an ownership receipt containing an invalid managed path");
     }
-    validate_real_parent_chain(path, "overlay ownership receipt")?;
-    ensure_private_parent(path)?;
-    validate_real_parent_chain(path, "overlay ownership receipt")?;
-    reject_non_regular_destination(path, "overlay ownership receipt", false)?;
-
     let receipt = OwnershipReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
         managed_overlay_id: managed_id.to_owned(),
         managed_paths: paths.iter().cloned().collect(),
     };
-    let mut bytes = serde_json::to_vec_pretty(&receipt)
+    let mut text = serde_json::to_string_pretty(&receipt)
         .context("cannot serialize overlay ownership receipt")?;
-    bytes.push(b'\n');
-    atomic_write(path, &bytes, None, "overlay ownership receipt", false)
-        .with_context(|| format!("cannot write overlay ownership receipt {}", path.display()))
+    text.push('\n');
+    if text.len() as u64 > RECEIPT_LIMIT {
+        bail!("overlay ownership receipt exceeds its size bound");
+    }
+    Ok(text)
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_file(path: &Path) -> Result<FileSnapshot> {
     validate_real_parent_chain(path, "overlay target snapshot")?;
     let metadata = match fs::symlink_metadata(path) {
@@ -268,6 +311,7 @@ pub(crate) fn snapshot_file(path: &Path) -> Result<FileSnapshot> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn restore_file(path: &Path, snapshot: &FileSnapshot) -> Result<()> {
     validate_real_parent_chain(path, "overlay target rollback")?;
     match snapshot {
@@ -288,6 +332,7 @@ pub(crate) fn restore_file(path: &Path, snapshot: &FileSnapshot) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn atomic_write_preserving_target(path: &Path, bytes: &[u8]) -> Result<()> {
     validate_real_parent_chain(path, "overlay target")?;
     let metadata = match fs::symlink_metadata(path) {
@@ -395,7 +440,8 @@ fn reject_non_regular_destination(
 }
 
 fn validate_receipt_metadata(path: &Path, metadata: &Metadata) -> Result<()> {
-    if !metadata.is_file() || metadata_is_link_boundary(metadata) {
+    if !metadata.is_file() || metadata_is_link_boundary(metadata) || metadata.len() > RECEIPT_LIMIT
+    {
         bail!(
             "overlay ownership receipt must be a regular file: {}",
             path.display()
@@ -418,7 +464,7 @@ fn validate_receipt_metadata(path: &Path, metadata: &Metadata) -> Result<()> {
                 path.display()
             );
         }
-        if metadata.permissions().mode() & 0o077 != 0 {
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
             bail!(
                 "overlay ownership receipt must be owner-only: {}",
                 path.display()
@@ -546,6 +592,7 @@ fn create_real_parent_chain(path: &Path, label: &str) -> Result<()> {
     validate_real_parent_chain(path, label)
 }
 
+#[cfg(test)]
 pub(crate) fn remove_existing_leaf(path: &Path, label: &str) -> Result<()> {
     validate_real_parent_chain(path, label)?;
     match fs::symlink_metadata(path) {
@@ -569,6 +616,7 @@ pub(crate) fn remove_existing_leaf(path: &Path, label: &str) -> Result<()> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn open_receipt_no_follow(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -621,17 +669,17 @@ fn metadata_is_unsupported_reparse_leaf(metadata: &Metadata) -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(test, not(any(unix, windows))))]
 fn create_symlink(_target: &Path, _link: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

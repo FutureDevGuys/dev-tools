@@ -37,7 +37,9 @@ use crate::paths::{
     canonical_target_key, is_absolute_for, resolve_config_path, PathContext, PathError,
     PathPlatform,
 };
-use crate::privilege::{discover_trusted_sudo, PrivilegeError, PrivilegeSession};
+use crate::privilege::{
+    discover_trusted_sudo, AuthenticationFailure, PrivilegeError, PrivilegeSession,
+};
 use crate::privileged_target::{
     apply_privileged_plans, plan_selected_privileged_entries, revalidate_privileged_plans,
     PrivilegedCommands, PrivilegedCopyPlan, PrivilegedTargetError, PrivilegedTargetOutcome,
@@ -47,7 +49,7 @@ use crate::reconciler::{
     resolve_executable as resolve_reconciler_executable, ReconcilerError, ReconcilerPrivilege,
     ReconcilerRunner, ReconcilerSpec,
 };
-use crate::report::{ReconcilerSummary, Record, Report, Status};
+use crate::report::{FailureDiagnostic, ReconcilerSummary, Record, Report, Status};
 use crate::scaffold::{initialize, render_examples, ScaffoldError, ScaffoldPaths};
 
 const RECONCILER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -116,6 +118,41 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Project only established typed causes; never infer one from elapsed time
+    /// or parse arbitrary error text. Interruption handling takes precedence.
+    pub fn failure_diagnostic(&self) -> FailureDiagnostic {
+        match self {
+            Self::Hook(crate::hooks::HookError::TimedOut { phase }) => {
+                FailureDiagnostic::HookTimedOut { phase: *phase }
+            }
+            Self::Privilege(source)
+            | Self::Hook(crate::hooks::HookError::Privilege(source))
+            | Self::PrivilegedTarget(PrivilegedTargetError::PrivilegedCommand {
+                source,
+                ..
+            }) => match source {
+                PrivilegeError::TimedOut => FailureDiagnostic::PrivilegedCommandTimedOut,
+                PrivilegeError::Authentication { stage, failure } => match failure {
+                    AuthenticationFailure::Process { os_code, .. } => {
+                        FailureDiagnostic::AuthenticationProcess {
+                            stage: *stage,
+                            os_code: *os_code,
+                        }
+                    }
+                    AuthenticationFailure::Exit { code, signal } => {
+                        FailureDiagnostic::AuthenticationExit {
+                            stage: *stage,
+                            code: *code,
+                            signal: *signal,
+                        }
+                    }
+                },
+                _ => FailureDiagnostic::ConvergenceFailed,
+            },
+            _ => FailureDiagnostic::ConvergenceFailed,
+        }
+    }
+
     pub const fn is_interrupted(&self) -> bool {
         matches!(
             self,
@@ -288,7 +325,20 @@ fn load_request(
     options.mode_override = cli.mode.map(mode_from_cli);
     options.prefer_source_overrides = !cli.no_source_overrides;
     let manifest = load_manifest(&config, &options)?;
-    let profiles = resolve_profiles(cli, &path_context)?;
+    let profiles =
+        if cli.profile.is_empty() && cli.profile_map.is_none() && cli.host_profile.is_none() {
+            match &manifest.default_profile_map {
+                Some(selection) => load_profile_map(
+                    &selection.path,
+                    &selection.host,
+                    selection.field.as_deref(),
+                    &path_context,
+                )?,
+                None => resolve_profiles(cli, &path_context)?,
+            }
+        } else {
+            resolve_profiles(cli, &path_context)?
+        };
 
     Ok(LoadedRequest {
         manifest,
