@@ -38,6 +38,25 @@ fn help_exposes_current_general_interfaces() {
 }
 
 #[test]
+fn version_is_one_stable_local_line() {
+    let home = TempDir::new().unwrap();
+    command(&home)
+        .env(
+            "DEV_TOOLS_GIT_COMMIT",
+            "runtime-value-must-not-replace-build-identity",
+        )
+        .env(
+            "UPDATE_ALL_GIT_COMMIT",
+            "runtime-value-must-not-replace-build-identity",
+        )
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(format!("update-all {}\n", env!("CARGO_PKG_VERSION")))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
 fn standard_build_info_is_local_and_uses_the_common_schema() {
     let home = TempDir::new().unwrap();
     let output = command(&home)
