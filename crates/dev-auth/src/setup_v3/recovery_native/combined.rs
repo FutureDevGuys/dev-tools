@@ -48,6 +48,7 @@ pub(super) fn upgrade_and_restore(
         &read_document,
         &|_| Ok(()),
         Some(policy),
+        BindingSourceCheck::NewApproval,
     )
     .unwrap();
     assert_eq!(plan.schema, "dev-auth-setup-plan-v4");

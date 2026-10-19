@@ -1,6 +1,22 @@
 //! Local common identity output, separate from the retained release verifier API.
 use dev_tools_product::{BuildInfo, ProductId};
 use std::io::Write;
+#[cfg(any(test, not(target_os = "linux")))]
+use std::path::Path;
+
+#[cfg(any(test, not(target_os = "linux")))]
+pub(super) fn has_version_layout(executable: &Path) -> bool {
+    executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        == Some(std::ffi::OsStr::new("versions"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn running_has_version_layout() -> std::io::Result<bool> {
+    std::env::current_exe().map(|executable| has_version_layout(&executable))
+}
 
 pub(super) fn print_version() -> i32 {
     write_output(format!("dev-auth {}\n", env!("CARGO_PKG_VERSION")).as_bytes())
@@ -36,4 +52,18 @@ fn write_output(bytes: &[u8]) -> i32 {
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_layout_classifier_does_not_infer_a_managed_installation_from_a_name() {
+        use super::has_version_layout;
+        use std::path::Path;
+        assert!(has_version_layout(Path::new(
+            "/opt/dev-auth/versions/0.5.0/dev-auth"
+        )));
+        assert!(!has_version_layout(Path::new("/opt/dev-auth/dev-auth")));
+        assert!(!has_version_layout(Path::new("/opt/versions/dev-auth")));
+    }
 }

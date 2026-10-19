@@ -25,10 +25,22 @@ if [ "${1-}" = hold ]; then
   printf '%s\n' "$$" > "$HOME/worker-$fixture_case.pid"
   while :; do /usr/bin/sleep 1; done
 fi
+if [ "${1-}" = nested ]; then
+  command -v bound-worker | /usr/bin/grep -q '/tool-bin/bound-worker$'
+  bound-worker child
+  printf 'strong-binding-nested=passed\n'
+  exit 0
+fi
 /usr/local/bin/dev-auth validate --component providers --online --non-interactive --json
 [ "$(/usr/local/bin/dev-auth secret read token --non-interactive)" = 'fixture-delivered-secret' ]
 /usr/local/bin/dev-auth secret exec --stdin token --non-interactive -- /usr/bin/bash -c 'IFS= read -r value || :; test "$value" = fixture-delivered-secret'
 printf 'workload-credential-check=passed\n'
+case ${1-} in
+  */COMMIT_EDITMSG) printf 'editor-launch=passed\n' > "$HOME/editor-launch-passed" ;;
+esac
+if [ -n "${GIO_LAUNCHED_DESKTOP_FILE-}" ]; then
+  printf 'desktop-launch=passed\n' > "$HOME/desktop-launch-passed"
+fi
 "##, 0o755);
     crate::setup::enroll_system_service_credential_slot("automation", b"fixture-service-account")
         .unwrap();

@@ -20,14 +20,19 @@ case ${1:-} in
         done
         if settle_fixture_exit_code 137 container_setup; then exit 1; else [[ $? == 137 ]]; fi
         ;;
-    run)
-        [[ ( $# == 4 || $# == 5 ) && $EUID != 0 && -t 0 && -t 1 ]]
+    run|prepare-sudo)
+        entry=$1
+        [[ ( $# == 4 || $# == 5 ) && $EUID != 0 ]]
+        [[ "$entry" == prepare-sudo || ( -t 0 && -t 1 ) ]]
         product=$(realpath -e -- "$2")
         library_test=$(realpath -e -- "$3")
         image=$4
         scenario=${5:-launch-grant}
         [[ "$scenario" == launch-grant || "$scenario" == tty-probe || "$scenario" == password-diagnostic || "$scenario" == login-session-probe || "$scenario" == privilege-setup || "$scenario" == privilege-setup-interrupted || "$scenario" == privilege-setup-reconfigured || "$scenario" == privilege-combined || "$scenario" == binding-strong ]]
         [[ "$image" =~ ^[a-f0-9]{64}$ ]]
+        if [[ "$scenario" == privilege-combined ]]; then
+            "$library_test" --ignored --exact setup_v3::privilege::native_acceptance::native_fixture_embedded_sudo_payload_available --test-threads=1
+        fi
         stage=$(mktemp -d /tmp/dev-auth-installed-stage.XXXXXXXX)
         install -m 0755 -- "$product" "$stage/dev-auth"
         install -m 0755 -- "$library_test" "$stage/library-test"
@@ -40,10 +45,24 @@ case ${1:-} in
         (cd "$stage" && sha256sum dev-auth library-test installed-linux.sh installed-user.sh image.tar image-id scenario >SHA256SUMS)
         manifest=$(sha256sum "$stage/SHA256SUMS")
         printf 'Installed launch fixture stage: %s\n' "$stage"
+        if [[ "$entry" == prepare-sudo ]]; then
+            printf 'Installed launch fixture manifest: %s\n' "${manifest%% *}"
+            printf 'Run only in the approved sudo tmux terminal: /usr/bin/bash %s/installed-linux.sh sudo-root %s %s\n' "$stage" "$stage" "${manifest%% *}"
+            exit 0
+        fi
         exec /usr/bin/pkexec /usr/bin/bash --noprofile --norc "$stage/installed-linux.sh" root "$stage" "${manifest%% *}"
         ;;
-    root)
-        [[ $# == 3 && $EUID == 0 && ${PKEXEC_UID:-} =~ ^[1-9][0-9]*$ && -t 0 && -t 1 ]]
+    root|sudo-root)
+        entry=$1
+        [[ $# == 3 && $EUID == 0 && -t 0 && -t 1 ]]
+        if [[ "$entry" == root ]]; then
+            [[ ${PKEXEC_UID:-} =~ ^[1-9][0-9]*$ ]]
+            host_approval=policykit
+        else
+            [[ ${SUDO_UID:-} =~ ^[1-9][0-9]*$ && ${SUDO_USER:-} != root ]]
+            [[ $(id -u "$SUDO_USER") == "$SUDO_UID" ]]
+            host_approval=sudo_session
+        fi
         stage=$2
         expected=$3
         [[ "$stage" =~ ^/tmp/dev-auth-installed-stage\.[A-Za-z0-9]{8}$ && "$expected" =~ ^[a-f0-9]{64}$ ]]
@@ -77,6 +96,7 @@ case ${1:-} in
         runtime=(/usr/bin/podman --root "$storage_base/storage" --runroot "$fixture/runtime" --storage-driver vfs --cgroup-manager "$cgroup_manager")
         container=''
         removed=false
+        storage_removed=false
         prepared=false
         privilege_setup=false
         progress_watcher=''
@@ -123,7 +143,17 @@ case ${1:-} in
                 fi
                 if "${runtime[@]}" rm --force --time 5 "$container"; then removed=true; else code=1; fi
             fi
-            jq -n --argjson code "$code" --argjson prepared "$prepared" --argjson removed "$removed" --argjson privilege_setup "$privilege_setup" --arg scenario "$scenario" --arg storage "$storage_base" --arg phase "$phase" --arg cgroup_manager "$cgroup_manager" '{schema:"dev-auth-installed-launch-run-v1",exit_code:$code,phase:$phase,scenario:$scenario,cgroup_manager:$cgroup_manager,prepared:$prepared,container_removed:$removed,image_storage:$storage,signed_release:false,privilege_setup_receipted:$privilege_setup}' >"$fixture/result.json"
+            # The private Podman image store is disposable only after the
+            # exact container is gone. Keeping every completed store can fill
+            # /var even though the value-free result reports container removal.
+            if [[ "$removed" == true || -z "$container" ]]; then
+                if [[ "$storage_base" == "/var/tmp/dev-auth-installed-store-$nonce" && -d "$storage_base" && ! -L "$storage_base" ]]; then
+                    if /usr/bin/rm -r -- "$storage_base"; then storage_removed=true; else code=1; fi
+                else
+                    code=1
+                fi
+            fi
+            jq -n --argjson code "$code" --argjson prepared "$prepared" --argjson removed "$removed" --argjson storage_removed "$storage_removed" --argjson privilege_setup "$privilege_setup" --arg scenario "$scenario" --arg storage "$storage_base" --arg phase "$phase" --arg cgroup_manager "$cgroup_manager" --arg host_approval "$host_approval" '{schema:"dev-auth-installed-launch-run-v1",exit_code:$code,phase:$phase,scenario:$scenario,cgroup_manager:$cgroup_manager,host_approval:$host_approval,prepared:$prepared,container_removed:$removed,image_storage:$storage,image_storage_removed:$storage_removed,signed_release:false,privilege_setup_receipted:$privilege_setup}' >"$fixture/result.json"
             chmod 0644 "$fixture/result.json"
             printf 'Installed launch result: %s/result.json\n' "$fixture"
             exit "$code"
@@ -215,7 +245,7 @@ case ${1:-} in
         if [[ "$scenario" == binding-strong ]]; then
             "${runtime[@]}" cp "$container:/fixture/binding-strong-result.json" "$fixture/binding-strong-result.json"
             chmod 0644 "$fixture/binding-strong-result.json"
-            jq -e '.passed == true and .mutable_edit == true and .restored == true' "$fixture/binding-strong-result.json"
+            jq -e '.passed == true and .mutable_edit == true and .desktop_entry == true and .desktop_launch == true and .service_launch == true and .editor_launch == true and .native_config_locator == true and .pinned_bytes == true and .pinned_update_snapshot == true and .pinned_retirement == true and .pinned_retirement_interrupted == true and .restored == true' "$fixture/binding-strong-result.json"
             prepared=true
             phase=complete
             exit 0
@@ -306,5 +336,5 @@ case ${1:-} in
         jq -e '.exit_code == 0 and .step == "complete"' "$fixture/installed-result.json"
         phase=complete
         ;;
-    *) printf '%s\n' 'usage: installed-linux.sh run PRODUCT LIBRARY_TEST IMAGE_ID [launch-grant|tty-probe|password-diagnostic|login-session-probe|privilege-setup|privilege-setup-interrupted|privilege-setup-reconfigured|privilege-combined|binding-strong]' >&2; exit 2 ;;
+    *) printf '%s\n' 'usage: installed-linux.sh run|prepare-sudo PRODUCT LIBRARY_TEST IMAGE_ID [launch-grant|tty-probe|password-diagnostic|login-session-probe|privilege-setup|privilege-setup-interrupted|privilege-setup-reconfigured|privilege-combined|binding-strong]' >&2; exit 2 ;;
 esac

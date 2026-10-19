@@ -1167,6 +1167,7 @@ fn setup_prerequisite_blockers(
                     "strong_admission",
                 ));
             }
+            #[cfg(target_os = "linux")]
             if rustix::process::pidfd_open(
                 rustix::process::getpid(),
                 rustix::process::PidfdFlags::empty(),
@@ -3653,7 +3654,7 @@ pub fn purge_user_state() -> Result<StateCleanupReport> {
             crate::runtime::revoke_user_broker_service_token_for_slot(slot)?;
         }
     } else {
-        crate::revoke_user_broker_service_token()?;
+        crate::runtime::revoke_user_broker_service_token()?;
     }
     let policy_removed = remove_optional_state_file(
         &policy_path,
@@ -3741,17 +3742,22 @@ fn require_uninstalled_layout(paths: &SetupPaths) -> Result<()> {
 }
 
 fn require_broker_sockets_absent() -> Result<()> {
-    for socket in [
-        crate::broker_client::SYSTEM_BROKER_SOCKET,
-        crate::broker_client::SYSTEM_CONTROL_SOCKET,
-    ] {
-        match fs::symlink_metadata(socket) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => bail!("system broker socket remains before state cleanup"),
-            Err(error) => return Err(error).context("inspect broker socket before cleanup"),
+    #[cfg(not(target_os = "linux"))]
+    bail!("system broker socket cleanup requires a native platform backend");
+    #[cfg(target_os = "linux")]
+    {
+        for socket in [
+            crate::broker_client::SYSTEM_BROKER_SOCKET,
+            crate::broker_client::SYSTEM_CONTROL_SOCKET,
+        ] {
+            match fs::symlink_metadata(socket) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => bail!("system broker socket remains before state cleanup"),
+                Err(error) => return Err(error).context("inspect broker socket before cleanup"),
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn require_user_sessions_absent() -> Result<()> {
@@ -3874,6 +3880,11 @@ pub fn privileged_launcher_path() -> &'static Path {
 }
 
 pub fn validate_running_privileged_launcher() -> Result<PathBuf> {
+    let (paths, receipt) = validated_privileged_launcher_installation()?;
+    Ok(paths.versioned_binary(&receipt.version))
+}
+
+pub(crate) fn validated_privileged_launcher_installation() -> Result<(SetupPaths, InstallReceipt)> {
     let current = std::env::current_exe().context("resolve privileged workload launcher")?;
     if current != Path::new(PRIVILEGED_LAUNCHER_PATH) {
         bail!("privileged workload dispatch requires the dedicated launcher identity");
@@ -3881,7 +3892,7 @@ pub fn validate_running_privileged_launcher() -> Result<PathBuf> {
     let (paths, receipt) = current_installation_from_privileged_launcher(&current)?;
     let executable = paths.versioned_binary(&receipt.version);
     verify_privileged_launcher(&executable, &receipt)?;
-    Ok(executable)
+    Ok((paths, receipt))
 }
 
 fn current_installation_from_privileged_launcher(
@@ -4280,19 +4291,27 @@ fn require_stopped_strong_installation() -> Result<()> {
 }
 
 fn require_stopped_strong_installation_at(paths: &SetupPaths) -> Result<()> {
-    let receipt = read_receipt(&paths.receipt_path())?;
-    if receipt.mode != InstallMode::Strong || !receipt.transparent_aliases.is_empty() {
-        bail!("operation requires a stopped, deactivated strong installation");
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = paths;
+        bail!("strong installation maintenance requires a native platform backend");
     }
-    for socket in [
-        crate::broker_client::SYSTEM_BROKER_SOCKET,
-        crate::broker_client::SYSTEM_CONTROL_SOCKET,
-    ] {
-        if fs::symlink_metadata(socket).is_ok() {
-            bail!("operation requires stopped broker sockets");
+    #[cfg(target_os = "linux")]
+    {
+        let receipt = read_receipt(&paths.receipt_path())?;
+        if receipt.mode != InstallMode::Strong || !receipt.transparent_aliases.is_empty() {
+            bail!("operation requires a stopped, deactivated strong installation");
         }
+        for socket in [
+            crate::broker_client::SYSTEM_BROKER_SOCKET,
+            crate::broker_client::SYSTEM_CONTROL_SOCKET,
+        ] {
+            if fs::symlink_metadata(socket).is_ok() {
+                bail!("operation requires stopped broker sockets");
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub fn system_service_credential_ready() -> bool {
@@ -4404,12 +4423,34 @@ pub fn reconcile_system_policy_at(
     approved_sha256: &str,
     current_sha256: Option<&str>,
 ) -> Result<PathBuf> {
+    reconcile_system_policy_with_bound_launchers_at(
+        paths,
+        source,
+        approved_sha256,
+        current_sha256,
+        &BTreeMap::new(),
+    )
+}
+
+/// Full setup supplies only launchers whose exact native owner/workload/binding
+/// relationship was checked against its retained approved generation. Direct
+/// policy mutation calls the empty-selection path above and remains root-only.
+pub(crate) fn reconcile_system_policy_with_bound_launchers_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    current_sha256: Option<&str>,
+    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
+) -> Result<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        bail!("strong administrator policy mutation requires a native platform backend");
+    }
     if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
         bail!("administrator policy installation requires root and the system layout");
     }
     let bytes = read_approved_public_document(source, approved_sha256)?;
     let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
-    validate_system_policy_programs(&policy)?;
+    validate_system_policy_programs_with_bindings(&policy, selected_mutable_launchers)?;
     let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
     match (fs::symlink_metadata(&destination), current_sha256) {
         (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5510,6 +5551,13 @@ fn read_approved_public_document(source: &Path, approved_sha256: &str) -> Result
 fn validate_system_policy_programs(
     policy: &crate::runtime_policy::RuntimeAdministrator,
 ) -> Result<()> {
+    validate_system_policy_programs_with_bindings(policy, &BTreeMap::new())
+}
+
+fn validate_system_policy_programs_with_bindings(
+    policy: &crate::runtime_policy::RuntimeAdministrator,
+    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
+) -> Result<()> {
     if policy.mode() != crate::policy_v2::SystemMode::Strong {
         bail!("administrator policy document has the wrong mode");
     }
@@ -5521,7 +5569,23 @@ fn validate_system_policy_programs(
         validate_root_owned_executable(Path::new(path), description)?;
     }
     for path in policy.trusted_launchers().values() {
-        validate_root_owned_executable(Path::new(path), "trusted workload launcher")?;
+        match selected_mutable_launchers.get(Path::new(path)) {
+            Some(uid) if *uid > 0 => validate_user_or_root_executable(
+                Path::new(path),
+                *uid,
+                "setup-bound mutable workload launcher",
+            )?,
+            Some(_) => bail!("setup-bound mutable launcher has no native owner"),
+            None => validate_root_owned_executable(Path::new(path), "trusted workload launcher")?,
+        }
+    }
+    if selected_mutable_launchers.keys().any(|path| {
+        !policy
+            .trusted_launchers()
+            .values()
+            .any(|trusted| Path::new(trusted) == path)
+    }) {
+        bail!("setup-bound mutable launcher is outside administrator policy");
     }
     for adapter in policy.sandbox_adapters().values() {
         validate_root_owned_executable(
@@ -7537,6 +7601,49 @@ fn receipt_mode_matches_installation(mode: u32, installation_mode: InstallMode) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_test_executable_cannot_claim_the_dedicated_launcher_identity() {
+        assert!(super::validated_privileged_launcher_installation().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_setup_policy_accepts_only_its_exact_selected_mutable_launcher() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        if uid == 0 {
+            return;
+        }
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+            .unwrap()
+            .unwrap();
+        let root = tempfile::tempdir_in(&user.dir).unwrap();
+        let launcher = root.path().join("mutable-worker");
+        fs::write(&launcher, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = format!(
+            "schema = \"dev-auth-administrator-policy-v3\"\nmode = \"strong\"\nallowed_users = [\"{}\"]\n[programs]\ngit = \"/usr/bin/true\"\ngh = \"/usr/bin/false\"\nssh = \"/usr/bin/true\"\nssh_keygen = \"/usr/bin/true\"\n[trusted_launchers]\nworker = \"{}\"\n[credentials.providers]\n[credentials.credential_slots]\n[credentials.resources]\n[credentials.resource_caps]\n[workload_caps]\n",
+            user.name,
+            launcher.display(),
+        );
+        let parsed = crate::runtime_policy::parse_runtime_administrator(policy.as_bytes()).unwrap();
+        assert!(super::validate_system_policy_programs(&parsed).is_err());
+        assert!(super::validate_system_policy_programs_with_bindings(
+            &parsed,
+            &BTreeMap::from([(launcher.clone(), uid)]),
+        )
+        .is_ok());
+        assert!(super::validate_system_policy_programs_with_bindings(
+            &parsed,
+            &BTreeMap::from([(launcher.clone(), uid + 1)]),
+        )
+        .is_err());
+        assert!(super::validate_system_policy_programs_with_bindings(
+            &parsed,
+            &BTreeMap::from([(root.path().join("other"), uid)]),
+        )
+        .is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_does_not_run_in_the_privilege_domain_it_must_stop() {

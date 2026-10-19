@@ -94,6 +94,52 @@ fn secret_exec_requires_admission_before_projecting_or_starting() {
     assert_eq!(report["started"], false);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn ssh_operation_signing_rejects_bad_selection_and_requires_admission_before_input() {
+    let root = private_runtime();
+    let fingerprint = format!("SHA256:{}", "a".repeat(43));
+    let invalid = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .args([
+                "secret",
+                "sign-ssh",
+                "--purpose",
+                "authentication",
+                "--fingerprint",
+                "not-a-fingerprint",
+            ]),
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+
+    let result = root.path().join("sign-result.json");
+    let denied = bounded_output(
+        Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .env_clear()
+            .env("HOME", root.path())
+            .stdin(Stdio::from(fs::File::open("/dev/zero").unwrap()))
+            .args([
+                "secret",
+                "sign-ssh",
+                "--purpose",
+                "git-signing",
+                "--fingerprint",
+                &fingerprint,
+                "--result-file",
+            ])
+            .arg(&result),
+    );
+    assert_eq!(denied.status.code(), Some(3));
+    assert!(denied.stdout.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(report["operation"], "secret_sign_ssh");
+    assert_eq!(report["outcome"], "admission_required");
+    assert_eq!(report["started"], false);
+}
+
 #[test]
 fn uninstalled_doctor_reports_external_without_loading_credentials_or_installing() {
     let root = private_runtime();
@@ -465,6 +511,8 @@ fn static_completion_does_not_load_configuration_or_change_private_dispatch() {
             "credential-stdin",
             "restore",
             "caller-argument-index",
+            "desktop-entry",
+            "sign-ssh",
             "component",
         ] {
             assert!(script.contains(token), "{shell}: missing {token}");
@@ -590,6 +638,10 @@ COMP_WORDS=(dev-auth workload bind plan --code-trust m)
 COMP_CWORD=5
 "$function_name" dev-auth m --code-trust
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth workload bind plan --desktop-e)
+COMP_CWORD=4
+"$function_name" dev-auth --desktop-e plan
+printf '%s\n' "${COMPREPLY[@]}"
 COMP_WORDS=(dev-auth workload bind plan --arg structured --caller-a)
 COMP_CWORD=6
 "$function_name" dev-auth --caller-a structured
@@ -614,7 +666,7 @@ printf '%s\n' "${COMPREPLY[@]}"
     );
     assert_eq!(
         output.stdout,
-        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\n--user\n--json\nstructured\nmutable\n--caller-argument-index\nproviders\n"
+        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\n--user\n--json\nstructured\nmutable\n--desktop-entry\n--caller-argument-index\nproviders\n"
     );
 }
 
@@ -1244,17 +1296,20 @@ fn typed_reconcile_defers_when_standalone_system_is_absent() {
     assert!(!plan.exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn release_manifest_signing_rejects_an_empty_payload_before_broker_access() {
+fn release_manifest_signing_rejects_unadmitted_input_without_reading_it() {
     let output = bounded_output(
         Command::new(env!("CARGO_BIN_EXE_dev-auth"))
             .args(["sign-release-manifest", "--profile", "release"])
-            .env_clear(),
+            .env_clear()
+            .stdin(Stdio::from(fs::File::open("/dev/zero").unwrap())),
     );
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(
-        error.contains("release manifest must not be empty"),
+        error.contains("release signing requires the selected admitted workload"),
         "{error}"
     );
     assert!(!error.contains("unknown command"), "{error}");
@@ -1378,6 +1433,71 @@ impl NativeUserSandbox {
             .success());
         fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_workstation_configuration_ignores_caller_home_and_xdg_roots() {
+    let sandbox = NativeUserSandbox::new();
+    let product = sandbox.root.join("dev-auth");
+    sandbox.install_binary(&product);
+    let workspace = sandbox.home.join("repos");
+    fs::create_dir(&workspace).unwrap();
+    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+    let native_config_dir = sandbox.home.join(".config/dev-auth");
+    fs::create_dir_all(&native_config_dir).unwrap();
+    fs::set_permissions(
+        sandbox.home.join(".config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&native_config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let native_config = native_config_dir.join("config.toml");
+    fs::write(&native_config, include_bytes!("../config.example.toml")).unwrap();
+    fs::set_permissions(&native_config, fs::Permissions::from_mode(0o600)).unwrap();
+    let attacker_config_dir = sandbox.root.join("attacker-config/dev-auth");
+    fs::create_dir_all(&attacker_config_dir).unwrap();
+    fs::set_permissions(
+        sandbox.root.join("attacker-config"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&attacker_config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let attacker_config = attacker_config_dir.join("config.toml");
+    fs::write(&attacker_config, b"invalid = [").unwrap();
+    fs::set_permissions(&attacker_config, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let selected = bounded_output_with_timeout(
+        sandbox
+            .command(&product, &workspace)
+            .arg("workspace-status"),
+        Duration::from_secs(20),
+        "native-account workstation configuration",
+    );
+    assert_eq!(
+        selected.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&selected.stdout),
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert_eq!(selected.stdout, b"managed\n");
+    assert!(selected.stderr.is_empty());
+
+    fs::write(&attacker_config, include_bytes!("../config.example.toml")).unwrap();
+    fs::remove_file(&native_config).unwrap();
+    let absent = bounded_output_with_timeout(
+        sandbox
+            .command(&product, &workspace)
+            .arg("workspace-status"),
+        Duration::from_secs(20),
+        "missing native-account workstation configuration",
+    );
+    assert!(!absent.status.success());
+    assert!(absent.stdout.is_empty());
+    let diagnostic = String::from_utf8(absent.stderr).unwrap();
+    assert!(diagnostic.contains(&native_config.display().to_string()));
+    assert!(!diagnostic.contains(&attacker_config.display().to_string()));
 }
 
 #[cfg(target_os = "linux")]
@@ -1546,15 +1666,35 @@ config = "{}"
     let worker_plan = worker_root.path().join("update-plan.json");
     assert_eq!(write_setup_plan_v3_at(&worker_plan, &plan).unwrap(), digest);
     let worker_result = worker_root.path().join("update-result.json");
-    let worker = bounded_output(
-        Command::new(user.dir.join(".local/bin/dev-auth"))
-            .args(["update-worker", "--plan"])
-            .arg(&worker_plan)
-            .args(["--sha256", &digest, "--result"])
-            .arg(&worker_result)
-            .env_clear()
-            .current_dir("/"),
-    );
+    let worker_lock = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(worker_root.path().join("update.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&worker_lock).unwrap();
+    let lock_fd = worker_lock.as_raw_fd();
+    let mut worker_command = Command::new(user.dir.join(".local/bin/dev-auth"));
+    worker_command
+        .args(["update-worker", "--plan"])
+        .arg(&worker_plan)
+        .args(["--sha256", &digest, "--result"])
+        .arg(&worker_result)
+        .arg("--staging-lock-fd")
+        .arg(lock_fd.to_string())
+        .env_clear()
+        .current_dir("/");
+    // SAFETY: fcntl changes only this inherited descriptor in the child.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        worker_command.pre_exec(move || {
+            if nix::libc::fcntl(lock_fd, nix::libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let worker = bounded_output(&mut worker_command);
     assert_eq!(
         worker.status.code(),
         Some(0),
@@ -1601,6 +1741,7 @@ config = "{}"
     assert_eq!(doctor["operation"], "doctor");
     assert_eq!(doctor["changed"], false);
     assert_eq!(doctor["installation_state"], "managed");
+    assert_eq!(doctor["details"]["purpose"], "credentials");
     assert_eq!(doctor["details"]["broker_state"], "not_probed");
     assert_eq!(doctor["details"]["credential_observation"], "not_required");
     assert_eq!(doctor["details"]["provider_use_observation"], "not_checked");
@@ -1888,6 +2029,27 @@ config = "{}"
     assert!(!deactivated.transparent_launchers_active);
     assert!(!user.dir.join(".local/bin/git").exists());
     assert!(!user.dir.join(".local/bin/gh").exists());
+    let abandoned_update = paths
+        .data_root
+        .join("dev-auth-update-sources-abandoned-fixture");
+    fs::create_dir(&abandoned_update).unwrap();
+    fs::set_permissions(&abandoned_update, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(abandoned_update.join("update.lock"))
+        .unwrap();
+    fs::write(
+        abandoned_update.join("source-0"),
+        b"disposable update source",
+    )
+    .unwrap();
+    fs::set_permissions(
+        abandoned_update.join("source-0"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let update_rollback = bounded_output_with_timeout(
         Command::new(user.dir.join(".local/bin/dev-auth"))
             .args(["update", "rollback", "--json"])
@@ -1911,6 +2073,7 @@ config = "{}"
     assert_eq!(rollback_result["outcome"], "rolled_back");
     assert_eq!(rollback_result["changed"], true);
     assert_eq!(rollback_result["installation_state"], "absent");
+    assert!(!abandoned_update.exists());
     assert!(!paths.data_root.join("install-v2.json").exists());
 }
 
@@ -3506,7 +3669,11 @@ fn run_mutable_binding_setup_child(scenario: BindingFixtureScenario) {
     let launcher = root.path().join("agent");
     fs::write(&native, b"#!/bin/sh\nexit 0\n").unwrap();
     fs::write(&native_gh, b"#!/bin/sh\nexit 0\n").unwrap();
-    fs::write(&launcher, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 0\n").unwrap();
+    fs::write(
+        &launcher,
+        b"#!/bin/sh\nif [ \"$1\" = \"--nested-probe\" ]; then\n  command -v bound-agent\n  bound-agent nested-leaf\n  exit $?\nfi\nprintf '%s\\n' \"$@\"\nexit 0\n",
+    )
+    .unwrap();
     for path in [&native, &native_gh, &launcher] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -3552,7 +3719,7 @@ max_duration_seconds = 3600
     let config = root.path().join("config.toml");
     fs::write(
         &config,
-        b"schema = \"dev-auth-user-config-v3\"\n[authority_profiles.main]\ncap = \"agent\"\nresources = {}\n[[workloads]]\nname = \"automation\"\nprofile = \"main\"\nlauncher = \"agent\"\nadmission = \"enrolled_noninteractive\"\nduration_seconds = 1800\nresources = {}\n",
+        b"schema = \"dev-auth-user-config-v3\"\n[authority_profiles.main]\ncap = \"agent\"\nresources = {}\n[[workloads]]\nname = \"automation\"\nprofile = \"main\"\nlauncher = \"agent\"\nadmission = \"enrolled_noninteractive\"\nduration_seconds = 1800\nresources = {}\ndesktop = { display_name = \"Agent\", terminal = true }\n",
     )
     .unwrap();
     for path in [&policy, &config] {
@@ -3562,7 +3729,8 @@ max_duration_seconds = 3600
     let binding_intent =
         BindingIntent::structured("bound-agent", "automation", &launcher, ["--fixed"])
             .unwrap()
-            .with_code_trust(BindingCodeTrust::Mutable);
+            .with_code_trust(BindingCodeTrust::Mutable)
+            .with_desktop_entry(true);
     let binding = build_binding_plan(
         "agent-binding",
         binding_intent,
@@ -3625,8 +3793,28 @@ max_duration_seconds = 3600
     assert_eq!(report["verified"], true);
     let binding_alias = user.dir.join(".local/bin/bound-agent");
     let binding_receipt = user.dir.join(".local/share/dev-auth/binding-set-v1.json");
+    let bound_desktop = user
+        .dir
+        .join(".local/share/applications/dev-auth-bound-agent.desktop");
+    let workload_desktop = user
+        .dir
+        .join(".local/share/applications/dev-auth-automation.desktop");
     assert!(binding_alias.is_symlink());
     assert!(binding_receipt.is_file());
+    assert!(workload_desktop.is_file());
+    assert!(String::from_utf8(fs::read(&bound_desktop).unwrap())
+        .unwrap()
+        .contains(&format!("Exec=\"{}\"", binding_alias.display())));
+    let doctor = bounded_output(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args(["doctor", "--json"])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin"),
+    );
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["details"]["desktop_entries_ready"], true);
     let inspect = |expected_generation: u64| {
         let output = bounded_output(
             Command::new(user.dir.join(".local/bin/dev-auth"))
@@ -3645,9 +3833,62 @@ max_duration_seconds = 3600
         assert_eq!(report["schema"], "dev-auth-workload-binding-inspection-v1");
         assert_eq!(report["workload"], "automation");
         assert_eq!(report["code_trust"], "mutable");
+        assert_eq!(report["desktop_entry"], true);
         assert_eq!(report["generation"], expected_generation);
     };
     inspect(1);
+    let nested = bounded_output_with_timeout(
+        Command::new(user.dir.join(".local/bin/automation"))
+            .arg("--nested-probe")
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(root.path()),
+        Duration::from_secs(20),
+        "bound alias from a nested workload shell",
+    );
+    assert!(
+        nested.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&nested.stdout),
+        String::from_utf8_lossy(&nested.stderr)
+    );
+    let nested_output = String::from_utf8(nested.stdout).unwrap();
+    assert!(nested_output.contains("/tool-bin/bound-agent\n"));
+    assert!(nested_output.contains("--fixed\nnested-leaf\n"));
+    let editor = root.path().join("editor-child");
+    fs::write(
+        &editor,
+        b"#!/bin/sh\ncommand -v bound-agent\nexec bound-agent \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
+    let editor_child = bounded_output_with_timeout(
+        Command::new(&editor)
+            .arg("editor literal $(not-expanded)")
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", user.dir.join(".local/bin").display()),
+            )
+            .current_dir(root.path()),
+        Duration::from_secs(20),
+        "bound alias from an editor child",
+    );
+    assert!(
+        editor_child.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&editor_child.stdout),
+        String::from_utf8_lossy(&editor_child.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(editor_child.stdout).unwrap(),
+        format!(
+            "{}\n--fixed\neditor literal $(not-expanded)\n",
+            binding_alias.display()
+        )
+    );
     let run_bound = |expected_code| {
         let output = bounded_output_with_timeout(
             Command::new(&binding_alias)
@@ -3675,6 +3916,32 @@ max_duration_seconds = 3600
     fs::write(&launcher, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 7\n").unwrap();
     inspect(1);
     run_bound(7);
+    let recovered = bounded_output_with_timeout(
+        Command::new(user.dir.join(".local/bin/dev-auth"))
+            .args([
+                "setup",
+                "recover",
+                "--mode",
+                "user-only",
+                "--format",
+                "json",
+            ])
+            .env_clear()
+            .env("HOME", &user.dir)
+            .env("PATH", "/usr/bin:/bin"),
+        Duration::from_secs(120),
+        "repeat recovery after an approved mutable edit",
+    );
+    assert_eq!(
+        recovered.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["verified"], true);
+    assert_eq!(recovered["changed"], false);
     let current_installation: dev_auth::setup::InstallReceipt =
         serde_json::from_slice(&fs::read(paths.data_root.join("install-v2.json")).unwrap())
             .unwrap();
@@ -3690,6 +3957,7 @@ max_duration_seconds = 3600
         1
     );
     assert_eq!(automatic_refresh["intent"]["code_trust"], "mutable");
+    assert_eq!(automatic_refresh["intent"]["desktop_entry"], true);
     drop(update_sources);
     let refresh_path = root.path().join("binding-refresh-plan.json");
     let refresh = bounded_output(
@@ -3706,7 +3974,14 @@ max_duration_seconds = 3600
                 "--executable",
             ])
             .arg(&launcher)
-            .args(["--arg", "--fixed", "--code-trust", "mutable", "--output"])
+            .args([
+                "--arg",
+                "--fixed",
+                "--code-trust",
+                "mutable",
+                "--desktop-entry",
+                "--output",
+            ])
             .arg(&refresh_path)
             .arg("--json")
             .env_clear()
@@ -3725,6 +4000,7 @@ max_duration_seconds = 3600
         serde_json::from_slice(&fs::read(&refresh_path).unwrap()).unwrap();
     assert_eq!(refresh_plan["current_receipt"]["active"]["generation"], 1);
     assert_eq!(refresh_plan["intent"]["code_trust"], "mutable");
+    assert_eq!(refresh_plan["intent"]["desktop_entry"], true);
     if scenario != BindingFixtureScenario::InitialRestore {
         let mut intent = plan.intent.clone();
         if scenario == BindingFixtureScenario::Refresh {
@@ -3773,9 +4049,12 @@ max_duration_seconds = 3600
         if scenario == BindingFixtureScenario::Refresh {
             inspect(2);
             run_bound(7);
+            assert!(bound_desktop.is_file());
         } else {
             assert!(!binding_alias.exists());
             assert!(!binding_receipt.exists());
+            assert!(!bound_desktop.exists());
+            assert!(workload_desktop.is_file());
             assert!(user.dir.join(".local/bin/automation").is_symlink());
         }
     }
@@ -3802,6 +4081,8 @@ max_duration_seconds = 3600
         String::from_utf8_lossy(&restored.stderr)
     );
     assert!(!binding_alias.exists());
+    assert!(!bound_desktop.exists());
+    assert!(!workload_desktop.exists());
     if scenario != BindingFixtureScenario::InitialRestore {
         let receipt: serde_json::Value =
             serde_json::from_slice(&fs::read(&binding_receipt).unwrap()).unwrap();
@@ -3957,6 +4238,25 @@ fn run_installed_user_only_validation_child() {
     fs::copy(&native, &native_gh).unwrap();
     let primary = root.join("op-primary");
     let secondary = root.join("op-secondary");
+    let signing_key = ssh_key::PrivateKey::new(
+        ssh_key::private::KeypairData::Ed25519(ssh_key::private::Ed25519Keypair::from_seed(
+            &[31; 32],
+        )),
+        "synthetic workload signing key",
+    )
+    .unwrap();
+    let signing_public = signing_key.public_key().to_openssh().unwrap();
+    let signing_fingerprint = signing_key
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+    let signing_source = root.join("synthetic-signing-key");
+    fs::write(
+        &signing_source,
+        signing_key.to_openssh(ssh_key::LineEnding::LF).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&signing_source, fs::Permissions::from_mode(0o600)).unwrap();
     for (path, token, reference, value) in [
         (
             &primary,
@@ -3972,7 +4272,7 @@ fn run_installed_user_only_validation_child() {
         ),
     ] {
         fs::write(path, format!(
-            "#!/bin/sh\n[ \"$OP_SERVICE_ACCOUNT_TOKEN\" = '{token}' ] || exit 90\nprintf '%s\\n' \"$1\" >> '{}.calls'\ncase \"$*\" in\n'user get --me --format json') printf '%s' '{{\"id\":\"fixture\",\"state\":\"ACTIVE\",\"type\":\"SERVICE_ACCOUNT\"}}' ;;\n'read --no-newline {reference}') printf '%s' '{value}' ;;\n*) exit 92 ;;\nesac\n", path.display()
+            "#!/bin/sh\n[ \"$OP_SERVICE_ACCOUNT_TOKEN\" = '{token}' ] || exit 90\nprintf '%s\\n' \"$1\" >> '{}.calls'\ncase \"$*\" in\n'user get --me --format json') printf '%s' '{{\"id\":\"fixture\",\"state\":\"ACTIVE\",\"type\":\"SERVICE_ACCOUNT\"}}' ;;\n'read --no-newline {reference}') printf '%s' '{value}' ;;\n'read --no-newline op://Fixture/Ssh/private-key') /usr/bin/cat -- '{}' ;;\n*) exit 92 ;;\nesac\n", path.display(), signing_source.display()
         )).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -3980,10 +4280,13 @@ fn run_installed_user_only_validation_child() {
     let launcher = root.join("generic-worker");
     let exported = root.join("exported");
     let denied_key = root.join("denied-key");
+    let signed = root.join("signed");
+    let unsigned_manifest = root.join("unsigned-manifest.json");
+    let release_signature = root.join("release-signature");
     let hint = root.join("session-hint");
     fs::write(&launcher, format!(
-        "#!/bin/sh\nset -eu\n[ -z \"${{GH_ENTERPRISE_TOKEN+x}}${{GITHUB_ENTERPRISE_TOKEN+x}}\" ] || exit 94\nprintf '%s\\n%s\\n' \"$DEV_AUTH_USER_BROKER_SOCKET\" \"$DEV_AUTH_USER_SESSION\" > '{}'\n'{}' validate --component providers --online --non-interactive --json\n'{}' secret read token --non-interactive > '{}'\nif '{}' secret read release --non-interactive > '{}' 2>/dev/null; then exit 93; fi\n",
-        hint.display(), installed.display(), installed.display(), exported.display(), installed.display(), denied_key.display()
+        "#!/bin/sh\nset -eu\n[ -z \"${{GH_ENTERPRISE_TOKEN+x}}${{GITHUB_ENTERPRISE_TOKEN+x}}\" ] || exit 94\nprintf '%s\\n%s\\n' \"$DEV_AUTH_USER_BROKER_SOCKET\" \"$DEV_AUTH_USER_SESSION\" > '{}'\n'{}' validate --component providers --online --non-interactive --json\n'{}' secret read token --non-interactive > '{}'\nif '{}' secret read release --non-interactive > '{}' 2>/dev/null; then exit 93; fi\nprintf '%s' 'synthetic-signing-payload' | '{}' secret sign-ssh --purpose authentication --fingerprint '{}' > '{}'\n'{}' sign-release-manifest --profile generic-worker < '{}' > '{}'\n",
+        hint.display(), installed.display(), installed.display(), exported.display(), installed.display(), denied_key.display(), installed.display(), signing_fingerprint, signed.display(), installed.display(), unsigned_manifest.display(), release_signature.display()
     )).unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
     let config_root = user.dir.join(".config/dev-auth");
@@ -3996,6 +4299,23 @@ fn run_installed_user_only_validation_child() {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    let manifest = serde_jcs::to_vec(&serde_json::json!({
+        "schema": "dev-tools-product-v2",
+        "product": "fixture",
+        "generation": 1,
+        "version": "0.1.0",
+        "source_commit": "a".repeat(40),
+        "engine_protocol": 1,
+        "artifacts": {"linux-x86_64": {
+            "url": "https://example.invalid/fixture",
+            "length": 42,
+            "sha256": "b".repeat(64),
+        }}
+    }))
+    .unwrap();
+    dev_tools_release::validate_unsigned_release_document(&manifest).unwrap();
+    fs::write(&unsigned_manifest, &manifest).unwrap();
+    fs::set_permissions(&unsigned_manifest, fs::Permissions::from_mode(0o600)).unwrap();
     let policy = format!(
         r#"schema = "dev-auth-administrator-policy-v3"
 mode = "user_only"
@@ -4029,12 +4349,19 @@ credential_slot = "secondary"
 reference = "op://Fixture/Release/value"
 kind = "operation_only"
 purposes = ["release_signing"]
+[credentials.resources.ssh]
+credential_slot = "automation"
+reference = "op://Fixture/Ssh/private-key"
+kind = "operation_only"
+purposes = ["ssh_authentication"]
 [credentials.resource_caps.worker]
 users = ["{user}"]
 [credentials.resource_caps.worker.resources.token]
 purposes = ["read"]
 [credentials.resource_caps.worker.resources.release]
 purposes = ["release_signing"]
+[credentials.resource_caps.worker.resources.ssh]
+purposes = ["ssh_authentication"]
 [workload_caps.worker]
 users = ["{user}"]
 resource_cap = "worker"
@@ -4044,6 +4371,9 @@ max_duration_seconds = 120
 [workload_caps.worker.operations.release_signing.release]
 public_key = "{public_key}"
 products = ["fixture"]
+[workload_caps.worker.operations.ssh.ssh]
+public_key = "{signing_public}"
+fingerprint = "{signing_fingerprint}"
 "#,
         user = user.name,
         native = native.display(),
@@ -4059,6 +4389,8 @@ cap = "worker"
 purposes = ["read"]
 [authority_profiles.worker.resources.release]
 purposes = ["release_signing"]
+[authority_profiles.worker.resources.ssh]
+purposes = ["ssh_authentication"]
 [[workloads]]
 name = "generic-worker"
 launcher = "generic-worker"
@@ -4069,6 +4401,10 @@ duration_seconds = 120
 purposes = ["read"]
 [workloads.resources.release]
 purposes = ["release_signing"]
+[workloads.resources.ssh]
+purposes = ["ssh_authentication"]
+[workloads.operations]
+ssh = ["ssh"]
 [workloads.operations.release_signing]
 resource = "release"
 products = ["fixture"]
@@ -4173,8 +4509,8 @@ products = ["fixture"]
     }
     for (component, count) in [
         ("provider_authentication", 2),
-        ("provider_resources", 2),
-        ("key_material", 1),
+        ("provider_resources", 3),
+        ("key_material", 2),
     ] {
         let check = report["checks"]
             .as_array()
@@ -4188,13 +4524,28 @@ products = ["fixture"]
     }
     assert_eq!(fs::read(&exported).unwrap(), b"fixture-export");
     assert!(fs::read(denied_key).unwrap().is_empty());
+    let signature = ssh_key::Signature::try_from(fs::read(&signed).unwrap().as_slice()).unwrap();
+    signature::Verifier::verify(
+        signing_key.public_key(),
+        b"synthetic-signing-payload",
+        &signature,
+    )
+    .unwrap();
+    let encoded = fs::read_to_string(&release_signature).unwrap();
+    let signature =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim()).unwrap();
+    let signature = ed25519_dalek::Signature::try_from(signature.as_slice()).unwrap();
+    ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+        .verifying_key()
+        .verify_strict(&manifest, &signature)
+        .unwrap();
     assert_eq!(
         fs::read_to_string(primary.with_extension("calls")).unwrap(),
-        "user\nread\nread\n"
+        "user\nread\nread\nread\nread\n"
     );
     assert_eq!(
         fs::read_to_string(secondary.with_extension("calls")).unwrap(),
-        "user\nread\n"
+        "user\nread\nread\n"
     );
     let hint = fs::read_to_string(hint).unwrap();
     let mut lines = hint.lines();
@@ -4219,7 +4570,7 @@ products = ["fixture"]
     assert!(!stale.status.success());
     assert_eq!(
         fs::read_to_string(primary.with_extension("calls")).unwrap(),
-        "user\nread\nread\n"
+        "user\nread\nread\nread\nread\n"
     );
 }
 
@@ -4573,6 +4924,7 @@ fn help_is_product_generic_and_lists_the_bounded_surface() {
     }
     assert_eq!(help.matches("dev-auth workload bind plan NAME").count(), 1);
     assert!(help.contains("--code-trust pinned|mutable"));
+    assert!(help.contains("--desktop-entry"));
     assert!(help.contains("--caller-argument-index N"));
     assert!(!help.to_ascii_lowercase().contains("codex"));
     assert!(!help.to_ascii_lowercase().contains("homelab"));
@@ -5539,12 +5891,13 @@ fn windows_credential_helper_name_preserves_fail_closed_git_output() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "quit=true\n");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn git_verification_does_not_require_the_secret_runtime_or_ssh_agent() {
-    let directory = private_program_root();
-    let helper = directory.path().join("ssh-keygen-dev-auth");
+    let sandbox = NativeUserSandbox::new();
+    let helper = sandbox.root.join("ssh-keygen-dev-auth");
     symlink(env!("CARGO_BIN_EXE_dev-auth"), &helper).unwrap();
-    let verifier = directory.path().join("ssh-keygen");
+    let verifier = sandbox.root.join("ssh-keygen");
     fs::write(
         &verifier,
         "#!/bin/sh\n[ \"$1\" = -Y ] && [ \"$2\" = verify ]\n",
@@ -5552,11 +5905,10 @@ fn git_verification_does_not_require_the_secret_runtime_or_ssh_agent() {
     .unwrap();
     fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
 
-    let home = tempfile::tempdir().unwrap();
-    let config_dir = home.path().join(".config/dev-auth");
+    let config_dir = sandbox.home.join(".config/dev-auth");
     fs::create_dir_all(&config_dir).unwrap();
     fs::set_permissions(
-        home.path().join(".config"),
+        sandbox.home.join(".config"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
@@ -5593,14 +5945,23 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     fs::write(&config_path, config).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let absent_runtime = home.path().join("absent-runtime");
-    let output = Command::new(&helper)
+    for redirected in ["attacker-home/.config", "attacker-config"] {
+        let directory = sandbox.root.join(redirected).join("dev-auth");
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(
+            directory.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = directory.join("config.toml");
+        fs::write(&file, b"version = 999\n").unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = sandbox
+        .command(&helper, &sandbox.home)
         .args(["-Y", "verify", "-n", "git"])
-        .env_clear()
-        .env("HOME", home.path())
-        .env("PATH", "/usr/bin")
-        .env("XDG_CONFIG_HOME", home.path().join(".config"))
-        .env("XDG_RUNTIME_DIR", &absent_runtime)
         .output()
         .unwrap();
     assert!(
@@ -5608,5 +5969,5 @@ fingerprint = "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!absent_runtime.exists());
+    assert!(!sandbox.runtime.join("dev-auth").exists());
 }

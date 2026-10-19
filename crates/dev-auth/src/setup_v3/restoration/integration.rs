@@ -255,7 +255,7 @@ pub(super) fn workload_retirements(
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        aliases.extend(candidate_binding_aliases(generation, account)?);
+        aliases.extend(candidate_binding_intents(generation, account)?.into_keys());
         aliases.sort();
         aliases.dedup();
         let mut retirement = WorkloadRetirement {
@@ -367,18 +367,18 @@ fn candidate_workloads(
         .workloads)
 }
 
-fn candidate_binding_aliases(
+fn candidate_binding_intents(
     generation: &RetainedSetupGeneration,
     account: &NativeAccountIdentity,
-) -> Result<Vec<String>> {
+) -> Result<BTreeMap<String, crate::smart_binding::BindingIntent>> {
     let plan = &generation.plan;
     if plan.intent.schema != "dev-auth-deployment-intent-v3"
         || plan.intent.activation != Activation::Transparent
         || !plan.accounts.contains(account)
     {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
-    let mut aliases = Vec::new();
+    let mut bindings = BTreeMap::new();
     for reference in plan
         .intent
         .bindings
@@ -392,9 +392,14 @@ fn candidate_binding_aliases(
         if binding.name != reference.name {
             bail!("candidate binding alias differs from its approved declaration");
         }
-        aliases.push(binding.intent.command_name);
+        if bindings
+            .insert(binding.intent.command_name.clone(), binding.intent)
+            .is_some()
+        {
+            bail!("candidate binding aliases are duplicated");
+        }
     }
-    Ok(aliases)
+    Ok(bindings)
 }
 
 #[cfg(test)]

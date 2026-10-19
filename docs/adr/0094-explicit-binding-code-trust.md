@@ -14,6 +14,8 @@ The pre-activation binding plan and receipt foundations move to v3 and include a
 
 The v2 draft plan and foundation receipt encodings are rejected under v3. No active binding proxy or installed binding receipt used v2, so the cutover does not migrate an installed launcher, credential, setup generation or release. An existing draft must be regenerated from current target identity. The target-specific resolution and snapshot mechanisms from [ADR 0017](0017-binding-target-specific-resolution.md) remain unchanged.
 
+The public planner now refuses its default pinned selection when target inspection finds user-owned or user-writable ancestry. It emits no plan and requires a deliberate `--code-trust mutable` choice for that location. A root-custodied executable can still produce a pinned draft. This early feasibility gate does not make pinned activation safe or silently change any existing mutable approval; setup retains its separate native launch gate.
+
 ## Remaining gate
 
 This schema change does not activate a proxy or make pinned/mutable execution safe. Activation must bind the selected workload launcher to the approved target, preserve native argv/cwd/streams and identity, keep an immutable pinned-byte view when selected, allow later edits only for explicit mutable mode, journal receipt/proxy publication through setup, and verify rollback/removal. Until those gates pass, the public binding command remains discovery and planning only. Tests cover default pinned plans, deliberate mutable plans, legacy-schema rejection and explicit trust downgrade classification.

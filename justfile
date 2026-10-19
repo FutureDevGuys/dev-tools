@@ -12,8 +12,8 @@ export CARGO_INCREMENTAL := "0"
 default:
     @just --list
 
-# Check formatting, strict lint, and noninteractive Dev Auth, execution, authorization, and installation tests
-ci: fmt-check lint test build
+# Check formatting and lint, then build Dev Auth before noninteractive product and foundation tests
+ci: fmt-check lint build test
 
 # Verify formatting without rewriting Rust source
 fmt-check:
@@ -24,9 +24,18 @@ lint:
     cargo clippy -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --all-targets --locked -j 2 -- -D warnings
 
 # Keep custody hashing representative without relaxing subprocess deadlines.
-# Run noninteractive Dev Auth and changed foundation tests with bounded parallelism
+# Run noninteractive Dev Auth and changed foundation tests with a source-matched Linux sudo helper
 test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" == Linux ]]; then
+        helper=$(cargo build -p dev-auth-sudo --locked -j 2 --message-format=json | jq -sr '[.[] | select(.reason == "compiler-artifact" and .target.name == "dev_auth_sudo") | .filenames[] | select(endswith(".so"))] | unique | if length == 1 then .[0] else error("expected one native sudo helper") end')
+        export DEV_AUTH_SUDO_ARTIFACT="$helper"
+    fi
     cargo test -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' -- --test-threads=2
+    if [[ "$(uname -s)" == Linux ]]; then
+        cargo test -p dev-auth --lib --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' setup_v3::privilege::native_acceptance::native_fixture_embedded_sudo_payload_available -- --ignored --exact --test-threads=1
+    fi
 
 # Compile Dev Auth and embed its version/target/source-matched Linux sudo helper
 build:
@@ -49,6 +58,10 @@ accept-sudo-abi:
 # Run isolated Linux privilege/sudo/Ansible acceptance on a visible native terminal; prompts for OS approval
 accept-native binary="target/debug/dev-auth":
     /usr/bin/bash tests/native_privilege/accept-linux.sh run "$1"
+
+# Observe one real 12-hour user grant through its hard deadline; explicitly interactive and long-running
+accept-overnight binary="target/debug/dev-auth":
+    /usr/bin/bash tests/native_privilege/accept-linux.sh run "$1" overnight
 
 # Run receipt-owned Linux setup/recovery/restore in a disposable systemd image on a visible terminal
 accept-installed binary library-test image scenario="privilege-setup":

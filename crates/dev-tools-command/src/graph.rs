@@ -1,7 +1,9 @@
 //! Bounded native stdin/stdout graph wiring. Callers own executable authority,
 //! inherited streams and descendant containment; this module owns direct children.
 
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(not(target_vendor = "apple"))]
+use std::process::Stdio;
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +27,7 @@ pub struct GraphOutput {
 /// A caller needing containment of detached descendants must provide it outside
 /// this process-local owner (for example, a native cgroup or Job Object).
 pub fn run_command_graph(
-    mut commands: Vec<Command>,
+    commands: Vec<Command>,
     pipes: &[(usize, usize)],
     mut continue_permitted: impl FnMut() -> bool,
 ) -> GraphOutput {
@@ -40,6 +42,8 @@ pub fn run_command_graph(
         statuses: vec![None; count],
         failure: None,
     };
+    #[cfg(not(target_vendor = "apple"))]
+    let mut commands = commands;
     let mut incoming = vec![false; count];
     let mut outgoing = vec![false; count];
     for &(from, to) in pipes {
@@ -49,6 +53,15 @@ pub fn run_command_graph(
         }
         incoming[to] = true;
         outgoing[from] = true;
+        #[cfg(target_vendor = "apple")]
+        {
+            // Darwin has no atomic pipe2(CLOEXEC) API. A pipe followed by
+            // F_SETFD can leak an endpoint to a concurrent spawn before the
+            // flags are set, so do not claim a protected graph pipe here.
+            output.failure = Some(GraphFailure::Spawn);
+            return output;
+        }
+        #[cfg(not(target_vendor = "apple"))]
         let (read, write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
             Ok(pair) => pair,
             Err(_) => {
@@ -56,7 +69,9 @@ pub fn run_command_graph(
                 return output;
             }
         };
+        #[cfg(not(target_vendor = "apple"))]
         commands[from].stdout(Stdio::from(write));
+        #[cfg(not(target_vendor = "apple"))]
         commands[to].stdin(Stdio::from(read));
     }
     let mut children: Vec<Child> = Vec::with_capacity(count);
@@ -116,6 +131,15 @@ pub fn run_command_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn graph_pipe_fails_closed_without_an_atomic_cloexec_backend() {
+        let commands = vec![Command::new("/usr/bin/true"), Command::new("/usr/bin/cat")];
+        let result = run_command_graph(commands, &[(0, 1)], || true);
+        assert_eq!(result.failure, Some(GraphFailure::Spawn));
+        assert_eq!(result.statuses, vec![None, None]);
+    }
 
     #[test]
     fn binary_pipe_closes_and_preserves_bytes() {

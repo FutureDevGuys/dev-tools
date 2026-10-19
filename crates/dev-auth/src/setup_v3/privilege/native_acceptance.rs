@@ -35,6 +35,15 @@ fn invoke(executable: &Path, arguments: &[&str]) -> serde_json::Value {
 }
 
 #[test]
+#[ignore = "only the installed-fixture preparer requires an embedded native sudo payload"]
+fn native_fixture_embedded_sudo_payload_available() {
+    assert!(
+        !assets::SUDO_LIBRARY.is_empty(),
+        "rebuild the library test with DEV_AUTH_SUDO_ARTIFACT set to the source-matched native sudo helper"
+    );
+}
+
+#[test]
 #[ignore = "requires an explicitly owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_privilege_only_recovery_and_restore() {
     privilege_only_recovery_and_restore(Case::Initial);

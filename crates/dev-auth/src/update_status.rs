@@ -15,6 +15,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -133,15 +134,19 @@ fn run_worker_child(
     plan: &Path,
     digest: &str,
     result: &Path,
+    staging_lock: &fs::File,
 ) -> Result<std::process::ExitStatus, UpdateError> {
     let mut command = Command::new(executable);
     let parent_pid = std::process::id();
+    let lock_fd = staging_lock.as_raw_fd();
     command
         .arg0("dev-auth")
         .args(["update-worker", "--plan"])
         .arg(plan)
         .args(["--sha256", digest, "--result"])
         .arg(result)
+        .arg("--staging-lock-fd")
+        .arg(lock_fd.to_string())
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
@@ -157,6 +162,9 @@ fn run_worker_child(
             }
             if nix::libc::getppid() != parent_pid as nix::libc::pid_t {
                 return Err(std::io::Error::from_raw_os_error(nix::libc::EPIPE));
+            }
+            if nix::libc::fcntl(lock_fd, nix::libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
@@ -191,10 +199,48 @@ fn run_worker_child(
     }
 }
 
+fn validate_inherited_staging_lock(plan_path: &Path, fd: RawFd) -> anyhow::Result<fs::File> {
+    anyhow::ensure!(fd >= 3, "update staging descriptor is invalid");
+    // SAFETY: fcntl inspects a numeric descriptor without retaining a pointer.
+    anyhow::ensure!(
+        unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } >= 0,
+        "update staging descriptor is unavailable"
+    );
+    // SAFETY: the private worker takes ownership of the one descriptor passed
+    // by its parent; the parent retains its own copy in the separate process.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let observed = file.metadata()?;
+    let path = plan_path
+        .parent()
+        .context("update plan has no staging directory")?
+        .join("update.lock");
+    let expected = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        expected.file_type().is_file()
+            && !expected.file_type().is_symlink()
+            && expected.uid() == nix::unistd::Uid::effective().as_raw()
+            && expected.mode() & 0o777 == 0o600
+            && expected.nlink() == 1
+            && observed.dev() == expected.dev()
+            && observed.ino() == expected.ino(),
+        "update staging descriptor does not match its owner-only lock"
+    );
+    fs2::FileExt::try_lock_exclusive(&file)
+        .context("update worker cannot retain its staging lock")?;
+    Ok(file)
+}
+
 /// The verified candidate executes this exact setup plan after the old binary
 /// has prepared and retained all source documents. No credential input enters
 /// this worker, and it emits only a value-free private result document.
-pub fn run_apply_worker(plan_path: &Path, digest: &str, result_path: &Path) -> i32 {
+pub fn run_apply_worker(plan_path: &Path, digest: &str, result_path: &Path, lock_fd: RawFd) -> i32 {
+    let _staging_lock = match validate_inherited_staging_lock(plan_path, lock_fd) {
+        Ok(lock) => lock,
+        Err(_) => {
+            eprintln!("dev-auth: update worker staging_lock failed");
+            return 4;
+        }
+    };
     let mut stage = "plan_read";
     let mut run = || -> anyhow::Result<WorkerReport> {
         let plan = if nix::unistd::Uid::effective().is_root() {
@@ -515,7 +561,13 @@ impl UpdateAdapter for DevAuthUpdateAdapter {
             .or_else(|| std::env::current_exe().ok())
             .ok_or(UpdateError::new(UpdateErrorKind::Operational))?;
         self.after_mutation = true;
-        let status = run_worker_child(&executable, &path, &plan.sha256, &result)?;
+        let status = run_worker_child(
+            &executable,
+            &path,
+            &plan.sha256,
+            &result,
+            plan.staging_lock(),
+        )?;
         if status.code() == Some(4) && !result.exists() {
             return Err(UpdateError::new(UpdateErrorKind::Authority).with_changed(false));
         }
@@ -544,6 +596,17 @@ impl UpdateAdapter for DevAuthUpdateAdapter {
         let mode = self
             .mode
             .ok_or(UpdateError::new(UpdateErrorKind::RequiresSetup))?;
+        let paths = self
+            .paths
+            .as_ref()
+            .ok_or(UpdateError::new(UpdateErrorKind::RequiresSetup))?;
+        let owner_uid = if mode == crate::setup::InstallMode::Strong {
+            0
+        } else {
+            nix::unistd::Uid::effective().as_raw()
+        };
+        crate::setup_v3::reclaim_abandoned_update_staging_at(&paths.data_root, owner_uid)
+            .map_err(|_| UpdateError::new(UpdateErrorKind::Authority).with_changed(false))?;
         self.after_mutation = true;
         let report = crate::setup_v3::restore_setup_v3(mode);
         if report.exit_code == 0 && report.verified {
@@ -566,5 +629,36 @@ impl UpdateAdapter for DevAuthUpdateAdapter {
             Some(changed) => error.with_changed(changed),
             None => error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[test]
+    fn inherited_worker_lock_remains_exclusive_after_parent_closes_its_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let lock_path = root.path().join("update.lock");
+        let parent = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&parent).unwrap();
+        let child_fd = rustix::io::fcntl_dupfd_cloexec(&parent, 3)
+            .unwrap()
+            .into_raw_fd();
+        let worker =
+            validate_inherited_staging_lock(&root.path().join("update-plan.json"), child_fd)
+                .unwrap();
+        drop(parent);
+        let another = fs::OpenOptions::new().read(true).open(&lock_path).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&another).is_err());
+        drop(worker);
+        fs2::FileExt::try_lock_exclusive(&another).unwrap();
     }
 }

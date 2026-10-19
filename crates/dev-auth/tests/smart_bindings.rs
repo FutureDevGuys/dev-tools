@@ -29,6 +29,27 @@ fn continuation_targets_reject_ignored_execution_constraints() {
 }
 
 #[test]
+fn desktop_selection_is_explicit_and_part_of_the_binding_intent() {
+    let ordinary = BindingIntent::continuation("agent", "automation").unwrap();
+    let ordinary_value = serde_json::to_value(&ordinary).unwrap();
+    assert!(ordinary_value.get("desktop_entry").is_none());
+    assert!(
+        !serde_json::from_value::<BindingIntent>(ordinary_value)
+            .unwrap()
+            .desktop_entry
+    );
+
+    let desktop = ordinary.with_desktop_entry(true);
+    let desktop_value = serde_json::to_value(&desktop).unwrap();
+    assert_eq!(desktop_value["desktop_entry"], true);
+    assert!(
+        serde_json::from_value::<BindingIntent>(desktop_value)
+            .unwrap()
+            .desktop_entry
+    );
+}
+
+#[test]
 fn structured_arguments_preserve_native_values_at_every_insertion_position() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -556,6 +577,29 @@ fn cli_discovers_and_plans_the_current_continuation_without_mutation() {
     );
 
     let plan = root.path().join("plan.json");
+    let unapproved = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .args([
+            "workload",
+            "bind",
+            "plan",
+            "agent-binding",
+            "--workload",
+            "automation",
+            "--command-name",
+            "agent",
+            "--target",
+            "current-resolution",
+            "--output",
+            plan.to_str().unwrap(),
+        ])
+        .env("PATH", &search_path)
+        .output()
+        .unwrap();
+    assert!(!unapproved.status.success());
+    assert!(unapproved.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unapproved.stderr).contains("--code-trust mutable"));
+    assert!(!plan.exists());
+
     let planned = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
         .args([
             "workload",
@@ -568,6 +612,8 @@ fn cli_discovers_and_plans_the_current_continuation_without_mutation() {
             "agent",
             "--target",
             "current-resolution",
+            "--code-trust",
+            "mutable",
             "--output",
             plan.to_str().unwrap(),
             "--json",
@@ -586,6 +632,44 @@ fn cli_discovers_and_plans_the_current_continuation_without_mutation() {
     assert_eq!(result["sha256"].as_str().unwrap().len(), 64);
     assert!(plan.is_file());
     assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
+}
+
+#[test]
+fn cli_can_draft_a_root_custodied_pin_without_activating_it() {
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("root-pin.json");
+    let planned = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .env_clear()
+        .args([
+            "workload",
+            "bind",
+            "plan",
+            "root-pin",
+            "--workload",
+            "automation",
+            "--command-name",
+            "bound-true",
+            "--target",
+            "structured",
+            "--executable",
+            "/usr/bin/true",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: dev_auth::smart_binding::BindingPlan =
+        serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(plan.intent.code_trust, BindingCodeTrust::Pinned);
+    assert_eq!(
+        plan.resolved.identity().authority,
+        BindingAuthority::RootOwned
+    );
 }
 
 #[test]
@@ -831,6 +915,38 @@ fn structured_cli_rejects_invalid_shapes_before_writing_a_plan() {
         assert!(result.stdout.is_empty());
         assert!(!output.exists());
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_reserved_binding_alias_is_rejected_before_plan_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("agent");
+    executable(&target, b"#!/bin/sh\nexit 0\n");
+    let output = root.path().join("must-not-exist.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .env_clear()
+        .args([
+            "workload",
+            "bind",
+            "plan",
+            "reserved",
+            "--command-name",
+            "git",
+            "--workload",
+            "automation",
+            "--target",
+            "structured",
+            "--executable",
+        ])
+        .arg(&target)
+        .args(["--code-trust", "mutable", "--output"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(!output.exists());
 }
 
 #[test]

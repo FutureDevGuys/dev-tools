@@ -9,6 +9,8 @@ use zeroize::Zeroize;
 mod completion;
 mod doctor;
 mod execution_result;
+#[cfg(target_os = "linux")]
+mod linux_input;
 mod privilege_cli;
 mod product_cli;
 mod secret_cli;
@@ -84,7 +86,7 @@ fn usage() -> String {
         "\n  dev-auth update install|apply [--json] [--offline]\n  dev-auth update rollback [--json]",
     );
     commands.push_str(
-        "\n  dev-auth setup template binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind inspect ALIAS [--json]\n  dev-auth workload bind plan NAME [--user USER] --workload WORKLOAD --command-name COMMAND --target current-resolution|structured [--executable PATH] [--arg VALUE]... [--caller-argument-index N] [--code-trust pinned|mutable] --output PLAN [--json]",
+        "\n  dev-auth setup template binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind inspect ALIAS [--json]\n  dev-auth workload bind plan NAME [--user USER] --workload WORKLOAD --command-name COMMAND --target current-resolution|structured [--executable PATH] [--arg VALUE]... [--caller-argument-index N] [--code-trust pinned|mutable] [--desktop-entry] --output PLAN [--json]",
     );
     format!(
         "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell",
@@ -138,6 +140,7 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                             "workload": binding.workload,
                             "generation": binding.generation,
                             "code_trust": binding.code_trust,
+                            "desktop_entry": binding.desktop_entry,
                             "target": binding.target,
                         })
                     );
@@ -146,6 +149,7 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                     println!("workload={}", binding.workload);
                     println!("generation={}", binding.generation);
                     println!("code_trust={:?}", binding.code_trust);
+                    println!("desktop_entry={}", binding.desktop_entry);
                     println!("target={}", binding.target.display());
                 }
                 Ok(0)
@@ -201,6 +205,7 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
             let mut executable = None;
             let mut fixed_arguments = Vec::new();
             let mut caller_argument_index = None;
+            let mut desktop_entry = false;
             let mut output = None;
             let mut json = false;
             while let Some(argument) = arguments.next() {
@@ -258,6 +263,7 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                                 .context("caller argument index is invalid")?,
                         );
                     }
+                    "--desktop-entry" if !desktop_entry => desktop_entry = true,
                     "--json" if !json => json = true,
                     _ => bail!("workload bind plan contains a duplicate or unknown argument"),
                 }
@@ -354,13 +360,21 @@ fn run_workload_management(mut arguments: impl Iterator<Item = String>) -> Resul
                 }
                 _ => bail!("binding plan requires --target current-resolution or structured"),
             };
+            if code_trust == dev_auth::smart_binding::BindingCodeTrust::Pinned
+                && resolved.identity().authority
+                    != dev_auth::smart_binding::BindingAuthority::RootOwned
+            {
+                bail!("pinned binding requires independently custodied root-owned target bytes; select --code-trust mutable explicitly for a user-owned location");
+            }
             #[cfg(target_os = "linux")]
             let current = planning.current.as_ref();
             #[cfg(not(target_os = "linux"))]
             let current = None;
             let plan = dev_auth::smart_binding::build_binding_plan(
                 name,
-                intent.with_code_trust(code_trust),
+                intent
+                    .with_code_trust(code_trust)
+                    .with_desktop_entry(desktop_entry),
                 resolved,
                 current,
             )?;
@@ -669,7 +683,7 @@ fn run_supervisor_child_os() -> Result<i32> {
         bail!("supervisor child requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
-    dev_auth::supervisor::run_supervisor_child(
+    let status = dev_auth::supervisor::run_supervisor_child(
         &session_id,
         &workload,
         &cgroup,
@@ -681,7 +695,7 @@ fn run_supervisor_child_os() -> Result<i32> {
         },
         &arguments,
     )?;
-    bail!("supervisor child returned unexpectedly")
+    workload_status_code(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -731,19 +745,33 @@ fn run_sandbox_child_os() -> Result<i32> {
         .map_err(|_| anyhow::anyhow!("parent network namespace is not UTF-8"))?
         .parse::<u64>()
         .context("sandbox child parent network namespace is invalid")?;
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--")) {
+    let next = arguments.next();
+    let (startup_fd, separator) = if next.as_deref() == Some(std::ffi::OsStr::new("--startup-fd")) {
+        let fd = arguments
+            .next()
+            .context("sandbox child startup descriptor is missing")?
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("sandbox child startup descriptor is not UTF-8"))?
+            .parse::<std::os::fd::RawFd>()
+            .context("sandbox child startup descriptor is invalid")?;
+        (Some(fd), arguments.next())
+    } else {
+        (None, next)
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
         bail!("sandbox child requires -- before workload arguments");
     }
     let arguments = arguments.collect::<Vec<_>>();
-    dev_auth::supervisor::run_sandbox_child(
+    let status = dev_auth::supervisor::run_sandbox_child(
         &session_id,
         &workload,
         &launcher,
         network_namespace,
         parent_network_namespace,
+        startup_fd,
         &arguments,
     )?;
-    bail!("sandbox child returned unexpectedly")
+    workload_status_code(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -1488,6 +1516,11 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 bail!("setup apply format must be human or json");
             }
             if let Some(authorize) = authorize {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = authorize;
+                    bail!("setup apply authorization requires a native platform backend");
+                }
                 #[cfg(target_os = "linux")]
                 {
                     if !matches!(authorize.as_str(), "sudo" | "polkit") {
@@ -1598,6 +1631,9 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
         "enroll-system" | "enroll-user" | "rotate-system" | "rotate-user" => {
             if arguments.next().is_some() {
                 bail!("setup credential enrollment accepts no arguments");
+            }
+            if !cfg!(target_os = "linux") {
+                bail!("setup credential enrollment requires a native platform backend");
             }
             let mut value = Vec::new();
             io::stdin()
@@ -2085,19 +2121,47 @@ fn run() -> Result<i32> {
             if arguments.next().is_some() {
                 bail!("sign-release-manifest accepts no additional arguments");
             }
-            let mut payload = Vec::new();
-            io::stdin()
-                .take(16 * 1024 + 1)
-                .read_to_end(&mut payload)
-                .context("read release manifest from standard input")?;
-            if payload.is_empty() {
-                bail!("release manifest must not be empty");
-            }
-            if payload.len() > 16 * 1024 {
-                bail!("release manifest exceeds the size limit");
-            }
             #[cfg(target_os = "linux")]
             {
+                use dev_auth::broker_protocol::{BrokerSessionProbe, LocalSessionClaim};
+                let admission = match dev_auth::broker_client::active_claim_and_probe() {
+                    Ok(admission) => admission,
+                    Err(_) => {
+                        eprintln!("dev-auth: release signing admission_invalid");
+                        return Ok(4);
+                    }
+                };
+                if !matches!(
+                    &admission,
+                    (
+                        LocalSessionClaim::Present { .. },
+                        BrokerSessionProbe::Verified { profile: admitted, .. }
+                    ) if admitted == &profile
+                ) {
+                    eprintln!("dev-auth: release signing requires the selected admitted workload");
+                    return Ok(3);
+                }
+                let payload = match linux_input::read_bounded(
+                    &io::stdin(),
+                    16 * 1024,
+                    std::time::Duration::from_secs(30),
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let (kind, code) = match error.kind() {
+                            io::ErrorKind::TimedOut => ("input_timeout", 3),
+                            io::ErrorKind::InvalidData => ("invalid_input", 2),
+                            _ => ("input_unavailable", 1),
+                        };
+                        eprintln!("dev-auth: release signing {kind}");
+                        return Ok(code);
+                    }
+                };
+                if !matches!(dev_auth::broker_client::active_claim_and_probe(), Ok(current) if current == admission)
+                {
+                    eprintln!("dev-auth: release signing admission_invalid");
+                    return Ok(4);
+                }
                 println!(
                     "{}",
                     BASE64.encode(dev_auth::broker_sign_release_manifest(&profile, &payload)?)
@@ -2107,7 +2171,6 @@ fn run() -> Result<i32> {
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = profile;
-                let _ = payload;
                 bail!("broker-backed signing is supported only on Linux")
             }
         }

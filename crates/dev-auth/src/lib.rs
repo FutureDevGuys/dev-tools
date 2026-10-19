@@ -86,6 +86,11 @@ pub use runtime::{
     enroll_user_broker_service_token, exec_broker_gh, exec_broker_git, exec_broker_ssh_keygen,
     revoke_user_broker_service_token, rotate_user_broker_service_token, run_provider_exec_child,
 };
+#[cfg(all(unix, not(target_os = "linux")))]
+pub use runtime::{
+    enroll_user_broker_service_token, revoke_user_broker_service_token,
+    rotate_user_broker_service_token,
+};
 #[cfg(unix)]
 pub use runtime::{exec_native_gh, exec_native_git};
 

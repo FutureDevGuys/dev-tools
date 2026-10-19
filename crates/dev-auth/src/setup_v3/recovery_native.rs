@@ -215,9 +215,18 @@ ssh_keygen = "/usr/bin/true"
                 .to_vec(),
         ),
     };
+    let (policy, config) = if matches!(scenario, Scenario::Binding) {
+        binding::prepare_targets_and_policy(&account, policy, config)
+    } else {
+        (policy, config)
+    };
     publish(policy_path, &policy, 0o600);
     publish(config_path, &config, 0o600);
-    let binding = matches!(scenario, Scenario::Binding).then(|| binding::prepare(&account));
+    let bindings = if matches!(scenario, Scenario::Binding) {
+        binding::prepare(&account)
+    } else {
+        Vec::new()
+    };
     let identity = ArtifactIdentity::from_file(source, 256 * 1024 * 1024).unwrap();
     let version = env!("CARGO_PKG_VERSION");
     let installation = SetupPlan {
@@ -253,7 +262,7 @@ ssh_keygen = "/usr/bin/true"
     };
     let intent = DeploymentIntent {
         purpose: Default::default(),
-        schema: if binding.is_some() {
+        schema: if !bindings.is_empty() {
             "dev-auth-deployment-intent-v3"
         } else {
             "dev-auth-deployment-intent-v1"
@@ -282,7 +291,7 @@ ssh_keygen = "/usr/bin/true"
         } else {
             Vec::new()
         },
-        bindings: binding.clone().into_iter().collect(),
+        bindings: bindings.clone(),
     };
     let plan = build_setup_plan_v3_with_reader(
         intent,
@@ -291,6 +300,7 @@ ssh_keygen = "/usr/bin/true"
         &read_document,
         &|_| Ok(()),
         None,
+        BindingSourceCheck::NewApproval,
     )
     .unwrap();
     let digest = sha256_hex(&serde_jcs::to_vec(&plan).unwrap());
@@ -354,7 +364,7 @@ ssh_keygen = "/usr/bin/true"
     };
     fs::remove_file(policy_path).unwrap();
     fs::remove_file(config_path).unwrap();
-    if let Some(binding) = &binding {
+    for binding in &bindings {
         fs::remove_file(&binding.plan).unwrap();
     }
     let report = recover(invocation);

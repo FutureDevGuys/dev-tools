@@ -9,7 +9,7 @@ case ${1:-} in
         [[ ( $# == 2 || $# == 3 ) && $EUID != 0 && -t 0 && -t 1 ]]
         product=$(realpath -e -- "$2")
         selected_scope=${3:-both}
-        [[ "$selected_scope" == both || "$selected_scope" == user || "$selected_scope" == workload ]]
+        [[ "$selected_scope" == both || "$selected_scope" == user || "$selected_scope" == workload || "$selected_scope" == overnight ]]
         repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
         command -v /usr/bin/ansible-playbook >/dev/null
         # mktemp owns this exact directory; no broad cleanup target is inferred.
@@ -19,11 +19,12 @@ case ${1:-} in
         /usr/bin/strip --strip-debug "$stage/dev-auth"
         install -m 0755 -- "${BASH_SOURCE[0]}" "$stage/accept-linux.sh"
         install -m 0755 -- "$repository/tests/native_privilege/user.sh" "$stage/user.sh"
+        install -m 0755 -- "$repository/tests/native_privilege/overnight.sh" "$stage/overnight.sh"
         install -m 0644 -- "$repository/tests/native_privilege/become.yml" "$stage/become.yml"
         install -m 0644 -- "$repository/tests/native_privilege/ansible.cfg" "$stage/ansible.cfg"
         install -m 0644 -- "$repository/crates/dev-auth/assets/privilege/org.futuredevguys.dev-auth.privilege.policy" "$stage/approval.policy"
         "$product" privilege-payload "$stage/dev-auth-sudo.so"
-        (cd -- "$stage" && sha256sum dev-auth accept-linux.sh user.sh become.yml ansible.cfg approval.policy dev-auth-sudo.so >SHA256SUMS)
+        (cd -- "$stage" && sha256sum dev-auth accept-linux.sh user.sh overnight.sh become.yml ansible.cfg approval.policy dev-auth-sudo.so >SHA256SUMS)
         manifest=$(sha256sum "$stage/SHA256SUMS")
         manifest=${manifest%% *}
         printf 'Native acceptance source: %s\n' "$stage"
@@ -34,7 +35,7 @@ case ${1:-} in
         stage=$2
         expected=$3
         selected_scope=$4
-        [[ "$selected_scope" == both || "$selected_scope" == user || "$selected_scope" == workload ]]
+        [[ "$selected_scope" == both || "$selected_scope" == user || "$selected_scope" == workload || "$selected_scope" == overnight ]]
         [[ "$stage" =~ ^/tmp/dev-auth-native-stage\.[A-Za-z0-9]{8}$ && "$expected" =~ ^[a-f0-9]{64}$ ]]
         owner=$PKEXEC_UID
         group=$(id -g "$owner")
@@ -48,14 +49,14 @@ case ${1:-} in
         actual=$(sha256sum "$stage/SHA256SUMS")
         [[ ${actual%% *} == "$expected" ]]
         install -d -m 0755 -- "$fixture"
-        for file in dev-auth accept-linux.sh user.sh become.yml ansible.cfg approval.policy dev-auth-sudo.so SHA256SUMS; do
+        for file in dev-auth accept-linux.sh user.sh overnight.sh become.yml ansible.cfg approval.policy dev-auth-sudo.so SHA256SUMS; do
             [[ -f "$stage/$file" && ! -L "$stage/$file" ]]
             install -m 0644 -- "$stage/$file" "$fixture/$file"
         done
         actual=$(sha256sum "$fixture/SHA256SUMS")
         [[ ${actual%% *} == "$expected" ]]
         (cd -- "$fixture" && sha256sum --check --strict SHA256SUMS)
-        chmod 0755 "$fixture/dev-auth" "$fixture/accept-linux.sh" "$fixture/user.sh"
+        chmod 0755 "$fixture/dev-auth" "$fixture/accept-linux.sh" "$fixture/user.sh" "$fixture/overnight.sh"
         if /usr/bin/setpriv --ruid="$owner" --euid=0 --regid=0 --clear-groups "$fixture/dev-auth" privilege-payload "$fixture/setuid-must-not-write.so"; then
             printf '%s\n' 'setuid invocation entered an ordinary payload writer' >&2
             exit 1
@@ -63,7 +64,7 @@ case ${1:-} in
         [[ ! -e "$fixture/setuid-must-not-write.so" ]]
         install -d -m 0700 -- "$fixture/timestamps"
         install -d -m 0700 -o "$owner" -g "$group" -- "$fixture/user"
-        jq -n --argjson uid "$owner" --arg scope "$selected_scope" --arg cwd "$fixture/user" '{schema:"dev-auth-privilege-policy-v1",sudo_program:"/usr/bin/sudo",subjects:[{account:{kind:"unix",uid:$uid},scopes:(if $scope == "both" then ["user","workload"] else [$scope] end),authorities:[{kind:"administrator"}],maximum_duration_seconds:86400,allow_delegation:true}],plans:{},operations:{"fixture-pipeline":{nodes:[{program:"/usr/bin/printf",arguments:["graph\\000bytes"],working_directory:$cwd,environment:[]},{program:"/usr/bin/cat",arguments:[],working_directory:$cwd,environment:[]}],pipes:[{from:0,to:1}],exit_policy:"pipefail"}}}' >"$fixture/policy.json"
+        jq -n --argjson uid "$owner" --arg scope "$selected_scope" --arg cwd "$fixture/user" '{schema:"dev-auth-privilege-policy-v1",sudo_program:"/usr/bin/sudo",subjects:[{account:{kind:"unix",uid:$uid},scopes:(if $scope == "both" then ["user","workload"] elif $scope == "overnight" then ["user"] else [$scope] end),authorities:[{kind:"administrator"}],maximum_duration_seconds:86400,allow_delegation:true}],plans:{},operations:{"fixture-pipeline":{nodes:[{program:"/usr/bin/printf",arguments:["graph\\000bytes"],working_directory:$cwd,environment:[]},{program:"/usr/bin/cat",arguments:[],working_directory:$cwd,environment:[]}],pipes:[{from:0,to:1}],exit_policy:"pipefail"}}}' >"$fixture/policy.json"
         printf 'Plugin sudoers_policy sudoers.so\nPlugin sudoers_io sudoers.so\nPlugin dev_auth_sudo_audit %s/dev-auth-sudo.so runtime=%s frontend=%s/dev-auth\nPlugin dev_auth_sudo_approval %s/dev-auth-sudo.so\n' "$fixture" "$fixture" "$fixture" "$fixture" >"$fixture/sudo.conf"
         printf 'Defaults timestampdir="%s/timestamps"\nDefaults timestamp_timeout=15\nDefaults group_plugin="%s/dev-auth-sudo.so"\nDefaults always_query_group_plugin\nDefaults:%%:dev-auth-active !authenticate\n%%:dev-auth-active ALL=(ALL:ALL) NOPASSWD: ALL\n#%s ALL=(ALL:ALL) ALL\n' "$fixture" "$fixture" "$owner" >"$fixture/sudoers"
         chmod 0440 "$fixture/sudoers"
@@ -91,12 +92,18 @@ case ${1:-} in
         install -m 0644 -- "$fixture/approval.policy" "$action"
         published_identity=$(stat -c '%d:%i' "$action")
         published=true
-        systemd-run --unit="$unit" --property=KillMode=control-group --property=SendSIGKILL=yes --property=ExitType=main --property=TimeoutStopSec=5s --property=RuntimeMaxSec=10m --property=Delegate=no "$fixture/dev-auth" privilege-daemon --policy "$fixture/policy.json" --runtime "$fixture"
+        runtime_limit=10m
+        [[ "$selected_scope" == overnight ]] && runtime_limit=13h
+        systemd-run --unit="$unit" --property=KillMode=control-group --property=SendSIGKILL=yes --property=ExitType=main --property=TimeoutStopSec=5s --property="RuntimeMaxSec=$runtime_limit" --property=Delegate=no "$fixture/dev-auth" privilege-daemon --policy "$fixture/policy.json" --runtime "$fixture"
         for ((attempt = 0; attempt < 100; attempt++)); do [[ -S "$fixture/control.sock" && -S "$fixture/sudo.sock" ]] && break; sleep 0.1; done
         [[ -S "$fixture/control.sock" && -S "$fixture/sudo.sock" ]]
         if [[ "$selected_scope" == both || "$selected_scope" == user ]]; then
             /usr/bin/unshare --mount --propagation private /usr/bin/bash "$fixture/accept-linux.sh" namespace "$fixture" "$owner" "$group"
             jq -e '.passed == true' "$fixture/user/user-result.json"
+        fi
+        if [[ "$selected_scope" == overnight ]]; then
+            /usr/bin/unshare --mount --propagation private /usr/bin/bash "$fixture/accept-linux.sh" namespace "$fixture" "$owner" "$group" overnight
+            jq -e '.passed == true and .expired == true and .non_root_survived == true' "$fixture/user/overnight-result.json"
         fi
         # The workload probe uses the same root-owned boundary shape and full
         # identity namespace as production, without enrollment or consumer data.
@@ -106,18 +113,23 @@ case ${1:-} in
         fi
         ;;
     namespace)
-        [[ $# == 4 && $EUID == 0 ]]
+        [[ ( $# == 4 || $# == 5 ) && $EUID == 0 ]]
         fixture=$2
         owner=$3
         group=$4
+        scenario=${5:-ordinary}
         [[ "$fixture" =~ ^/run/dev-auth-privilege-accept-[a-f0-9]{32}$ && "$owner" =~ ^[1-9][0-9]*$ && "$group" =~ ^[0-9]+$ ]]
+        [[ "$scenario" == ordinary || "$scenario" == overnight ]]
         [[ $(readlink /proc/self/ns/mnt) != "$(readlink /proc/1/ns/mnt)" ]]
         mount --bind "$fixture/sudo.conf" /etc/sudo.conf
         mount --bind "$fixture/sudoers" /etc/sudoers
+        if [[ "$scenario" == overnight ]]; then
+            exec /usr/bin/setpriv --reuid="$owner" --regid="$group" --init-groups --reset-env /usr/bin/bash "$fixture/overnight.sh" "$fixture"
+        fi
         exec /usr/bin/setpriv --reuid="$owner" --regid="$group" --init-groups --reset-env /usr/bin/bash "$fixture/user.sh" "$fixture" user
         ;;
     *)
-        printf '%s\n' 'usage: accept-linux.sh run /absolute/path/to/embedded-dev-auth [both|user|workload]' >&2
+        printf '%s\n' 'usage: accept-linux.sh run /absolute/path/to/embedded-dev-auth [both|user|workload|overnight]' >&2
         exit 2
         ;;
 esac

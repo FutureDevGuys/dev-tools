@@ -203,7 +203,13 @@ pub struct BindingIntent {
     pub command_name: String,
     pub workload: String,
     pub code_trust: BindingCodeTrust,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub desktop_entry: bool,
     pub target: BindingTargetIntent,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BindingIntent {
@@ -250,12 +256,18 @@ impl BindingIntent {
             command_name,
             workload,
             code_trust: BindingCodeTrust::Pinned,
+            desktop_entry: false,
             target,
         })
     }
 
     pub fn with_code_trust(mut self, code_trust: BindingCodeTrust) -> Self {
         self.code_trust = code_trust;
+        self
+    }
+
+    pub fn with_desktop_entry(mut self, desktop_entry: bool) -> Self {
+        self.desktop_entry = desktop_entry;
         self
     }
 }
@@ -319,10 +331,22 @@ pub fn build_binding_plan(
     resolved: impl Into<BindingResolution>,
     current: Option<&BindingReceipt>,
 ) -> Result<BindingPlan> {
-    let resolved = resolved.into();
-    let name = name.into();
+    build_binding_plan_inner(name.into(), intent, resolved.into(), current, true)
+}
+
+fn build_binding_plan_inner(
+    name: String,
+    intent: BindingIntent,
+    resolved: BindingResolution,
+    current: Option<&BindingReceipt>,
+    check_source: bool,
+) -> Result<BindingPlan> {
     require_simple_name(&name, "binding name")?;
-    validate_intent_resolution(&intent, &resolved)?;
+    if check_source {
+        validate_intent_resolution(&intent, &resolved)?;
+    } else {
+        validate_intent_resolution_structure(&intent, &resolved)?;
+    }
     let (current_generation, current_receipt_sha256, change) = match current {
         Some(receipt) => {
             validate_binding_receipt_structure(receipt)?;
@@ -380,8 +404,42 @@ pub fn build_binding_plan(
 }
 
 pub fn canonical_binding_plan(plan: &BindingPlan) -> Result<Vec<u8>> {
-    validate_binding_plan(plan)?;
+    validate_binding_plan(plan, true)?;
     serde_jcs::to_vec(plan).context("canonicalize workload binding plan")
+}
+
+/// Validate a previously captured exact plan without reopening its original
+/// pathname after acceptance. Mutable bindings admit later edits; pinned
+/// bindings instead require their separate retained artifact postcondition.
+/// Only retained setup authority may use this path to check prior plan bytes.
+#[cfg(unix)]
+pub(crate) fn canonical_retained_binding_plan(plan: &BindingPlan) -> Result<Vec<u8>> {
+    validate_binding_plan(plan, false)?;
+    serde_jcs::to_vec(plan).context("canonicalize retained binding plan")
+}
+
+/// Rebase a retained, unchanged pin against its current receipt without
+/// reopening the original pathname. The setup owner must separately verify
+/// the receipt-owned copied artifact before publishing this as a new plan.
+#[cfg(target_os = "linux")]
+pub(crate) fn rebase_retained_pinned_plan(
+    plan: &BindingPlan,
+    current: &BindingReceipt,
+) -> Result<BindingPlan> {
+    if plan.intent.code_trust != BindingCodeTrust::Pinned
+        || plan.intent != current.active.intent
+        || plan.resolved != current.active.resolved
+    {
+        bail!("retained pin differs from the current approved generation");
+    }
+    validate_binding_plan(plan, false)?;
+    build_binding_plan_inner(
+        plan.name.clone(),
+        plan.intent.clone(),
+        plan.resolved.clone(),
+        Some(current),
+        false,
+    )
 }
 
 pub fn binding_plan_sha256(plan: &BindingPlan) -> Result<String> {
@@ -407,7 +465,7 @@ pub fn write_binding_plan(path: &Path, plan: &BindingPlan) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
-fn validate_binding_plan(plan: &BindingPlan) -> Result<()> {
+fn validate_binding_plan(plan: &BindingPlan, check_source: bool) -> Result<()> {
     if plan.schema != "dev-auth-workload-binding-plan-v3" {
         bail!("workload binding plan schema is not supported");
     }
@@ -415,12 +473,12 @@ fn validate_binding_plan(plan: &BindingPlan) -> Result<()> {
         bail!("workload binding plan belongs to a different native platform");
     }
     require_simple_name(&plan.name, "binding name")?;
-    validate_intent_resolution(&plan.intent, &plan.resolved)?;
-    let expected = build_binding_plan(
+    let expected = build_binding_plan_inner(
         plan.name.clone(),
         plan.intent.clone(),
         plan.resolved.clone(),
         plan.current_receipt.as_ref(),
+        check_source,
     )?;
     if &expected != plan {
         bail!("workload binding plan is not canonical for its current-state snapshot");
@@ -640,7 +698,7 @@ pub fn validate_binding_receipt_structure(receipt: &BindingReceipt) -> Result<()
     Ok(())
 }
 
-fn validate_binding_generation(generation: &BindingGeneration) -> Result<()> {
+pub(crate) fn validate_binding_generation(generation: &BindingGeneration) -> Result<()> {
     if generation.generation == 0 {
         bail!("binding generation must be positive");
     }
@@ -1007,6 +1065,98 @@ pub fn default_proxy_directories() -> Result<Vec<PathBuf>> {
     }
     directories.push(base.data_local_dir().join("dev-auth/workload-bindings/bin"));
     Ok(directories)
+}
+
+#[cfg(all(test, unix))]
+mod retained_plan_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn retained_mutable_plan_keeps_approved_structure_after_source_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("agent");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let intent =
+            BindingIntent::structured("agent", "automation", &target, Vec::<String>::new())
+                .unwrap()
+                .with_code_trust(BindingCodeTrust::Mutable);
+        let plan = build_binding_plan(
+            "agent-binding",
+            intent,
+            resolve_structured_target(&target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let approved = canonical_binding_plan(&plan).unwrap();
+        fs::write(&target, b"#!/bin/sh\nexit 7\n").unwrap();
+        assert!(canonical_binding_plan(&plan).is_err());
+        assert_eq!(canonical_retained_binding_plan(&plan).unwrap(), approved);
+        let mut tampered = plan;
+        tampered.actions.pop();
+        assert!(canonical_retained_binding_plan(&tampered).is_err());
+    }
+
+    #[test]
+    fn retained_root_pin_preserves_the_exact_approved_plan_structure() {
+        let target = Path::new("/usr/bin/true");
+        let plan = build_binding_plan(
+            "root-pin",
+            BindingIntent::structured("bound-true", "automation", target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(target).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.intent.code_trust, BindingCodeTrust::Pinned);
+        assert_eq!(
+            plan.resolved.identity().authority,
+            BindingAuthority::RootOwned
+        );
+        assert_eq!(
+            canonical_retained_binding_plan(&plan).unwrap(),
+            canonical_binding_plan(&plan).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepted_pin_rebases_without_reopening_original_target() {
+        let target = Path::new("/usr/bin/true");
+        let intent =
+            BindingIntent::structured("bound-true", "automation", target, Vec::<String>::new())
+                .unwrap();
+        let original = build_binding_plan(
+            "root-pin",
+            intent.clone(),
+            resolve_structured_target(target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut identity = original.resolved.identity().clone();
+        identity.sha256 = "0".repeat(64);
+        let resolved = BindingResolution::Structured { identity };
+        let retained =
+            build_binding_plan_inner(original.name, intent.clone(), resolved.clone(), None, false)
+                .unwrap();
+        let current = BindingReceipt {
+            schema: BINDING_RECEIPT_SCHEMA.into(),
+            platform: current_platform(),
+            active: BindingGeneration {
+                generation: 1,
+                intent,
+                resolved,
+            },
+            previous: None,
+        };
+        assert!(canonical_binding_plan(&retained).is_err());
+        let rebased = rebase_retained_pinned_plan(&retained, &current).unwrap();
+        assert_eq!(rebased.change, BindingPlanChange::Unchanged);
+        assert_eq!(rebased.current_receipt, Some(current));
+        assert!(canonical_binding_plan(&rebased).is_err());
+        canonical_retained_binding_plan(&rebased).unwrap();
+    }
 }
 
 #[cfg(unix)]

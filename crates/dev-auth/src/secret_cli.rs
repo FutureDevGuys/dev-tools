@@ -30,48 +30,66 @@ pub(super) fn specification() -> Command {
                 ),
         );
     }
-    command.subcommand(
-        Command::new("exec")
-            .about("Project admitted resources into one native child")
-            .arg(Arg::new("stdin").long("stdin").value_name("RESOURCE"))
-            .arg(
-                Arg::new("fd")
-                    .long("fd")
-                    .value_name("FD=RESOURCE")
-                    .action(ArgAction::Append),
-            )
-            .arg(
-                Arg::new("file")
-                    .long("file")
-                    .value_name("VARIABLE=RESOURCE")
-                    .action(ArgAction::Append),
-            )
-            .arg(
-                Arg::new("env")
-                    .long("env")
-                    .value_name("VARIABLE=RESOURCE")
-                    .action(ArgAction::Append),
-            )
-            .arg(
-                Arg::new("non-interactive")
-                    .long("non-interactive")
-                    .action(ArgAction::SetTrue),
-            )
-            .arg(
-                Arg::new("result-file")
-                    .long("result-file")
-                    .value_parser(OsStringValueParser::new())
-                    .value_hint(ValueHint::FilePath),
-            )
-            .arg(
-                Arg::new("command")
-                    .last(true)
-                    .required(true)
-                    .num_args(1..)
-                    .allow_hyphen_values(true)
-                    .value_parser(OsStringValueParser::new()),
-            ),
-    )
+    command
+        .subcommand(
+            Command::new("exec")
+                .about("Project admitted resources into one native child")
+                .arg(Arg::new("stdin").long("stdin").value_name("RESOURCE"))
+                .arg(
+                    Arg::new("fd")
+                        .long("fd")
+                        .value_name("FD=RESOURCE")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .value_name("VARIABLE=RESOURCE")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("env")
+                        .long("env")
+                        .value_name("VARIABLE=RESOURCE")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("non-interactive")
+                        .long("non-interactive")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("result-file")
+                        .long("result-file")
+                        .value_parser(OsStringValueParser::new())
+                        .value_hint(ValueHint::FilePath),
+                )
+                .arg(
+                    Arg::new("command")
+                        .last(true)
+                        .required(true)
+                        .num_args(1..)
+                        .allow_hyphen_values(true)
+                        .value_parser(OsStringValueParser::new()),
+                ),
+        )
+        .subcommand(
+            Command::new("sign-ssh")
+                .about("Sign bounded standard input with an admitted operation-only SSH key")
+                .arg(
+                    Arg::new("purpose")
+                        .long("purpose")
+                        .required(true)
+                        .value_parser(["authentication", "git-signing"]),
+                )
+                .arg(Arg::new("fingerprint").long("fingerprint").required(true))
+                .arg(
+                    Arg::new("result-file")
+                        .long("result-file")
+                        .value_parser(OsStringValueParser::new())
+                        .value_hint(ValueHint::FilePath),
+                ),
+        )
 }
 
 pub(super) fn help() -> String {
@@ -107,6 +125,9 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
     if operation == "exec" {
         return run_exec(parsed);
     }
+    if operation == "sign-ssh" {
+        return run_sign_ssh(parsed);
+    }
     let Some(resource) = parsed.get_one::<String>("resource") else {
         return Ok(2);
     };
@@ -131,6 +152,160 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         "secret_public"
     };
     finish(execute(operation, resource), sink)
+}
+
+fn run_sign_ssh(parsed: &clap::ArgMatches) -> anyhow::Result<i32> {
+    let purpose = parsed.get_one::<String>("purpose").map(String::as_str);
+    let fingerprint = parsed.get_one::<String>("fingerprint");
+    if !matches!(purpose, Some("authentication" | "git-signing"))
+        || !fingerprint.is_some_and(|value| valid_ssh_fingerprint(value))
+    {
+        eprintln!("dev-auth: invalid SSH signing selection");
+        return Ok(2);
+    }
+    let sink = match parsed
+        .get_one::<OsString>("result-file")
+        .map(|path| ResultDestination::reserve(Path::new(path)))
+        .transpose()
+    {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("dev-auth: result destination is unavailable; signing was not requested");
+            return Ok(1);
+        }
+    };
+    sign_ssh(purpose.unwrap(), fingerprint.unwrap(), sink)
+}
+
+fn valid_ssh_fingerprint(value: &str) -> bool {
+    let Some(encoded) = value.strip_prefix("SHA256:") else {
+        return false;
+    };
+    encoded.len() == 43
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-'))
+}
+
+#[cfg(target_os = "linux")]
+fn sign_ssh(
+    purpose: &str,
+    fingerprint: &str,
+    sink: Option<ResultDestination>,
+) -> anyhow::Result<i32> {
+    use dev_auth::broker_protocol::{
+        BrokerRequest, BrokerResponse, BrokerSessionProbe, LocalSessionClaim, SshOperationPurpose,
+    };
+    let (claim, probe) = match dev_auth::broker_client::active_claim_and_probe() {
+        Ok(pair) => pair,
+        Err(_) => {
+            return finish(
+                result("secret_sign_ssh", "admission_invalid", Some(false), 4),
+                sink,
+            )
+        }
+    };
+    let profile = match (&claim, &probe) {
+        (LocalSessionClaim::Present { .. }, BrokerSessionProbe::Verified { profile, .. }) => {
+            profile.clone()
+        }
+        (LocalSessionClaim::Absent, BrokerSessionProbe::NoSession) => {
+            return finish(
+                result("secret_sign_ssh", "admission_required", Some(false), 3),
+                sink,
+            )
+        }
+        (_, BrokerSessionProbe::Unavailable { .. }) => {
+            return finish(
+                result("secret_sign_ssh", "broker_unavailable", Some(false), 1),
+                sink,
+            )
+        }
+        _ => {
+            return finish(
+                result("secret_sign_ssh", "admission_invalid", Some(false), 4),
+                sink,
+            )
+        }
+    };
+    // Hex framing limits the native protocol to less than 60 KiB. Read only
+    // after admission, with an absolute deadline as well as a byte bound.
+    let payload = match crate::linux_input::read_bounded(
+        &std::io::stdin(),
+        24 * 1024,
+        std::time::Duration::from_secs(30),
+    ) {
+        Ok(payload) => payload,
+        Err(error) => {
+            let (kind, code) = match error.kind() {
+                std::io::ErrorKind::TimedOut => ("input_timeout", 3),
+                std::io::ErrorKind::InvalidData => ("invalid_input", 2),
+                _ => ("input_unavailable", 1),
+            };
+            return finish(result("secret_sign_ssh", kind, Some(false), code), sink);
+        }
+    };
+    // Input may arrive much later than admission. Never carry its bytes into a
+    // replacement or revoked session, even if that session selects the same key.
+    if !matches!(dev_auth::broker_client::active_claim_and_probe(), Ok(current) if current == (claim, probe))
+    {
+        return finish(
+            result("secret_sign_ssh", "admission_invalid", Some(false), 4),
+            sink,
+        );
+    }
+    let purpose = if purpose == "authentication" {
+        SshOperationPurpose::Authentication
+    } else {
+        SshOperationPurpose::GitSigning
+    };
+    let request = BrokerRequest::SignSsh {
+        profile,
+        purpose,
+        public_key_fingerprint: fingerprint.into(),
+        payload,
+    };
+    match dev_auth::broker_client::request_active(request) {
+        Ok(BrokerResponse::Signature { signature }) => {
+            let mut output = std::io::stdout().lock();
+            if output
+                .write_all(&signature)
+                .and_then(|()| output.flush())
+                .is_err()
+            {
+                finish(
+                    result("secret_sign_ssh", "output_failed", Some(true), 1),
+                    sink,
+                )
+            } else {
+                finish(result("secret_sign_ssh", "completed", Some(true), 0), sink)
+            }
+        }
+        Ok(BrokerResponse::Denied { .. }) => finish(
+            result("secret_sign_ssh", "resource_denied", Some(false), 4),
+            sink,
+        ),
+        Ok(_) => finish(
+            result("secret_sign_ssh", "invalid_response", Some(false), 4),
+            sink,
+        ),
+        Err(_) => finish(
+            result("secret_sign_ssh", "broker_failed", Some(false), 1),
+            sink,
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sign_ssh(
+    _purpose: &str,
+    _fingerprint: &str,
+    sink: Option<ResultDestination>,
+) -> anyhow::Result<i32> {
+    finish(
+        result("secret_sign_ssh", "unsupported", Some(false), 3),
+        sink,
+    )
 }
 
 fn finish(result: ExecutionResult, sink: Option<ResultDestination>) -> anyhow::Result<i32> {

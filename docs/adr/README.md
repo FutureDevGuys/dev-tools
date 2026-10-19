@@ -101,6 +101,12 @@ Read the applicable records before changing a public product contract or cross-p
 | [0094](0094-explicit-binding-code-trust.md) | Explicit binding code trust | proposed | pending |
 | [0095](0095-setup-owned-mutable-binding-activation.md) | Setup-owned mutable binding activation | proposed | pending |
 | [0096](0096-grant-startup-proof-before-handoff.md) | Prove configured launcher startup before handing off a new grant | proposed | pending |
+| [0097](0097-strong-mutable-binding-launcher-authority.md) | Strong mutable binding launcher authority | proposed | pending |
+| [0098](0098-linux-private-authority-filesystem-custody.md) | Reject host-shared Linux private authority | proposed | pending |
+| [0099](0099-admission-before-public-signing-input.md) | Admission before public signing input | proposed | pending |
+| [0100](0100-native-account-workstation-config-authority.md) | Native-account workstation configuration authority | proposed | pending |
+| [0101](0101-provider-neutral-operation-only-ssh-signing.md) | Provider-neutral operation-only signing | proposed | pending |
+| [0102](0102-strong-root-pinned-binding-generations.md) | Strong root-owned pinned binding generations | proposed | pending |
 
 Product-scoped records remain with their product. The existing [Update All ADR series](../../crates/update-all/docs/adr/README.md) remains authoritative for Update All decisions until an applicable record is explicitly superseded.
 

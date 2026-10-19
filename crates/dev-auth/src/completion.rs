@@ -240,6 +240,7 @@ fn specification() -> Command {
                                 value("command-name"),
                                 choice("target", ["current-resolution", "structured"]),
                                 choice("code-trust", ["pinned", "mutable"]),
+                                flag("desktop-entry"),
                                 path("executable"),
                                 value("arg")
                                     .action(clap::ArgAction::Append)

@@ -62,10 +62,11 @@ pub(super) fn run(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
 #[cfg(target_os = "linux")]
 pub(super) fn worker(arguments: Vec<std::ffi::OsString>) -> i32 {
     use std::ffi::OsStr;
-    if arguments.len() != 6
+    if arguments.len() != 8
         || arguments[0] != OsStr::new("--plan")
         || arguments[2] != OsStr::new("--sha256")
         || arguments[4] != OsStr::new("--result")
+        || arguments[6] != OsStr::new("--staging-lock-fd")
     {
         return 2;
     }
@@ -82,10 +83,17 @@ pub(super) fn worker(arguments: Vec<std::ffi::OsString>) -> i32 {
     };
     let plan = std::path::Path::new(&arguments[1]);
     let result = std::path::Path::new(&arguments[5]);
+    let lock_fd = match arguments[7]
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        Some(fd) if fd >= 3 => fd,
+        _ => return 2,
+    };
     if !plan.is_absolute() || !result.is_absolute() {
         return 2;
     }
-    dev_auth::update_status::run_apply_worker(plan, digest, result)
+    dev_auth::update_status::run_apply_worker(plan, digest, result, lock_fd)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -117,24 +125,39 @@ pub(super) fn run(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
         }
     }
     let _ = offline;
+    let external = matches!(operation, dev_tools_product::CommonOperation::UpdateStatus)
+        && crate::product_cli::running_has_version_layout().is_ok_and(|managed| !managed);
     let report = dev_tools_product::OperationResultV2 {
         schema: dev_tools_product::OPERATION_RESULT_V2_SCHEMA,
         product: dev_tools_product::ProductId::parse("dev-auth")?,
         operation,
-        outcome: dev_tools_product::OperationOutcome::Unsupported,
+        outcome: if external {
+            dev_tools_product::OperationOutcome::External
+        } else {
+            dev_tools_product::OperationOutcome::Unsupported
+        },
         changed: Some(false),
         installed_version: None,
         available_version: None,
         cache_freshness: Some(dev_tools_product::CacheFreshness::NotApplicable),
-        installation_state: Some(dev_tools_product::InstallationState::Unknown),
-        exit_code: 3,
-        error_kind: Some(dev_tools_product::ErrorKind::Unsupported),
+        installation_state: Some(if external {
+            dev_tools_product::InstallationState::External
+        } else {
+            dev_tools_product::InstallationState::Unknown
+        }),
+        exit_code: if external { 0 } else { 3 },
+        error_kind: (!external).then_some(dev_tools_product::ErrorKind::Unsupported),
     };
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
-        println!("outcome=unsupported");
-        eprintln!("dev-auth: update requires a native platform adapter");
+        println!(
+            "outcome={}",
+            if external { "external" } else { "unsupported" }
+        );
+        if !external {
+            eprintln!("dev-auth: update requires a native platform adapter");
+        }
     }
     Ok(report.exit_code)
 }
