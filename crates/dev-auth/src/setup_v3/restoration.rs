@@ -380,6 +380,7 @@ fn restore_owned_inner(
         }
         Ok(())
     })?;
+    progress.next_action = "inspect_retained_configuration";
     let configurations = restoration_documents(&generation)?;
     for document in &configurations {
         document.observe()?;
@@ -436,14 +437,20 @@ fn restore_owned_inner(
     }
     validate_prior_configuration(&generation)?;
     let integration_executable = installation.integration_executable()?;
+    progress.next_action = "inspect_retained_workload_integrations";
     let workload_retirements =
         integration::workload_retirements(&generation, &integration_executable)?;
     for retirement in &workload_retirements {
         retirement.observe()?;
     }
+    progress.next_action = "inspect_retained_desktop_integrations";
     let desktop_retirements = integration::desktop_retirements(&generation)?;
     for retirement in &desktop_retirements {
         retirement.observe()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        progress.next_action = "inspect_retained_binding_integrations";
     }
     #[cfg(target_os = "linux")]
     let binding_restorations = binding::binding_restorations(&generation)?;

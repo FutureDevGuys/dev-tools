@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct BrokerStatusReport {
     pub schema: &'static str,
     pub mode: InstallMode,
+    pub purpose: crate::deployment::SetupPurpose,
     pub version: String,
     pub source_commit: Option<String>,
     pub root_generation: Option<u64>,
@@ -112,13 +113,57 @@ fn status_with_probe(probe_broker: bool) -> Result<BrokerStatusReport> {
         (_, None) => None,
     };
     let integrations = match (user.as_ref(), resolved.as_ref()) {
-        (Some(user), Some(resolved)) => crate::setup::verify_user_integrations_at(
-            &user.dir,
-            std::path::Path::new(&receipt.executable),
-            &resolved.workloads,
-            user.uid.as_raw(),
-        )
-        .ok(),
+        (Some(user), Some(resolved)) => {
+            #[cfg(target_os = "linux")]
+            {
+                (|| -> Result<_> {
+                    let mut aliases = resolved.workloads.keys().cloned().collect::<Vec<_>>();
+                    let path = crate::binding_activation::native_receipt_path(
+                        receipt.mode,
+                        &user.dir,
+                        user.uid.as_raw(),
+                    )?;
+                    let bindings = crate::binding_activation::read_at(
+                        &path,
+                        receipt.mode,
+                        user.uid.as_raw(),
+                        &receipt,
+                    )?
+                    .map(|(set, _)| {
+                        set.bindings
+                            .into_iter()
+                            .map(|(alias, binding)| (alias, binding.active.intent))
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                    aliases.extend(bindings.keys().cloned());
+                    aliases.sort();
+                    aliases.dedup();
+                    let desktop = crate::setup_v3::desktop_workloads_with_bindings(
+                        &resolved.workloads,
+                        &bindings,
+                    )?;
+                    crate::setup::verify_user_integrations_with_aliases_at(
+                        &user.dir,
+                        std::path::Path::new(&receipt.executable),
+                        &desktop,
+                        &aliases,
+                        user.uid.as_raw(),
+                    )
+                })()
+                .ok()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                crate::setup::verify_user_integrations_at(
+                    &user.dir,
+                    std::path::Path::new(&receipt.executable),
+                    &resolved.workloads,
+                    user.uid.as_raw(),
+                )
+                .ok()
+            }
+        }
         _ => None,
     };
     let signing_configured = resolved.as_ref().is_some_and(|resolved| {
@@ -174,6 +219,7 @@ fn status_with_probe(probe_broker: bool) -> Result<BrokerStatusReport> {
     Ok(BrokerStatusReport {
         schema: "dev-auth-broker-status-v2",
         mode: receipt.mode,
+        purpose: receipt.purpose,
         version: receipt.version,
         source_commit: receipt.source_commit.clone(),
         root_generation: receipt.root_generation,

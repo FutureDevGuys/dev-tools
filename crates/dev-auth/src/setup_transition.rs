@@ -732,6 +732,11 @@ mod tests {
         std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(try_admit_at(&lock, &paths, owner).is_err());
         std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let state_document = state_path(&paths);
+        let hidden = root.path().join("withheld-transition");
+        std::fs::rename(&state_document, &hidden).unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).unwrap().is_none());
+        std::fs::rename(&hidden, &state_document).unwrap();
         let lease = try_admit_at(&lock, &paths, owner).unwrap().unwrap();
         assert!(InstallationLock::try_acquire(&lock).unwrap().is_none());
         drop(lease);
@@ -824,6 +829,96 @@ mod tests {
         assert!(admit_at(&lock, &state, uid).is_err());
         accept(&paths, uid, &digest).unwrap();
         assert!(admit_at(&lock, &state, uid).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child fixture invoked only by coordinator_process_death_releases_setup_exclusion"]
+    fn coordinator_shared_lease_child() {
+        let lock = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_LOCK").unwrap());
+        let paths = SetupPaths {
+            data_root: PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_DATA_ROOT").unwrap()),
+            bin_dir: PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_BIN_DIR").unwrap()),
+        };
+        let ready = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_SETUP_READY").unwrap());
+        let owner_uid = std::env::var("DEV_AUTH_TEST_SETUP_UID")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let _lease = try_admit_at(&lock, &paths, owner_uid).unwrap().unwrap();
+        std::fs::write(ready, b"admitted").unwrap();
+        loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(1));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn coordinator_process_death_releases_setup_exclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: temp.path().join("data"),
+            bin_dir: temp.path().join("bin"),
+        };
+        let lock = temp.path().join("setup.lock");
+        let ready = temp.path().join("admitted");
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let prior_digest = "c".repeat(64);
+        begin(&paths, uid, &prior_digest, || {
+            Ok(b"accepted prior generation".to_vec())
+        })
+        .unwrap();
+        accept(&paths, uid, &prior_digest).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "setup_transition::tests::coordinator_shared_lease_child",
+                "--test-threads=1",
+            ])
+            .env("DEV_AUTH_TEST_SETUP_LOCK", &lock)
+            .env("DEV_AUTH_TEST_SETUP_DATA_ROOT", &paths.data_root)
+            .env("DEV_AUTH_TEST_SETUP_BIN_DIR", &paths.bin_dir)
+            .env("DEV_AUTH_TEST_SETUP_READY", &ready)
+            .env("DEV_AUTH_TEST_SETUP_UID", uid.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let admitted = loop {
+            if ready.is_file() {
+                break true;
+            }
+            if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let writer_blocked = if admitted {
+            InstallationLock::try_acquire(&lock).map(|lease| lease.is_none())
+        } else {
+            Ok(false)
+        };
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(
+            admitted,
+            "coordinator child did not retain its admission lease"
+        );
+        assert!(writer_blocked.unwrap());
+        let writer = InstallationLock::try_acquire(&lock).unwrap().unwrap();
+        let digest = "d".repeat(64);
+        begin(&paths, uid, &digest, || {
+            Ok(b"retained after coordinator death".to_vec())
+        })
+        .unwrap();
+        assert!(try_admit_at(&lock, &paths, uid).unwrap().is_none());
+        drop(writer);
+        assert!(try_admit_at(&lock, &paths, uid).unwrap().is_none());
+        accept(&paths, uid, &digest).unwrap();
+        assert!(try_admit_at(&lock, &paths, uid).unwrap().is_some());
     }
 
     #[test]

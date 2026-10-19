@@ -1,0 +1,15 @@
+---
+- name: Prove public native sudo become integration
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Observe the become identity
+      ansible.builtin.command: /usr/bin/id -u
+      become: true
+      become_method: sudo
+      changed_when: false
+      register: native_identity
+    - name: Require host root
+      ansible.builtin.assert:
+        that:
+          - native_identity.stdout == "0"

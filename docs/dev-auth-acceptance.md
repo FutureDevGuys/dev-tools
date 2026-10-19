@@ -80,3 +80,7 @@ Uninstalled copies return `requires_setup` with exit 3 and `started=false`. Noni
 ## Standalone production receipt-install adapter (0.5 candidate)
 
 The closed adapter's source contract and ordinary-build conformance are in [ADR0095](adr/0095-standalone-receipt-install-maintenance.md) and [protocol v1](dev-tools-receipt-install-v1.md). The [real-artifact native matrix](../crates/dev-auth/tests/support/RECEIPT-NATIVE.md) requires independently root-deployed executor/generation evidence and actual administrator approval. It covers a complete reusable receipt-install workflow, real pending-transaction revoke/hard-expiry cleanup, and protected bind-alias rejection. Native runs remain NOT RUN. Compiled fixtures, synthetic installer tests and the separate27-case containment matrix do not alone qualify this real adapter.
+
+## Integrated source qualification
+
+The native-account configuration and admitted operation-only signing changes are recorded in ADRs 0132–0134. Published topic fixtures and historical unsigned/disposable evidence do not qualify the reconciled main source. Existing grant, maintenance, binding, terminal/stdio and signed-release gates remain in force. Source integration uses compile, formatting and static checks only; no native acceptance or test campaign is claimed.

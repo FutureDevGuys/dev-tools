@@ -364,3 +364,231 @@ pub(super) fn retire_at(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use wait_timeout::ChildExt;
+
+    #[test]
+    #[ignore = "child fixture invoked only by every_retirement_crash_boundary_replays"]
+    fn retirement_abrupt_child() {
+        let input = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_PIN_RETIRE_INPUT").unwrap());
+        let marker: PinnedRetirement = serde_json::from_slice(&fs::read(input).unwrap()).unwrap();
+        let data_account = marker.layout.data_root.parent().unwrap().parent().unwrap();
+        let link_account = marker.layout.bin_dir.parent().unwrap().parent().unwrap();
+        retire_at(
+            &marker.layout,
+            &marker.receipt,
+            data_account,
+            link_account,
+            marker.layout.owner_uid,
+            marker.layout.directory_mode,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        panic!("retirement child did not reach the abrupt boundary");
+    }
+
+    #[test]
+    fn every_retirement_crash_boundary_replays() {
+        for stage in [
+            "after_marker",
+            "after_alias",
+            "after_active",
+            "after_receipt",
+            "after_artifact",
+            "after_versions",
+            "after_lock",
+            "after_data_root",
+            "after_bin_dir",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let owner_uid = nix::unistd::Uid::effective().as_raw();
+            let data_account = root.path().join("data/1234");
+            let link_account = root.path().join("links/1234");
+            let alias = "bound-tool";
+            let identity =
+                ArtifactIdentity::from_file(Path::new("/usr/bin/true"), 512 * 1024 * 1024).unwrap();
+            let generation = format!("g1-{}", identity.sha256);
+            let layout = VersionedLayout {
+                product: "dev-auth-binding".into(),
+                data_root: data_account.join(alias).join(&generation),
+                bin_dir: link_account.join(alias).join(&generation),
+                artifact_name: "payload".into(),
+                owner_uid,
+                directory_mode: 0o700,
+                bin_directory_mode: None,
+            };
+            let receipt = dev_tools_installation::apply_versioned_installation_if_unchanged(
+                &VersionedInstallRequest {
+                    layout: layout.clone(),
+                    version: "v1".into(),
+                    source: "/usr/bin/true".into(),
+                    identity,
+                    aliases: vec![alias.into()],
+                },
+                None,
+                |_| Ok(()),
+            )
+            .unwrap()
+            .receipt;
+            for path in [
+                &data_account,
+                &data_account.join(alias),
+                &link_account,
+                &link_account.join(alias),
+            ] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let marker = PinnedRetirement {
+                schema: RETIREMENT_SCHEMA.into(),
+                layout: layout.clone(),
+                receipt,
+            };
+            let input = root.path().join("retirement-input.json");
+            fs::write(&input, serde_jcs::to_vec(&marker).unwrap()).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "binding_activation::retirement::tests::retirement_abrupt_child",
+                    "--test-threads=1",
+                ])
+                .env("DEV_AUTH_TEST_PIN_RETIRE_INPUT", &input)
+                .env("DEV_AUTH_TEST_PIN_RETIRE_ABORT", stage)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let status = match child
+                .wait_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+            {
+                Some(status) => status,
+                None => {
+                    let _ = child.kill();
+                    child.wait().unwrap();
+                    panic!("retirement child stalled at {stage}");
+                }
+            };
+            assert_eq!(status.code(), Some(77), "retirement child missed {stage}");
+            assert!(
+                marker_path(&data_account).is_file(),
+                "marker missing at {stage}"
+            );
+            assert!(
+                resume_at(
+                    &data_account,
+                    &link_account,
+                    owner_uid,
+                    0o700,
+                    &BTreeSet::new()
+                )
+                .unwrap(),
+                "retirement could not resume after {stage}"
+            );
+            assert!(
+                !layout.data_root.exists(),
+                "data root remains after {stage}"
+            );
+            assert!(!layout.bin_dir.exists(), "link root remains after {stage}");
+            assert!(
+                !marker_path(&data_account).exists(),
+                "marker remains after {stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_partial_retirement_replays_without_deleting_foreign_content() {
+        let root = tempfile::tempdir().unwrap();
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let data_account = root.path().join("data/1234");
+        let link_account = root.path().join("links/1234");
+        let alias = "bound-tool";
+        let identity =
+            ArtifactIdentity::from_file(Path::new("/usr/bin/true"), 512 * 1024 * 1024).unwrap();
+        let generation = format!("g1-{}", identity.sha256);
+        let layout = VersionedLayout {
+            product: "dev-auth-binding".into(),
+            data_root: data_account.join(alias).join(&generation),
+            bin_dir: link_account.join(alias).join(&generation),
+            artifact_name: "payload".into(),
+            owner_uid,
+            directory_mode: 0o700,
+            bin_directory_mode: None,
+        };
+        let receipt = dev_tools_installation::apply_versioned_installation_if_unchanged(
+            &VersionedInstallRequest {
+                layout: layout.clone(),
+                version: "v1".into(),
+                source: "/usr/bin/true".into(),
+                identity,
+                aliases: vec![alias.into()],
+            },
+            None,
+            |_| Ok(()),
+        )
+        .unwrap()
+        .receipt;
+        for path in [
+            &data_account,
+            &data_account.join(alias),
+            &link_account,
+            &link_account.join(alias),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let marker = PinnedRetirement {
+            schema: RETIREMENT_SCHEMA.into(),
+            layout: layout.clone(),
+            receipt,
+        };
+        write_atomic_document(
+            &marker_path(&data_account),
+            &serde_jcs::to_vec(&marker).unwrap(),
+            &marker_authority(owner_uid),
+            None,
+        )
+        .unwrap();
+        assert!(pending_at(&data_account, owner_uid).unwrap());
+        fs::remove_file(layout.bin_dir.join(alias)).unwrap();
+        fs::remove_file(layout.data_root.join("active")).unwrap();
+        fs::remove_file(layout.data_root.join("installation-receipt-v1.json")).unwrap();
+        let foreign = layout.data_root.join("foreign");
+        fs::write(&foreign, b"not retirement owned").unwrap();
+        assert!(resume_at(
+            &data_account,
+            &link_account,
+            owner_uid,
+            0o700,
+            &BTreeSet::new(),
+        )
+        .is_err());
+        assert!(layout.data_root.join("versions/v1/payload").is_file());
+        fs::remove_file(foreign).unwrap();
+        assert!(resume_at(
+            &data_account,
+            &link_account,
+            owner_uid,
+            0o700,
+            &BTreeSet::new(),
+        )
+        .unwrap());
+        assert!(!layout.data_root.exists());
+        assert!(!layout.bin_dir.exists());
+        assert!(!marker_path(&data_account).exists());
+        assert!(!pending_at(&data_account, owner_uid).unwrap());
+        assert!(!resume_at(
+            &data_account,
+            &link_account,
+            owner_uid,
+            0o700,
+            &BTreeSet::new(),
+        )
+        .unwrap());
+    }
+}

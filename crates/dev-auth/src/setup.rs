@@ -40,6 +40,9 @@ pub fn setup_template(name: &str) -> Result<&'static str> {
         "administrator-policy-v3" => Ok(include_str!("../policy-v3.example.toml")),
         "user-only-policy-v3" => Ok(include_str!("../policy-v3-user-only.example.toml")),
         "user-config-v3" => Ok(include_str!("../config-v3.example.toml")),
+        "binding-deployment" => Ok(include_str!("../binding-deployment.example.toml")),
+        "binding-user-only-policy" => Ok(include_str!("../binding-policy-v3.example.toml")),
+        "binding-user-config" => Ok(include_str!("../binding-config-v3.example.toml")),
         "administrator-grant-policy" => {
             Ok(include_str!("../administrator-grant-policy.example.json"))
         }
@@ -1098,6 +1101,7 @@ fn setup_prerequisite_blockers(
                     "strong_admission",
                 ));
             }
+            #[cfg(target_os = "linux")]
             if rustix::process::pidfd_open(
                 rustix::process::getpid(),
                 rustix::process::PidfdFlags::empty(),
@@ -3716,7 +3720,7 @@ pub fn purge_user_state() -> Result<StateCleanupReport> {
             crate::runtime::revoke_user_broker_service_token_for_slot(slot)?;
         }
     } else {
-        crate::revoke_user_broker_service_token()?;
+        crate::runtime::revoke_user_broker_service_token()?;
     }
     let policy_removed = remove_optional_state_file(
         &policy_path,
@@ -3804,17 +3808,22 @@ fn require_uninstalled_layout(paths: &SetupPaths) -> Result<()> {
 }
 
 fn require_broker_sockets_absent() -> Result<()> {
-    for socket in [
-        crate::broker_client::SYSTEM_BROKER_SOCKET,
-        crate::broker_client::SYSTEM_CONTROL_SOCKET,
-    ] {
-        match fs::symlink_metadata(socket) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => bail!("system broker socket remains before state cleanup"),
-            Err(error) => return Err(error).context("inspect broker socket before cleanup"),
+    #[cfg(not(target_os = "linux"))]
+    bail!("system broker socket cleanup requires a native platform backend");
+    #[cfg(target_os = "linux")]
+    {
+        for socket in [
+            crate::broker_client::SYSTEM_BROKER_SOCKET,
+            crate::broker_client::SYSTEM_CONTROL_SOCKET,
+        ] {
+            match fs::symlink_metadata(socket) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => bail!("system broker socket remains before state cleanup"),
+                Err(error) => return Err(error).context("inspect broker socket before cleanup"),
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn require_user_sessions_absent() -> Result<()> {
@@ -4337,19 +4346,27 @@ fn require_stopped_strong_installation() -> Result<()> {
 }
 
 fn require_stopped_strong_installation_at(paths: &SetupPaths) -> Result<()> {
-    let receipt = read_receipt(&paths.receipt_path())?;
-    if receipt.mode != InstallMode::Strong || !receipt.transparent_aliases.is_empty() {
-        bail!("operation requires a stopped, deactivated strong installation");
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = paths;
+        bail!("strong installation maintenance requires a native platform backend");
     }
-    for socket in [
-        crate::broker_client::SYSTEM_BROKER_SOCKET,
-        crate::broker_client::SYSTEM_CONTROL_SOCKET,
-    ] {
-        if fs::symlink_metadata(socket).is_ok() {
-            bail!("operation requires stopped broker sockets");
+    #[cfg(target_os = "linux")]
+    {
+        let receipt = read_receipt(&paths.receipt_path())?;
+        if receipt.mode != InstallMode::Strong || !receipt.transparent_aliases.is_empty() {
+            bail!("operation requires a stopped, deactivated strong installation");
         }
+        for socket in [
+            crate::broker_client::SYSTEM_BROKER_SOCKET,
+            crate::broker_client::SYSTEM_CONTROL_SOCKET,
+        ] {
+            if fs::symlink_metadata(socket).is_ok() {
+                bail!("operation requires stopped broker sockets");
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub fn system_service_credential_ready() -> bool {

@@ -238,7 +238,7 @@ impl PrivilegeAuthorizer for PkexecAuthorizer {
 fn validate_request(request: &ExactHelperRequest<'_>) -> Result<()> {
     validate_exact_executable(request.helper, "privileged helper")?;
     if request.deadline.is_some() {
-        bail!("sudo cannot safely enforce a complete privileged helper deadline");
+        bail!("native authorization cannot safely enforce a complete privileged helper deadline");
     }
     if request.interaction == UserInteraction::Allowed && request.stdio != StdioPolicy::Inherit {
         bail!("interactive privilege authorization requires inherited standard streams");

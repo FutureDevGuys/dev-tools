@@ -63,6 +63,25 @@ fn build_info_is_machine_readable_and_names_exact_source_when_embedded() {
 }
 
 #[test]
+fn privilege_only_binary_plan_has_no_native_git_or_gh_authority() {
+    let (_root, _paths, mut request) = fixture();
+    request.purpose = dev_auth::deployment::SetupPurpose::PrivilegeOnly;
+    request.mode = InstallMode::Strong;
+    request.version = "0.5.0".into();
+    request.native_git = Default::default();
+    request.native_gh = Default::default();
+    let plan = build_plan(&SetupPaths::strong(), &request).unwrap();
+    assert_eq!(plan.schema, "dev-auth-setup-binary-plan-v3");
+    assert!(plan.request.native_git.as_os_str().is_empty());
+    assert!(plan.request.native_gh.as_os_str().is_empty());
+    request.native_git = "/unconfigured-native-program-must-not-be-consulted".into();
+    assert!(build_plan(&SetupPaths::strong(), &request).is_err());
+    request.native_git = Default::default();
+    request.mode = InstallMode::UserOnly;
+    assert!(build_plan(&SetupPaths::strong(), &request).is_err());
+}
+
+#[test]
 fn standalone_setup_installs_every_product_alias_before_same_name_activation() {
     let (_root, paths, request) = fixture();
     let report = install_at(&paths, &request).unwrap();

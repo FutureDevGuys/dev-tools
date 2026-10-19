@@ -1,6 +1,8 @@
+#[cfg(target_os = "linux")]
+use crate::broker_protocol::MAX_BROKER_FRAME_BYTES;
 use crate::broker_protocol::{
     decode_response_frame, encode_request_frame, BrokerRequest, BrokerRequestEnvelope,
-    BrokerResponse, BrokerSessionProbe, BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES,
+    BrokerResponse, BrokerSessionProbe, BROKER_PROTOCOL_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -78,7 +80,7 @@ pub fn active_claim_and_probe() -> Result<(
     crate::broker_protocol::LocalSessionClaim,
     BrokerSessionProbe,
 )> {
-    let strong_claim = crate::linux_admission::local_session_claim()?;
+    let strong_claim = native_strong_claim()?;
     let user = user_broker_from_environment()?;
     match (strong_claim, user) {
         (crate::broker_protocol::LocalSessionClaim::Present { .. }, Some(_)) => {
@@ -110,7 +112,7 @@ pub fn request_active(request: BrokerRequest) -> Result<BrokerResponse> {
 }
 
 fn active_endpoint() -> Result<ActiveBrokerEndpoint> {
-    let strong_claim = crate::linux_admission::local_session_claim()?;
+    let strong_claim = native_strong_claim()?;
     let user = user_broker_from_environment()?;
     match (strong_claim, user) {
         (crate::broker_protocol::LocalSessionClaim::Present { .. }, Some(_)) => {
@@ -128,24 +130,47 @@ fn active_endpoint() -> Result<ActiveBrokerEndpoint> {
     }
 }
 
+fn native_strong_claim() -> Result<crate::broker_protocol::LocalSessionClaim> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_admission::local_session_claim()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(crate::broker_protocol::LocalSessionClaim::Absent)
+    }
+}
+
 fn user_broker_from_environment() -> Result<Option<(String, PathBuf)>> {
-    let socket = std::env::var_os(USER_BROKER_SOCKET_ENV);
-    let session = std::env::var_os(USER_BROKER_SESSION_ENV);
-    let (socket, session) = match (socket, session) {
-        (Some(socket), Some(session)) => (socket, session),
-        (None, None) => return Ok(None),
-        (Some(_), None) | (None, Some(_)) => {
-            bail!("user workload broker environment is incomplete")
+    #[cfg(not(target_os = "linux"))]
+    {
+        if std::env::var_os(USER_BROKER_SOCKET_ENV).is_some()
+            || std::env::var_os(USER_BROKER_SESSION_ENV).is_some()
+        {
+            bail!("native user-broker admission requires a platform backend");
         }
-    };
-    let session = session
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("user workload broker session is not UTF-8"))?;
-    let owner_uid = nix::unistd::Uid::effective().as_raw();
-    let runtime_root = PathBuf::from(format!("/run/user/{owner_uid}/dev-auth-v3"));
-    let socket =
-        validate_user_broker_hint_at(&runtime_root, Path::new(&socket), &session, owner_uid)?;
-    Ok(Some((session, socket)))
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let socket = std::env::var_os(USER_BROKER_SOCKET_ENV);
+        let session = std::env::var_os(USER_BROKER_SESSION_ENV);
+        let (socket, session) = match (socket, session) {
+            (Some(socket), Some(session)) => (socket, session),
+            (None, None) => return Ok(None),
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("user workload broker environment is incomplete")
+            }
+        };
+        let session = session
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("user workload broker session is not UTF-8"))?;
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let runtime_root = PathBuf::from(format!("/run/user/{owner_uid}/dev-auth-v3"));
+        let socket =
+            validate_user_broker_hint_at(&runtime_root, Path::new(&socket), &session, owner_uid)?;
+        Ok(Some((session, socket)))
+    }
 }
 
 fn validate_user_broker_hint_at(

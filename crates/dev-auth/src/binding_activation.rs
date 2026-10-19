@@ -1465,3 +1465,482 @@ mod public_parent_tests {
         assert_eq!(fs::read_dir(&selected).unwrap().count(), 0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::smart_binding::{build_binding_plan, resolve_structured_target, BindingIntent};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn privileged_binding_lookup_requires_the_exact_root_launcher_shape() {
+        let launcher = crate::setup::privileged_launcher_path();
+        assert!(uses_privileged_launcher_installation(launcher, 0));
+        assert!(!uses_privileged_launcher_installation(launcher, 1000));
+        assert!(!uses_privileged_launcher_installation(
+            Path::new("/usr/local/lib/dev-auth/versions/0.5.0/dev-auth"),
+            0,
+        ));
+        assert!(!uses_privileged_launcher_installation(
+            Path::new("/tmp/copied-privileged-launcher"),
+            0,
+        ));
+    }
+
+    #[test]
+    fn tool_plane_requires_the_authenticated_native_owner() {
+        assert!(require_tool_plane_owner(1000, 1000).is_ok());
+        assert!(require_tool_plane_owner(0, 1000).is_err());
+        assert!(require_tool_plane_owner(0, 0).is_err());
+        assert!(require_tool_plane_owner(1001, 1000).is_err());
+    }
+
+    #[test]
+    fn strong_root_pin_records_only_its_active_artifact_identity() {
+        let target = Path::new("/usr/bin/true");
+        let plan = build_binding_plan(
+            "root-pin",
+            BindingIntent::structured("bound-true", "automation", target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut installed = installation("/usr/local/bin/dev-auth", &"a".repeat(64));
+        installed.mode = crate::setup::InstallMode::Strong;
+        let desired = build_desired(1234, &installed, None, std::slice::from_ref(&plan)).unwrap();
+        assert_eq!(
+            desired.pinned_artifacts.get("bound-true"),
+            Some(&ArtifactIdentity {
+                length: plan.resolved.identity().length,
+                sha256: plan.resolved.identity().sha256.clone(),
+            })
+        );
+        assert_eq!(
+            desired,
+            expected_desired_from_approved_plans(
+                1234,
+                &installed,
+                None,
+                std::slice::from_ref(&plan),
+            )
+            .unwrap()
+        );
+        let mut tampered = desired.clone();
+        tampered.pinned_artifacts.clear();
+        assert!(validate(&tampered, 1234, &installed).is_err());
+        assert!(validate(&desired, 1234, &installed).is_ok());
+        assert_eq!(
+            pinned_artifact_path(1234, "bound-true", &desired.bindings["bound-true"]).unwrap(),
+            PathBuf::from(format!(
+                "/var/lib/dev-auth/pinned-bindings/1234/bound-true/g1-{}/versions/v1/payload",
+                plan.resolved.identity().sha256
+            ))
+        );
+    }
+
+    #[test]
+    fn mixed_strong_mutable_and_root_pin_build_one_binding_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mutable_target = root.path().join("mutable-worker");
+        fs::write(&mutable_target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&mutable_target, fs::Permissions::from_mode(0o700)).unwrap();
+        let mutable = build_binding_plan(
+            "fixture-binding",
+            BindingIntent::structured(
+                "bound-worker",
+                "worker",
+                &mutable_target,
+                Vec::<String>::new(),
+            )
+            .unwrap()
+            .with_code_trust(BindingCodeTrust::Mutable),
+            resolve_structured_target(&mutable_target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let pinned_target = Path::new("/usr/bin/true");
+        let pinned = build_binding_plan(
+            "fixture-pinned-binding",
+            BindingIntent::structured(
+                "bound-pinned-worker",
+                "pinned-worker",
+                pinned_target,
+                Vec::<String>::new(),
+            )
+            .unwrap(),
+            resolve_structured_target(pinned_target).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut installed = installation("/usr/local/bin/dev-auth", &"a".repeat(64));
+        installed.mode = crate::setup::InstallMode::Strong;
+        let desired = build_desired(1234, &installed, None, &[mutable, pinned]).unwrap();
+        assert_eq!(desired.bindings.len(), 2);
+        assert_eq!(desired.pinned_artifacts.len(), 1);
+    }
+
+    #[test]
+    fn pinned_payload_ledger_retains_exact_active_and_prior_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let first_layout = VersionedLayout {
+            product: "dev-auth-binding".into(),
+            data_root: root.path().join("pinned-data/g1"),
+            bin_dir: root.path().join("pinned-links/g1"),
+            artifact_name: "payload".into(),
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+            directory_mode: 0o700,
+            bin_directory_mode: None,
+        };
+        let alias = "bound-true";
+        let first_target = Path::new("/usr/bin/true");
+        let first = BindingReceipt::new(
+            BindingIntent::structured(alias, "automation", first_target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(first_target).unwrap(),
+        )
+        .unwrap();
+        assert!(publish_pinned_artifact_at(&first_layout, alias, &first).unwrap());
+        assert!(!publish_pinned_artifact_at(&first_layout, alias, &first).unwrap());
+        let first_path = verify_pinned_artifact_at(&first_layout, alias, &first).unwrap();
+        assert_eq!(
+            fs::read(&first_path).unwrap(),
+            fs::read(first_target).unwrap()
+        );
+
+        let second_target = Path::new("/usr/bin/false");
+        let second = advance_binding(
+            &first,
+            BindingIntent::structured(alias, "automation", second_target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(second_target).unwrap(),
+        )
+        .unwrap();
+        let second_layout = VersionedLayout {
+            data_root: root.path().join("pinned-data/g2"),
+            bin_dir: root.path().join("pinned-links/g2"),
+            ..first_layout.clone()
+        };
+        assert!(publish_pinned_artifact_at(&second_layout, alias, &second).unwrap());
+        let second_path = verify_pinned_artifact_at(&second_layout, alias, &second).unwrap();
+        assert_eq!(
+            fs::read(&second_path).unwrap(),
+            fs::read(second_target).unwrap()
+        );
+        let current = observe_versioned_installation(&first_layout, 512 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current,
+            pinned_ledger_receipt_at(&first_layout, alias, &first).unwrap()
+        );
+        assert!(publish_pinned_artifact_at(&first_layout, alias, &second).is_err());
+        dev_tools_installation::uninstall_versioned_installation(&second_layout).unwrap();
+        assert_eq!(
+            fs::read(verify_pinned_artifact_at(&first_layout, alias, &first).unwrap()).unwrap(),
+            fs::read(first_target).unwrap()
+        );
+        assert!(
+            observe_versioned_installation(&second_layout, 512 * 1024 * 1024)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pinned_publication_completes_an_exact_prejournal_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let layout = VersionedLayout {
+            product: "dev-auth-binding".into(),
+            data_root: root.path().join("pinned-data/g1"),
+            bin_dir: root.path().join("pinned-links/g1"),
+            artifact_name: "payload".into(),
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+            directory_mode: 0o700,
+            bin_directory_mode: None,
+        };
+        let alias = "bound-true";
+        let target = Path::new("/usr/bin/true");
+        let binding = BindingReceipt::new(
+            BindingIntent::structured(alias, "automation", target, Vec::<String>::new()).unwrap(),
+            resolve_structured_target(target).unwrap(),
+        )
+        .unwrap();
+        let payload = pinned_artifact_path_at(&layout, alias, &binding).unwrap();
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        for directory in [
+            &layout.data_root,
+            &layout.data_root.join("versions"),
+            payload.parent().unwrap(),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dev_tools_installation::publish_executable(target, &payload, &pinned_identity(&binding))
+            .unwrap();
+        assert!(publish_pinned_artifact_at(&layout, alias, &binding).unwrap());
+        assert!(!publish_pinned_artifact_at(&layout, alias, &binding).unwrap());
+        assert_eq!(
+            verify_pinned_artifact_at(&layout, alias, &binding).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn pinned_publication_recovers_an_exact_nested_commit_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = VersionedLayout {
+            product: "dev-auth-binding".into(),
+            data_root: root.path().join("pinned-data/g1"),
+            bin_dir: root.path().join("pinned-links/g1"),
+            artifact_name: "payload".into(),
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+            directory_mode: 0o700,
+            bin_directory_mode: None,
+        };
+        let alias = "bound-true";
+        let target = Path::new("/usr/bin/true");
+        let binding = BindingReceipt::new(
+            BindingIntent::structured(alias, "automation", target, Vec::<String>::new()).unwrap(),
+            resolve_structured_target(target).unwrap(),
+        )
+        .unwrap();
+        assert!(publish_pinned_artifact_at(&layout, alias, &binding).unwrap());
+        let receipt = pinned_ledger_receipt_at(&layout, alias, &binding).unwrap();
+        let journal = layout.data_root.join("installation-transition-v1.json");
+        fs::write(
+            &journal,
+            serde_jcs::to_vec(&serde_json::json!({
+                "schema": "dev-tools-versioned-transition-v1",
+                "prior": null,
+                "next": receipt,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(layout.data_root.join("installation-receipt-v1.json")).unwrap();
+        fs::remove_file(layout.data_root.join("active")).unwrap();
+        fs::remove_file(layout.bin_dir.join(alias)).unwrap();
+        assert!(publish_pinned_artifact_at(&layout, alias, &binding).unwrap());
+        assert!(!journal.exists());
+        assert_eq!(
+            fs::read(verify_pinned_artifact_at(&layout, alias, &binding).unwrap()).unwrap(),
+            fs::read(target).unwrap(),
+        );
+    }
+
+    #[test]
+    fn pinned_collection_preserves_active_and_prior_and_refuses_foreign_content() {
+        let root = tempfile::tempdir().unwrap();
+        let account_uid = 1234;
+        let owner_uid = nix::unistd::Uid::effective().as_raw();
+        let alias = "bound-tool";
+        let first_target = Path::new("/usr/bin/true");
+        let first = BindingReceipt::new(
+            BindingIntent::structured(alias, "automation", first_target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(first_target).unwrap(),
+        )
+        .unwrap();
+        let second_target = Path::new("/usr/bin/false");
+        let second = advance_binding(
+            &first,
+            BindingIntent::structured(alias, "automation", second_target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(second_target).unwrap(),
+        )
+        .unwrap();
+        let third_target = Path::new("/usr/bin/id");
+        let third = advance_binding(
+            &second,
+            BindingIntent::structured(alias, "automation", third_target, Vec::<String>::new())
+                .unwrap(),
+            resolve_structured_target(third_target).unwrap(),
+        )
+        .unwrap();
+        let data_base = root.path().join("data");
+        let link_base = root.path().join("links");
+        let make_layout = |receipt: &BindingReceipt| VersionedLayout {
+            product: "dev-auth-binding".into(),
+            data_root: data_base
+                .join(account_uid.to_string())
+                .join(alias)
+                .join(format!(
+                    "g{}-{}",
+                    receipt.active.generation,
+                    receipt.active.resolved.identity().sha256
+                )),
+            bin_dir: link_base
+                .join(account_uid.to_string())
+                .join(alias)
+                .join(format!(
+                    "g{}-{}",
+                    receipt.active.generation,
+                    receipt.active.resolved.identity().sha256
+                )),
+            artifact_name: "payload".into(),
+            owner_uid,
+            directory_mode: 0o700,
+            bin_directory_mode: None,
+        };
+        let layouts = [&first, &second, &third].map(make_layout);
+        for (layout, receipt) in layouts.iter().zip([&first, &second, &third]) {
+            publish_pinned_artifact_at(layout, alias, receipt).unwrap();
+        }
+        for parent in [
+            data_base.join(account_uid.to_string()),
+            data_base.join(account_uid.to_string()).join(alias),
+            link_base.join(account_uid.to_string()),
+            link_base.join(account_uid.to_string()).join(alias),
+        ] {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let keep = BTreeSet::from([layouts[1].data_root.clone(), layouts[2].data_root.clone()]);
+        let mut impossible_keep = keep.clone();
+        impossible_keep.insert(
+            data_base
+                .join(account_uid.to_string())
+                .join(alias)
+                .join(format!("g99-{}", "a".repeat(64))),
+        );
+        assert!(collect_pinned_stores_at(
+            account_uid,
+            &data_base,
+            &link_base,
+            owner_uid,
+            0o700,
+            &impossible_keep,
+        )
+        .is_err());
+        assert!(layouts[0].data_root.join("versions/v1/payload").is_file());
+        let foreign = layouts[0].data_root.join("foreign");
+        fs::write(&foreign, b"not receipt owned").unwrap();
+        assert!(collect_pinned_stores_at(
+            account_uid,
+            &data_base,
+            &link_base,
+            owner_uid,
+            0o700,
+            &keep,
+        )
+        .is_err());
+        assert!(layouts[0].data_root.join("versions/v1/payload").is_file());
+        fs::remove_file(&foreign).unwrap();
+        assert_eq!(
+            collect_pinned_stores_at(account_uid, &data_base, &link_base, owner_uid, 0o700, &keep,)
+                .unwrap(),
+            1
+        );
+        assert!(!layouts[0].data_root.exists());
+        assert!(verify_pinned_artifact_at(&layouts[1], alias, &second).is_ok());
+        assert!(verify_pinned_artifact_at(&layouts[2], alias, &third).is_ok());
+        assert_eq!(
+            collect_pinned_stores_at(
+                account_uid,
+                &data_base,
+                &link_base,
+                owner_uid,
+                0o700,
+                &BTreeSet::new(),
+            )
+            .unwrap(),
+            2
+        );
+        assert!(!layouts[1].data_root.exists());
+        assert!(!layouts[2].data_root.exists());
+    }
+
+    #[test]
+    fn pinned_collection_without_a_store_does_not_create_one() {
+        let root = tempfile::tempdir().unwrap();
+        let data_base = root.path().join("data");
+        let link_base = root.path().join("links");
+        assert_eq!(
+            collect_pinned_stores_at(
+                1234,
+                &data_base,
+                &link_base,
+                nix::unistd::Uid::effective().as_raw(),
+                0o700,
+                &BTreeSet::new(),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!data_base.exists());
+        assert!(!link_base.exists());
+    }
+
+    #[test]
+    fn pinned_collection_rejects_a_replaced_account_parent_before_marker_intake() {
+        let root = tempfile::tempdir().unwrap();
+        let data_base = root.path().join("data");
+        let foreign = root.path().join("foreign");
+        fs::create_dir_all(&data_base).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("retirement-v1.json"), b"not a product marker").unwrap();
+        std::os::unix::fs::symlink(&foreign, data_base.join("1234")).unwrap();
+        assert!(collect_pinned_stores_at(
+            1234,
+            &data_base,
+            &root.path().join("links"),
+            nix::unistd::Uid::effective().as_raw(),
+            0o700,
+            &BTreeSet::new(),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(foreign.join("retirement-v1.json")).unwrap(),
+            b"not a product marker"
+        );
+    }
+
+    fn installation(executable: &str, digest: &str) -> InstallReceipt {
+        InstallReceipt {
+            purpose: Default::default(),
+            schema: "dev-auth-install-v2".into(),
+            mode: crate::setup::InstallMode::UserOnly,
+            version: "0.5.0".into(),
+            executable: executable.into(),
+            bin_dir: "/tmp/bin".into(),
+            executable_length: 10,
+            executable_sha256: digest.into(),
+            source_commit: None,
+            root_generation: None,
+            manifest_generation: None,
+            native_git: "/usr/bin/git".into(),
+            native_gh: "/usr/bin/gh".into(),
+            product_aliases: vec![],
+            transparent_aliases: vec![],
+            privileged_launcher: None,
+            system_assets: BTreeMap::new(),
+            previous_release: None,
+        }
+    }
+
+    #[test]
+    fn reserved_native_command_cannot_become_a_binding_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("agent");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let plan = build_binding_plan(
+            "reserved",
+            BindingIntent::structured("git", "automation", &target, Vec::<String>::new())
+                .unwrap()
+                .with_code_trust(BindingCodeTrust::Mutable),
+            resolve_structured_target(&target).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(build_desired(
+            1000,
+            &installation("/tmp/dev-auth", &"a".repeat(64)),
+            None,
+            &[plan],
+        )
+        .is_err());
+    }
+}

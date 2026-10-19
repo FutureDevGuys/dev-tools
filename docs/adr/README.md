@@ -146,3 +146,7 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0128](0128-sync-configs-fatal-run-diagnostics.md) | SyncConfigs closed fatal-run diagnostics | proposed | pending |
 | [0129](0129-independent-file-publication-contracts.md) | Independent file publication contracts | proposed | pending |
 | [0131](0131-authenticated-native-workload-stdio-handoff.md) | Authenticated native workload standard-stream handoff | proposed | pending |
+
+| [0132](0132-admission-before-public-signing-input.md) | Admission before public signing input | proposed | pending |
+| [0133](0133-native-account-workstation-config-authority.md) | Native-account workstation configuration authority | proposed | pending |
+| [0134](0134-provider-neutral-operation-only-ssh-signing.md) | Provider-neutral operation-only signing | proposed | pending |

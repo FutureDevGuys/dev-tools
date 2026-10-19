@@ -229,6 +229,8 @@ fn plan_target(
     excluded: &[PathBuf],
 ) -> Result<(BindingIntent, BindingResolution)> {
     let alias = text(matches, "command-name")?;
+    #[cfg(target_os = "linux")]
+    crate::setup::validate_workload_alias_names(&[alias.to_owned()])?;
     let workload = text(matches, "workload")?;
     let trust = match text(matches, "code-trust")? {
         "mutable" => BindingCodeTrust::Mutable,

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use zeroize::Zeroizing;
 
-pub const SETUP_TEMPLATE_NAMES: [&str; 10] = [
+pub const SETUP_TEMPLATE_NAMES: [&str; 13] = [
     "deployment",
     "administrator-policy",
     "user-only-policy",
@@ -15,6 +15,9 @@ pub const SETUP_TEMPLATE_NAMES: [&str; 10] = [
     "privilege-deployment",
     "credential-grant-deployment",
     "administrator-grant-policy",
+    "binding-deployment",
+    "binding-user-only-policy",
+    "binding-user-config",
 ];
 
 #[cfg(target_os = "linux")]
@@ -88,6 +91,11 @@ pub use runtime::{
     broker_credential_erase, broker_credential_get, broker_sign_release_manifest,
     enroll_user_broker_service_token, exec_broker_gh, exec_broker_git, exec_broker_ssh_keygen,
     revoke_user_broker_service_token, rotate_user_broker_service_token, run_provider_exec_child,
+};
+#[cfg(all(unix, not(target_os = "linux")))]
+pub use runtime::{
+    enroll_user_broker_service_token, revoke_user_broker_service_token,
+    rotate_user_broker_service_token,
 };
 #[cfg(unix)]
 pub use runtime::{exec_native_gh, exec_native_git};

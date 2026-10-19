@@ -146,7 +146,7 @@ fn bound_frontend_runtime_and_config(
 }
 
 #[cfg(unix)]
-fn native_current_user_home() -> Result<PathBuf> {
+pub(super) fn native_current_user_home() -> Result<PathBuf> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .context("query current operating-system user")?
         .context("current operating-system user has no account record")?;
@@ -157,13 +157,13 @@ fn native_current_user_home() -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn native_current_user_home() -> Result<PathBuf> {
+pub(super) fn native_current_user_home() -> Result<PathBuf> {
     let base = BaseDirs::new().context("the operating system has no user home directory")?;
     Ok(base.home_dir().to_path_buf())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn native_current_user_home() -> Result<PathBuf> {
+pub(super) fn native_current_user_home() -> Result<PathBuf> {
     bail!("the current platform does not provide a supported user-home authority")
 }
 

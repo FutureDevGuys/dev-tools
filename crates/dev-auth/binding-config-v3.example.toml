@@ -1,0 +1,15 @@
+# Fictional provider-free workload. Its launcher name matches the policy;
+# the separate binding plan chooses the ordinary command alias and code trust.
+schema = "dev-auth-user-config-v3"
+
+[authority_profiles.main]
+cap = "agent"
+resources = {}
+
+[[workloads]]
+name = "automation"
+profile = "main"
+launcher = "agent"
+admission = "approval_required"
+duration_seconds = 1800
+resources = {}

@@ -70,7 +70,7 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn base_usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|privilege-deployment|credential-grant-deployment|administrator-grant-policy\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--grant-policy PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|privilege-deployment|credential-grant-deployment|administrator-grant-policy|binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--grant-policy PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 fn usage() -> String {
@@ -86,7 +86,7 @@ fn usage() -> String {
         update_cli::specification().render_long_help()
     );
     format!(
-        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth privilege plan|request|execute|execute-plan|status|revoke [OPTIONS]\n  dev-auth privilege grant request|status|inspect|exec|delegate|revoke|leave [OPTIONS]\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution --output PLAN [--json]",
+        "{}\n  dev-auth --version\n  dev-auth build-info --json\n  dev-auth completion bash|zsh|fish|elvish|powershell\n  dev-auth privilege plan|request|execute|execute-plan|status|revoke [OPTIONS]\n  dev-auth privilege grant request|status|inspect|exec|delegate|revoke|leave [OPTIONS]\n  dev-auth workload bind discover COMMAND [--json]\n  dev-auth workload bind plan NAME --workload WORKLOAD --command-name COMMAND --target current-resolution|structured|pinned-shell [--executable PATH] [--arg VALUE]... [--caller-argument-index N] [--code-trust pinned|mutable] [--desktop-entry] [--shell PATH --source-stdin --acknowledge-public-shell-source] [--source PATH --source-sha256 HEX --user USER] --output PLAN [--json]",
         commands
     )
 }
@@ -1487,6 +1487,9 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             if arguments.next().is_some() {
                 bail!("setup credential enrollment accepts no arguments");
             }
+            if !cfg!(target_os = "linux") {
+                bail!("setup credential enrollment requires a native platform backend");
+            }
             let mut value = Vec::new();
             io::stdin()
                 .take(REQUEST_LIMIT + 1)
@@ -1989,40 +1992,50 @@ fn run() -> Result<i32> {
                 bail!("sign-release-manifest accepts no additional arguments");
             }
             #[cfg(target_os = "linux")]
-            let payload = match linux_input::read_bounded(
-                &io::stdin(),
-                16 * 1024,
-                std::time::Duration::from_secs(30),
-            ) {
-                Ok(payload) => payload,
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    bail!("release manifest exceeds the size limit")
-                }
-                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                    eprintln!("dev-auth: release manifest input timed out");
+            {
+                use dev_auth::broker_protocol::{BrokerSessionProbe, LocalSessionClaim};
+                let admission = match dev_auth::broker_client::active_claim_and_probe() {
+                    Ok(admission) => admission,
+                    Err(_) => {
+                        eprintln!("dev-auth: release signing admission_invalid");
+                        return Ok(4);
+                    }
+                };
+                if !matches!(
+                    &admission,
+                    (
+                        LocalSessionClaim::Present { .. },
+                        BrokerSessionProbe::Verified { profile: admitted, .. }
+                    ) if admitted == &profile
+                ) {
+                    eprintln!("dev-auth: release signing requires the selected admitted workload");
                     return Ok(3);
                 }
-                Err(error) => {
-                    return Err(error).context("read release manifest from standard input");
+                let payload = match linux_input::read_bounded(
+                    &io::stdin(),
+                    16 * 1024,
+                    std::time::Duration::from_secs(30),
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let (kind, code) = match error.kind() {
+                            io::ErrorKind::TimedOut => ("input_timeout", 3),
+                            io::ErrorKind::InvalidData => ("invalid_input", 2),
+                            _ => ("input_unavailable", 1),
+                        };
+                        eprintln!("dev-auth: release signing {kind}");
+                        return Ok(code);
+                    }
+                };
+                if payload.is_empty() {
+                    eprintln!("dev-auth: release signing invalid_input");
+                    return Ok(2);
                 }
-            };
-            #[cfg(not(target_os = "linux"))]
-            let payload = {
-                let mut payload = Vec::new();
-                io::stdin()
-                    .take(16 * 1024 + 1)
-                    .read_to_end(&mut payload)
-                    .context("read release manifest from standard input")?;
-                payload
-            };
-            if payload.is_empty() {
-                bail!("release manifest must not be empty");
-            }
-            if payload.len() > 16 * 1024 {
-                bail!("release manifest exceeds the size limit");
-            }
-            #[cfg(target_os = "linux")]
-            {
+                if !matches!(dev_auth::broker_client::active_claim_and_probe(), Ok(current) if current == admission)
+                {
+                    eprintln!("dev-auth: release signing admission_invalid");
+                    return Ok(4);
+                }
                 println!(
                     "{}",
                     BASE64.encode(dev_auth::broker_sign_release_manifest(&profile, &payload)?)
@@ -2032,7 +2045,6 @@ fn run() -> Result<i32> {
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = profile;
-                let _ = payload;
                 bail!("broker-backed signing is supported only on Linux")
             }
         }

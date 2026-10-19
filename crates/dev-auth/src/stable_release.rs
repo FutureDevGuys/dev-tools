@@ -1159,6 +1159,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit signed GitHub metadata observation; requires network access"]
+    fn public_stable_observation_fetches_metadata_without_an_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = StableReleaseObservationStorage {
+            path: root.path().join("stable-release-observation-v1.json"),
+            owner_uid: nix::unistd::Uid::effective().as_raw(),
+        };
+        let observation = check_user_stable_release_classified(&storage).unwrap();
+        assert_eq!(observation.verified().unwrap().product, "dev-auth");
+        assert_eq!(
+            load_user_release_observation_classified(&storage)
+                .unwrap()
+                .unwrap()
+                .checked_at_unix(),
+            observation.checked_at_unix()
+        );
+        let entries = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "only observation and its stable lock");
+        assert!(!root.path().join("accepted.json").exists());
+    }
+
+    #[test]
     fn online_authority_limits_legacy_to_source_bound_bootstrap_manifest() {
         let authority = release_authority().unwrap();
         assert_eq!(

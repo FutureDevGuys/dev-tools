@@ -237,9 +237,20 @@ impl RuntimePaths {
 }
 
 fn discover_config_path() -> Result<PathBuf> {
-    let project = ProjectDirs::from("", "", "dev-auth")
-        .context("the operating system has no user configuration directory")?;
-    Ok(project.config_dir().join("config.toml"))
+    #[cfg(unix)]
+    {
+        let home = git_runtime::native_current_user_home()?;
+        #[cfg(target_os = "macos")]
+        return Ok(home.join("Library/Application Support/dev-auth/config.toml"));
+        #[cfg(not(target_os = "macos"))]
+        return Ok(home.join(".config/dev-auth/config.toml"));
+    }
+    #[cfg(not(unix))]
+    {
+        let project = ProjectDirs::from("", "", "dev-auth")
+            .context("the operating system has no user configuration directory")?;
+        Ok(project.config_dir().join("config.toml"))
+    }
 }
 
 fn select_runtime_root(
@@ -770,6 +781,9 @@ pub(crate) fn user_broker_service_tokens<'a>(
         let stores = slots
             .map(|slot| Ok((slot.to_owned(), user_broker_credential_store(slot)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        if stores.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         return prompt_free_store::read(&stores).map_err(Into::into);
     }
     slots
@@ -780,6 +794,15 @@ pub(crate) fn user_broker_service_tokens<'a>(
             ))
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn zero_slot_noninteractive_broker_needs_no_secret_service_session() {
+    let values =
+        user_broker_service_tokens(std::iter::empty::<&str>(), CredentialInteraction::NoPrompt)
+            .unwrap();
+    assert!(values.is_empty());
 }
 
 #[cfg(target_os = "linux")]
@@ -885,6 +908,46 @@ pub fn revoke_user_broker_service_token() -> Result<()> {
     revoke_user_broker_service_token_for_slot("automation")
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn user_broker_service_token_for_slot(_slot: &str) -> Result<SecretString> {
+    bail!("native user-broker credential observation requires a platform backend")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn user_broker_service_token() -> Result<SecretString> {
+    bail!("native user-broker credential observation requires a platform backend")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn enroll_user_broker_service_token_for_slot(_slot: &str, _value: &[u8]) -> Result<()> {
+    bail!("native user-broker enrollment requires a platform backend")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn enroll_user_broker_service_token(value: &[u8]) -> Result<()> {
+    enroll_user_broker_service_token_for_slot("automation", value)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn rotate_user_broker_service_token_for_slot(_slot: &str, _value: &[u8]) -> Result<()> {
+    bail!("native user-broker rotation requires a platform backend")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn rotate_user_broker_service_token(value: &[u8]) -> Result<()> {
+    rotate_user_broker_service_token_for_slot("automation", value)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn revoke_user_broker_service_token_for_slot(_slot: &str) -> Result<()> {
+    bail!("native user-broker revocation requires a platform backend")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn revoke_user_broker_service_token() -> Result<()> {
+    bail!("native user-broker revocation requires a platform backend")
+}
+
 pub fn enroll_service_account_token(value: &[u8]) -> Result<()> {
     let paths = RuntimePaths::discover()?;
     let config = load_config(&paths)?;
@@ -951,6 +1014,27 @@ impl<'a> OnePasswordProvider<'a> {
             service_token,
             child_executable: child_executable.to_owned(),
         })
+    }
+
+    fn read_private_material(
+        &self,
+        reference: &SecretReference,
+        operation: SecretOperationContext<'_>,
+    ) -> std::result::Result<SecretMaterial, SecretError> {
+        #[cfg(target_os = "linux")]
+        {
+            read_one_password_material_at_child(
+                operation,
+                &self.child_executable,
+                self.op_program,
+                self.service_token,
+                reference,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            read_one_password_material(operation, self.op_program, self.service_token, reference)
+        }
     }
 }
 
@@ -1504,7 +1588,7 @@ impl SecretProvider for OnePasswordProvider<'_> {
         ProviderCapabilities {
             exportable_read: true,
             public_material: true,
-            signing: false,
+            signing: true,
             metadata: true,
         }
     }
@@ -1564,7 +1648,7 @@ impl SecretProvider for OnePasswordProvider<'_> {
         Ok(SecretMetadata {
             exportable: true,
             public_material: true,
-            signing: false,
+            signing: true,
         })
     }
 
@@ -1581,20 +1665,7 @@ impl SecretProvider for OnePasswordProvider<'_> {
         reference: &SecretReference,
         operation: SecretOperationContext<'_>,
     ) -> std::result::Result<SecretMaterial, SecretError> {
-        #[cfg(target_os = "linux")]
-        {
-            read_one_password_material_at_child(
-                operation,
-                &self.child_executable,
-                self.op_program,
-                self.service_token,
-                reference,
-            )
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            read_one_password_material(operation, self.op_program, self.service_token, reference)
-        }
+        self.read_private_material(reference, operation)
     }
 
     fn public_material(
@@ -1606,7 +1677,7 @@ impl SecretProvider for OnePasswordProvider<'_> {
         // The adapter may hold private material to derive a public key. Only
         // the public derivative crosses this operation boundary; product read
         // permission is deliberately not substituted for public permission.
-        let material = self.read_exportable(reference, operation)?;
+        let material = self.read_private_material(reference, operation)?;
         let public = derive_provider_public_material(&material)?;
         operation.checkpoint()?;
         Ok(public)
@@ -1614,12 +1685,38 @@ impl SecretProvider for OnePasswordProvider<'_> {
 
     fn sign(
         &self,
-        _reference: &SecretReference,
-        _payload: &[u8],
+        reference: &SecretReference,
+        payload: &[u8],
         operation: SecretOperationContext<'_>,
     ) -> std::result::Result<ProviderSignature, SecretError> {
         operation.checkpoint()?;
-        Err(secret_error(SecretErrorKind::Unsupported))
+        if payload.is_empty() || payload.len() > 1024 * 1024 {
+            return Err(secret_error(SecretErrorKind::ResourceLimitExceeded));
+        }
+        let metadata = self.metadata(reference, SecretPurpose::Sign, operation)?;
+        if !metadata.signing {
+            return Err(secret_error(SecretErrorKind::PermissionDenied));
+        }
+        // Operation-only keys are read inside this trusted adapter, not through
+        // the public exportable-resource operation.
+        let material = self.read_private_material(reference, operation)?;
+        let source = provider_material_as_secret_string(&material)
+            .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?;
+        let encoded = if let Ok(key) = parse_declared_ssh_private_key(&source) {
+            let signature = key
+                .try_sign(payload)
+                .map_err(|_| secret_error(SecretErrorKind::ProviderFailure))?;
+            Vec::<u8>::try_from(signature)
+                .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?
+        } else {
+            parse_unbound_release_key(&source)
+                .map_err(|_| secret_error(SecretErrorKind::InvalidResponse))?
+                .sign(payload)
+                .to_bytes()
+                .to_vec()
+        };
+        operation.checkpoint()?;
+        ProviderSignature::new(encoded)
     }
 }
 
@@ -4489,11 +4586,12 @@ pub(crate) fn broker_sign_ssh(
     if payload.is_empty() || payload.len() > 1024 * 1024 {
         bail!("SSH signing payload size is invalid");
     }
-    let source =
-        read_declared_secret_with_token(operation, op_program, service_token, private_key_ref)?;
-    broker_sign_ssh_with_source(
-        operation,
-        &source,
+    let provider = OnePasswordProvider::new(op_program, service_token)?;
+    let reference = SecretReference::new(private_key_ref.to_owned())?;
+    provider_bound_ssh_signature(
+        &provider,
+        &reference,
+        operation.secret_context(),
         declared_public_key,
         declared_fingerprint,
         payload,
@@ -4501,6 +4599,43 @@ pub(crate) fn broker_sign_ssh(
 }
 
 #[cfg(target_os = "linux")]
+fn provider_bound_ssh_signature(
+    provider: &dyn SecretProvider,
+    reference: &SecretReference,
+    context: SecretOperationContext<'_>,
+    declared_public_key: &str,
+    declared_fingerprint: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let encoded = dev_tools_secret::SecretProvider::sign(provider, reference, payload, context)?;
+    verify_declared_ssh_signature(
+        encoded.as_bytes(),
+        declared_public_key,
+        declared_fingerprint,
+        payload,
+    )?;
+    context.checkpoint()?;
+    Ok(encoded.as_bytes().to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_declared_ssh_signature(
+    encoded: &[u8],
+    declared_public_key: &str,
+    declared_fingerprint: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let public = PublicKey::from_openssh(declared_public_key)
+        .context("declared operation public key is invalid")?;
+    if public.fingerprint(HashAlg::Sha256).to_string() != declared_fingerprint {
+        bail!("declared operation key fingerprint does not match");
+    }
+    let signature = Signature::try_from(encoded).context("decode provider SSH signature")?;
+    signature::Verifier::verify(&public, payload, &signature)
+        .context("provider SSH signature does not match declared key")
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn broker_sign_ssh_with_source(
     operation: &crate::provider_operation::ProviderOperation<'_>,
     source: &SecretString,
@@ -4561,12 +4696,38 @@ pub(crate) fn broker_sign_release_manifest_bytes(
     if payload.is_empty() || payload.len() > 16 * 1024 {
         bail!("release manifest signing payload size is invalid");
     }
-    let source =
-        read_declared_secret_with_token(operation, op_program, service_token, private_key_ref)?;
-    broker_sign_release_manifest_with_source(operation, &source, declared_public_key, payload)
+    let provider = OnePasswordProvider::new(op_program, service_token)?;
+    let reference = SecretReference::new(private_key_ref.to_owned())?;
+    provider_bound_release_signature(
+        &provider,
+        &reference,
+        operation.secret_context(),
+        declared_public_key,
+        payload,
+    )
 }
 
 #[cfg(target_os = "linux")]
+fn provider_bound_release_signature(
+    provider: &dyn SecretProvider,
+    reference: &SecretReference,
+    context: SecretOperationContext<'_>,
+    declared_public_key: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let encoded = provider.sign(reference, payload, context)?;
+    let signature = ed25519_dalek::Signature::try_from(encoded.as_bytes())
+        .context("decode provider release signature")?;
+    let public_key = dev_tools_release::parse_release_public_key(declared_public_key)
+        .context("declared release public key is invalid")?;
+    public_key
+        .verify_strict(payload, &signature)
+        .context("provider release signature does not match declared key")?;
+    context.checkpoint()?;
+    Ok(signature.to_bytes().to_vec())
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn broker_sign_release_manifest_with_source(
     operation: &crate::provider_operation::ProviderOperation<'_>,
     source: &SecretString,
@@ -4584,6 +4745,16 @@ fn parse_identity_bound_release_key(
     source: &SecretString,
     declared_public_key: &str,
 ) -> Result<ed25519_dalek::SigningKey> {
+    let signing_key = parse_unbound_release_key(source)?;
+    let public_key = dev_tools_release::parse_release_public_key(declared_public_key)
+        .context("declared release public key is invalid")?;
+    if signing_key.verifying_key() != public_key {
+        bail!("declared release key identity does not match private material");
+    }
+    Ok(signing_key)
+}
+
+fn parse_unbound_release_key(source: &SecretString) -> Result<ed25519_dalek::SigningKey> {
     let encoded = source.expose().trim();
     if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("declared release private key is not raw Ed25519 hex material");
@@ -4593,13 +4764,7 @@ fn parse_identity_bound_release_key(
         *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
             .context("decode declared release private key")?;
     }
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&private_bytes);
-    let public_key = dev_tools_release::parse_release_public_key(declared_public_key)
-        .context("declared release public key is invalid")?;
-    if signing_key.verifying_key() != public_key {
-        bail!("declared release key identity does not match private material");
-    }
-    Ok(signing_key)
+    Ok(ed25519_dalek::SigningKey::from_bytes(&private_bytes))
 }
 
 #[cfg(target_os = "linux")]
@@ -5540,7 +5705,7 @@ exit {exit_code}
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_program_filesystem_policy_rejects_remote_and_host_shared_types() {
+    fn linux_authority_filesystem_policy_rejects_remote_and_host_shared_types() {
         for filesystem_type in [
             0x0000_6969,
             0xff53_4d42,
@@ -6245,6 +6410,17 @@ exit {exit_code}
             );
         }
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_private_directory(Path::new("relative"), "test directory").is_err());
+        assert!(private_read(Path::new("relative"), "test file").is_err());
+        assert!(ensure_private_directory(Path::new("relative")).is_err());
+
+        let authority = target.join("config.toml");
+        fs::write(&authority, b"synthetic private authority").unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o600)).unwrap();
+        private_read(&authority, "test private authority").unwrap();
+        fs::set_permissions(&authority, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(private_read(&authority, "test private authority").is_err());
+        fs::remove_file(&authority).unwrap();
 
         fs::remove_dir(&target).unwrap();
         std::os::unix::fs::symlink(root.path(), &target).unwrap();
@@ -7158,7 +7334,7 @@ exit {exit_code}
         assert_eq!(provider.id().as_str(), "one-password");
         assert_eq!(material.expose_secret(), b"provider-value");
         assert!(provider.capabilities().exportable_read);
-        assert!(!provider.capabilities().signing);
+        assert!(provider.capabilities().signing);
     }
 
     #[cfg(target_os = "linux")]
@@ -7430,6 +7606,129 @@ exit {exit_code}
         let signature = Signature::try_from(encoded.as_slice()).unwrap();
         signature::Verifier::verify(&public_key, payload, &signature).unwrap();
 
+        let service_token = SecretString::new("test-service-token".into());
+        let provider =
+            OnePasswordProvider::at_child(op.to_str().unwrap(), &service_token, &child).unwrap();
+        let reference = SecretReference::new("op://Automation/signing/private-key").unwrap();
+        let signature = provider
+            .sign(&reference, payload, operation.secret_context())
+            .unwrap();
+        verify_declared_ssh_signature(
+            signature.as_bytes(),
+            &public_key.to_openssh().unwrap(),
+            &fingerprint,
+            payload,
+        )
+        .unwrap();
+        assert!(verify_declared_ssh_signature(
+            signature.as_bytes(),
+            &public_key.to_openssh().unwrap(),
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            payload,
+        )
+        .is_err());
+        assert!(provider_bound_release_signature(
+            &provider,
+            &reference,
+            operation.secret_context(),
+            "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072",
+            payload,
+        )
+        .is_err());
+
+        struct IndependentSigner {
+            id: ProviderId,
+        }
+        impl SecretProvider for IndependentSigner {
+            fn id(&self) -> &ProviderId {
+                &self.id
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    exportable_read: false,
+                    public_material: false,
+                    signing: true,
+                    metadata: true,
+                }
+            }
+            fn health(
+                &self,
+                _context: SecretOperationContext<'_>,
+            ) -> std::result::Result<ProviderHealth, SecretError> {
+                Ok(ProviderHealth::Healthy)
+            }
+            fn metadata(
+                &self,
+                _reference: &SecretReference,
+                _purpose: SecretPurpose,
+                _context: SecretOperationContext<'_>,
+            ) -> std::result::Result<SecretMetadata, SecretError> {
+                Ok(SecretMetadata {
+                    exportable: false,
+                    public_material: false,
+                    signing: true,
+                })
+            }
+            fn read_exportable(
+                &self,
+                _reference: &SecretReference,
+                _context: SecretOperationContext<'_>,
+            ) -> std::result::Result<SecretMaterial, SecretError> {
+                Err(SecretError::new(SecretErrorKind::PermissionDenied))
+            }
+            fn public_material(
+                &self,
+                _reference: &SecretReference,
+                _context: SecretOperationContext<'_>,
+            ) -> std::result::Result<SecretPublicMaterial, SecretError> {
+                Err(SecretError::new(SecretErrorKind::PermissionDenied))
+            }
+            fn sign(
+                &self,
+                reference: &SecretReference,
+                payload: &[u8],
+                context: SecretOperationContext<'_>,
+            ) -> std::result::Result<ProviderSignature, SecretError> {
+                context.checkpoint()?;
+                if reference.expose_to_provider() != "fake://ssh" {
+                    return Err(SecretError::new(SecretErrorKind::PermissionDenied));
+                }
+                let key = PrivateKey::new(
+                    KeypairData::Ed25519(Ed25519Keypair::from_seed(&[29; 32])),
+                    "independent fake provider",
+                )
+                .map_err(|_| SecretError::new(SecretErrorKind::ProviderFailure))?;
+                let signature = key
+                    .try_sign(payload)
+                    .map_err(|_| SecretError::new(SecretErrorKind::ProviderFailure))?;
+                let encoded = Vec::<u8>::try_from(signature)
+                    .map_err(|_| SecretError::new(SecretErrorKind::InvalidResponse))?;
+                context.checkpoint()?;
+                ProviderSignature::new(encoded)
+            }
+        }
+        let fake = IndependentSigner {
+            id: ProviderId::parse("independent-fake").unwrap(),
+        };
+        let fake_reference = SecretReference::new("fake://ssh").unwrap();
+        let fake_signature = provider_bound_ssh_signature(
+            &fake,
+            &fake_reference,
+            operation.secret_context(),
+            &public_key.to_openssh().unwrap(),
+            &fingerprint,
+            payload,
+        )
+        .unwrap();
+        assert!(fake
+            .read_exportable(&fake_reference, operation.secret_context())
+            .is_err());
+        assert!(fake
+            .public_material(&fake_reference, operation.secret_context())
+            .is_err());
+        let fake_signature = Signature::try_from(fake_signature.as_slice()).unwrap();
+        signature::Verifier::verify(&public_key, payload, &fake_signature).unwrap();
+
         assert!(broker_sign_ssh_with_source(
             &operation,
             &source,
@@ -7493,6 +7792,35 @@ exit {exit_code}
         let signature = ed25519_dalek::Signature::try_from(encoded.as_slice()).unwrap();
         public_key.verify_strict(payload, &signature).unwrap();
         assert_eq!(encoded.len(), 64);
+
+        let service_token = SecretString::new("test-service-token".into());
+        let provider =
+            OnePasswordProvider::at_child(op.to_str().unwrap(), &service_token, &child).unwrap();
+        let reference = SecretReference::new("op://Automation/release/private-key").unwrap();
+        let declared_public = public_key
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            provider_bound_release_signature(
+                &provider,
+                &reference,
+                operation.secret_context(),
+                &declared_public,
+                payload,
+            )
+            .unwrap(),
+            encoded
+        );
+        assert!(provider_bound_release_signature(
+            &provider,
+            &reference,
+            operation.secret_context(),
+            "11686a3552e97ca8d717b24007da01716c308dd526340e50a15461f400850072",
+            payload,
+        )
+        .is_err());
 
         assert!(broker_sign_release_manifest_with_source(
             &operation,
@@ -7721,5 +8049,17 @@ exit {exit_code}
             select_runtime_root(None, None, Path::new("/cache")),
             PathBuf::from("/cache/runtime")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workstation_config_uses_the_native_account_home() {
+        let home = git_runtime::native_current_user_home().unwrap();
+        #[cfg(target_os = "macos")]
+        let expected = home.join("Library/Application Support/dev-auth/config.toml");
+        #[cfg(not(target_os = "macos"))]
+        let expected = home.join(".config/dev-auth/config.toml");
+        assert_eq!(discover_config_path().unwrap(), expected);
+        assert_eq!(RuntimePaths::discover().unwrap().config, expected);
     }
 }

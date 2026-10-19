@@ -779,6 +779,9 @@ fn apply_setup_plan_v3_with_loader<'a, F>(
 where
     F: FnOnce(&BTreeSet<String>, &BTreeSet<String>) -> Result<LoadedCredentialMaterials<'a>>,
 {
+    if !cfg!(target_os = "linux") {
+        bail!("full setup mutation requires a qualified native platform backend");
+    }
     let (_, digest) = render_setup_plan_v3(plan)?;
     if digest != approved_sha256.to_ascii_lowercase() {
         bail!("setup plan v3 does not match the approved digest");
@@ -2147,6 +2150,9 @@ fn build_setup_plan_v3_with_reader(
     prior_policy: Option<&[u8]>,
     binding_source_check: BindingSourceCheck,
 ) -> Result<SetupPlanV3> {
+    if !cfg!(target_os = "linux") {
+        bail!("full setup planning requires a qualified native platform backend");
+    }
     if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
         #[cfg(target_os = "linux")]
         return grants::build(
@@ -2647,6 +2653,9 @@ fn validate_prior_policy_bytes(current: &CurrentPathIdentity, bytes: Option<&[u8
 }
 
 fn approved_prior_policy(plan: &SetupPlanV3) -> Result<Option<Vec<u8>>> {
+    if !plan.intent.purpose.is_credentials() {
+        return Ok(None);
+    }
     if plan.intent.mode != DeploymentMode::Strong {
         return Ok(None);
     }

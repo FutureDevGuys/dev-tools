@@ -10,47 +10,82 @@ use std::os::unix::fs::PermissionsExt;
 #[test]
 #[ignore = "requires an owned disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_initial_staged_recovery() {
-    exercise(true, false, false, false);
+    exercise(true, Scenario::Empty);
 }
 
 #[test]
 #[ignore = "requires an owned disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_initial_unstaged_recovery() {
-    exercise(false, false, false, false);
+    exercise(false, Scenario::Empty);
 }
 
 #[test]
 #[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_public_strong_enrolled_workload() {
-    exercise(false, true, false, false);
+    exercise(false, Scenario::Workload);
 }
 
 mod binding;
 mod combined_grants;
+mod privilege_launch;
+mod signed;
+mod workload;
 
 #[test]
-#[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
-fn native_disposable_full_v5_binding_recovery_and_restoration() {
-    exercise(false, true, false, true);
+#[ignore = "prepares an interactive privilege fixture in an owned rootful disposable systemd container; never run on the host"]
+fn native_disposable_prepare_installed_launch_with_grant() {
+    exercise(false, Scenario::PrivilegeLaunch);
 }
 
 #[test]
 #[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
 fn native_disposable_combined_credential_grant_upgrade() {
-    exercise(false, true, true, false);
+    exercise(false, Scenario::Combined);
 }
 
-mod signed;
-mod workload;
+#[test]
+#[ignore = "requires an owned rootful disposable systemd container and /candidate/dev-auth; never run on the host"]
+fn native_disposable_full_v5_binding_recovery_and_restoration() {
+    exercise(false, Scenario::Binding);
+}
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    Empty,
+    Workload,
+    PrivilegeLaunch,
+    Combined,
+    Binding,
+}
 
 fn command(executable: &Path, arguments: &[&str]) -> dev_tools_command::BoundedCommandOutput {
     eprintln!("fixture command: {} {arguments:?}", executable.display());
+    // The interactive fixture's preparer runs before any real password input.
+    // Trace only process/file/locking syscalls around fixed recovery, excluding
+    // read/write payloads, to distinguish native waits from custody hashing.
+    let trace_recovery = std::env::var("DEV_AUTH_NATIVE_TRACE_SETUP").as_deref() == Ok("1")
+        && arguments.starts_with(&["setup", "recover"]);
+    let mut native_arguments = Vec::new();
+    let selected = if trace_recovery {
+        native_arguments.extend([
+            "-qq".into(),
+            "-f".into(),
+            "-ttt".into(),
+            "-T".into(),
+            "-o".into(),
+            "/fixture/setup-recovery.trace".into(),
+            "-e".into(),
+            "trace=%process,%file,flock,poll,ppoll,futex,fsync,fdatasync".into(),
+            executable.as_os_str().to_owned(),
+        ]);
+        Path::new("/usr/bin/strace")
+    } else {
+        executable
+    };
+    native_arguments.extend(arguments.iter().map(std::ffi::OsString::from));
     dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
-        executable,
-        arguments: &arguments
-            .iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>(),
+        executable: selected,
+        arguments: &native_arguments,
         environment: &BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: Some(Path::new("/")),
         timeout: std::time::Duration::from_secs(90),
@@ -82,7 +117,11 @@ fn recover(executable: &Path) -> SetupRecoveryReportV1 {
     report
 }
 
-fn exercise(staged: bool, with_workload: bool, with_grants: bool, with_bindings: bool) {
+fn exercise(staged: bool, scenario: Scenario) {
+    let with_workload = matches!(
+        scenario,
+        Scenario::Workload | Scenario::PrivilegeLaunch | Scenario::Combined | Scenario::Binding
+    );
     assert_eq!(
         std::env::var("DEV_AUTH_NATIVE_SYSTEMD_FIXTURE").as_deref(),
         Ok("disposable")
@@ -167,27 +206,29 @@ ssh_keygen = "/usr/bin/true"
 "#
     )
     .into_bytes();
-    let (policy, config) = if with_workload {
-        workload::prepare(&account)
-    } else {
-        (
+    let (policy, config) = match scenario {
+        Scenario::Workload => workload::prepare(&account),
+        Scenario::PrivilegeLaunch => privilege_launch::prepare(&account),
+        Scenario::Combined => workload::prepare(&account),
+        Scenario::Binding => workload::prepare(&account),
+        Scenario::Empty => (
             empty_policy,
             b"schema = \"dev-auth-user-config-v3\"\nworkloads = []\n[authority_profiles]\n"
                 .to_vec(),
-        )
+        ),
     };
-    let (policy, config) = if with_bindings {
+    let (policy, config) = if matches!(scenario, Scenario::Binding) {
         binding::prepare_targets_and_policy(&account, policy, config)
     } else {
         (policy, config)
     };
-    let bindings = if with_bindings {
+    publish(policy_path, &policy, 0o600);
+    publish(config_path, &config, 0o600);
+    let bindings = if matches!(scenario, Scenario::Binding) {
         binding::prepare(&account)
     } else {
         Vec::new()
     };
-    publish(policy_path, &policy, 0o600);
-    publish(config_path, &config, 0o600);
     let identity = ArtifactIdentity::from_file(source, 256 * 1024 * 1024).unwrap();
     let version = env!("CARGO_PKG_VERSION");
     let installation = SetupPlan {
@@ -222,10 +263,8 @@ ssh_keygen = "/usr/bin/true"
         }),
     };
     let intent = DeploymentIntent {
-        bindings: bindings.clone(),
         purpose: Default::default(),
-        grant_policy: None,
-        schema: if with_bindings {
+        schema: if !bindings.is_empty() {
             "dev-auth-deployment-intent-v3"
         } else {
             "dev-auth-deployment-intent-v1"
@@ -240,6 +279,7 @@ ssh_keygen = "/usr/bin/true"
             Activation::Inactive
         },
         administrator_policy: policy_path.into(),
+        grant_policy: None,
         users: vec![crate::deployment::DeploymentUser {
             name: name.into(),
             config: config_path.into(),
@@ -253,6 +293,7 @@ ssh_keygen = "/usr/bin/true"
         } else {
             Vec::new()
         },
+        bindings: bindings.clone(),
     };
     let plan = build_setup_plan_v3_with_reader(
         intent,
@@ -325,10 +366,10 @@ ssh_keygen = "/usr/bin/true"
     };
     fs::remove_file(policy_path).unwrap();
     fs::remove_file(config_path).unwrap();
-    for selected in &bindings {
-        fs::remove_file(&selected.plan).unwrap();
+    for binding in &bindings {
+        fs::remove_file(&binding.plan).unwrap();
     }
-    if with_bindings {
+    if matches!(scenario, Scenario::Binding) {
         assert_eq!(plan.schema, "dev-auth-setup-plan-v5");
     }
     let report = recover(invocation);
@@ -402,19 +443,36 @@ ssh_keygen = "/usr/bin/true"
         fs::remove_file(source).unwrap();
     }
     let report = recover(&executable);
+    if !report.verified && matches!(scenario, Scenario::Binding) {
+        let transition = crate::setup_transition::retained_transition(&paths, 0)
+            .unwrap()
+            .unwrap();
+        let retained: RetainedSetupGeneration = serde_json::from_slice(&transition.bytes).unwrap();
+        panic!(
+            "binding fixture recovery postcondition: {:?}",
+            verify_postcondition(
+                &retained.plan,
+                &retained.plan_sha256,
+                &retained.candidate_documents,
+            )
+            .err()
+        );
+    }
     assert!(report.verified);
     assert_eq!(report.changed, Some(false));
     assert!(report.actions.is_empty());
-    if with_bindings {
-        binding::verify_and_restore(&account, &executable);
-        return;
-    }
-    if with_grants {
+    if matches!(scenario, Scenario::Combined) {
         combined_grants::upgrade_and_restore(&plan, &account, &policy, &config, &executable);
         return;
     }
     if with_workload {
-        workload::exercise(&account, &executable);
+        match scenario {
+            Scenario::PrivilegeLaunch => privilege_launch::finish_prepare(&account, &executable),
+            Scenario::Workload => workload::exercise(&account, &executable),
+            Scenario::Binding => binding::exercise(&account, &executable),
+            Scenario::Empty => unreachable!(),
+            Scenario::Combined => unreachable!(),
+        }
         return;
     }
     // An accepted generation cannot be replayed to repair an incomplete state.

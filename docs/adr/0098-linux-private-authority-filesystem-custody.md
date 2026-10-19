@@ -18,7 +18,7 @@ These directory checks validate the opened directory object; they do not retain 
 
 ## Compatibility
 
-Existing XDG/default configuration and runtime selection remains unchanged. Previously accepted private authority on a recognized denied filesystem now fails custody validation; there is no fallback, automatic relocation or permission repair. Operators must deliberately select storage satisfying the existing absolute-path and native-custody contract before retrying. This record does not adopt a fixed native-account workstation configuration location.
+The original filesystem-custody slice preserved XDG/default selection. [ADR 0133](0133-native-account-workstation-config-authority.md) now supersedes configuration selection only for Dev Auth workstation `config.toml`; separately validated runtime and cache selection remains unchanged. Previously accepted private authority on a recognized denied filesystem now fails custody validation; there is no fallback, automatic relocation or permission repair. Operators must deliberately select storage satisfying the existing absolute-path and native-custody contract before retrying. The fixed native-account configuration locator and its explicit migration boundary are owned by ADR 0133.
 
 ## Verification and qualification
 

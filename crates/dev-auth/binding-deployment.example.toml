@@ -1,0 +1,17 @@
+# Fictional user-only normal-command binding. Replace every account/path and
+# the 64-character digest printed by `dev-auth workload bind plan`.
+schema = "dev-auth-deployment-v3"
+mode = "user-only"
+channel = "stable"
+activation = "transparent"
+administrator_policy = "/home/example-user/dev-auth-source/binding-policy-v3.toml"
+
+[[users]]
+name = "example-user"
+config = "/home/example-user/dev-auth-source/binding-config-v3.toml"
+
+[[bindings]]
+user = "example-user"
+name = "agent-binding"
+plan = "/home/example-user/dev-auth-source/agent-binding-plan.json"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
