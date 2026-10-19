@@ -17,7 +17,16 @@ fn transient_arguments(
     privilege: Option<&crate::privilege::grants::GrantRequest>,
     arguments: &[OsString],
 ) -> Vec<OsString> {
+    transient_arguments_with_stdio(privilege, arguments, &native_stdio::NativeStdio::Terminal)
+}
+
+fn transient_arguments_with_stdio(
+    privilege: Option<&crate::privilege::grants::GrantRequest>,
+    arguments: &[OsString],
+    stdio: &native_stdio::NativeStdio,
+) -> Vec<OsString> {
     transient_service_arguments(&TransientServiceRequest {
+        stdio,
         duration_seconds: Some(86400),
         privilege,
         session_id: "0123456789abcdef0123456789abcdef",
@@ -32,6 +41,22 @@ fn transient_arguments(
         arguments,
     })
     .unwrap()
+}
+
+#[test]
+fn captured_workload_streams_bypass_pid1_without_reinterpreting_payload_argv() {
+    let payload = [OsString::from("--pipe"), OsString::from("--pty")];
+    let streams = native_stdio::NativeStdio::Captured([None, None, None]);
+    let arguments = transient_arguments_with_stdio(None, &payload, &streams);
+    let service_separator = arguments.iter().position(|arg| arg == "--").unwrap();
+    let service_options = &arguments[..service_separator];
+    assert!(!service_options
+        .iter()
+        .any(|arg| arg == "--pipe" || arg == "--pty"));
+    for selected in ["StandardInput", "StandardOutput", "StandardError"] {
+        assert!(service_options.contains(&OsString::from(format!("--property={selected}=null"))));
+    }
+    assert_eq!(&arguments[arguments.len() - payload.len()..], &payload);
 }
 
 #[test]
