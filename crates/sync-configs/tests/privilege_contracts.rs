@@ -80,6 +80,16 @@ fn authentication_failures_identify_stage_without_echoing_executable_authority()
     ));
     assert!(!session.is_authenticated());
 
+    let diagnostic = sync_configs::engine::EngineError::Privilege(error).failure_diagnostic();
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap(),
+        serde_json::json!({
+            "kind": "authentication_process",
+            "stage": "cached_check",
+            "os_code": libc::ENOENT,
+        })
+    );
+
     executable_script(&sudo, "#!/bin/sh\nexit 17\n");
     let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).unwrap();
     let error = session.ensure_authenticated().unwrap_err();
@@ -98,6 +108,16 @@ fn authentication_failures_identify_stage_without_echoing_executable_authority()
         }
     ));
     assert!(!session.is_authenticated());
+    let diagnostic = sync_configs::engine::EngineError::Privilege(error).failure_diagnostic();
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap(),
+        serde_json::json!({
+            "kind": "authentication_exit",
+            "stage": "prompt",
+            "code": 17,
+            "signal": null,
+        })
+    );
 }
 
 #[test]

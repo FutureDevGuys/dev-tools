@@ -340,6 +340,9 @@ fn parent_run_id_is_accepted_only_in_the_exact_generated_shape() {
 #[test]
 #[cfg(unix)]
 fn terminal_metadata_records_failed_and_interrupted_outcomes() {
+    use sync_configs::hooks::HookPhase;
+    use sync_configs::report::FailureDiagnostic;
+
     let temp = TempDir::new().expect("tempdir");
     for (leaf, code, interrupted, status) in [
         ("failed", 9, false, "failed"),
@@ -348,18 +351,43 @@ fn terminal_metadata_records_failed_and_interrupted_outcomes() {
         let root = temp.path().join(leaf);
         let mut recorder =
             RunRecorder::start(run_options(&root, LogStyle::Events)).expect("start recorder");
+        if !interrupted {
+            recorder.record_failure(FailureDiagnostic::HookTimedOut {
+                phase: HookPhase::Pre,
+            });
+        }
         recorder.finish(code, interrupted);
         let metadata = read_json(&only_run(&root).join("run.json"));
         assert_eq!(metadata["status"], status);
         assert_eq!(metadata["exit_code"], code);
         assert!(metadata["ended_at"].as_str().is_some());
+        let events = fs::read_to_string(only_run(&root).join("events.jsonl")).unwrap();
+        if interrupted {
+            assert!(metadata.get("failure").is_none());
+            assert!(!events.contains("run_failure"));
+        } else {
+            assert_eq!(
+                metadata["failure"],
+                json!({"kind": "hook_timed_out", "phase": "pre_script"})
+            );
+            assert!(events.lines().any(|line| {
+                let event: Value = serde_json::from_str(line).unwrap();
+                event["kind"] == "run_failure" && event["failure"] == metadata["failure"]
+            }));
+        }
     }
+    assert_eq!(
+        serde_json::from_value::<FailureDiagnostic>(json!({"kind": "future_kind"})).unwrap(),
+        FailureDiagnostic::ConvergenceFailed
+    );
 }
 
 #[cfg(any(debug_assertions, feature = "test-support"))]
 #[cfg(unix)]
 #[test]
 fn terminal_metadata_survives_a_run_finished_event_append_failure() {
+    use sync_configs::report::FailureDiagnostic;
+
     let temp = TempDir::new().expect("tempdir");
     for (leaf, code, interrupted, status) in [
         ("failed", 9, false, "failed"),
@@ -369,6 +397,9 @@ fn terminal_metadata_survives_a_run_finished_event_append_failure() {
         let mut recorder =
             RunRecorder::start(run_options(&root, LogStyle::Events)).expect("start recorder");
         recorder.fail_event_writes_for_test();
+        if !interrupted {
+            recorder.record_failure(FailureDiagnostic::PrivilegedCommandTimedOut);
+        }
 
         recorder.finish(code, interrupted);
 
@@ -376,6 +407,9 @@ fn terminal_metadata_survives_a_run_finished_event_append_failure() {
         assert_eq!(metadata["status"], status);
         assert_eq!(metadata["exit_code"], code);
         assert!(metadata["ended_at"].as_str().is_some());
+        if !interrupted {
+            assert_eq!(metadata["failure"]["kind"], "privileged_command_timed_out");
+        }
         assert!(
             !recorder.enabled(),
             "the failed event channel stays disabled"
