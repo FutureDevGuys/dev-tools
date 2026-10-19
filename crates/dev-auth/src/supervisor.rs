@@ -26,6 +26,7 @@ mod dispatch_diagnostics;
 mod exec_barrier;
 #[cfg(test)]
 mod launch_grant_tests;
+mod native_stdio;
 pub(crate) mod startup_proof;
 pub use dispatch_diagnostics::enrolled_dispatch_diagnostic;
 use dispatch_diagnostics::{observe_dispatch, EnrolledDispatchStage};
@@ -111,6 +112,7 @@ struct TransientServiceRequest<'a> {
     duration_seconds: Option<u64>,
     pinned_projection: Option<(&'a Path, &'a Path)>,
     privilege: Option<&'a crate::privilege::grants::GrantRequest>,
+    stdio: &'a native_stdio::NativeStdio,
 }
 
 struct GatedChildRequest<'a> {
@@ -597,8 +599,6 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
         OsString::from("--quiet"),
         OsString::from("--wait"),
         OsString::from("--collect"),
-        OsString::from("--pipe"),
-        OsString::from("--pty"),
         OsString::from("--expand-environment=no"),
         OsString::from("--service-type=exec"),
         OsString::from(format!("--unit={unit}")),
@@ -636,6 +636,15 @@ fn transient_service_arguments(request: &TransientServiceRequest<'_>) -> Result<
         request.boundary_socket.as_os_str().to_os_string(),
         OsString::from("--"),
     ];
+    command.splice(
+        3..3,
+        request
+            .stdio
+            .systemd_arguments()
+            .iter()
+            .copied()
+            .map(OsString::from),
+    );
     if let Some((source, target)) = request.pinned_projection {
         command.insert(
             0,
@@ -960,6 +969,11 @@ fn connect_strong_boundary(
     if credentials.uid() != 0 {
         bail!("strong workload dispatcher is not root-owned");
     }
+    let standard_streams = native_stdio::NativeStdio::receive(&mut stream)?;
+    // SAFETY: this is the fresh service's synchronous startup path, before any
+    // agent, credential or payload worker exists. No retained Rust File owns
+    // slots 0..2. Failure returns out of the service before session activation.
+    unsafe { standard_streams.install()? };
     let shell_source = crate::binding_activation::launch_shell::receive_source(&mut stream)?;
     let environment = read_environment_frame(&mut stream)?;
     Ok((environment, stream, shell_source))
@@ -1862,6 +1876,7 @@ fn run_authorized_dispatcher(
         let (environment, mut native_handoff) =
             receive_workload_environment(owner_uid, launcher_pid, environment_socket)?;
         *stage = EnrolledDispatchStage::BoundaryCreate;
+        let standard_streams = native_stdio::NativeStdio::capture()?;
         let session_id = random_session_id()?;
         let boundary = StrongBoundaryListener::create(&session_id, owner_uid, owner.gid.as_raw())?;
         let tool_bin = strong_workload_runtime_directory(&session_id)?.join("tool-bin");
@@ -1895,6 +1910,7 @@ fn run_authorized_dispatcher(
                 .as_deref()
                 .map(|source| (source, Path::new(&workload.launcher_path))),
             privilege,
+            stdio: &standard_streams,
         }) {
             Ok(arguments) => arguments,
             Err(error) => {
@@ -1929,8 +1945,8 @@ fn run_authorized_dispatcher(
                 return Err(error).context("establish the strong workload boundary handoff");
             }
         };
-        // With mixed terminal/pipe streams systemd preserves the streams but
-        // gives the service no controlling TTY. Keep its native approval UI on
+        // Mixed terminal/pipe streams cross the authenticated peer handoff and
+        // give the service no controlling TTY. Keep its native approval UI on
         // this dispatcher's foreground terminal, scoped to the held peer.
         let _approval_agent = if privilege.is_some() {
             match crate::privilege::grants::TtyAgent::for_workload_request(
@@ -1968,11 +1984,15 @@ fn run_authorized_dispatcher(
         }
         *stage = EnrolledDispatchStage::SupervisorRelease;
         let frame = encode_workload_environment(&environment)?;
-        if let Err(error) = crate::binding_activation::launch_shell::send_source(
-            &workload_handoff,
-            shell_source.as_ref(),
-        )
-        .and_then(|_| write_environment_frame(&mut workload_handoff, &frame))
+        if let Err(error) = standard_streams
+            .send(&workload_handoff)
+            .and_then(|_| {
+                crate::binding_activation::launch_shell::send_source(
+                    &workload_handoff,
+                    shell_source.as_ref(),
+                )
+            })
+            .and_then(|_| write_environment_frame(&mut workload_handoff, &frame))
         {
             let _ = systemd_run.kill();
             let _ = systemd_run.wait();
@@ -4451,6 +4471,7 @@ mod tests {
     #[test]
     fn transient_systemd_boundary_is_exact_and_kills_the_whole_workload_on_supervisor_exit() {
         let arguments = transient_service_arguments(&TransientServiceRequest {
+            stdio: &native_stdio::NativeStdio::Terminal,
             duration_seconds: None,
             pinned_projection: None,
             privilege: None,

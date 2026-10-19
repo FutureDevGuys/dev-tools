@@ -145,3 +145,4 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0127](0127-active-workload-root-coordination.md) | Active workload root coordination | proposed | pending |
 | [0128](0128-sync-configs-fatal-run-diagnostics.md) | SyncConfigs closed fatal-run diagnostics | proposed | pending |
 | [0129](0129-independent-file-publication-contracts.md) | Independent file publication contracts | proposed | pending |
+| [0131](0131-authenticated-native-workload-stdio-handoff.md) | Authenticated native workload standard-stream handoff | proposed | pending |
