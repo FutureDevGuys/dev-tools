@@ -29,6 +29,13 @@ newer release exists online. Both install and update use the same offline
 activation operation. An externally managed public command retains the existing
 external/no-change outcome and is not replaced.
 
+The unreleased Update All common-lifecycle integration routes explicit
+`product install/update update-all` bundles through the same v2 transaction as
+canonical common mutation. It preserves complete-input and fixed-trust admission;
+legacy migration additionally needs local original accepted/active/previous
+proofs. Missing proof blocks offline migration rather than downloading it or
+inventing ownership. Other products retain their existing scoped adapters.
+
 ## Accepted inputs
 
 - Supply the original signed root document, source-bound product-v2 manifest and
