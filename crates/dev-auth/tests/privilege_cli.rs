@@ -18,11 +18,129 @@ fn reusable_administrator_surface_is_static_and_closed() {
         "execute-plan",
         "status",
         "revoke",
+        "grant",
+        "inspect",
+        "exec",
+        "delegate",
+        "leave",
     ] {
         assert!(help.contains(command), "missing {command}");
     }
     for private in ["admit-v1", "serve-v1", "child-v1", "unrestricted"] {
         assert!(!help.contains(private), "exposed {private}");
+    }
+}
+
+#[test]
+fn maintenance_grammar_remains_explicit_and_accepts_its_existing_operations() {
+    for arguments in [
+        vec![
+            "plan",
+            "--request",
+            "/tmp/request",
+            "--output",
+            "/tmp/plan",
+            "--json",
+        ],
+        vec![
+            "request",
+            "--plan",
+            "/tmp/plan",
+            "--sha256",
+            "selected-digest",
+            "--authorize",
+            "polkit",
+            "--non-interactive",
+            "--result-file",
+            "/tmp/result",
+            "--",
+            "/usr/bin/true",
+        ],
+        vec![
+            "execute",
+            "--session",
+            "selected-session",
+            "--operation",
+            "selected-operation",
+            "--request",
+            "/tmp/request",
+            "--result-file",
+            "/tmp/result",
+        ],
+        vec![
+            "execute-plan",
+            "--session",
+            "selected-session",
+            "--operation",
+            "selected-operation",
+            "--plan-id",
+            "selected-plan",
+            "--result-file",
+            "/tmp/result",
+        ],
+        vec!["status", "--session", "selected-session", "--json"],
+        vec!["revoke", "--session", "selected-session", "--json"],
+    ] {
+        let parsed = dev_auth::privilege::cli::specification()
+            .try_get_matches_from(std::iter::once("privilege").chain(arguments.iter().copied()))
+            .unwrap();
+        assert_eq!(parsed.subcommand_name(), Some(arguments[0]));
+    }
+}
+
+#[test]
+fn administrator_request_status_and_revoke_require_the_grant_namespace() {
+    for arguments in [
+        vec![
+            "request",
+            "--scope",
+            "user",
+            "--authority",
+            "administrator",
+            "--duration",
+            "12h",
+            "--non-interactive",
+        ],
+        vec!["status", "--format", "json"],
+        vec!["revoke", "selected-grant"],
+        vec![
+            "request",
+            "--plan",
+            "/tmp/plan",
+            "--sha256",
+            "selected-digest",
+            "--format",
+            "json",
+            "--",
+            "/usr/bin/true",
+        ],
+    ] {
+        assert!(
+            dev_auth::privilege::cli::specification()
+                .try_get_matches_from(std::iter::once("privilege").chain(arguments.iter().copied()))
+                .is_err(),
+            "{arguments:?}"
+        );
+    }
+    for arguments in [
+        vec![
+            "grant",
+            "request",
+            "--scope",
+            "user",
+            "--authority",
+            "administrator",
+            "--duration",
+            "12h",
+            "--non-interactive",
+        ],
+        vec!["grant", "status", "--format", "json"],
+        vec!["grant", "revoke", "selected-grant", "--format", "json"],
+    ] {
+        let parsed = dev_auth::privilege::cli::specification()
+            .try_get_matches_from(std::iter::once("privilege").chain(arguments.iter().copied()))
+            .unwrap();
+        assert_eq!(parsed.subcommand_name(), Some("grant"));
     }
 }
 

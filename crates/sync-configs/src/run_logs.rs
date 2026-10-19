@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 use tempfile::Builder;
 use uuid::Uuid;
 
+use crate::report::FailureDiagnostic;
+
 pub const EVENT_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 pub const TRANSCRIPT_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_AGE_DAYS: u64 = 30;
@@ -356,6 +358,8 @@ pub struct RunMetadata {
     pub parent_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub summary: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureDiagnostic>,
 }
 
 struct ActiveRecorder {
@@ -441,6 +445,7 @@ impl RunRecorder {
             exit_code: None,
             parent_run_id,
             summary: BTreeMap::new(),
+            failure: None,
         };
         ensure_root_custody(&options.root, root_custody)?;
         atomic_write_json(&run_dir.join("run.json"), &metadata)?;
@@ -518,6 +523,20 @@ impl RunRecorder {
 
     pub fn run_dir(&self) -> Option<&Path> {
         self.active.as_ref().map(|active| active.run_dir.as_path())
+    }
+
+    /// Keep a closed cause in terminal metadata even if the optional event
+    /// channel is disabled, filtered or full. `finish` owns durable publication.
+    pub fn record_failure(&mut self, failure: FailureDiagnostic) {
+        if let Some(active) = self.active.as_mut() {
+            if active.metadata.status.is_terminal() {
+                return;
+            }
+            active.metadata.failure = Some(failure);
+        }
+        self.fixed_event(LogLevel::Error, "run_failure", |payload| {
+            payload.insert("failure".to_owned(), json!(failure));
+        });
     }
 
     /// Record an entry outcome without persisting the entry labels. Unknown

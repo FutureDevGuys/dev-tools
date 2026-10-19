@@ -28,9 +28,10 @@ use crate::util::cancel;
 use crate::util::lockfile::{try_acquire_pid_lock, PidLockOptions, ScopedFileLock};
 use crate::util::privilege::{resolve_privilege_decision, PrivilegeDecision};
 use crate::util::process::{
-    capture_guard_reason, process_exit_output, run_capture_allow_exit_codes, run_capture_streaming,
-    run_capture_streaming_allow_exit_codes, run_capture_streaming_controlled,
-    run_capture_streaming_controlled_allow_exit_codes, run_capture_streaming_controlled_foreground,
+    capture_guard_reason, process_error_stderr, process_exit_output, process_timed_out,
+    run_capture_allow_exit_codes, run_capture_streaming, run_capture_streaming_allow_exit_codes,
+    run_capture_streaming_controlled, run_capture_streaming_controlled_allow_exit_codes,
+    run_capture_streaming_controlled_foreground,
     run_capture_streaming_controlled_stdin_pty_capture_guarded,
     run_capture_streaming_controlled_stdin_tty_capture,
     run_capture_streaming_controlled_stdin_tty_capture_guarded, run_capture_streaming_foreground,
@@ -1573,7 +1574,7 @@ impl SyncContext {
             match result {
                 Ok(out) => return Ok(out),
                 Err(e) => {
-                    if e.downcast_ref::<crate::Cancelled>().is_some() {
+                    if e.downcast_ref::<crate::Cancelled>().is_some() || process_timed_out(&e) {
                         return Err(e);
                     }
                     // Sudo may already have authenticated and run part of the
@@ -1706,7 +1707,6 @@ pub(crate) fn effective_retry_budget(policy: &TaskPolicy, err_text: &str) -> u32
         // Authentication needs an explicit user decision, not another attempt in
         // a fresh terminal. In particular, a password timeout is not a network timeout.
         RuntimeFailureClass::SudoSessionUnavailable => 0,
-        RuntimeFailureClass::TransientNetwork => policy.retries.max(1),
         _ => policy.retries,
     }
 }
@@ -3558,9 +3558,11 @@ fn run_command_task(ctx: &SyncContext, spec: &TaskSpec, cmd: &CommandTask) -> Re
         }
     }
 
-    let mut result = run_command_task_inner(ctx, spec, &command)?;
+    let mut runner_timed_out = false;
+    let mut result = run_command_task_inner(ctx, spec, &command, &mut runner_timed_out)?;
     if uses_linux_pacman
         && result.status == TaskStatus::Failed
+        && !runner_timed_out
         && !interactive_unix_elevation(ctx.host_os, &command)
     {
         let mut repaired_after_failure = false;
@@ -3586,7 +3588,7 @@ fn run_command_task(ctx: &SyncContext, spec: &TaskSpec, cmd: &CommandTask) -> Re
             if let Some(outcome) = authority_outcome.as_ref() {
                 command.args = append_ignore_args(&command.args, &outcome.excluded_packages);
             }
-            result = run_command_task_inner(ctx, spec, &command)?;
+            result = run_command_task_inner(ctx, spec, &command, &mut runner_timed_out)?;
             result.details.push(
                 "Retried the package-manager task after catalog-driven provider reconciliation."
                     .to_string(),
@@ -3614,6 +3616,7 @@ fn run_command_task_inner(
     ctx: &SyncContext,
     spec: &TaskSpec,
     cmd: &CommandTask,
+    runner_timed_out: &mut bool,
 ) -> Result<TaskResult> {
     let Some(cmd) = resolve_command_task(ctx, cmd) else {
         return Ok(TaskResult::skipped(
@@ -3672,7 +3675,7 @@ fn run_command_task_inner(
         }
     }
 
-    let pre_output = match run_command_pre_commands(ctx, spec, &cmd, &policy)? {
+    let pre_output = match run_command_pre_commands(ctx, spec, &cmd, &policy, runner_timed_out)? {
         PreCommandOutcome::Continue(output) => output,
         PreCommandOutcome::Stop(result) => return Ok(result),
     };
@@ -3719,15 +3722,38 @@ fn run_command_task_inner(
             } else {
                 e.to_string()
             };
+            if process_timed_out(&e) {
+                *runner_timed_out = true;
+                let detail = format_package_manager_timeout_failure(
+                    spec,
+                    &cmd,
+                    &policy,
+                    ctx.run_log.as_ref().map(Arc::as_ref),
+                    &e.to_string(),
+                )
+                .unwrap_or_else(|| format!("{} (see task log for partial output)", e));
+                return Ok(failed_command_result_with_report_sections(
+                    spec.label.clone(),
+                    detail,
+                    &cmd,
+                    &err_text,
+                    Some(&before_report_output),
+                ));
+            }
+            let failure_text = command_error_summary(&e);
             if interactive_unix_elevation(ctx.host_os, &cmd) {
                 return Ok(failed_command_result_with_report_sections(
                     spec.label.clone(),
-                    build_command_failure_detail(spec, &cmd, &program, &err_text),
+                    build_command_failure_detail(spec, &cmd, &program, &failure_text),
                     &cmd,
                     &err_text,
+                    Some(&before_report_output),
                 ));
             }
-            if let Some(partial) = classify_partial_winget_result(spec, &err_text) {
+            if let Some(mut partial) = classify_partial_winget_result(spec, &err_text) {
+                if partial.status == TaskStatus::Failed {
+                    attach_unconfirmed_before_report(&mut partial, &before_report_output);
+                }
                 return Ok(partial);
             }
             if cmd.external_manager_skip && is_external_manager_self_update_unsupported(&err_text) {
@@ -3763,10 +3789,10 @@ fn run_command_task_inner(
                     "sudo session unavailable at command launch; refreshing sudo session and retrying once".to_string(),
                 );
                 if let Err(refresh_err) = refresh_sudo_session_after_launch_failure(ctx, spec) {
-                    return Ok(TaskResult::failed(
-                        spec.label.clone(),
-                        refresh_err.to_string(),
-                    ));
+                    let mut result =
+                        TaskResult::failed(spec.label.clone(), refresh_err.to_string());
+                    attach_unconfirmed_before_report(&mut result, &before_report_output);
+                    return Ok(result);
                 }
                 match run_command_execution(
                     ctx,
@@ -3790,6 +3816,7 @@ fn run_command_task_inner(
                         return Err(retry_err);
                     }
                     Err(retry_err) => {
+                        *runner_timed_out = process_timed_out(&retry_err);
                         let retry_text = if let Some(output) = process_exit_output(&retry_err) {
                             output.to_string()
                         } else {
@@ -3797,9 +3824,15 @@ fn run_command_task_inner(
                         };
                         return Ok(failed_command_result_with_report_sections(
                             spec.label.clone(),
-                            build_command_failure_detail(spec, &cmd, &program, &retry_text),
+                            build_command_failure_detail(
+                                spec,
+                                &cmd,
+                                &program,
+                                &command_error_summary(&retry_err),
+                            ),
                             &cmd,
                             &retry_text,
+                            Some(&before_report_output),
                         ));
                     }
                 }
@@ -3817,7 +3850,7 @@ fn run_command_task_inner(
                     package_manager_kind_for_command(spec, &cmd, &program),
                     &err_text,
                 );
-                if let Some(recovery_result) = try_recover_verified_repository_retirement(
+                if let Some(mut recovery_result) = try_recover_verified_repository_retirement(
                     ctx,
                     spec,
                     &cmd,
@@ -3826,10 +3859,17 @@ fn run_command_task_inner(
                     effective_interactive,
                     &err_text,
                     recovery_plan.as_ref(),
+                    runner_timed_out,
                 )? {
+                    if recovery_result.status == TaskStatus::Failed {
+                        attach_unconfirmed_before_report(
+                            &mut recovery_result,
+                            &before_report_output,
+                        );
+                    }
                     return Ok(recovery_result);
                 }
-                if let Some(recovery_result) = try_recover_yay_conflicts(
+                if let Some(mut recovery_result) = try_recover_yay_conflicts(
                     ctx,
                     spec,
                     &cmd,
@@ -3839,7 +3879,14 @@ fn run_command_task_inner(
                     effective_interactive,
                     &err_text,
                     recovery_plan.as_ref(),
+                    runner_timed_out,
                 )? {
+                    if recovery_result.status == TaskStatus::Failed {
+                        attach_unconfirmed_before_report(
+                            &mut recovery_result,
+                            &before_report_output,
+                        );
+                    }
                     return Ok(recovery_result);
                 }
                 if recovery_plan
@@ -3867,6 +3914,7 @@ fn run_command_task_inner(
                         detail,
                         &cmd,
                         &err_text,
+                        Some(&before_report_output),
                     ));
                 }
                 if let Some(plan) = recovery_plan {
@@ -3887,6 +3935,7 @@ fn run_command_task_inner(
                             rows: recovery_diagnostic_rows(plan.kind.label(), &plan.causes),
                         });
                         attach_command_output_diagnostics(&mut result, &err_text);
+                        attach_unconfirmed_before_report(&mut result, &before_report_output);
                         return Ok(result);
                     }
                 }
@@ -3896,6 +3945,7 @@ fn run_command_task_inner(
                         detail,
                         &cmd,
                         &err_text,
+                        Some(&before_report_output),
                     ));
                 }
                 if class == RuntimeFailureClass::TransientLockOrBusy {
@@ -3932,6 +3982,7 @@ fn run_command_task_inner(
                             return Err(retry_err);
                         }
                         Err(retry_err) => {
+                            *runner_timed_out = process_timed_out(&retry_err);
                             let retry_text = if let Some(output) = process_exit_output(&retry_err) {
                                 output.to_string()
                             } else {
@@ -3939,18 +3990,25 @@ fn run_command_task_inner(
                             };
                             return Ok(failed_command_result_with_report_sections(
                                 spec.label.clone(),
-                                build_command_failure_detail(spec, &cmd, &program, &retry_text),
+                                build_command_failure_detail(
+                                    spec,
+                                    &cmd,
+                                    &program,
+                                    &command_error_summary(&retry_err),
+                                ),
                                 &cmd,
                                 &retry_text,
+                                Some(&before_report_output),
                             ));
                         }
                     }
                 } else {
                     return Ok(failed_command_result_with_report_sections(
                         spec.label.clone(),
-                        build_command_failure_detail(spec, &cmd, &program, &err_text),
+                        build_command_failure_detail(spec, &cmd, &program, &failure_text),
                         &cmd,
                         &err_text,
+                        Some(&before_report_output),
                     ));
                 }
             }
@@ -4076,9 +4134,12 @@ fn apply_structured_command_result(result: &mut TaskResult, output: &str) -> boo
         }
     }
     if let (Some(current), Some(latest)) = (protocol.current, protocol.latest) {
-        result
-            .details
-            .push(format!("version: {current} -> {latest}"));
+        let version_detail = match protocol.outcome.as_str() {
+            "updated" => format!("version: {current} -> {latest}"),
+            "deferred" => format!("installed: {current}; available: {latest} (deferred)"),
+            _ => format!("current: {current}; latest: {latest}"),
+        };
+        result.details.push(version_detail);
     }
     true
 }
@@ -4088,27 +4149,14 @@ fn failed_command_result_with_report_sections(
     detail: impl Into<String>,
     cmd: &CommandTask,
     output: &str,
+    before_report: Option<&CommandReportOutput>,
 ) -> TaskResult {
     let detail = detail.into();
-    let detail = if detail.starts_with("command failed:") {
-        strip_ansi(output)
-            .lines()
-            .rev()
-            .find_map(|line| {
-                let (kind, diagnostic) = command_diagnostic_sample(line)?;
-                (kind == "error").then(|| {
-                    format!(
-                        "command failed: {} (see task log for full output)",
-                        bounded_structured_text(&diagnostic.text),
-                    )
-                })
-            })
-            .unwrap_or(detail)
-    } else {
-        detail
-    };
     let mut result = TaskResult::failed(label, detail.clone());
     result.report_sections = build_failed_command_report_sections_for_command(cmd, output);
+    if let Some(before_report) = before_report {
+        attach_unconfirmed_before_report(&mut result, before_report);
+    }
     attach_command_output_diagnostics(&mut result, output);
     if result.report_sections.is_empty() {
         result.report_sections.push(TaskReportSection {
@@ -4124,6 +4172,44 @@ fn failed_command_result_with_report_sections(
         });
     }
     result
+}
+
+fn attach_unconfirmed_before_report(result: &mut TaskResult, before_report: &CommandReportOutput) {
+    for sample in &before_report.state_samples {
+        for (name, version) in &sample.versions {
+            if let Some(row) = result
+                .report_sections
+                .iter_mut()
+                .find(|section| {
+                    section.key == sample.section_key && section.title == sample.section_title
+                })
+                .and_then(|section| section.rows.iter_mut().find(|row| row.name == *name))
+            {
+                row.before = Some(version.clone());
+                // A missing final inventory must not overwrite an explicit
+                // per-package completion or failure observed before timeout.
+                if known_report_value(row.after.as_deref()).is_none() {
+                    row.after = Some("-".to_string());
+                }
+                continue;
+            }
+            append_row_to_report_sections(
+                &mut result.report_sections,
+                &sample.section_key,
+                &sample.section_title,
+                TaskReportRow {
+                    name: name.clone(),
+                    status: TaskReportStatus::Blocked,
+                    before: Some(version.clone()),
+                    after: Some("-".to_string()),
+                    note: Some("after-state not observed; update not confirmed".to_string()),
+                },
+            );
+        }
+    }
+    if let Some(section) = command_report_probe_section(before_report.probe_rows.clone()) {
+        merge_report_sections(&mut result.report_sections, vec![section]);
+    }
 }
 
 fn attach_command_output_diagnostics(result: &mut TaskResult, output: &str) {
@@ -4323,14 +4409,16 @@ fn is_error_diagnostic_line(lower: &str) -> bool {
         || lower.starts_with("npm err!")
         || lower.starts_with("-> error ")
         || (lower.starts_with("thread '") && lower.contains(" panicked at "))
-        || lower.split_once(": ").is_some_and(|(program, message)| {
+        || lower.split_once(':').is_some_and(|(program, message)| {
+            let message = message.trim_start();
             !program.is_empty()
                 && program
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
                 && (message.starts_with("error ")
                     || message.starts_with("error:")
-                    || message.starts_with("fatal:"))
+                    || message.starts_with("fatal:")
+                    || message.starts_with("fatal "))
         })
 }
 
@@ -4382,6 +4470,16 @@ fn build_failed_command_report_sections_for_command(
 ) -> Vec<TaskReportSection> {
     let mut sections = build_command_report_sections_for_command(cmd, output);
     mark_unconfirmed_command_report_sections(cmd, &mut sections, output);
+    for section in &mut sections {
+        for row in &mut section.rows {
+            if row.status == TaskReportStatus::Refreshed
+                && known_report_value(row.after.as_deref()).is_none()
+            {
+                row.status = TaskReportStatus::Blocked;
+                row.note = Some("refresh not confirmed after failed command".to_string());
+            }
+        }
+    }
     sections
 }
 
@@ -4559,6 +4657,7 @@ fn run_command_pre_commands(
     spec: &TaskSpec,
     cmd: &CommandTask,
     policy: &TaskPolicy,
+    runner_timed_out: &mut bool,
 ) -> Result<PreCommandOutcome> {
     let mut combined_output = String::new();
     for pre_command in &cmd.pre_commands {
@@ -4590,10 +4689,15 @@ fn run_command_pre_commands(
             Ok(output) => output,
             Err(err) if err.downcast_ref::<crate::Cancelled>().is_some() => return Err(err),
             Err(err) => {
+                *runner_timed_out = process_timed_out(&err);
                 let err_text = process_exit_output(&err)
                     .map(str::to_string)
                     .unwrap_or_else(|| err.to_string());
-                let class = classify_runtime_failure(&err_text, cmd.requires_elevation);
+                let class = if *runner_timed_out {
+                    RuntimeFailureClass::Other
+                } else {
+                    classify_runtime_failure(&err_text, cmd.requires_elevation)
+                };
                 if class == RuntimeFailureClass::UserCanceledElevation {
                     return Ok(PreCommandOutcome::Stop(user_canceled_elevation_result(
                         spec.label.clone(),
@@ -4609,9 +4713,15 @@ fn run_command_pre_commands(
                 return Ok(PreCommandOutcome::Stop(
                     failed_command_result_with_report_sections(
                         spec.label.clone(),
-                        build_pre_command_failure_detail(spec, &pre_cmd, &program, &err_text),
+                        build_pre_command_failure_detail(
+                            spec,
+                            &pre_cmd,
+                            &program,
+                            &command_error_summary(&err),
+                        ),
                         cmd,
                         &report_input,
+                        None,
                     ),
                 ));
             }
@@ -4787,22 +4897,16 @@ fn append_command_report_outputs(
 }
 
 fn report_command_failure_summary(err: &anyhow::Error) -> String {
-    if let Some(output) = process_exit_output(err) {
-        if let Some(line) = output.lines().map(str::trim).find(|line| !line.is_empty()) {
-            return line.to_string();
+    if let Some(exit) = err.downcast_ref::<ProcessExitError>() {
+        if exit
+            .output
+            .as_deref()
+            .is_none_or(|output| output.trim().is_empty())
+        {
+            return format!("report probe failed without output (code={})", exit.code);
         }
     }
-
-    if let Some(exit) = err.downcast_ref::<ProcessExitError>() {
-        return format!("report probe failed without output (code={})", exit.code);
-    }
-
-    err.to_string()
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "report probe failed without output".to_string())
+    command_error_summary(err)
 }
 
 fn command_report_runs_in_phase(command: &CommandReportCommand, phase: CommandReportPhase) -> bool {
@@ -5510,6 +5614,46 @@ fn concise_command_text(output: &str) -> String {
         .unwrap_or_else(|| "command failed".to_string())
 }
 
+fn concise_command_failure_text(output: &str) -> String {
+    let clean = strip_progress_output(output);
+    let cause = last_command_error_line(&clean)
+        // Without explicit error syntax, retain terminal context instead of an
+        // earlier startup/progress line. This does not classify prose as failure.
+        .or_else(|| clean.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or("command failed");
+    bounded_structured_text(cause)
+}
+
+fn last_command_error_line(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .rev()
+        .find(|line| command_diagnostic_kind(&line.trim().to_ascii_lowercase()) == Some("error"))
+}
+
+fn command_error_summary(error: &anyhow::Error) -> String {
+    if process_timed_out(error) {
+        return error.to_string();
+    }
+    let stderr = process_error_stderr(error).map(strip_progress_output);
+    let output = process_exit_output(error).map(strip_progress_output);
+    if let Some(cause) = stderr
+        .as_deref()
+        .and_then(last_command_error_line)
+        .or_else(|| output.as_deref().and_then(last_command_error_line))
+    {
+        return bounded_structured_text(cause);
+    }
+    if let Some(output) = stderr
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .or_else(|| output.as_deref().filter(|text| !text.is_empty()))
+    {
+        return concise_command_failure_text(output);
+    }
+    concise_command_failure_text(&error.to_string())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeFailureClass {
     UserCanceledElevation,
@@ -5577,8 +5721,6 @@ pub(crate) fn classify_runtime_failure(
 
 fn is_transient_network_failure(lower: &str) -> bool {
     lower.contains("etimedout")
-        || lower.contains("timed out")
-        || lower.contains("timeout running ")
         || lower.contains("operation too slow")
         || lower.contains("less than 1 bytes/sec")
         || lower.contains("connection reset by peer")
@@ -5677,7 +5819,10 @@ common fixes: close locking processes (for example uv.exe), run `winget source r
 then retry `winget upgrade --all --scope {scope}`"
         );
     }
-    format!("command failed: {err_text}")
+    bounded_structured_text(&format!(
+        "command failed: {} (see task log for full output)",
+        concise_command_failure_text(err_text)
+    ))
 }
 
 fn summarize_winget_failure(err_text: &str) -> Option<String> {
@@ -5875,6 +6020,7 @@ fn try_recover_yay_conflicts(
     effective_interactive: bool,
     err_text: &str,
     original_recovery_plan: Option<&RecoveryPlan>,
+    runner_timed_out: &mut bool,
 ) -> Result<Option<TaskResult>> {
     if !command_uses_yay_helper(cmd) {
         return Ok(None);
@@ -5891,6 +6037,7 @@ fn try_recover_yay_conflicts(
                 effective_interactive,
                 err_text,
                 recovery_plan,
+                runner_timed_out,
             );
         }
         let detail = format_package_manager_failure(err_text)
@@ -5908,6 +6055,7 @@ fn try_recover_yay_conflicts(
             effective_interactive,
             err_text,
             recovery_plan,
+            runner_timed_out,
         );
     }
 
@@ -5922,6 +6070,7 @@ fn try_recover_yay_conflicts(
             err_text,
             recovery_plan,
             original_recovery_plan,
+            runner_timed_out,
         );
     }
 
@@ -6065,6 +6214,7 @@ fn try_recover_verified_repository_retirement(
     effective_interactive: bool,
     original_output: &str,
     original_recovery_plan: Option<&RecoveryPlan>,
+    runner_timed_out: &mut bool,
 ) -> Result<Option<TaskResult>> {
     if !command_uses_yay_helper(cmd) {
         return Ok(None);
@@ -6216,6 +6366,7 @@ fn try_recover_verified_repository_retirement(
     ) {
         Ok(output) => output,
         Err(error) => {
+            *runner_timed_out = process_timed_out(&error);
             let retry_output = process_exit_output(&error)
                 .map(str::to_string)
                 .unwrap_or_else(|| error.to_string());
@@ -6394,6 +6545,7 @@ fn try_recover_yay_conflict_plan(
     effective_interactive: bool,
     original_output: &str,
     recovery_plan: YayRecoveryPlan,
+    runner_timed_out: &mut bool,
 ) -> Result<Option<TaskResult>> {
     ctx.log_line(
         &spec.id,
@@ -6476,6 +6628,7 @@ fn try_recover_yay_conflict_plan(
             Ok(Some(result))
         }
         Err(resume_err) => {
+            *runner_timed_out = process_timed_out(&resume_err);
             let resume_err_output = process_exit_output(&resume_err)
                 .map(str::to_string)
                 .unwrap_or_else(|| resume_err.to_string());
@@ -6580,6 +6733,7 @@ fn try_recover_yay_package_plan(
     original_output: &str,
     recovery_plan: YayPackageRecoveryPlan,
     original_recovery_plan: Option<&RecoveryPlan>,
+    runner_timed_out: &mut bool,
 ) -> Result<Option<TaskResult>> {
     let handled_packages = recovery_plan
         .packages
@@ -6701,6 +6855,31 @@ fn try_recover_yay_package_plan(
                 });
             }
             Err(retry_err) => {
+                if process_timed_out(&retry_err) {
+                    *runner_timed_out = true;
+                    let retry_output = process_exit_output(&retry_err).unwrap_or_default();
+                    let combined = join_command_outputs(original_output, retry_output);
+                    let mut failed = failed_command_result_with_report_sections(
+                        spec.label.clone(),
+                        format!("{} (see task log for partial output)", retry_err),
+                        cmd,
+                        &combined,
+                        None,
+                    );
+                    recovery_rows.push(TaskReportRow {
+                        name: package_plan.package.clone(),
+                        status: TaskReportStatus::Failed,
+                        before: Some("source/build failure".to_string()),
+                        after: Some("-".to_string()),
+                        note: Some("isolated retry timed out; update not confirmed".to_string()),
+                    });
+                    failed.report_sections.push(TaskReportSection {
+                        key: package_recovery_section_key().to_string(),
+                        title: package_recovery_section_title().to_string(),
+                        rows: recovery_rows,
+                    });
+                    return Ok(Some(failed));
+                }
                 let retry_err_text = process_exit_output(&retry_err)
                     .map(str::to_string)
                     .unwrap_or_else(|| retry_err.to_string());
@@ -6846,6 +7025,7 @@ fn try_recover_yay_package_plan(
             Ok(Some(result))
         }
         Err(resume_err) => {
+            *runner_timed_out = process_timed_out(&resume_err);
             let mut failed = if retry_failures.is_empty() {
                 TaskResult::failed(
                     spec.label.clone(),
@@ -9492,6 +9672,7 @@ struct RunTaskArtifact<'a> {
 #[derive(Serialize)]
 struct RunArtifact<'a> {
     schema_version: u32,
+    build_info: &'a dev_tools_product::BuildInfo,
     run_id: &'a str,
     display_name: String,
     started_unix_ms: u64,
@@ -9591,6 +9772,7 @@ fn write_run_artifact<'a>(
     let runtime_advisories = run_runtime_advisories(run_log);
     let payload = RunArtifact {
         schema_version: 1,
+        build_info: run_log.build_info(),
         run_id: run_log.run_id(),
         display_name: run_log.display_name(),
         started_unix_ms,

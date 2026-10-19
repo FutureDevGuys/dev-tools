@@ -1,6 +1,5 @@
 //! Public operations backing the standalone structured-overlay and managed-path commands.
 
-use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
 use std::fs::{self, Metadata};
@@ -9,15 +8,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use toml_edit::{DocumentMut, TableLike};
 
 use crate::overlay::json::{overlay_json_file, JsonOverlayOptions};
 use crate::overlay::ownership;
 use crate::overlay::toml::{
-    overlay_toml_file, parse_toml_key_path, CommentedTargetPolicy, TomlConflictPolicy,
+    overlay_toml_file, remove_source_owned_text, CommentedTargetPolicy, TomlConflictPolicy,
     TomlOverlayOptions,
 };
-use crate::overlay::{OverlayResult, PathKey};
+use crate::overlay::OverlayResult;
 use crate::paths::{lexical_normalize, PathPlatform};
 
 /// Inputs for the standalone JSON overlay operation.
@@ -274,46 +272,50 @@ pub fn classify_managed_path(request: &ManagedPathRequest) -> ManagedPathClassif
 }
 
 fn remove_source_owned_toml(request: &TomlRequest) -> Result<OverlayResult> {
-    ownership::validate_real_parent_chain(&request.target, "TOML removal target")?;
-    let target_metadata = optional_metadata(&request.target)?;
-    let Some(metadata) = target_metadata else {
-        return Ok(OverlayResult::default());
-    };
-    let source_text = fs::read_to_string(&request.source).with_context(|| {
-        format!(
-            "cannot read TOML removal source {}",
-            request.source.display()
-        )
-    })?;
-    if !metadata.is_file() && !is_link_or_reparse(&metadata) {
-        return Err(anyhow!(
-            "TOML removal target must be a regular file path: {}",
-            request.target.display()
-        ));
-    }
-    ownership::validate_real_parent_chain(&request.target, "TOML removal target")?;
-    let target_text = fs::read_to_string(&request.target).with_context(|| {
-        format!(
-            "cannot read TOML removal target {}",
-            request.target.display()
-        )
-    })?;
-
-    let source_paths = assignment_paths_from_text(&source_text, "source")?;
-    let result = prune_toml_assignments(&target_text, &source_paths)?;
-    validate_toml_prune_semantics(&source_text, &target_text, &result.text)?;
-    let mut result = result;
-    result.materialized_symlink = result.changed && is_link_or_reparse(&metadata);
-
-    if !result.changed || request.dry_run || request.check {
+    #[cfg(target_os = "linux")]
+    if !request.dry_run && !request.check {
+        use crate::overlay::transaction::{Operation, Transaction};
+        // Remove is target-only, irrespective of inactive receipt flags.
+        let mut transaction = Transaction::begin(
+            &request.source,
+            &request.target,
+            Operation::TomlRemove,
+            None,
+        )?;
+        if transaction.is_missing() {
+            return Ok(OverlayResult {
+                changed: transaction.recovered(),
+                ..OverlayResult::default()
+            });
+        }
+        let source_text = transaction.source_text()?.to_owned();
+        let target_text = transaction.target_text()?;
+        let mut result = remove_source_owned_text(&source_text, &target_text)?;
+        result.materialized_symlink = result.changed && transaction.is_symlink();
+        transaction.publish(&mut result, true, None)?;
         return Ok(result);
     }
-    if result.text.is_empty() {
-        ownership::remove_existing_leaf(&request.target, "TOML removal target")?;
-    } else {
-        ownership::atomic_write_preserving_target(&request.target, result.text.as_bytes())?;
+    #[cfg(target_os = "linux")]
+    crate::overlay::transaction::ensure_no_pending(&request.target)?;
+    ownership::validate_real_parent_chain(&request.target, "TOML removal target")?;
+    let Some(metadata) = optional_metadata(&request.target)? else {
+        return Ok(OverlayResult::default());
+    };
+    if !metadata.is_file() && !is_link_or_reparse(&metadata) {
+        return Err(anyhow!("TOML removal target must be a regular file path"));
     }
-    Ok(result)
+    let source_text =
+        fs::read_to_string(&request.source).context("cannot read TOML removal source")?;
+    let target_text =
+        fs::read_to_string(&request.target).context("cannot read TOML removal target")?;
+    let mut result = remove_source_owned_text(&source_text, &target_text)?;
+    result.materialized_symlink = result.changed && is_link_or_reparse(&metadata);
+    if request.dry_run || request.check || !result.changed {
+        return Ok(result);
+    }
+    Err(anyhow!(
+        "durable overlay publication is currently available only on Linux"
+    ))
 }
 
 fn optional_metadata(path: &Path) -> Result<Option<Metadata>> {
@@ -324,263 +326,6 @@ fn optional_metadata(path: &Path) -> Result<Option<Metadata>> {
             Err(error).with_context(|| format!("cannot inspect TOML target {}", path.display()))
         }
     }
-}
-
-fn assignment_paths_from_text(text: &str, label: &str) -> Result<BTreeSet<PathKey>> {
-    text.parse::<DocumentMut>()
-        .map_err(|_| anyhow!("failed to parse TOML {label}"))?;
-    let mut paths = BTreeSet::new();
-    let mut table_path = Vec::new();
-    for line in text.lines() {
-        if let Some(path) = table_header_path(line)? {
-            table_path = path;
-            continue;
-        }
-        let Some(separator) = assignment_separator(line) else {
-            continue;
-        };
-        let raw_key = line[..separator].trim();
-        if raw_key.is_empty() {
-            continue;
-        }
-        let mut path = table_path.clone();
-        path.extend(parse_toml_key_path(raw_key)?);
-        paths.insert(path);
-    }
-    Ok(paths)
-}
-
-fn assignment_line_paths(text: &str) -> Result<Vec<(usize, PathKey)>> {
-    let mut paths = Vec::new();
-    let mut table_path = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if let Some(path) = table_header_path(line)? {
-            table_path = path;
-            continue;
-        }
-        let Some(separator) = assignment_separator(line) else {
-            continue;
-        };
-        let raw_key = line[..separator].trim();
-        if raw_key.is_empty() {
-            continue;
-        }
-        let mut path = table_path.clone();
-        path.extend(parse_toml_key_path(raw_key)?);
-        paths.push((index, path));
-    }
-    Ok(paths)
-}
-
-fn prune_toml_assignments(
-    target_text: &str,
-    source_paths: &BTreeSet<PathKey>,
-) -> Result<OverlayResult> {
-    target_text
-        .parse::<DocumentMut>()
-        .map_err(|_| anyhow!("failed to parse TOML target"))?;
-    let removed_indexes = assignment_line_paths(target_text)?
-        .into_iter()
-        .filter_map(|(index, path)| source_paths.contains(&path).then_some(index))
-        .collect::<BTreeSet<_>>();
-    if removed_indexes.is_empty() {
-        return Ok(OverlayResult {
-            text: target_text.to_owned(),
-            ..OverlayResult::default()
-        });
-    }
-
-    let mut lines = target_text
-        .split_inclusive('\n')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for index in &removed_indexes {
-        lines
-            .get_mut(*index)
-            .ok_or_else(|| anyhow!("TOML assignment index was outside the parsed document"))?
-            .clear();
-    }
-    remove_empty_table_headers(&mut lines)?;
-    let text = normalize_pruned_toml(lines);
-    text.parse::<DocumentMut>()
-        .map_err(|_| anyhow!("failed to parse TOML pruned output"))?;
-    Ok(OverlayResult {
-        changed: text != target_text,
-        removed: removed_indexes.len(),
-        text,
-        ..OverlayResult::default()
-    })
-}
-
-fn remove_empty_table_headers(lines: &mut [String]) -> Result<()> {
-    loop {
-        let mut headers = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if !line.is_empty() && table_header_path(line)?.is_some() {
-                headers.push(index);
-            }
-        }
-        let mut changed = false;
-        for offset in (0..headers.len()).rev() {
-            let start = headers[offset];
-            let end = headers.get(offset + 1).copied().unwrap_or(lines.len());
-            let body_has_active_content = lines[start + 1..end]
-                .iter()
-                .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'));
-            if !body_has_active_content {
-                lines[start].clear();
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(());
-        }
-    }
-}
-
-fn normalize_pruned_toml(lines: Vec<String>) -> String {
-    let mut compact = Vec::new();
-    let mut previous_blank = true;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let blank = line.trim().is_empty();
-        if blank && previous_blank {
-            continue;
-        }
-        compact.push(line);
-        previous_blank = blank;
-    }
-    while compact.last().is_some_and(|line| line.trim().is_empty()) {
-        compact.pop();
-    }
-    let mut text = compact.concat();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text
-}
-
-fn table_header_path(line: &str) -> Result<Option<PathKey>> {
-    let stripped = line.trim();
-    let (start, end_token) = if stripped.starts_with("[[") {
-        (2, "]]")
-    } else if stripped.starts_with('[') {
-        (1, "]")
-    } else {
-        return Ok(None);
-    };
-    let mut quote = None;
-    let mut escaped = false;
-    let mut index = start;
-    while index < stripped.len() {
-        let character = stripped.as_bytes()[index] as char;
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some('"') if character == '"' => quote = None,
-            Some('\'') if character == '\'' => quote = None,
-            Some(_) => {}
-            None if matches!(character, '\'' | '"') => quote = Some(character),
-            None if stripped.as_bytes()[index..].starts_with(end_token.as_bytes()) => {
-                let trailer = stripped[index + end_token.len()..].trim();
-                if !trailer.is_empty() && !trailer.starts_with('#') {
-                    return Ok(None);
-                }
-                return parse_toml_key_path(stripped[start..index].trim()).map(Some);
-            }
-            None => {}
-        }
-        index += 1;
-    }
-    Ok(None)
-}
-
-fn assignment_separator(line: &str) -> Option<usize> {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if character == '\\' => escaped = true,
-            Some('"') if character == '"' => quote = None,
-            Some('\'') if character == '\'' => quote = None,
-            Some(_) => {}
-            None if matches!(character, '\'' | '"') => quote = Some(character),
-            None if character == '#' => return None,
-            None if character == '=' => return Some(index),
-            None => {}
-        }
-    }
-    None
-}
-
-fn validate_toml_prune_semantics(
-    source_text: &str,
-    target_text: &str,
-    updated_text: &str,
-) -> Result<()> {
-    let source = source_text
-        .parse::<DocumentMut>()
-        .map_err(|_| anyhow!("failed to parse TOML source"))?;
-    let mut expected = target_text
-        .parse::<DocumentMut>()
-        .map_err(|_| anyhow!("failed to parse TOML target"))?;
-    prune_source_keys(source.as_table(), expected.as_table_mut());
-    let actual = updated_text
-        .parse::<DocumentMut>()
-        .map_err(|_| anyhow!("failed to parse TOML pruned output"))?;
-    if semantic_table(expected.as_table()) != semantic_table(actual.as_table()) {
-        return Err(anyhow!(
-            "pruned TOML output did not match source-owned key removal; normalize the target structure before retrying"
-        ));
-    }
-    Ok(())
-}
-
-fn prune_source_keys(source: &dyn TableLike, target: &mut dyn TableLike) {
-    for (key, source_item) in source.iter() {
-        let remove_key = {
-            let Some(target_item) = target.get_mut(key) else {
-                continue;
-            };
-            if let (Some(source_table), Some(target_table)) =
-                (source_item.as_table_like(), target_item.as_table_like_mut())
-            {
-                prune_source_keys(source_table, target_table);
-                target_table.is_empty()
-            } else {
-                true
-            }
-        };
-        if remove_key {
-            target.remove(key);
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum SemanticToml {
-    Table(Vec<(String, SemanticToml)>),
-    Value(String),
-}
-
-fn semantic_table(table: &dyn TableLike) -> SemanticToml {
-    let mut entries = table
-        .iter()
-        .filter_map(|(key, item)| {
-            if let Some(child) = item.as_table_like() {
-                Some((key.to_owned(), semantic_table(child)))
-            } else if !item.is_none() {
-                Some((key.to_owned(), SemanticToml::Value(item.to_string())))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    SemanticToml::Table(entries)
 }
 
 fn classify_state(request: &ManagedPathRequest) -> ManagedPathState {

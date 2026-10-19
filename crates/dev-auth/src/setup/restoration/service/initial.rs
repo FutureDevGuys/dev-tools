@@ -147,15 +147,8 @@ pub(in crate::setup::restoration) fn synchronize_completion(
 }
 
 impl InitialInstallationRestoration {
-    fn initial_service_authority(&self) -> Result<[bool; 3]> {
+    fn initial_service_files(&self) -> Result<[bool; 3]> {
         self.require_initial_native_authority()?;
-        if self
-            .admitted_receipt()?
-            .is_some_and(|receipt| !receipt.transparent_aliases.is_empty())
-        {
-            bail!("initial service control requires inactive integrations");
-        }
-        self.verify_inactive_transparent()?;
         let directory = dev_tools_installation::ExistingDocumentDirectory::open(
             Path::new("/etc/systemd/system"),
             0,
@@ -178,6 +171,27 @@ impl InitialInstallationRestoration {
             }
         }
         Ok(present)
+    }
+
+    fn initial_service_authority(&self) -> Result<[bool; 3]> {
+        if self
+            .admitted_receipt()?
+            .is_some_and(|receipt| !receipt.transparent_aliases.is_empty())
+        {
+            bail!("initial service control requires inactive integrations");
+        }
+        self.verify_inactive_transparent()?;
+        self.initial_service_files()
+    }
+
+    pub(in crate::setup::restoration) fn observe_initial_shutdown(&self) -> Result<()> {
+        if self.candidate.mode == InstallMode::UserOnly {
+            return Ok(());
+        }
+        let files = self.initial_service_files()?;
+        let mut backend = NativeBackend::new()?;
+        initial_observations(&mut backend, &files)?;
+        backend.require_absence(false)
     }
 
     pub(in crate::setup::restoration) fn stop_initial_services(&self) -> Result<bool> {
@@ -230,8 +244,15 @@ mod tests {
     use super::*;
 
     fn absent(unit: Unit) -> String {
-        format!("Id={}\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\nDropInPaths=\nUnitFileState=\nJob=\nControlGroup=\nControlPID=0\nNeedDaemonReload=no\n{}", unit.name(),
-            if unit == Unit::Broker { "MainPID=0\n" } else { "" })
+        format!(
+            "Id={}\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\nDropInPaths=\nUnitFileState=\nJob=\nControlGroup=\nControlPID=0\nNeedDaemonReload=no\n{}",
+            unit.name(),
+            if unit == Unit::Broker {
+                "MainPID=0\n"
+            } else {
+                ""
+            }
+        )
     }
 
     struct InitialBackend {

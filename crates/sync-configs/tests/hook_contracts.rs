@@ -882,6 +882,11 @@ fn hook_timeout_is_fast_distinct_and_value_free() {
     let rendered = format!("{error:?} {error}");
     assert!(!rendered.contains(private_command));
     assert!(!rendered.contains("PRIVATE_TIMEOUT_COMMAND"));
+    let diagnostic = sync_configs::engine::EngineError::Hook(error).failure_diagnostic();
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap(),
+        serde_json::json!({"kind": "hook_timed_out", "phase": "pre_script"})
+    );
 }
 
 #[test]

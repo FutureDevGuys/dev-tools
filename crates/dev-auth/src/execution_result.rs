@@ -91,7 +91,19 @@ impl ResultDestination {
         anyhow::bail!("native protected result destinations are not qualified on this platform")
     }
 
-    pub fn finish(mut self, result: &ExecutionResult) -> anyhow::Result<()> {
+    pub fn finish(self, result: &ExecutionResult) -> anyhow::Result<()> {
+        self.finish_serialized(result)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn finish_grant(
+        self,
+        result: &dev_auth::privilege::grants::ControlResult,
+    ) -> anyhow::Result<()> {
+        self.finish_serialized(result)
+    }
+
+    fn finish_serialized(mut self, result: &impl Serialize) -> anyhow::Result<()> {
         let mut bytes = serde_json::to_vec(result)?;
         bytes.push(b'\n');
         self.0.write_all(&bytes)?;

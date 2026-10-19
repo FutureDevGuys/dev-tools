@@ -153,6 +153,8 @@ pub struct SandboxAdapterCap {
     #[serde(default)]
     pub arguments: Vec<String>,
     #[serde(default)]
+    pub inherited_descriptor_arguments: Vec<String>,
+    #[serde(default)]
     pub argument_separator: bool,
     pub launcher_visibility: SandboxVisibility,
     pub broker_socket_visibility: SandboxVisibility,
@@ -397,6 +399,7 @@ pub struct ResolvedWorkload {
     pub desktop: Option<DesktopWorkloadConfig>,
     pub admission: Option<crate::policy_v3::Admission>,
     pub duration_seconds: Option<u64>,
+    pub allow_pinned_shell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,6 +642,7 @@ fn validate_system_policy(policy: &SystemPolicyV2) -> Result<()> {
         {
             bail!("sandbox adapter contains an invalid fixed argument");
         }
+        validate_inherited_descriptor_arguments(&adapter.inherited_descriptor_arguments)?;
         validate_sandbox_mount_arguments(
             &adapter.read_only_mount_arguments,
             "read-only workspace mount",
@@ -822,6 +826,30 @@ pub(crate) fn validate_sandbox_mount_arguments(
         || !arguments.iter().any(|argument| argument.contains("{path}"))
     {
         bail!("sandbox adapter contains invalid {description} arguments");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_inherited_descriptor_arguments(template: &[String]) -> Result<()> {
+    if template.is_empty() {
+        return Ok(());
+    }
+    if template.len() > 8 {
+        bail!("sandbox descriptor preservation arguments exceed their bound");
+    }
+    let mut count_tokens = 0;
+    for argument in template {
+        if argument.is_empty() || argument.len() > 256 || argument.chars().any(char::is_control) {
+            bail!("sandbox descriptor preservation argument is invalid");
+        }
+        count_tokens += argument.matches("{count}").count();
+        let literal = argument.replace("{count}", "");
+        if literal.contains('{') || literal.contains('}') {
+            bail!("sandbox descriptor preservation has an unknown placeholder");
+        }
+    }
+    if count_tokens != 1 {
+        bail!("sandbox descriptor preservation requires exactly one count placeholder");
     }
     Ok(())
 }
@@ -1172,6 +1200,7 @@ fn resolve_policy_inner(
                 desktop: workload.desktop.clone(),
                 admission: None,
                 duration_seconds: None,
+                allow_pinned_shell: false,
             },
         );
     }

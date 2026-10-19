@@ -7,8 +7,11 @@ owner: dev-tools
 
 Read the applicable records before changing a public product contract or cross-product foundation. The normative current behavior is defined by [the product standard](../product-standard.md).
 
+SyncConfigs also maintains product-local records, including [durable overlay publication](../../crates/sync-configs/docs/adr/0003-durable-overlay-publication.md), which selects the focused installation file boundary and records pending source-only verification.
+
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0125](0125-descriptor-relative-ordinary-files-and-locks.md) | Descriptor-relative ordinary files and resource locks | proposed | pending |
 | [0001](0001-standalone-products-and-shared-rust-foundations.md) | Standalone products and shared Rust foundations | proposed | pending |
 | [0002](0002-common-product-cli-and-explicit-network-boundaries.md) | Common product CLI and explicit network boundaries | proposed | pending |
 | [0003](0003-native-release-administration-and-separated-authority.md) | Native release administration and separated authority | proposed | pending |
@@ -116,6 +119,8 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0104](0104-dev-cache-experimental-native-cache-gate.md) | Default-off experimental native cache | proposed | pending |
 
 | [0105](0105-retained-cargo-final-outputs.md) | Opt-in retained Cargo final-output routing | proposed | pending |
+| [0106](0106-dev-cache-bounded-catalog-inventory.md) | Bounded read-only resource catalog inventory | proposed | pending |
+| [0107](0107-owner-linked-cargo-orphan-gc.md) | Owner-linked Cargo orphan collection | proposed | pending |
 
 | [0114](0114-admitted-value-free-resource-metadata.md) | Admitted value-free resource metadata | proposed | pending |
 
@@ -133,3 +138,9 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 
 | [0121](0121-terminal-command-graph-custody.md) | Foreground terminal command graph custody | proposed | pending |
 | [0122](0122-exact-plan-node-identity-and-streams.md) | Exact plan node identity and streams | proposed | pending |
+| [0123](0123-completion-intercept-passthrough.md) | Native completion intercept passthrough | proposed | pending |
+| [0124](0124-explicit-pending-update-recovery.md) | Explicit pending update recovery | proposed | pending |
+| [0126](0126-owned-version-retention-pins.md) | Owned version retention pins | proposed | pending |
+| [0127](0127-active-workload-root-coordination.md) | Active workload root coordination | proposed | pending |
+| [0128](0128-sync-configs-fatal-run-diagnostics.md) | SyncConfigs closed fatal-run diagnostics | proposed | pending |
+| [0129](0129-independent-file-publication-contracts.md) | Independent file publication contracts | proposed | pending |

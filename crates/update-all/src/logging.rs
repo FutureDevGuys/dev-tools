@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub struct RunLogSink {
+    build_info: dev_tools_product::BuildInfo,
     run_dir: PathBuf,
     run_id: String,
     display_name: Mutex<String>,
@@ -40,6 +41,7 @@ struct LogFileHandle {
 
 impl RunLogSink {
     pub fn new(root_dir: &Path, timestamps: bool) -> Result<Self> {
+        let build_info = crate::build_info::current_product_build_info()?;
         let started_unix_ms = unix_ms_now()?;
         create_owner_only_dir(root_dir)?;
         let run_id = Uuid::new_v4().to_string();
@@ -51,6 +53,7 @@ impl RunLogSink {
         let event_file_path = run_dir.join("events.jsonl");
         let event_file = open_append(&event_file_path)?;
         let sink = Self {
+            build_info,
             run_dir,
             run_id: run_id.clone(),
             display_name: Mutex::new(run_id),
@@ -72,13 +75,21 @@ impl RunLogSink {
         sink.write_event(
             "run_started",
             None,
-            serde_json::json!({"run_id": sink.run_id.clone(), "display_name": sink.display_name()}),
+            serde_json::json!({
+                "run_id": sink.run_id.clone(),
+                "display_name": sink.display_name(),
+                "build_info": sink.build_info(),
+            }),
         )?;
         Ok(sink)
     }
 
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
+    }
+
+    pub fn build_info(&self) -> &dev_tools_product::BuildInfo {
+        &self.build_info
     }
 
     pub fn started_unix_ms(&self) -> u64 {
@@ -564,6 +575,25 @@ mod tests {
         assert_eq!(records[1]["task_id"], "demo");
         assert_eq!(records[0]["sequence"], 1);
         assert_eq!(records[1]["sequence"], 2);
+    }
+
+    #[test]
+    fn run_started_records_build_identity_before_any_task() {
+        let root = TempDir::new().unwrap();
+        let sink = RunLogSink::new(root.path(), false).unwrap();
+        let journal = std::fs::read_to_string(sink.run_dir().join("events.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = journal
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "run_started");
+        assert_eq!(
+            records[0]["payload"]["build_info"],
+            serde_json::to_value(sink.build_info()).unwrap()
+        );
+        assert_eq!(sink.build_info().product.as_str(), "update-all");
+        assert_eq!(sink.build_info().version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

@@ -357,6 +357,124 @@ fn profile_map_selection_and_order_are_stable() {
     assert!(!sandbox.path().join("output/windows.txt").exists());
 }
 
+fn linked_default_profile_fixture(sandbox: &Sandbox) -> PathBuf {
+    let manifest = sandbox.write(
+        "source/manifest.yaml",
+        "default_mode: copy\ndefault_profile_map:\n  path: ./unused-map.yaml\n  host: unused\nentries_dir: ./entries\n",
+    );
+    sandbox.write("source/selected.txt", "selected\n");
+    sandbox.write("source/alternate.txt", "alternate\n");
+    sandbox.write(
+        "source/entries/10-files.yaml",
+        "entries:\n  - name: selected\n    source: ./selected.txt\n    target: ~/selected.txt\n    profiles: [desktop]\n    pre_script: /bin/sh hook.sh\n  - name: alternate\n    source: ./alternate.txt\n    target: ~/alternate.txt\n    profiles: [alternate]\n",
+    );
+    sandbox.write(
+        "source/hook.sh",
+        "set -eu\ntest \"$SYNC_CONFIGS_ACTIVE_PROFILES\" = desktop,linux\ntest \"$SYNC_CONFIGS_CONFIG_DIR\" = \"$(pwd -P)\"\ntest \"$SYNC_CONFIGS_MANIFEST_PATH\" = \"$SYNC_CONFIGS_CONFIG_DIR/manifest.yaml\"\ntest \"$SYNC_CONFIGS_ENTRY_SOURCE\" = \"$SYNC_CONFIGS_CONFIG_DIR/selected.txt\"\nprintf '%s\\n' \"$SYNC_CONFIGS_ACTIVE_PROFILES\" > hook-profiles.txt\n",
+    );
+    sandbox.write(
+        "config/sync-configs/profiles.yaml",
+        "profiles:\n  workstation:\n    config_profiles: [desktop, linux, desktop]\n",
+    );
+    sandbox.write(
+        "config/sync-configs/manifest.override.yaml",
+        "default_profile_map:\n  path: ./profiles.yaml\n  host: workstation\n  field: config_profiles\n",
+    );
+    let link = sandbox.path().join("config/sync-configs/manifest.yaml");
+    std::os::unix::fs::symlink(&manifest, &link).expect("link default manifest");
+    link
+}
+
+#[test]
+fn no_arguments_follow_linked_manifest_and_local_default_profile_map() {
+    let sandbox = Sandbox::new();
+    let manifest = linked_default_profile_fixture(&sandbox);
+    sandbox.write("home/alternate.txt", "preserve local\n");
+
+    let first = sync_configs_command(&sandbox)
+        .output()
+        .expect("run with no arguments");
+    assert_success(&first);
+    assert_eq!(
+        fs::read(sandbox.path().join("home/selected.txt")).unwrap(),
+        b"selected\n"
+    );
+    assert_eq!(
+        fs::read(sandbox.path().join("home/alternate.txt")).unwrap(),
+        b"preserve local\n"
+    );
+    assert_eq!(
+        fs::read(sandbox.path().join("source/hook-profiles.txt")).unwrap(),
+        b"desktop,linux\n"
+    );
+    assert!(fs::symlink_metadata(&manifest)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let before = ordinary_file_identity(&sandbox.path().join("home/selected.txt"));
+    let second = sync_configs_command(&sandbox)
+        .output()
+        .expect("repeat with no arguments");
+    assert_success(&second);
+    assert_eq!(
+        ordinary_file_identity(&sandbox.path().join("home/selected.txt")),
+        before
+    );
+    assert_eq!(
+        fs::read(sandbox.path().join("home/alternate.txt")).unwrap(),
+        b"preserve local\n"
+    );
+}
+
+#[test]
+fn explicit_profile_choices_do_not_read_the_dormant_default_map() {
+    for explicit_map in [false, true] {
+        let sandbox = Sandbox::new();
+        let manifest = linked_default_profile_fixture(&sandbox);
+        fs::remove_file(sandbox.path().join("config/sync-configs/profiles.yaml")).unwrap();
+        let map = sandbox.write("explicit.yaml", "profiles:\n  choice: [alternate]\n");
+        let map_arg = map.to_string_lossy().into_owned();
+        let arguments = if explicit_map {
+            vec!["--profile-map", &map_arg, "--host-profile", "choice"]
+        } else {
+            vec!["--profile", "alternate"]
+        };
+        let output = run(&sandbox, &manifest, &arguments);
+        assert_success(&output);
+        assert_eq!(json_output(&output)["profiles"], json!(["alternate"]));
+        assert_eq!(
+            fs::read(sandbox.path().join("home/alternate.txt")).unwrap(),
+            b"alternate\n"
+        );
+        assert!(!sandbox.path().join("home/selected.txt").exists());
+        assert!(!sandbox.path().join("source/hook-profiles.txt").exists());
+    }
+}
+
+#[test]
+fn malformed_default_map_selection_fails_before_hooks_or_target_writes() {
+    let sandbox = Sandbox::new();
+    linked_default_profile_fixture(&sandbox);
+    sandbox.write("home/selected.txt", "local\n");
+    sandbox.write(
+        "config/sync-configs/profiles.yaml",
+        "profiles:\n  workstation: [desktop]\n",
+    );
+
+    let output = sync_configs_command(&sandbox)
+        .output()
+        .expect("reject malformed default selection");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("config_profiles"));
+    assert_eq!(
+        fs::read(sandbox.path().join("home/selected.txt")).unwrap(),
+        b"local\n"
+    );
+    assert!(!sandbox.path().join("home/alternate.txt").exists());
+    assert!(!sandbox.path().join("source/hook-profiles.txt").exists());
+}
+
 fn hook_fixture(sandbox: &Sandbox, fail: bool) -> PathBuf {
     sandbox.write(
         "hook.sh",
@@ -558,6 +676,7 @@ fn unknown_manifest_fields_fail_closed_end_to_end() {
     let value = json_output(&output);
     assert_eq!(value["outcome"], "failed");
     assert_eq!(value["error_kind"], "convergence_failed");
+    assert_eq!(value["failure"]["kind"], "convergence_failed");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("source\n"));
 }
 

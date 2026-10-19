@@ -20,6 +20,8 @@ enum Mode {
     StalledSearch,
     StalledRead,
     DelayedSearchThenStalledRead,
+    FailedSearch,
+    UnsupportedSearch,
 }
 
 struct Observations {
@@ -111,14 +113,24 @@ impl Store {
     async fn search_items(
         &self,
         attributes: HashMap<String, String>,
-    ) -> (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) {
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
         let mode = {
             let mut state = self.0.lock().unwrap();
             state.searches.push(attributes);
+            state.senders.push(header.sender().unwrap().to_string());
             state.mode
         };
         let item = || OwnedObjectPath::try_from(ITEM).unwrap();
-        match mode {
+        Ok(match mode {
+            Mode::FailedSearch => {
+                return Err(zbus::fdo::Error::Failed("synthetic backend text".into()));
+            }
+            Mode::UnsupportedSearch => {
+                return Err(zbus::fdo::Error::NotSupported(
+                    "synthetic backend text".into(),
+                ));
+            }
             Mode::Missing => (vec![], vec![]),
             Mode::Locked => (vec![], vec![item()]),
             Mode::Ambiguous => (vec![item(), item()], vec![]),
@@ -132,7 +144,7 @@ impl Store {
                 (vec![item()], vec![])
             }
             _ => (vec![item()], vec![]),
-        }
+        })
     }
 
     fn unlock(&self, _objects: Vec<OwnedObjectPath>) -> (Vec<OwnedObjectPath>, OwnedObjectPath) {
@@ -546,5 +558,72 @@ fn slot_read_does_not_receive_a_new_budget_after_slow_lookup() {
         );
         assert_disconnected(&connection, &store).await;
         store.shutdown(connection).await;
+    });
+}
+
+#[test]
+fn setup_enrollment_observation_never_opens_a_session_or_reads_a_value() {
+    use crate::runtime::credential_presence::{observe_at, PresenceError};
+    for (mode, expected) in [
+        (Mode::Unlocked, Ok(true)),
+        (Mode::Missing, Ok(false)),
+        (Mode::Locked, Err(PresenceError::Locked)),
+        (Mode::Ambiguous, Err(PresenceError::Ambiguous)),
+        (Mode::Mixed, Err(PresenceError::Ambiguous)),
+        (Mode::FailedSearch, Err(PresenceError::Unavailable)),
+        (Mode::UnsupportedSearch, Err(PresenceError::Unsupported)),
+        (Mode::StalledSearch, Err(PresenceError::Unavailable)),
+        (Mode::StalledRead, Ok(true)),
+    ] {
+        let bus = Bus::new();
+        run_test(async {
+            let (connection, store) = bus.store(mode, b"synthetic-secret".to_vec()).await;
+            let credential_stores = stores();
+            let result = observe_at(
+                &bus.path(),
+                &credential_stores["fixture-slot"],
+                Duration::from_millis(300),
+            )
+            .await;
+            assert_eq!(result, expected, "{mode:?}");
+            {
+                let state = store.0.lock().unwrap();
+                assert_eq!(state.searches.len(), 1);
+                assert_eq!(
+                    state.searches[0],
+                    HashMap::from([
+                        ("service".into(), "dev-auth-v3".into()),
+                        (
+                            "username".into(),
+                            "user-broker-service-account-token-fixture-slot".into()
+                        ),
+                    ])
+                );
+                assert_eq!((state.reads, state.unlocks, state.prompts), (0, 0, 0));
+                assert!(
+                    state.keys.is_empty(),
+                    "metadata opened an encryption session"
+                );
+            }
+            assert_disconnected(&connection, &store).await;
+            store.shutdown(connection).await;
+        });
+    }
+}
+
+#[test]
+fn missing_metadata_service_is_unknown_instead_of_absent_enrollment() {
+    let bus = Bus::new();
+    run_test(async {
+        let credential_stores = stores();
+        assert_eq!(
+            crate::runtime::credential_presence::observe_at(
+                &bus.path(),
+                &credential_stores["fixture-slot"],
+                READ_BUDGET,
+            )
+            .await,
+            Err(crate::runtime::credential_presence::PresenceError::Unavailable),
+        );
     });
 }

@@ -16,6 +16,20 @@ Appending diagnostic stderr to machine-readable stdout can invalidate a successf
 
 Machine-readable capture returns stdout alone while failed commands preserve both streams as evidence. Streaming logs retain stream identity and classify explicit diagnostic syntax independently of the stream. Multiline messages become individual logical records. Diagnostic collection keeps fixed sample budgets per severity, renders errors first, and reports omitted occurrences with a complete-task-log reference. Diagnostic severity remains independent of package transaction status. ADR 0003's bounded JSON and full-log authority remain in force.
 
+A runner deadline remains a timeout with unknown underlying cause. It retains
+observed partial output and settles its owned input/capture workers before
+returning. It cannot authorize automatic replay or be classified as a network
+failure from the deadline alone. Native managers own their normal retries;
+additional non-timeout retries require the configured task policy. Failed tasks
+retain known before-state and observed outcomes, with unavailable after-state
+explicitly unconfirmed. Deferred results distinguish installed and available
+versions; availability is not an installed transition. Compact failure details
+prefer causal stderr while complete output remains in the task log. Explicit
+error syntax retains precedence. When it is absent, the compact failure summary
+uses the final non-progress record instead of an earlier startup/progress line.
+That record is terminal context, not proof of the underlying cause; it does not
+reclassify a successful command, change diagnostic severity, or authorize replay.
+
 Before reporting a planned npm root as updated, verify its installed version, manifest and declared executable health even when npm printed no lifecycle warning. Share version and root observations across the planned batch. An isolated recovery invocation requests warning output without changing persistent npm configuration; lifecycle authorization continues to follow ADR 0002.
 
 Each closure member's complete registry manifest must be observed successfully and decoded as one unambiguous manifest before authorizing its scripts. The manifest name and version must exactly match the requested closure member. JSON objects and npm 12's singleton-array response are accepted; empty and multiple-result arrays are rejected. Unavailable or malformed registry metadata, invalid dependency shapes and non-registry sources stop recovery before the script-authorized retry. Existing observational parsing does not grant that authority.
@@ -54,6 +68,18 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 - `multiline_task_logs_retain_every_logical_line_in_dashboard_and_journal`
 - `successful_capture_keeps_unterminated_stdout_separate_from_stderr`
 - `stdout_capture_failure_keeps_both_streams_in_error_context`
+- `capture_timeout_preserves_partial_output_and_settles_owned_io`
+- `cargo_catalog_report_preserves_updates_with_available_prereleases`
+- `go_catalog_report_preserves_mixed_versions_and_partial_failure`
+- `failed_command_report_retains_pipx_before_inventory_without_claiming_refresh`
+- `command_failure_summary_keeps_causal_stderr_and_explicit_error_precedence`
+- `command_failure_summary_uses_terminal_context_without_explicit_errors`
+- `controlled_catalog_failure_summary_keeps_terminal_context`
+- `structured_command_result_marks_a_successful_process_as_deferred`
+- `command_policy_does_not_retry_transient_network_failure_without_policy_retry`
+- `command_policy_timeout_never_retries_even_with_transient_partial_output`
+- `command_task_failure_preserves_causal_evidence_and_before_inventory`
+- `npm_failed_discovery_retains_partial_output_without_authorizing_updates`
 - `npm_global_path_ignores_stderr_diagnostics`
 - `npm_silent_install_does_not_report_a_broken_executable_as_updated`
 - `does_not_coalesce_diagnostics_or_package_messages_containing_byte_counts`

@@ -24,8 +24,9 @@ fn session() -> Arg {
         .help("Public session selector; kernel workload membership supplies execution authority")
 }
 pub fn specification() -> Command {
+    let direct = super::grants::direct_specification();
     Command::new("privilege")
-        .about("Request and use a bounded reusable administrative session")
+        .about("Manage bounded maintenance sessions and native administrator grants")
         .subcommand_required(true)
         .subcommand(Command::new("plan").args([
             path("request").required(true),
@@ -68,6 +69,8 @@ pub fn specification() -> Command {
             session(),
             Arg::new("json").long("json").action(ArgAction::SetTrue),
         ]))
+        .subcommand(super::grants::specification())
+        .subcommands(direct.get_subcommands().cloned())
 }
 
 #[derive(Deserialize)]

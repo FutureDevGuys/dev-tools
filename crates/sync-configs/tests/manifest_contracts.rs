@@ -149,6 +149,11 @@ fn rejects_unknown_fields_at_every_manifest_boundary() {
             "future_root",
         ),
         (
+            "default-profile-map",
+            "default_profile_map: {path: ./profiles.yaml, host: workstation, guessed: true}\n",
+            "guessed",
+        ),
+        (
             "entry",
             "entries:\n  - source: ./a\n    target: ./b\n    future_entry: true\n",
             "future_entry",
@@ -170,6 +175,52 @@ fn rejects_unknown_fields_at_every_manifest_boundary() {
         .expect_err("unknown field must fail closed");
         assert!(error.to_string().contains(expected), "{name}: {error}");
     }
+}
+
+#[test]
+fn default_profile_map_rejects_empty_authority_fields() {
+    let temp = TempDir::new().expect("temporary directory");
+    for (selection, field) in [
+        ("{path: ' ', host: workstation}", "path"),
+        ("{path: ./profiles.yaml, host: ' '}", "host"),
+        (
+            "{path: ./profiles.yaml, host: workstation, field: ' '}",
+            "field",
+        ),
+    ] {
+        let path = temp.path().join("manifest.yaml");
+        fs::write(&path, format!("default_profile_map: {selection}\n")).unwrap();
+        let error = load_manifest(
+            &path,
+            &LoadOptions::default().with_path_context(path_context(temp.path())),
+        )
+        .expect_err("empty default profile-map field must fail");
+        assert!(error.to_string().contains(field), "{error}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn linked_manifest_default_map_path_uses_its_canonical_parent() {
+    let temp = TempDir::new().expect("temporary directory");
+    let root = temp.path();
+    fs::create_dir(root.join("source")).unwrap();
+    fs::create_dir(root.join("installed")).unwrap();
+    fs::write(
+        root.join("source/manifest.yaml"),
+        "default_profile_map: {path: ./profiles.yaml, host: workstation}\n",
+    )
+    .unwrap();
+    let link = root.join("installed/manifest.yaml");
+    std::os::unix::fs::symlink(root.join("source/manifest.yaml"), &link).unwrap();
+
+    let manifest = load(root, &link);
+    let canonical_source = fs::canonicalize(root.join("source")).unwrap();
+    assert_eq!(manifest.path, canonical_source.join("manifest.yaml"));
+    let selection = manifest.default_profile_map.expect("declared default");
+    assert_eq!(selection.path, canonical_source.join("profiles.yaml"));
+    assert_eq!(selection.host, "workstation");
+    assert_eq!(selection.field, None);
 }
 
 #[test]

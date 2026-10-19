@@ -75,6 +75,9 @@ pub use validation::{
 mod prompt_free_store;
 
 #[cfg(target_os = "linux")]
+mod credential_presence;
+
+#[cfg(target_os = "linux")]
 pub(crate) use prompt_free_store::CredentialUnavailable;
 
 #[cfg(target_os = "linux")]
@@ -782,6 +785,13 @@ pub(crate) fn user_broker_service_tokens<'a>(
 #[cfg(target_os = "linux")]
 pub(crate) fn user_broker_service_token_for_slot(slot: &str) -> Result<SecretString> {
     service_account_token(&user_broker_credential_store(slot)?)
+}
+
+/// Observes exact native enrollment metadata without reading, unlocking, or
+/// prompting for the stored credential. Unknown observations are errors.
+#[cfg(target_os = "linux")]
+pub(crate) fn user_broker_credential_slot_present(slot: &str) -> Result<bool> {
+    credential_presence::observe(&user_broker_credential_store(slot)?).map_err(Into::into)
 }
 
 #[cfg(target_os = "linux")]

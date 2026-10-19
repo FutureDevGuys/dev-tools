@@ -397,13 +397,14 @@ external_window = false
 shell = false
 
 [[tasks.report_patterns]]
-pattern = '^\s*(?P<name>\S+)\s+(?P<before>\S+)\s+(?P<after>\S+)\s+Yes\s*$'
+pattern = '^\s*(?P<name>\S+)\s+(?P<before>\S+)\s+(?P<after>\S+)(?:\s+\((?P<note>[^)]*\bavailable\b[^)]*)\))?\s+Yes\s*$'
 section_key = "cargo_packages"
 section_title = "Cargo Package Results"
 status = "updated"
 name = "{name}"
 before = "{before}"
 after = "{after}"
+note = "{note}"
 
 [[tasks.report_patterns]]
 pattern = '^\s*(?P<name>\S+)\s+(?P<before>\S+)\s+\S+\s+\((?P<note>[^)]*\bavailable\b[^)]*)\)\s+No\s*$'
@@ -447,13 +448,14 @@ program = "gup"
 args = ["list"]
 
 [[tasks.report_patterns]]
-pattern = '^\s*\[\d+/\d+\]\s+(?P<name>\S+)\s+\((?P<before>\S+)\s+(?:to|->)\s+(?P<after>\S+)\)\s*$'
+pattern = '^\s*\[\d+/\d+\]\s+(?P<name>\S+)\s+\((?P<before>\S+)\s+(?:to|->)\s+(?P<after>[^\s,)]+)(?:,\s+(?P<note>[^)]+))?\)\s*$'
 section_key = "go_tools"
 section_title = "Go Tool Results"
 status = "updated"
 name = "{name}"
 before = "{before}"
 after = "{after}"
+note = "{note}"
 
 [[tasks.report_patterns]]
 pattern = '^\s*(?P<alias>[^\s:]+):\s+(?P<name>\S+)@(?P<version>v?[0-9][^\s"/]*)\s*$'
@@ -466,14 +468,14 @@ after = "{version}"
 note = "already up-to-date"
 
 [[tasks.report_patterns]]
-pattern = "^gup:ERROR:\\s+\\[\\d+/\\d+\\]\\s+(?P<tool>[^:]+):\\s+can't check\\s+(?P<name>[^:]+):"
+pattern = "^gup:ERROR:\\s+\\[\\d+/\\d+\\]\\s+(?P<tool>[^:]+):\\s+can't (?P<operation>check|install)\\s+(?P<name>[^:]+):"
 section_key = "go_tools"
 section_title = "Go Tool Results"
 status = "failed"
 name = "{name}"
 before = "-"
 after = "-"
-note = "{tool}: check failed"
+note = "{tool}: {operation} failed"
 
 [[tasks]]
 id = "yay"

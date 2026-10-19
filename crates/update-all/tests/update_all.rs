@@ -124,6 +124,69 @@ policy_key = "tool_update"
 
 #[cfg(unix)]
 #[test]
+fn persisted_runs_identify_the_executing_build_without_caller_values() {
+    for engine in ["sync", "async"] {
+        for child_exit in [0, 7] {
+            let home = TempDir::new().unwrap();
+            let config_dir = home.path().join("config/update-all");
+            let catalog_dir = config_dir.join("catalog.d/local");
+            fs::create_dir_all(&catalog_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                format!("[install]\nauto_update=false\n[engine]\nmode=\"{engine}\"\n"),
+            )
+            .unwrap();
+            fs::write(
+                catalog_dir.join("identity.toml"),
+                format!(
+                    "[tasks.\"local/identity\"]\nlabel=\"Build identity fixture\"\ncategory=\"maintenance\"\nos=[\"linux\",\"macos\"]\ndetect_mode=\"command_available\"\ncommand=\"sh\"\nargs=[\"-c\",\"exit {child_exit}\",\"private-argument-sentinel\"]\npolicy_key=\"tool_update\"\n"
+                ),
+            )
+            .unwrap();
+            let build_output = command(&home)
+                .args(["build-info", "--json"])
+                .output()
+                .unwrap();
+            assert!(build_output.status.success());
+            let expected: serde_json::Value = serde_json::from_slice(&build_output.stdout).unwrap();
+            command(&home)
+                .env("UPDATE_ALL_GIT_COMMIT", "private-runtime-value-sentinel")
+                .args([
+                    "--plain",
+                    "--completions",
+                    "off",
+                    "--only",
+                    "local/identity",
+                ])
+                .assert()
+                .code(if child_exit == 0 { 0 } else { 1 });
+            let run = fs::read_dir(home.path().join("state/update-all/runs"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.join("run.json").is_file())
+                .unwrap();
+            let artifact: serde_json::Value =
+                serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+            assert_eq!(
+                artifact["build_info"], expected,
+                "{engine}, exit {child_exit}"
+            );
+            let journal = fs::read_to_string(run.join("events.jsonl")).unwrap();
+            let started: serde_json::Value =
+                serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+            assert_eq!(started["kind"], "run_started");
+            assert_eq!(started["payload"]["build_info"], expected);
+            assert_eq!(expected.as_object().unwrap().len(), 8);
+            let identity = expected.to_string();
+            assert!(!identity.contains("private-argument-sentinel"));
+            assert!(!identity.contains("private-runtime-value-sentinel"));
+            assert!(!identity.contains(&home.path().to_string_lossy().to_string()));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn controlled_catalog_keeps_late_errors_in_full_logs_and_bounded_summary() {
     let home = TempDir::new().unwrap();
     let config_dir = home.path().join("config/update-all");
@@ -250,6 +313,60 @@ policy_key = "tool_update"
         .find(|section| section["key"] == "command_diagnostics")
         .unwrap();
     assert_eq!(final_diagnostics, diagnostics);
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_catalog_failure_summary_keeps_terminal_context() {
+    for stream in ["stdout", "stderr"] {
+        let home = TempDir::new().unwrap();
+        let config_dir = home.path().join("config/update-all");
+        let catalog_dir = config_dir.join("catalog.d/local");
+        fs::create_dir_all(&catalog_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[install]\nauto_update=false\n[engine]\nmode=\"async\"\njobs=\"1\"\n",
+        )
+        .unwrap();
+        let redirect = if stream == "stderr" { " >&2" } else { "" };
+        let script = format!(
+            "printf 'preparing transaction...\\n'{redirect}; printf 'resource is busy; operation did not start\\n'{redirect}; printf 'The following operations failed: fixture-one,fixture-two\\n'{redirect}; exit 1"
+        );
+        fs::write(
+            catalog_dir.join("failure.toml"),
+            format!(
+                "[tasks.\"local/failure\"]\nlabel=\"Failure summary fixture\"\ncategory=\"maintenance\"\nos=[\"linux\",\"macos\"]\ndetect_mode=\"command_available\"\ncommand=\"sh\"\nargs=[\"-c\",{}]\npolicy_key=\"tool_update\"\n",
+                serde_json::to_string(&script).unwrap()
+            ),
+        )
+        .unwrap();
+        command(&home)
+            .args(["--plain", "--completions", "off", "--only", "local/failure"])
+            .assert()
+            .code(1);
+        let run = fs::read_dir(home.path().join("state/update-all/runs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("run.json").is_file())
+            .unwrap();
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+        assert_eq!(artifact["exit_code"], 1);
+        assert_eq!(artifact["tasks"][0]["status"], "failed");
+        let detail = artifact["tasks"][0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("The following operations failed"),
+            "{stream}: {detail}"
+        );
+        assert!(
+            !detail.contains("preparing transaction"),
+            "{stream}: {detail}"
+        );
+        let raw = fs::read_to_string(run.join("task-local%2Ffailure.raw.log")).unwrap();
+        assert!(raw.contains("preparing transaction..."));
+        assert!(raw.contains("resource is busy; operation did not start"));
+        assert!(raw.contains("The following operations failed"));
+    }
 }
 
 #[test]

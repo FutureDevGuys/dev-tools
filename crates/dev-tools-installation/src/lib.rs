@@ -19,9 +19,19 @@ pub use document_retirement::{
 #[cfg(target_os = "linux")]
 mod activation_withdrawal;
 #[cfg(target_os = "linux")]
+mod retained_repair;
+#[cfg(target_os = "linux")]
+pub use retained_repair::{
+    observe_retained_versioned_installation_repair, repair_retained_versioned_installation,
+};
+#[cfg(target_os = "linux")]
 mod existing_document_directory;
 #[cfg(target_os = "linux")]
 pub use existing_document_directory::{DocumentDirectoryPreparation, ExistingDocumentDirectory};
+#[cfg(target_os = "linux")]
+mod retention_pin;
+#[cfg(target_os = "linux")]
+pub use retention_pin::{retain_versioned_artifact, versioned_artifact_is_retained};
 #[cfg(target_os = "linux")]
 mod directory_publication;
 #[cfg(target_os = "linux")]
@@ -42,6 +52,27 @@ pub struct DocumentAuthority {
     pub owner_uid: u32,
     pub mode: u32,
     pub limit: u64,
+}
+
+/// Exact ordinary-file custody, including empty content and the native group.
+/// Document APIs retain their nonempty contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAuthority {
+    pub owner_uid: u32,
+    pub group_gid: u32,
+    pub mode: u32,
+    pub limit: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl FileAuthority {
+    fn document_authority(&self) -> DocumentAuthority {
+        DocumentAuthority {
+            owner_uid: self.owner_uid,
+            mode: self.mode,
+            limit: self.limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2315,6 +2346,13 @@ fn remove_superseded_version(
         .previous_identity
         .as_ref()
         .context("prior receipt omitted its previous identity")?;
+    // An exact product-published pin survives normal activation pruning. A
+    // malformed or drifted pin is an error, never authority to keep/delete an
+    // arbitrary version. Both v1 and v2 activation use this helper.
+    #[cfg(target_os = "linux")]
+    if versioned_artifact_is_retained(layout, version, identity)? {
+        return Ok(());
+    }
     remove_owned_file(&layout.version_artifact(version), identity)?;
     remove_directory_if_empty(&layout.versions_dir().join(version))
 }
@@ -2566,10 +2604,43 @@ pub fn read_atomic_document(
 }
 
 fn read_atomic_document_file(
-    mut file: File,
+    file: File,
     path: &Path,
     authority: &DocumentAuthority,
 ) -> Result<AtomicDocument> {
+    read_atomic_file_content(file, path, authority, false, None)
+}
+
+/// Read bounded regular-file bytes, including a deliberately empty file.
+/// Document readers retain their separate nonempty-content requirement.
+pub fn read_atomic_file(
+    path: &Path,
+    authority: &DocumentAuthority,
+) -> Result<Option<AtomicDocument>> {
+    validate_document_authority(authority)?;
+    let file = match open_read_nofollow(path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    read_atomic_file_content(file, path, authority, true, None).map(Some)
+}
+
+fn read_atomic_file_content(
+    mut file: File,
+    path: &Path,
+    authority: &DocumentAuthority,
+    allow_empty: bool,
+    group_gid: Option<u32>,
+) -> Result<AtomicDocument> {
+    #[cfg(not(unix))]
+    let _ = group_gid;
     let before = file
         .metadata()
         .with_context(|| format!("inspect atomic document {}", path.display()))?;
@@ -2577,14 +2648,18 @@ fn read_atomic_document_file(
     if !before.file_type().is_file()
         || before.nlink() != 1
         || before.uid() != authority.owner_uid
+        || group_gid.is_some_and(|group| before.gid() != group)
         || before.mode() & 0o777 != authority.mode
-        || before.len() == 0
+        || (!allow_empty && before.len() == 0)
         || before.len() > authority.limit
     {
         bail!("atomic document has unsafe filesystem authority");
     }
     #[cfg(not(unix))]
-    if !before.file_type().is_file() || before.len() == 0 || before.len() > authority.limit {
+    if !before.file_type().is_file()
+        || (!allow_empty && before.len() == 0)
+        || before.len() > authority.limit
+    {
         bail!("atomic document has unsafe filesystem authority");
     }
     let mut bytes = Vec::with_capacity(before.len() as usize);
@@ -2602,6 +2677,12 @@ fn read_atomic_document_file(
         || before.len() != after.len()
         || before.mtime() != after.mtime()
         || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.uid() != after.uid()
+        || before.gid() != after.gid()
+        || before.mode() != after.mode()
+        || before.nlink() != after.nlink()
     {
         bail!("atomic document changed while being read");
     }

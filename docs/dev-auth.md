@@ -1,5 +1,9 @@
 # dev-auth
 
+The execution follow-on adds direct `privilege inspect|exec|delegate|leave` aliases and `workload launch NAME --privilege-scope user|workload --privilege-duration 30m -- ...`. Fresh launch approval remains interactive and explicit; the configured target stays at its native exec barrier until its pending grant is activated. Administrator `request/status/revoke` remain under `privilege grant`, preserving existing maintenance commands. Selected plans can bind an aggregate output budget to their approval digest. See [ADR 0119](adr/0119-bounded-grant-output-and-native-launch-activation.md) for exact limits, native signal/stream custody and pending acceptance.
+
+The source candidate also adds the separate `privilege grant` administrator family: request, status, inspect, exec, delegate, revoke and leave. Existing bounded maintenance commands remain available. Grant authority uses distinct closed schemas and runtime custody; it cannot be inferred from credential policy, maintenance sessions or cached sudo authorization. Privilege-only and combined setup select the component explicitly. Native grant, sudo, guardian and signed setup acceptance remain pending; this source is not an installed-support claim. See [ADR 0115](adr/0115-native-administrator-grants-with-maintenance-compatibility.md) and [ADR 0116](adr/0116-retained-grant-setup-and-explicit-empty-native-files.md).
+
 The unreleased 0.5 candidate adds a reusable typed/exact-plan maintenance lifecycle. Its finite standalone receipt-install effect adapter is implemented in source; ordinary builds reject synthetic and generic helpers. See [bounded maintenance authority](dev-auth-privilege.md) and [ADR 0094](adr/0094-reusable-bounded-maintenance-sessions.md). Native approval, containment, signed setup and real maintenance compatibility remain explicit release gates; ordinary credential workloads do not become root sessions.
 
 The current general-purpose implementation and release gaps are tracked in [executable acceptance](dev-auth-acceptance.md). `dev-auth doctor [--json]` provides local observation without retrieving credentials or contacting the broker/provider; its invoked version helps distinguish a retained executable from the intended installation. `workload launch` has explicit noninteractive and separate result-file controls with the limits documented there.
@@ -93,3 +97,31 @@ Legacy `setup repair`, `setup rollback` and `setup uninstall` are blocked when a
 ## Platform contract
 
 The configuration model and security boundaries are designed for Linux, WSL, native Windows, and macOS, but a build or cross-compile does not establish runtime support. Linux x86-64 is the currently supported runtime. WSL must prove its independent Secret Service session, Unix agent lifecycle, native-current-user routing policy, and no Windows fallback; native Windows must prove current-user Credential Manager, protected private ACLs, current-user-owned workspace-root identity, fixed-drive and reparse/junction rejection, held path identity, named-pipe isolation, Git/gh routing, and OpenSSH interoperability; macOS must prove Keychain, native-user configuration routing, launchd lifecycle, socket isolation, and Git/gh routing. Until those native acceptance matrices pass, WSL and Windows remain acceptance-pending and macOS remains unclaimed.
+
+## Setup-aware updates
+
+`dev-auth update status --json` observes only authenticated local release evidence.
+`update check --json` explicitly refreshes release metadata. `update apply --json`
+updates an existing Accepted full setup generation; `--offline` admits only
+already authenticated cached payloads. The selected candidate runs a private
+offline setup worker, preserves accepted policy and credential disposition,
+retains selected grants/bindings, and activates only after the full setup
+postcondition. First installation and ordinary-user Strong mutation return
+`requires_setup` for the existing explicit setup/administrator route.
+
+`dev-auth update rollback --json` restores the receipt-owned retained generation
+without network access and leaves integrations inactive. The v2 common result
+reports known change, known no change or unknown entered progress; it never
+prints credential values or captured native command output. This is an unqualified
+source interface pending the signed/native gates in ADR 0120.
+
+`dev-auth setup repair --mode strong|user-only` selects preserving full-generation
+maintenance when a full marker exists. It repairs only exact owned missing state,
+keeps credential action evidence unchanged, and activates after verification.
+`setup uninstall` retires owned enforcement and leaves current policy/credential
+state intact. Its retained direction supports retry through the reported exact
+executable even after public aliases are removed. Immutable continuation artifacts
+and private copied payload custody remain retained for explicit later cleanup.
+Both commands emit `dev-auth-setup-maintenance-report-v1` for the full-generation
+route; malformed or unsafe authority fails closed. Pending/recovery/restoration
+must finish their existing direction first. Native signed acceptance is pending.

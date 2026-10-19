@@ -162,6 +162,45 @@ fn indirect_dispatch_matches_only_exact_supported_command_grammar() {
     ] {
         assert_eq!(classify_invocation(command, &args), Dispatch::Delegate);
     }
+    for (command, args, expected) in [
+        (
+            "uv",
+            vec!["generate-shell-completion".into(), "zsh".into()],
+            Dispatch::Delegate,
+        ),
+        (
+            "uvx",
+            vec!["--generate-shell-completion".into(), "fish".into()],
+            Dispatch::Delegate,
+        ),
+        (
+            "uv.exe",
+            vec!["generate-shell-completion".into(), "powershell".into()],
+            Dispatch::Delegate,
+        ),
+        (
+            "uv",
+            vec!["run".into(), "generate-shell-completion".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+        (
+            "uvx",
+            vec!["generate-shell-completion".into(), "zsh".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+        (
+            "uv",
+            vec!["--".into(), "generate-shell-completion".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+        (
+            "uvx",
+            vec!["tool".into(), "--generate-shell-completion".into()],
+            Dispatch::Adapter(Adapter::Uv),
+        ),
+    ] {
+        assert_eq!(classify_invocation(command, &args), expected, "{command}");
+    }
 }
 
 #[test]
@@ -2897,7 +2936,7 @@ fn garbage_collection_is_dry_run_first_and_honors_active_leases() {
 }
 
 #[test]
-fn garbage_collection_skips_active_resources_without_blocking_unrelated_collection() {
+fn garbage_collection_preserves_active_preview_and_defers_apply_until_completion() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
     let active_path = root.shared().join("meson/packages");
@@ -2942,21 +2981,36 @@ fn garbage_collection_skips_active_resources_without_blocking_unrelated_collecti
         ..GcOverrides::default()
     };
 
-    let report =
-        gc::collect(&root, &policy, 120, &overrides, true).expect("unrelated collection proceeds");
+    let report = gc::collect(&root, &policy, 120, &overrides, false)
+        .expect("preview coexists with active work");
+    assert!(!report.applied);
     assert!(active_path.exists());
-    assert!(!inactive_path.exists());
+    assert!(inactive_path.exists());
+    assert!(report
+        .actions
+        .iter()
+        .any(|action| action.path == inactive_path));
     assert!(report
         .abstentions
         .iter()
         .any(|item| item.resource_id.as_ref() == Some(&active_ids[0])
             && item.reason.contains("active routed command")));
+    assert!(gc::collect_if_idle(&root, &policy, 120, &overrides, true)
+        .expect("automatic collection defers during active work")
+        .is_none());
+    let busy = gc::collect(&root, &policy, 120, &overrides, true)
+        .expect_err("explicit collection cannot exclude nested routed setup");
+    assert!(busy.to_string().contains("busy"));
+    assert!(active_path.exists());
+    assert!(inactive_path.exists());
     drop(active);
 
     let drained = gc::collect(&root, &policy, 120, &overrides, true)
-        .expect("active resource becomes collectible");
+        .expect("both resources become collectible after active work finishes");
+    assert!(drained.applied);
     assert!(drained.complete);
     assert!(!active_path.exists());
+    assert!(!inactive_path.exists());
 }
 
 #[test]
