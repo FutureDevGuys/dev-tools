@@ -50,9 +50,9 @@ struct Mapping {
 // SAFETY: the fixed mapping is never moved, resized or unmapped while any Arc
 // owner exists. Every shared field is an AtomicU64; no borrowed payload pointer
 // or non-atomic mutation is exposed. Supported targets are gated in map().
-unsafe impl Send for Mapping {}
-// SAFETY: same atomic-only access and Arc-owned lifetime as Send above.
-unsafe impl Sync for Mapping {}
+unsafe impl Send for Mapping {} // SAFETY: Arc retains the fixed mapping; all exposed shared fields are atomic.
+
+unsafe impl Sync for Mapping {} // SAFETY: shared access exposes only atomics within the Arc-owned mapping.
 
 impl Mapping {
     fn map(descriptor: OwnedFd, initialize: bool) -> io::Result<Self> {
@@ -1210,6 +1210,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Both terminal try_wait observations above have already reaped these
+        // children; wait confirms their cached statuses without another wait.
+        relay.wait().unwrap();
+        producer.wait().unwrap();
         let output = counts.observation(true).unwrap();
         assert!(output.limit_exceeded);
         assert_eq!(output.observed.stdout, 33);

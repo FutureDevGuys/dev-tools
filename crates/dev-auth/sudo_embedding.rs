@@ -58,7 +58,7 @@ pub(crate) fn validate(
 
 #[cfg(test)]
 mod tests {
-    use super::{ValidationError, validate};
+    use super::{validate, ValidationError};
 
     const VERSION: &str = "0.5.3";
     const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";

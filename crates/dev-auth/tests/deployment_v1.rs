@@ -384,9 +384,10 @@ fn binding_duplicates_and_disagreeing_source_selections_fail_before_plan_intake(
     )
     .is_err());
 
-    let document =
-        parse_deployment_document(deployment_with_bindings(&[selected.clone()]).as_bytes())
-            .unwrap();
+    let document = parse_deployment_document(
+        deployment_with_bindings(std::slice::from_ref(&selected)).as_bytes(),
+    )
+    .unwrap();
     let mut conflicting = cli_equivalent();
     let mut changed = selected;
     changed.sha256 = "b".repeat(64);

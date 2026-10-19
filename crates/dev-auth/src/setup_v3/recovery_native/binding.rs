@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Source fixture for retained V5 binding capture, recovery and inactive restoration.
 //! Only the enclosing ignored disposable-container test may invoke this module.
 use super::*;

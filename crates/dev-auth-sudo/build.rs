@@ -8,7 +8,7 @@ mod identity {
 
 mod abi_identity;
 
-fn main() {
+fn main() -> std::io::Result<()> {
     identity::emit();
     println!("cargo:rerun-if-changed=abi_identity.rs");
     println!(
@@ -16,7 +16,7 @@ fn main() {
         abi_identity::identity()
     );
     let output = std::path::PathBuf::from(
-        std::env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"),
+        std::env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"), // INVARIANT: Cargo supplies OUT_DIR before invoking a build script.
     )
     .join("dev-auth-sudo-abi.rs");
     std::fs::write(
@@ -27,6 +27,6 @@ fn main() {
             abi_identity::PLUGIN_API_VERSION,
             abi_identity::GROUP_API_VERSION,
         ),
-    )
-    .expect("write product-owned sudo ABI constants");
+    )?;
+    Ok(())
 }

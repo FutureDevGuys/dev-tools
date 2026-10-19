@@ -367,6 +367,44 @@ fn candidate_workloads(
         .workloads)
 }
 
+fn candidate_binding_intents(
+    generation: &RetainedSetupGeneration,
+    account: &NativeAccountIdentity,
+) -> Result<BTreeMap<String, crate::smart_binding::BindingIntent>> {
+    let plan = &generation.plan;
+    if plan.intent.schema != "dev-auth-deployment-intent-v3"
+        || plan.intent.activation != Activation::Transparent
+        || !plan.accounts.contains(account)
+    {
+        return Ok(BTreeMap::new());
+    }
+    let mut bindings = BTreeMap::new();
+    for reference in plan
+        .intent
+        .bindings
+        .iter()
+        .filter(|binding| binding.user == account.name)
+    {
+        let subject = format!("{}/{}", reference.user, reference.name);
+        let identity = document_identity(plan, "binding_plan", &subject)?;
+        let binding = crate::smart_binding::source::decode_plan(
+            candidate_bytes(&generation.candidate_documents, identity)?,
+            &identity.sha256,
+            false,
+        )?;
+        if binding.name != reference.name {
+            bail!("candidate binding alias differs from its approved declaration");
+        }
+        if bindings
+            .insert(binding.intent.command_name.clone(), binding.intent)
+            .is_some()
+        {
+            bail!("candidate binding aliases are duplicated");
+        }
+    }
+    Ok(bindings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,42 +873,4 @@ mod tests {
         assert!(retirement.retire().unwrap());
         retirement.verify_retired().unwrap();
     }
-}
-
-fn candidate_binding_intents(
-    generation: &RetainedSetupGeneration,
-    account: &NativeAccountIdentity,
-) -> Result<BTreeMap<String, crate::smart_binding::BindingIntent>> {
-    let plan = &generation.plan;
-    if plan.intent.schema != "dev-auth-deployment-intent-v3"
-        || plan.intent.activation != Activation::Transparent
-        || !plan.accounts.contains(account)
-    {
-        return Ok(BTreeMap::new());
-    }
-    let mut bindings = BTreeMap::new();
-    for reference in plan
-        .intent
-        .bindings
-        .iter()
-        .filter(|binding| binding.user == account.name)
-    {
-        let subject = format!("{}/{}", reference.user, reference.name);
-        let identity = document_identity(plan, "binding_plan", &subject)?;
-        let binding = crate::smart_binding::source::decode_plan(
-            candidate_bytes(&generation.candidate_documents, identity)?,
-            &identity.sha256,
-            false,
-        )?;
-        if binding.name != reference.name {
-            bail!("candidate binding alias differs from its approved declaration");
-        }
-        if bindings
-            .insert(binding.intent.command_name.clone(), binding.intent)
-            .is_some()
-        {
-            bail!("candidate binding aliases are duplicated");
-        }
-    }
-    Ok(bindings)
 }

@@ -242,6 +242,12 @@ fn populated(bytes: &[u8]) -> Result<bool> {
     }
 }
 
+pub(super) fn require_grant_empty() -> Result<()> {
+    let root = KernelDirectory::open(Path::new(crate::linux_admission::WORKLOAD_CGROUP_ROOT))?;
+    root.require_empty(OsStr::new("dev-auth-grants.service"))?;
+    root.validate()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,10 +319,4 @@ mod tests {
         }
         assert!(populated(&vec![b' '; 4097]).is_err());
     }
-}
-
-pub(super) fn require_grant_empty() -> Result<()> {
-    let root = KernelDirectory::open(Path::new(crate::linux_admission::WORKLOAD_CGROUP_ROOT))?;
-    root.require_empty(OsStr::new("dev-auth-grants.service"))?;
-    root.validate()
 }

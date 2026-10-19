@@ -20,7 +20,7 @@ fn cancellation_does_not_replace_an_observed_process_exit() {
         let observed = child.wait().unwrap();
         let result = wait_with_cancel_timeout(
             &mut child,
-            Some(Duration::from_secs(1)),
+            CommandDeadline::new(Some(Duration::from_secs(1))),
             Some(Arc::new(|| true)),
             None,
         );
@@ -63,6 +63,7 @@ fn cancellation_drain_keeps_exited_status_and_releases_descendant_pipes() {
             None,
             (!guard_cleanup).then_some(&cancellation),
             guard_cleanup.then_some(&guard),
+            CommandDeadline::new(Some(Duration::from_secs(1))),
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(child.try_wait().unwrap(), Some(observed));
@@ -201,6 +202,51 @@ fn capture_timeout_preserves_partial_output_and_settles_owned_io() {
         assert!(sender.send("not delivered".to_string()).is_err());
         assert!(!pid_exists(pid.load(Ordering::SeqCst) as i32));
     }
+}
+
+#[test]
+fn capture_deadline_includes_descendant_pipe_drain_after_leader_exit() {
+    let temp = TempDir::new().unwrap();
+    let tool = temp.path().join("exited-leader-fixture");
+    write_executable(
+        &tool,
+        "#!/bin/sh\ntrap '' TERM\nprintf 'leader completed\\n'\nprintf 'retained diagnostic\\n' >&2\n/bin/sleep 3 &\nexit 0\n",
+    );
+    let started = std::time::Instant::now();
+    let result = run_capture(
+        tool.to_str().unwrap(),
+        std::iter::empty::<&str>(),
+        Some(Duration::from_millis(250)),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "descendant output outlived the command deadline: {elapsed:?}"
+    );
+    let error = result.expect_err("unsettled command output must not be reported as success");
+    assert!(process_timed_out(&error), "{error:#}");
+    let partial = process_exit_output(&error).unwrap();
+    assert!(partial.contains("leader completed"));
+    assert!(partial.contains("retained diagnostic"));
+}
+
+#[test]
+fn capture_deadline_allows_descendant_output_that_settles_in_time() {
+    let temp = TempDir::new().unwrap();
+    let tool = temp.path().join("settled-descendant-fixture");
+    write_executable(
+        &tool,
+        "#!/bin/sh\n/bin/sh -c '/bin/sleep 0.1; printf \"descendant result\\n\"' &\nexit 0\n",
+    );
+    assert_eq!(
+        run_capture(
+            tool.to_str().unwrap(),
+            std::iter::empty::<&str>(),
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap(),
+        "descendant result\n"
+    );
 }
 
 struct EnvVarGuard {

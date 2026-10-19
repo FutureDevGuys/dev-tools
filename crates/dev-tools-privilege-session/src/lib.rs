@@ -148,10 +148,9 @@ impl LeaseLifecycle {
 
     /// This facade always has a finite budget, preserving the existing API.
     pub const fn remaining_uses(&self) -> u64 {
-        match self.core.remaining_uses() {
-            Some(remaining) => remaining,
-            None => panic!("fixed lease facade always constructs a finite budget"),
-        }
+        self.core
+            .remaining_uses()
+            .expect("fixed lease facade always constructs a finite budget") // INVARIANT: the sole constructor supplies Some(uses), and lifecycle operations never change its budget kind.
     }
 
     /// Merely owning a lifecycle installs no timer and stops no process.

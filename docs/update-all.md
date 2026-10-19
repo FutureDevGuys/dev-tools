@@ -25,6 +25,13 @@ can still run after an earlier failure. The corresponding `*_exclude` fields
 remove exact task IDs only from generated selected-task relationships; explicit
 relationships remain authoritative. Unknown IDs and cycles fail validation.
 
+In the unreleased runner correction, a command's configured timeout covers its
+direct-child wait and owned output/input settlement. A child that exits while a
+descendant retains captured pipes cannot extend that deadline indefinitely.
+Timeout cleanup keeps partial output, settles the owned process group, and then
+releases task resources; it does not authorize replay or classify the underlying
+cause as a network failure. See [ADR 0026](../crates/update-all/docs/adr/0026-command-output-fidelity-and-bounded-diagnostics.md).
+
 Outcome values are `updated`, `no_op`, `not_applicable`, `deferred`, `failed`, `blocked`, and `cancelled`. Exit status `0` means clean completion, `1` task failures, `2` deferrals only, `3` an invalid plan or cancelled required prompt, and `4` updater integrity failure.
 
 Authenticated product operations share one interface:

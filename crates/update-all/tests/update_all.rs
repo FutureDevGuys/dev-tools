@@ -124,6 +124,94 @@ policy_key = "tool_update"
 
 #[cfg(unix)]
 #[test]
+fn command_deadline_settles_descendant_output_and_releases_scheduler_lock() {
+    for engine in ["sync", "async"] {
+        let home = TempDir::new().unwrap();
+        let config_dir = home.path().join("config/update-all");
+        let catalog_dir = config_dir.join("catalog.d/local");
+        fs::create_dir_all(&catalog_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[install]\nauto_update=false\n[engine]\nmode=\"{engine}\"\njobs=\"2\"\n[tasks.tool_update]\ntimeout_secs=1\nretries=0\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            catalog_dir.join("deadline.toml"),
+            r#"
+[tasks."local/a-holder"]
+label = "Deadline holder"
+os = ["linux", "macos"]
+detect_mode = "command_available"
+category = "maintenance"
+command = "sh"
+args = ["-c", "trap '' TERM; printf 'leader result\\n'; printf 'retained evidence\\n' >&2; sleep 4 & exit 0"]
+policy_key = "tool_update"
+resource_locks = ["fixture-resource"]
+
+[tasks."local/b-follower"]
+label = "Deadline follower"
+os = ["linux", "macos"]
+detect_mode = "command_available"
+category = "maintenance"
+command = "sh"
+args = ["-c", "printf 'follower completed\\n'"]
+policy_key = "tool_update"
+resource_locks = ["fixture-resource"]
+"#,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        command(&home)
+            .args([
+                "--plain",
+                "--completions",
+                "off",
+                "--only",
+                "local/a-holder,local/b-follower",
+            ])
+            .timeout(std::time::Duration::from_secs(8))
+            .assert()
+            .code(1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{engine} retained a task lock beyond its command deadline"
+        );
+        let run = fs::read_dir(home.path().join("state/update-all/runs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("run.json").is_file())
+            .unwrap();
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+        let tasks = artifact["tasks"].as_array().unwrap();
+        let holder = tasks
+            .iter()
+            .find(|task| task["task_id"] == "local/a-holder")
+            .unwrap();
+        let follower = tasks
+            .iter()
+            .find(|task| task["task_id"] == "local/b-follower")
+            .unwrap();
+        assert_eq!(holder["status"], "failed");
+        assert!(holder["detail"].as_str().unwrap().contains("timeout"));
+        assert_eq!(follower["status"], "completed");
+        assert_eq!(artifact["failed_task_count"], 1);
+        let logs = fs::read_dir(&run)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+            .filter_map(|path| fs::read_to_string(path).ok())
+            .collect::<String>();
+        assert!(logs.contains("leader result"));
+        assert!(logs.contains("retained evidence"));
+        assert!(logs.contains("follower completed"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn persisted_runs_identify_the_executing_build_without_caller_values() {
     for engine in ["sync", "async"] {
         for child_exit in [0, 7] {

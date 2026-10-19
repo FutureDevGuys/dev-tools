@@ -579,69 +579,6 @@ fn preflight_public_binding_parent(
     Ok(retained)
 }
 
-#[cfg(test)]
-mod public_parent_tests {
-    use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    #[test]
-    fn unsafe_earlier_ancestor_rejects_before_publication_or_storage_sync() {
-        for mode in [0o700, 0o777, 0o1755] {
-            let anchor = tempfile::tempdir().unwrap();
-            fs::set_permissions(anchor.path(), fs::Permissions::from_mode(0o755)).unwrap();
-            let earlier = anchor.path().join("earlier");
-            let closest = earlier.join("closest");
-            fs::create_dir(&earlier).unwrap();
-            fs::create_dir(&closest).unwrap();
-            fs::set_permissions(&earlier, fs::Permissions::from_mode(mode)).unwrap();
-            fs::set_permissions(&closest, fs::Permissions::from_mode(0o755)).unwrap();
-            let selected = closest.join("selected");
-            let mut entered_preparation = false;
-            let result = prepare_public_binding_parent_paths(
-                &[anchor.path(), &earlier, &closest, &selected],
-                nix::unistd::Uid::effective().as_raw(),
-                |preparation| {
-                    entered_preparation = true;
-                    Ok(preparation.prepare()?.1)
-                },
-            );
-            assert!(result.is_err());
-            assert!(!entered_preparation);
-            assert!(!selected.exists());
-            assert_eq!(
-                fs::symlink_metadata(&earlier).unwrap().mode() & 0o7777,
-                mode
-            );
-            assert_eq!(fs::read_dir(&closest).unwrap().count(), 0);
-        }
-    }
-
-    #[test]
-    fn incompatible_existing_leaf_rejects_before_storage_sync_without_chmod() {
-        let anchor = tempfile::tempdir().unwrap();
-        fs::set_permissions(anchor.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        let selected = anchor.path().join("selected");
-        fs::create_dir(&selected).unwrap();
-        fs::set_permissions(&selected, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut entered_preparation = false;
-        let result = prepare_public_binding_parent_paths(
-            &[anchor.path(), &selected],
-            nix::unistd::Uid::effective().as_raw(),
-            |preparation| {
-                entered_preparation = true;
-                Ok(preparation.prepare()?.1)
-            },
-        );
-        assert!(result.is_err());
-        assert!(!entered_preparation);
-        assert_eq!(
-            fs::symlink_metadata(&selected).unwrap().mode() & 0o7777,
-            0o700
-        );
-        assert_eq!(fs::read_dir(&selected).unwrap().count(), 0);
-    }
-}
-
 pub fn read_at(
     path: &Path,
     mode: crate::setup::InstallMode,
@@ -1464,4 +1401,67 @@ fn require_store_entries(path: &Path, owner_uid: u32, mode: u32, expected: &[&st
         bail!("pinned store contains an unowned entry");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod public_parent_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn unsafe_earlier_ancestor_rejects_before_publication_or_storage_sync() {
+        for mode in [0o700, 0o777, 0o1755] {
+            let anchor = tempfile::tempdir().unwrap();
+            fs::set_permissions(anchor.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let earlier = anchor.path().join("earlier");
+            let closest = earlier.join("closest");
+            fs::create_dir(&earlier).unwrap();
+            fs::create_dir(&closest).unwrap();
+            fs::set_permissions(&earlier, fs::Permissions::from_mode(mode)).unwrap();
+            fs::set_permissions(&closest, fs::Permissions::from_mode(0o755)).unwrap();
+            let selected = closest.join("selected");
+            let mut entered_preparation = false;
+            let result = prepare_public_binding_parent_paths(
+                &[anchor.path(), &earlier, &closest, &selected],
+                nix::unistd::Uid::effective().as_raw(),
+                |preparation| {
+                    entered_preparation = true;
+                    Ok(preparation.prepare()?.1)
+                },
+            );
+            assert!(result.is_err());
+            assert!(!entered_preparation);
+            assert!(!selected.exists());
+            assert_eq!(
+                fs::symlink_metadata(&earlier).unwrap().mode() & 0o7777,
+                mode
+            );
+            assert_eq!(fs::read_dir(&closest).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn incompatible_existing_leaf_rejects_before_storage_sync_without_chmod() {
+        let anchor = tempfile::tempdir().unwrap();
+        fs::set_permissions(anchor.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let selected = anchor.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut entered_preparation = false;
+        let result = prepare_public_binding_parent_paths(
+            &[anchor.path(), &selected],
+            nix::unistd::Uid::effective().as_raw(),
+            |preparation| {
+                entered_preparation = true;
+                Ok(preparation.prepare()?.1)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!entered_preparation);
+        assert_eq!(
+            fs::symlink_metadata(&selected).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(&selected).unwrap().count(), 0);
+    }
 }

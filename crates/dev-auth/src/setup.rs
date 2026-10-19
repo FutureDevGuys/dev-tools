@@ -29,6 +29,7 @@ pub use maintenance::{
 };
 
 const RECEIPT_SCHEMA: &str = "dev-auth-install-v2";
+pub(crate) const INSTALLATION_DIRECTORY_MODE: u32 = 0o755;
 
 pub fn setup_template(name: &str) -> Result<&'static str> {
     match name {
@@ -367,7 +368,7 @@ fn shared_installation_layout(
             InstallMode::Strong => 0,
             InstallMode::UserOnly => nix::unistd::Uid::effective().as_raw(),
         },
-        directory_mode: 0o755,
+        directory_mode: INSTALLATION_DIRECTORY_MODE,
         bin_directory_mode: None,
     }
 }
@@ -7560,6 +7561,239 @@ fn receipt_mode_matches_installation(mode: u32, installation_mode: InstallMode) 
     }
 }
 
+pub(crate) fn binary_plan_schema(purpose: crate::deployment::SetupPurpose) -> &'static str {
+    if purpose.is_credentials() {
+        "dev-auth-setup-plan-v2"
+    } else {
+        "dev-auth-setup-binary-plan-v3"
+    }
+}
+
+fn validate_native_tool_selection(
+    purpose: crate::deployment::SetupPurpose,
+    mode: InstallMode,
+    version: &str,
+    git: &Path,
+    gh: &Path,
+    transparent: bool,
+) -> Result<()> {
+    if purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
+        if !cfg!(target_os = "linux")
+            || mode != InstallMode::Strong
+            || semver::Version::parse(version)? < semver::Version::new(0, 5, 0)
+            || !git.as_os_str().is_empty()
+            || !gh.as_os_str().is_empty()
+            || transparent
+        {
+            bail!("privilege-only installation has incompatible credential-tool authority");
+        }
+        return Ok(());
+    }
+    validate_native_program(git, "native Git")?;
+    validate_native_program(gh, "native GitHub CLI")?;
+    Ok(())
+}
+
+fn validate_receipted_native_tools(receipt: &InstallReceipt) -> Result<()> {
+    validate_native_tool_selection(
+        receipt.purpose,
+        receipt.mode,
+        &receipt.version,
+        Path::new(&receipt.native_git),
+        Path::new(&receipt.native_gh),
+        !receipt.transparent_aliases.is_empty(),
+    )
+}
+
+pub(crate) fn build_verified_privilege_release_plan(
+    verified: crate::release_manifest::VerifiedDevAuthRelease,
+) -> Result<SetupPlan> {
+    let request = InstallRequest {
+        purpose: crate::deployment::SetupPurpose::PrivilegeOnly,
+        mode: InstallMode::Strong,
+        version: verified.version.clone(),
+        source_executable: fs::canonicalize(&verified.artifact_path)?,
+        native_git: PathBuf::new(),
+        native_gh: PathBuf::new(),
+        activate_transparent_launchers: false,
+    };
+    let mut plan = build_plan(&SetupPaths::strong(), &request)?;
+    if plan.source_length != verified.artifact_length
+        || plan.source_sha256 != verified.artifact_sha256
+    {
+        bail!("privilege release changed before planning");
+    }
+    plan.verified_release = Some(verified);
+    validate_plan(&plan)?;
+    Ok(plan)
+}
+
+pub(crate) fn require_preserving_purpose(
+    prior: crate::deployment::SetupPurpose,
+    next: crate::deployment::SetupPurpose,
+) -> Result<()> {
+    if prior != next {
+        bail!("installation purpose changes require a complete preserving setup transition");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn require_independent_setup_execution() -> Result<()> {
+    let group = crate::linux_admission::read_unified_cgroup(std::process::id())?;
+    if setup_is_in_privilege_domain(&group) {
+        bail!(
+            "setup and recovery require independent native approval outside administrator-grant execution; use --authorize polkit from an ordinary terminal"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn setup_is_in_privilege_domain(group: &Path) -> bool {
+    group.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name.starts_with("dev-auth-maintenance-")
+            || name == "dev-auth-grants.service"
+            || name
+                .strip_prefix("dev-auth-grants-accept-")
+                .and_then(|name| name.strip_suffix(".service"))
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
+}
+
+pub(crate) fn read_install_receipt_at(paths: &SetupPaths) -> Result<Option<InstallReceipt>> {
+    match fs::symlink_metadata(paths.receipt_path()) {
+        Ok(_) => read_receipt(&paths.receipt_path()).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect current installation receipt"),
+    }
+}
+
+pub(crate) fn validated_privileged_launcher_installation() -> Result<(SetupPaths, InstallReceipt)> {
+    let current = std::env::current_exe().context("resolve privileged workload launcher")?;
+    if current != Path::new(PRIVILEGED_LAUNCHER_PATH) {
+        bail!("privileged workload dispatch requires the dedicated launcher identity");
+    }
+    let (paths, receipt) = current_installation_from_privileged_launcher(&current)?;
+    let executable = paths.versioned_binary(&receipt.version);
+    verify_privileged_launcher(&executable, &receipt)?;
+    Ok((paths, receipt))
+}
+
+pub(crate) fn verify_current_workload_alias_link(
+    alias: &str,
+    home: &Path,
+    owner_uid: u32,
+    executable: &Path,
+) -> Result<()> {
+    validate_workload_alias_names(&[alias.to_owned()])?;
+    let receipt = read_workload_alias_receipt(home, owner_uid)?
+        .context("workload launcher receipt is not installed")?;
+    if !receipt.aliases.iter().any(|value| value == alias)
+        || Path::new(&receipt.executable) != executable
+    {
+        bail!("workload launcher is outside the installed alias set");
+    }
+    let path = home.join(".local/bin").join(alias);
+    let metadata = fs::symlink_metadata(&path).context("inspect current workload launcher")?;
+    if !metadata.file_type().is_symlink() || fs::read_link(&path)? != executable {
+        bail!("current workload launcher does not match its receipt");
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_system_policy_with_bound_launchers_at(
+    paths: &SetupPaths,
+    source: &Path,
+    approved_sha256: &str,
+    current_sha256: Option<&str>,
+    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
+) -> Result<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        bail!("strong administrator policy mutation requires a native platform backend");
+    }
+    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
+        bail!("administrator policy installation requires root and the system layout");
+    }
+    if !selected_mutable_launchers.is_empty() {
+        #[cfg(target_os = "linux")]
+        crate::setup_v3::require_pending_binding_policy_selection(
+            paths,
+            approved_sha256,
+            selected_mutable_launchers,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        bail!("mutable binding publication requires a native Linux backend");
+    }
+    let bytes = read_approved_public_document(source, approved_sha256)?;
+    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
+    validate_system_policy_programs_with_bindings(&policy, selected_mutable_launchers)?;
+    let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
+    match (fs::symlink_metadata(&destination), current_sha256) {
+        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+            install_policy_document(&destination, &bytes, 0, 0o644)?;
+        }
+        (Err(error), _) => return Err(error).context("inspect administrator policy"),
+        (Ok(_), _) if fs::read(&destination)? == bytes => {
+            install_policy_document(&destination, &bytes, 0, 0o644)?;
+        }
+        (Ok(_), Some(current)) => {
+            require_stopped_strong_installation_at(paths)?;
+            replace_policy_document(&destination, &bytes, 0, 0o644, current)?;
+        }
+        (Ok(_), None) => install_policy_document(&destination, &bytes, 0, 0o644)?,
+    }
+    Ok(destination)
+}
+
+fn validate_system_policy_programs_with_bindings(
+    policy: &crate::runtime_policy::RuntimeAdministrator,
+    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
+) -> Result<()> {
+    if policy.mode() != crate::policy_v2::SystemMode::Strong {
+        bail!("administrator policy document has the wrong mode");
+    }
+    for (description, path) in policy
+        .programs()
+        .into_iter()
+        .chain(policy.provider_programs())
+    {
+        validate_root_owned_executable(Path::new(path), description)?;
+    }
+    for path in policy.trusted_launchers().values() {
+        match selected_mutable_launchers.get(Path::new(path)) {
+            Some(uid) if *uid > 0 => validate_user_or_root_executable(
+                Path::new(path),
+                *uid,
+                "setup-bound mutable workload launcher",
+            )?,
+            Some(_) => bail!("setup-bound mutable launcher has no native owner"),
+            None => validate_root_owned_executable(Path::new(path), "trusted workload launcher")?,
+        }
+    }
+    if selected_mutable_launchers.keys().any(|path| {
+        !policy
+            .trusted_launchers()
+            .values()
+            .any(|trusted| Path::new(trusted) == path)
+    }) {
+        bail!("setup-bound mutable launcher is outside administrator policy");
+    }
+    for adapter in policy.sandbox_adapters().values() {
+        validate_root_owned_executable(
+            Path::new(&adapter.executable),
+            "sandbox adapter executable",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
@@ -9921,237 +10155,4 @@ adapters = []
                 .is_err()
         );
     }
-}
-
-pub(crate) fn binary_plan_schema(purpose: crate::deployment::SetupPurpose) -> &'static str {
-    if purpose.is_credentials() {
-        "dev-auth-setup-plan-v2"
-    } else {
-        "dev-auth-setup-binary-plan-v3"
-    }
-}
-
-fn validate_native_tool_selection(
-    purpose: crate::deployment::SetupPurpose,
-    mode: InstallMode,
-    version: &str,
-    git: &Path,
-    gh: &Path,
-    transparent: bool,
-) -> Result<()> {
-    if purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
-        if !cfg!(target_os = "linux")
-            || mode != InstallMode::Strong
-            || semver::Version::parse(version)? < semver::Version::new(0, 5, 0)
-            || !git.as_os_str().is_empty()
-            || !gh.as_os_str().is_empty()
-            || transparent
-        {
-            bail!("privilege-only installation has incompatible credential-tool authority");
-        }
-        return Ok(());
-    }
-    validate_native_program(git, "native Git")?;
-    validate_native_program(gh, "native GitHub CLI")?;
-    Ok(())
-}
-
-fn validate_receipted_native_tools(receipt: &InstallReceipt) -> Result<()> {
-    validate_native_tool_selection(
-        receipt.purpose,
-        receipt.mode,
-        &receipt.version,
-        Path::new(&receipt.native_git),
-        Path::new(&receipt.native_gh),
-        !receipt.transparent_aliases.is_empty(),
-    )
-}
-
-pub(crate) fn build_verified_privilege_release_plan(
-    verified: crate::release_manifest::VerifiedDevAuthRelease,
-) -> Result<SetupPlan> {
-    let request = InstallRequest {
-        purpose: crate::deployment::SetupPurpose::PrivilegeOnly,
-        mode: InstallMode::Strong,
-        version: verified.version.clone(),
-        source_executable: fs::canonicalize(&verified.artifact_path)?,
-        native_git: PathBuf::new(),
-        native_gh: PathBuf::new(),
-        activate_transparent_launchers: false,
-    };
-    let mut plan = build_plan(&SetupPaths::strong(), &request)?;
-    if plan.source_length != verified.artifact_length
-        || plan.source_sha256 != verified.artifact_sha256
-    {
-        bail!("privilege release changed before planning");
-    }
-    plan.verified_release = Some(verified);
-    validate_plan(&plan)?;
-    Ok(plan)
-}
-
-pub(crate) fn require_preserving_purpose(
-    prior: crate::deployment::SetupPurpose,
-    next: crate::deployment::SetupPurpose,
-) -> Result<()> {
-    if prior != next {
-        bail!("installation purpose changes require a complete preserving setup transition");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn require_independent_setup_execution() -> Result<()> {
-    let group = crate::linux_admission::read_unified_cgroup(std::process::id())?;
-    if setup_is_in_privilege_domain(&group) {
-        bail!(
-            "setup and recovery require independent native approval outside administrator-grant execution; use --authorize polkit from an ordinary terminal"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn setup_is_in_privilege_domain(group: &Path) -> bool {
-    group.components().any(|component| {
-        let std::path::Component::Normal(name) = component else {
-            return false;
-        };
-        let Some(name) = name.to_str() else {
-            return false;
-        };
-        name.starts_with("dev-auth-maintenance-")
-            || name == "dev-auth-grants.service"
-            || name
-                .strip_prefix("dev-auth-grants-accept-")
-                .and_then(|name| name.strip_suffix(".service"))
-                .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    })
-}
-
-pub(crate) fn read_install_receipt_at(paths: &SetupPaths) -> Result<Option<InstallReceipt>> {
-    match fs::symlink_metadata(paths.receipt_path()) {
-        Ok(_) => read_receipt(&paths.receipt_path()).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("inspect current installation receipt"),
-    }
-}
-
-pub(crate) fn validated_privileged_launcher_installation() -> Result<(SetupPaths, InstallReceipt)> {
-    let current = std::env::current_exe().context("resolve privileged workload launcher")?;
-    if current != Path::new(PRIVILEGED_LAUNCHER_PATH) {
-        bail!("privileged workload dispatch requires the dedicated launcher identity");
-    }
-    let (paths, receipt) = current_installation_from_privileged_launcher(&current)?;
-    let executable = paths.versioned_binary(&receipt.version);
-    verify_privileged_launcher(&executable, &receipt)?;
-    Ok((paths, receipt))
-}
-
-pub(crate) fn verify_current_workload_alias_link(
-    alias: &str,
-    home: &Path,
-    owner_uid: u32,
-    executable: &Path,
-) -> Result<()> {
-    validate_workload_alias_names(&[alias.to_owned()])?;
-    let receipt = read_workload_alias_receipt(home, owner_uid)?
-        .context("workload launcher receipt is not installed")?;
-    if !receipt.aliases.iter().any(|value| value == alias)
-        || Path::new(&receipt.executable) != executable
-    {
-        bail!("workload launcher is outside the installed alias set");
-    }
-    let path = home.join(".local/bin").join(alias);
-    let metadata = fs::symlink_metadata(&path).context("inspect current workload launcher")?;
-    if !metadata.file_type().is_symlink() || fs::read_link(&path)? != executable {
-        bail!("current workload launcher does not match its receipt");
-    }
-    Ok(())
-}
-
-pub(crate) fn reconcile_system_policy_with_bound_launchers_at(
-    paths: &SetupPaths,
-    source: &Path,
-    approved_sha256: &str,
-    current_sha256: Option<&str>,
-    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
-) -> Result<PathBuf> {
-    if !cfg!(target_os = "linux") {
-        bail!("strong administrator policy mutation requires a native platform backend");
-    }
-    if !nix::unistd::Uid::effective().is_root() || *paths != SetupPaths::strong() {
-        bail!("administrator policy installation requires root and the system layout");
-    }
-    if !selected_mutable_launchers.is_empty() {
-        #[cfg(target_os = "linux")]
-        crate::setup_v3::require_pending_binding_policy_selection(
-            paths,
-            approved_sha256,
-            selected_mutable_launchers,
-        )?;
-        #[cfg(not(target_os = "linux"))]
-        bail!("mutable binding publication requires a native Linux backend");
-    }
-    let bytes = read_approved_public_document(source, approved_sha256)?;
-    let policy = crate::runtime_policy::parse_runtime_administrator(&bytes)?;
-    validate_system_policy_programs_with_bindings(&policy, selected_mutable_launchers)?;
-    let destination = PathBuf::from(crate::policy_store::SYSTEM_POLICY_PATH);
-    match (fs::symlink_metadata(&destination), current_sha256) {
-        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
-            install_policy_document(&destination, &bytes, 0, 0o644)?;
-        }
-        (Err(error), _) => return Err(error).context("inspect administrator policy"),
-        (Ok(_), _) if fs::read(&destination)? == bytes => {
-            install_policy_document(&destination, &bytes, 0, 0o644)?;
-        }
-        (Ok(_), Some(current)) => {
-            require_stopped_strong_installation_at(paths)?;
-            replace_policy_document(&destination, &bytes, 0, 0o644, current)?;
-        }
-        (Ok(_), None) => install_policy_document(&destination, &bytes, 0, 0o644)?,
-    }
-    Ok(destination)
-}
-
-fn validate_system_policy_programs_with_bindings(
-    policy: &crate::runtime_policy::RuntimeAdministrator,
-    selected_mutable_launchers: &BTreeMap<PathBuf, u32>,
-) -> Result<()> {
-    if policy.mode() != crate::policy_v2::SystemMode::Strong {
-        bail!("administrator policy document has the wrong mode");
-    }
-    for (description, path) in policy
-        .programs()
-        .into_iter()
-        .chain(policy.provider_programs())
-    {
-        validate_root_owned_executable(Path::new(path), description)?;
-    }
-    for path in policy.trusted_launchers().values() {
-        match selected_mutable_launchers.get(Path::new(path)) {
-            Some(uid) if *uid > 0 => validate_user_or_root_executable(
-                Path::new(path),
-                *uid,
-                "setup-bound mutable workload launcher",
-            )?,
-            Some(_) => bail!("setup-bound mutable launcher has no native owner"),
-            None => validate_root_owned_executable(Path::new(path), "trusted workload launcher")?,
-        }
-    }
-    if selected_mutable_launchers.keys().any(|path| {
-        !policy
-            .trusted_launchers()
-            .values()
-            .any(|trusted| Path::new(trusted) == path)
-    }) {
-        bail!("setup-bound mutable launcher is outside administrator policy");
-    }
-    for adapter in policy.sandbox_adapters().values() {
-        validate_root_owned_executable(
-            Path::new(&adapter.executable),
-            "sandbox adapter executable",
-        )?;
-    }
-    Ok(())
 }

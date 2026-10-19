@@ -1016,7 +1016,9 @@ mod tests {
         assert!(store
             .observe_for_restoration(&prior, ShellRestorationObservation::RetainedComplete, &[])
             .is_err());
-        assert!(store.resume_for_restoration(&[prior.clone()]).is_err());
+        assert!(store
+            .resume_for_restoration(std::slice::from_ref(&prior))
+            .is_err());
         assert!(store.resume_for_restoration(&selected).unwrap());
         assert!(store.observe(&prior, true).unwrap());
         assert!(!store.observe(&candidate, false).unwrap());

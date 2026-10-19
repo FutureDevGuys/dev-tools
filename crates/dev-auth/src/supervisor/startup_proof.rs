@@ -348,6 +348,92 @@ pub(crate) fn validate_writer(file: &File) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_release_writer(release: &OwnedFd) -> Result<()> {
+    let file = File::from(rustix::io::fcntl_dupfd_cloexec(release, 3)?);
+    let flags = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETFL)?;
+    if !file.metadata()?.file_type().is_fifo()
+        || flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
+        || flags & nix::libc::O_NONBLOCK == 0
+    {
+        bail!("bootstrap release requires a retained write-only pipe");
+    }
+    Ok(())
+}
+
+pub(crate) fn send_byte(socket: &File, byte: u8) -> Result<()> {
+    use nix::sys::socket::{send, MsgFlags};
+    if send(
+        socket.as_raw_fd(),
+        &[byte],
+        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+    )? != 1
+    {
+        bail!("private startup message was not sent exactly");
+    }
+    Ok(())
+}
+
+pub(crate) fn await_release_witness(
+    socket: &OwnedFd,
+    owner: &RootSpawnOwner,
+    proof: &Proof,
+) -> Result<()> {
+    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
+    loop {
+        proof.recheck(owner)?;
+        if Instant::now() >= deadline {
+            bail!("native release witness timed out");
+        }
+        let mut poller = [PollFd::new(
+            socket.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        poll(&mut poller, PollTimeout::from(20_u16))?;
+        let Some(message) = receive(socket)? else {
+            continue;
+        };
+        if message.byte != 3
+            || message.credentials.pid as u32 != proof.pid
+            || message.credentials.uid != owner.uid
+            || message.credentials.gid != owner.gid
+            || pidfd_pid(&message.pidfd)? != proof.pid
+        {
+            bail!("native release witness differs from the retained ready monitor");
+        }
+        proof.recheck(owner)?;
+        return Ok(());
+    }
+}
+
+pub(crate) fn send_commit_receipt(socket: &OwnedFd) -> Result<()> {
+    let file = File::from(rustix::io::fcntl_dupfd_cloexec(socket, 3)?);
+    send_byte(&file, 4)
+}
+
+pub(crate) fn await_commit_receipt(socket: &File) -> Result<()> {
+    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("release commit receipt timed out");
+        }
+        let mut poller = [PollFd::new(
+            socket.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        poll(&mut poller, PollTimeout::from(20_u16))?;
+        let mut bytes = [0_u8; 2];
+        match nix::sys::socket::recv(
+            socket.as_raw_fd(),
+            &mut bytes,
+            nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(1) if bytes[0] == 4 => return Ok(()),
+            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+            _ => bail!("release commit receipt was absent or invalid"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,91 +564,5 @@ mod tests {
         assert!(receive(&reader).is_err());
         let mut byte = [0_u8];
         assert_eq!(nix::unistd::read(&pipe_reader, &mut byte).unwrap(), 0);
-    }
-}
-
-pub(crate) fn validate_release_writer(release: &OwnedFd) -> Result<()> {
-    let file = File::from(rustix::io::fcntl_dupfd_cloexec(release, 3)?);
-    let flags = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETFL)?;
-    if !file.metadata()?.file_type().is_fifo()
-        || flags & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
-        || flags & nix::libc::O_NONBLOCK == 0
-    {
-        bail!("bootstrap release requires a retained write-only pipe");
-    }
-    Ok(())
-}
-
-pub(crate) fn send_byte(socket: &File, byte: u8) -> Result<()> {
-    use nix::sys::socket::{send, MsgFlags};
-    if send(
-        socket.as_raw_fd(),
-        &[byte],
-        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
-    )? != 1
-    {
-        bail!("private startup message was not sent exactly");
-    }
-    Ok(())
-}
-
-pub(crate) fn await_release_witness(
-    socket: &OwnedFd,
-    owner: &RootSpawnOwner,
-    proof: &Proof,
-) -> Result<()> {
-    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
-    loop {
-        proof.recheck(owner)?;
-        if Instant::now() >= deadline {
-            bail!("native release witness timed out");
-        }
-        let mut poller = [PollFd::new(
-            socket.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
-        let Some(message) = receive(socket)? else {
-            continue;
-        };
-        if message.byte != 3
-            || message.credentials.pid as u32 != proof.pid
-            || message.credentials.uid != owner.uid
-            || message.credentials.gid != owner.gid
-            || pidfd_pid(&message.pidfd)? != proof.pid
-        {
-            bail!("native release witness differs from the retained ready monitor");
-        }
-        proof.recheck(owner)?;
-        return Ok(());
-    }
-}
-
-pub(crate) fn send_commit_receipt(socket: &OwnedFd) -> Result<()> {
-    let file = File::from(rustix::io::fcntl_dupfd_cloexec(socket, 3)?);
-    send_byte(&file, 4)
-}
-
-pub(crate) fn await_commit_receipt(socket: &File) -> Result<()> {
-    let deadline = Instant::now() + STARTUP_PROOF_TIMEOUT;
-    loop {
-        if Instant::now() >= deadline {
-            bail!("release commit receipt timed out");
-        }
-        let mut poller = [PollFd::new(
-            socket.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
-        let mut bytes = [0_u8; 2];
-        match nix::sys::socket::recv(
-            socket.as_raw_fd(),
-            &mut bytes,
-            nix::sys::socket::MsgFlags::MSG_DONTWAIT,
-        ) {
-            Ok(1) if bytes[0] == 4 => return Ok(()),
-            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
-            _ => bail!("release commit receipt was absent or invalid"),
-        }
     }
 }

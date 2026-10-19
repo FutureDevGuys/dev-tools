@@ -30,6 +30,17 @@ uses the final non-progress record instead of an earlier startup/progress line.
 That record is terminal context, not proof of the underlying cause; it does not
 reclassify a successful command, change diagnostic severity, or authorize replay.
 
+The command deadline uses one monotonic start through the direct-child wait and
+owned capture/input settlement. A direct child exiting does not grant an
+unbounded drain interval to descendants retaining its pipes. If that interval
+exhausts the original deadline, the execution owner terminates its owned group,
+settles its I/O workers, and reports a typed timeout with the observed output.
+Scheduler resources remain held until settlement. Output that settles within the
+deadline keeps the direct child's status. Cancellation retains ADR 0027's
+already-observed-exit precedence; it does not become a timeout solely because
+cleanup takes time. This does not add termination authority over escaped
+descendants or bound kernel-blocked filesystem operations.
+
 Before reporting a planned npm root as updated, verify its installed version, manifest and declared executable health even when npm printed no lifecycle warning. Share version and root observations across the planned batch. An isolated recovery invocation requests warning output without changing persistent npm configuration; lifecycle authorization continues to follow ADR 0002.
 
 Each closure member's complete registry manifest must be observed successfully and decoded as one unambiguous manifest before authorizing its scripts. The manifest name and version must exactly match the requested closure member. JSON objects and npm 12's singleton-array response are accepted; empty and multiple-result arrays are rejected. Unavailable or malformed registry metadata, invalid dependency shapes and non-registry sources stop recovery before the script-authorized retry. Existing observational parsing does not grant that authority.
@@ -69,6 +80,9 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 - `successful_capture_keeps_unterminated_stdout_separate_from_stderr`
 - `stdout_capture_failure_keeps_both_streams_in_error_context`
 - `capture_timeout_preserves_partial_output_and_settles_owned_io`
+- `capture_deadline_includes_descendant_pipe_drain_after_leader_exit`
+- `capture_deadline_allows_descendant_output_that_settles_in_time`
+- `command_deadline_settles_descendant_output_and_releases_scheduler_lock`
 - `cargo_catalog_report_preserves_updates_with_available_prereleases`
 - `go_catalog_report_preserves_mixed_versions_and_partial_failure`
 - `failed_command_report_retains_pipx_before_inventory_without_claiming_refresh`

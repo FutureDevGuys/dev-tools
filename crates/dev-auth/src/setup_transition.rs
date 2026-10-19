@@ -125,6 +125,27 @@ pub(crate) fn begin(
     digest: &str,
     capture: impl FnOnce() -> Result<Vec<u8>>,
 ) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    let data_root = {
+        use std::os::unix::fs::MetadataExt;
+
+        let prepared = dev_tools_installation::DocumentDirectoryPreparation::observe(
+            &paths.data_root,
+            owner_uid,
+            crate::setup::INSTALLATION_DIRECTORY_MODE,
+        )?;
+        match std::fs::symlink_metadata(&paths.data_root) {
+            Ok(metadata)
+                if metadata.mode() & 0o777 != crate::setup::INSTALLATION_DIRECTORY_MODE =>
+            {
+                bail!("setup transition root differs from the installation directory mode");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect setup transition root"),
+        }
+        prepared
+    };
     let path = state_path(paths);
     let authority = authority(owner_uid);
     let current = read_atomic_document(&path, &authority)?;
@@ -169,6 +190,18 @@ pub(crate) fn begin(
     };
     let bytes = serde_jcs::to_vec(&state)?;
     parse(&bytes)?;
+    #[cfg(target_os = "linux")]
+    {
+        // Retention precedes installation, so its parent must already satisfy
+        // the binary layout. Publish new final metadata before exposing the
+        // root; never chmod an existing path or let umask select its mode.
+        data_root.prepare()?;
+        dev_tools_installation::ensure_owned_directory(
+            &paths.data_root,
+            owner_uid,
+            crate::setup::INSTALLATION_DIRECTORY_MODE,
+        )?;
+    }
     // Immutable, digest-addressed-by-plan retention precedes the admission
     // marker and every candidate mutation. Retry cannot replace old bytes.
     write_atomic_document(
@@ -451,9 +484,225 @@ pub(crate) fn admit(mode: InstallMode) -> Result<InstallationLock> {
     admit_at(&lock, &state_path(&paths), uid)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn try_grant_admission() -> Result<Option<InstallationLock>> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("privilege admission requires its native coordinator");
+    }
+    try_admit_at(
+        &lock_path(DeploymentMode::Strong, None)?,
+        &SetupPaths::strong(),
+        0,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn try_admit_at(
+    lock: &Path,
+    paths: &SetupPaths,
+    owner_uid: u32,
+) -> Result<Option<InstallationLock>> {
+    let Some(lease) = InstallationLock::try_acquire_shared(lock)? else {
+        return Ok(None);
+    };
+    let Some(document) = read_atomic_document(&state_path(paths), &authority(owner_uid))? else {
+        return Ok(None);
+    };
+    let transition = parse(&document.bytes)?;
+    if transition.phase != Phase::Accepted {
+        return Ok(None);
+    }
+    read_generation(paths, owner_uid, &transition)?;
+    Ok(Some(lease))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_root_rejects_existing_wrong_modes_without_changing_custody() {
+        for mode in [0o700, 0o775] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = SetupPaths {
+                data_root: root.path().join("data"),
+                bin_dir: root.path().join("bin"),
+            };
+            std::fs::create_dir(&paths.data_root).unwrap();
+            std::fs::set_permissions(&paths.data_root, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let before = std::fs::symlink_metadata(&paths.data_root).unwrap();
+            assert!(begin(
+                &paths,
+                nix::unistd::geteuid().as_raw(),
+                &"a".repeat(64),
+                || { panic!("invalid existing root must reject before capture") }
+            )
+            .is_err());
+            let after = std::fs::symlink_metadata(&paths.data_root).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(after.mode() & 0o7777, mode);
+            assert_eq!(std::fs::read_dir(&paths.data_root).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_root_rejects_symlinks_and_failed_capture_keeps_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: root.path().join("data"),
+            bin_dir: root.path().join("bin"),
+        };
+        let owner = nix::unistd::geteuid().as_raw();
+        let digest = "a".repeat(64);
+        assert!(begin(&paths, owner, &digest, || anyhow::bail!("capture failed")).is_err());
+        assert!(!paths.data_root.exists());
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&other, &paths.data_root).unwrap();
+        assert!(begin(&paths, owner, &digest, || {
+            panic!("symlink root must reject before capture")
+        })
+        .is_err());
+        assert_eq!(std::fs::read_link(&paths.data_root).unwrap(), other);
+        assert_eq!(std::fs::read_dir(other).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_root_does_not_adopt_a_directory_created_after_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: root.path().join("data"),
+            bin_dir: root.path().join("bin"),
+        };
+        assert!(begin(
+            &paths,
+            nix::unistd::geteuid().as_raw(),
+            &"a".repeat(64),
+            || {
+                std::fs::create_dir(&paths.data_root)?;
+                std::fs::set_permissions(&paths.data_root, std::fs::Permissions::from_mode(0o755))?;
+                std::fs::write(paths.data_root.join("other-writer"), b"keep")?;
+                Ok(b"retained initial installation".to_vec())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(paths.data_root.join("other-writer")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(std::fs::read_dir(&paths.data_root).unwrap().count(), 1);
+        assert!(!state_path(&paths).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_root_mode_drift_preserves_pending_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = SetupPaths {
+            data_root: root.path().join("data"),
+            bin_dir: root.path().join("bin"),
+        };
+        let owner = nix::unistd::geteuid().as_raw();
+        let digest = "a".repeat(64);
+        begin(&paths, owner, &digest, || Ok(b"retained".to_vec())).unwrap();
+        let state = std::fs::read(state_path(&paths)).unwrap();
+        let generation = std::fs::read(generation_path(&paths, &digest)).unwrap();
+        std::fs::set_permissions(&paths.data_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(begin(&paths, owner, &digest, || {
+            panic!("pending generation must not be recaptured")
+        })
+        .is_err());
+        assert_eq!(std::fs::read(state_path(&paths)).unwrap(), state);
+        assert_eq!(
+            std::fs::read(generation_path(&paths, &digest)).unwrap(),
+            generation
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&paths.data_root).unwrap().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_retention_preserves_installation_root_mode_under_restrictive_umask() {
+        for umask in ["0022", "0077"] {
+            let root = tempfile::tempdir().unwrap();
+            let executable = std::env::current_exe().unwrap();
+            let output =
+                dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
+                    executable: &executable,
+                    arguments: &[
+                        "--ignored".into(),
+                        "--exact".into(),
+                        "setup_transition::tests::transition_root_mode_child".into(),
+                        "--test-threads=1".into(),
+                        "--nocapture".into(),
+                    ],
+                    environment: &std::collections::BTreeMap::from([
+                        ("DEV_AUTH_TEST_TRANSITION_ROOT".into(), root.path().into()),
+                        ("DEV_AUTH_TEST_TRANSITION_UMASK".into(), umask.into()),
+                    ]),
+                    cwd: Some(Path::new("/")),
+                    timeout: std::time::Duration::from_secs(15),
+                    output_limit: 64 * 1024,
+                })
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "umask {umask}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated umask child invoked only by transition_retention_preserves_installation_root_mode_under_restrictive_umask"]
+    fn transition_root_mode_child() {
+        let root = PathBuf::from(std::env::var_os("DEV_AUTH_TEST_TRANSITION_ROOT").unwrap());
+        let mask =
+            u32::from_str_radix(&std::env::var("DEV_AUTH_TEST_TRANSITION_UMASK").unwrap(), 8)
+                .unwrap();
+        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask));
+        let paths = SetupPaths {
+            data_root: root.join("data"),
+            bin_dir: root.join("bin"),
+        };
+        let owner = nix::unistd::geteuid().as_raw();
+        let digest = "e".repeat(64);
+        assert!(begin(&paths, owner, &digest, || {
+            Ok(b"retained initial installation".to_vec())
+        })
+        .unwrap());
+        let directory = std::fs::symlink_metadata(&paths.data_root).unwrap();
+        assert_eq!(directory.mode() & 0o7777, 0o755);
+        assert_eq!(directory.uid(), owner);
+        for path in [state_path(&paths), generation_path(&paths, &digest)] {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o600);
+            assert_eq!(metadata.uid(), owner);
+        }
+        dev_tools_installation::ensure_owned_directory(&paths.data_root, owner, 0o755).unwrap();
+        assert!(!begin(&paths, owner, &digest, || {
+            panic!("unchanged retry must not capture a new generation")
+        })
+        .unwrap());
+        let retried = std::fs::symlink_metadata(&paths.data_root).unwrap();
+        assert_eq!(
+            (directory.dev(), directory.ino()),
+            (retried.dev(), retried.ino())
+        );
+        assert_eq!(retried.mode() & 0o7777, 0o755);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -478,6 +727,11 @@ mod tests {
         std::fs::remove_file(&generation).unwrap();
         assert!(try_admit_at(&lock, &paths, owner).is_err());
         std::fs::write(&generation, retained).unwrap();
+        // Recreating the retained document must restore its explicit private
+        // mode, independent of the test runner's inherited umask.
+        std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(try_admit_at(&lock, &paths, owner).is_err());
+        std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o600)).unwrap();
         let lease = try_admit_at(&lock, &paths, owner).unwrap().unwrap();
         assert!(InstallationLock::try_acquire(&lock).unwrap().is_none());
         drop(lease);
@@ -840,36 +1094,4 @@ mod tests {
         drop(_writer);
         assert!(admit_at(&lock, &state_path(&paths), uid).is_ok());
     }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn try_grant_admission() -> Result<Option<InstallationLock>> {
-    if !nix::unistd::geteuid().is_root() {
-        bail!("privilege admission requires its native coordinator");
-    }
-    try_admit_at(
-        &lock_path(DeploymentMode::Strong, None)?,
-        &SetupPaths::strong(),
-        0,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn try_admit_at(
-    lock: &Path,
-    paths: &SetupPaths,
-    owner_uid: u32,
-) -> Result<Option<InstallationLock>> {
-    let Some(lease) = InstallationLock::try_acquire_shared(lock)? else {
-        return Ok(None);
-    };
-    let Some(document) = read_atomic_document(&state_path(paths), &authority(owner_uid))? else {
-        return Ok(None);
-    };
-    let transition = parse(&document.bytes)?;
-    if transition.phase != Phase::Accepted {
-        return Ok(None);
-    }
-    read_generation(paths, owner_uid, &transition)?;
-    Ok(Some(lease))
 }
