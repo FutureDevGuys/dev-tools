@@ -23,10 +23,11 @@ use crate::updaters::{
     BuiltinFoundationCommand, BuiltinManagedExecutor, BuiltinPreCommand, BuiltinReportCommand,
     BuiltinReportCommandWhen, BuiltinReportParser, BuiltinReportPattern, BuiltinScopedDelta,
     BuiltinStateReportPattern, BuiltinTask, BuiltinTaskKind, BuiltinWindowsFoundation, HostOs,
+    PrivilegeMode,
 };
 use crate::util::cancel;
 use crate::util::lockfile::{try_acquire_pid_lock, PidLockOptions, ScopedFileLock};
-use crate::util::privilege::{resolve_privilege_decision, PrivilegeDecision};
+use crate::util::privilege::{resolve_privilege_decision, PrivilegeDecision, PrivilegeUnavailable};
 use crate::util::process::{
     capture_guard_reason, process_error_stderr, process_exit_output, process_timed_out,
     run_capture_allow_exit_codes, run_capture_streaming, run_capture_streaming_allow_exit_codes,
@@ -214,12 +215,10 @@ impl TaskResult {
 
     fn blocks_dependents(&self) -> bool {
         match self.status {
-            TaskStatus::Completed => {
+            TaskStatus::Completed | TaskStatus::Skipped => {
                 self.has_blocking_report_rows() || self.has_blocking_advisory()
             }
-            TaskStatus::Failed => true,
-            TaskStatus::Canceled => true,
-            TaskStatus::Skipped => false,
+            TaskStatus::Failed | TaskStatus::Canceled => true,
         }
     }
 }
@@ -354,18 +353,35 @@ pub struct SyncContext {
 
 #[derive(Clone)]
 pub(crate) struct DashboardSender {
-    tx: mpsc::Sender<DashboardEvent>,
+    tx: crate::ui::DashboardEventSender,
     detached: Arc<AtomicBool>,
     run_log: Option<Arc<RunLogSink>>,
 }
 
 impl DashboardSender {
+    #[cfg(test)]
     pub(crate) fn new(tx: mpsc::Sender<DashboardEvent>, run_log: Option<Arc<RunLogSink>>) -> Self {
         Self {
-            tx,
+            tx: crate::ui::DashboardEventSender::fixture(tx),
             detached: Arc::new(AtomicBool::new(false)),
             run_log,
         }
+    }
+
+    pub(crate) fn bounded(
+        run_log: Option<Arc<RunLogSink>>,
+        max_records: usize,
+        task_ids: &[String],
+    ) -> (Self, crate::ui::DashboardReceiver) {
+        let (tx, rx) = crate::ui::dashboard_channel(max_records, task_ids);
+        (
+            Self {
+                tx,
+                detached: Arc::new(AtomicBool::new(false)),
+                run_log,
+            },
+            rx,
+        )
     }
 
     fn send(
@@ -394,6 +410,16 @@ impl DashboardSender {
 
     fn is_detached(&self) -> bool {
         self.detached.load(Ordering::SeqCst)
+    }
+
+    fn shutdown_ui(&self) -> std::result::Result<(), mpsc::SendError<DashboardEvent>> {
+        // Shutdown must still wake a blocked frontend after authoritative
+        // journal failure. This only releases presentation resources; it cannot
+        // admit execution or make a failed run appear successful.
+        if let Some(log) = &self.run_log {
+            let _ = journal_dashboard_event(log, &DashboardEvent::UiDone);
+        }
+        self.tx.send(DashboardEvent::UiDone)
     }
 
     fn journal_error(&self) -> Option<String> {
@@ -441,6 +467,10 @@ impl DashboardSender {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/ui_transport.rs"]
+mod dashboard_transport_tests;
 
 fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<()> {
     match event {
@@ -510,8 +540,11 @@ fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<(
                 "line": record.line,
             }),
         ),
+        // Display omissions are receiver-generated summaries, not missing
+        // execution evidence. Every original record was already journaled.
+        DashboardEvent::DisplayLogsOmitted { .. } => Ok(()),
         DashboardEvent::RunComplete { success, canceled, had_failures, .. } => log.write_event(
-            "run_completed",
+            "tasks_completed",
             None,
             serde_json::json!({"success": success, "canceled": canceled, "had_failures": had_failures}),
         ),
@@ -621,6 +654,7 @@ pub struct AsyncContext {
     pub host_os: HostOs,
     pub updater_config: UpdaterConfig,
     pub jobs: String,
+    pub engine_mode: &'static str,
     pub ui: UiModeResolved,
     pub fail_fast: bool,
     pub ui_persist_until_exit: bool,
@@ -849,6 +883,7 @@ pub(crate) struct PrivilegeSession {
     sudo_preflight: Mutex<Option<Result<(), String>>>,
     sudo_runtime_error: Mutex<Option<String>>,
     sudo_refresh_gate: Mutex<()>,
+    auto_unavailable: Mutex<Option<PrivilegeUnavailable>>,
 }
 
 #[cfg(unix)]
@@ -970,6 +1005,13 @@ impl RuntimeControl {
 }
 
 impl SyncContext {
+    fn ensure_run_evidence_healthy(&self) -> Result<()> {
+        if let Some(error) = self.run_log.as_ref().and_then(|log| log.journal_failure()) {
+            bail!("authoritative run evidence failed before command admission: {error}");
+        }
+        Ok(())
+    }
+
     fn set_task_input_state(&self, task_id: &str, enabled: bool) {
         if !enabled {
             if let Some(generation) = self.prompt_runtime.cancel(task_id) {
@@ -1164,8 +1206,12 @@ impl SyncContext {
                 line: msg,
             };
             if let Some(log) = &run_log {
-                log.write_raw(&rec);
-                log.write_record(&rec);
+                if let Err(error) = log.write_raw(&rec) {
+                    log.emit_write_warning_once(&error);
+                }
+                if let Err(error) = log.write_record(&rec) {
+                    log.emit_write_warning_once(&error);
+                }
             }
             if let Some(tx) = &tx {
                 let _ = tx.send(DashboardEvent::LogLine(rec));
@@ -1270,6 +1316,7 @@ impl SyncContext {
         command: &CommandReportCommand,
         policy: &TaskPolicy,
     ) -> Result<String> {
+        self.ensure_run_evidence_healthy()?;
         let cb = self.build_stream_callback(task_id, false);
         let args_for_run = command.args.iter().map(String::as_str);
         if let Some(runtime) = &self.runtime_control {
@@ -1326,6 +1373,7 @@ impl SyncContext {
         let mut capture_this_run = capture_foreground_output;
 
         loop {
+            self.ensure_run_evidence_healthy()?;
             // A request admitted during retry backoff must not launch new work.
             if cancel::is_cancel_requested()
                 || self
@@ -1645,6 +1693,7 @@ impl SyncContext {
     }
 
     pub fn completion_sync_for_task(&self, task_id: &str) -> Result<CompletionSyncResult> {
+        self.ensure_run_evidence_healthy()?;
         let runtime = crate::config::load_runtime_config(self.completion_config_path.clone())?;
         let shells = resolve_completion_shells(&[], &runtime.completions.shells)?;
         completion_sync(CompletionSyncArgs {
@@ -1719,131 +1768,7 @@ pub(crate) fn format_retry_delay(delay: Duration) -> String {
     }
 }
 
-pub fn run_sync(ctx: SyncContext) -> Result<()> {
-    let specs = build_task_specs(&ctx.flags, &ctx.host_os, &ctx.updater_config)
-        .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
-    if specs.is_empty() && ctx.host_os == HostOs::Unknown {
-        crate::ua_errln!(
-            "update-all: no built-in updater set is defined for this host OS; configure custom tasks or run on Linux, macOS, or Windows"
-        );
-    }
-    let selected_tasks = selected_task_ids(&specs);
-    let task_categories = task_categories_by_id(&specs);
-    let mut summary: Vec<(String, TaskResult)> = Vec::new();
-    let task_run_lock = acquire_task_run_lock(ctx.run_log.as_ref())?;
-
-    if let Some(log) = ctx.run_log.as_ref() {
-        for spec in &specs {
-            log.write_event(
-                "task_registered",
-                Some(&spec.id),
-                serde_json::json!({
-                    "label": &spec.label,
-                    "category": &spec.category,
-                    "depends_on": &spec.depends_on,
-                    "accepts_input": matches!(&spec.kind, TaskKind::Command(command) if command.interactive),
-                }),
-            )?;
-        }
-    }
-
-    for spec in specs {
-        ctx.set_task_state(&spec.id, TaskState::Running, None);
-        ensure_sync_journal_healthy(&ctx)?;
-        let result = match execute_task(&ctx, &spec) {
-            Ok(result) => result,
-            Err(e) => {
-                if e.downcast_ref::<crate::Cancelled>().is_some() {
-                    return Err(e);
-                }
-                failed_task_error_result(spec.label.clone(), spec.id.clone(), e.to_string())
-            }
-        };
-        emit_task_report_logs_sync(&ctx, &spec.id, &result.report_sections);
-        emit_task_outcome_log_sync(&ctx, &spec.id, &result);
-        ctx.set_task_state(
-            &spec.id,
-            to_task_state(result.status),
-            result.details.first().cloned(),
-        );
-        ensure_sync_journal_healthy(&ctx)?;
-        summary.push((spec.id, result));
-    }
-
-    let tasks_completed_unix_ms = now_unix_ms();
-    drop(task_run_lock);
-    print_sync_summary(&summary);
-    emit_end_of_run_reports_sync(&ctx, &summary, &task_categories);
-    let failed = summary
-        .iter()
-        .any(|(_, result)| result.status == TaskStatus::Failed);
-    let deferred = summary.iter().any(|(_, result)| result.is_deferred());
-    let exit_code = if failed {
-        1
-    } else if deferred {
-        2
-    } else {
-        0
-    };
-    let tasks_ended_unix_ms = now_unix_ms();
-    if let Some(log) = ctx.run_log.as_ref() {
-        log.write_event(
-            "run_completed",
-            None,
-            serde_json::json!({"success": !failed && !deferred}),
-        )?;
-    }
-    write_run_artifact(
-        ctx.run_log.as_ref(),
-        ctx.host_os.as_str(),
-        "plain",
-        "sync",
-        selected_tasks,
-        summary.iter().map(|(id, result)| (id.as_str(), result)),
-        tasks_ended_unix_ms,
-        exit_code,
-        tasks_completed_unix_ms,
-    );
-
-    if failed {
-        bail!("one or more tasks failed");
-    }
-    if deferred {
-        return Err(anyhow::anyhow!(crate::Deferred));
-    }
-    Ok(())
-}
-
-fn ensure_sync_journal_healthy(ctx: &SyncContext) -> Result<()> {
-    if let Some(error) = ctx.run_log.as_ref().and_then(|log| log.journal_failure()) {
-        bail!("authoritative event journal failed: {error}");
-    }
-    Ok(())
-}
-
-fn print_sync_summary(summary: &[(String, TaskResult)]) {
-    crate::ua_outln!("\nSummary");
-    for (_, t) in summary {
-        let status = match t.status {
-            TaskStatus::Completed if t.is_deferred() => "Deferred.",
-            TaskStatus::Completed if t.has_issues() => "Completed with issues.",
-            TaskStatus::Completed => "Completed.",
-            TaskStatus::Failed => "Failed.",
-            TaskStatus::Canceled => "Canceled.",
-            TaskStatus::Skipped => "Skipped.",
-        };
-        crate::ua_outln!("[{}] {}", t.label, status);
-        for d in &t.details {
-            crate::ua_outln!("  {d}");
-        }
-    }
-}
-
-fn acquire_task_run_lock(run_log: Option<&Arc<RunLogSink>>) -> Result<Option<ScopedFileLock>> {
-    let Some(run_log) = run_log else {
-        return Ok(None);
-    };
-    let lock_root = run_log_root(run_log);
+fn acquire_task_run_lock(lock_root: &Path) -> Result<ScopedFileLock> {
     try_acquire_pid_lock(
         lock_root,
         PidLockOptions {
@@ -1854,7 +1779,6 @@ fn acquire_task_run_lock(run_log: Option<&Arc<RunLogSink>>) -> Result<Option<Sco
             stale_after: TASK_RUN_LOCK_STALE_AFTER,
         },
     )
-    .map(Some)
 }
 
 fn run_log_root(run_log: &RunLogSink) -> &Path {
@@ -1865,6 +1789,11 @@ fn run_log_root(run_log: &RunLogSink) -> &Path {
 }
 
 pub fn run_async(ctx: AsyncContext) -> Result<()> {
+    let authoritative_log = ctx
+        .run_log
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("task execution requires an authoritative run journal"))?;
+    let task_run_lock = acquire_task_run_lock(run_log_root(authoritative_log))?;
     let specs = build_task_specs(&ctx.flags, &ctx.host_os, &ctx.updater_config)
         .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
     if specs.is_empty() && ctx.host_os == HostOs::Unknown {
@@ -1874,11 +1803,28 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     }
     let selected_tasks = selected_task_ids(&specs);
     let task_categories = task_categories_by_id(&specs);
-    let task_run_lock = acquire_task_run_lock(ctx.run_log.as_ref())?;
+    authoritative_log.record_selected_tasks(&selected_tasks)?;
+    authoritative_log.write_metadata(
+        "running",
+        Some(ctx.host_os.as_str()),
+        Some(ctx.ui.as_str()),
+        Some(ctx.engine_mode),
+        selected_tasks.clone(),
+        now_unix_ms(),
+    )?;
 
-    let max_parallel_jobs = resolve_parallel_jobs(&ctx.jobs, specs.len())?;
+    let max_parallel_jobs = if ctx.engine_mode == "sync" {
+        1
+    } else {
+        resolve_parallel_jobs(&ctx.jobs, specs.len())?
+    };
     crate::ua_outln!(
-        "Async Update Engine (jobs={}=>{}, ui={}, fail_fast={})",
+        "{} Update Engine (jobs={}=>{}, ui={}, fail_fast={})",
+        if ctx.engine_mode == "sync" {
+            "Sync"
+        } else {
+            "Async"
+        },
         ctx.jobs,
         max_parallel_jobs,
         ctx.ui.as_str(),
@@ -1889,8 +1835,11 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     #[cfg(not(unix))]
     let _ = maintain_sudo_session;
 
-    let (raw_event_tx, event_rx) = mpsc::channel::<DashboardEvent>();
-    let event_tx = DashboardSender::new(raw_event_tx, ctx.run_log.clone());
+    let (event_tx, event_rx) = DashboardSender::bounded(
+        ctx.run_log.clone(),
+        ctx.max_in_memory_lines,
+        &selected_tasks,
+    );
     let (ui_control_tx, ui_control_rx) = mpsc::channel::<UiControlEvent>();
     let runtime_control = Arc::new(RuntimeControl::default());
     let prompt_runtime = Arc::new(PromptRuntime::default());
@@ -2147,7 +2096,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                                 "running",
                                 Some(ctx.host_os.as_str()),
                                 Some(ctx.ui.as_str()),
-                                Some("async"),
+                                Some(ctx.engine_mode),
                                 selected_tasks.clone(),
                                 now_unix_ms(),
                             )
@@ -2197,8 +2146,16 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             };
             let _ = pending.remove(&task_id);
 
-            if cancel_new.load(Ordering::SeqCst) || cancel::is_cancel_requested() {
-                let result = TaskResult::canceled(spec.label, "canceled before start");
+            if cancel_new.load(Ordering::SeqCst)
+                || cancel::is_cancel_requested()
+                || event_tx.journal_error().is_some()
+            {
+                let detail = if cancel_all_requested || cancel::is_cancel_requested() {
+                    "canceled before start"
+                } else {
+                    "not run after fail-fast failure"
+                };
+                let result = TaskResult::canceled(spec.label, detail);
                 emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &task_id, &result);
                 let _ = event_tx.send(DashboardEvent::TaskStateChanged {
                     id: task_id.clone(),
@@ -2216,7 +2173,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 detail: None,
             });
             if ctx.ui == UiModeResolved::Plain {
-                crate::ua_outln!("[async] started {}", spec.label);
+                crate::ua_outln!("[{}] started {}", ctx.engine_mode, spec.label);
             }
 
             let task_ctx = ctx_clone_for_task(
@@ -2253,7 +2210,25 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 &blocked_id,
                 &blocking_detail,
             );
-            let result = TaskResult::canceled(spec.label, blocking_detail);
+            let privilege_deferred = spec.depends_on.iter().any(|dependency| {
+                !is_ordering_dependency(dependency)
+                    && done
+                        .get(dependency_task_id(dependency))
+                        .is_some_and(|result| {
+                            result.blocks_dependents()
+                                && (result.is_deferred() || result.status == TaskStatus::Skipped)
+                        })
+            });
+            let mut result = TaskResult::canceled(spec.label, blocking_detail);
+            if privilege_deferred {
+                result.advisories.push(TaskAdvisory {
+                    severity: AdvisorySeverity::Warning,
+                    code: "deferred".to_string(),
+                    summary: "required dependency capability was not established".to_string(),
+                    remediation: "review the prerequisite's result before retrying".to_string(),
+                    blocks_dependents: true,
+                });
+            }
             emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &blocked_id, &result);
             let _ = event_tx.send(DashboardEvent::TaskStateChanged {
                 id: blocked_id.clone(),
@@ -2358,7 +2333,6 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
 
     let tasks_completed_at = Instant::now();
     let tasks_completed_unix_ms = now_unix_ms();
-    drop(task_run_lock);
 
     if cancel_all_requested {
         emit_runtime_log(
@@ -2392,17 +2366,18 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         tasks_completed_at,
     );
     let tasks_ended_unix_ms = now_unix_ms();
-    write_run_artifact(
+    let initial_artifact_result = write_run_artifact(
         ctx.run_log.as_ref(),
         ctx.host_os.as_str(),
         ctx.ui.as_str(),
-        "async",
+        ctx.engine_mode,
         selected_tasks.clone(),
         done.iter().map(|(id, result)| (id.as_str(), result)),
         tasks_ended_unix_ms,
         exit_code,
         tasks_completed_unix_ms,
     );
+    drop(task_run_lock);
     join_active_log_viewer(&mut active_log_viewer);
 
     let mut dashboard_unavailable = event_tx.is_detached();
@@ -2411,9 +2386,16 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             dashboard_unavailable = true;
             crate::ua_errln!("update-all: dashboard UI unavailable; using plain summary fallback");
         }
-        if ctx.ui_persist_until_exit {
+        if ctx.ui_persist_until_exit
+            && event_tx.journal_error().is_none()
+            && initial_artifact_result.is_ok()
+        {
             if let Some(h) = ui_handle.take() {
                 while !h.is_finished() {
+                    if event_tx.journal_error().is_some() {
+                        let _ = event_tx.shutdown_ui();
+                        break;
+                    }
                     let handled = drain_completed_run_ui_controls(
                         &ui_control_rx,
                         &event_tx,
@@ -2438,7 +2420,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 }
             }
         } else if let Some(h) = ui_handle.take() {
-            let _ = event_tx.send(DashboardEvent::UiDone);
+            let _ = event_tx.shutdown_ui();
             match h.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -2452,7 +2434,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             }
         }
     } else if let Some(h) = ui_handle.take() {
-        let _ = event_tx.send(DashboardEvent::UiDone);
+        let _ = event_tx.shutdown_ui();
         match h.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -2465,7 +2447,14 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     }
 
     if ctx.ui == UiModeResolved::Plain || dashboard_unavailable {
-        crate::ua_outln!("\nAsync Task Summary");
+        crate::ua_outln!(
+            "\n{} Task Summary",
+            if ctx.engine_mode == "sync" {
+                "Sync"
+            } else {
+                "Async"
+            }
+        );
         for result in done.values() {
             print_async_task_line(&result.label, result);
         }
@@ -2477,11 +2466,11 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         );
     }
 
-    write_run_artifact(
+    let final_artifact_result = write_run_artifact(
         ctx.run_log.as_ref(),
         ctx.host_os.as_str(),
         ctx.ui.as_str(),
-        "async",
+        ctx.engine_mode,
         selected_tasks,
         done.iter().map(|(id, result)| (id.as_str(), result)),
         tasks_ended_unix_ms,
@@ -2489,6 +2478,8 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         tasks_completed_unix_ms,
     );
 
+    initial_artifact_result.context("persist task completion evidence")?;
+    final_artifact_result.context("persist final dashboard timing")?;
     if let Some(error) = event_tx.journal_error().or(journal_error) {
         bail!("authoritative event journal failed: {error}");
     }
@@ -2671,34 +2662,137 @@ fn find_first_sudo_session_task(specs: &[TaskSpec]) -> Option<&TaskSpec> {
     })
 }
 
+fn privilege_deferred_result(spec: &TaskSpec, reason: PrivilegeUnavailable) -> TaskResult {
+    let detail = format!(
+        "{}: elevation deferred before launch: {} (mode=auto)",
+        spec.label,
+        reason.detail()
+    );
+    let mut result = TaskResult::skipped(spec.label.clone(), detail.clone());
+    result.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Warning,
+        code: "deferred".to_string(),
+        summary: detail.clone(),
+        remediation: "Provide noninteractive authority and explicitly rerun, or choose prompt_tty/required from an interactive terminal.".to_string(),
+        blocks_dependents: true,
+    });
+    result.advisories.push(TaskAdvisory {
+        // Preserve a machine-readable fixed reason without duplicating the
+        // user-facing warning already carried by the deferred advisory.
+        severity: AdvisorySeverity::Info,
+        code: reason.code().to_string(),
+        summary: detail,
+        remediation: "No protected command was started by this admission attempt.".to_string(),
+        blocks_dependents: true,
+    });
+    result
+}
+
+fn command_uses_auto_elevation(ctx: &SyncContext, cmd: &CommandTask) -> bool {
+    ctx.updater_config.privilege_mode == PrivilegeMode::Auto && command_needs_sudo_session(cmd)
+}
+
+fn command_forbids_privilege_replay(ctx: &SyncContext, cmd: &CommandTask) -> bool {
+    matches!(
+        ctx.updater_config.privilege_mode,
+        PrivilegeMode::Auto | PrivilegeMode::Required
+    ) && command_needs_sudo_session(cmd)
+}
+
+fn command_privilege_admission(
+    ctx: &SyncContext,
+    spec: &TaskSpec,
+    cmd: &CommandTask,
+) -> Result<Option<TaskResult>> {
+    if !command_needs_sudo_session(cmd) {
+        return Ok(None);
+    }
+    if matches!(
+        ctx.updater_config.privilege_mode,
+        PrivilegeMode::PromptTty | PrivilegeMode::Required
+    ) {
+        if let Some(err) = sudo_runtime_error(&ctx.privilege_session) {
+            return Ok(Some(TaskResult::failed(spec.label.clone(), format!(
+                "sudo session is unavailable before launch: {err}; rerun update-all and complete sudo authentication again"
+            ))));
+        }
+    }
+    match resolve_privilege_decision(ctx.updater_config.privilege_mode, ctx.host_os, &spec.label)? {
+        PrivilegeDecision::Skip(detail) => {
+            let mut result = TaskResult::skipped(spec.label.clone(), detail.clone());
+            result.advisories.push(TaskAdvisory {
+                severity: AdvisorySeverity::Warning,
+                code: "privilege-disabled".to_string(),
+                summary: detail,
+                remediation: "Select a privilege mode that permits this task before running its health dependents.".to_string(),
+                blocks_dependents: true,
+            });
+            Ok(Some(result))
+        }
+        PrivilegeDecision::Fail(detail) => Ok(Some(TaskResult::failed(spec.label.clone(), detail))),
+        PrivilegeDecision::Defer(reason) => Ok(Some(privilege_deferred_result(spec, reason))),
+        PrivilegeDecision::Proceed if command_uses_auto_elevation(ctx, cmd) => {
+            let auxiliary_authority = package_manager_kind_for_task(&spec.id, &cmd.program)
+                == PackageManagerKind::PacmanLike
+                && std::env::var("UPDATE_ALL_PACKAGE_AUTHORITY")
+                    .ok()
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("on"));
+            if cmd.needs_sudo_session || auxiliary_authority {
+                return Ok(Some(privilege_deferred_result(
+                    spec,
+                    PrivilegeUnavailable::UnsupportedNestedSession,
+                )));
+            }
+            Ok(ensure_auto_sudo_authority(ctx, spec)?
+                .map(|reason| privilege_deferred_result(spec, reason)))
+        }
+        PrivilegeDecision::Proceed => match ensure_sudo_session_fresh(ctx, spec, cmd) {
+            Ok(()) => Ok(None),
+            Err(err) if err.downcast_ref::<crate::Cancelled>().is_some() => Err(err),
+            Err(err) => Ok(Some(TaskResult::failed(
+                spec.label.clone(),
+                err.to_string(),
+            ))),
+        },
+    }
+}
+
 fn maybe_prepare_sudo_session_before_run(ctx: &AsyncContext, specs: &[TaskSpec]) -> Result<bool> {
+    let Some(spec) = find_first_sudo_session_task(specs) else {
+        return Ok(false);
+    };
+    let mode = ctx.updater_config.privilege_mode;
+    // Auto admits each task noninteractively. It neither renews credentials in
+    // the background nor cancels independent tasks on authority loss.
+    if matches!(
+        mode,
+        PrivilegeMode::Auto | PrivilegeMode::Skip | PrivilegeMode::Fail
+    ) {
+        return Ok(false);
+    }
+    if mode == PrivilegeMode::Required
+        && (!cfg!(unix) || !matches!(ctx.host_os, HostOs::Linux | HostOs::Macos))
+    {
+        bail!("required elevation is unsupported on this platform; no tasks were started");
+    }
     #[cfg(unix)]
     {
         if !matches!(ctx.host_os, HostOs::Linux | HostOs::Macos) {
             return Ok(false);
         }
-        let Some(spec) = find_first_sudo_session_task(specs) else {
-            return Ok(false);
-        };
-
-        let decision = resolve_privilege_decision(
-            ctx.updater_config.privilege_mode,
-            ctx.host_os,
-            &spec.label,
-        )?;
+        let decision = resolve_privilege_decision(mode, ctx.host_os, &spec.label)?;
         if !matches!(decision, PrivilegeDecision::Proceed) {
             return Ok(false);
         }
-
         // Authenticate before dashboard startup to avoid prompt/render contention.
-        crate::ua_outln!("Preparing elevated session (sudo authentication required)...");
+        crate::ua_outln!("Preparing elevated session...");
         let preflight_ctx = ctx_clone_for_task(ctx, None, None, Arc::new(PromptRuntime::default()));
         ensure_sudo_preflight_once(&preflight_ctx, spec)?;
         Ok(true)
     }
     #[cfg(not(unix))]
     {
-        let _ = (ctx, specs);
+        let _ = spec;
         Ok(false)
     }
 }
@@ -2880,6 +2974,9 @@ fn os_args<const N: usize>(args: [&str; N], path: &OsStr) -> Vec<OsString> {
 }
 
 fn execute_task(ctx: &SyncContext, spec: &TaskSpec) -> Result<TaskResult> {
+    if let Some(error) = ctx.run_log.as_ref().and_then(|log| log.journal_failure()) {
+        bail!("authoritative event journal failed before task admission: {error}");
+    }
     match &spec.kind {
         TaskKind::Managed(ManagedTaskExecutor::Npm) => npm::task_npm_sync(ctx),
         TaskKind::Command(cmd) => run_command_task(ctx, spec, cmd),
@@ -3530,6 +3627,18 @@ fn run_command_execution(
 
 fn run_command_task(ctx: &SyncContext, spec: &TaskSpec, cmd: &CommandTask) -> Result<TaskResult> {
     let mut command = cmd.clone();
+    if ctx.updater_config.privilege_mode != PrivilegeMode::PromptTty {
+        let Some(resolved) = resolve_command_task(ctx, &command) else {
+            return Ok(TaskResult::skipped(
+                spec.label.clone(),
+                "no command candidate available",
+            ));
+        };
+        command = resolved;
+        if let Some(result) = command_privilege_admission(ctx, spec, &command)? {
+            return Ok(result);
+        }
+    }
     let mut authority_outcome: Option<package_authority::PackageAuthorityOutcome> = None;
     let mut authority_errors = Vec::new();
     let uses_linux_pacman = ctx.host_os == HostOs::Linux
@@ -3564,6 +3673,7 @@ fn run_command_task(ctx: &SyncContext, spec: &TaskSpec, cmd: &CommandTask) -> Re
         && result.status == TaskStatus::Failed
         && !runner_timed_out
         && !interactive_unix_elevation(ctx.host_os, &command)
+        && !command_forbids_privilege_replay(ctx, &command)
     {
         let mut repaired_after_failure = false;
         for backend in ["pacman", "aur"] {
@@ -3631,38 +3741,19 @@ fn run_command_task_inner(
         }
     }
 
-    if command_needs_sudo_session(&cmd) {
-        if let Some(err) = sudo_runtime_error(&ctx.privilege_session) {
-            return Ok(TaskResult::failed(
-                spec.label.clone(),
-                format!(
-                    "sudo session is unavailable before launch: {err}; rerun update-all and complete sudo authentication again"
-                ),
-            ));
-        }
-        let decision = resolve_privilege_decision(
-            ctx.updater_config.privilege_mode,
-            ctx.host_os,
-            &spec.label,
-        )?;
-        match decision {
-            PrivilegeDecision::Proceed => {
-                if let Err(e) = ensure_sudo_session_fresh(ctx, spec, &cmd) {
-                    return Ok(TaskResult::failed(spec.label.clone(), e.to_string()));
-                }
-            }
-            PrivilegeDecision::Skip(msg) => {
-                return Ok(TaskResult::skipped(spec.label.clone(), msg));
-            }
-            PrivilegeDecision::Fail(msg) => {
-                return Ok(TaskResult::failed(spec.label.clone(), msg));
-            }
+    if ctx.updater_config.privilege_mode == PrivilegeMode::PromptTty {
+        if let Some(result) = command_privilege_admission(ctx, spec, &cmd)? {
+            return Ok(result);
         }
     }
 
-    let policy = ctx
+    let mut policy = ctx
         .task_policies
         .by_key(&cmd.policy_key, TaskPolicy::new(1800, 0, 0));
+    if command_forbids_privilege_replay(ctx, &cmd) {
+        policy.retries = 0;
+        policy.retry_backoff = Duration::ZERO;
+    }
     let execution_path = interactive_execution_path(ctx.host_os, &cmd);
     let effective_interactive = !matches!(execution_path, InteractiveExecutionPath::Standard);
 
@@ -3688,7 +3779,11 @@ fn run_command_task_inner(
         CommandReportPhase::Before,
     );
 
-    let (program, args) = build_command_invocation(ctx.host_os, &cmd);
+    let (program, args) = build_command_invocation_with_privilege(
+        ctx.host_os,
+        &cmd,
+        ctx.updater_config.privilege_mode,
+    );
     ctx.log_line(
         &spec.id,
         LogLevel::Info,
@@ -3741,7 +3836,9 @@ fn run_command_task_inner(
                 ));
             }
             let failure_text = command_error_summary(&e);
-            if interactive_unix_elevation(ctx.host_os, &cmd) {
+            if interactive_unix_elevation(ctx.host_os, &cmd)
+                || command_forbids_privilege_replay(ctx, &cmd)
+            {
                 return Ok(failed_command_result_with_report_sections(
                     spec.label.clone(),
                     build_command_failure_detail(spec, &cmd, &program, &failure_text),
@@ -4665,7 +4762,11 @@ fn run_command_pre_commands(
         let pre_execution_path = interactive_execution_path(ctx.host_os, &pre_cmd);
         let pre_effective_interactive =
             !matches!(pre_execution_path, InteractiveExecutionPath::Standard);
-        let (program, args) = build_command_invocation(ctx.host_os, &pre_cmd);
+        let (program, args) = build_command_invocation_with_privilege(
+            ctx.host_os,
+            &pre_cmd,
+            ctx.updater_config.privilege_mode,
+        );
         ctx.log_line(
             &spec.id,
             LogLevel::Info,
@@ -4693,7 +4794,8 @@ fn run_command_pre_commands(
                 let err_text = process_exit_output(&err)
                     .map(str::to_string)
                     .unwrap_or_else(|| err.to_string());
-                let class = if *runner_timed_out {
+                let class = if *runner_timed_out || command_forbids_privilege_replay(ctx, &pre_cmd)
+                {
                     RuntimeFailureClass::Other
                 } else {
                     classify_runtime_failure(&err_text, cmd.requires_elevation)
@@ -8018,6 +8120,80 @@ fn detect_command_output_failure(cmd: &CommandTask, output: &str) -> Option<Stri
     None
 }
 
+fn run_noninteractive_sudo_preflight(ctx: &SyncContext, spec: &TaskSpec) -> Result<()> {
+    let mut policy = ctx.task_policies.system_update.clone();
+    policy.timeout = policy.timeout.min(Duration::from_secs(15));
+    policy.retries = 0;
+    policy.retry_backoff = Duration::ZERO;
+    ctx.run_command_with_policy_replay(
+        &spec.id,
+        "sudo",
+        vec!["-n".to_string(), "-v".to_string()],
+        &policy,
+        false,
+        false,
+    )
+    .map(|_| ())
+}
+
+fn ensure_auto_sudo_authority(
+    ctx: &SyncContext,
+    spec: &TaskSpec,
+) -> Result<Option<PrivilegeUnavailable>> {
+    if !cfg!(unix) || ctx.host_os != HostOs::Linux {
+        return Ok(Some(PrivilegeUnavailable::UnsupportedPlatform));
+    }
+    let _gate = ctx
+        .privilege_session
+        .sudo_refresh_gate
+        .lock()
+        .map_err(|_| anyhow::anyhow!("privilege session refresh lock poisoned"))?;
+    let mut unavailable = ctx
+        .privilege_session
+        .auto_unavailable
+        .lock()
+        .map_err(|_| anyhow::anyhow!("privilege availability lock poisoned"))?;
+    if let Some(reason) = *unavailable {
+        return Ok(Some(reason));
+    }
+    if which("sudo").is_none() {
+        *unavailable = Some(PrivilegeUnavailable::MissingExecutable);
+        return Ok(*unavailable);
+    }
+    let mut cached = ctx
+        .privilege_session
+        .sudo_preflight
+        .lock()
+        .map_err(|_| anyhow::anyhow!("privilege session lock poisoned"))?;
+    let had_authority = cached.as_ref().is_some_and(Result::is_ok);
+    if sudo_runtime_error(&ctx.privilege_session).is_some() {
+        let reason = if had_authority {
+            PrivilegeUnavailable::ExpiredSession
+        } else {
+            PrivilegeUnavailable::NoninteractiveAuthorityUnavailable
+        };
+        *unavailable = Some(reason);
+        return Ok(*unavailable);
+    }
+    match run_noninteractive_sudo_preflight(ctx, spec) {
+        Ok(()) => {
+            *cached = Some(Ok(()));
+            Ok(None)
+        }
+        Err(err) if err.downcast_ref::<crate::Cancelled>().is_some() => Err(err),
+        Err(_) => {
+            let reason = if had_authority {
+                PrivilegeUnavailable::ExpiredSession
+            } else {
+                PrivilegeUnavailable::NoninteractiveAuthorityUnavailable
+            };
+            *cached = Some(Err(reason.detail().to_string()));
+            *unavailable = Some(reason);
+            Ok(*unavailable)
+        }
+    }
+}
+
 fn ensure_sudo_preflight_once(ctx: &SyncContext, spec: &TaskSpec) -> Result<()> {
     #[cfg(unix)]
     {
@@ -8039,7 +8215,16 @@ fn ensure_sudo_preflight_once(ctx: &SyncContext, spec: &TaskSpec) -> Result<()> 
             bail!(err);
         }
 
-        let preflight = run_sudo_preflight(ctx, spec, false);
+        let noninteractive = ctx.updater_config.privilege_mode == PrivilegeMode::Required
+            && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal());
+        let preflight = if noninteractive {
+            match run_noninteractive_sudo_preflight(ctx, spec) {
+                Err(err) if err.downcast_ref::<crate::Cancelled>().is_some() => return Err(err),
+                result => result.map_err(|err| format!("sudo preflight failed: {err}")),
+            }
+        } else {
+            run_sudo_preflight(ctx, spec, false)
+        };
 
         *cached = Some(preflight.clone());
         if preflight.is_ok() {
@@ -8060,24 +8245,8 @@ fn run_sudo_preflight(
     noninteractive: bool,
 ) -> Result<(), String> {
     if noninteractive {
-        return Command::new("sudo")
-            .args(["-n", "-v"])
-            .output()
-            .map_err(|e| format!("sudo non-interactive refresh failed: {e}"))
-            .and_then(|output| {
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    if detail.is_empty() {
-                        detail = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    }
-                    if detail.is_empty() {
-                        detail = format!("exit status {}", output.status);
-                    }
-                    Err(format!("sudo non-interactive refresh failed: {detail}"))
-                }
-            });
+        return run_noninteractive_sudo_preflight(ctx, spec)
+            .map_err(|err| format!("sudo non-interactive refresh failed: {err}"));
     }
 
     let mut preflight_policy = ctx.task_policies.system_update.clone();
@@ -8137,6 +8306,13 @@ fn ensure_sudo_session_fresh(ctx: &SyncContext, spec: &TaskSpec, cmd: &CommandTa
                     *cached = Some(Err(err.clone()));
                 }
                 bail!(err);
+            }
+            Err(noninteractive_err)
+                if ctx.updater_config.privilege_mode == PrivilegeMode::Required
+                    && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) =>
+            {
+                record_sudo_runtime_error(&ctx.privilege_session, noninteractive_err.clone());
+                bail!(noninteractive_err);
             }
             Err(noninteractive_err) => match run_sudo_preflight(ctx, spec, false) {
                 Ok(()) => {
@@ -8230,6 +8406,14 @@ fn sudo_runtime_error(session: &PrivilegeSession) -> Option<String> {
 }
 
 fn build_command_invocation(host_os: HostOs, cmd: &CommandTask) -> (String, Vec<String>) {
+    build_command_invocation_with_privilege(host_os, cmd, PrivilegeMode::PromptTty)
+}
+
+fn build_command_invocation_with_privilege(
+    host_os: HostOs,
+    cmd: &CommandTask,
+    mode: PrivilegeMode,
+) -> (String, Vec<String>) {
     let mut base_program = cmd.program.clone();
     let mut base_args = cmd.args.clone();
     if cmd.shell {
@@ -8260,7 +8444,11 @@ fn build_command_invocation(host_os: HostOs, cmd: &CommandTask) -> (String, Vec<
         {
             if matches!(host_os, HostOs::Linux | HostOs::Macos) {
                 let mut args = Vec::new();
-                if !cmd.interactive {
+                if !cmd.interactive
+                    || mode == PrivilegeMode::Auto
+                    || (mode == PrivilegeMode::Required
+                        && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
+                {
                     // Noninteractive tasks must fail fast if preflight authority
                     // does not apply at command launch.
                     args.push("-n".to_string());
@@ -9492,12 +9680,7 @@ fn dependency_ready(task_id: &str, dep_id: &str, dep_result: &TaskResult) -> boo
             TaskStatus::Completed | TaskStatus::Skipped | TaskStatus::Failed | TaskStatus::Canceled
         );
     }
-    match dep_result.status {
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled => {
-            !dep_result.blocks_dependents()
-        }
-        TaskStatus::Skipped => true,
-    }
+    !dep_result.blocks_dependents()
 }
 
 fn blocked_by_failed_dependency(
@@ -9732,9 +9915,9 @@ fn write_run_artifact<'a>(
     tasks_ended_unix_ms: u64,
     exit_code: i32,
     tasks_completed_unix_ms: u64,
-) {
+) -> Result<()> {
     let Some(run_log) = run_log else {
-        return;
+        return Ok(());
     };
     let tasks = summary
         .into_iter()
@@ -9768,7 +9951,9 @@ fn write_run_artifact<'a>(
         .count();
     let started_unix_ms = run_log.started_unix_ms();
     let artifact_updated_unix_ms = now_unix_ms();
-    let status = crate::runs::status_from_exit_code(exit_code);
+    // The process still owns the frontend and open evidence files. Retention must
+    // not remove them while a completed dashboard waits for dismissal.
+    let status = "finalizing";
     let runtime_advisories = run_runtime_advisories(run_log);
     let payload = RunArtifact {
         schema_version: 1,
@@ -9795,19 +9980,17 @@ fn write_run_artifact<'a>(
         runtime_advisories,
         tasks,
     };
-    if let Err(err) = run_log.write_metadata(
-        &status,
+    run_log.record_selected_tasks(&selected_tasks)?;
+    run_log.write_json_file("run.json", &payload)?;
+    run_log.write_metadata(
+        status,
         Some(host_os),
         Some(ui_mode),
         Some(engine_mode),
         selected_tasks.clone(),
         artifact_updated_unix_ms,
-    ) {
-        run_log.emit_write_warning_once(&err);
-    }
-    if let Err(err) = run_log.write_json_file("run.json", &payload) {
-        run_log.emit_write_warning_once(&err);
-    }
+    )?;
+    Ok(())
 }
 
 fn run_runtime_advisories(run_log: &RunLogSink) -> Vec<TaskAdvisory> {

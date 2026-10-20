@@ -1706,7 +1706,7 @@ fn parse_core_config_values(parsed: &FileConfig) -> Result<ParsedCoreConfig> {
         privilege_mode: parse_optional_config_value(
             "updaters.privilege_mode",
             updaters.and_then(|up| up.privilege_mode.as_deref()),
-            "skip|prompt_tty|fail",
+            "skip|never|prompt_tty|fail|auto|required",
             PrivilegeMode::parse,
         )?,
     })

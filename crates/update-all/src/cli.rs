@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::logging::RunLogSink;
 use crate::sections::Sections;
-use crate::tasks::{run_async, run_sync, PrivilegeSession, TaskPolicies};
+use crate::tasks::{run_async, PrivilegeSession, TaskPolicies};
 use crate::ui::{MouseRowStride, UiModeResolved};
 use crate::updaters::{detected_builtin_tasks, HostOs};
 use anyhow::{bail, Context, Result};
@@ -307,97 +307,35 @@ impl RunCli {
             .unwrap_or_else(|| "compact".to_string());
 
         let completion_paths = resolve_completion_paths();
-        let run_log = open_run_log(&runtime_cfg.logging.run_dir, runtime_cfg.logging.timestamps);
+        let run_log = open_run_log(&runtime_cfg.logging.run_dir, runtime_cfg.logging.timestamps)?;
         let task_policies = resolve_task_policies(&runtime_cfg);
         let mouse_row_stride = resolve_mouse_row_stride(&runtime_cfg);
 
-        let flags = Sections::from_cli_selectors(&self.only, &self.exclude)?;
-
         let fail_fast = self.fail_fast || runtime_cfg.engine.fail_fast;
         let host_os = HostOs::current();
-
+        let engine_label = match engine_mode {
+            EngineMode::Sync => "sync",
+            EngineMode::Async => "async",
+        };
         if let Some(src) = runtime_cfg.source_path.as_ref() {
             crate::ua_outln!("Using config: {}", src.display());
         }
-        if let Some(log) = run_log.as_ref() {
-            crate::ua_outln!("Run logs: {}", log.run_dir().display());
-            crate::ua_outln!("Run ID: {}", log.run_id());
-        }
+        crate::ua_outln!("Run logs: {}", run_log.run_dir().display());
+        crate::ua_outln!("Run ID: {}", run_log.run_id());
 
-        let run_result = match engine_mode {
-            EngineMode::Sync => {
-                if ui == UiModeResolved::Dashboard {
-                    run_async(crate::tasks::AsyncContext {
-                        flags,
-                        host_os,
-                        updater_config: runtime_cfg.updaters.clone(),
-                        jobs: "1".to_string(),
-                        ui,
-                        fail_fast,
-                        ui_persist_until_exit: runtime_cfg.ui.persist_until_exit,
-                        completions_mode,
-                        completion_providers,
-                        completion_discover,
-                        completion_strict,
-                        completion_report,
-                        filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
-                        rc_root: completion_paths.rc_root,
-                        completion_managed_root: completion_paths.managed_root,
-                        completion_config_path: runtime_cfg.source_path.clone(),
-                        completion_catalog_path: completion_paths.catalog_path,
-                        completion_registry_path: completion_paths.registry_path,
-                        run_log: run_log.clone(),
-                        task_policies: task_policies.clone(),
-                        interactive_runtime: runtime_cfg.interactive.clone(),
-                        privilege_session: Arc::new(PrivilegeSession::default()),
-                        dashboard_quit_behavior: map_dashboard_quit_behavior(
-                            runtime_cfg.ui.dashboard_quit_behavior,
-                        ),
-                        mouse_row_stride,
-                        quit_cancel_grace: std::time::Duration::from_millis(
-                            runtime_cfg.ui.quit_cancel_grace_ms,
-                        ),
-                        show_global_log: runtime_cfg.ui.show_global_log,
-                        max_in_memory_lines: runtime_cfg.logging.max_in_memory_lines,
-                        max_events_per_frame: runtime_cfg.ui.max_events_per_frame,
-                        task_colors: runtime_cfg.logging.task_colors,
-                        note_verbosity: runtime_cfg.ui.note_verbosity,
-                        debug_report: self.debug_report,
-                    })
-                } else {
-                    run_sync(crate::tasks::SyncContext {
-                        flags,
-                        host_os,
-                        updater_config: runtime_cfg.updaters.clone(),
-                        completions_mode,
-                        completion_providers,
-                        completion_discover,
-                        completion_strict,
-                        completion_report,
-                        filter_progress_noise: runtime_cfg.logging.filter_progress_noise,
-                        emit_plain: true,
-                        event_tx: None,
-                        run_log: run_log.clone(),
-                        rc_root: completion_paths.rc_root.clone(),
-                        completion_managed_root: completion_paths.managed_root.clone(),
-                        completion_config_path: runtime_cfg.source_path.clone(),
-                        completion_catalog_path: completion_paths.catalog_path.clone(),
-                        completion_registry_path: completion_paths.registry_path.clone(),
-                        task_policies: task_policies.clone(),
-                        interactive_runtime: runtime_cfg.interactive.clone(),
-                        note_verbosity: runtime_cfg.ui.note_verbosity,
-                        debug_report: self.debug_report,
-                        privilege_session: Arc::new(PrivilegeSession::default()),
-                        runtime_control: None,
-                        prompt_runtime: Arc::new(crate::tasks::PromptRuntime::default()),
-                    })
-                }
-            }
-            EngineMode::Async => run_async(crate::tasks::AsyncContext {
+        // This closure owns every controlled return after journal admission.
+        let run_result = (|| {
+            let flags = Sections::from_cli_selectors(&self.only, &self.exclude)?;
+            run_async(crate::tasks::AsyncContext {
                 flags,
                 host_os,
                 updater_config: runtime_cfg.updaters.clone(),
-                jobs,
+                jobs: if matches!(engine_mode, EngineMode::Sync) {
+                    "1".to_string()
+                } else {
+                    jobs
+                },
+                engine_mode: engine_label,
                 ui,
                 fail_fast,
                 ui_persist_until_exit: runtime_cfg.ui.persist_until_exit,
@@ -412,7 +350,7 @@ impl RunCli {
                 completion_config_path: runtime_cfg.source_path.clone(),
                 completion_catalog_path: completion_paths.catalog_path,
                 completion_registry_path: completion_paths.registry_path,
-                run_log: run_log.clone(),
+                run_log: Some(run_log.clone()),
                 task_policies,
                 interactive_runtime: runtime_cfg.interactive.clone(),
                 privilege_session: Arc::new(PrivilegeSession::default()),
@@ -429,8 +367,18 @@ impl RunCli {
                 task_colors: runtime_cfg.logging.task_colors,
                 note_verbosity: runtime_cfg.ui.note_verbosity,
                 debug_report: self.debug_report,
-            }),
-        };
+            })
+        })();
+        let (status, exit_code) = task_run_outcome(&run_result);
+        let reason = run_result.as_ref().err().map(|error| format!("{error:#}"));
+        let finalization = run_log.finalize_task_run(
+            host_os.as_str(),
+            ui.as_str(),
+            engine_label,
+            status,
+            exit_code,
+            reason.as_deref(),
+        );
 
         let retention = crate::runs::RunRetentionPolicy {
             max_age_days: runtime_cfg.logging.retention_max_age_days,
@@ -441,16 +389,19 @@ impl RunCli {
             &runtime_cfg.logging.run_dir,
             retention,
             now_unix_ms_u64(),
-            run_log.as_ref().map(|log| log.run_dir()),
+            Some(run_log.run_dir()),
             false,
         ) {
             crate::ua_errln!(
                 "update-all: run retention failed; continuing without pruning diagnostics: {error:#}"
             );
         }
-        run_result?;
-
-        Ok(())
+        if let Err(error) = finalization {
+            return Err(error.context(format!(
+                "failed to persist terminal run evidence (observed task-run outcome: {status}, exit {exit_code})"
+            )));
+        }
+        run_result
     }
 }
 
@@ -610,15 +561,20 @@ fn run_history_root(default_config_path: Option<PathBuf>) -> Result<PathBuf> {
         .run_dir)
 }
 
-fn open_run_log(root: &Path, timestamps: bool) -> Option<Arc<RunLogSink>> {
-    match RunLogSink::new(root, timestamps) {
-        Ok(log) => Some(Arc::new(log)),
-        Err(error) => {
-            crate::ua_errln!(
-                "update-all: run logging unavailable; continuing without persisted diagnostics: {error:#}"
-            );
-            None
-        }
+fn open_run_log(root: &Path, timestamps: bool) -> Result<Arc<RunLogSink>> {
+    RunLogSink::new(root, timestamps).map(Arc::new).with_context(|| {
+        "cannot initialize the authoritative run journal; no tasks started. Configure a writable absolute [logging].run_dir (logging.run_dir) or absolute XDG_STATE_HOME".to_string()
+    })
+}
+
+fn task_run_outcome(result: &Result<()>) -> (&'static str, i32) {
+    match result {
+        Ok(()) => ("completed", 0),
+        Err(error) if error.downcast_ref::<crate::Cancelled>().is_some() => ("canceled", 3),
+        Err(error) if error.downcast_ref::<crate::InvalidPlan>().is_some() => ("failed", 3),
+        Err(error) if error.downcast_ref::<crate::Deferred>().is_some() => ("failed", 2),
+        Err(error) if error.downcast_ref::<crate::IntegrityFailure>().is_some() => ("failed", 4),
+        Err(_) => ("failed", 1),
     }
 }
 

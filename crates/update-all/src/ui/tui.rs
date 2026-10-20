@@ -1,7 +1,7 @@
 use crate::ui::{
     is_report_meta_line, is_report_note_line, looks_like_interactive_prompt, DashboardEvent,
-    DashboardQuitBehavior, LogLevel, LogRecord, LogStream, LogViewTarget, MouseRowStride,
-    TaskState, UiControlEvent, RUN_LOG_SCOPE,
+    DashboardQuitBehavior, DashboardReceiver, LogLevel, LogRecord, LogStream, LogViewTarget,
+    MouseRowStride, TaskState, UiControlEvent, RUN_LOG_SCOPE,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -113,6 +113,15 @@ struct RenameEditState {
     buffer: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModalOwner {
+    Help,
+    Rename,
+    Search,
+    Prompt(String, u64),
+    None,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     Generic,
@@ -154,10 +163,13 @@ struct Model {
     task_log_from_bottom: usize,
     global_log_from_bottom: usize,
     show_help: bool,
+    help_scroll: usize,
     wrap_logs: bool,
     search_edit: Option<SearchEditState>,
     prompt_edit: Option<PromptEditState>,
     prompt_request: Option<PromptRequestState>,
+    pending_prompts: VecDeque<PromptRequestState>,
+    prompt_generations: BTreeMap<String, u64>,
     rename_edit: Option<RenameEditState>,
     prompt_scroll_from_bottom: usize,
     task_search: SearchSpec,
@@ -212,10 +224,13 @@ impl Model {
             task_log_from_bottom: 0,
             global_log_from_bottom: 0,
             show_help: false,
+            help_scroll: 0,
             wrap_logs: false,
             search_edit: None,
             prompt_edit: None,
             prompt_request: None,
+            pending_prompts: VecDeque::new(),
+            prompt_generations: BTreeMap::new(),
             rename_edit: None,
             prompt_scroll_from_bottom: 0,
             task_search: SearchSpec::default(),
@@ -305,6 +320,25 @@ impl Model {
         );
     }
 
+    fn record_display_omission(&mut self, task_id: &str, count: u64) {
+        self.global_logs_dropped = self.global_logs_dropped.saturating_add(count);
+        if task_id == RUN_LOG_SCOPE {
+            return;
+        }
+        if let Some(task) = self.tasks.get_mut(task_id) {
+            task.logs_dropped = task.logs_dropped.saturating_add(count);
+        } else {
+            let pending = self
+                .pending_task_logs
+                .entry(task_id.to_string())
+                .or_insert_with(|| PendingTaskLogs {
+                    logs: VecDeque::new(),
+                    logs_dropped: 0,
+                });
+            pending.logs_dropped = pending.logs_dropped.saturating_add(count);
+        }
+    }
+
     fn register_task(
         &mut self,
         id: String,
@@ -372,29 +406,79 @@ impl Model {
     }
 
     fn set_prompt_request(&mut self, task_id: String, generation: u64, prompt: String) {
-        self.prompt_request = Some(PromptRequestState {
+        if self
+            .prompt_generations
+            .get(&task_id)
+            .is_some_and(|latest| generation <= *latest)
+        {
+            return;
+        }
+        self.prompt_generations.insert(task_id.clone(), generation);
+        let request = PromptRequestState {
             task_id: task_id.clone(),
             generation,
             prompt: sanitize_log_line(&prompt),
             submitted: false,
-        });
+        };
+        self.pending_prompts
+            .retain(|pending| pending.task_id != task_id);
+        if self
+            .prompt_request
+            .as_ref()
+            .is_none_or(|active| active.task_id == task_id || active.submitted)
+        {
+            self.activate_prompt(request);
+        } else {
+            self.pending_prompts.push_back(request);
+        }
+    }
+
+    fn activate_prompt(&mut self, request: PromptRequestState) {
         self.prompt_edit = Some(PromptEditState {
-            task_id,
-            generation,
+            task_id: request.task_id.clone(),
+            generation: request.generation,
             buffer: String::new(),
         });
+        self.prompt_request = Some(request);
         self.prompt_scroll_from_bottom = 0;
     }
 
+    fn activate_next_prompt(&mut self) {
+        if let Some(request) = self.pending_prompts.pop_front() {
+            self.activate_prompt(request);
+        }
+    }
+
+    fn modal_owner(&self) -> ModalOwner {
+        if self.show_help {
+            ModalOwner::Help
+        } else if self.rename_edit.is_some() {
+            ModalOwner::Rename
+        } else if self.search_edit.is_some() {
+            ModalOwner::Search
+        } else if let Some((id, generation)) = latest_prompt_generation(self) {
+            ModalOwner::Prompt(id, generation)
+        } else {
+            ModalOwner::None
+        }
+    }
+
     fn cancel_prompt_request(&mut self, task_id: &str, generation: u64) {
+        self.prompt_generations
+            .entry(task_id.to_string())
+            .and_modify(|latest| *latest = (*latest).max(generation))
+            .or_insert(generation);
+        self.pending_prompts
+            .retain(|request| request.task_id != task_id || request.generation > generation);
         let matches = self
             .prompt_request
             .as_ref()
-            .is_some_and(|request| request.task_id == task_id && request.generation == generation);
+            .is_some_and(|request| request.task_id == task_id && request.generation <= generation);
         if matches {
             self.prompt_request = None;
             self.prompt_edit = None;
             self.prompt_scroll_from_bottom = 0;
+            self.activate_next_prompt();
         }
     }
 
@@ -406,6 +490,7 @@ impl Model {
         {
             request.submitted = true;
             self.prompt_edit = None;
+            self.activate_next_prompt();
         }
     }
 
@@ -525,7 +610,7 @@ impl Model {
 }
 
 pub fn run_dashboard(
-    rx: Receiver<DashboardEvent>,
+    rx: DashboardReceiver,
     control_tx: Sender<UiControlEvent>,
     quit_behavior: DashboardQuitBehavior,
     mouse_row_stride: MouseRowStride,
@@ -536,7 +621,7 @@ pub fn run_dashboard(
 ) -> Result<()> {
     let mut terminal = Some(setup_terminal()?);
     if let Some(t) = terminal.as_mut() {
-        let _ = t.clear();
+        t.clear()?;
     }
     let result = (|| -> Result<()> {
         let max_events_per_frame = max_events_per_frame.max(1);
@@ -549,7 +634,6 @@ pub fn run_dashboard(
         let idle_tick = Duration::from_millis(20);
         let mut done = false;
         let mut suspended = false;
-        let mut pending_logs: VecDeque<LogRecord> = VecDeque::new();
         let mut layout = layout_for(
             terminal_rect(
                 terminal
@@ -562,24 +646,15 @@ pub fn run_dashboard(
         );
 
         while !done {
-            if !suspended {
-                while event::poll(Duration::from_millis(0))? {
-                    match event::read()? {
-                        Event::Key(k) => {
-                            if handle_key_event(&mut model, k, &layout, &control_tx, quit_behavior)
-                            {
-                                done = true;
-                                break;
-                            }
-                        }
-                        Event::Mouse(m) => handle_mouse_event(&mut model, m, &layout),
-                        Event::Resize(_, _) => model.reset_task_mouse_stride_calibration(),
-                        _ => {}
-                    }
-                }
+            if !suspended && drain_terminal_input(&mut model, &layout, &control_tx, quit_behavior)?
+            {
+                done = true;
             }
 
-            while let Ok(ev) = rx.try_recv() {
+            let mut processed = 0usize;
+            while processed < max_events_per_frame {
+                let Ok(ev) = rx.try_recv() else { break };
+                processed += 1;
                 match ev {
                     DashboardEvent::RunIdentity {
                         run_id,
@@ -617,7 +692,10 @@ pub fn run_dashboard(
                     DashboardEvent::TaskStateChanged { id, state, detail } => {
                         model.set_task_state(&id, state, detail);
                     }
-                    DashboardEvent::LogLine(rec) => pending_logs.push_back(rec),
+                    DashboardEvent::LogLine(rec) => model.push_task_log(rec),
+                    DashboardEvent::DisplayLogsOmitted { task_id, count } => {
+                        model.record_display_omission(&task_id, count);
+                    }
                     DashboardEvent::RunComplete {
                         success,
                         canceled,
@@ -633,7 +711,7 @@ pub fn run_dashboard(
                     DashboardEvent::UiSuspendRequested { reason, ack } => {
                         if !suspended {
                             if let Some(mut t) = terminal.take() {
-                                let _ = restore_terminal(&mut t);
+                                restore_terminal(&mut t)?;
                             }
                             suspended = true;
                         }
@@ -646,7 +724,7 @@ pub fn run_dashboard(
                         if suspended {
                             terminal = Some(setup_terminal()?);
                             if let Some(t) = terminal.as_mut() {
-                                let _ = t.clear();
+                                t.clear()?;
                             }
                             suspended = false;
                         }
@@ -655,39 +733,6 @@ pub fn run_dashboard(
                         }
                     }
                     DashboardEvent::UiDone => done = true,
-                }
-            }
-
-            let mut processed = 0usize;
-            while processed < max_events_per_frame {
-                let Some(rec) = pending_logs.pop_front() else {
-                    break;
-                };
-                model.push_task_log(rec);
-                processed += 1;
-                if !suspended && processed.is_multiple_of(32) {
-                    while event::poll(Duration::from_millis(0))? {
-                        match event::read()? {
-                            Event::Key(k) => {
-                                if handle_key_event(
-                                    &mut model,
-                                    k,
-                                    &layout,
-                                    &control_tx,
-                                    quit_behavior,
-                                ) {
-                                    done = true;
-                                    break;
-                                }
-                            }
-                            Event::Mouse(m) => handle_mouse_event(&mut model, m, &layout),
-                            Event::Resize(_, _) => model.reset_task_mouse_stride_calibration(),
-                            _ => {}
-                        }
-                    }
-                    if done {
-                        break;
-                    }
                 }
             }
 
@@ -730,6 +775,36 @@ pub fn run_dashboard(
         (Ok(_), Err(e)) => Err(e),
         (Ok(_), Ok(_)) => Ok(()),
     }
+}
+
+fn drain_terminal_input(
+    model: &mut Model,
+    layout: &LayoutRects,
+    control_tx: &Sender<UiControlEvent>,
+    quit_behavior: DashboardQuitBehavior,
+) -> Result<bool> {
+    for _ in 0..64 {
+        if !event::poll(Duration::from_millis(0))? {
+            break;
+        }
+        let owner = model.modal_owner();
+        match event::read()? {
+            Event::Key(key) => {
+                if handle_key_event(model, key, layout, control_tx, quit_behavior) {
+                    return Ok(true);
+                }
+            }
+            Event::Mouse(mouse) => handle_mouse_event(model, mouse, layout),
+            Event::Resize(_, _) => model.reset_task_mouse_stride_calibration(),
+            _ => {}
+        }
+        // A newly activated prompt must be drawn before any already-buffered
+        // keys can answer it or a closing overlay can expose it to typing.
+        if owner != model.modal_owner() {
+            break;
+        }
+    }
+    Ok(false)
 }
 
 fn visible_panes(show_global: bool, right_mode: RightPaneMode) -> Vec<ActivePane> {
@@ -806,20 +881,44 @@ fn handle_key_event(
     if key.kind == KeyEventKind::Release {
         return false;
     }
-    if handle_prompt_overlay_input(model, key, layout, control_tx) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        if model.run_complete.is_none() && !model.cancel_requested {
+            let _ = control_tx.send(UiControlEvent::CancelAll);
+            model.cancel_requested = true;
+        }
         return false;
     }
-    if model.rename_edit.is_some() {
-        return handle_rename_edit_input(model, key.code, control_tx);
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
     }
-    if model.search_edit.is_some() {
-        return handle_search_edit_input(model, key.code, layout);
+    match model.modal_owner() {
+        ModalOwner::Help => {
+            handle_help_input(model, key.code, layout.root);
+            return false;
+        }
+        ModalOwner::Rename => return handle_rename_edit_input(model, key.code, control_tx),
+        ModalOwner::Search => return handle_search_edit_input(model, key.code, layout),
+        ModalOwner::Prompt(_, _) => {
+            if handle_prompt_overlay_input(model, key, layout, control_tx) {
+                return false;
+            }
+        }
+        ModalOwner::None => {}
     }
 
     let code = key.code;
     let visible_rows = layout.tasks_inner.height as usize;
+    clamp_active_log_scroll(model, layout);
+    let page_rows = log_page_rows(model.active_pane, layout);
     match code {
-        KeyCode::Char('?') => model.show_help = !model.show_help,
+        KeyCode::Char('?') => {
+            model.show_help = true;
+            model.help_scroll = 0;
+        }
         KeyCode::Char('/') => {
             ensure_search_restore_snapshot(model, model.active_pane);
             model.search_edit = Some(SearchEditState {
@@ -915,16 +1014,17 @@ fn handle_key_event(
             }
         },
         KeyCode::PageUp => match model.active_pane {
-            ActivePane::TaskLogs => model.task_log_from_bottom += 10,
-            ActivePane::GlobalLogs => model.global_log_from_bottom += 10,
+            ActivePane::TaskLogs => model.task_log_from_bottom += page_rows,
+            ActivePane::GlobalLogs => model.global_log_from_bottom += page_rows,
             ActivePane::Tasks => model.move_task_selection(-10, visible_rows),
         },
         KeyCode::PageDown => match model.active_pane {
             ActivePane::TaskLogs => {
-                model.task_log_from_bottom = model.task_log_from_bottom.saturating_sub(10)
+                model.task_log_from_bottom = model.task_log_from_bottom.saturating_sub(page_rows)
             }
             ActivePane::GlobalLogs => {
-                model.global_log_from_bottom = model.global_log_from_bottom.saturating_sub(10)
+                model.global_log_from_bottom =
+                    model.global_log_from_bottom.saturating_sub(page_rows)
             }
             ActivePane::Tasks => model.move_task_selection(10, visible_rows),
         },
@@ -995,7 +1095,19 @@ fn handle_key_event(
         }
         _ => {}
     }
+    clamp_active_log_scroll(model, layout);
     false
+}
+
+fn clamp_active_log_scroll(model: &mut Model, layout: &LayoutRects) {
+    let limit = log_scroll_limit(model, model.active_pane, layout);
+    match model.active_pane {
+        ActivePane::TaskLogs => model.task_log_from_bottom = model.task_log_from_bottom.min(limit),
+        ActivePane::GlobalLogs => {
+            model.global_log_from_bottom = model.global_log_from_bottom.min(limit)
+        }
+        ActivePane::Tasks => {}
+    }
 }
 
 fn handle_prompt_overlay_input(
@@ -1005,7 +1117,7 @@ fn handle_prompt_overlay_input(
     control_tx: &Sender<UiControlEvent>,
 ) -> bool {
     let prompt_visible = find_latest_prompt(model).is_some();
-    if !prompt_visible && model.prompt_edit.is_none() {
+    if !prompt_visible {
         return false;
     }
 
@@ -1062,6 +1174,11 @@ fn handle_prompt_overlay_input(
         }
     }
 
+    if model.prompt_edit.is_some() && matches!(key.code, KeyCode::Char(_)) {
+        handle_prompt_edit_input(model, key, control_tx);
+        return true;
+    }
+
     match key.code {
         KeyCode::Up => {
             model.prompt_scroll_from_bottom += 1;
@@ -1080,11 +1197,11 @@ fn handle_prompt_overlay_input(
                 model.prompt_scroll_from_bottom.saturating_sub(page_rows);
             true
         }
-        KeyCode::Home | KeyCode::Char('g') => {
+        KeyCode::Home => {
             model.prompt_scroll_from_bottom = usize::MAX / 4;
             true
         }
-        KeyCode::End | KeyCode::Char('G') => {
+        KeyCode::End => {
             model.prompt_scroll_from_bottom = 0;
             true
         }
@@ -1093,6 +1210,24 @@ fn handle_prompt_overlay_input(
             true
         }
         _ => false,
+    }
+}
+
+fn handle_help_input(model: &mut Model, code: KeyCode, root: Rect) {
+    let page = help_page_rows(root);
+    let limit = help_scroll_limit(root);
+    model.help_scroll = model.help_scroll.min(limit);
+    match code {
+        KeyCode::Esc | KeyCode::Char('?') => model.show_help = false,
+        KeyCode::Up => model.help_scroll = model.help_scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.help_scroll = (model.help_scroll + 1).min(limit)
+        }
+        KeyCode::PageUp => model.help_scroll = model.help_scroll.saturating_sub(page),
+        KeyCode::PageDown => model.help_scroll = model.help_scroll.saturating_add(page).min(limit),
+        KeyCode::Home | KeyCode::Char('g') => model.help_scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => model.help_scroll = limit,
+        _ => {}
     }
 }
 
@@ -1222,7 +1357,21 @@ fn handle_search_edit_input(model: &mut Model, code: KeyCode, layout: &LayoutRec
 }
 
 fn handle_mouse_event(model: &mut Model, mouse: MouseEvent, layout: &LayoutRects) {
-    let prompt_visible = find_latest_prompt(model).is_some();
+    match model.modal_owner() {
+        ModalOwner::Help => {
+            let code = match mouse.kind {
+                MouseEventKind::ScrollUp => KeyCode::Up,
+                MouseEventKind::ScrollDown => KeyCode::Down,
+                _ => return,
+            };
+            handle_help_input(model, code, layout.root);
+            return;
+        }
+        ModalOwner::Rename | ModalOwner::Search => return,
+        ModalOwner::Prompt(_, _) => {}
+        ModalOwner::None => {}
+    }
+    let prompt_visible = matches!(model.modal_owner(), ModalOwner::Prompt(_, _));
     let prompt_area = prompt_overlay_area(layout.root);
     if prompt_visible && rect_contains(prompt_area, mouse.column, mouse.row) {
         match mouse.kind {
@@ -1235,7 +1384,11 @@ fn handle_mouse_event(model: &mut Model, mouse: MouseEvent, layout: &LayoutRects
         }
         return;
     }
+    if prompt_visible {
+        return;
+    }
 
+    clamp_active_log_scroll(model, layout);
     let visible_rows = layout.tasks_inner.height as usize;
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1288,6 +1441,7 @@ fn handle_mouse_event(model: &mut Model, mouse: MouseEvent, layout: &LayoutRects
         },
         _ => {}
     }
+    clamp_active_log_scroll(model, layout);
 }
 
 fn task_index_for_mouse(model: &Model, tasks_inner: Rect, mouse_row: u16) -> Option<usize> {
@@ -1393,17 +1547,15 @@ fn jump_search_match(model: &mut Model, pane: ActivePane, forward: bool, layout:
                 Some(id) => id.to_string(),
                 None => return,
             };
-            let (matches, total) = {
+            let matches = {
                 let Some(task) = model.tasks.get(&task_id) else {
                     return;
                 };
-                let matches: Vec<usize> = task
-                    .logs
+                task.logs
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, rec)| re.is_match(&rec.line).then_some(idx))
-                    .collect();
-                (matches, task.logs.len())
+                    .collect::<Vec<_>>()
             };
             if matches.is_empty() {
                 model.search_spec_mut(pane).last_match = None;
@@ -1411,7 +1563,20 @@ fn jump_search_match(model: &mut Model, pane: ActivePane, forward: bool, layout:
             }
             let next = pick_next_match(&matches, model.search_spec(pane).last_match, forward);
             model.search_spec_mut(pane).last_match = Some(next);
-            model.task_log_from_bottom = total.saturating_sub(next + 1);
+            if let (Some(task), Some(rect)) = (model.tasks.get(&task_id), layout.task_logs) {
+                let inner = inner_rect(rect);
+                let banner =
+                    (task.logs_dropped > 0).then(|| task_truncation_banner(task.logs_dropped));
+                model.task_log_from_bottom = log_search_from_bottom(
+                    &task.logs,
+                    banner.as_ref(),
+                    next,
+                    &re,
+                    inner,
+                    model.wrap_logs,
+                    false,
+                );
+            }
         }
         ActivePane::GlobalLogs => {
             let matches: Vec<usize> = model
@@ -1426,10 +1591,106 @@ fn jump_search_match(model: &mut Model, pane: ActivePane, forward: bool, layout:
             }
             let next = pick_next_match(&matches, model.search_spec(pane).last_match, forward);
             model.search_spec_mut(pane).last_match = Some(next);
-            let total = model.global_logs.len();
-            model.global_log_from_bottom = total.saturating_sub(next + 1);
+            if let Some(rect) = layout.global_logs {
+                let banner = (model.global_logs_dropped > 0)
+                    .then(|| global_truncation_banner(model.global_logs_dropped));
+                model.global_log_from_bottom = log_search_from_bottom(
+                    &model.global_logs,
+                    banner.as_ref(),
+                    next,
+                    &re,
+                    inner_rect(rect),
+                    model.wrap_logs,
+                    true,
+                );
+            }
         }
     }
+}
+
+fn log_search_from_bottom(
+    records: &VecDeque<LogRecord>,
+    banner: Option<&Line<'static>>,
+    selected: usize,
+    regex: &Regex,
+    inner: Rect,
+    wrap: bool,
+    include_task: bool,
+) -> usize {
+    let width = inner.width as usize;
+    let mut total_rows = banner.map_or(0, |line| line_row_count(line, width, wrap));
+    let mut target_row = total_rows;
+    for (idx, rec) in records.iter().enumerate() {
+        let rows = log_record_row_count(rec, width, wrap, include_task);
+        if idx == selected {
+            target_row = total_rows;
+            if wrap {
+                if let Some(matched) = regex.find(&rec.line) {
+                    let prefix = log_record_prefix(rec, include_task);
+                    let mut cursor = WrappedRowCursor::new(width);
+                    for ch in prefix.chars().chain(rec.line[..matched.start()].chars()) {
+                        cursor.push(ch);
+                    }
+                    let match_row = rec.line[matched.start()..]
+                        .chars()
+                        .next()
+                        .map_or(cursor.row, |ch| cursor.push(ch));
+                    target_row += match_row.min(rows.saturating_sub(1));
+                }
+            }
+        }
+        total_rows += rows;
+    }
+    // Put the matching visual row at the top, leaving room for a match that
+    // crosses a wrap boundary. The renderer clamps near the end of history.
+    total_rows.saturating_sub(target_row.saturating_add(inner.height as usize))
+}
+
+fn log_page_rows(pane: ActivePane, layout: &LayoutRects) -> usize {
+    let inner = match pane {
+        ActivePane::Tasks => Some(layout.tasks_inner),
+        ActivePane::TaskLogs => layout.task_logs.map(inner_rect),
+        ActivePane::GlobalLogs => layout.global_logs.map(inner_rect),
+    };
+    inner.map_or(1, |inner| inner.height.max(1) as usize)
+}
+
+fn log_scroll_limit(model: &Model, pane: ActivePane, layout: &LayoutRects) -> usize {
+    let (records, banner, inner, include_task) = match pane {
+        ActivePane::Tasks => return 0,
+        ActivePane::TaskLogs => {
+            let (Some(task), Some(rect)) = (model.selected_task_row(), layout.task_logs) else {
+                return 0;
+            };
+            (
+                &task.logs,
+                (task.logs_dropped > 0).then(|| task_truncation_banner(task.logs_dropped)),
+                inner_rect(rect),
+                false,
+            )
+        }
+        ActivePane::GlobalLogs => {
+            let Some(rect) = layout.global_logs else {
+                return 0;
+            };
+            (
+                &model.global_logs,
+                (model.global_logs_dropped > 0)
+                    .then(|| global_truncation_banner(model.global_logs_dropped)),
+                inner_rect(rect),
+                true,
+            )
+        }
+    };
+    let width = inner.width as usize;
+    let banner_rows = banner
+        .as_ref()
+        .map_or(0, |line| line_row_count(line, width, model.wrap_logs));
+    let record_rows = records
+        .iter()
+        .map(|rec| log_record_row_count(rec, width, model.wrap_logs, include_task))
+        .sum::<usize>();
+    (banner_rows + record_rows).saturating_sub(inner.height as usize)
 }
 
 fn pick_next_match(matches: &[usize], last: Option<usize>, forward: bool) -> usize {
@@ -1627,12 +1888,18 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &Layout
         frame.render_widget(global_widget, rect);
     }
 
-    let footer = Paragraph::new(render_footer_lines(model))
-        .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL));
+    let footer_inner = inner_rect(layout.footer);
+    let footer = Paragraph::new(render_footer_viewport(
+        model,
+        footer_inner.width as usize,
+        footer_inner.height as usize,
+    ))
+    .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, layout.footer);
 
-    if let Some((task_id, prompt)) = find_latest_prompt(model) {
+    if let (ModalOwner::Prompt(_, _), Some((task_id, prompt))) =
+        (model.modal_owner(), find_latest_prompt(model))
+    {
         let context_lines = prompt_overlay_context_lines(model, &task_id, &prompt);
         draw_prompt_overlay(
             frame,
@@ -1646,12 +1913,12 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, model: &Model, layout: &Layout
         );
     }
 
-    if let Some(edit) = model.rename_edit.as_ref() {
+    if let (ModalOwner::Rename, Some(edit)) = (model.modal_owner(), model.rename_edit.as_ref()) {
         draw_rename_overlay(frame, layout.root, edit);
     }
 
     if model.show_help {
-        draw_help(frame, layout.root);
+        draw_help(frame, layout.root, model.help_scroll);
     }
 }
 
@@ -1825,7 +2092,7 @@ fn render_footer_lines(model: &Model) -> Vec<Line<'static>> {
         Span::raw(" close overlay"),
     ]);
 
-    let mut lines = vec![
+    let shortcut_lines = vec![
         Line::from(vec![
             Span::styled("Tab/h/l", Style::default().fg(Color::Yellow)),
             Span::raw(" pane  "),
@@ -1843,6 +2110,9 @@ fn render_footer_lines(model: &Model) -> Vec<Line<'static>> {
         Line::from(second_line),
     ];
 
+    // Search is current input, not optional shortcut reference. It must be
+    // first so a short footer cannot hide either the editor or its error.
+    let mut lines = Vec::new();
     if let Some(edit) = &model.search_edit {
         let pane = pane_name(edit.target);
         lines.push(Line::from(vec![
@@ -1877,7 +2147,32 @@ fn render_footer_lines(model: &Model) -> Vec<Line<'static>> {
         }
     }
 
+    lines.extend(shortcut_lines);
     lines
+}
+
+fn render_footer_viewport(model: &Model, width: usize, height: usize) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    render_footer_lines(model)
+        .into_iter()
+        .take(height)
+        .map(|line| {
+            let mut remaining = width;
+            let mut spans = Vec::new();
+            for span in line.spans {
+                let text = sanitize_log_line(&span.content);
+                let clipped = take_display_width(&text, remaining);
+                remaining = remaining.saturating_sub(UnicodeWidthStr::width(clipped.as_str()));
+                spans.push(Span::styled(clipped, span.style));
+                if remaining == 0 {
+                    break;
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn model_elapsed(model: &Model) -> Duration {
@@ -2215,7 +2510,7 @@ fn render_focused_task_logs_viewport(
         ));
         report_state = advance_report_highlight_state(report_state, rec);
     }
-    take_visible_rows(&lines, 0, width, height, wrap)
+    render_log_viewport_rows(&lines, slice, width, height, wrap)
 }
 
 fn render_global_logs(model: &Model) -> Vec<Line<'static>> {
@@ -2315,7 +2610,7 @@ fn render_global_logs_viewport(
             advance_report_highlight_state(report_state, rec),
         );
     }
-    take_visible_rows(&lines, 0, width, height, wrap)
+    render_log_viewport_rows(&lines, slice, width, height, wrap)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2323,6 +2618,26 @@ struct LogViewportSlice {
     banner_visible: bool,
     record_start: usize,
     record_end: usize,
+    // A window may begin in the middle of its first record (or banner).
+    row_offset: usize,
+    padding_top: usize,
+}
+
+fn render_log_viewport_rows(
+    lines: &[Line<'static>],
+    slice: LogViewportSlice,
+    width: usize,
+    height: usize,
+    wrap: bool,
+) -> Vec<Line<'static>> {
+    let mut visible = vec![Line::default(); slice.padding_top];
+    visible.extend(
+        expand_visual_rows(lines, width, wrap)
+            .into_iter()
+            .skip(slice.row_offset)
+            .take(height.saturating_sub(slice.padding_top)),
+    );
+    visible
 }
 
 fn log_viewport_slice(
@@ -2356,11 +2671,13 @@ fn log_viewport_slice(
     let mut cursor = banner_rows;
     let mut record_start = None;
     let mut record_end = 0usize;
+    let mut first_record_row = banner_rows;
     for (idx, rows) in record_rows.iter().copied().enumerate() {
         let next = cursor.saturating_add(rows);
         if cursor < end && next > start {
             if record_start.is_none() {
                 record_start = Some(idx);
+                first_record_row = cursor;
             }
             record_end = idx + 1;
         }
@@ -2371,6 +2688,8 @@ fn log_viewport_slice(
         banner_visible,
         record_start: record_start.unwrap_or(0),
         record_end,
+        row_offset: start.saturating_sub(if banner_visible { 0 } else { first_record_row }),
+        padding_top: height.saturating_sub(end - start),
     })
 }
 
@@ -2378,10 +2697,30 @@ fn log_record_row_count(rec: &LogRecord, width: usize, wrap: bool, include_task:
     if !wrap {
         return 1;
     }
-    let visible = log_record_plain_width(rec, include_task).max(1);
-    visible.div_ceil(width.max(1))
+    let prefix = log_record_prefix(rec, include_task);
+    let mut cursor = WrappedRowCursor::new(width);
+    for ch in prefix.chars().chain(rec.line.chars()) {
+        cursor.push(ch);
+    }
+    cursor.row_count()
 }
 
+fn log_record_prefix(rec: &LogRecord, include_task: bool) -> String {
+    let mut prefix = format!("{} ", fmt_ts(rec.ts_unix_ms));
+    if include_task {
+        prefix.push_str(&rec.task_id);
+        prefix.push(' ');
+    }
+    let prompt = looks_like_interactive_prompt(&rec.line);
+    if let Some((badge, _)) = log_display_kind(rec, prompt).badge() {
+        prefix.push('[');
+        prefix.push_str(badge);
+        prefix.push_str("] ");
+    }
+    prefix
+}
+
+#[cfg(test)]
 fn log_record_plain_width(rec: &LogRecord, include_task: bool) -> usize {
     let mut width = UnicodeWidthStr::width(fmt_ts(rec.ts_unix_ms).as_str()) + 1;
     if include_task {
@@ -2503,26 +2842,56 @@ fn scroll_top_for_lines(
     if height == 0 || width == 0 || lines.is_empty() {
         return 0;
     }
-    let total_rows = lines
-        .iter()
-        .map(|line| {
-            if !wrap {
-                1
-            } else {
-                let w = line.width().max(1);
-                w.div_ceil(width)
-            }
-        })
-        .sum::<usize>();
+    let total_rows = count_visual_rows(lines, width, wrap);
     total_rows.saturating_sub(height.saturating_add(from_bottom))
+}
+
+struct WrappedRowCursor {
+    width: usize,
+    row: usize,
+    used: usize,
+}
+
+impl WrappedRowCursor {
+    fn new(width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            row: 0,
+            used: 0,
+        }
+    }
+
+    // Return the visual row containing this character. Counting, rendering,
+    // and search positioning must all agree when a wide glyph crosses a row.
+    fn push(&mut self, ch: char) -> usize {
+        let char_width = ch.width().unwrap_or(0).max(1);
+        if self.used > 0 && self.used + char_width > self.width {
+            self.row += 1;
+            self.used = 0;
+        }
+        let row = self.row;
+        self.used += char_width;
+        if self.used >= self.width {
+            self.row += 1;
+            self.used = 0;
+        }
+        row
+    }
+
+    fn row_count(&self) -> usize {
+        (self.row + usize::from(self.used > 0)).max(1)
+    }
 }
 
 fn line_row_count(line: &Line<'_>, width: usize, wrap: bool) -> usize {
     if !wrap {
         return 1;
     }
-    let w = line.width().max(1);
-    w.div_ceil(width.max(1))
+    let mut cursor = WrappedRowCursor::new(width);
+    for ch in line.spans.iter().flat_map(|span| span.content.chars()) {
+        cursor.push(ch);
+    }
+    cursor.row_count()
 }
 
 fn count_visual_rows(lines: &[Line<'_>], width: usize, wrap: bool) -> usize {
@@ -2533,37 +2902,30 @@ fn count_visual_rows(lines: &[Line<'_>], width: usize, wrap: bool) -> usize {
 }
 
 fn wrap_line_rows(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
     if line.spans.is_empty() {
         return vec![Line::default()];
     }
 
     let mut rows = Vec::new();
     let mut row_spans = Vec::new();
-    let mut row_width = 0usize;
+    let mut cursor = WrappedRowCursor::new(width);
+    let mut current_row = 0;
 
     for span in &line.spans {
         let style = span.style;
         let mut segment = String::new();
 
         for ch in span.content.chars() {
-            let char_width = Line::from(ch.to_string()).width().max(1);
-            if row_width > 0 && row_width + char_width > width {
+            let row = cursor.push(ch);
+            if row != current_row {
                 if !segment.is_empty() {
                     row_spans.push(Span::styled(std::mem::take(&mut segment), style));
                 }
                 rows.push(Line::from(std::mem::take(&mut row_spans)));
-                row_width = 0;
+                current_row = row;
             }
 
             segment.push(ch);
-            row_width += char_width;
-
-            if row_width >= width {
-                row_spans.push(Span::styled(std::mem::take(&mut segment), style));
-                rows.push(Line::from(std::mem::take(&mut row_spans)));
-                row_width = 0;
-            }
         }
 
         if !segment.is_empty() {
@@ -3908,22 +4270,38 @@ fn strip_ansi(raw: &str) -> String {
     single.replace_all(&without_osc, "").into_owned()
 }
 
-fn draw_help(frame: &mut ratatui::Frame<'_>, size: Rect) {
+fn help_page_rows(size: Rect) -> usize {
+    inner_rect(centered_rect(88, 78, size)).height.max(1) as usize
+}
+
+fn help_scroll_limit(size: Rect) -> usize {
+    let inner = inner_rect(centered_rect(88, 78, size));
+    count_visual_rows(&render_help_lines(), inner.width as usize, true)
+        .saturating_sub(inner.height as usize)
+}
+
+fn draw_help(frame: &mut ratatui::Frame<'_>, size: Rect, scroll: usize) {
     let area = centered_rect(88, 78, size);
     frame.render_widget(Clear, area);
-    let help = Paragraph::new(render_help_lines())
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    "Dashboard Help",
-                    Style::default()
-                        .fg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .border_style(Style::default().fg(Color::LightCyan)),
-        );
+    let inner = inner_rect(area);
+    let rows = expand_visual_rows(&render_help_lines(), inner.width as usize, true);
+    let top = scroll.min(rows.len().saturating_sub(inner.height as usize));
+    let visible_rows = rows
+        .into_iter()
+        .skip(top)
+        .take(inner.height as usize)
+        .collect::<Vec<_>>();
+    let help = Paragraph::new(visible_rows).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                "Dashboard Help [Up/Down PgUp/PgDn Home/End]",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(Color::LightCyan)),
+    );
     frame.render_widget(help, area);
 }
 
@@ -3966,7 +4344,7 @@ fn render_help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         help_section("Actions"),
         help_entry(&["k"], "cancel the selected task"),
-        help_entry(&["K"], "cancel all tasks"),
+        help_entry(&["K", "Ctrl+C"], "cancel all tasks"),
         help_entry(
             &["Enter"],
             "on an input prompt, start stdin editor; Shift+Enter inserts newline",
@@ -4161,7 +4539,7 @@ fn prompt_overlay_lines(
             Style::default().fg(Color::LightCyan),
         )]));
         lines.push(Line::from(
-            "Up/Down/PgUp/PgDn/Home/End: scroll   k/K: cancel one/all   q: exit",
+            "Ctrl+C: cancel all   k/K: cancel one/all   q: exit   Up/Down: scroll",
         ));
     } else if let Some(edit) = edit {
         let display_buffer = if prompt_expects_secret(prompt) {
@@ -4175,12 +4553,12 @@ fn prompt_overlay_lines(
             Span::raw(display_buffer),
         ]));
         lines.push(Line::from(
-            "Enter: send   Shift+Enter: newline   Esc: close",
+            "Enter: send   Shift+Enter: newline   Esc: close   Ctrl+C: cancel all",
         ));
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "Enter: start input   Up/Down/PgUp/PgDn/Home/End: scroll",
+            "Enter: send empty answer   Up/Down: scroll   Ctrl+C: cancel all",
         ));
     }
     lines
@@ -4220,28 +4598,115 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+#[derive(Default)]
+struct TerminalModes {
+    raw: bool,
+    alternate: bool,
+    mouse: bool,
 }
 
-fn terminal_rect(terminal: &Terminal<CrosstermBackend<Stdout>>) -> Result<Rect> {
+impl TerminalModes {
+    fn restore(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        if self.raw {
+            match disable_raw_mode() {
+                Ok(()) => self.raw = false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let mut stdout = io::stdout();
+        if self.mouse {
+            match execute!(stdout, DisableMouseCapture) {
+                Ok(()) => self.mouse = false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if self.alternate {
+            match execute!(stdout, LeaveAlternateScreen) {
+                Ok(()) => self.alternate = false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Err(error) = execute!(stdout, crossterm::cursor::Show) {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for TerminalModes {
+    fn drop(&mut self) {
+        if self.raw || self.alternate || self.mouse {
+            let _ = self.restore();
+        }
+    }
+}
+
+struct DashboardTerminal {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    modes: TerminalModes,
+}
+
+impl std::ops::Deref for DashboardTerminal {
+    type Target = Terminal<CrosstermBackend<Stdout>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
+impl std::ops::DerefMut for DashboardTerminal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.terminal
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalSetupStep {
+    RawMode,
+    AlternateScreen,
+    MouseCapture,
+    TerminalConstruction,
+}
+
+fn setup_terminal() -> Result<DashboardTerminal> {
+    setup_terminal_with_checkpoint(|_| Ok(()))
+}
+
+fn setup_terminal_with_checkpoint(
+    mut checkpoint: impl FnMut(TerminalSetupStep) -> Result<()>,
+) -> Result<DashboardTerminal> {
+    let mut modes = TerminalModes::default();
+    enable_raw_mode()?;
+    modes.raw = true;
+    checkpoint(TerminalSetupStep::RawMode)?;
+    let mut stdout = io::stdout();
+    // Output can fail after a partial write, so cleanup owns these modes
+    // before sending each enable sequence.
+    modes.alternate = true;
+    execute!(stdout, EnterAlternateScreen)?;
+    checkpoint(TerminalSetupStep::AlternateScreen)?;
+    modes.mouse = true;
+    execute!(stdout, EnableMouseCapture)?;
+    checkpoint(TerminalSetupStep::MouseCapture)?;
+    checkpoint(TerminalSetupStep::TerminalConstruction)?;
+    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    Ok(DashboardTerminal { terminal, modes })
+}
+
+fn terminal_rect(terminal: &DashboardTerminal) -> Result<Rect> {
     let size = terminal.size()?;
     Ok(Rect::new(0, 0, size.width, size.height))
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
+fn restore_terminal(terminal: &mut DashboardTerminal) -> Result<()> {
+    terminal.modes.restore().map_err(Into::into)
 }
 
 fn fmt_ts(unix_ms: u64) -> String {
@@ -4262,3 +4727,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 #[path = "../tests/ui_tui.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/ui_viewport.rs"]
+mod viewport_tests;

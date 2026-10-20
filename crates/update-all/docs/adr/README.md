@@ -23,7 +23,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0011](0011-native-completion-protocol-and-trust-authority.md) | Native completion protocol and trust authority | proposed | pending |
 | [0012](0012-help-derived-completion-ir-and-query-authority.md) | Help-derived completion IR and query authority | proposed | pending |
 | [0013](0013-five-shell-immutable-completion-activation.md) | Five-shell immutable completion activation | proposed | pending |
-| [0014](0014-bounded-run-retention.md) | Bounded run retention | proposed | pending |
+| [0014](0014-bounded-run-retention.md) | Bounded run retention | superseded | pending |
 | [0015](0015-bounded-release-state-observation.md) | Bounded release-state observation | proposed | pending |
 | [0016](0016-serialized-release-mutation-admission.md) | Serialized release mutation admission | proposed | pending |
 | [0017](0017-release-state-writer-custody.md) | Release-state writer custody | proposed | pending |
@@ -37,11 +37,14 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0025](0025-explicit-offline-signed-bundle-intake.md) | Explicit offline signed-bundle intake | proposed | pending |
 | [0026](0026-command-output-fidelity-and-bounded-diagnostics.md) | Command output fidelity and bounded diagnostics | proposed | pending |
 | [0027](0027-execution-owned-cancellation-outcomes.md) | Execution-owned cancellation outcomes | proposed | pending |
-| [0028](0028-task-terminal-sudo-authentication.md) | Task-terminal sudo authentication | proposed | pending |
-| [0029](0029-implementation-first-linux-sudo-delivery.md) | Implementation-first Linux sudo delivery | proposed | pending |
+| [0028](0028-task-terminal-sudo-authentication.md) | Task-terminal sudo authentication | superseded | verified |
+| [0029](0029-implementation-first-linux-sudo-delivery.md) | Implementation-first Linux sudo delivery | accepted | verified |
 | [0030](0030-common-managed-update-lifecycle.md) | Common managed update lifecycle | proposed | pending |
 | [0031](0031-nonactivating-authenticated-artifact-retention.md) | Nonactivating authenticated artifact retention | proposed | pending |
 | [0032](0032-executing-build-run-provenance.md) | Executing-build run provenance | proposed | pending |
+| [0033](0033-mandatory-task-run-evidence-and-shared-scheduling.md) | Mandatory task-run evidence and shared scheduling | proposed | pending |
+| [0034](0034-compatible-privilege-fallback-modes.md) | Compatible privilege fallback modes | proposed | pending |
+| [0035](0035-owned-dashboard-input-and-bounded-display.md) | Owned dashboard input and bounded display | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

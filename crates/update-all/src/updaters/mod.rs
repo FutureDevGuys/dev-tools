@@ -50,14 +50,18 @@ pub enum PrivilegeMode {
     Skip,
     PromptTty,
     Fail,
+    Auto,
+    Required,
 }
 
 impl PrivilegeMode {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
-            "skip" | "best_effort_skip" => Some(Self::Skip),
+            "skip" | "best_effort_skip" | "never" => Some(Self::Skip),
             "prompt_tty" | "prompt" => Some(Self::PromptTty),
             "fail" | "fail_run" => Some(Self::Fail),
+            "auto" => Some(Self::Auto),
+            "required" => Some(Self::Required),
             _ => None,
         }
     }

@@ -95,9 +95,17 @@ include = []
 # Built-in or custom updater IDs to always exclude.
 # Alias: "winget" expands to "winget-user" + "winget-machine".
 exclude = []
-# skip | prompt_tty | fail
+# prompt_tty (default) | auto | never | required | skip | fail
 # prompt_tty prompts only from an interactive terminal; non-interactive runs
 # require an existing sudo session and fail loudly otherwise.
+# auto: opt in to noninteractive, already-authorized Linux elevation only.
+# Missing/denied/expired authority defers affected tasks, not independent work.
+# No password fallback or background renewal; nested needs_sudo_session commands
+# defer because an outer sudo check cannot promise they will not prompt.
+# never: alias for skip, deliberately exclude elevated tasks without invoking sudo.
+# required: selected elevated work makes usable elevation a run prerequisite.
+# fail (alias fail_run) refuses elevated tasks; it is NOT an alias for required.
+# skip/never exclusions alone are clean; unestablished health dependencies block.
 privilege_mode = "prompt_tty"
 # Optional external custom-updater catalog files. Relative paths are resolved
 # from this config file. Catalog task IDs and inline task IDs must be unique.

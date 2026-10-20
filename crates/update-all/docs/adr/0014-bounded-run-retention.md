@@ -5,14 +5,17 @@ owner: dev-tools
 
 # ADR 0014: Bounded run retention
 
-status: proposed
+status: superseded
 verification: pending
+replacement: 0033-mandatory-task-run-evidence-and-shared-scheduling.md
 
 ## Context
 
 Update All already owns structured run metadata, an event journal, human logs, and task transcripts beneath one configured run root. Without a retention boundary, normal repeated operation grows that diagnostic root indefinitely. A separate cleanup service would split product ownership and add platform-specific maintenance.
 
 ## Decision
+
+[ADR 0033](0033-mandatory-task-run-evidence-and-shared-scheduling.md) replaces only the former non-fatal logging-initialization contract. The retention policy below remains applicable.
 
 Update All enforces age, count, and aggregate-byte limits over its completed run directories after each terminal invocation and through an explicit `runs prune` command. Retention is diagnostic maintenance, not updater desired state. The current run is protected, and automatic cleanup recognizes only real directories containing parseable Update All metadata with a terminal status.
 
@@ -46,7 +49,7 @@ Named regression tests:
 - `logging_retention_defaults_and_overrides_are_explicit`
 - `runs_prune_is_a_public_dry_run_capable_command`
 - `run_artifacts_are_owner_only_even_with_a_permissive_parent`
-- `logging_initialization_failure_is_non_fatal`
+- `logging_initialization_failure_is_fatal`
 
 ## Runtime acceptance
 

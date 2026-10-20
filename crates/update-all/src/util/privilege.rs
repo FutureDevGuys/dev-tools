@@ -5,10 +5,42 @@ use is_terminal::IsTerminal;
 use std::io;
 use std::process::{Command, Stdio};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivilegeUnavailable {
+    MissingExecutable,
+    NoninteractiveAuthorityUnavailable,
+    ExpiredSession,
+    UnsupportedPlatform,
+    UnsupportedNestedSession,
+}
+
+impl PrivilegeUnavailable {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::MissingExecutable => "privilege-missing-executable",
+            Self::NoninteractiveAuthorityUnavailable => "privilege-noninteractive-unavailable",
+            Self::ExpiredSession => "privilege-expired-session",
+            Self::UnsupportedPlatform => "privilege-unsupported-platform",
+            Self::UnsupportedNestedSession => "privilege-unsupported-nested-session",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::MissingExecutable => "sudo was not found",
+            Self::NoninteractiveAuthorityUnavailable => "noninteractive sudo authority is unavailable",
+            Self::ExpiredSession => "previously usable sudo authority expired before launch",
+            Self::UnsupportedPlatform => "noninteractive elevation is unsupported on this platform",
+            Self::UnsupportedNestedSession => "the command requires nested or auxiliary authority without a supported no-prompt path",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum PrivilegeDecision {
     Proceed,
     Skip(String),
+    Defer(PrivilegeUnavailable),
     Fail(String),
 }
 
@@ -25,6 +57,12 @@ pub fn resolve_privilege_decision(
             "{task_label}: requires elevation but mode=fail"
         ))),
         PrivilegeMode::PromptTty => prompt_tty_for_privilege(host_os, task_label),
+        PrivilegeMode::Auto if host_os != HostOs::Linux => Ok(PrivilegeDecision::Defer(
+            PrivilegeUnavailable::UnsupportedPlatform,
+        )),
+        // New modes perform bounded, execution-owned admission in the task runner.
+        // Resolving policy alone must not launch sudo or prompt.
+        PrivilegeMode::Auto | PrivilegeMode::Required => Ok(PrivilegeDecision::Proceed),
     }
 }
 

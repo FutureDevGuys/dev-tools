@@ -5128,3 +5128,45 @@ exit 7
         );
     }
 }
+
+#[path = "tasks_privilege.rs"]
+mod privilege_tests;
+
+#[test]
+fn failed_authoritative_evidence_blocks_command_and_precommand_admission() {
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("effect");
+    let log = Arc::new(crate::logging::RunLogSink::new(temp.path(), false).unwrap());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.run_log = Some(log.clone());
+    log.inject_journal_fault_for_test();
+    assert!(log
+        .write_event("fixture_fault", None, serde_json::json!({}))
+        .is_err());
+    let error = ctx
+        .run_command_with_policy(
+            "fixture",
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                format!("printf effect > '{}'", marker.display()),
+            ],
+            &TaskPolicy::new(1, 3, 0),
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("authoritative run evidence"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn completion_progress_write_failure_latches_evidence_admission_failure() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(crate::logging::RunLogSink::new(temp.path(), false).unwrap());
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.run_log = Some(log.clone());
+    fs::create_dir(log.run_dir().join("task-fixture.log")).unwrap();
+    ctx.completion_progress_cb("fixture").unwrap()("progress".into());
+    assert!(log.journal_failure().is_some());
+    assert!(ctx.ensure_run_evidence_healthy().is_err());
+}

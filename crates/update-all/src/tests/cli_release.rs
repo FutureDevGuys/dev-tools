@@ -17,12 +17,12 @@ fn runs_prune_is_a_public_dry_run_capable_command() {
 }
 
 #[test]
-fn logging_initialization_failure_is_non_fatal() {
+fn logging_initialization_failure_is_fatal() {
     let temp = tempfile::TempDir::new().unwrap();
     let occupied = temp.path().join("occupied");
     std::fs::write(&occupied, "not a directory").unwrap();
 
-    assert!(open_run_log(&occupied, true).is_none());
+    assert!(open_run_log(&occupied, true).is_err());
 }
 
 #[test]
@@ -74,6 +74,7 @@ fn product_subcommands_share_the_release_engine() {
             "update",
             "update-if-installed",
             "rollback",
+            "retain",
         ]
     );
 }
@@ -181,6 +182,34 @@ fn product_offline_bundle_flags_are_scoped_to_install_and_update() {
                 continue;
             }
             for flag in ["offline", "root-document", "manifest", "artifact"] {
+                // ADR 0031 retention requires three local inputs, but is
+                // inherently offline rather than another activation operation.
+                if family == "product" && operation.get_name() == "retain" && flag != "offline" {
+                    let argument = operation
+                        .get_arguments()
+                        .find(|argument| argument.get_long() == Some(flag))
+                        .expect("retention must expose each exact local input");
+                    assert!(argument.is_required_set());
+                    continue;
+                }
+                // Common install/apply permits cached-only operation, not the
+                // product activation interface's explicit bundle-path inputs.
+                if family == "update"
+                    && matches!(operation.get_name(), "install" | "apply")
+                    && flag == "offline"
+                {
+                    assert!(operation
+                        .get_arguments()
+                        .any(|argument| argument.get_long() == Some(flag)));
+                    assert!(RunCli::try_parse_from([
+                        "update-all",
+                        "update",
+                        operation.get_name(),
+                        "--offline",
+                    ])
+                    .is_ok());
+                    continue;
+                }
                 assert!(
                     !operation
                         .get_arguments()
@@ -205,6 +234,27 @@ fn product_offline_bundle_flags_are_scoped_to_install_and_update() {
                     ErrorKind::UnknownArgument,
                 );
             }
+        }
+    }
+    for included in 0..8 {
+        let mut arguments = vec!["update-all", "product", "retain", "dev-cache", "--json"];
+        for (index, flag) in ["--root-document", "--manifest", "--artifact"]
+            .iter()
+            .enumerate()
+        {
+            if included & (1 << index) != 0 {
+                arguments.extend([*flag, "unused-path"]);
+            }
+        }
+        let parsed = RunCli::try_parse_from(arguments);
+        if included == 7 {
+            assert!(parsed.is_ok());
+        } else {
+            assert_eq!(
+                parsed.unwrap_err().kind(),
+                ErrorKind::MissingRequiredArgument,
+                "retention must require every exact local input",
+            );
         }
     }
 }

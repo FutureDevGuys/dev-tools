@@ -27,6 +27,9 @@ pub struct RunLogSink {
     event_file_path: PathBuf,
     event_sequence: Mutex<u64>,
     journal_failure: Mutex<Option<String>>,
+    run_snapshot: Mutex<Option<Value>>,
+    selected_tasks: Mutex<Vec<String>>,
+    started_tasks: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     journal_fault_injected: AtomicBool,
     task_files: Mutex<BTreeMap<String, LogFileHandle>>,
@@ -65,13 +68,15 @@ impl RunLogSink {
             event_file_path,
             event_sequence: Mutex::new(0),
             journal_failure: Mutex::new(None),
+            run_snapshot: Mutex::new(None),
+            selected_tasks: Mutex::new(Vec::new()),
+            started_tasks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             journal_fault_injected: AtomicBool::new(false),
             task_files: Mutex::new(BTreeMap::new()),
             raw_task_files: Mutex::new(BTreeMap::new()),
             write_warning_targets: Mutex::new(BTreeSet::new()),
         };
-        sink.write_metadata("running", None, None, None, Vec::new(), started_unix_ms)?;
         sink.write_event(
             "run_started",
             None,
@@ -81,6 +86,7 @@ impl RunLogSink {
                 "build_info": sink.build_info(),
             }),
         )?;
+        sink.write_metadata("running", None, None, None, Vec::new(), started_unix_ms)?;
         Ok(sink)
     }
 
@@ -193,7 +199,13 @@ impl RunLogSink {
     }
 
     pub fn write_event(&self, kind: &str, task_id: Option<&str>, payload: Value) -> Result<()> {
+        let starts_task = kind == "task_state_changed" && payload["state"] == "running";
         let result = self.write_event_inner(kind, task_id, payload);
+        if result.is_ok() && starts_task {
+            if let (Some(task_id), Ok(mut started)) = (task_id, self.started_tasks.lock()) {
+                started.insert(task_id.to_string());
+            }
+        }
         if let Err(error) = &result {
             if let Ok(mut failure) = self.journal_failure.lock() {
                 if failure.is_none() {
@@ -299,16 +311,164 @@ impl RunLogSink {
 
     pub fn write_json_file<T: Serialize>(&self, relative_name: &str, value: &T) -> Result<()> {
         let path = self.run_dir.join(relative_name);
+        if relative_name == "run.json" {
+            *self
+                .run_snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))? =
+                Some(serde_json::to_value(value)?);
+        }
         let json = serde_json::to_vec_pretty(value)
             .with_context(|| format!("serialize {}", path.display()))?;
         write_owner_only(&path, &json)
     }
 
+    pub(crate) fn record_selected_tasks(&self, selected: &[String]) -> Result<()> {
+        *self
+            .selected_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run selection lock poisoned"))? = selected.to_vec();
+        Ok(())
+    }
+
+    /// One controlled-return owner calls this after task execution (or rejected admission).
+    /// The last in-memory artifact preserves observed effects even if its disk write failed.
+    pub(crate) fn finalize_task_run(
+        &self,
+        host_os: &str,
+        ui_mode: &str,
+        engine_mode: &str,
+        status: &str,
+        exit_code: i32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ms_now()?;
+        let selected = self
+            .selected_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run selection lock poisoned"))?
+            .clone();
+        let snapshot = self
+            .run_snapshot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))?
+            .clone();
+        let mut payload = snapshot.unwrap_or_else(|| {
+            serde_json::json!({
+                "schema_version": 1,
+                "build_info": self.build_info(),
+                "run_id": self.run_id(),
+                "started_unix_ms": self.started_unix_ms,
+                "tasks_ended_unix_ms": now,
+                "tasks_completed_unix_ms": now,
+                "ended_unix_ms": now,
+                "tasks_elapsed_ms": now.saturating_sub(self.started_unix_ms),
+                "completed_with_issues": false,
+                "issue_count": 0,
+                "failed_task_count": 0,
+                "canceled_task_count": 0,
+                "runtime_advisories": [],
+                "tasks": [],
+            })
+        });
+        let started = self
+            .started_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run started-task lock poisoned"))?;
+        let unstarted: Vec<String> = selected
+            .iter()
+            .filter(|id| !started.contains(*id))
+            .cloned()
+            .collect();
+        drop(started);
+        payload["status"] = status.into();
+        payload["exit_code"] = exit_code.into();
+        payload["reason"] = reason
+            .map(|text| text.chars().take(1024).collect::<String>())
+            .into();
+        payload["display_name"] = self.display_name().into();
+        payload["host_os"] = host_os.into();
+        payload["ui_mode"] = ui_mode.into();
+        payload["engine_mode"] = engine_mode.into();
+        payload["run_dir"] = self.run_dir.display().to_string().into();
+        payload["selected_tasks"] = serde_json::to_value(&selected)?;
+        payload["unstarted_tasks"] = serde_json::to_value(unstarted)?;
+        payload["artifact_updated_unix_ms"] = now.into();
+        payload["ui_wait_ms"] = now
+            .saturating_sub(payload["tasks_ended_unix_ms"].as_u64().unwrap_or(now))
+            .into();
+
+        let mut failure = self.write_json_file("run.json", &payload).err();
+        let final_status = if failure.is_some() { "failed" } else { status };
+        let final_exit = if failure.is_some() { 1 } else { exit_code };
+        if let Err(error) = self.write_metadata(
+            final_status,
+            Some(host_os),
+            Some(ui_mode),
+            Some(engine_mode),
+            selected.clone(),
+            now,
+        ) {
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
+        let final_status = if failure.is_some() { "failed" } else { status };
+        let final_exit = if failure.is_some() { 1 } else { final_exit };
+        if let Err(error) = self.write_event(
+            "run_completed",
+            None,
+            serde_json::json!({
+                "status": final_status,
+                "exit_code": final_exit,
+                "success": final_exit == 0,
+                "canceled": final_status == "canceled",
+                "had_failures": payload["failed_task_count"].as_u64().unwrap_or(0) > 0
+                    || self.journal_failure().is_some()
+                    || (final_status == "failed" && final_exit != 2),
+                "reason": payload["reason"],
+            }),
+        ) {
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
+        if let Some(error) = failure {
+            // Preserve actual task results. Best-effort correction is diagnostic only;
+            // the explicit error remains non-clean even if this correction succeeds.
+            payload["status"] = "failed".into();
+            payload["exit_code"] = 1.into();
+            payload["finalization_error"] = format!("{error:#}")
+                .chars()
+                .take(1024)
+                .collect::<String>()
+                .into();
+            let _ = self.write_json_file("run.json", &payload);
+            let _ = self.write_metadata(
+                "failed",
+                Some(host_os),
+                Some(ui_mode),
+                Some(engine_mode),
+                selected,
+                now,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn emit_write_warning_once(&self, err: &anyhow::Error) {
+        // Full persisted evidence is part of task admission. A failed task log or
+        // artifact write must stop later admissions just like a failed event write.
+        if let Ok(mut failure) = self.journal_failure.lock() {
+            if failure.is_none() {
+                *failure = Some(format!("{err:#}"));
+            }
+        }
         let target = write_warning_target(err);
         if self.mark_write_warning_target(&target) {
             crate::ua_errln!(
-                "update-all: log/artifact write failed for {target}; continuing without full diagnostics: {err:#}"
+                "update-all: log/artifact write failed for {target}; the run cannot complete cleanly: {err:#}"
             );
         }
     }
