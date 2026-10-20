@@ -454,8 +454,17 @@ impl UiModeResolved {
                 let _ = task_colors;
                 Ok(Some(thread::spawn(move || {
                     while let Ok(event) = rx.recv() {
-                        if matches!(event, DashboardEvent::UiDone) {
-                            break;
+                        match event {
+                            DashboardEvent::UiDone => break,
+                            DashboardEvent::UiSuspendRequested { ack, .. }
+                            | DashboardEvent::UiResumeRequested { ack } => {
+                                // Plain output owns no terminal modes to restore,
+                                // but execution still needs its handoff acknowledged.
+                                if let Some(ack) = ack {
+                                    let _ = ack.send(());
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     Ok(())

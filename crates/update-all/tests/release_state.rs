@@ -7,6 +7,10 @@ use std::path::Path;
 use std::time::Duration;
 
 fn status(root: &Path) -> Command {
+    release_status(root, &["self", "status", "--json"])
+}
+
+fn release_status(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("update-all"));
     command
         .env_clear()
@@ -14,9 +18,94 @@ fn status(root: &Path) -> Command {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("PATH", "/nonexistent")
         .current_dir(root)
-        .args(["self", "status", "--json"])
+        .args(args)
         .timeout(Duration::from_secs(5));
     command
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn standalone_legacy_status_reports_common_failures_without_mutation() {
+    use std::os::unix::fs::MetadataExt;
+
+    for (mode, hardlinked) in [(0o644, false), (0o700, false), (0o600, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let product = root.path().join("state/dev-tools/products/update-all");
+        fs::create_dir_all(&product).unwrap();
+        fs::set_permissions(&product, fs::Permissions::from_mode(0o700)).unwrap();
+        let state = product.join("state.json");
+        let bytes = b"{\"accepted_root_generation\":0,\"accepted_generation\":0}";
+        fs::write(&state, bytes).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(mode)).unwrap();
+        if hardlinked {
+            fs::hard_link(&state, root.path().join("private-state-alias")).unwrap();
+        }
+        let before = fs::symlink_metadata(&state).unwrap();
+        for args in [
+            &["self", "status", "--json"][..],
+            &["self", "status"][..],
+            &["product", "status", "update-all", "--json"][..],
+            &["product", "status", "update-all"][..],
+        ] {
+            release_status(root.path(), args)
+                .assert()
+                .code(4)
+                .stdout("")
+                .stderr("release status failed; use update-all update status --json for details\n");
+            let after = fs::symlink_metadata(&state).unwrap();
+            assert_eq!(fs::read(&state).unwrap(), bytes);
+            assert_eq!(after.mode(), before.mode());
+            assert_eq!(after.ino(), before.ino());
+            assert_eq!(after.nlink(), before.nlink());
+            assert_eq!(after.mtime(), before.mtime());
+            assert_eq!(after.mtime_nsec(), before.mtime_nsec());
+            assert_eq!(fs::read_dir(&product).unwrap().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn standalone_legacy_status_preserves_successful_json_shape() {
+    let root = tempfile::tempdir().unwrap();
+    let product = root.path().join("state/dev-tools/products/update-all");
+    let state = product.join("state.json");
+    let bytes = br#"{"accepted_root_generation":0,"accepted_generation":0,"active_version":"0.1.14","previous_version":"0.1.13","last_successful_check_unix":42}"#;
+    for present in [false, true] {
+        if present {
+            fs::create_dir_all(&product).unwrap();
+            fs::set_permissions(&product, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(&state, bytes).unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        for args in [
+            &["self", "status", "--json"][..],
+            &["product", "status", "update-all", "--json"][..],
+        ] {
+            let assertion = release_status(root.path(), args)
+                .assert()
+                .success()
+                .stderr("");
+            let document: serde_json::Value =
+                serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+            assert_eq!(
+                document,
+                serde_json::json!({
+                    "product": "update-all",
+                    "installed_version": present.then_some("0.1.14"),
+                    "engine_version": env!("CARGO_PKG_VERSION"),
+                    "previous_version": present.then_some("0.1.13"),
+                    "managed": false,
+                    "last_successful_check_unix": present.then_some(42),
+                })
+            );
+            if present {
+                assert_eq!(fs::read(&state).unwrap(), bytes);
+                assert_eq!(fs::read_dir(&product).unwrap().count(), 1);
+            } else {
+                assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+            }
+        }
+    }
 }
 
 #[test]

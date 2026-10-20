@@ -1539,7 +1539,7 @@ impl SelfCli {
                 cli.json,
             ),
             SelfCmd::Status(cli) => {
-                let status = crate::release::status(crate::release::Product::UpdateAll)?;
+                let status = legacy_release_status(crate::release::Product::UpdateAll)?;
                 if cli.json {
                     crate::ua_outln!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
@@ -1584,6 +1584,18 @@ impl SelfCli {
         }
         Ok(())
     }
+}
+
+fn legacy_release_status(product: crate::release::Product) -> Result<crate::release::Status> {
+    crate::release::status(product).inspect_err(|error| {
+        // The common exit marker suppresses main's diagnostics. Unlike the
+        // canonical command, a failed legacy status has not emitted a result.
+        if error.downcast_ref::<crate::CommonOperationExit>().is_some() {
+            crate::ua_errln!(
+                "release status failed; use update-all update status --json for details"
+            );
+        }
+    })
 }
 
 fn emit_release_result(result: crate::release::Activation, json: bool) {
@@ -1736,7 +1748,7 @@ impl ProductCli {
         match self.cmd {
             ProductCmd::Install(cli) => cli.run(crate::release::install)?,
             ProductCmd::Status(cli) => {
-                let status = crate::release::status(cli.product.into())?;
+                let status = legacy_release_status(cli.product.into())?;
                 if cli.json {
                     crate::ua_outln!("{}", serde_json::to_string_pretty(&status)?);
                 } else {

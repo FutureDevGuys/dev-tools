@@ -1740,7 +1740,7 @@ fn model_wrap_logs_defaults_to_false() {
 #[test]
 fn dashboard_footer_mentions_log_pager_key() {
     let model = Model::new(200, true, true);
-    let footer = render_footer_lines(&model)
+    let footer = render_footer_lines(&model, 120)
         .into_iter()
         .map(|line| {
             line.spans
@@ -1760,7 +1760,7 @@ fn dashboard_footer_drops_cancel_actions_after_run_complete() {
     model.run_complete = Some(true);
     model.run_completed_at = Some(std::time::Instant::now());
 
-    let footer = render_footer_lines(&model)
+    let footer = render_footer_lines(&model, 120)
         .into_iter()
         .map(|line| {
             line.spans

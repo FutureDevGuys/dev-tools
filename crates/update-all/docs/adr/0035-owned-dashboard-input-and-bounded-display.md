@@ -36,6 +36,10 @@ Use the same visual-row geometry for wrapped rendering, scrolling and search,
 including Unicode width, timestamps, badges and omission banners. Reserve visible
 footer rows for the search editor and its error ahead of optional shortcuts.
 Help owns its scroll position, and its input cannot move underlying panes.
+Shortcut labels wrap between complete key/meaning groups at ordinary terminal
+widths rather than clipping commands or splitting cancellation instructions.
+The plain frontend acknowledges suspend/resume controls as terminal-mode no-ops,
+so harmless foreground work does not report nonexistent dashboard timeouts.
 
 Own terminal cleanup from the first successful mode change. On setup, resume or
 restoration failure, attempt every applicable restoration operation while
@@ -87,6 +91,9 @@ behavior, a signed release or an installed fix.
 - `dashboard_transport_journals_full_ordered_output_before_eviction`
 - `dashboard_transport_shutdown_wakes_frontend_after_journal_failure`
 - `terminal_setup_faults_restore_native_terminal_flags`
+- `native_e2e_footer_keeps_complete_shortcuts_at_standard_terminal_sizes`
+- `native_e2e_prompt_hints_keep_cancellation_words_together`
+- `native_e2e_plain_frontend_acknowledges_foreground_handoffs`
 
 ## Runtime acceptance
 

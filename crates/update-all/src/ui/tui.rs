@@ -2058,57 +2058,55 @@ fn log_pane_title<'a>(label: &'a str, dropped: u64) -> Cow<'a, str> {
     }
 }
 
-fn render_footer_lines(model: &Model) -> Vec<Line<'static>> {
-    let cancel_help = if model.run_complete.is_some() {
-        vec![
-            Span::styled("m", Style::default().fg(Color::Yellow)),
-            Span::raw(" open log  "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::raw(" close dashboard"),
-        ]
+// Keep each key and its meaning together; clipped fragments are not usable hints.
+fn pack_shortcut_hints(hints: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (key, description) in hints {
+        let hint_width = UnicodeWidthStr::width(*key) + 1 + UnicodeWidthStr::width(*description);
+        let separator = usize::from(!spans.is_empty()) * 2;
+        if !spans.is_empty() && used + separator + hint_width > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+            used += 2;
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw(format!(" {description}")));
+        used += hint_width;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn render_footer_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
+    let mut hints = vec![
+        ("?", "help"),
+        ("Tab/h/l", "pane"),
+        ("↑/↓/j", "move/scroll"),
+        ("PgUp/PgDn", "page"),
+        ("Home/End", "top/bottom"),
+        ("/", "search(regex)"),
+        ("n/N", "next/prev"),
+        ("w", "wrap logs"),
+        ("z/Space", "focus logs"),
+        ("m", "open log"),
+    ];
+    if model.run_complete.is_some() {
+        hints.push(("q", "close dashboard"));
     } else {
-        vec![
-            Span::styled("m", Style::default().fg(Color::Yellow)),
-            Span::raw(" open log  "),
-            Span::styled("k/K", Style::default().fg(Color::Yellow)),
-            Span::raw(" kill one/all  "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::raw(" exit"),
-        ]
-    };
-
-    let mut second_line = vec![
-        Span::styled("w", Style::default().fg(Color::Yellow)),
-        Span::raw(" wrap logs  "),
-        Span::styled("z/Space", Style::default().fg(Color::Yellow)),
-        Span::raw(" focus logs  "),
-    ];
-    second_line.extend(cancel_help);
-    second_line.extend([
-        Span::raw("  "),
-        Span::styled("click", Style::default().fg(Color::Yellow)),
-        Span::raw(" select  "),
-        Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(" close overlay"),
-    ]);
-
-    let shortcut_lines = vec![
-        Line::from(vec![
-            Span::styled("Tab/h/l", Style::default().fg(Color::Yellow)),
-            Span::raw(" pane  "),
-            Span::styled("↑/↓/j", Style::default().fg(Color::Yellow)),
-            Span::raw(" move/scroll  "),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow)),
-            Span::raw(" page  "),
-            Span::styled("Home/End", Style::default().fg(Color::Yellow)),
-            Span::raw(" top/bottom  "),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(" search(regex)  "),
-            Span::styled("n/N", Style::default().fg(Color::Yellow)),
-            Span::raw(" next/prev"),
-        ]),
-        Line::from(second_line),
-    ];
+        hints.extend([("k/K", "kill one/all"), ("q", "exit")]);
+    }
+    hints.extend([("click", "select"), ("Esc", "close overlay")]);
+    let shortcut_lines = pack_shortcut_hints(&hints, width);
 
     // Search is current input, not optional shortcut reference. It must be
     // first so a short footer cannot hide either the editor or its error.
@@ -2155,7 +2153,7 @@ fn render_footer_viewport(model: &Model, width: usize, height: usize) -> Vec<Lin
     if width == 0 || height == 0 {
         return Vec::new();
     }
-    render_footer_lines(model)
+    render_footer_lines(model, width)
         .into_iter()
         .take(height)
         .map(|line| {
@@ -4450,7 +4448,14 @@ fn draw_prompt_overlay(
     let area = prompt_overlay_area(root);
     frame.render_widget(Clear, area);
     let inner = inner_rect(area);
-    let lines = prompt_overlay_lines(task_id, prompt, context_lines, edit, submitted);
+    let lines = prompt_overlay_lines(
+        task_id,
+        prompt,
+        context_lines,
+        edit,
+        submitted,
+        inner.width as usize,
+    );
     let visible_lines = take_visible_rows(
         &lines,
         scroll_from_bottom,
@@ -4508,6 +4513,7 @@ fn prompt_overlay_lines(
     context_lines: &[String],
     edit: Option<&PromptEditState>,
     submitted: bool,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![Span::styled(
         format!("Input expected for active command ({task_id})"),
@@ -4538,8 +4544,14 @@ fn prompt_overlay_lines(
             "Answer submitted; waiting for command…",
             Style::default().fg(Color::LightCyan),
         )]));
-        lines.push(Line::from(
-            "Ctrl+C: cancel all   k/K: cancel one/all   q: exit   Up/Down: scroll",
+        lines.extend(pack_shortcut_hints(
+            &[
+                ("Ctrl+C:", "cancel all"),
+                ("k/K:", "cancel one/all"),
+                ("q:", "exit"),
+                ("Up/Down:", "scroll"),
+            ],
+            width,
         ));
     } else if let Some(edit) = edit {
         let display_buffer = if prompt_expects_secret(prompt) {
@@ -4552,13 +4564,24 @@ fn prompt_overlay_lines(
             Span::styled("stdin> ", Style::default().fg(Color::Magenta)),
             Span::raw(display_buffer),
         ]));
-        lines.push(Line::from(
-            "Enter: send   Shift+Enter: newline   Esc: close   Ctrl+C: cancel all",
+        lines.extend(pack_shortcut_hints(
+            &[
+                ("Enter:", "send"),
+                ("Shift+Enter:", "newline"),
+                ("Esc:", "close"),
+                ("Ctrl+C:", "cancel all"),
+            ],
+            width,
         ));
     } else {
         lines.push(Line::from(""));
-        lines.push(Line::from(
-            "Enter: send empty answer   Up/Down: scroll   Ctrl+C: cancel all",
+        lines.extend(pack_shortcut_hints(
+            &[
+                ("Enter:", "send empty answer"),
+                ("Up/Down:", "scroll"),
+                ("Ctrl+C:", "cancel all"),
+            ],
+            width,
         ));
     }
     lines

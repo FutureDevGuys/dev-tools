@@ -346,3 +346,37 @@ fn dashboard_transport_shutdown_wakes_frontend_after_journal_failure() {
     done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     frontend.join().unwrap();
 }
+
+#[test]
+fn native_e2e_plain_frontend_acknowledges_foreground_handoffs() {
+    let (tx, rx) = DashboardSender::bounded(None, 2, &["fixture".into()]);
+    let (control_tx, _control_rx) = mpsc::channel();
+    let frontend = UiModeResolved::Plain
+        .spawn_ui_thread(
+            rx,
+            control_tx,
+            DashboardQuitBehavior::Detach,
+            MouseRowStride::Auto,
+            true,
+            2,
+            2,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    let (suspend_tx, suspend_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    tx.send(DashboardEvent::UiSuspendRequested {
+        reason: "harmless foreground task".into(),
+        ack: Some(suspend_tx),
+    })
+    .unwrap();
+    tx.send(DashboardEvent::UiResumeRequested {
+        ack: Some(resume_tx),
+    })
+    .unwrap();
+    tx.shutdown_ui().unwrap();
+    frontend.join().unwrap().unwrap();
+    assert_eq!(suspend_rx.try_recv(), Ok(()));
+    assert_eq!(resume_rx.try_recv(), Ok(()));
+}

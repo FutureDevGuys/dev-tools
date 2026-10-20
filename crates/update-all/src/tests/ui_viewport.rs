@@ -314,3 +314,60 @@ fn help_end_reaches_final_entry_without_moving_underlying_panes() {
         assert_eq!(model.selected_task, 0);
     }
 }
+
+#[test]
+fn native_e2e_footer_keeps_complete_shortcuts_at_standard_terminal_sizes() {
+    for size in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 120, 40)] {
+        for complete in [false, true] {
+            let mut model = viewport_model();
+            model.run_complete = complete.then_some(true);
+            let screen = viewport_screen(&model, size);
+            for hint in [
+                "? help",
+                "n/N next/prev",
+                "click select",
+                "Esc close overlay",
+            ] {
+                assert!(screen.contains(hint), "missing {hint}:\n{screen}");
+            }
+        }
+    }
+}
+
+#[test]
+fn native_e2e_prompt_hints_keep_cancellation_words_together() {
+    for size in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 120, 40)] {
+        for (editing, submitted) in [(true, false), (false, false), (false, true)] {
+            let backend = ratatui::backend::TestBackend::new(size.width, size.height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let edit = PromptEditState {
+                task_id: "t".into(),
+                generation: 1,
+                buffer: "".into(),
+            };
+            terminal
+                .draw(|frame| {
+                    draw_prompt_overlay(
+                        frame,
+                        size,
+                        "t",
+                        "Proceed?",
+                        &[],
+                        editing.then_some(&edit),
+                        submitted,
+                        0,
+                    )
+                })
+                .unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(size.width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(screen.contains("Ctrl+C: cancel all"), "{screen}");
+        }
+    }
+}
