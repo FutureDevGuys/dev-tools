@@ -209,15 +209,7 @@ struct RenameCli {
 impl RunCli {
     pub fn run(mut self) -> Result<()> {
         if self.version {
-            let build = crate::build_info::current_build_info();
-            crate::ua_outln!(
-                "update-all {} profile={} git_commit={} git_dirty={} built_unix={}",
-                env!("CARGO_PKG_VERSION"),
-                build.profile,
-                build.git_commit,
-                build.git_dirty,
-                build.built_unix
-            );
+            crate::ua_outln!("update-all {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
 
