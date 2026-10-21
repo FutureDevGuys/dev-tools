@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -57,8 +58,8 @@ pub(crate) struct RunSummary {
     pub(crate) metadata: RunMetadata,
     pub(crate) path: PathBuf,
     pub(crate) run_json_status: RunArtifactStatus,
-    pub(crate) task_count: usize,
-    pub(crate) issue_count: usize,
+    pub(crate) task_count: Option<usize>,
+    pub(crate) issue_count: Option<usize>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) elapsed_ms: Option<u64>,
 }
@@ -68,6 +69,10 @@ pub(crate) enum RunArtifactStatus {
     Loaded,
     Missing,
     Malformed,
+    Unreadable,
+    Unsafe,
+    Oversized,
+    Unsupported,
 }
 
 impl RunArtifactStatus {
@@ -76,24 +81,28 @@ impl RunArtifactStatus {
             Self::Loaded => "loaded",
             Self::Missing => "missing",
             Self::Malformed => "malformed",
+            Self::Unreadable => "unreadable",
+            Self::Unsafe => "unsafe",
+            Self::Oversized => "oversized",
+            Self::Unsupported => "unsupported",
         }
     }
 }
 
 pub(crate) fn scan_runs(root: &Path) -> Result<Vec<RunSummary>> {
     let mut out = Vec::new();
-    if !root.exists() {
-        return Ok(out);
-    }
-    for entry in fs::read_dir(root).with_context(|| format!("read run root {}", root.display()))? {
-        let entry = entry.with_context(|| format!("read run root entry {}", root.display()))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+    let mut omitted = 0;
+    for path in history_directories(root)? {
         if let Some(summary) = read_run_summary(&path)? {
             out.push(summary);
+        } else {
+            omitted += 1;
         }
+    }
+    if omitted > 0 {
+        crate::ua_errln!(
+            "update-all: omitted {omitted} entries with unavailable run metadata; use runs inspect for evidence status"
+        );
     }
     out.sort_by(|left, right| {
         right
@@ -405,35 +414,95 @@ pub(crate) fn status_from_exit_code(exit_code: i32) -> String {
 }
 
 fn read_run_summary(path: &Path) -> Result<Option<RunSummary>> {
-    let meta_path = path.join("run-meta.json");
-    if meta_path.exists() {
-        let metadata: RunMetadata = serde_json::from_slice(
-            &fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?,
-        )
-        .with_context(|| format!("parse {}", meta_path.display()))?;
-        let (artifact, run_json_status) = read_run_json_status(path);
-        return Ok(Some(summary_from_parts(
-            path,
-            metadata,
-            artifact,
-            run_json_status,
-        )));
-    }
-    Ok(None)
+    let (metadata, _) = read_run_metadata(path);
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let (artifact, run_json_status) = read_run_json_status(path);
+    Ok(Some(summary_from_parts(
+        path,
+        metadata,
+        artifact,
+        run_json_status,
+    )))
 }
 
 fn read_run_json_status(path: &Path) -> (Option<Value>, RunArtifactStatus) {
-    let run_json = path.join("run.json");
-    if !run_json.exists() {
-        return (None, RunArtifactStatus::Missing);
-    }
-    let Ok(payload) = fs::read(&run_json) else {
+    let payload = match bounded_regular_read(&path.join("run.json"), MAX_ARTIFACT_BYTES) {
+        Ok(payload) => payload,
+        Err(status) => return (None, status),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&payload) else {
         return (None, RunArtifactStatus::Malformed);
     };
-    match serde_json::from_slice(&payload) {
-        Ok(value) => (Some(value), RunArtifactStatus::Loaded),
-        Err(_) => (None, RunArtifactStatus::Malformed),
+    if value
+        .get("schema_version")
+        .is_some_and(|v| v.as_u64() != Some(1))
+    {
+        return (None, RunArtifactStatus::Unsupported);
     }
+    let valid = value
+        .get("tasks")
+        .and_then(Value::as_array)
+        .is_some_and(|tasks| {
+            tasks.iter().all(|task| {
+                task.is_object()
+                    && matches!(
+                        task.get("status").and_then(Value::as_str),
+                        Some("completed" | "failed" | "canceled" | "skipped")
+                    )
+                    && valid_issue_evidence(task)
+                    && task
+                        .get("completed_with_issues")
+                        .is_none_or(Value::is_boolean)
+            })
+        });
+    if !valid {
+        return (None, RunArtifactStatus::Malformed);
+    }
+    (Some(value), RunArtifactStatus::Loaded)
+}
+
+fn valid_issue_evidence(task: &Value) -> bool {
+    let advisories_valid = task.get("advisories").is_none_or(|value| {
+        value.as_array().is_some_and(|items| {
+            items.iter().all(|item| {
+                item.is_object()
+                    && matches!(
+                        item.get("severity").and_then(Value::as_str),
+                        Some("info" | "warning" | "error")
+                    )
+            })
+        })
+    });
+    let reports_valid = task.get("report_sections").is_none_or(|value| {
+        value.as_array().is_some_and(|sections| {
+            sections.iter().all(|section| {
+                section
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .is_some_and(|rows| {
+                        rows.iter().all(|row| {
+                            row.is_object()
+                                && matches!(
+                                    row.get("status").and_then(Value::as_str),
+                                    Some(
+                                        "updated"
+                                            | "refreshed"
+                                            | "passed"
+                                            | "unchanged"
+                                            | "failed"
+                                            | "blocked"
+                                            | "skipped"
+                                            | "info"
+                                    )
+                                )
+                        })
+                    })
+            })
+        })
+    });
+    advisories_valid && reports_valid
 }
 
 fn summary_from_parts(
@@ -446,12 +515,12 @@ fn summary_from_parts(
         .as_ref()
         .and_then(|value| value.get("tasks"))
         .and_then(Value::as_array)
-        .map_or(0, |tasks| tasks.len());
+        .map(|tasks| tasks.len());
     let issue_count = artifact
         .as_ref()
         .and_then(|value| value.get("tasks"))
         .and_then(Value::as_array)
-        .map_or(0, |tasks| count_issue_tasks(tasks));
+        .map(|tasks| count_issue_tasks(tasks));
     let exit_code = artifact
         .as_ref()
         .and_then(|value| value.get("exit_code"))
@@ -481,7 +550,37 @@ fn count_issue_tasks(tasks: &[Value]) -> usize {
                 .get("completed_with_issues")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            matches!(status, "failed" | "canceled") || completed_with_issues
+            matches!(status, "failed" | "canceled")
+                || completed_with_issues
+                || task
+                    .get("advisories")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            matches!(
+                                item.get("severity").and_then(Value::as_str),
+                                Some("warning" | "warn" | "error")
+                            )
+                        })
+                    })
+                || task
+                    .get("report_sections")
+                    .and_then(Value::as_array)
+                    .is_some_and(|sections| {
+                        sections.iter().any(|section| {
+                            section
+                                .get("rows")
+                                .and_then(Value::as_array)
+                                .is_some_and(|rows| {
+                                    rows.iter().any(|row| {
+                                        matches!(
+                                            row.get("status").and_then(Value::as_str),
+                                            Some("failed" | "blocked")
+                                        )
+                                    })
+                                })
+                        })
+                    })
         })
         .count()
 }
@@ -504,3 +603,219 @@ fn run_matches_query(run: &RunSummary, needle: &str) -> bool {
 #[cfg(test)]
 #[path = "tests/runs.rs"]
 mod tests;
+
+// Inspection is observation, never a repair authority. These limits also apply to legacy browsing.
+const MAX_HISTORY_ENTRIES: usize = 4096;
+const MAX_METADATA_BYTES: u64 = 256 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+fn history_directories(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("inspect run history root"),
+    };
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!("run history root is not a real directory");
+    }
+    let mut paths = Vec::new();
+    for (index, entry) in fs::read_dir(root)?.enumerate() {
+        if index >= MAX_HISTORY_ENTRIES {
+            anyhow::bail!("run history exceeds the 4096-entry inspection bound");
+        }
+        let entry = entry.context("read run history entry")?;
+        if entry.file_type()?.is_dir() {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    let mut bytes = 0_u64;
+    for path in &paths {
+        for (name, limit) in [
+            ("run-meta.json", MAX_METADATA_BYTES),
+            ("run.json", MAX_ARTIFACT_BYTES),
+        ] {
+            if let Ok(meta) = fs::symlink_metadata(path.join(name)) {
+                if meta.file_type().is_file() && meta.len() <= limit {
+                    bytes = bytes.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    if bytes > 64 * 1024 * 1024 {
+        anyhow::bail!("run history exceeds the 64 MiB observation bound");
+    }
+    Ok(paths)
+}
+
+fn bounded_regular_read(
+    path: &Path,
+    limit: u64,
+) -> std::result::Result<Vec<u8>, RunArtifactStatus> {
+    let classify = |error: io::Error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            RunArtifactStatus::Missing
+        } else {
+            RunArtifactStatus::Unreadable
+        }
+    };
+    let metadata = fs::symlink_metadata(path).map_err(classify)?;
+    if !metadata.file_type().is_file() {
+        return Err(RunArtifactStatus::Unsafe);
+    }
+    if metadata.len() > limit {
+        return Err(RunArtifactStatus::Oversized);
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path).map_err(classify)?;
+    let opened = file.metadata().map_err(classify)?;
+    if !opened.file_type().is_file() {
+        return Err(RunArtifactStatus::Unsafe);
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(classify)?;
+    if bytes.len() as u64 > limit {
+        return Err(RunArtifactStatus::Oversized);
+    }
+    Ok(bytes)
+}
+
+fn read_run_metadata(path: &Path) -> (Option<RunMetadata>, RunArtifactStatus) {
+    let bytes = match bounded_regular_read(&path.join("run-meta.json"), MAX_METADATA_BYTES) {
+        Ok(bytes) => bytes,
+        Err(status) => return (None, status),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return (None, RunArtifactStatus::Malformed);
+    };
+    if value
+        .get("schema_version")
+        .is_some_and(|v| v.as_u64() != Some(1))
+    {
+        return (None, RunArtifactStatus::Unsupported);
+    }
+    let Ok(metadata) = serde_json::from_value::<RunMetadata>(value) else {
+        return (None, RunArtifactStatus::Malformed);
+    };
+    if metadata.run_id.is_empty()
+        || !matches!(
+            metadata.status.as_str(),
+            "running" | "finalizing" | "completed" | "failed" | "canceled"
+        )
+    {
+        return (None, RunArtifactStatus::Malformed);
+    }
+    (Some(metadata), RunArtifactStatus::Loaded)
+}
+
+#[derive(Serialize)]
+pub(crate) struct RunInspectionReport {
+    schema: &'static str,
+    pub(crate) runs: Vec<RunInspection>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RunInspection {
+    pub(crate) directory_name: String,
+    path: PathBuf,
+    pub(crate) metadata_status: &'static str,
+    pub(crate) run_artifact_status: &'static str,
+    pub(crate) evidence_status: &'static str,
+    run_id: Option<String>,
+    display_name: Option<String>,
+    recorded_status: Option<String>,
+    created_unix_ms: Option<u64>,
+    updated_unix_ms: Option<u64>,
+    selected_tasks: Option<Vec<String>>,
+    pub(crate) task_count: Option<usize>,
+    pub(crate) issue_count: Option<usize>,
+    exit_code: Option<i32>,
+}
+
+fn inspection_directories(root: &Path, query: Option<&str>) -> Result<Vec<PathBuf>> {
+    if let Some(query) = query {
+        let mut components = Path::new(query).components();
+        if matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+        {
+            let path = root.join(query);
+            if fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_dir())
+                && fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_dir())
+            {
+                return Ok(vec![path]);
+            }
+        }
+    }
+    history_directories(root)
+}
+
+pub(crate) fn inspect_runs(root: &Path, query: Option<&str>) -> Result<RunInspectionReport> {
+    let mut runs = Vec::new();
+    for path in inspection_directories(root, query)? {
+        let (metadata, metadata_status) = read_run_metadata(&path);
+        let directory_name = path_file_name(&path);
+        if let Some(query) = query {
+            // Damaged entries have only an observed directory locator, never an invented identity.
+            if directory_name != query
+                && !metadata
+                    .as_ref()
+                    .is_some_and(|meta| meta.run_id == query || meta.display_name == query)
+            {
+                continue;
+            }
+        }
+        let (artifact, run_status) = read_run_json_status(&path);
+        let task_count = artifact
+            .as_ref()
+            .and_then(|a| a.get("tasks"))
+            .and_then(Value::as_array)
+            .map(Vec::len);
+        let issue_count = artifact
+            .as_ref()
+            .and_then(|a| a.get("tasks"))
+            .and_then(Value::as_array)
+            .map(|tasks| count_issue_tasks(tasks));
+        let evidence_status = if metadata.is_some() && artifact.is_some() {
+            "available"
+        } else {
+            "incomplete"
+        };
+        runs.push(RunInspection {
+            directory_name,
+            path,
+            metadata_status: metadata_status.as_str(),
+            run_artifact_status: run_status.as_str(),
+            evidence_status,
+            run_id: metadata.as_ref().map(|m| m.run_id.clone()),
+            display_name: metadata.as_ref().map(|m| m.display_name.clone()),
+            recorded_status: metadata.as_ref().map(|m| m.status.clone()),
+            created_unix_ms: metadata.as_ref().map(|m| m.created_unix_ms),
+            updated_unix_ms: metadata.as_ref().map(|m| m.updated_unix_ms),
+            selected_tasks: metadata.as_ref().map(|m| m.selected_tasks.clone()),
+            task_count,
+            issue_count,
+            exit_code: artifact
+                .as_ref()
+                .and_then(|a| a.get("exit_code"))
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok()),
+        });
+    }
+    if query.is_some() && runs.is_empty() {
+        anyhow::bail!("no run matched the exact inspection query");
+    }
+    Ok(RunInspectionReport {
+        schema: "update-all-run-inspection-v1",
+        runs,
+    })
+}

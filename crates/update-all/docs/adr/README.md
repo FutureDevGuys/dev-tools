@@ -46,6 +46,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0034](0034-compatible-privilege-fallback-modes.md) | Compatible privilege fallback modes | proposed | pending |
 | [0035](0035-owned-dashboard-input-and-bounded-display.md) | Owned dashboard input and bounded display | proposed | pending |
 | [0036](0036-opt-in-post-run-restart.md) | Opt-in post-run restart requests | proposed | pending |
+| [0037](0037-read-only-damaged-run-inspection.md) | Read-only damaged run inspection | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

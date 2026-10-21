@@ -44,3 +44,24 @@ or cancellation. Free space, inspect the affected manager's state, and follow it
 recovery procedure before retrying; do not infer success from a downloaded version
 or automatically rerun every updater. This behavior applies with or without the
 restart flag, and incomplete evidence always prevents an automatic restart.
+
+### Inspect damaged run evidence
+
+Use `update-all runs inspect [QUERY] --json` to inspect local run metadata and
+final artifacts without repairs, package commands, network access, or replay.
+QUERY is an exact recorded UUID/display name or observed directory name. The
+`update-all-run-inspection-v1` result distinguishes missing, malformed,
+unreadable, unsafe, oversized and unsupported evidence. Unknown facts are null.
+`evidence_status: available` means the two artifacts are readable and supported,
+not that the run completed or packages are healthy; journal consistency is not
+checked. Human inspection escapes directory names and uses `?` for unknown counts.
+
+`restore` and `resume` also use null task/issue counts (rather than misleading
+zero) for unavailable final evidence. Healthy legacy results remain equivalent.
+A malformed metadata neighbor no longer hides healthy history. Scan limits are
+4096 root entries, 256 KiB per metadata file, 8 MiB per run artifact and 64 MiB of
+initially observed eligible files. No scan silently returns a truncated result.
+
+Exact directory-name inspection reads only that child, even when unrelated
+history exceeds the aggregate scan bounds. Observation is not a coherent live
+filesystem snapshot or protection against adversarial parent-directory races.

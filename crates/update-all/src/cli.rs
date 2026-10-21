@@ -1,15 +1,15 @@
 use crate::completions::CompletionSyncArgs;
 use crate::config::{
-    init_config_file, load_runtime_config, parse_engine_mode, parse_ui_mode, validate_config,
     DashboardQuitBehavior as ConfigDashboardQuitBehavior,
-    MouseRowStrideMode as ConfigMouseRowStrideMode, RuntimeConfig, TaskPolicy,
+    MouseRowStrideMode as ConfigMouseRowStrideMode, RuntimeConfig, TaskPolicy, init_config_file,
+    load_runtime_config, parse_engine_mode, parse_ui_mode, validate_config,
 };
 use crate::logging::RunLogSink;
 use crate::sections::Sections;
-use crate::tasks::{run_async, PrivilegeSession, TaskPolicies};
+use crate::tasks::{PrivilegeSession, TaskPolicies, run_async};
 use crate::ui::{MouseRowStride, UiModeResolved};
-use crate::updaters::{detected_builtin_tasks, HostOs};
-use anyhow::{bail, Context, Result};
+use crate::updaters::{HostOs, detected_builtin_tasks};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use is_terminal::IsTerminal;
 use std::env;
@@ -185,6 +185,16 @@ struct RunsCli {
 enum RunsCommand {
     /// Enforce configured run retention without affecting updater state.
     Prune(RunsPruneCli),
+    /// Inspect run evidence locally without repairing or replaying anything.
+    Inspect(RunsInspectCli),
+}
+
+#[derive(clap::Args, Debug)]
+struct RunsInspectCli {
+    /// Exact run UUID, display name, or observed directory name.
+    query: Option<String>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -247,7 +257,9 @@ impl RunCli {
 
         let restart = if self.restart_after {
             let request = crate::restart::RestartRequest::prepare()?;
-            crate::ua_errln!("WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart after a clean update run and dashboard exit. No forced restart or automatic elevation will be used.");
+            crate::ua_errln!(
+                "WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart after a clean update run and dashboard exit. No forced restart or automatic elevation will be used."
+            );
             Some(request)
         } else {
             None
@@ -494,6 +506,29 @@ impl RunsCli {
         let runtime = load_runtime_config(default_config_path)
             .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?;
         match self.command {
+            RunsCommand::Inspect(cli) => {
+                let report =
+                    crate::runs::inspect_runs(&runtime.logging.run_dir, cli.query.as_deref())?;
+                if cli.json {
+                    crate::ua_outln!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    crate::ua_outln!(
+                        "Read-only artifact inspection; recorded status does not prove current execution or package health."
+                    );
+                    for run in &report.runs {
+                        crate::ua_outln!(
+                            "{}: metadata={}, run artifact={}, evidence={}, tasks={}, issues={}",
+                            run.directory_name.escape_default(),
+                            run.metadata_status,
+                            run.run_artifact_status,
+                            run.evidence_status,
+                            known_count(run.task_count),
+                            known_count(run.issue_count)
+                        );
+                    }
+                }
+                Ok(())
+            }
             RunsCommand::Prune(cli) => {
                 let report = crate::runs::prune_runs(
                     &runtime.logging.run_dir,
@@ -566,8 +601,8 @@ struct RunSummaryJson {
     created_unix_ms: u64,
     updated_unix_ms: u64,
     selected_tasks: Vec<String>,
-    task_count: usize,
-    issue_count: usize,
+    task_count: Option<usize>,
+    issue_count: Option<usize>,
     exit_code: Option<i32>,
     elapsed_ms: Option<u64>,
     run_json_status: String,
@@ -666,6 +701,10 @@ fn select_run_match_for_rename_with_tty<'a>(
     );
 }
 
+fn known_count(value: Option<usize>) -> String {
+    value.map_or_else(|| "?".to_string(), |count| count.to_string())
+}
+
 fn print_run_table(runs: &[crate::runs::RunSummary]) {
     let now = now_unix_ms_u64();
     crate::ua_outln!(
@@ -688,7 +727,7 @@ fn print_run_table(runs: &[crate::runs::RunSummary]) {
             truncate_cell(&run.metadata.status, 10),
             truncate_cell(&relative_time_label(run.metadata.created_unix_ms, now), 9),
             truncate_cell(&relative_time_label(run.metadata.updated_unix_ms, now), 9),
-            run.issue_count,
+            known_count(run.issue_count),
             truncate_cell(&run.metadata.selected_tasks.join(","), 12),
             run.path.display()
         );
@@ -723,8 +762,8 @@ fn print_run_detail(run: &crate::runs::RunSummary) {
             .map_or_else(|| "-".to_string(), |v| v.to_string())
     );
     crate::ua_outln!("Tasks: {}", run.metadata.selected_tasks.join(","));
-    crate::ua_outln!("Task count: {}", run.task_count);
-    crate::ua_outln!("Issue count: {}", run.issue_count);
+    crate::ua_outln!("Task count: {}", known_count(run.task_count));
+    crate::ua_outln!("Issue count: {}", known_count(run.issue_count));
 }
 
 fn runs_json(runs: &[crate::runs::RunSummary]) -> Vec<RunSummaryJson> {
@@ -1742,7 +1781,12 @@ impl ProductActivationCli {
         online: fn(crate::release::Product) -> Result<crate::release::Activation>,
     ) -> Result<()> {
         let product = self.output.product.into();
-        let result = match (self.offline, self.root_document, self.manifest, self.artifact) {
+        let result = match (
+            self.offline,
+            self.root_document,
+            self.manifest,
+            self.artifact,
+        ) {
             (false, None, None, None) => online(product)?,
             (true, Some(root_document), Some(manifest), Some(artifact)) => {
                 crate::release::install_offline(
