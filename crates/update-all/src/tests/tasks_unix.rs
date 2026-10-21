@@ -458,6 +458,8 @@ exit 2
 
 #[test]
 fn command_policy_retries_transient_network_failure_when_explicitly_configured() {
+    // The fixture's cat lookup inherits PATH, which other tests temporarily replace.
+    let _lock = env_guard();
     let temp = TempDir::new().unwrap();
     let script = temp.path().join("flaky-network");
     let counter = temp.path().join("counter");
@@ -690,6 +692,8 @@ exit 7
 
 #[test]
 fn command_policy_does_not_retry_deterministic_failure_without_policy_retry() {
+    // Keep the counter fixture's inherited PATH stable even if an unexpected retry runs.
+    let _lock = env_guard();
     let temp = TempDir::new().unwrap();
     let script = temp.path().join("source-validation-fails");
     let counter = temp.path().join("counter");
@@ -4534,7 +4538,14 @@ exit 1
         .report_sections
         .iter()
         .find(|section| section.title == "Package Recovery Actions")
-        .expect("package recovery section")
+        .unwrap_or_else(|| {
+            panic!(
+                "package recovery section: result={result:?}; fixture_log={:?}; PATH={:?}; source_exists={}",
+                fs::read_to_string(&log_file),
+                env::var_os("PATH"),
+                source_dir.exists(),
+            )
+        })
         .rows
         .iter()
         .filter_map(|row| row.note.as_deref())
@@ -5169,4 +5180,52 @@ fn completion_progress_write_failure_latches_evidence_admission_failure() {
     ctx.completion_progress_cb("fixture").unwrap()("progress".into());
     assert!(log.journal_failure().is_some());
     assert!(ctx.ensure_run_evidence_healthy().is_err());
+}
+
+#[test]
+fn captured_npm_authority_failure_stops_guard_fallback_without_replaying() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let provider = temp.path().join("provider");
+    assert!(Command::new("rustc")
+        .args(["--edition=2024", "-C", "debuginfo=0"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/npm_authority.rs"
+        ))
+        .arg("-o")
+        .arg(&provider)
+        .status()
+        .unwrap()
+        .success());
+    let _root = EnvVarGuard::set("AUTHORITY_FIXTURE_ROOT", temp.path());
+    let _mode = EnvVarGuard::set("AUTHORITY_FIXTURE_MODE", "guard");
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.interactive_runtime.mode = InteractiveExecutionMode::AutoFallback;
+    ctx.interactive_runtime.max_line_bytes = 4096;
+    ctx.interactive_runtime.max_capture_bytes = 16384;
+    ctx.interactive_runtime.retry_once = true;
+    let error = ctx
+        .run_command_with_policy_replay(
+            TASK_NPM,
+            provider.to_str().unwrap(),
+            vec!["install".to_string()],
+            &TaskPolicy::new(5, 2, 0),
+            true,
+            CommandReplayPolicy::NpmInstall,
+        )
+        .expect_err("guard-terminated mutation cannot succeed");
+    assert_eq!(
+        capture_guard_reason(&error),
+        Some(CaptureGuardReason::LineTooLong)
+    );
+    assert!(crate::util::process::process_permission_denied(&error));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("mutation-count")).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("partial-effect")).unwrap(),
+        "retained"
+    );
 }

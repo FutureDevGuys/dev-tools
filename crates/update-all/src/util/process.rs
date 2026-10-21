@@ -194,6 +194,9 @@ pub enum CaptureGuardReason {
 #[derive(Debug)]
 pub struct CaptureGuardError {
     pub reason: CaptureGuardReason,
+    /// A classified observation survives capture disposal; raw output is not retained here.
+    pub storage_exhausted: bool,
+    pub permission_denied: bool,
 }
 
 impl std::fmt::Display for CaptureGuardError {
@@ -256,6 +259,64 @@ pub fn process_timed_out(err: &anyhow::Error) -> bool {
 
 pub fn capture_guard_reason(err: &anyhow::Error) -> Option<CaptureGuardReason> {
     err.downcast_ref::<CaptureGuardError>().map(|e| e.reason)
+}
+
+pub(crate) fn storage_exhaustion_output(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "enospc" | "edquot"))
+        || lower.contains("no space left on device")
+        || lower.contains("disk quota exceeded")
+        || lower.contains("not enough space on the disk")
+        || lower.contains("disk is full")
+        || lower.contains("storage exhausted (automatic retries stopped)")
+}
+
+pub(crate) fn process_storage_exhausted(error: &anyhow::Error) -> bool {
+    if let Some(guard) = error.downcast_ref::<CaptureGuardError>() {
+        return guard.storage_exhausted;
+    }
+    if error.is::<ProcessExitError>() || error.is::<ProcessTimeoutError>() {
+        return process_exit_output(error).is_some_and(storage_exhaustion_output)
+            || process_error_stderr(error).is_some_and(storage_exhaustion_output);
+    }
+    storage_exhaustion_output(&error.to_string())
+}
+
+/// Recognize reported denial diagnostics, not path components or marker names.
+/// Callers decide whether the failed operation permits an automatic replay.
+pub(crate) fn permission_denied_output(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    let boundary = |ch: char| ch.is_ascii_whitespace() || ":,;()[]{}\"'".contains(ch);
+    [
+        "eacces",
+        "eperm",
+        "permission denied",
+        "operation not permitted",
+        "access is denied",
+        "access denied",
+    ]
+    .iter()
+    .any(|marker| {
+        lower.match_indices(marker).any(|(start, matched)| {
+            let suffix = &lower[start + matched.len()..];
+            lower[..start].chars().next_back().is_none_or(boundary)
+                && suffix.chars().next().is_none_or(|ch| {
+                    boundary(ch) || (ch == '.' && suffix[1..].chars().next().is_none_or(boundary))
+                })
+        })
+    })
+}
+
+pub(crate) fn process_permission_denied(error: &anyhow::Error) -> bool {
+    if let Some(guard) = error.downcast_ref::<CaptureGuardError>() {
+        return guard.permission_denied;
+    }
+    // In particular, do not classify the executable name or an arbitrary
+    // formatted error/health-check message as captured provider evidence.
+    process_exit_output(error).is_some_and(permission_denied_output)
+        || process_error_stderr(error).is_some_and(permission_denied_output)
 }
 
 pub fn process_exit_output(err: &anyhow::Error) -> Option<&str> {
@@ -1006,12 +1067,24 @@ where
             }));
         }
         Err(WaitOutcome::GuardTriggered(reason)) => {
-            return Err(anyhow!(CaptureGuardError { reason }));
+            return Err(anyhow!(CaptureGuardError {
+                reason,
+                storage_exhausted: storage_exhaustion_output(&output.stdout)
+                    || storage_exhaustion_output(&output.stderr),
+                permission_denied: permission_denied_output(&output.stdout)
+                    || permission_denied_output(&output.stderr),
+            }));
         }
         Err(WaitOutcome::Other(error)) => return Err(error),
     };
     if let Some(reason) = guard_state.as_ref().and_then(|state| state.reason()) {
-        return Err(anyhow!(CaptureGuardError { reason }));
+        return Err(anyhow!(CaptureGuardError {
+            reason,
+            storage_exhausted: storage_exhaustion_output(&output.stdout)
+                || storage_exhaustion_output(&output.stderr),
+            permission_denied: permission_denied_output(&output.stdout)
+                || permission_denied_output(&output.stderr),
+        }));
     }
 
     if status.success()
@@ -1165,12 +1238,20 @@ where
             }));
         }
         Err(WaitOutcome::GuardTriggered(reason)) => {
-            return Err(anyhow!(CaptureGuardError { reason }));
+            return Err(anyhow!(CaptureGuardError {
+                reason,
+                storage_exhausted: storage_exhaustion_output(&out),
+                permission_denied: permission_denied_output(&out),
+            }));
         }
         Err(WaitOutcome::Other(error)) => return Err(error),
     };
     if let Some(reason) = guard_state.reason() {
-        return Err(anyhow!(CaptureGuardError { reason }));
+        return Err(anyhow!(CaptureGuardError {
+            reason,
+            storage_exhausted: storage_exhaustion_output(&out),
+            permission_denied: permission_denied_output(&out),
+        }));
     }
 
     if status.success() {

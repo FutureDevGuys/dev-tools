@@ -19,7 +19,9 @@ jobs = "auto"
 fail_fast = false
 
 [install]
-# Authenticate and activate the latest stable release during normal runs.
+# Legacy compatibility field; true and false have no effect on startup or task
+# selection. Selected builtin/dev-tools-* tasks can still update installed
+# managed products. Control those tasks with [updaters], --only, or --exclude.
 auto_update = true
 
 [runtime.interactive]
@@ -314,6 +316,8 @@ catalogs = []
 # category = "custom"
 
 [completions]
+# Settings for explicit `update-all completions sync`. Ordinary task runs do not
+# implicitly publish completions: the built-in catalog has no completion task.
 # Optional default publication targets. An omitted or empty list detects the
 # installed supported shells and includes the current shell. Use `all` alone
 # to publish every supported shell.

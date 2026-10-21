@@ -11,6 +11,31 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 #[test]
+fn storage_failure_classification_uses_full_channels_not_program_name() {
+    let error = anyhow!(ProcessExitError {
+        program: "/fixture/ENOSPC/provider".to_string(),
+        code: "1".to_string(),
+        output: Some("ordinary package failure XENOSPCX".to_string()),
+        stderr: None,
+    });
+    assert!(!process_storage_exhausted(&error));
+    let error = anyhow!(ProcessExitError {
+        program: "provider".to_string(),
+        code: "1".to_string(),
+        output: Some("ordinary stdout".to_string()),
+        stderr: Some(format!(
+            "{}\nEDQUOT: disk quota exceeded",
+            "padding".repeat(100)
+        )),
+    });
+    assert!(process_storage_exhausted(&error));
+    assert!(!storage_exhaustion_output(
+        "provider name XENOSPCX is unavailable"
+    ));
+    assert!(storage_exhaustion_output("ETIMEDOUT followed by ENOSPC"));
+}
+
+#[test]
 fn cancellation_does_not_replace_an_observed_process_exit() {
     for code in [0, 42] {
         let mut child = Command::new("/bin/sh")
@@ -116,7 +141,16 @@ fn stdout_capture_failure_keeps_both_streams_in_error_context() {
         Some(Duration::from_secs(5)),
     )
     .unwrap_err();
-    assert_eq!(error.downcast_ref::<ProcessExitError>().unwrap().code, "7");
+    let exit_error = error.downcast_ref::<ProcessExitError>().unwrap_or_else(|| {
+        let io_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+        panic!(
+            "expected ProcessExitError: error={error:#}; debug={error:?}; raw_os_error={:?}",
+            io_error.and_then(std::io::Error::raw_os_error),
+        )
+    });
+    assert_eq!(exit_error.code, "7");
     assert_eq!(
         process_exit_output(&error),
         Some("partial result\nerror: failed")
@@ -129,6 +163,8 @@ fn stdout_capture_failure_keeps_both_streams_in_error_context() {
 
 #[test]
 fn capture_timeout_preserves_partial_output_and_settles_owned_io() {
+    // The cleanup probe resolves kill through the process-wide PATH.
+    let _lock = env_guard();
     let temp = TempDir::new().unwrap();
     let tool = temp.path().join("timeout-fixture");
     write_executable(
@@ -200,7 +236,8 @@ fn capture_timeout_preserves_partial_output_and_settles_owned_io() {
         );
         assert!(exited.load(Ordering::SeqCst));
         assert!(sender.send("not delivered".to_string()).is_err());
-        assert!(!pid_exists(pid.load(Ordering::SeqCst) as i32));
+        assert!(!pid_exists(pid.load(Ordering::SeqCst) as i32)
+            .expect("launch kill -0 process-existence probe"));
     }
 }
 
@@ -290,12 +327,23 @@ impl Drop for CurrentDirGuard {
     }
 }
 
-fn pid_exists(pid: i32) -> bool {
+fn pid_exists(pid: i32) -> std::io::Result<bool> {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .map(|status| status.success())
-        .unwrap_or(false)
+}
+
+#[test]
+fn missing_pid_probe_cannot_report_process_absence() {
+    let _lock = env_guard();
+    let temp = TempDir::new().expect("empty executable directory");
+    let _path_guard = EnvVarGuard::set("PATH", temp.path().as_os_str());
+    let pid = i32::try_from(std::process::id()).expect("test process ID fits i32");
+
+    let error =
+        pid_exists(pid).expect_err("an unavailable process probe must not report process absence");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
 #[test]
@@ -368,6 +416,7 @@ printf 'explicit-path-tool\n'
 #[test]
 #[ignore = "depends on process-group semantics that vary by environment"]
 fn controlled_capture_cancel_terminates_descendants() {
+    let _lock = env_guard();
     let temp = TempDir::new().expect("temp dir");
     let script = temp.path().join("spawn-helper.sh");
     let helper_pid_file = temp.path().join("helper.pid");
@@ -412,7 +461,7 @@ while :; do sleep 1; done
     }
     let helper_pid = helper_pid.expect("helper pid to be written");
     assert!(
-        pid_exists(helper_pid),
+        pid_exists(helper_pid).expect("launch kill -0 process-existence probe"),
         "expected helper process to be running"
     );
 
@@ -423,7 +472,7 @@ while :; do sleep 1; done
 
     let mut helper_dead = false;
     for _ in 0..200 {
-        if !pid_exists(helper_pid) {
+        if !pid_exists(helper_pid).expect("launch kill -0 process-existence probe") {
             helper_dead = true;
             break;
         }
@@ -500,10 +549,20 @@ exit 1
     )
     .expect_err("expected non-zero exit");
 
+    assert!(
+        err.downcast_ref::<ProcessExitError>().is_some(),
+        "expected a process exit error, got {err:?}"
+    );
     let display = err.to_string();
-    assert!(display.contains("exited non-zero (code=1); output:"));
-    assert!(display.contains("prefix prefix"));
-    assert!(!display.contains("pinokio-bin-debug"));
+    assert!(
+        display.contains("exited non-zero (code=1); output:"),
+        "unexpected process exit diagnostic: {err:?}"
+    );
+    assert!(display.contains("prefix prefix"), "diagnostic: {display}");
+    assert!(
+        !display.contains("pinokio-bin-debug"),
+        "diagnostic was not bounded: {display}"
+    );
 
     let full = process_exit_output(&err).expect("preserved full output");
     assert!(full.contains("pinokio-bin-debug"));
@@ -802,4 +861,55 @@ fn streaming_readers_do_not_emit_after_capture_guard() {
         guard.reason(),
         Some(CaptureGuardReason::CaptureLimitExceeded)
     );
+}
+
+#[test]
+fn authority_failure_classification_requires_captured_diagnostics_not_names() {
+    for diagnostic in [
+        "npm error code EACCES",
+        "npm ERR! code EPERM",
+        "EACCES: permission denied, rename '/fixture'",
+        "Permission denied.",
+        "Access is denied.",
+        "Operation not permitted",
+    ] {
+        assert!(permission_denied_output(diagnostic), "{diagnostic}");
+    }
+    for text in [
+        "/tmp/EACCES/cache",
+        "C:\\EPERM\\cache",
+        "npm-cache-eperm",
+        "NOT_EACCES XEPERMX EACCES_CACHE",
+        "EACCES.log EPERM.txt permission denied.txt",
+        "/tmp/permission denied/package",
+        "ordinary package failure",
+    ] {
+        assert!(!permission_denied_output(text), "{text}");
+    }
+    let error = anyhow!(ProcessExitError {
+        program: "/fixture/EACCES/provider".to_string(),
+        code: "1".to_string(),
+        output: Some("ordinary stdout".to_string()),
+        stderr: Some("unrelated failure".to_string()),
+    });
+    assert!(!process_permission_denied(&error));
+    assert!(!process_permission_denied(&anyhow!("EACCES health path")));
+    for stdout in [true, false] {
+        let diagnostic = format!("{}\nnpm ERR! code EPERM", "padding".repeat(100));
+        let error = anyhow!(ProcessExitError {
+            program: "provider".to_string(),
+            code: "1".to_string(),
+            output: Some(if stdout {
+                diagnostic.clone()
+            } else {
+                "ordinary stdout".to_string()
+            }),
+            stderr: Some(if stdout {
+                "unrelated stderr".to_string()
+            } else {
+                diagnostic
+            }),
+        });
+        assert!(process_permission_denied(&error));
+    }
 }

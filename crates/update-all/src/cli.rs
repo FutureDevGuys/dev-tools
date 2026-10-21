@@ -1,15 +1,15 @@
 use crate::completions::CompletionSyncArgs;
 use crate::config::{
+    init_config_file, load_runtime_config, parse_engine_mode, parse_ui_mode, validate_config,
     DashboardQuitBehavior as ConfigDashboardQuitBehavior,
-    MouseRowStrideMode as ConfigMouseRowStrideMode, RuntimeConfig, TaskPolicy, init_config_file,
-    load_runtime_config, parse_engine_mode, parse_ui_mode, validate_config,
+    MouseRowStrideMode as ConfigMouseRowStrideMode, RuntimeConfig, TaskPolicy,
 };
 use crate::logging::RunLogSink;
 use crate::sections::Sections;
-use crate::tasks::{PrivilegeSession, TaskPolicies, run_async};
+use crate::tasks::{run_async, PrivilegeSession, TaskPolicies};
 use crate::ui::{MouseRowStride, UiModeResolved};
-use crate::updaters::{HostOs, detected_builtin_tasks};
-use anyhow::{Context, Result, bail};
+use crate::updaters::{detected_builtin_tasks, HostOs};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use is_terminal::IsTerminal;
 use std::env;
@@ -25,8 +25,8 @@ use std::time::Duration;
 #[command(name = "update-all")]
 #[command(disable_help_subcommand = true)]
 #[command(
-    about = "Run detected updater tasks and refresh managed shell completions.",
-    long_about = "Run detected updater tasks and refresh managed shell completions.\n\nBuilt-in and custom updater tasks are catalog-driven. Catalog-linked tasks can declare relationships such as including `skills` with `npm`, and command candidates let `skills` run directly when available or through `npx --no-install skills` when only the local npm package is resolvable."
+    about = "Run selected updater tasks; manage shell completions with explicit subcommands.",
+    long_about = "Run selected updater tasks; manage shell completions with explicit subcommands.\n\nBuilt-in and custom updater tasks are catalog-driven. Selected builtin/dev-tools-* tasks can check releases and update installed managed products; the legacy install.auto_update field does not control them or perform a hidden startup update. Use --only, --exclude, or [updaters] configuration to select tasks.\n\nOrdinary task runs do not implicitly refresh completions: the built-in catalog currently has no completion task. Use `update-all completions sync` explicitly. User-owned custom tasks can invoke that command themselves.\n\nCatalog-linked tasks can declare relationships such as including `skills` with `npm`, and command candidates let `skills` run directly when available or through `npx --no-install skills` when only the local npm package is resolvable."
 )]
 pub struct RunCli {
     #[command(subcommand)]
@@ -85,13 +85,13 @@ pub struct RunCli {
 
     #[arg(
         long = "completions",
-        help = "Control public completion refresh behavior: off or refresh"
+        help = "Legacy completion task mode: off or refresh (inactive in ordinary built-in runs; use completions sync)"
     )]
     completions: Option<String>,
 
     #[arg(
         long = "completion-provider",
-        help = "Comma-separated completion providers to refresh (for example: npm,path,pipx,uv,go)"
+        help = "Legacy completion task providers (inactive in ordinary built-in runs; use completions sync --providers)"
     )]
     completion_provider: Option<String>,
 
@@ -269,8 +269,9 @@ impl RunCli {
             load_runtime_config(self.config.clone())
                 .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?,
         );
-        // Ordinary work never refreshes or activates the executable. The legacy
-        // auto_update field remains readable; explicit update commands own those effects.
+        // No hidden startup update: auto_update remains readable but inert.
+        // Selected built-in product-update tasks can still check and activate
+        // managed releases through their visible update-if-installed commands.
 
         if self.dashboard && self.plain {
             bail!("--dashboard and --plain are mutually exclusive");
@@ -515,13 +516,17 @@ impl RunsCli {
                     crate::ua_outln!(
                         "Read-only artifact inspection; recorded status does not prove current execution or package health."
                     );
+                    crate::ua_outln!(
+                        "Available means readable snapshots, not a verified final invocation outcome."
+                    );
                     for run in &report.runs {
                         crate::ua_outln!(
-                            "{}: metadata={}, run artifact={}, evidence={}, tasks={}, issues={}",
+                            "{}: metadata={}, run artifact={}, evidence={}, recorded status={}, tasks={}, issues={}",
                             run.directory_name.escape_default(),
                             run.metadata_status,
                             run.run_artifact_status,
                             run.evidence_status,
+                            run.recorded_status.as_deref().unwrap_or("unknown"),
                             known_count(run.task_count),
                             known_count(run.issue_count)
                         );

@@ -48,6 +48,8 @@ Publishing only self-completion would leave the public loader incomplete. Writin
 
 ## Consequences and known limitations
 
+Reachability qualification: public sync here means the explicit `completions sync` command. The current built-in catalog contains no completion task; ordinary task runs include no built-in completion refresh or implicit snapshot publication. User-owned custom tasks may explicitly invoke sync. The parsed ordinary-run `refresh` default is dormant, not evidence of automatic publication. Existing executor-level coverage does not establish built-in ordinary-run reachability, and any future catalog integration requires separate review and runtime acceptance. This record remains proposed and pending.
+
 This record completes the provider-activation boundary reserved by ADRs 0011 and 0012 without changing their probe, trust, IR, query, or performance decisions. Explicit legacy users receive one release to move to public init. Snapshot content changes once because provider bindings and binding metadata become part of activation identity. The transient lock lives beside rather than inside the managed root so an unchanged sync does not alter managed-root directory metadata. The age floor can temporarily retain more than the count floor during frequent behavior changes; bounded generator outputs and eventual age-based reclamation keep this product-owned history finite without risking files referenced by recently started shells.
 
 ## Verification

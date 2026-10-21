@@ -47,6 +47,14 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0035](0035-owned-dashboard-input-and-bounded-display.md) | Owned dashboard input and bounded display | proposed | pending |
 | [0036](0036-opt-in-post-run-restart.md) | Opt-in post-run restart requests | proposed | pending |
 | [0037](0037-read-only-damaged-run-inspection.md) | Read-only damaged run inspection | proposed | pending |
+| [0038](0038-terminal-reported-storage-exhaustion.md) | Terminal reported storage exhaustion | proposed | pending |
+| [0039](0039-preserve-unclassified-npm-directories.md) | Preserve unclassified NPM directories | proposed | pending |
+
+| [0040](0040-truthful-blocked-run-outcomes.md) | Truthful blocked run outcomes | proposed | pending |
+| [0041](0041-terminal-reported-npm-authority-failure.md) | Terminal reported NPM authority failure | proposed | pending |
+| [0042](0042-explicit-configuration-read-selection.md) | Explicit configuration read selection | proposed | pending |
+| [0043](0043-regular-configuration-input-admission.md) | Regular configuration input admission | proposed | pending |
+| [0044](0044-preserving-run-artifact-replacement.md) | Preserving run artifact replacement | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

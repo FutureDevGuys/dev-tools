@@ -126,7 +126,7 @@ Dev Auth adds the stable `--version` line and `build-info --json` common identit
 
 [ADR 0018](0018-journal-owned-initial-directory-publication.md) adds journal-owned recovery for Artifact Update's first-use directory publication and staging-reservation initialization, including explicit post-publication reconciliation without final-document changes. Its narrower ownership and compatibility contract supersedes the corresponding initial-directory limitation above; unmarked legacy entries and reservation retirement remain explicitly separate.
 
-- Ordinary commands, `--version`, `build-info`, `doctor`, status, and rollback are network-free.
+- Ordinary startup performs no implicit release check or self-update. Selected Update All updater workloads, including default-detected tasks, may use their existing network/update authority; this is not hidden startup work. `--version`, `build-info`, `doctor`, status, and rollback retain their network-free contracts.
 - Expired or absent release evidence produces `unknown`, not `current`.
 - An external installation is never overwritten implicitly.
 - Cache freshness defaults to 24 hours; a check is the only implicit metadata-network operation.

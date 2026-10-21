@@ -683,20 +683,167 @@ fn create_owner_only_dir(path: &Path) -> Result<()> {
 }
 
 fn write_owner_only(path: &Path, payload: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    let previous = artifact_leaf_metadata(path)?;
+    let mut staged = artifact_staging_file(path)?;
+    // Keep the old file untouched, including its mode and write authorization.
+    // Directory rename permission alone must not bypass a denied file write.
+    let _previous_write_access = if let Some(metadata) = &previous {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                metadata.uid() == staged.as_file().metadata()?.uid(),
+                "refuse unsafe artifact leaf {}: different owner",
+                path.display()
+            );
+        }
+        let mut options = OpenOptions::new();
+        options.write(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_OPEN_REPARSE_POINT: inspect the leaf, never its target.
+            options.custom_flags(0x0020_0000);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("check write access to {}", path.display()))?;
+        anyhow::ensure!(
+            same_artifact_file(metadata, &file.metadata()?)?,
+            "artifact leaf changed while checking write access: {}",
+            path.display()
+        );
+        Some(file)
+    } else {
+        None
+    };
+    staged
+        .as_file_mut()
+        .write_all(payload)
+        .with_context(|| format!("write {} (staged)", path.display()))?;
+    staged
+        .as_file_mut()
+        .flush()
+        .with_context(|| format!("flush {} (staged)", path.display()))?;
+    publish_artifact(staged, path, previous.as_ref())
+}
+
+fn artifact_leaf_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect artifact {}", path.display()))
+        }
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "refuse unsafe artifact leaf {}: expected a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        !metadata.permissions().readonly(),
+        "refuse read-only artifact leaf {}",
+        path.display()
+    );
     #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    file.write_all(payload)
-        .with_context(|| format!("write {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush {}", path.display()))?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.nlink() == 1 && metadata.mode() & 0o7000 == 0 && metadata.mode() & 0o200 != 0,
+            "refuse unsafe artifact leaf {}: requires one link and ordinary owner-write permissions",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "refuse unsafe artifact reparse leaf {}",
+            path.display()
+        );
+    }
+    Ok(Some(metadata))
+}
+
+fn same_artifact_file(left: &fs::Metadata, right: &fs::Metadata) -> Result<bool> {
+    let same = right.file_type().is_file()
+        && left.len() == right.len()
+        && left.permissions() == right.permissions()
+        && left.modified()? == right.modified()?;
     #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("set owner-only permissions on {}", path.display()))?;
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        same && left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.uid() == right.uid()
+            && left.gid() == right.gid()
+            && left.nlink() == right.nlink()
+            && left.mode() == right.mode()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    };
+    #[cfg(windows)]
+    let same = {
+        use std::os::windows::fs::MetadataExt;
+        same && left.file_attributes() == right.file_attributes()
+            && left.creation_time() == right.creation_time()
+    };
+    Ok(same)
+}
+
+fn artifact_staging_file(path: &Path) -> Result<tempfile::NamedTempFile> {
+    let parent = path.parent().context("artifact has no parent directory")?;
+    let name = path.file_name().context("artifact has no filename")?;
+    // Retain short diagnostic suffixes without growing near-NAME_MAX task names.
+    let mut suffix = std::ffi::OsString::from("-");
+    if name.as_encoded_bytes().len() <= 96 {
+        suffix.push(name);
+    } else {
+        suffix.push("artifact.json");
+    }
+    let staged = tempfile::Builder::new()
+        .prefix(".update-all-artifact-")
+        .suffix(&suffix)
+        .tempfile_in(parent)
+        .with_context(|| format!("stage artifact for {}", path.display()))?;
+    #[cfg(unix)]
+    staged
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set private staging permissions for {}", path.display()))?;
+    Ok(staged)
+}
+
+fn publish_artifact(
+    staged: tempfile::NamedTempFile,
+    path: &Path,
+    previous: Option<&fs::Metadata>,
+) -> Result<()> {
+    let current = artifact_leaf_metadata(path)?;
+    let unchanged = match (previous, current.as_ref()) {
+        (None, None) => true,
+        (Some(previous), Some(current)) => same_artifact_file(previous, current)?,
+        _ => false,
+    };
+    anyhow::ensure!(
+        unchanged,
+        "artifact leaf changed before publication: {}",
+        path.display()
+    );
+    persist_staged_artifact(staged, path)
+}
+
+fn persist_staged_artifact(staged: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    // One namespace-atomic replacement, not a power-loss durability guarantee.
+    // Never unlink the destination as a fallback. On error, drop only our stage.
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish artifact {}", path.display()))?;
     Ok(())
 }
 
@@ -705,6 +852,312 @@ mod tests {
     use super::{render_human_record, RunLogSink};
     use crate::ui::{LogLevel, LogRecord, LogStream};
     use tempfile::TempDir;
+
+    #[test]
+    fn artifact_replacement_publishes_complete_private_bytes_and_bounded_names() {
+        let root = TempDir::new().unwrap();
+        let sink = RunLogSink::new(root.path(), false).unwrap();
+        let unknown = sink.run_dir().join(".update-all-artifact-unknown-run.json");
+        std::fs::write(&unknown, b"not this invocation's stage").unwrap();
+        for name in [
+            "run.json".to_string(),
+            format!("task-{}.json", "x".repeat(240)),
+        ] {
+            let payload = serde_json::json!({"schema_version":1,"tasks":[{"status":"completed"}],"exit_code":0});
+            let stage = super::artifact_staging_file(&sink.run_dir().join(&name)).unwrap();
+            let stage_name = stage.path().file_name().unwrap().to_string_lossy();
+            assert!(stage_name.len() < 128);
+            if name == "run.json" {
+                assert!(stage_name.ends_with("-run.json"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    stage.as_file().metadata().unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            drop(stage);
+            sink.write_json_file(&name, &payload).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    sink.run_dir().join(&name),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            sink.write_json_file(&name, &true).unwrap();
+            assert_eq!(std::fs::read(sink.run_dir().join(&name)).unwrap(), b"true");
+            sink.write_json_file(&name, &payload).unwrap();
+            assert_eq!(
+                std::fs::read(sink.run_dir().join(&name)).unwrap(),
+                serde_json::to_vec_pretty(&payload).unwrap()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(sink.run_dir().join(&name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(unknown).unwrap(),
+            b"not this invocation's stage"
+        );
+        assert_eq!(std::fs::read_dir(sink.run_dir()).unwrap().count(), 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn artifact_replacement_refuses_unsafe_leaves_without_changing_them() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("outside.json");
+        std::fs::write(&target, b"outside preserved").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let target_before = std::fs::metadata(&target).unwrap();
+        let directory = root.path().join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("child"), b"preserve child").unwrap();
+        let link = root.path().join("link.json");
+        symlink(&target, &link).unwrap();
+        let broken = root.path().join("broken.json");
+        symlink(root.path().join("absent"), &broken).unwrap();
+        let hardlink = root.path().join("hardlink.json");
+        std::fs::hard_link(&target, &hardlink).unwrap();
+        let fifo = root.path().join("fifo.json");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: create an unconnected FIFO only at this test's owned temporary path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let readonly = root.path().join("readonly.json");
+        std::fs::write(&readonly, b"read-only preserved").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let special = root.path().join("special.json");
+        std::fs::write(&special, b"special mode preserved").unwrap();
+        std::fs::set_permissions(&special, std::fs::Permissions::from_mode(0o1600)).unwrap();
+        let before_entries = std::fs::read_dir(root.path()).unwrap().count();
+        for path in [
+            &directory, &link, &broken, &hardlink, &fifo, &readonly, &special,
+        ] {
+            let before = std::fs::symlink_metadata(path).unwrap();
+            assert!(
+                super::write_owner_only(path, b"replacement").is_err(),
+                "{}",
+                path.display()
+            );
+            let after = std::fs::symlink_metadata(path).unwrap();
+            assert_eq!(
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.mode(),
+                    before.nlink(),
+                    before.len(),
+                    before.mtime(),
+                    before.mtime_nsec()
+                ),
+                (
+                    after.dev(),
+                    after.ino(),
+                    after.mode(),
+                    after.nlink(),
+                    after.len(),
+                    after.mtime(),
+                    after.mtime_nsec()
+                )
+            );
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside preserved");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().mode(),
+            target_before.mode()
+        );
+        assert_eq!(std::fs::read_link(link).unwrap(), target);
+        assert_eq!(
+            std::fs::read(directory.join("child")).unwrap(),
+            b"preserve child"
+        );
+        assert_eq!(std::fs::read(readonly).unwrap(), b"read-only preserved");
+        assert_eq!(std::fs::read(special).unwrap(), b"special mode preserved");
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            before_entries
+        );
+    }
+
+    #[test]
+    fn artifact_replacement_cleans_owned_stage_on_publication_and_revalidation_failures() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("run.json");
+        std::fs::write(&path, b"prior bytes").unwrap();
+        let previous = super::artifact_leaf_metadata(&path).unwrap();
+        let unknown = root.path().join(".update-all-artifact-unknown-run.json");
+        std::fs::write(&unknown, b"unknown stage").unwrap();
+        let staged = super::artifact_staging_file(&path).unwrap();
+        let stage_path = staged.path().to_path_buf();
+        std::fs::write(&path, b"newly observed bytes").unwrap();
+        assert!(super::publish_artifact(staged, &path, previous.as_ref()).is_err());
+        assert!(!stage_path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"newly observed bytes");
+
+        // Exercise the actual rename error boundary, independently of leaf admission.
+        // This directory is an obstruction, not a preexisting regular artifact.
+        let obstruction = root.path().join("obstruction.json");
+        std::fs::create_dir(&obstruction).unwrap();
+        std::fs::write(obstruction.join("child"), b"preserved obstruction").unwrap();
+        let staged = super::artifact_staging_file(&obstruction).unwrap();
+        let stage_path = staged.path().to_path_buf();
+        let error = super::persist_staged_artifact(staged, &obstruction).unwrap_err();
+        assert!(format!("{error:#}").contains("publish artifact"));
+        assert!(
+            !stage_path.exists(),
+            "cleanup happens before the returned error is dropped"
+        );
+        assert_eq!(
+            std::fs::read(obstruction.join("child")).unwrap(),
+            b"preserved obstruction"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"newly observed bytes");
+        assert_eq!(std::fs::read(&unknown).unwrap(), b"unknown stage");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn artifact_replacement_preserves_previous_bytes_after_partial_write() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+
+        // Process-local limits must never affect the parallel test runner.
+        const CHILD: &str = "UPDATE_ALL_ARTIFACT_PARTIAL_WRITE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = TempDir::new().unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "logging::tests::artifact_replacement_preserves_previous_bytes_after_partial_write",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", root.path())
+                .env("TMPDIR", root.path())
+                .env("PATH", "")
+                .current_dir(root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            if child
+                .wait_timeout(Duration::from_secs(15))
+                .unwrap()
+                .is_none()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned artifact-write test exceeded its bound");
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct LimitGuard(libc::rlimit, libc::sighandler_t);
+        impl Drop for LimitGuard {
+            fn drop(&mut self) {
+                // SAFETY: restore only this isolated test process's saved limit and handler.
+                unsafe {
+                    assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &self.0), 0);
+                    libc::signal(libc::SIGXFSZ, self.1);
+                }
+            }
+        }
+        let root = TempDir::new().unwrap();
+        let sink = RunLogSink::new(root.path(), false).unwrap();
+        let path = sink.run_dir().join("run.json");
+        let old = serde_json::json!({"tasks":[{"status":"completed"}],"exit_code":0});
+        sink.write_json_file("run.json", &old).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let before_metadata = std::fs::metadata(&path).unwrap();
+        let before_entries = std::fs::read_dir(sink.run_dir()).unwrap().count();
+        let next =
+            serde_json::json!({"tasks":[{"status":"completed"}],"exit_code":1,"status":"failed"});
+
+        // SAFETY: get/set a valid rlimit only in this self-spawned, single-test process.
+        let guard = unsafe {
+            let mut old_limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old_limit), 0);
+            let old_handler = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_ne!(old_handler, libc::SIG_ERR);
+            let guard = LimitGuard(old_limit, old_handler);
+            let limit = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: guard.0.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            guard
+        };
+        let error = sink.write_json_file("run.json", &next).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EFBIG)
+        );
+        assert!(format!("{error:#}").contains("run.json"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode(),
+            before_metadata.permissions().mode()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before_metadata.modified().unwrap()
+        );
+        assert_eq!(sink.run_snapshot.lock().unwrap().as_ref(), Some(&next));
+        let first_failure = sink.journal_failure().unwrap();
+        assert!(sink.write_json_file("missing.json", &next).is_err());
+        assert!(!sink.run_dir().join("missing.json").exists());
+        assert_eq!(
+            std::fs::read_dir(sink.run_dir()).unwrap().count(),
+            before_entries
+        );
+        drop(guard);
+        sink.write_json_file("run.json", &next).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&next).unwrap()
+        );
+        assert_eq!(
+            sink.journal_failure().as_deref(),
+            Some(first_failure.as_str())
+        );
+    }
 
     #[cfg(unix)]
     #[test]

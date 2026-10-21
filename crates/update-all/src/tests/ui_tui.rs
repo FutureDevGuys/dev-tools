@@ -1807,7 +1807,7 @@ fn run_completion_header_preserves_cancellation_and_real_failures() {
         (false, true, false, " canceled ", Color::Yellow),
         (false, true, true, " failed ", Color::LightRed),
         (false, false, true, " failed ", Color::LightRed),
-        (false, false, false, " failed ", Color::LightRed),
+        (false, false, false, " blocked/deferred ", Color::Yellow),
     ] {
         // No task rows: completion facts must also cover journal failures and
         // cancellation after a child has already completed.

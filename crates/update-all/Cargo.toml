@@ -19,6 +19,7 @@ dev-tools-update = { version = "0.2.0", path = "../dev-tools-update" }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 sha2.workspace = true
 toml = "1.0"
 wait-timeout = "0.2"
@@ -37,7 +38,6 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 predicates = "3"
 serde_jcs = "0.2"
-tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.31", default-features = false, features = ["process", "signal"] }

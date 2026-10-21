@@ -1,5 +1,5 @@
 //! Read-only real executable acceptance for damaged run history.
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 use std::{
     fs,
@@ -154,6 +154,37 @@ fn active_finalizing_metadata_and_warning_skips_remain_truthful() {
 }
 
 #[test]
+fn plain_inspection_distinguishes_finalizing_from_available_snapshot() {
+    let f = Fixture::new();
+    let dir = f.entry(
+        "retained",
+        r#"{"tasks":[{"status":"completed"}],"exit_code":0}"#,
+    );
+    let path = dir.join("run-meta.json");
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    metadata["status"] = json!("finalizing");
+    fs::write(&path, metadata.to_string()).unwrap();
+    let before = snapshot(f.root.path());
+    let plain = f.run(&["runs", "inspect", "retained"]);
+    assert!(plain.status.success());
+    let output = String::from_utf8_lossy(&plain.stdout);
+    assert!(output.contains("recorded status=finalizing"), "{output}");
+    assert!(
+        output.contains(
+            "Available means readable snapshots, not a verified final invocation outcome."
+        ),
+        "{output}"
+    );
+    let json = f.run(&["runs", "inspect", "retained", "--json"]);
+    assert!(json.status.success());
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["runs"][0]["evidence_status"], "available");
+    assert_eq!(report["runs"][0]["recorded_status"], "finalizing");
+    assert_eq!(report["runs"][0]["exit_code"], 0);
+    assert_eq!(snapshot(f.root.path()), before);
+}
+
+#[test]
 fn unsupported_and_oversized_evidence_is_unknown() {
     let f = Fixture::new();
     let dir = f.entry("future", r#"{"schema_version":99,"tasks":[]}"#);
@@ -195,12 +226,10 @@ fn symlinks_and_fifos_are_not_followed_or_opened() {
     assert_eq!(report["runs"][0]["metadata_status"], "unsafe");
     assert_eq!(report["runs"][0]["run_artifact_status"], "unsafe");
     assert!(!f.run(&["rename", "unsafe", "new-name"]).status.success());
-    assert!(
-        fs::symlink_metadata(dir.join("run.json"))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
+    assert!(fs::symlink_metadata(dir.join("run.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 fn snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>, u32)> {
@@ -249,4 +278,21 @@ fn exact_directory_inspection_works_beside_large_unrelated_history() {
     );
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["runs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn explicit_info_deferral_is_counted_in_existing_run_history() {
+    let f = Fixture::new();
+    for status in ["completed", "skipped"] {
+        let name = format!("deferred-{status}");
+        let artifact = format!("{{\"tasks\":[{{\"status\":\"{status}\",\"completed_with_issues\":false,\"advisories\":[{{\"severity\":\"info\",\"code\":\"deferred\"}}]}}],\"issue_count\":0,\"exit_code\":2}}");
+        f.entry(&name, &artifact);
+        let out = f.run(&["resume", &name, "--json"]);
+        assert!(out.status.success());
+        let run: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(run["issue_count"], 1);
+        let inspect: Value =
+            serde_json::from_slice(&f.run(&["runs", "inspect", &name, "--json"]).stdout).unwrap();
+        assert_eq!(inspect["runs"][0]["issue_count"], 1);
+    }
 }

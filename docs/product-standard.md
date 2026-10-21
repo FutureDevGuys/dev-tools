@@ -42,7 +42,7 @@ Metadata refresh does not retrieve artifact payloads. Online install/apply prepa
 
 An externally managed public command is reported as `external` and is never overwritten implicitly. A product whose first installation requires product-owned policy or enrollment may return `requires_setup`; the common update layer must not create policy, enroll credentials, or weaken the product's approval contract.
 
-Ordinary product operations and `--version` never access the network. Remote release metadata may describe product identity and artifacts, but it may not provide executable commands, arbitrary destinations, shell programs, or privileged effects.
+Ordinary product startup never performs an implicit release check or self-update, and `--version` never accesses the network. This does not make selected updater workloads offline, including Update All tasks selected by default detection: its visible product-update tasks invoke `product update-if-installed` and may check releases and activate managed products, subject to normal task selection and installation ownership. This describes existing updater workload behavior, not additional startup authority. Local inspection commands retain their network-free contracts. Remote release metadata may describe product identity and artifacts, but it may not provide executable commands, arbitrary destinations, shell programs, or privileged effects.
 
 `artifact-update` is the standalone configuration-driven form of the shared update foundation. Its local `artifact-update-config-v1` authority selects providers, version conventions, artifact types, platform/architecture mappings, deterministic exact/glob/linear-time-regex selectors, verification requirements, and managed destinations for independently packaged applications. Unverifiable sources are check-only. Selection ambiguity is terminal, downloads are bounded and streaming, and install/rollback mutate only receipt-owned state.
 
@@ -99,7 +99,7 @@ Release authenticity does not grant privilege. Ordinary product helpers use type
 
 ## Dependencies, performance, and platform support
 
-Workspace dependencies are intentionally narrow, licensed, locked, and audited. Update functionality uses one audited Rust HTTP/TLS stack and ordinary command paths do not initialize network machinery. Cargo features exclude unused network and platform implementations. Released binaries use dead-code elimination and link-time optimization when measurement supports it.
+Workspace dependencies are intentionally narrow, licensed, locked, and audited. Update functionality uses one audited Rust HTTP/TLS stack; startup and local inspection do not initialize release-network machinery independently of a selected network-capable workload. Cargo features exclude unused network and platform implementations. Released binaries use dead-code elimination and link-time optimization when measurement supports it.
 
 Every release records startup, cached-status, explicit-check, update-application, and binary-size baselines. An unexplained regression greater than 10 percent or 2 milliseconds absolute on a hot local command blocks release.
 
