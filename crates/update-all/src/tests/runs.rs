@@ -1,6 +1,6 @@
 use super::{
-    prune_runs, resolve_run_query, scan_runs, write_metadata_atomic, RunArtifactStatus,
-    RunMetadata, RunRetentionPolicy,
+    RunArtifactStatus, RunMetadata, RunRetentionPolicy, prune_runs, resolve_run_query, scan_runs,
+    write_metadata_atomic,
 };
 use std::fs;
 use std::path::Path;
@@ -264,7 +264,7 @@ fn scan_keeps_metadata_run_when_run_json_is_malformed() {
 
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].metadata.run_id, "metadata-id");
-    assert_eq!(runs[0].task_count, 0);
+    assert_eq!(runs[0].task_count, None);
     assert_eq!(runs[0].run_json_status, RunArtifactStatus::Malformed);
 }
 
