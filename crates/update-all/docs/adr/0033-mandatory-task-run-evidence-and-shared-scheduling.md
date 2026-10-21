@@ -55,6 +55,8 @@ Previously tolerated unwritable log roots now require configuration repair. This
 - `finalizing_run_is_protected_from_another_runs_retention`
 - `dashboard_transport_shutdown_wakes_frontend_after_journal_failure`
 - `completion_progress_write_failure_latches_evidence_admission_failure`
+- `persistence_failure_latches_without_producer_terminal_output`
+- `general_enospc_stops_admission_settles_processes_and_restores_terminal`
 
 ## Runtime acceptance
 

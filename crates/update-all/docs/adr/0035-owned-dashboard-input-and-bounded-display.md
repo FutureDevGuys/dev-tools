@@ -94,6 +94,7 @@ behavior, a signed release or an installed fix.
 - `native_e2e_footer_keeps_complete_shortcuts_at_standard_terminal_sizes`
 - `native_e2e_prompt_hints_keep_cancellation_words_together`
 - `native_e2e_plain_frontend_acknowledges_foreground_handoffs`
+- `general_enospc_stops_admission_settles_processes_and_restores_terminal`
 
 ## Runtime acceptance
 

@@ -53,6 +53,14 @@ pub struct RunCli {
     #[arg(long = "config")]
     config: Option<PathBuf>,
 
+    /// Request a non-forced OS restart only after a clean, fully finalized task run.
+    #[arg(
+        long = "restart-after",
+        visible_alias = "reboot",
+        default_value_t = false
+    )]
+    restart_after: bool,
+
     #[arg(long = "fail-fast", default_value_t = false)]
     fail_fast: bool,
 
@@ -237,6 +245,14 @@ impl RunCli {
             None => {}
         }
 
+        let restart = if self.restart_after {
+            let request = crate::restart::RestartRequest::prepare()?;
+            crate::ua_errln!("WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart after a clean update run and dashboard exit. No forced restart or automatic elevation will be used.");
+            Some(request)
+        } else {
+            None
+        };
+
         let startup_cfg = Some(
             load_runtime_config(self.config.clone())
                 .map_err(|error| crate::InvalidPlan(format!("{error:#}")))?,
@@ -401,7 +417,11 @@ impl RunCli {
                 "failed to persist terminal run evidence (observed task-run outcome: {status}, exit {exit_code})"
             )));
         }
-        run_result
+        run_result?;
+        if let Some(restart) = restart {
+            restart.request(&run_log)?;
+        }
+        Ok(())
     }
 }
 

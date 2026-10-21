@@ -1925,7 +1925,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         let mut made_progress = false;
 
         if !journal_abort_reported {
-            if let Some(error) = event_tx.journal_error() {
+            if event_tx.journal_error().is_some() {
                 journal_abort_reported = true;
                 cancel_all_requested = true;
                 if cancel_all_since.is_none() {
@@ -1936,9 +1936,8 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 for pending_id in pending.keys() {
                     let _ = runtime_control.request_task_cancel(pending_id);
                 }
-                crate::ua_errln!(
-                    "update-all: authoritative event journal failed; canceling the run: {error}"
-                );
+                // The final diagnostic is emitted after owned commands settle
+                // and the dashboard restores the terminal, never from producers.
                 made_progress = true;
             }
         }
@@ -2150,7 +2149,9 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 || cancel::is_cancel_requested()
                 || event_tx.journal_error().is_some()
             {
-                let detail = if cancel_all_requested || cancel::is_cancel_requested() {
+                let detail = if event_tx.journal_error().is_some() {
+                    "not run after required run evidence could not be persisted"
+                } else if cancel_all_requested || cancel::is_cancel_requested() {
                     "canceled before start"
                 } else {
                     "not run after fail-fast failure"
@@ -2481,7 +2482,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     initial_artifact_result.context("persist task completion evidence")?;
     final_artifact_result.context("persist final dashboard timing")?;
     if let Some(error) = event_tx.journal_error().or(journal_error) {
-        bail!("authoritative event journal failed: {error}");
+        bail!("required run evidence could not be persisted; no further updates started, already-running commands settled; the run is incomplete: {error}");
     }
     match outcome {
         AsyncRunOutcome::Success => Ok(()),

@@ -44,6 +44,8 @@ nix = { version = "0.31", default-features = false, features = ["process", "sign
 
 [features]
 default = ["tui"]
+# Test builds can NEVER issue a native restart. Do not distribute these builds.
+restart-test-backend = []
 tui = ["dep:ratatui"]
 
 # rust-development-skill:clippy-lints:start
