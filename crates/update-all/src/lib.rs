@@ -5,6 +5,7 @@ mod completions;
 mod config;
 mod logging;
 mod release;
+mod restart;
 mod runs;
 mod sections;
 mod tasks;

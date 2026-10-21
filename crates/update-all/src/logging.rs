@@ -27,11 +27,13 @@ pub struct RunLogSink {
     event_file_path: PathBuf,
     event_sequence: Mutex<u64>,
     journal_failure: Mutex<Option<String>>,
+    run_snapshot: Mutex<Option<Value>>,
+    selected_tasks: Mutex<Vec<String>>,
+    started_tasks: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     journal_fault_injected: AtomicBool,
     task_files: Mutex<BTreeMap<String, LogFileHandle>>,
     raw_task_files: Mutex<BTreeMap<String, LogFileHandle>>,
-    write_warning_targets: Mutex<BTreeSet<String>>,
 }
 
 struct LogFileHandle {
@@ -65,13 +67,14 @@ impl RunLogSink {
             event_file_path,
             event_sequence: Mutex::new(0),
             journal_failure: Mutex::new(None),
+            run_snapshot: Mutex::new(None),
+            selected_tasks: Mutex::new(Vec::new()),
+            started_tasks: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             journal_fault_injected: AtomicBool::new(false),
             task_files: Mutex::new(BTreeMap::new()),
             raw_task_files: Mutex::new(BTreeMap::new()),
-            write_warning_targets: Mutex::new(BTreeSet::new()),
         };
-        sink.write_metadata("running", None, None, None, Vec::new(), started_unix_ms)?;
         sink.write_event(
             "run_started",
             None,
@@ -81,6 +84,7 @@ impl RunLogSink {
                 "build_info": sink.build_info(),
             }),
         )?;
+        sink.write_metadata("running", None, None, None, Vec::new(), started_unix_ms)?;
         Ok(sink)
     }
 
@@ -143,10 +147,14 @@ impl RunLogSink {
             engine_mode: engine_mode.map(str::to_string),
             selected_tasks,
         };
-        crate::runs::write_metadata_atomic(&self.run_dir, &metadata)
+        self.record_persistence_result(crate::runs::write_metadata_atomic(&self.run_dir, &metadata))
     }
 
     pub fn write_record(&self, rec: &LogRecord) -> Result<()> {
+        self.record_persistence_result(self.write_record_inner(rec))
+    }
+
+    fn write_record_inner(&self, rec: &LogRecord) -> Result<()> {
         let run_line = render_human_record(rec, self.timestamps, true);
         let task_line = render_human_record(rec, self.timestamps, false);
 
@@ -193,7 +201,13 @@ impl RunLogSink {
     }
 
     pub fn write_event(&self, kind: &str, task_id: Option<&str>, payload: Value) -> Result<()> {
+        let starts_task = kind == "task_state_changed" && payload["state"] == "running";
         let result = self.write_event_inner(kind, task_id, payload);
+        if result.is_ok() && starts_task {
+            if let (Some(task_id), Ok(mut started)) = (task_id, self.started_tasks.lock()) {
+                started.insert(task_id.to_string());
+            }
+        }
         if let Err(error) = &result {
             if let Ok(mut failure) = self.journal_failure.lock() {
                 if failure.is_none() {
@@ -249,6 +263,10 @@ impl RunLogSink {
     }
 
     pub fn write_raw(&self, rec: &LogRecord) -> Result<()> {
+        self.record_persistence_result(self.write_raw_inner(rec))
+    }
+
+    fn write_raw_inner(&self, rec: &LogRecord) -> Result<()> {
         if rec.task_id == RUN_LOG_SCOPE {
             return Ok(());
         }
@@ -299,30 +317,235 @@ impl RunLogSink {
 
     pub fn write_json_file<T: Serialize>(&self, relative_name: &str, value: &T) -> Result<()> {
         let path = self.run_dir.join(relative_name);
+        if relative_name == "run.json" {
+            *self
+                .run_snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))? =
+                Some(serde_json::to_value(value)?);
+        }
         let json = serde_json::to_vec_pretty(value)
             .with_context(|| format!("serialize {}", path.display()))?;
-        write_owner_only(&path, &json)
+        self.record_persistence_result(write_owner_only(&path, &json))
     }
 
-    pub fn emit_write_warning_once(&self, err: &anyhow::Error) {
-        let target = write_warning_target(err);
-        if self.mark_write_warning_target(&target) {
-            crate::ua_errln!(
-                "update-all: log/artifact write failed for {target}; continuing without full diagnostics: {err:#}"
+    pub(crate) fn record_selected_tasks(&self, selected: &[String]) -> Result<()> {
+        *self
+            .selected_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run selection lock poisoned"))? = selected.to_vec();
+        Ok(())
+    }
+
+    /// A zero exit can include cancel-one or all-skipped plans; neither permits restart.
+    pub(crate) fn restart_eligible(&self) -> Result<bool> {
+        let snapshot = self
+            .run_snapshot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))?;
+        Ok(snapshot.as_ref().is_some_and(|run| {
+            run["failed_task_count"].as_u64() == Some(0)
+                && run["canceled_task_count"].as_u64() == Some(0)
+                && run["issue_count"].as_u64() == Some(0)
+                && run["tasks"]
+                    .as_array()
+                    .is_some_and(|tasks| tasks.iter().any(|task| task["status"] == "completed"))
+        }))
+    }
+
+    /// Flush OS buffers as well as Rust buffers before a host restart request.
+    pub(crate) fn sync_before_restart(&self) -> Result<()> {
+        for file in [&self.run_file, &self.event_file] {
+            file.lock()
+                .map_err(|_| anyhow::anyhow!("run log lock poisoned"))?
+                .sync_all()?;
+        }
+        for files in [&self.task_files, &self.raw_task_files] {
+            for handle in files
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task log lock poisoned"))?
+                .values()
+            {
+                handle.file.sync_all()?;
+            }
+        }
+        let snapshot = self
+            .run_snapshot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))?;
+        let tasks = snapshot
+            .as_ref()
+            .and_then(|run| run["tasks"].as_array())
+            .context("cannot sync missing terminal task evidence")?;
+        let mut names = vec![
+            "run.json".to_string(),
+            "run-meta.json".to_string(),
+            "restart.json".to_string(),
+        ];
+        for task in tasks {
+            let id = task["task_id"]
+                .as_str()
+                .context("task artifact has no task id")?;
+            names.push(format!("task-{}.json", task_file_stem(id)));
+        }
+        for name in names {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.run_dir.join(name))?
+                .sync_all()?;
+        }
+        #[cfg(unix)]
+        {
+            File::open(&self.run_dir)?.sync_all()?;
+            if let Some(parent) = self.run_dir.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One controlled-return owner calls this after task execution (or rejected admission).
+    /// The last in-memory artifact preserves observed effects even if its disk write failed.
+    pub(crate) fn finalize_task_run(
+        &self,
+        host_os: &str,
+        ui_mode: &str,
+        engine_mode: &str,
+        status: &str,
+        exit_code: i32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ms_now()?;
+        let selected = self
+            .selected_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run selection lock poisoned"))?
+            .clone();
+        let snapshot = self
+            .run_snapshot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))?
+            .clone();
+        let mut payload = snapshot.unwrap_or_else(|| {
+            serde_json::json!({
+                "schema_version": 1,
+                "build_info": self.build_info(),
+                "run_id": self.run_id(),
+                "started_unix_ms": self.started_unix_ms,
+                "tasks_ended_unix_ms": now,
+                "tasks_completed_unix_ms": now,
+                "ended_unix_ms": now,
+                "tasks_elapsed_ms": now.saturating_sub(self.started_unix_ms),
+                "completed_with_issues": false,
+                "issue_count": 0,
+                "failed_task_count": 0,
+                "canceled_task_count": 0,
+                "runtime_advisories": [],
+                "tasks": [],
+            })
+        });
+        let started = self
+            .started_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run started-task lock poisoned"))?;
+        let unstarted: Vec<String> = selected
+            .iter()
+            .filter(|id| !started.contains(*id))
+            .cloned()
+            .collect();
+        drop(started);
+        payload["status"] = status.into();
+        payload["exit_code"] = exit_code.into();
+        payload["reason"] = reason
+            .map(|text| text.chars().take(1024).collect::<String>())
+            .into();
+        payload["display_name"] = self.display_name().into();
+        payload["host_os"] = host_os.into();
+        payload["ui_mode"] = ui_mode.into();
+        payload["engine_mode"] = engine_mode.into();
+        payload["run_dir"] = self.run_dir.display().to_string().into();
+        payload["selected_tasks"] = serde_json::to_value(&selected)?;
+        payload["unstarted_tasks"] = serde_json::to_value(unstarted)?;
+        payload["artifact_updated_unix_ms"] = now.into();
+        payload["ui_wait_ms"] = now
+            .saturating_sub(payload["tasks_ended_unix_ms"].as_u64().unwrap_or(now))
+            .into();
+
+        let mut failure = self.write_json_file("run.json", &payload).err();
+        let final_status = if failure.is_some() { "failed" } else { status };
+        let final_exit = if failure.is_some() { 1 } else { exit_code };
+        if let Err(error) = self.write_metadata(
+            final_status,
+            Some(host_os),
+            Some(ui_mode),
+            Some(engine_mode),
+            selected.clone(),
+            now,
+        ) {
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
+        let final_status = if failure.is_some() { "failed" } else { status };
+        let final_exit = if failure.is_some() { 1 } else { final_exit };
+        if let Err(error) = self.write_event(
+            "run_completed",
+            None,
+            serde_json::json!({
+                "status": final_status,
+                "exit_code": final_exit,
+                "success": final_exit == 0,
+                "canceled": final_status == "canceled",
+                "had_failures": payload["failed_task_count"].as_u64().unwrap_or(0) > 0
+                    || self.journal_failure().is_some()
+                    || (final_status == "failed" && final_exit != 2),
+                "reason": payload["reason"],
+            }),
+        ) {
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
+        if let Some(error) = failure {
+            // Preserve actual task results. Best-effort correction is diagnostic only;
+            // the explicit error remains non-clean even if this correction succeeds.
+            payload["status"] = "failed".into();
+            payload["exit_code"] = 1.into();
+            payload["finalization_error"] = format!("{error:#}")
+                .chars()
+                .take(1024)
+                .collect::<String>()
+                .into();
+            let _ = self.write_json_file("run.json", &payload);
+            let _ = self.write_metadata(
+                "failed",
+                Some(host_os),
+                Some(ui_mode),
+                Some(engine_mode),
+                selected,
+                now,
             );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    // Producers never write diagnostics to the terminal: the lifecycle owner
+    // reports the sticky failure after the dashboard restores terminal ownership.
+    pub fn emit_write_warning_once(&self, err: &anyhow::Error) {
+        if let Ok(mut failure) = self.journal_failure.lock() {
+            if failure.is_none() {
+                *failure = Some(format!("{err:#}"));
+            }
         }
     }
 
-    fn mark_write_warning_target(&self, target: &str) -> bool {
-        match self.write_warning_targets.lock() {
-            Ok(mut targets) => targets.insert(target.to_string()),
-            Err(_) => true,
+    fn record_persistence_result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.emit_write_warning_once(error);
         }
-    }
-
-    #[cfg(test)]
-    fn mark_write_warning_target_for_test(&self, target: &str) -> bool {
-        self.mark_write_warning_target(target)
+        result
     }
 }
 
@@ -475,21 +698,6 @@ fn write_owner_only(path: &Path, payload: &[u8]) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("set owner-only permissions on {}", path.display()))?;
     Ok(())
-}
-
-fn write_warning_target(err: &anyhow::Error) -> String {
-    for cause in err.chain() {
-        let message = cause.to_string();
-        for prefix in ["write ", "flush ", "open ", "serialize "] {
-            if let Some(target) = message.strip_prefix(prefix) {
-                let target = target.trim();
-                if !target.is_empty() {
-                    return target.to_string();
-                }
-            }
-        }
-    }
-    "unknown sink".to_string()
 }
 
 #[cfg(test)]
@@ -654,15 +862,57 @@ mod tests {
     }
 
     #[test]
-    fn write_warning_dedupes_by_failure_target() {
+    fn persistence_failure_latches_without_producer_terminal_output() {
         let root = TempDir::new().unwrap();
         let sink = RunLogSink::new(root.path(), false).unwrap();
+        std::fs::create_dir(sink.run_dir().join("fixture.json")).unwrap();
+        assert!(sink.write_json_file("fixture.json", &true).is_err());
+        let first = sink.journal_failure().unwrap();
+        sink.emit_write_warning_once(&anyhow::anyhow!("second failure"));
+        assert_eq!(sink.journal_failure().unwrap(), first);
+    }
 
-        assert!(sink.mark_write_warning_target_for_test("/tmp/run.log"));
-        assert!(!sink.mark_write_warning_target_for_test("/tmp/run.log"));
-        assert!(sink.mark_write_warning_target_for_test("/tmp/task-a.log"));
+    #[test]
+    fn restart_eligibility_requires_clean_completed_task_evidence() {
+        let root = TempDir::new().unwrap();
+        let sink = RunLogSink::new(root.path(), false).unwrap();
+        assert!(!sink.restart_eligible().unwrap(), "missing snapshot");
 
-        let err = anyhow::anyhow!("permission denied").context("write /tmp/run.log");
-        assert_eq!(super::write_warning_target(&err), "/tmp/run.log");
+        let clean = serde_json::json!({
+            "status": "completed",
+            "exit_code": 0,
+            "failed_task_count": 0,
+            "canceled_task_count": 0,
+            "issue_count": 0,
+            "tasks": [{"status": "completed"}],
+        });
+        sink.write_json_file("run.json", &clean).unwrap();
+        assert!(sink.restart_eligible().unwrap());
+
+        for tasks in [
+            serde_json::json!([]),
+            serde_json::json!([{"status": "skipped"}]),
+        ] {
+            let mut snapshot = clean.clone();
+            snapshot["tasks"] = tasks;
+            sink.write_json_file("run.json", &snapshot).unwrap();
+            assert!(!sink.restart_eligible().unwrap(), "{snapshot}");
+        }
+        // Cancel-one can retain a zero invocation exit alongside a completed
+        // sibling. Explicit task evidence must still suppress the restart.
+        for (counter, task_status) in [
+            ("canceled_task_count", "canceled"),
+            ("failed_task_count", "failed"),
+            ("issue_count", "completed"),
+        ] {
+            let mut snapshot = clean.clone();
+            snapshot[counter] = 1.into();
+            snapshot["tasks"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"status": task_status}));
+            sink.write_json_file("run.json", &snapshot).unwrap();
+            assert!(!sink.restart_eligible().unwrap(), "{counter}: {snapshot}");
+        }
     }
 }

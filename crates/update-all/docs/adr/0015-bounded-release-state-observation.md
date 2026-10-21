@@ -31,9 +31,20 @@ Treating an unreadable or nonregular state object as absence conceals lost autho
 
 Previously tolerated unsafe state modes and links now fail instead of being read or silently ignored. The reader does not chmod or guess an intended replacement. Existing mutable-state serialization, writer custody, installation recovery and receipt-bound release proofs require their separate migration before a complete common product adapter can claim conformance. Native Windows reparse/ACL acceptance remains gated; bounded shared-file reading is not that acceptance.
 
+Legacy self/product status retains its successful JSON shape and existing exit
+codes. When the common observation adapter rejects Update All state, the legacy
+CLI emits a fixed value-free stderr diagnostic rather than failing silently;
+stdout remains empty. Canonical `update status --json` remains the structured
+failure interface. This presentation correction adds no repair or initialization.
+
 ## Verification
 
 Named regression tests are `release_state_directory_is_not_missing_authority`, `release_state_symlink_is_not_missing_or_accepted_authority`, `release_state_oversized_document_is_not_accepted`, `release_state_absence_and_valid_boundary_reads_are_nonmutating`, `release_state_rejects_hardlinks_modes_and_socket_without_repair`, and `release_state_rejects_linked_and_writable_authority_parent`. The first three failed on the old reader before the production correction. Existing release-reader, migration, activation and rollback tests preserve valid behavior.
+
+`standalone_legacy_status_reports_common_failures_without_mutation` covers the
+legacy self/product JSON and human failure diagnostics with unchanged bytes,
+modes, links and identity. `standalone_legacy_status_preserves_successful_json_shape`
+protects compatibility and absent-state noninitialization.
 
 ## Runtime acceptance
 

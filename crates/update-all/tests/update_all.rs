@@ -4,7 +4,11 @@ use std::fs;
 use tempfile::TempDir;
 
 fn command(home: &TempDir) -> Command {
-    let mut command = Command::cargo_bin("update-all").expect("compiled update-all binary");
+    Command::from_std(fixture_process(home))
+}
+
+fn fixture_process(home: &TempDir) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_update-all"));
     command
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -35,6 +39,25 @@ fn help_exposes_current_general_interfaces() {
         .stdout(predicate::str::contains("update"))
         .stdout(predicate::str::contains("rollback"))
         .stdout(predicate::str::contains("repair").not());
+}
+
+#[test]
+fn version_is_one_stable_local_line() {
+    let home = TempDir::new().unwrap();
+    command(&home)
+        .env(
+            "DEV_TOOLS_GIT_COMMIT",
+            "runtime-value-must-not-replace-build-identity",
+        )
+        .env(
+            "UPDATE_ALL_GIT_COMMIT",
+            "runtime-value-must-not-replace-build-identity",
+        )
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(format!("update-all {}\n", env!("CARGO_PKG_VERSION")))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -581,4 +604,502 @@ fn completion_status_reports_retained_snapshot_history_in_json_and_text() {
         .success()
         .stdout(predicate::str::contains("historical_snapshots=1"))
         .stdout(predicate::str::contains("historical_snapshot="));
+}
+
+#[cfg(unix)]
+fn admission_fixture(home: &TempDir, engine: &str, extra: &str) -> std::path::PathBuf {
+    let config_dir = home.path().join("config/update-all");
+    let catalog_dir = config_dir.join("catalog.d/local");
+    fs::create_dir_all(&catalog_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("[install]\nauto_update=false\n[engine]\nmode=\"{engine}\"\njobs=\"1\"\n{extra}\n"),
+    )
+    .unwrap();
+    let marker = home.path().join("effect");
+    fs::write(
+        catalog_dir.join("fixture.toml"),
+        format!(
+            r#"
+[tasks."local/a"]
+label="Failing prerequisite"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="sh"
+args=["-c","exit 7"]
+policy_key="tool_update"
+[tasks."local/b"]
+label="Health dependent"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="sh"
+args=["-c","echo dependent >> {}"]
+depends_on=["local/a"]
+policy_key="tool_update"
+[tasks."local/c"]
+label="Ordering dependent"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="sh"
+args=["-c","echo ordering >> {}"]
+after=["local/a"]
+policy_key="tool_update"
+"#,
+            marker.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    marker
+}
+
+#[cfg(unix)]
+fn only_run(home: &TempDir) -> std::path::PathBuf {
+    fs::read_dir(home.path().join("state/update-all/runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("run-meta.json").is_file())
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn task_run_requires_writable_journal_before_any_effect() {
+    let home = TempDir::new().unwrap();
+    let occupied = home.path().join("occupied");
+    fs::write(&occupied, "not a directory").unwrap();
+    let marker = admission_fixture(&home, "sync", &format!("[logging]\nrun_dir={:?}", occupied));
+    let output = command(&home)
+        .args(["--plain", "--completions", "off", "--only", "local/c"])
+        .output()
+        .unwrap();
+    assert!(!marker.exists(), "task ran without journal admission");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("logging.run_dir") && stderr.contains("XDG_STATE_HOME"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_and_async_share_health_dependencies_and_fail_fast() {
+    for (engine, jobs) in [("sync", "9"), ("async", "1"), ("async", "3")] {
+        for fail_fast in [false, true] {
+            let home = TempDir::new().unwrap();
+            let marker = admission_fixture(&home, engine, "");
+            let mut cmd = command(&home);
+            cmd.args([
+                "--plain",
+                "--completions",
+                "off",
+                "--only",
+                "local/a,local/b,local/c",
+                "--jobs",
+                jobs,
+            ]);
+            if fail_fast {
+                cmd.arg("--fail-fast");
+            }
+            let output = cmd.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{engine}, fail_fast={fail_fast}"
+            );
+            let effects = fs::read_to_string(&marker).unwrap_or_default();
+            assert!(
+                !effects.contains("dependent"),
+                "{engine} bypassed dependency: {effects}"
+            );
+            assert_eq!(
+                effects.contains("ordering"),
+                !fail_fast,
+                "{engine}, fail_fast={fail_fast}: {effects}"
+            );
+            let artifact: serde_json::Value =
+                serde_json::from_slice(&fs::read(only_run(&home).join("run.json")).unwrap())
+                    .unwrap();
+            assert_eq!(artifact["engine_mode"], engine);
+            assert_eq!(artifact["tasks"].as_array().unwrap().len(), 3);
+            let unstarted = artifact["unstarted_tasks"].as_array().unwrap();
+            assert!(unstarted.iter().any(|id| id == "local/b"));
+            assert_eq!(unstarted.iter().any(|id| id == "local/c"), fail_fast);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_selector_and_jobs_terminalize_created_run_once() {
+    for args in [
+        vec!["--only", "does-not-exist"],
+        vec!["--only", "local/a", "--jobs", "nonsense"],
+    ] {
+        let home = TempDir::new().unwrap();
+        let marker = admission_fixture(&home, "async", "");
+        let output = command(&home)
+            .args(["--plain", "--completions", "off"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!marker.exists());
+        let run = only_run(&home);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run-meta.json")).unwrap()).unwrap();
+        assert_eq!(metadata["status"], "failed", "{args:?}: {metadata}");
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+        assert_eq!(artifact["exit_code"], output.status.code().unwrap());
+        assert_eq!(artifact["status"], "failed");
+        assert!(artifact["reason"].as_str().is_some_and(|s| !s.is_empty()));
+        let events = fs::read_to_string(run.join("events.jsonl")).unwrap();
+        assert_eq!(
+            events
+                .lines()
+                .filter(|line| line.contains("\"kind\":\"run_completed\""))
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(unix)]
+fn privilege_cli_fixture(
+    home: &TempDir,
+    mode: &str,
+    engine: &str,
+    jobs: usize,
+) -> std::path::PathBuf {
+    let config_dir = home.path().join("config/update-all");
+    let catalogs = config_dir.join("catalog.d/local");
+    fs::create_dir_all(&catalogs).unwrap();
+    fs::create_dir_all(home.path().join("empty-path")).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[install]
+auto_update=false
+[engine]
+mode="{engine}"
+jobs="{jobs}"
+[updaters]
+privilege_mode="{mode}"
+"#
+        ),
+    )
+    .unwrap();
+    let marker = home.path().join("effects");
+    fs::write(
+        catalogs.join("privilege.toml"),
+        format!(
+            r#"
+[tasks."local/a"]
+label="Elevated prerequisite"
+category="maintenance"
+os=["linux"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c","echo elevated >> {}"]
+requires_elevation=true
+policy_key="tool_update"
+[tasks."local/b"]
+label="Health dependent"
+category="maintenance"
+os=["linux"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c","echo dependent >> {}"]
+depends_on=["local/a"]
+policy_key="tool_update"
+[tasks."local/c"]
+label="Ordering dependent"
+category="maintenance"
+os=["linux"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c","echo ordering >> {}"]
+after=["local/a"]
+policy_key="tool_update"
+[tasks."local/d"]
+label="Independent task"
+category="maintenance"
+os=["linux"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c","echo independent >> {}"]
+policy_key="tool_update"
+"#,
+            marker.display(),
+            marker.display(),
+            marker.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    marker
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn auto_privilege_cli_defers_health_gates_and_continues_independent_work() {
+    for (engine, jobs) in [("sync", 1), ("async", 1), ("async", 3)] {
+        let home = TempDir::new().unwrap();
+        let marker = privilege_cli_fixture(&home, "auto", engine, jobs);
+        let output = command(&home)
+            .env("PATH", home.path().join("empty-path"))
+            .args([
+                "--plain",
+                "--completions",
+                "off",
+                "--only",
+                "local/a,local/b,local/c,local/d",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{engine}/{jobs}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effects = fs::read_to_string(&marker).unwrap_or_default();
+        assert!(!effects.contains("elevated"), "{effects}");
+        assert!(
+            !effects.lines().any(|line| line == "dependent"),
+            "{effects}"
+        );
+        assert!(
+            effects.contains("ordering") && effects.contains("independent"),
+            "{effects}"
+        );
+        let run = only_run(&home);
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+        assert_eq!(artifact["exit_code"], 2);
+        let tasks = artifact["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 4);
+        let elevated = tasks
+            .iter()
+            .find(|task| task["task_id"] == "local/a")
+            .expect("elevated task result");
+        assert_eq!(elevated["status"], "skipped");
+        assert!(elevated["advisories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |advisory| advisory["code"] == "privilege-missing-executable"
+                    && advisory["blocks_dependents"] == true
+            ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn required_privilege_cli_is_a_prerequisite_only_for_selected_elevated_work() {
+    for engine in ["sync", "async"] {
+        let home = TempDir::new().unwrap();
+        let marker = privilege_cli_fixture(&home, "required", engine, 3);
+        let output = command(&home)
+            .env("PATH", home.path().join("empty-path"))
+            .args([
+                "--plain",
+                "--completions",
+                "off",
+                "--only",
+                "local/a,local/d",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{engine}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "required prerequisite failed after a task had started"
+        );
+        let run = only_run(&home);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run-meta.json")).unwrap()).unwrap();
+        assert_eq!(metadata["status"], "failed");
+        let events = fs::read_to_string(run.join("events.jsonl")).unwrap();
+        assert_eq!(
+            events
+                .lines()
+                .filter(|line| line.contains("\"kind\":\"run_completed\""))
+                .count(),
+            1
+        );
+
+        let home = TempDir::new().unwrap();
+        let marker = privilege_cli_fixture(&home, "required", engine, 3);
+        command(&home)
+            .env("PATH", home.path().join("empty-path"))
+            .args(["--plain", "--completions", "off", "--only", "local/d"])
+            .assert()
+            .success();
+        assert_eq!(fs::read_to_string(marker).unwrap(), "independent\n");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn never_privilege_cli_keeps_clean_exclusions_but_reports_blocked_health_dependents() {
+    for (selected, expected) in [("local/a,local/d", 0), ("local/a,local/b,local/d", 2)] {
+        let home = TempDir::new().unwrap();
+        let marker = privilege_cli_fixture(&home, "never", "sync", 1);
+        let output = command(&home)
+            .env("PATH", home.path().join("empty-path"))
+            .args(["--plain", "--completions", "off", "--only", selected])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{selected}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(marker).unwrap(), "independent\n");
+    }
+}
+
+#[cfg(unix)]
+fn wait_fixture_marker(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !path.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        path.is_file(),
+        "fixture marker did not appear: {}",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+fn blocking_cli_fixture(home: &TempDir, engine: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config_dir = home.path().join("config/update-all");
+    let catalogs = config_dir.join("catalog.d/local");
+    fs::create_dir_all(&catalogs).unwrap();
+    fs::write(config_dir.join("config.toml"), format!("[install]\nauto_update=false\n[engine]\nmode=\"{engine}\"\njobs=\"1\"\n[tasks.tool_update]\ntimeout_secs=10\n")).unwrap();
+    let marker = home.path().join("started");
+    let release = home.path().join("release");
+    fs::write(catalogs.join("lock.toml"), format!(r#"
+[tasks."local/lock"]
+label="Blocking harmless fixture"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c","echo started >> {}; n=0; while [ ! -e {} ] && [ $n -lt 200 ]; do n=$((n+1)); /bin/sleep 0.02; done"]
+policy_key="tool_update"
+"#, marker.display(), release.display())).unwrap();
+    (marker, release)
+}
+
+#[cfg(unix)]
+#[test]
+fn two_processes_share_mandatory_task_lock_until_owned_execution_settles() {
+    let home = TempDir::new().unwrap();
+    let (marker, release) = blocking_cli_fixture(&home, "async");
+    let mut first_cmd = fixture_process(&home);
+    first_cmd.args(["--plain", "--completions", "off", "--only", "local/lock"]);
+    let mut first = first_cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_fixture_marker(&marker);
+    let second = command(&home)
+        .args(["--plain", "--completions", "off", "--only", "local/lock"])
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("task lock is held"));
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    fs::write(&release, "release").unwrap();
+    assert!(first.wait().unwrap().success());
+    command(&home)
+        .args(["--plain", "--completions", "off", "--only", "local/lock"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
+    let runs = fs::read_dir(home.path().join("state/update-all/runs")).unwrap();
+    let mut completed = 0;
+    for run in runs
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+    {
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run-meta.json")).unwrap()).unwrap();
+        assert_ne!(metadata["status"], "running");
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+        if artifact["exit_code"] == 0 {
+            completed += 1;
+        }
+        let events = fs::read_to_string(run.join("events.jsonl")).unwrap();
+        assert_eq!(
+            events
+                .lines()
+                .filter(|line| line.contains("\"kind\":\"run_completed\""))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(completed, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_cancellation_settles_tasks_finalizes_evidence_and_releases_lock() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    let home = TempDir::new().unwrap();
+    let (marker, _release) = blocking_cli_fixture(&home, "sync");
+    let mut cmd = fixture_process(&home);
+    cmd.args(["--plain", "--completions", "off", "--only", "local/lock"]);
+    let mut child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_fixture_marker(&marker);
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(3));
+    let run = only_run(&home);
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+    assert_eq!(artifact["status"], "canceled");
+    assert_eq!(artifact["exit_code"], 3);
+    assert_eq!(artifact["engine_mode"], "sync");
+    assert_eq!(artifact["tasks"][0]["status"], "canceled");
+    assert!(!home
+        .path()
+        .join("state/update-all/runs/.update-all-task-run.lock")
+        .exists());
+    let events = fs::read_to_string(run.join("events.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"run_completed\""))
+            .count(),
+        1
+    );
 }

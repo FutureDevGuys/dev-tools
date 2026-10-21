@@ -406,3 +406,45 @@ fn duplicate_authority_claims_and_builtin_ids_fail_closed() {
     let error = load_runtime_config(Some(config)).unwrap_err().to_string();
     assert!(error.contains("embedded public catalog"), "{error}");
 }
+
+#[test]
+fn privilege_configuration_preserves_default_and_validates_new_modes() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    assert_eq!(
+        load_runtime_config(Some(config.clone()))
+            .unwrap()
+            .updaters
+            .privilege_mode,
+        crate::updaters::PrivilegeMode::PromptTty
+    );
+    for mode in [
+        "skip",
+        "best_effort_skip",
+        "never",
+        "prompt_tty",
+        "prompt",
+        "fail",
+        "fail_run",
+        "auto",
+        "required",
+    ] {
+        std::fs::write(
+            &config,
+            format!("[updaters]\nprivilege_mode = \"{mode}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_runtime_config(Some(config.clone()))
+                .unwrap()
+                .updaters
+                .privilege_mode,
+            crate::updaters::PrivilegeMode::parse(mode).unwrap(),
+            "{mode}"
+        );
+    }
+    std::fs::write(&config, "[updaters]\nprivilege_mode = \"automatic\"\n").unwrap();
+    let error = load_runtime_config(Some(config)).unwrap_err().to_string();
+    assert!(error.contains("auto|required"), "{error}");
+}

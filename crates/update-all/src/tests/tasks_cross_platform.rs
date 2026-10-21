@@ -3218,7 +3218,7 @@ fn completion_event_retains_cancellation_and_failure_facts_in_journal() {
     let completed = journal
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .find(|event| event["kind"] == "run_completed")
+        .find(|event| event["kind"] == "tasks_completed")
         .unwrap();
     assert_eq!(
         completed["payload"],
@@ -5385,7 +5385,14 @@ fn run_artifact_records_task_end_and_ui_wait_timing() {
             .unwrap();
     assert_eq!(meta_payload["run_id"], payload["run_id"]);
     assert_eq!(meta_payload["display_name"], payload["display_name"]);
-    assert_eq!(meta_payload["status"], "completed");
+    assert_eq!(meta_payload["status"], "finalizing");
+    run_log
+        .finalize_task_run("linux", "dashboard", "async", "completed", 0, None)
+        .unwrap();
+    let final_meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_log.run_dir().join("run-meta.json")).unwrap())
+            .unwrap();
+    assert_eq!(final_meta["status"], "completed");
 }
 
 #[test]
@@ -5692,30 +5699,27 @@ fn task_run_lock_uses_shared_run_root_and_releases_on_drop() {
     let second_run_log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
     let lock_path = temp.path().join(".update-all-task-run.lock");
 
-    let first_lock = acquire_task_run_lock(Some(&first_run_log))
-        .unwrap()
-        .unwrap();
+    let first_lock = acquire_task_run_lock(temp.path()).unwrap();
     assert!(lock_path.is_file());
 
-    let err = acquire_task_run_lock(Some(&second_run_log))
-        .unwrap_err()
-        .to_string();
+    let err = acquire_task_run_lock(temp.path()).unwrap_err().to_string();
     assert!(err.contains("update-all task lock is held"), "{err}");
 
     drop(first_lock);
     assert!(!lock_path.exists());
 
-    let second_lock = acquire_task_run_lock(Some(&second_run_log))
-        .unwrap()
-        .unwrap();
+    let second_lock = acquire_task_run_lock(temp.path()).unwrap();
     assert!(lock_path.is_file());
     drop(second_lock);
     assert!(!lock_path.exists());
 }
 
 #[test]
-fn task_run_lock_is_optional_without_run_log() {
-    assert!(acquire_task_run_lock(None).unwrap().is_none());
+fn task_run_lock_requires_an_explicit_run_root() {
+    let temp = TempDir::new().unwrap();
+    let occupied = temp.path().join("occupied");
+    fs::write(&occupied, "not a directory").unwrap();
+    assert!(acquire_task_run_lock(&occupied).is_err());
 }
 
 #[test]
@@ -7794,4 +7798,124 @@ fn sudo_authentication_failures_never_receive_automatic_retry_budget() {
         effective_retry_budget(&TaskPolicy::new(30, 0, 0), "connection reset by peer"),
         0
     );
+}
+
+#[test]
+fn skipped_health_dependency_honors_only_explicit_blocking_evidence() {
+    let harmless = TaskResult::skipped("Fixture", "not applicable");
+    assert!(!harmless.blocks_dependents());
+    assert!(dependency_ready("consumer", "fixture", &harmless));
+    let mut blocked = harmless;
+    blocked.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Warning,
+        code: "privilege-unavailable".into(),
+        summary: "capability not established".into(),
+        remediation: "review elevation policy".into(),
+        blocks_dependents: true,
+    });
+    assert!(blocked.blocks_dependents());
+    assert!(!dependency_ready("consumer", "fixture", &blocked));
+    assert!(dependency_ready(TASK_COMPLETIONS, "fixture", &blocked));
+}
+
+#[test]
+fn final_artifact_failure_returns_error_without_losing_observed_task_result() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let result = TaskResult::completed("Observed success");
+    log.record_selected_tasks(&["fixture".into()]).unwrap();
+    fs::create_dir(log.run_dir().join("run.json")).unwrap();
+    assert!(write_run_artifact(
+        Some(&log),
+        "linux",
+        "plain",
+        "sync",
+        vec!["fixture".into()],
+        [("fixture", &result)],
+        log.started_unix_ms(),
+        0,
+        log.started_unix_ms()
+    )
+    .is_err());
+    fs::remove_dir(log.run_dir().join("run.json")).unwrap();
+    log.finalize_task_run(
+        "linux",
+        "plain",
+        "sync",
+        "failed",
+        1,
+        Some("artifact write failed"),
+    )
+    .unwrap();
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(log.run_dir().join("run.json")).unwrap()).unwrap();
+    assert_eq!(artifact["exit_code"], 1);
+    assert_eq!(artifact["tasks"][0]["status"], "completed");
+    assert_eq!(artifact["tasks"][0]["label"], "Observed success");
+    assert_eq!(
+        artifact["build_info"],
+        serde_json::to_value(log.build_info()).unwrap()
+    );
+}
+
+#[test]
+fn finalization_retains_failure_facts_when_run_is_canceled() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let failed = TaskResult::failed("Observed failure", "fixture failure");
+    write_run_artifact(
+        Some(&log),
+        "linux",
+        "plain",
+        "async",
+        vec!["fixture".into()],
+        [("fixture", &failed)],
+        log.started_unix_ms(),
+        3,
+        log.started_unix_ms(),
+    )
+    .unwrap();
+    log.finalize_task_run("linux", "plain", "async", "canceled", 3, Some("cancel-all"))
+        .unwrap();
+    let events = fs::read_to_string(log.run_dir().join("events.jsonl")).unwrap();
+    let terminal: serde_json::Value = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["kind"] == "run_completed")
+        .unwrap();
+    assert_eq!(terminal["payload"]["canceled"], true);
+    assert_eq!(terminal["payload"]["had_failures"], true);
+    assert_eq!(terminal["payload"]["exit_code"], 3);
+}
+
+#[test]
+fn finalizing_run_is_protected_from_another_runs_retention() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let result = TaskResult::completed("Fixture");
+    write_run_artifact(
+        Some(&log),
+        "linux",
+        "dashboard",
+        "async",
+        vec!["fixture".into()],
+        [("fixture", &result)],
+        log.started_unix_ms(),
+        0,
+        log.started_unix_ms(),
+    )
+    .unwrap();
+    crate::runs::prune_runs(
+        temp.path(),
+        crate::runs::RunRetentionPolicy {
+            max_age_days: 0,
+            max_runs: 0,
+            max_bytes: 0,
+        },
+        log.started_unix_ms().saturating_add(86_400_000),
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(log.run_dir().join("run.json").is_file());
 }

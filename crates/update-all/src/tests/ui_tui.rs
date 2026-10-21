@@ -1740,7 +1740,7 @@ fn model_wrap_logs_defaults_to_false() {
 #[test]
 fn dashboard_footer_mentions_log_pager_key() {
     let model = Model::new(200, true, true);
-    let footer = render_footer_lines(&model)
+    let footer = render_footer_lines(&model, 120)
         .into_iter()
         .map(|line| {
             line.spans
@@ -1760,7 +1760,7 @@ fn dashboard_footer_drops_cancel_actions_after_run_complete() {
     model.run_complete = Some(true);
     model.run_completed_at = Some(std::time::Instant::now());
 
-    let footer = render_footer_lines(&model)
+    let footer = render_footer_lines(&model, 120)
         .into_iter()
         .map(|line| {
             line.spans
@@ -3351,7 +3351,9 @@ fn wrapped_viewport_bottom_keeps_latest_rows_visible() {
             Span::raw("02:34:18 "),
             Span::raw("[INFO] "),
             Span::raw("[STDERR] "),
-            Span::raw("insync-dolphin: /usr/share/icons/hicolor/scalable/emblems/emblem-insync-syncing.svg exists in filesystem"),
+            Span::raw(
+                "insync-dolphin: /usr/share/icons/hicolor/scalable/emblems/emblem-insync-syncing.svg exists in filesystem",
+            ),
         ]),
         Line::from("Errors occurred, no packages were upgraded."),
         Line::from("-> error installing transaction"),
@@ -3428,4 +3430,322 @@ fn global_logs_render_bounded_viewport_from_large_retention() {
     assert_eq!(scrolled.len(), 4);
     assert!(scrolled[0].contains("global-line-993"), "{scrolled:?}");
     assert!(scrolled[3].contains("global-line-996"), "{scrolled:?}");
+}
+
+#[test]
+fn prompt_editor_preserves_all_printable_navigation_characters() {
+    for prompt in ["Password:", "Which color?"] {
+        let mut model = Model::new(200, true, true);
+        model.register_task("fixture/a".into(), "A".into(), vec![], true);
+        model.set_task_state("fixture/a", TaskState::Running, None);
+        model.set_task_input_state("fixture/a", true);
+        model.set_prompt_request("fixture/a".into(), 42, prompt.into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let layout = layout_for(
+            Rect::new(0, 0, 80, 24),
+            true,
+            RightPaneMode::Split,
+            ActivePane::Tasks,
+        );
+        for ch in "orangeGkKqQ".chars() {
+            handle_key_event(
+                &mut model,
+                KeyEvent::from(KeyCode::Char(ch)),
+                &layout,
+                &tx,
+                DashboardQuitBehavior::Detach,
+            );
+        }
+        handle_key_event(
+            &mut model,
+            KeyEvent::from(KeyCode::Enter),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::Detach,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(UiControlEvent::SendStdin { id, generation: 42, line }) if id == "fixture/a" && line == "orangeGkKqQ")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn control_c_cancels_without_editing_or_submitting_prompt() {
+    for stage in [0, 1, 2] {
+        let mut model = Model::new(200, true, true);
+        model.register_task("fixture/a".into(), "A".into(), vec![], true);
+        model.set_task_state("fixture/a", TaskState::Running, None);
+        model.set_task_input_state("fixture/a", true);
+        model.set_prompt_request("fixture/a".into(), 42, "Password:".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let layout = layout_for(
+            Rect::new(0, 0, 80, 24),
+            true,
+            RightPaneMode::Split,
+            ActivePane::Tasks,
+        );
+        if stage == 1 {
+            handle_key_event(
+                &mut model,
+                KeyEvent::from(KeyCode::Esc),
+                &layout,
+                &tx,
+                DashboardQuitBehavior::Detach,
+            );
+        } else if stage == 2 {
+            model.mark_prompt_submitted("fixture/a", 42);
+        }
+        let before = model.prompt_edit.as_ref().map(|edit| edit.buffer.clone());
+        handle_key_event(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::Detach,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(UiControlEvent::CancelAll)),
+            "stage {stage}"
+        );
+        assert_eq!(
+            model.prompt_edit.as_ref().map(|edit| edit.buffer.clone()),
+            before
+        );
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn concurrent_prompt_requests_preserve_active_draft_and_advance_once() {
+    let mut model = Model::new(200, true, true);
+    for id in ["fixture/a", "fixture/b"] {
+        model.register_task(id.into(), id.into(), vec![], true);
+        model.set_task_state(id, TaskState::Running, None);
+        model.set_task_input_state(id, true);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let layout = layout_for(
+        Rect::new(0, 0, 80, 24),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    model.set_prompt_request("fixture/a".into(), 1, "A?".into());
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Char('a')),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
+    );
+    model.set_prompt_request("fixture/b".into(), 9, "B?".into());
+    assert_eq!(find_latest_prompt(&model).unwrap().0, "fixture/a");
+    assert_eq!(model.prompt_edit.as_ref().unwrap().buffer, "a");
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Enter),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
+    );
+    assert!(
+        matches!(rx.try_recv(), Ok(UiControlEvent::SendStdin { id, generation: 1, line }) if id == "fixture/a" && line == "a")
+    );
+    assert_eq!(find_latest_prompt(&model).unwrap().0, "fixture/b");
+    model.cancel_prompt_request("fixture/a", 1);
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Char('b')),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
+    );
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Enter),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
+    );
+    assert!(
+        matches!(rx.try_recv(), Ok(UiControlEvent::SendStdin { id, generation: 9, line }) if id == "fixture/b" && line == "b")
+    );
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Enter),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::Detach,
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn hidden_prompt_never_receives_modal_editor_keystrokes() {
+    for modal in ["help", "rename", "search"] {
+        let mut model = Model::new(200, true, true);
+        model.register_task("fixture/a".into(), "A".into(), vec![], true);
+        model.set_task_state("fixture/a", TaskState::Running, None);
+        model.set_task_input_state("fixture/a", true);
+        match modal {
+            "help" => model.show_help = true,
+            "rename" => {
+                model.rename_edit = Some(RenameEditState {
+                    buffer: String::new(),
+                })
+            }
+            _ => {
+                model.search_edit = Some(SearchEditState {
+                    target: ActivePane::Tasks,
+                    buffer: String::new(),
+                    error: None,
+                })
+            }
+        }
+        model.set_prompt_request("fixture/a".into(), 42, "Password:".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let layout = layout_for(
+            Rect::new(0, 0, 80, 24),
+            true,
+            RightPaneMode::Split,
+            ActivePane::Tasks,
+        );
+        handle_key_event(
+            &mut model,
+            KeyEvent::from(KeyCode::Char('x')),
+            &layout,
+            &tx,
+            DashboardQuitBehavior::Detach,
+        );
+        assert_eq!(model.prompt_edit.as_ref().unwrap().buffer, "", "{modal}");
+        assert!(rx.try_recv().is_err());
+        if modal == "rename" {
+            assert_eq!(model.rename_edit.as_ref().unwrap().buffer, "x");
+        }
+        if modal == "search" {
+            assert_eq!(model.search_edit.as_ref().unwrap().buffer, "x");
+        }
+    }
+}
+
+#[test]
+fn stale_prompt_generations_cannot_replace_or_resurrect_input() {
+    let mut model = Model::new(200, true, true);
+    model.register_task("fixture/a".into(), "A".into(), vec![], true);
+    model.set_task_state("fixture/a", TaskState::Running, None);
+    model.set_task_input_state("fixture/a", true);
+    model.set_prompt_request("fixture/a".into(), 9, "new?".into());
+    model.prompt_edit.as_mut().unwrap().buffer = "draft".into();
+    model.set_prompt_request("fixture/a".into(), 8, "old?".into());
+    model.cancel_prompt_request("fixture/a", 8);
+    assert_eq!(model.prompt_edit.as_ref().unwrap().buffer, "draft");
+    assert_eq!(find_latest_prompt(&model).unwrap().1, "new?");
+    model.cancel_prompt_request("fixture/a", 9);
+    model.set_prompt_request("fixture/a".into(), 9, "late duplicate?".into());
+    assert!(find_latest_prompt(&model).is_none());
+}
+
+#[test]
+fn modal_mouse_input_cannot_select_or_scroll_underlying_panes() {
+    for modal in ["help", "rename", "search", "prompt"] {
+        let mut model = Model::new(200, true, true);
+        for id in ["a", "b"] {
+            model.register_task(id.into(), id.into(), vec![], true);
+            model.set_task_state(id, TaskState::Running, None);
+            model.set_task_input_state(id, true);
+        }
+        match modal {
+            "help" => model.show_help = true,
+            "rename" => {
+                model.rename_edit = Some(RenameEditState {
+                    buffer: String::new(),
+                })
+            }
+            "search" => {
+                model.search_edit = Some(SearchEditState {
+                    target: ActivePane::Tasks,
+                    buffer: String::new(),
+                    error: None,
+                })
+            }
+            _ => model.set_prompt_request("a".into(), 1, "Answer?".into()),
+        }
+        let layout = layout_for(
+            Rect::new(0, 0, 80, 24),
+            true,
+            RightPaneMode::Split,
+            ActivePane::Tasks,
+        );
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            handle_mouse_event(
+                &mut model,
+                MouseEvent {
+                    kind,
+                    column: layout.tasks.x + 1,
+                    row: layout.tasks.y + 3,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &layout,
+            );
+        }
+        assert_eq!(model.selected_task, 0, "{modal}");
+        assert_eq!(model.active_pane, ActivePane::Tasks);
+        assert_eq!(model.task_log_from_bottom, 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "native terminal acceptance: run this exact test under a disposable PTY"]
+fn terminal_setup_faults_restore_native_terminal_flags() {
+    fn terminal_flags() -> Vec<u8> {
+        let output = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "test must run under a native PTY");
+        output.stdout
+    }
+    let original = terminal_flags();
+    for step in [
+        TerminalSetupStep::RawMode,
+        TerminalSetupStep::AlternateScreen,
+        TerminalSetupStep::MouseCapture,
+        TerminalSetupStep::TerminalConstruction,
+    ] {
+        let result = setup_terminal_with_checkpoint(|current| {
+            if current == step {
+                anyhow::bail!("injected terminal setup failure: {step:?}");
+            }
+            Ok(())
+        });
+        let error = result.err().expect("setup failure must reach caller");
+        assert!(error
+            .to_string()
+            .contains("injected terminal setup failure"));
+        assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+        assert_eq!(
+            terminal_flags(),
+            original,
+            "flags not restored after {step:?}"
+        );
+    }
+    let mut terminal = setup_terminal().unwrap();
+    restore_terminal(&mut terminal).unwrap();
+    drop(terminal);
+    assert_eq!(terminal_flags(), original, "normal setup/restore");
+    // This is the same setup boundary used after a pager/foreground suspension.
+    let result = setup_terminal_with_checkpoint(|step| {
+        if step == TerminalSetupStep::MouseCapture {
+            anyhow::bail!("injected resume failure");
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(terminal_flags(), original, "resume failure");
 }

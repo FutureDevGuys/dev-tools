@@ -5,8 +5,9 @@ owner: dev-tools/update-all
 
 # ADR 0028: Task-terminal sudo authentication
 
-status: accepted
+status: superseded
 verification: verified
+replacement: 0034-compatible-privilege-fallback-modes.md
 
 ## Context
 
@@ -23,7 +24,10 @@ Interactive Unix elevation uses one native `sudo -- command args` invocation in
 the existing task execution path. That process owns authentication and protected
 command launch. Noninteractive elevation retains `sudo -n -- command args`.
 Privilege-mode admission, startup preflight, keepalive, task input routing, log
-capture and process ownership retain their existing contracts.
+capture and process ownership retain their existing contracts. The new explicitly
+selected fallback modes in [ADR 0034](0034-compatible-privilege-fallback-modes.md)
+supersede only their admission/preflight/keepalive and auto noninteractive launch
+clauses; legacy prompt_tty and the no-replay invariants below are retained.
 
 Sudo authentication diagnostics receive no automatic command-policy retry.
 Password-read timeout is authentication failure, not transient network failure.
