@@ -1333,6 +1333,7 @@ fn parse_custom_tasks(
 }
 
 fn parse_updater_catalog_file(path: &Path) -> Result<FileUpdaterCatalog> {
+    admit_regular_config_input(path, "updater catalog")?;
     let txt = std::fs::read_to_string(path)
         .with_context(|| format!("read updater catalog {}", path.display()))?;
     let catalog = toml::from_str::<FileUpdaterCatalog>(&txt)
@@ -1934,14 +1935,7 @@ pub fn init_config_file(path: Option<PathBuf>, force: bool) -> Result<PathBuf> {
 }
 
 pub fn validate_config(path: Option<PathBuf>, strict: bool) -> Result<ConfigValidationReport> {
-    let resolved = if let Some(p) = path {
-        if !p.exists() {
-            bail!("config file not found: {}", p.display());
-        }
-        Some(p)
-    } else {
-        resolve_config_path(None)?
-    };
+    let resolved = resolve_config_path(path)?;
 
     let Some(cfg_path) = resolved.clone() else {
         return Ok(ConfigValidationReport {
@@ -2142,27 +2136,41 @@ fn expand_tilde_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn admit_regular_config_input(path: &Path, kind: &str) -> Result<()> {
+    // Follow ordinary file symlinks. This is static admission, not descriptor custody.
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{kind} file not found: {}", path.display());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {kind} {}", path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        bail!("{kind} path is not a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
 pub fn resolve_config_path(config_path_cli: Option<PathBuf>) -> Result<Option<PathBuf>> {
-    if let Some(path) = config_path_cli {
-        if !path.exists() {
-            bail!("config file not found: {}", path.display());
-        }
-        return Ok(Some(path));
+    let selected = config_path_cli
+        .or_else(|| {
+            env::var_os("UPDATE_ALL_CONFIG")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(discover_config_path);
+    if let Some(path) = selected.as_deref() {
+        admit_regular_config_input(path, "config")?;
     }
+    Ok(selected)
+}
 
-    if let Ok(path) = env::var("UPDATE_ALL_CONFIG") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Ok(Some(path));
-        }
-    }
-
-    for candidate in default_config_candidates() {
-        if candidate.exists() {
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(None)
+fn discover_config_path() -> Option<PathBuf> {
+    default_config_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn default_config_write_path() -> PathBuf {
@@ -2179,12 +2187,14 @@ pub fn resolve_config_write_path(config_path_cli: Option<PathBuf>) -> Result<Pat
 
     if let Ok(path) = env::var("UPDATE_ALL_CONFIG") {
         let path = PathBuf::from(path);
-        if !path.to_string_lossy().trim().is_empty() {
+        // Preserve legacy writer selection, including an existing whitespace path.
+        // Explicit read admission must not prevent creating an absent destination.
+        if !path.to_string_lossy().trim().is_empty() || path.exists() {
             return Ok(path);
         }
     }
 
-    if let Some(path) = resolve_config_path(None)? {
+    if let Some(path) = discover_config_path() {
         return Ok(path);
     }
     Ok(default_config_write_path())

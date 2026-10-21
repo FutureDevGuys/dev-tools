@@ -511,7 +511,7 @@ fn restart_test_backend_missing_marker_fails_closed_before_task_effects() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn restart_after_suppresses_enospc_during_terminal_evidence_write() {
+fn restart_after_suppresses_unsafe_terminal_artifact_leaf() {
     use std::os::unix::fs::symlink;
     for engine in ["sync", "async"] {
         let fixture = Fixture::new(
@@ -531,14 +531,34 @@ fn restart_after_suppresses_enospc_during_terminal_evidence_write() {
         wait_for(&fixture.home.path().join("task-started"), &mut child);
         let artifact = fixture.only_run().join("run.json");
         assert!(!artifact.exists());
-        // /dev/full rejects the first write with ENOSPC; no host storage is filled.
-        // The sink returns before its post-write permission operation.
+        // Refuse the symlink itself; neither replace it nor open its device target.
+        let target_before = fs::metadata("/dev/full").unwrap();
         symlink("/dev/full", &artifact).unwrap();
         fs::write(fixture.home.path().join("release"), "continue").unwrap();
         assert!(!wait_child(&mut child).success());
         fixture.assert_no_restart();
         let stderr = fs::read_to_string(&stderr_path).unwrap();
-        assert!(stderr.contains("os error 28"), "expected ENOSPC: {stderr}");
+        assert!(
+            stderr.contains("unsafe artifact leaf"),
+            "expected leaf refusal: {stderr}"
+        );
+        assert_eq!(fs::read_link(&artifact).unwrap(), Path::new("/dev/full"));
+        use std::os::unix::fs::MetadataExt;
+        let target_after = fs::metadata("/dev/full").unwrap();
+        assert_eq!(
+            (
+                target_before.dev(),
+                target_before.ino(),
+                target_before.mode(),
+                target_before.rdev()
+            ),
+            (
+                target_after.dev(),
+                target_after.ino(),
+                target_after.mode(),
+                target_after.rdev()
+            )
+        );
         assert_eq!(
             json(fixture.only_run().join("run-meta.json"))["status"],
             "failed"

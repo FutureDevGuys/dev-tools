@@ -7919,3 +7919,120 @@ fn finalizing_run_is_protected_from_another_runs_retention() {
     .unwrap();
     assert!(log.run_dir().join("run.json").is_file());
 }
+
+#[test]
+fn explicit_blocking_evidence_controls_incomplete_runs_not_display_severity() {
+    for status in [TaskStatus::Completed, TaskStatus::Skipped] {
+        let mut result = TaskResult::completed("fixture");
+        result.status = status;
+        result.advisories.push(TaskAdvisory {
+            severity: AdvisorySeverity::Warning,
+            code: "ordinary-warning".into(),
+            summary: "ordinary finding".into(),
+            remediation: "review".into(),
+            blocks_dependents: false,
+        });
+        assert!(!result.is_blocked_or_deferred());
+        assert!(!result.stops_new_admission());
+        result.advisories[0].severity = AdvisorySeverity::Error;
+        assert!(
+            !result.is_blocked_or_deferred(),
+            "severity alone is not capability evidence"
+        );
+        result.advisories[0].blocks_dependents = true;
+        assert!(result.is_blocked_or_deferred());
+        assert!(result.stops_new_admission());
+        result.advisories[0].severity = AdvisorySeverity::Info;
+        assert!(
+            !result.is_blocked_or_deferred(),
+            "info does not acquire blocking authority"
+        );
+        result.advisories[0].code = "deferred".into();
+        assert!(
+            result.is_blocked_or_deferred(),
+            "explicit structured deferral is independent of severity"
+        );
+    }
+    let mut excluded = TaskResult::skipped("fixture", "intentional exclusion");
+    excluded.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Warning,
+        code: "privilege-disabled".into(),
+        summary: "intentional exclusion".into(),
+        remediation: "review".into(),
+        blocks_dependents: true,
+    });
+    assert!(excluded.blocks_dependents());
+    assert!(!excluded.is_blocked_or_deferred());
+    let mut other = excluded.advisories[0].clone();
+    other.code = "other-blocking-capability".into();
+    excluded.advisories.push(other);
+    assert!(excluded.is_blocked_or_deferred());
+    excluded.advisories.pop();
+    for status in [TaskReportStatus::Blocked, TaskReportStatus::Failed] {
+        excluded.report_sections = vec![TaskReportSection {
+            key: "capability".into(),
+            title: "Capability".into(),
+            rows: vec![TaskReportRow {
+                name: "fixture".into(),
+                status,
+                before: None,
+                after: None,
+                note: None,
+            }],
+        }];
+        assert!(
+            excluded.is_blocked_or_deferred(),
+            "intentional exclusion cannot mask other blocking rows"
+        );
+        excluded.status = TaskStatus::Completed;
+        excluded.advisories.clear();
+        assert!(
+            excluded.is_blocked_or_deferred(),
+            "explicit row alone is blocking evidence"
+        );
+    }
+    assert!(!TaskResult::canceled("fixture", "cancel-one").is_blocked_or_deferred());
+    assert!(TaskResult::failed("fixture", "failure").stops_new_admission());
+}
+
+#[test]
+fn skipped_issue_counts_follow_bounded_persisted_evidence() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let mut result = TaskResult::skipped("fixture", "skipped with findings");
+    result.advisories = vec![
+        TaskAdvisory {
+            severity: AdvisorySeverity::Info,
+            code: "ordinary-info".into(),
+            summary: "finding".into(),
+            remediation: "review".into(),
+            blocks_dependents: false,
+        };
+        STRUCTURED_DETAIL_LIMIT
+    ];
+    let mut warning = result.advisories[0].clone();
+    warning.severity = AdvisorySeverity::Warning;
+    result.advisories.push(warning);
+    for (first_severity, count) in [(AdvisorySeverity::Info, 0), (AdvisorySeverity::Warning, 1)] {
+        result.advisories[0].severity = first_severity;
+        write_run_artifact(
+            Some(&log),
+            "linux",
+            "plain",
+            "sync",
+            vec!["fixture".into()],
+            [("fixture", &result)],
+            log.started_unix_ms(),
+            2,
+            log.started_unix_ms(),
+        )
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(log.run_dir().join("run.json")).unwrap()).unwrap();
+        assert_eq!(value["issue_count"], count);
+        assert_eq!(
+            value["tasks"][0]["advisories"].as_array().unwrap().len(),
+            STRUCTURED_DETAIL_LIMIT
+        );
+    }
+}

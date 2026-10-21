@@ -345,6 +345,8 @@ fn arbitrary_shell_characters_survive_query_candidate_transport() -> anyhow::Res
 
 #[test]
 fn real_shell_candidates_are_syntax_checked_when_shells_are_available() -> anyhow::Result<()> {
+    // Do not mistake another test's temporary PATH for an unavailable host shell.
+    let _lock = crate::test_support::env_guard();
     let parsed = ir(b"Usage: tool [OPTIONS]\n\nCommands:\n  run  run work\n  stop stop work\n\nOptions:\n  --flag  a flag\n");
     let cases = [
         (QueryShell::Bash, "bash", vec!["-n"]),

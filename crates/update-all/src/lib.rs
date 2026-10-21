@@ -60,49 +60,14 @@ pub struct Deferred;
 
 impl std::fmt::Display for Deferred {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("one or more tasks were deferred")
+        formatter.write_str("one or more tasks were blocked or deferred")
     }
 }
 
 impl std::error::Error for Deferred {}
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    pub(crate) fn env_guard() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-    }
-
-    pub(crate) fn write_executable(path: &Path, content: &str) -> std::io::Result<()> {
-        let tmp = executable_temp_path(path);
-        fs::write(&tmp, content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut perms = fs::metadata(&tmp)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&tmp, perms)?;
-        }
-        fs::rename(tmp, path)
-    }
-
-    fn executable_temp_path(path: &Path) -> PathBuf {
-        let file_name = path
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("executable"))
-            .to_string_lossy();
-        path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
-    }
-}
+pub(crate) mod test_support;
 
 #[macro_export]
 macro_rules! ua_outln {

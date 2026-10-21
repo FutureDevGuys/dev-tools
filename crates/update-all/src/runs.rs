@@ -326,20 +326,29 @@ pub(crate) fn write_metadata_atomic(run_dir: &Path, metadata: &RunMetadata) -> R
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options
+    let file = options
         .open(&temp_path)
         .with_context(|| format!("open {}", temp_path.display()))?;
-    use std::io::Write as _;
-    file.write_all(&payload)
-        .with_context(|| format!("write {}", temp_path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush {}", temp_path.display()))?;
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("set owner-only permissions on {}", temp_path.display()))?;
-    drop(file);
-    replace_file(&temp_path, &path)?;
-    Ok(())
+    let result = (|| {
+        // Own the handle here so every returned error closes it before cleanup.
+        let mut file = file;
+        use std::io::Write as _;
+        file.write_all(&payload)
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", temp_path.display()))?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set owner-only permissions on {}", temp_path.display()))?;
+        drop(file);
+        replace_file(&temp_path, &path)
+    })();
+    if result.is_err() {
+        // Only successful create_new grants cleanup ownership. Keep the causal
+        // error if removing this invocation's exact stage also fails.
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn replace_file(temp_path: &Path, path: &Path) -> Result<()> {
@@ -557,10 +566,11 @@ fn count_issue_tasks(tasks: &[Value]) -> usize {
                     .and_then(Value::as_array)
                     .is_some_and(|items| {
                         items.iter().any(|item| {
-                            matches!(
-                                item.get("severity").and_then(Value::as_str),
-                                Some("warning" | "warn" | "error")
-                            )
+                            item.get("code").and_then(Value::as_str) == Some("deferred")
+                                || matches!(
+                                    item.get("severity").and_then(Value::as_str),
+                                    Some("warning" | "warn" | "error")
+                                )
                         })
                     })
                 || task
@@ -733,7 +743,7 @@ pub(crate) struct RunInspection {
     pub(crate) evidence_status: &'static str,
     run_id: Option<String>,
     display_name: Option<String>,
-    recorded_status: Option<String>,
+    pub(crate) recorded_status: Option<String>,
     created_unix_ms: Option<u64>,
     updated_unix_ms: Option<u64>,
     selected_tasks: Option<Vec<String>>,

@@ -35,6 +35,7 @@ pub(crate) struct PackageConflictPair {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryCause {
+    StorageExhausted,
     FileConflict {
         owners: Vec<String>,
     },
@@ -132,6 +133,12 @@ pub(crate) fn classify_package_recovery(
     output: &str,
 ) -> Option<RecoveryPlan> {
     let lower = output.to_ascii_lowercase();
+    if crate::util::process::storage_exhaustion_output(&lower) {
+        return Some(RecoveryPlan::diagnose(
+            kind,
+            vec![RecoveryCause::StorageExhausted],
+        ));
+    }
     match kind {
         PackageManagerKind::PacmanLike => classify_pacman_like(output, &lower),
         PackageManagerKind::Npm => classify_npm(&lower),

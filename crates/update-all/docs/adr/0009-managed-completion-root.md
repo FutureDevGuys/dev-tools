@@ -35,6 +35,8 @@ Keeping task-backed publication on the platform default would make the environme
 
 ## Consequences and known limitations
 
+Reachability qualification: the current built-in catalog contains no completion task, so an ordinary task run cannot reach the completion executor through that catalog. Direct `completions sync` is available, including from an explicit user-owned custom command; executor-level tests establish root selection and publication behavior, not built-in ordinary-run scheduling. The retained ordinary-run completion flags do not activate that path. Task-backed acceptance below remains pending until a separately reviewed catalog integration and its runtime acceptance exist; this record remains proposed and pending.
+
 Consumers can inspect and source the same validated immutable snapshot regardless of which update path refreshed it. Repair may replace a broken snapshot directory while readers are active; readers fail closed during that bounded repair window and succeed on retry. This record does not redesign provider discovery, native generator probing, managed payload overlays, or consumer-owned startup policy.
 
 ## Verification
@@ -47,6 +49,7 @@ Named regression tests:
 - `publish_repairs_missing_active_snapshot_without_rewriting_current`
 - `status_and_init_reject_an_active_snapshot_with_a_missing_view`
 - `completion_sync_help_leads_with_public_init_and_labels_the_legacy_bridge`
+- `ordinary_release_selection_controls_match_the_recorded_plan`
 
 ## Runtime acceptance
 

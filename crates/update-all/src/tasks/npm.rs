@@ -296,8 +296,14 @@ fn npm_authority_blocked_result(
             status: TaskReportStatus::Blocked,
             before: normalize_version(entry.current.as_deref())
                 .or_else(|| Some(MISSING_NPM_CURRENT_VERSION.to_string())),
-            after: select_target(entry),
-            note: Some("unowned global-root residue; not mutated".to_string()),
+            after: None,
+            note: Some(format!(
+                "unowned global-root residue; not mutated; requested target: {}",
+                match select_target(entry) {
+                    Some(target) => target,
+                    None => "unknown".to_string(),
+                }
+            )),
         });
     }
     let mut result = TaskResult::completed("NPM");
@@ -464,42 +470,37 @@ fn npm_system_managed_packages(
         .collect()
 }
 
-fn npm_install_authority_failure(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    [
-        "eacces",
-        "eperm",
-        "permission denied",
-        "operation not permitted",
-        "access is denied",
-        "access denied",
-    ]
-    .iter()
-    .any(|marker| detail.contains(marker))
-}
-
 fn npm_install_authority_failure_result(
     plans: &[PlannedUpdate],
     detail: String,
+    mut rows: Vec<TaskReportRow>,
+    advisories: Vec<TaskAdvisory>,
     authority_outcome: Option<&package_authority::PackageAuthorityOutcome>,
 ) -> TaskResult {
-    let remediation = "Repair the NPM installation by moving global packages to a user-owned, user-writable prefix or supported per-user Node installation. Update system-manager-owned packages through that manager; update-all will not infer sudo or rewrite ownership.".to_string();
-    let rows = plans
+    let remediation = "Review the reported denial and verify package state before explicitly retrying. Use a user-owned, user-writable NPM prefix or the owning system package manager as appropriate; update-all will not infer sudo, rewrite ownership, or roll back partial changes.".to_string();
+    let observed = rows
         .iter()
+        .map(|row| row.name.clone())
+        .collect::<BTreeSet<_>>();
+    rows.extend(plans
+        .iter()
+        .filter(|plan| !observed.contains(&plan.package))
         .map(|plan| TaskReportRow {
             name: plan.package.clone(),
             status: TaskReportStatus::Blocked,
             before: Some(plan.current.clone()),
-            after: Some(plan.target.clone()),
-            note: Some(
-                "install authority changed or could not be exercised; not retried".to_string(),
-            ),
+            after: None,
+            note: Some(format!(
+                "installation reported an authority denial; no further automatic mutation; requested target: {}; installed state unverified; partial changes may remain",
+                plan.target
+            )),
         })
-        .collect();
+        );
     let mut result = TaskResult::completed("NPM");
     result.details.push(format!(
-        "Blocked npm update after one authority failure; individual retries were suppressed: {detail}"
+        "Blocked npm update after reported authority failure; no further automatic installs or recovery: {detail}"
     ));
+    result.advisories = advisories;
     result.advisories.push(TaskAdvisory {
         severity: AdvisorySeverity::Error,
         code: "npm-global-authority-blocked".to_string(),
@@ -518,6 +519,150 @@ fn npm_install_authority_failure_result(
         }
     }
     result
+}
+
+fn npm_storage_failure_result(
+    plans: &[PlannedUpdate],
+    detail: String,
+    mut rows: Vec<TaskReportRow>,
+    advisories: Vec<TaskAdvisory>,
+    authority_outcome: Option<&package_authority::PackageAuthorityOutcome>,
+) -> TaskResult {
+    let observed = rows
+        .iter()
+        .map(|row| row.name.clone())
+        .collect::<BTreeSet<_>>();
+    rows.extend(
+        plans
+            .iter()
+            .filter(|plan| !observed.contains(&plan.package))
+            .map(|plan| TaskReportRow {
+                name: plan.package.clone(),
+                status: TaskReportStatus::Blocked,
+                before: Some(plan.current.clone()),
+                after: None,
+                note: Some(format!(
+                    "storage exhausted; target {} not verified; partial changes may remain",
+                    plan.target
+                )),
+            }),
+    );
+    let mut result = TaskResult::failed(
+        "NPM",
+        format!("Reported storage exhaustion; no further automatic installs or recovery: {detail}"),
+    );
+    result.advisories = advisories;
+    result.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Error,
+        code: "npm-storage-exhausted".to_string(),
+        summary: "NPM reported exhausted storage; package post-state is not assumed".to_string(),
+        remediation: "Inspect capacity or quota on the affected npm prefix/cache/temp filesystem and verify package state before explicitly retrying. Partial changes were not rolled back.".to_string(),
+        blocks_dependents: true,
+    });
+    result.report_sections.push(TaskReportSection {
+        key: "npm_packages".to_string(),
+        title: "NPM Package Results".to_string(),
+        rows,
+    });
+    if let Some(section) = authority_outcome.and_then(package_authority::report_section) {
+        result.report_sections.push(section);
+    }
+    result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpmInstallStop {
+    Storage,
+    Authority,
+}
+
+fn npm_terminal_install_failure_result(
+    stop: NpmInstallStop,
+    plans: &[PlannedUpdate],
+    detail: String,
+    rows: Vec<TaskReportRow>,
+    advisories: Vec<TaskAdvisory>,
+    authority_outcome: Option<&package_authority::PackageAuthorityOutcome>,
+) -> TaskResult {
+    match stop {
+        NpmInstallStop::Storage => {
+            npm_storage_failure_result(plans, detail, rows, advisories, authority_outcome)
+        }
+        NpmInstallStop::Authority => {
+            npm_install_authority_failure_result(plans, detail, rows, advisories, authority_outcome)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NpmRecoveryFailure {
+    detail: String,
+    stop: Option<NpmInstallStop>,
+}
+
+impl From<String> for NpmRecoveryFailure {
+    fn from(detail: String) -> Self {
+        // Keep ADR0038's existing storage handling for health/metadata errors.
+        // Authority, unlike storage, is never inferred from these strings.
+        let stop = crate::util::process::storage_exhaustion_output(&detail)
+            .then_some(NpmInstallStop::Storage);
+        Self { detail, stop }
+    }
+}
+
+fn record_verified_npm_plan(
+    successful_plans: &mut Vec<PlannedUpdate>,
+    verified_rows: &mut Vec<TaskReportRow>,
+    plan: &PlannedUpdate,
+    note: String,
+) {
+    let mut verified_plan = plan.clone();
+    verified_plan.note = Some(note.clone());
+    successful_plans.push(verified_plan);
+    verified_rows.push(TaskReportRow {
+        name: plan.package.clone(),
+        status: TaskReportStatus::Updated,
+        before: Some(plan.current.clone()),
+        after: Some(plan.target.clone()),
+        note: Some(note),
+    });
+}
+
+fn npm_rows_with_verified(
+    mut rows: Vec<TaskReportRow>,
+    verified_rows: &[TaskReportRow],
+) -> Vec<TaskReportRow> {
+    let observed = rows
+        .iter()
+        .map(|row| row.name.clone())
+        .collect::<BTreeSet<_>>();
+    rows.extend(
+        verified_rows
+            .iter()
+            .filter(|row| !observed.contains(&row.name))
+            .cloned(),
+    );
+    rows
+}
+
+impl std::fmt::Display for NpmRecoveryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+fn npm_recovery_error(error: anyhow::Error) -> NpmRecoveryFailure {
+    let stop = if crate::util::process::process_storage_exhausted(&error) {
+        Some(NpmInstallStop::Storage)
+    } else if crate::util::process::process_permission_denied(&error) {
+        Some(NpmInstallStop::Authority)
+    } else {
+        None
+    };
+    NpmRecoveryFailure {
+        detail: command_error_summary(&error),
+        stop,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -627,20 +772,14 @@ fn recover_unhealthy_npm_root(
     ctx: &SyncContext,
     npm_bin: &str,
     plan: &PlannedUpdate,
-) -> Result<String, String> {
+) -> Result<String, NpmRecoveryFailure> {
     let mut isolated_args = npm_install_args(std::slice::from_ref(plan));
     // Lifecycle recovery needs warnings even when the user's ordinary npm
     // output is quiet. This is an invocation override, never persisted trust.
     isolated_args.push("--loglevel=warn".to_string());
     let isolated_output = ctx
-        .run_command_with_policy(
-            TASK_NPM,
-            npm_bin,
-            isolated_args,
-            &ctx.task_policies.npm_install,
-            false,
-        )
-        .map_err(|error| format!("isolated reinstall failed: {error}"))?;
+        .run_npm_install_with_policy(npm_bin, isolated_args)
+        .map_err(npm_recovery_error)?;
     let closure = parse_blocked_install_scripts(&isolated_output);
     if closure.is_empty() {
         verify_installed_npm_root(npm_bin, plan)?;
@@ -658,7 +797,8 @@ fn recover_unhealthy_npm_root(
                 script.package,
                 script.version,
                 describe_manifest_protocol_issue(&issue)
-            ));
+            )
+            .into());
         }
     }
 
@@ -668,14 +808,11 @@ fn recover_unhealthy_npm_root(
         .cloned()
         .collect::<BTreeSet<_>>();
     let retry_output = ctx
-        .run_command_with_policy(
-            TASK_NPM,
+        .run_npm_install_with_policy(
             npm_bin,
             npm_install_args_with_allowed_scripts(plan, &allowed_packages),
-            &ctx.task_policies.npm_install,
-            false,
         )
-        .map_err(|error| format!("isolated lifecycle retry failed: {error}"))?;
+        .map_err(npm_recovery_error)?;
     let still_blocked = parse_blocked_install_scripts(&retry_output);
     if !still_blocked.is_empty() {
         return Err(format!(
@@ -688,7 +825,8 @@ fn recover_unhealthy_npm_root(
                 ))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ));
+        )
+        .into());
     }
     verify_installed_npm_root(npm_bin, plan)?;
     Ok(format!(
@@ -708,10 +846,10 @@ fn record_blocked_install_script(
         name: plan.package.clone(),
         status: TaskReportStatus::Blocked,
         before: Some(plan.current.clone()),
-        after: Some(plan.target.clone()),
+        after: None,
         note: Some(format!(
-            "install script blocked ({}); {reason}",
-            script.lifecycle
+            "install script blocked ({}); {reason}; requested target: {}; installed state unverified",
+            script.lifecycle, plan.target
         )),
     });
     advisories.push(TaskAdvisory {
@@ -765,10 +903,10 @@ fn record_associated_lifecycle_diagnostic(
         name: plan.package.clone(),
         status: TaskReportStatus::Info,
         before: Some(plan.current.clone()),
-        after: Some(plan.target.clone()),
+        after: None,
         note: Some(format!(
-            "root-attributable install script warning ({}); {reason}",
-            script.lifecycle
+            "root-attributable install script warning ({}); {reason}; requested target: {}",
+            script.lifecycle, plan.target
         )),
     });
     advisories.push(TaskAdvisory {
@@ -972,23 +1110,55 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
     )
     .is_empty()
     {
-        match prune_stale_npm_temp_dirs(ctx, npm_bin) {
-            Ok(pruned) if !pruned.is_empty() => {
-                let summary = format!(
-                    "Pruned {} stale npm temp package director{}: {}.",
-                    pruned.len(),
-                    if pruned.len() == 1 { "y" } else { "ies" },
-                    pruned.join(", ")
-                );
-                ctx.log_line(TASK_NPM, LogLevel::Info, LogStream::Meta, summary.clone());
-                details.push(summary);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let detail = format!("npm temp-dir cleanup skipped: {e}");
-                ctx.log_line(TASK_NPM, LogLevel::Warn, LogStream::Meta, detail.clone());
-                details.push(detail);
-            }
+        let notice = match npm_global_root(npm_bin)
+            .and_then(|root| observe_npm_hidden_directories(&root))
+        {
+            Ok(observed) if observed.count > 0 => Some(TaskAdvisory {
+                severity: AdvisorySeverity::Warning,
+                code: "npm-hidden-directories-preserved".to_string(),
+                summary: format!(
+                    "Update All left {} unclassified hidden NPM director{} unchanged",
+                    observed.count,
+                    if observed.count == 1 { "y" } else { "ies" }
+                ),
+                remediation: format!(
+                    "Names do not establish that these directories are disposable or recoverable. If NPM reports a conflict, review them before explicitly retrying; Update All will not delete or restore them. Observed paths: {}{}",
+                    observed
+                        .samples
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if observed.count > observed.samples.len() {
+                        format!(
+                            " ({} more omitted)",
+                            observed.count - observed.samples.len()
+                        )
+                    } else {
+                        String::new()
+                    }
+                ),
+                blocks_dependents: false,
+            }),
+            Ok(_) => None,
+            Err(error) => Some(TaskAdvisory {
+                severity: AdvisorySeverity::Warning,
+                code: "npm-hidden-directory-inspection-incomplete".to_string(),
+                summary: "Read-only hidden NPM directory inspection did not complete".to_string(),
+                remediation: format!(
+                    "Update All performed no directory cleanup. Inspection failed: {error}. NPM's own update behavior is unchanged."
+                ),
+                blocks_dependents: false,
+            }),
+        };
+        if let Some(notice) = notice {
+            ctx.log_line(
+                TASK_NPM,
+                LogLevel::Warn,
+                LogStream::Meta,
+                format!("{}: {}", notice.summary, notice.remediation),
+            );
+            advisories.push(notice);
         }
     }
 
@@ -1082,8 +1252,10 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                             name: pkg.clone(),
                             status: TaskReportStatus::Failed,
                             before: Some(current),
-                            after: Some(target_seed),
-                            note: Some(issue_detail),
+                            after: None,
+                            note: Some(format!(
+                                "{issue_detail}; requested target: {target_seed}; not mutated"
+                            )),
                         });
                         continue;
                     }
@@ -1123,8 +1295,10 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                             name: pkg.clone(),
                             status: TaskReportStatus::Failed,
                             before: Some(current),
-                            after: Some(target_seed),
-                            note: Some(issue_detail),
+                            after: None,
+                            note: Some(format!(
+                                "{issue_detail}; requested target: {target_seed}; not mutated"
+                            )),
                         });
                         continue;
                     }
@@ -1189,8 +1363,10 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                                 name: pkg.clone(),
                                 status: TaskReportStatus::Failed,
                                 before: Some(current),
-                                after: Some(view_target),
-                                note: Some(issue_detail),
+                                after: None,
+                                note: Some(format!(
+                                    "{issue_detail}; requested target: {view_target}; not mutated"
+                                )),
                             });
                             continue;
                         }
@@ -1253,13 +1429,10 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                 format!("running npm install for {} package(s)", plans.len()),
             );
             let mut successful_plans: Vec<PlannedUpdate> = Vec::new();
-            match ctx.run_command_with_policy(
-                TASK_NPM,
-                npm_bin,
-                args,
-                &ctx.task_policies.npm_install,
-                false,
-            ) {
+            // Successful provider exit is not root verification. Retain the
+            // latter separately if a later root stops the task early.
+            let mut verified_rows = Vec::new();
+            match ctx.run_npm_install_with_policy(npm_bin, args) {
                 Ok(install_out) => {
                     if ctx.emit_plain {
                         crate::ua_out!("{install_out}");
@@ -1295,39 +1468,36 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                             script,
                         );
                         match verify_installed_npm_root(npm_bin, plan) {
-                            Ok(()) => successful_plans.push(PlannedUpdate {
-                                package: plan.package.clone(),
-                                current: plan.current.clone(),
-                                target: plan.target.clone(),
-                                note: Some(
-                                    "root version, manifest, and executable health verified despite lifecycle warning"
-                                        .to_string(),
-                                ),
-                            }),
+                            Ok(()) => record_verified_npm_plan(&mut successful_plans, &mut verified_rows, plan,
+                                "root version, manifest, and executable health verified despite lifecycle warning".to_string()),
                             Err(initial_health_failure) => {
                                 match recover_unhealthy_npm_root(ctx, npm_bin, plan) {
-                                    Ok(recovery_note) => successful_plans.push(PlannedUpdate {
-                                        package: plan.package.clone(),
-                                        current: plan.current.clone(),
-                                        target: plan.target.clone(),
-                                        note: Some(recovery_note),
-                                    }),
-                                    Err(recovery_failure) => record_blocked_install_script(
-                                        &mut report_rows,
-                                        &mut advisories,
-                                        plan,
-                                        script,
-                                        &format!(
-                                            "root health failed ({initial_health_failure}); bounded recovery failed ({recovery_failure})"
-                                        ),
-                                    ),
+                                    Ok(recovery_note) => record_verified_npm_plan(&mut successful_plans, &mut verified_rows, plan, recovery_note),
+                                    Err(recovery_failure) => {
+                                        if let Some(stop) = recovery_failure.stop {
+                                            return Ok(npm_terminal_install_failure_result(stop, &plans, recovery_failure.to_string(), npm_rows_with_verified(report_rows, &verified_rows), advisories, authority_outcome.as_ref()));
+                                        }
+                                        record_blocked_install_script(
+                                            &mut report_rows, &mut advisories, plan, script,
+                                            &format!("root health failed ({initial_health_failure}); bounded recovery failed ({recovery_failure})"),
+                                        );
+                                    },
                                 }
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    if npm_install_authority_failure(&e.to_string()) {
+                    if crate::util::process::process_storage_exhausted(&e) {
+                        return Ok(npm_storage_failure_result(
+                            &plans,
+                            command_error_summary(&e),
+                            npm_rows_with_verified(report_rows, &verified_rows),
+                            advisories,
+                            authority_outcome.as_ref(),
+                        ));
+                    }
+                    if crate::util::process::process_permission_denied(&e) {
                         let detail = format!("npm install authority failure: {e}");
                         ctx.log_line(
                             TASK_NPM,
@@ -1340,6 +1510,8 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                         return Ok(npm_install_authority_failure_result(
                             &plans,
                             detail,
+                            npm_rows_with_verified(report_rows, &verified_rows),
+                            advisories,
                             authority_outcome.as_ref(),
                         ));
                     }
@@ -1365,13 +1537,9 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                     let mut failed_retry_count = 0usize;
                     for plan in &plans {
                         let retry_plan = [plan.clone()];
-                        match ctx.run_command_with_policy(
-                            TASK_NPM,
-                            npm_bin,
-                            npm_install_args(&retry_plan),
-                            &ctx.task_policies.npm_install,
-                            false,
-                        ) {
+                        match ctx
+                            .run_npm_install_with_policy(npm_bin, npm_install_args(&retry_plan))
+                        {
                             Ok(retry_out) => {
                                 if ctx.emit_plain {
                                     crate::ua_out!("{retry_out}");
@@ -1395,29 +1563,46 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                                         ),
                                         Err(initial_health_failure) => {
                                             recover_unhealthy_npm_root(ctx, npm_bin, plan).map_err(
-                                                |recovery_failure| {
-                                                    format!(
+                                                |mut recovery_failure| {
+                                                    recovery_failure.detail = format!(
                                                         "root health failed ({initial_health_failure}); bounded recovery failed ({recovery_failure})"
-                                                    )
+                                                    );
+                                                    if crate::util::process::storage_exhaustion_output(&recovery_failure.detail) {
+                                                        recovery_failure.stop = Some(NpmInstallStop::Storage);
+                                                    }
+                                                    recovery_failure
                                                 },
                                             )
                                         }
                                     };
                                     match recovery {
-                                        Ok(note) => successful_plans.push(PlannedUpdate {
-                                            package: plan.package.clone(),
-                                            current: plan.current.clone(),
-                                            target: plan.target.clone(),
-                                            note: Some(note),
-                                        }),
+                                        Ok(note) => record_verified_npm_plan(
+                                            &mut successful_plans,
+                                            &mut verified_rows,
+                                            plan,
+                                            note,
+                                        ),
                                         Err(reason) => {
+                                            if let Some(stop) = reason.stop {
+                                                return Ok(npm_terminal_install_failure_result(
+                                                    stop,
+                                                    &plans,
+                                                    reason.to_string(),
+                                                    npm_rows_with_verified(
+                                                        report_rows,
+                                                        &verified_rows,
+                                                    ),
+                                                    advisories,
+                                                    authority_outcome.as_ref(),
+                                                ));
+                                            }
                                             failed_retry_count += 1;
                                             record_blocked_install_script(
                                                 &mut report_rows,
                                                 &mut advisories,
                                                 plan,
                                                 script,
-                                                &reason,
+                                                &reason.to_string(),
                                             );
                                         }
                                     }
@@ -1440,6 +1625,24 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                                 }
                             }
                             Err(retry_err) => {
+                                if crate::util::process::process_storage_exhausted(&retry_err) {
+                                    return Ok(npm_storage_failure_result(
+                                        &plans,
+                                        command_error_summary(&retry_err),
+                                        npm_rows_with_verified(report_rows, &verified_rows),
+                                        advisories,
+                                        authority_outcome.as_ref(),
+                                    ));
+                                }
+                                if crate::util::process::process_permission_denied(&retry_err) {
+                                    return Ok(npm_install_authority_failure_result(
+                                        &plans,
+                                        command_error_summary(&retry_err),
+                                        npm_rows_with_verified(report_rows, &verified_rows),
+                                        advisories,
+                                        authority_outcome.as_ref(),
+                                    ));
+                                }
                                 failed_retry_count += 1;
                                 ctx.log_line(
                                     TASK_NPM,
@@ -1454,9 +1657,10 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                                     name: plan.package.clone(),
                                     status: TaskReportStatus::Failed,
                                     before: Some(plan.current.clone()),
-                                    after: Some(plan.target.clone()),
+                                    after: None,
                                     note: Some(format!(
-                                        "install command failed after batch retry: {retry_err}"
+                                        "install command failed after batch retry: {retry_err}; requested target: {}; installed state unverified",
+                                        plan.target
                                     )),
                                 });
                             }
@@ -1547,10 +1751,23 @@ pub fn task_npm_sync(ctx: &SyncContext) -> Result<TaskResult> {
                     let recovery_note = match health {
                         Ok(()) => None,
                         Err(initial_health_failure) => {
+                            verified_rows.retain(|row| row.name != plan.package);
                             match recover_unhealthy_npm_root(ctx, npm_bin, plan) {
                                 Ok(note) => Some(note),
                                 Err(recovery_failure) => {
-                                    let reason = format!("root executable health failed ({initial_health_failure}); bounded recovery failed ({recovery_failure})");
+                                    if let Some(stop) = recovery_failure.stop {
+                                        return Ok(npm_terminal_install_failure_result(
+                                            stop,
+                                            &plans,
+                                            recovery_failure.to_string(),
+                                            npm_rows_with_verified(report_rows, &verified_rows),
+                                            advisories,
+                                            authority_outcome.as_ref(),
+                                        ));
+                                    }
+                                    let reason = format!(
+                                        "root executable health failed ({initial_health_failure}); bounded recovery failed ({recovery_failure})"
+                                    );
                                     report_rows.push(TaskReportRow {
                                         name: plan.package.clone(),
                                         status: TaskReportStatus::Blocked,
@@ -1716,64 +1933,64 @@ fn dedupe_advisories(advisories: Vec<TaskAdvisory>) -> Vec<TaskAdvisory> {
     seen.into_values().collect()
 }
 
-fn prune_stale_npm_temp_dirs(ctx: &SyncContext, npm_bin: &str) -> Result<Vec<String>> {
-    let root = npm_global_root(npm_bin)?;
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
+const NPM_HIDDEN_DIRECTORY_SAMPLES: usize = 5;
 
-    let mut removed = Vec::new();
-    prune_stale_npm_temp_dirs_in_dir(ctx, &root, &mut removed)?;
-
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() || file_type.is_symlink() {
-            continue;
-        }
-
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with('@') {
-            continue;
-        }
-
-        prune_stale_npm_temp_dirs_in_dir(ctx, &entry.path(), &mut removed)?;
-    }
-
-    removed.sort();
-    Ok(removed)
+#[derive(Default)]
+struct NpmHiddenDirectories {
+    count: usize,
+    samples: BTreeSet<PathBuf>,
 }
 
-fn prune_stale_npm_temp_dirs_in_dir(
-    ctx: &SyncContext,
+impl NpmHiddenDirectories {
+    fn observe(&mut self, path: PathBuf) {
+        self.count = self.count.saturating_add(1);
+        self.samples.insert(path);
+        if self.samples.len() > NPM_HIDDEN_DIRECTORY_SAMPLES {
+            self.samples.pop_last();
+        }
+    }
+}
+
+// This is observation only: neither a name nor an installed canonical copy
+// grants Update All authority to remove a provider's potentially retained data.
+fn observe_npm_hidden_directories(root: &Path) -> Result<NpmHiddenDirectories> {
+    if !root.is_absolute() {
+        anyhow::bail!("npm global root is not an absolute path");
+    }
+    let metadata = fs::symlink_metadata(root)
+        .with_context(|| format!("could not inspect npm global root {}", root.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("npm global root {} is not a real directory", root.display());
+    }
+    let mut observed = NpmHiddenDirectories::default();
+    observe_npm_hidden_directories_in_dir(root, &mut observed, true)?;
+    Ok(observed)
+}
+
+fn observe_npm_hidden_directories_in_dir(
     dir: &Path,
-    removed: &mut Vec<String>,
+    observed: &mut NpmHiddenDirectories,
+    inspect_scopes: bool,
 ) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("could not read npm directory {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("could not read entry in {}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("could not inspect npm entry {}", entry.path().display()))?;
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
-
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !looks_like_stale_npm_temp_package_dir(&name) {
-            continue;
+        if is_hidden_hyphenated_directory_name(&name) {
+            observed.observe(entry.path());
+        } else if inspect_scopes && name.starts_with('@') {
+            // Exactly one real scope level, never a recursive package walk.
+            observe_npm_hidden_directories_in_dir(&entry.path(), observed, false)?;
         }
-
-        let path = entry.path();
-        ctx.log_line(
-            TASK_NPM,
-            LogLevel::Warn,
-            LogStream::Meta,
-            format!("removing stale npm temp package dir {}", path.display()),
-        );
-        fs::remove_dir_all(&path)?;
-        removed.push(path.display().to_string());
     }
-
     Ok(())
 }
 
@@ -1906,7 +2123,7 @@ fn verify_installed_npm_root_with_state(
     ))
 }
 
-fn looks_like_stale_npm_temp_package_dir(name: &str) -> bool {
+fn is_hidden_hyphenated_directory_name(name: &str) -> bool {
     if name == ".bin" {
         return false;
     }
@@ -2424,6 +2641,76 @@ fn build_report_counts_line(rows: &[TaskReportRow]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn npm_hidden_directory_observation_is_bounded_and_never_recursive() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in [
+            ".bin",
+            ".notes",
+            "ordinary",
+            "@scope",
+            "ordinary/.nested-hidden",
+        ] {
+            fs::create_dir_all(temp.path().join(name)).unwrap();
+        }
+        for index in 0..12 {
+            let name = format!(".retained-{index:02}");
+            fs::create_dir_all(temp.path().join(&name)).unwrap();
+            fs::write(temp.path().join(name).join("only-copy"), "preserve").unwrap();
+        }
+        fs::create_dir_all(temp.path().join("@scope/.scoped-retained")).unwrap();
+        fs::write(temp.path().join(".hidden-file"), "preserve").unwrap();
+        let observed = observe_npm_hidden_directories(temp.path()).unwrap();
+        assert_eq!(observed.count, 13);
+        assert_eq!(observed.samples.len(), NPM_HIDDEN_DIRECTORY_SAMPLES);
+        assert_eq!(
+            observed.samples.first().unwrap(),
+            &temp.path().join(".retained-00")
+        );
+        assert_eq!(
+            observed.samples.last().unwrap(),
+            &temp.path().join(".retained-04")
+        );
+        for index in 0..12 {
+            assert_eq!(
+                fs::read_to_string(temp.path().join(format!(".retained-{index:02}/only-copy")))
+                    .unwrap(),
+                "preserve"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_hidden_directory_observation_skips_symlinks_and_reports_unreadable_roots() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join(".outside-retained")).unwrap();
+        symlink(outside.path(), root.path().join(".linked-retained")).unwrap();
+        symlink(outside.path(), root.path().join("@linked")).unwrap();
+        assert_eq!(
+            observe_npm_hidden_directories(root.path()).unwrap().count,
+            0
+        );
+        assert!(observe_npm_hidden_directories(&root.path().join("@linked")).is_err());
+        assert!(observe_npm_hidden_directories(&root.path().join("absent")).is_err());
+        assert!(observe_npm_hidden_directories(Path::new("relative")).is_err());
+        let scope = root.path().join("@unreadable");
+        fs::create_dir(&scope).unwrap();
+        fs::set_permissions(&scope, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = observe_npm_hidden_directories(root.path());
+        fs::set_permissions(&scope, fs::Permissions::from_mode(0o700)).unwrap();
+        // The product explicitly rejects root-owned global mutation already.
+        if current_unix_uid().unwrap() != 0 {
+            assert!(
+                result.is_err(),
+                "an incomplete scan cannot report a clean empty result"
+            );
+        }
+        assert!(outside.path().join(".outside-retained").is_dir());
+    }
+
     #[cfg(unix)]
     #[test]
     fn npm_global_path_ignores_stderr_diagnostics() {
@@ -2579,5 +2866,38 @@ npm warn install-scripts helper@1.2.3 (prepare: node prepare.cjs)
                 "@scope/desired-cli@2.0.0",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod outcome_evidence_tests {
+    use super::*;
+    #[test]
+    fn npm_lifecycle_diagnostics_do_not_invent_an_installed_version() {
+        let plan = PlannedUpdate {
+            package: "first".into(),
+            current: "1.0.0".into(),
+            target: "2.0.0".into(),
+            note: None,
+        };
+        let script = BlockedInstallScript {
+            package: "first".into(),
+            version: "2.0.0".into(),
+            lifecycle: "install".into(),
+        };
+        let mut rows = Vec::new();
+        let mut advisories = Vec::new();
+        record_blocked_install_script(
+            &mut rows,
+            &mut advisories,
+            &plan,
+            &script,
+            "health unverified",
+        );
+        record_associated_lifecycle_diagnostic(&mut rows, &mut advisories, &plan, &script);
+        for row in rows {
+            assert!(row.after.is_none(), "{row:?}");
+            assert!(row.note.as_deref().unwrap().contains("2.0.0"));
+        }
     }
 }

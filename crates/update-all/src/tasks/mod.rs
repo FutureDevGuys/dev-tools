@@ -77,6 +77,23 @@ const STRUCTURED_DETAIL_LIMIT: usize = 32;
 const STRUCTURED_SECTION_LIMIT: usize = 64;
 const STRUCTURED_ROW_LIMIT: usize = 1_000;
 
+#[derive(Clone, Copy)]
+enum CommandReplayPolicy {
+    Never,
+    Configured,
+    NpmInstall,
+}
+
+impl CommandReplayPolicy {
+    fn for_allowed_replay(allowed: bool) -> Self {
+        if allowed {
+            Self::Configured
+        } else {
+            Self::Never
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -184,9 +201,11 @@ impl TaskResult {
     }
 
     fn has_issues(&self) -> bool {
-        self.advisories
-            .iter()
-            .any(|advisory| advisory.severity != AdvisorySeverity::Info)
+        self.is_deferred()
+            || self
+                .advisories
+                .iter()
+                .any(|advisory| advisory.severity != AdvisorySeverity::Info)
             || self.has_blocking_report_rows()
     }
 
@@ -194,6 +213,24 @@ impl TaskResult {
         self.advisories
             .iter()
             .any(|advisory| advisory.code == "deferred")
+    }
+
+    fn is_blocked_or_deferred(&self) -> bool {
+        self.is_deferred()
+            || (matches!(self.status, TaskStatus::Completed | TaskStatus::Skipped)
+                && (self.has_blocking_report_rows()
+                    || self.advisories.iter().any(|advisory| {
+                        advisory.severity != AdvisorySeverity::Info
+                            && advisory.blocks_dependents
+                            // Intentional exclusion is not failed requested work.
+                            // Exempt this evidence only, never other blocking findings.
+                            && !(self.status == TaskStatus::Skipped
+                                && advisory.code == "privilege-disabled")
+                    })))
+    }
+
+    fn stops_new_admission(&self) -> bool {
+        self.status == TaskStatus::Failed || self.is_blocked_or_deferred()
     }
 
     fn has_blocking_report_rows(&self) -> bool {
@@ -1233,7 +1270,21 @@ impl SyncContext {
             args,
             policy,
             interactive,
-            !interactive_sudo_invocation(program, interactive),
+            CommandReplayPolicy::for_allowed_replay(!interactive_sudo_invocation(
+                program,
+                interactive,
+            )),
+        )
+    }
+
+    fn run_npm_install_with_policy(&self, program: &str, args: Vec<String>) -> Result<String> {
+        self.run_command_with_policy_replay(
+            TASK_NPM,
+            program,
+            args,
+            &self.task_policies.npm_install,
+            false,
+            CommandReplayPolicy::NpmInstall,
         )
     }
 
@@ -1244,7 +1295,7 @@ impl SyncContext {
         args: Vec<String>,
         policy: &TaskPolicy,
         interactive: bool,
-        allow_replay: bool,
+        replay_policy: CommandReplayPolicy,
     ) -> Result<String> {
         // Interactive tasks should use foreground TTY to avoid dashboard/raw-mode
         // contention with tools that may prompt or manipulate terminal state.
@@ -1266,7 +1317,7 @@ impl SyncContext {
             interactive,
             foreground_tty,
             capture_foreground_output,
-            allow_replay,
+            replay_policy,
         )
     }
 
@@ -1286,7 +1337,7 @@ impl SyncContext {
             interactive,
             true,
             false,
-            true,
+            CommandReplayPolicy::Configured,
         )
     }
 
@@ -1306,7 +1357,7 @@ impl SyncContext {
             true,
             true,
             false,
-            allow_replay,
+            CommandReplayPolicy::for_allowed_replay(allow_replay),
         )
     }
 
@@ -1366,7 +1417,7 @@ impl SyncContext {
         interactive: bool,
         foreground_tty: bool,
         capture_foreground_output: bool,
-        allow_replay: bool,
+        replay_policy: CommandReplayPolicy,
     ) -> Result<String> {
         let mut attempt = 0u32;
         let mut fallback_consumed = false;
@@ -1628,7 +1679,11 @@ impl SyncContext {
                     // Sudo may already have authenticated and run part of the
                     // protected command. Neither a timeout nor captured prose
                     // establishes that replay is safe.
-                    if !allow_replay {
+                    if matches!(replay_policy, CommandReplayPolicy::Never)
+                        || crate::util::process::process_storage_exhausted(&e)
+                        || (matches!(replay_policy, CommandReplayPolicy::NpmInstall)
+                            && crate::util::process::process_permission_denied(&e))
+                    {
                         return Err(e);
                     }
                     if auto_fallback_enabled && capture_enabled_for_run && !fallback_consumed {
@@ -1755,7 +1810,7 @@ pub(crate) fn effective_retry_budget(policy: &TaskPolicy, err_text: &str) -> u32
     match classify_runtime_failure(err_text, false) {
         // Authentication needs an explicit user decision, not another attempt in
         // a fresh terminal. In particular, a password timeout is not a network timeout.
-        RuntimeFailureClass::SudoSessionUnavailable => 0,
+        RuntimeFailureClass::SudoSessionUnavailable | RuntimeFailureClass::StorageExhausted => 0,
         _ => policy.retries,
     }
 }
@@ -2134,6 +2189,51 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             }
         }
 
+        // Settle unavailable health capabilities before admitting newly ready work.
+        let blocked = blocked_by_failed_dependency(&pending, &done);
+        for blocked_id in blocked {
+            let Some(spec) = pending.remove(&blocked_id) else {
+                continue;
+            };
+            let blocking_detail = dependency_blocking_detail(&spec, &done);
+            emit_runtime_log(
+                &event_tx,
+                ctx.run_log.as_ref(),
+                &blocked_id,
+                &blocking_detail,
+            );
+            let privilege_deferred = spec.depends_on.iter().any(|dependency| {
+                !is_ordering_dependency(dependency)
+                    && done
+                        .get(dependency_task_id(dependency))
+                        .is_some_and(|result| {
+                            result.blocks_dependents()
+                                && (result.is_deferred() || result.status == TaskStatus::Skipped)
+                        })
+            });
+            let mut result = TaskResult::canceled(spec.label, blocking_detail);
+            if privilege_deferred {
+                result.advisories.push(TaskAdvisory {
+                    severity: AdvisorySeverity::Warning,
+                    code: "deferred".to_string(),
+                    summary: "required dependency capability was not established".to_string(),
+                    remediation: "review the prerequisite's result before retrying".to_string(),
+                    blocks_dependents: true,
+                });
+            }
+            if ctx.fail_fast && result.stops_new_admission() {
+                cancel_new.store(true, Ordering::SeqCst);
+            }
+            emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &blocked_id, &result);
+            let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                id: blocked_id.clone(),
+                state: TaskState::Canceled,
+                detail: result.details.first().cloned(),
+            });
+            done.insert(blocked_id, result);
+            made_progress = true;
+        }
+
         while running.len() < max_parallel_jobs {
             let busy_resources = running
                 .iter()
@@ -2154,7 +2254,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 } else if cancel_all_requested || cancel::is_cancel_requested() {
                     "canceled before start"
                 } else {
-                    "not run after fail-fast failure"
+                    "not run after fail-fast failure or blocked/deferred work"
                 };
                 let result = TaskResult::canceled(spec.label, detail);
                 emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &task_id, &result);
@@ -2199,47 +2299,6 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             made_progress = true;
         }
 
-        let blocked = blocked_by_failed_dependency(&pending, &done);
-        for blocked_id in blocked {
-            let Some(spec) = pending.remove(&blocked_id) else {
-                continue;
-            };
-            let blocking_detail = dependency_blocking_detail(&spec, &done);
-            emit_runtime_log(
-                &event_tx,
-                ctx.run_log.as_ref(),
-                &blocked_id,
-                &blocking_detail,
-            );
-            let privilege_deferred = spec.depends_on.iter().any(|dependency| {
-                !is_ordering_dependency(dependency)
-                    && done
-                        .get(dependency_task_id(dependency))
-                        .is_some_and(|result| {
-                            result.blocks_dependents()
-                                && (result.is_deferred() || result.status == TaskStatus::Skipped)
-                        })
-            });
-            let mut result = TaskResult::canceled(spec.label, blocking_detail);
-            if privilege_deferred {
-                result.advisories.push(TaskAdvisory {
-                    severity: AdvisorySeverity::Warning,
-                    code: "deferred".to_string(),
-                    summary: "required dependency capability was not established".to_string(),
-                    remediation: "review the prerequisite's result before retrying".to_string(),
-                    blocks_dependents: true,
-                });
-            }
-            emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &blocked_id, &result);
-            let _ = event_tx.send(DashboardEvent::TaskStateChanged {
-                id: blocked_id.clone(),
-                state: TaskState::Canceled,
-                detail: result.details.first().cloned(),
-            });
-            done.insert(blocked_id, result);
-            made_progress = true;
-        }
-
         while let Some((finished_id, result)) = take_next_finished(&mut running) {
             emit_task_report_logs_async(
                 &event_tx,
@@ -2256,7 +2315,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 state,
                 detail,
             });
-            if ctx.fail_fast && result.status == TaskStatus::Failed {
+            if ctx.fail_fast && result.stops_new_admission() {
                 cancel_new.store(true, Ordering::SeqCst);
             }
             done.insert(finished_id, result);
@@ -2347,7 +2406,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
     let canceled = cancel_all_requested || cancel::is_cancel_requested();
     let journal_error = event_tx.journal_error();
     let failed = done.values().any(|r| r.status == TaskStatus::Failed) || journal_error.is_some();
-    let deferred = done.values().any(TaskResult::is_deferred);
+    let deferred = done.values().any(TaskResult::is_blocked_or_deferred);
     let outcome = resolve_async_outcome(failed, deferred, canceled);
     let exit_code = match outcome {
         AsyncRunOutcome::Success => 0,
@@ -3565,7 +3624,9 @@ fn run_command_with_transcript(
                 Vec::new(),
                 policy,
                 true,
-                !interactive_sudo_invocation(program, true),
+                CommandReplayPolicy::for_allowed_replay(!interactive_sudo_invocation(
+                    program, true,
+                )),
             );
             let transcript_out =
                 replay_interactive_transcript(ctx, task_id, &transcript.transcript_path)?;
@@ -3836,6 +3897,15 @@ fn run_command_task_inner(
                     Some(&before_report_output),
                 ));
             }
+            if crate::util::process::process_storage_exhausted(&e) {
+                return Ok(failed_command_result_with_report_sections(
+                    spec.label.clone(),
+                    format!("Reported storage exhaustion; automatic retries and recovery were stopped. Partial changes may remain. Inspect the affected filesystem and package state before retrying explicitly. Cause: {}", command_error_summary(&e)),
+                    &cmd,
+                    &err_text,
+                    Some(&before_report_output),
+                ));
+            }
             let failure_text = command_error_summary(&e);
             if interactive_unix_elevation(ctx.host_os, &cmd)
                 || command_forbids_privilege_replay(ctx, &cmd)
@@ -3939,10 +4009,7 @@ fn run_command_task_inner(
                     return Ok(user_canceled_elevation_result(spec.label.clone()));
                 }
                 if class == RuntimeFailureClass::ElevationDenied {
-                    return Ok(TaskResult::skipped(
-                        spec.label.clone(),
-                        build_elevation_required_detail(spec),
-                    ));
+                    return Ok(elevation_denied_result(spec));
                 }
                 let recovery_plan = classify_package_recovery(
                     package_manager_kind_for_command(spec, &cmd, &program),
@@ -4807,10 +4874,7 @@ fn run_command_pre_commands(
                     )));
                 }
                 if class == RuntimeFailureClass::ElevationDenied {
-                    return Ok(PreCommandOutcome::Stop(TaskResult::skipped(
-                        spec.label.clone(),
-                        build_elevation_required_detail(spec),
-                    )));
+                    return Ok(PreCommandOutcome::Stop(elevation_denied_result(spec)));
                 }
                 let report_input = join_command_outputs(&combined_output, &err_text);
                 return Ok(PreCommandOutcome::Stop(
@@ -5565,7 +5629,8 @@ fn recovery_cause_row_name(manager_label: &str, cause: &RecoveryCause) -> String
 
 fn recovery_diagnostic_status(cause: &RecoveryCause) -> TaskReportStatus {
     match cause {
-        RecoveryCause::PackageConflict { .. }
+        RecoveryCause::StorageExhausted
+        | RecoveryCause::PackageConflict { .. }
         | RecoveryCause::LockOrBusy { .. }
         | RecoveryCause::BuildFailure { .. }
         | RecoveryCause::RunningProcess { .. } => TaskReportStatus::Blocked,
@@ -5575,6 +5640,10 @@ fn recovery_diagnostic_status(cause: &RecoveryCause) -> TaskReportStatus {
 
 fn describe_recovery_cause(cause: &RecoveryCause) -> String {
     match cause {
+        RecoveryCause::StorageExhausted => {
+            "storage exhausted; no automatic retry or repair; partial changes may remain"
+                .to_string()
+        }
         RecoveryCause::FileConflict { owners } if owners.is_empty() => {
             "file/package conflict".to_string()
         }
@@ -5765,6 +5834,7 @@ pub(crate) enum RuntimeFailureClass {
     CommandLaunchFailed,
     TransientLockOrBusy,
     TransientNetwork,
+    StorageExhausted,
     Other,
 }
 
@@ -5773,6 +5843,9 @@ pub(crate) fn classify_runtime_failure(
     requires_elevation: bool,
 ) -> RuntimeFailureClass {
     let lower = err_text.to_ascii_lowercase();
+    if crate::util::process::storage_exhaustion_output(&lower) {
+        return RuntimeFailureClass::StorageExhausted;
+    }
     if requires_elevation
         && (lower.contains("code=1223")
             || lower.contains("exit code 1223")
@@ -5851,6 +5924,19 @@ fn build_elevation_required_detail(spec: &TaskSpec) -> String {
         "{} requires elevated privileges; update-all did not receive elevation",
         spec.label
     )
+}
+
+fn elevation_denied_result(spec: &TaskSpec) -> TaskResult {
+    let detail = build_elevation_required_detail(spec);
+    let mut result = TaskResult::skipped(spec.label.clone(), detail.clone());
+    result.advisories.push(TaskAdvisory {
+        severity: AdvisorySeverity::Warning,
+        code: "deferred".to_string(),
+        summary: detail,
+        remediation: "Review the task log and any partial effects before explicitly retrying with appropriate authority.".to_string(),
+        blocks_dependents: true,
+    });
+    result
 }
 
 fn user_canceled_elevation_result(label: impl Into<String>) -> TaskResult {
@@ -8132,7 +8218,7 @@ fn run_noninteractive_sudo_preflight(ctx: &SyncContext, spec: &TaskSpec) -> Resu
         vec!["-n".to_string(), "-v".to_string()],
         &policy,
         false,
-        false,
+        CommandReplayPolicy::Never,
     )
     .map(|_| ())
 }
@@ -9948,6 +10034,17 @@ fn write_run_artifact<'a>(
         .filter(|task| {
             task.completed_with_issues
                 || matches!(task.status, TaskStatus::Failed | TaskStatus::Canceled)
+                || task.advisories.iter().any(|advisory| {
+                    advisory.severity != AdvisorySeverity::Info || advisory.code == "deferred"
+                })
+                || task.report_sections.iter().any(|section| {
+                    section.rows.iter().any(|row| {
+                        matches!(
+                            row.status,
+                            TaskReportStatus::Failed | TaskReportStatus::Blocked
+                        )
+                    })
+                })
         })
         .count();
     let started_unix_ms = run_log.started_unix_ms();
@@ -10051,7 +10148,9 @@ fn resolve_parallel_jobs(jobs: &str, task_count: usize) -> Result<usize> {
 
 fn print_async_task_line(label: &str, r: &TaskResult) {
     let status = match r.status {
-        TaskStatus::Completed if r.is_deferred() => "Deferred",
+        TaskStatus::Completed | TaskStatus::Skipped if r.is_blocked_or_deferred() => {
+            "Blocked/deferred"
+        }
         TaskStatus::Completed if r.has_issues() => "Completed with issues",
         TaskStatus::Completed => "Completed",
         TaskStatus::Failed => "Failed",
@@ -10066,8 +10165,11 @@ fn print_async_task_line(label: &str, r: &TaskResult) {
 
 fn task_outcome_message(result: &TaskResult) -> String {
     match result.status {
-        TaskStatus::Completed if result.is_deferred() => {
-            format!("task outcome: deferred - {}", result.primary_detail())
+        TaskStatus::Completed | TaskStatus::Skipped if result.is_blocked_or_deferred() => {
+            format!(
+                "task outcome: blocked/deferred - {}",
+                result.primary_detail()
+            )
         }
         TaskStatus::Completed if result.has_issues() => {
             format!(
@@ -12429,7 +12531,7 @@ fn render_final_task_overview<'a>(
             task: entry.label,
             status: entry.result.status,
             has_issues: entry.result.has_issues(),
-            deferred: entry.result.is_deferred(),
+            deferred: entry.result.is_blocked_or_deferred(),
             items: summarize_task_items(entry.result),
             notes: summarize_task_notes(entry.result),
         })
@@ -13840,7 +13942,7 @@ fn task_status_cell_from_parts(
     deferred: bool,
 ) -> &'static str {
     match status {
-        TaskStatus::Completed if deferred => "Deferred",
+        TaskStatus::Completed | TaskStatus::Skipped if deferred => "Blocked/deferred",
         TaskStatus::Completed if has_issues => "Completed*",
         TaskStatus::Completed => "Completed",
         TaskStatus::Failed => "Failed",

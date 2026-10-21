@@ -2,6 +2,75 @@ use super::{load_runtime_config, merge_user_completion_catalog, validate_config}
 use crate::completions::registry::Registry;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[test]
+fn configuration_writer_preserves_legacy_destination_selection_in_isolated_processes() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf, process::Command};
+    if let Some(expected) = std::env::var_os("UPDATE_ALL_WRITER_EXPECTED") {
+        assert_eq!(
+            super::resolve_config_write_path(None).unwrap(),
+            PathBuf::from(expected)
+        );
+        let explicit = PathBuf::from("absent-explicit-writer-target.toml");
+        assert_eq!(
+            super::resolve_config_write_path(Some(explicit.clone())).unwrap(),
+            explicit
+        );
+        return;
+    }
+    for existing_default in [false, true] {
+        for (selection, exists, chosen) in [
+            (None, false, false),
+            (Some(OsString::from("")), false, false),
+            (Some(OsString::from("absent.toml")), false, true),
+            (Some(OsString::from(" ")), false, false),
+            (Some(OsString::from(" ")), true, true),
+            (
+                Some(OsString::from_vec(b"native-\xff.toml".to_vec())),
+                false,
+                false,
+            ),
+            (
+                Some(OsString::from_vec(b"native-\xff.toml".to_vec())),
+                true,
+                false,
+            ),
+        ] {
+            let root = TempDir::new().unwrap();
+            let fallback = root.path().join("config/update-all/config.toml");
+            if existing_default {
+                std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+                std::fs::write(&fallback, "").unwrap();
+            }
+            if exists {
+                std::fs::write(root.path().join(selection.as_ref().unwrap()), "").unwrap();
+            }
+            let expected = if chosen {
+                PathBuf::from(selection.as_ref().unwrap())
+            } else {
+                fallback
+            };
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.env_clear()
+                .env("HOME", root.path().join("home"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("UPDATE_ALL_WRITER_EXPECTED", &expected)
+                .current_dir(root.path())
+                .args(["--exact", "config::tests::configuration_writer_preserves_legacy_destination_selection_in_isolated_processes"]);
+            if let Some(selection) = selection {
+                child.env("UPDATE_ALL_CONFIG", selection);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 #[test]
 fn logging_retention_defaults_and_overrides_are_explicit() {
     let tmp = TempDir::new().unwrap();

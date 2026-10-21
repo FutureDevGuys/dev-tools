@@ -1819,7 +1819,7 @@ fn run_completion_style(model: &Model) -> (&'static str, Color) {
         Some(_) if model.run_had_failures => (" failed ", Color::LightRed),
         Some(_) if model.run_canceled => (" canceled ", Color::Yellow),
         Some(true) => (" completed ", Color::LightGreen),
-        Some(false) => (" failed ", Color::LightRed),
+        Some(false) => (" blocked/deferred ", Color::Yellow),
     }
 }
 
@@ -3890,6 +3890,11 @@ fn box_cell_style(cell: &str) -> Option<Style> {
 
 fn report_outcome_style(outcome: &str) -> Option<Style> {
     match outcome {
+        "Blocked/deferred" => Some(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         "Completed" | "Passed" | "Pass" | "Updated" | "Generated" | "Recovered" | "Restarted" => {
             Some(
                 Style::default()
