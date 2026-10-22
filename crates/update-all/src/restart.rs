@@ -27,6 +27,11 @@ impl RestartRequest {
         if crate::util::cancel::is_cancel_requested() {
             return Err(crate::Cancelled.into());
         }
+        // Tasks deliberately release admission before a persistent dashboard
+        // closes. Another run may have started since our tasks completed.
+        // Fail closed if so, and prevent admission through the OS request.
+        let _restart_admission = crate::tasks::acquire_restart_admission_lock(log)
+            .context("restart withheld: cannot establish exclusive Update All task admission")?;
         if !log.restart_eligible()? {
             bail!("Restart not requested: a clean run with at least one completed task and no canceled tasks or issues is required; restart manually if appropriate");
         }
@@ -178,12 +183,21 @@ fn request_backend(run_dir: &Path) -> Result<()> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| event["event"] == "run_completed" || event["kind"] == "run_completed")
         .count();
+    let task_lock = run_dir
+        .parent()
+        .context("test run directory has no admission root")?
+        .join(".update-all-task-run.lock");
+    let lock_payload = std::fs::read_to_string(task_lock)?;
+    let task_admission_owned = lock_payload
+        .lines()
+        .any(|line| line == format!("pid={}", std::process::id()));
     let payload = serde_json::json!({
         "run_dir": run_dir,
         "run": read("run.json")?,
         "metadata": read("run-meta.json")?,
         "run_completed_count": run_completed_count,
         "terminal_raw_mode": crossterm::terminal::is_raw_mode_enabled()?,
+        "task_admission_owned": task_admission_owned,
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)
