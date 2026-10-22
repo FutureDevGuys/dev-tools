@@ -45,12 +45,10 @@ fn installed_public_composition_projects_into_native_child() {
     let observations = store.observations.lock().unwrap();
     assert!(observations.reads.len() > 2);
     assert_eq!(observations.reads.len(), observations.searches.len());
-    assert!(
-        observations
-            .reads
-            .chunks_exact(2)
-            .all(|pair| pair == ["automation", "secondary"])
-    );
+    assert!(observations
+        .reads
+        .chunks_exact(2)
+        .all(|pair| pair == ["automation", "secondary"]));
     assert_eq!(observations.reads.len() % 2, 0);
 }
 
@@ -69,13 +67,11 @@ fn plain_rust_consumer() {
     assert!(Path::new(&path).starts_with("/proc/self/fd"));
     assert!(fs::read(&path).unwrap() == expected);
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o400);
-    assert!(
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .and_then(|mut file| file.write_all(b"replacement"))
-            .is_err()
-    );
+    assert!(fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(b"replacement"))
+        .is_err());
     assert!(std::env::var_os("GENERIC_TOKEN").unwrap() == "fixture-export");
     assert!(std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none());
     assert_eq!(nix::unistd::getuid(), nix::unistd::geteuid());
