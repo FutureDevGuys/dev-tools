@@ -42,10 +42,12 @@ fn installed_public_composition_projects_into_native_child() {
     let observations = store.observations.lock().unwrap();
     assert!(observations.reads.len() > 2);
     assert_eq!(observations.reads.len(), observations.searches.len());
-    assert!(observations
-        .reads
-        .chunks_exact(2)
-        .all(|pair| pair == ["automation", "secondary"]));
+    assert!(
+        observations
+            .reads
+            .chunks_exact(2)
+            .all(|pair| pair == ["automation", "secondary"])
+    );
     assert_eq!(observations.reads.len() % 2, 0);
 }
 
@@ -64,11 +66,13 @@ fn plain_rust_consumer() {
     assert!(Path::new(&path).starts_with("/proc/self/fd"));
     assert!(fs::read(&path).unwrap() == expected);
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o400);
-    assert!(fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .and_then(|mut file| file.write_all(b"replacement"))
-        .is_err());
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(b"replacement"))
+            .is_err()
+    );
     assert!(std::env::var_os("GENERIC_TOKEN").unwrap() == "fixture-export");
     assert!(std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none());
     assert_eq!(nix::unistd::getuid(), nix::unistd::geteuid());
@@ -100,8 +104,10 @@ pub(super) fn exercise(paths: &dev_auth::setup::SetupPaths, root: &Path) {
     let config_root = root.parent().unwrap().join(".config/dev-auth");
     let policy_path = config_root.join("policy-v3.toml");
     let config_path = config_root.join("config-v3.toml");
-    let mut policy: toml::Value = toml::from_str(&fs::read_to_string(&policy_path).unwrap()).unwrap();
-    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mut policy: toml::Value =
+        toml::from_str(&fs::read_to_string(&policy_path).unwrap()).unwrap();
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     policy["trusted_launchers"]
         .as_table_mut()
         .unwrap()
@@ -221,19 +227,70 @@ resources = {}
     assert!(cat.stderr.is_empty());
     assert_report(&cat_inner, "exited", Some(true), 0);
     // Child stdout belongs to the consumer, not to value-free control output.
-    assert_value_free(&Output {
-        status: cat.status,
-        stdout: Vec::new(),
-        stderr: cat.stderr,
-    }, &[&cat_inner, &cat_outer]);
+    assert_value_free(
+        &Output {
+            status: cat.status,
+            stdout: Vec::new(),
+            stderr: cat.stderr,
+        },
+        &[&cat_inner, &cat_outer],
+    );
 
     for (index, workload, projection, resource, command, expected, outcome) in [
-        (0, "secret-executor", "GENERIC_TOKEN", "unknown-resource", "/usr/bin/touch", 4, "resource_denied"),
-        (1, "secret-executor", "GENERIC_TOKEN", "release", "/usr/bin/touch", 4, "resource_denied"),
-        (2, "narrow-executor", "GENERIC_TOKEN", "token", "/usr/bin/touch", 4, "resource_denied"),
-        (3, "secret-executor", "PATH", "token", "/usr/bin/touch", 2, ""),
-        (4, "secret-executor", "GENERIC_TOKEN", "token", "/absent-native-consumer", 2, "executable_unavailable"),
-        (5, "secret-executor", "GENERIC_TOKEN", "missing-token", "/usr/bin/touch", 4, "resource_denied"),
+        (
+            0,
+            "secret-executor",
+            "GENERIC_TOKEN",
+            "unknown-resource",
+            "/usr/bin/touch",
+            4,
+            "resource_denied",
+        ),
+        (
+            1,
+            "secret-executor",
+            "GENERIC_TOKEN",
+            "release",
+            "/usr/bin/touch",
+            4,
+            "resource_denied",
+        ),
+        (
+            2,
+            "narrow-executor",
+            "GENERIC_TOKEN",
+            "token",
+            "/usr/bin/touch",
+            4,
+            "resource_denied",
+        ),
+        (
+            3,
+            "secret-executor",
+            "PATH",
+            "token",
+            "/usr/bin/touch",
+            2,
+            "",
+        ),
+        (
+            4,
+            "secret-executor",
+            "GENERIC_TOKEN",
+            "token",
+            "/absent-native-consumer",
+            2,
+            "executable_unavailable",
+        ),
+        (
+            5,
+            "secret-executor",
+            "GENERIC_TOKEN",
+            "missing-token",
+            "/usr/bin/touch",
+            4,
+            "resource_denied",
+        ),
     ] {
         let before = calls();
         let marker = root.join(format!("denied-consumer-{index}"));
@@ -277,7 +334,15 @@ resources = {}
     let outer = root.join("partial-outer.json");
     let mut partial = launch(&installed, root, "secret-executor", &outer);
     partial
-        .args(["secret", "exec", "--stdin", "token", "--env", "GENERIC_TOKEN=missing-token", "--result-file"])
+        .args([
+            "secret",
+            "exec",
+            "--stdin",
+            "token",
+            "--env",
+            "GENERIC_TOKEN=missing-token",
+            "--result-file",
+        ])
         .arg(&inner)
         .args(["--", "/usr/bin/touch"])
         .arg(&marker);
@@ -300,14 +365,26 @@ resources = {}
             .env_clear()
             .current_dir(root)
             .args([
-                "workload", "launch", "secret-executor",
+                "workload",
+                "launch",
+                "secret-executor",
                 "--non-interactive",
-                "--privilege-scope", "workload",
-                "--privilege-duration", "30m",
+                "--privilege-scope",
+                "workload",
+                "--privilege-duration",
+                "30m",
                 "--result-file",
             ])
             .arg(&result)
-            .args(["--", "secret", "exec", "--env", "GENERIC_TOKEN=token", "--", "/usr/bin/touch"])
+            .args([
+                "--",
+                "secret",
+                "exec",
+                "--env",
+                "GENERIC_TOKEN=token",
+                "--",
+                "/usr/bin/touch",
+            ])
             .arg(&marker),
     );
     assert_eq!(output.status.code(), Some(3));
@@ -323,7 +400,13 @@ fn launch(installed: &Path, root: &Path, workload: &str, result: &Path) -> Comma
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .current_dir(root)
-        .args(["workload", "launch", workload, "--non-interactive", "--result-file"])
+        .args([
+            "workload",
+            "launch",
+            workload,
+            "--non-interactive",
+            "--result-file",
+        ])
         .arg(result)
         .arg("--");
     command
@@ -343,7 +426,12 @@ fn assert_value_free(output: &Output, reports: &[&Path]) {
         observations.extend(fs::read(path).unwrap());
     }
     let observations = String::from_utf8_lossy(&observations);
-    for forbidden in ["fixture-export", "fixture-enrollment", "op://", "ambient-value"] {
+    for forbidden in [
+        "fixture-export",
+        "fixture-enrollment",
+        "op://",
+        "ambient-value",
+    ] {
         assert!(!observations.contains(forbidden));
     }
 }
