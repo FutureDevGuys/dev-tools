@@ -158,6 +158,10 @@ resources = {}
         let resources = workload["resources"].as_table_mut().unwrap();
         resources.insert("token".into(), resource_selection(allowed));
         resources.insert("missing-token".into(), resource_selection(&["environment"]));
+        resources.insert(
+            "release".into(),
+            config["authority_profiles"]["worker"]["resources"]["release"].clone(),
+        );
         config["workloads"].as_array_mut().unwrap().push(workload);
     }
     for (path, value) in [(&policy_path, &policy), (&config_path, &config)] {
