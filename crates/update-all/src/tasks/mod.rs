@@ -1843,6 +1843,12 @@ fn run_log_root(run_log: &RunLogSink) -> &Path {
         .unwrap_or_else(|| run_log.run_dir())
 }
 
+// Use the same admission boundary for task execution and restart requests.
+// This guards other Update All runs using this run-log root, not external writers.
+pub(crate) fn acquire_restart_admission_lock(log: &RunLogSink) -> Result<ScopedFileLock> {
+    acquire_task_run_lock(run_log_root(log))
+}
+
 pub fn run_async(ctx: AsyncContext) -> Result<()> {
     let authoritative_log = ctx
         .run_log

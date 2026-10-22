@@ -27,6 +27,12 @@ reported task issues, no pending global cancellation, and successful finalizatio
 The dashboard must be dismissed first. An empty or entirely skipped run cannot
 restart the machine. An unsatisfied explicit restart request exits nonzero.
 
+After dashboard dismissal, restart must reacquire the same run-root task admission
+used by the scheduler and retain it through the OS request and its evidence writes.
+If another run owns admission, withhold restart without canceling that run or
+relabeling already-completed task evidence. Completed dashboards may still remain
+open while another run executes; dashboard ownership is not restart authority.
+
 Linux uses /usr/bin/systemctl with --no-ask-password --check-inhibitors=yes reboot,
 only on a native systemd host. Detected containers and WSL are rejected. Windows
 resolves shutdown.exe through GetSystemDirectoryW and passes /r /t 0, never /f;
@@ -54,6 +60,7 @@ release artifacts. Normal binaries have no runtime command injection seam.
 - No restart follows failed, deferred, canceled, empty, all-skipped or unpersisted work.
 - A success exit does not override canceled-task evidence.
 - No request precedes terminal teardown and durable final run evidence.
+- No request occurs while a different same-root Update All run owns task admission.
 - No implicit sudo, credential refresh, permission change or force option exists.
 - No retry follows a denied, timed out or uncertain request.
 - OS acceptance is distinguished from actual reboot completion.
@@ -76,6 +83,9 @@ acceptance remains pending, including ABI, signing and local permission behavior
 There is an unavoidable boundary after OS acceptance beyond which update-all
 cannot cancel the restart. Power loss can leave a pending receipt. Persistence
 errors after a request do not imply the request had no effect.
+The admission guard coordinates only Update All runs using the same run root. It
+does not fence manual package-manager commands, other state roots, or new writers
+after the asynchronous OS request is accepted and the guard is released.
 
 ## Verification
 
@@ -84,6 +94,7 @@ errors after a request do not imply the request had no effect.
 - `restart_after_requests_once_only_after_successful_persisted_terminalization`
 - `restart_after_is_opt_in_and_read_only_surfaces_never_request_it`
 - `restart_after_waits_for_dashboard_exit_and_restores_terminal`
+- `restart_after_refuses_when_second_run_started_during_dashboard_review`
 - `restart_after_suppresses_failed_pre_request_evidence_sync`
 
 ## Runtime acceptance

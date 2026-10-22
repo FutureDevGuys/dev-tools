@@ -177,6 +177,7 @@ fn restart_after_requests_once_only_after_successful_persisted_terminalization()
             assert_eq!(request["metadata"]["status"], "completed");
             assert_eq!(request["run_completed_count"], 1);
             assert_eq!(request["terminal_raw_mode"], false);
+            assert_eq!(request["task_admission_owned"], true);
             assert_eq!(request["run"]["engine_mode"], engine);
             assert_eq!(request["run"], json(fixture.only_run().join("run.json")));
             assert!(!fixture
@@ -465,6 +466,211 @@ fn restart_after_waits_for_dashboard_exit_and_restores_terminal() {
     assert_eq!(request["run"]["ui_mode"], "dashboard");
     assert_eq!(request["metadata"]["status"], "completed");
     assert_eq!(request["run_completed_count"], 1);
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_after_refuses_when_second_run_started_during_dashboard_review() {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::new("async", "printf 'dashboard harmless task\\n'");
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let size = libc::winsize {
+        ws_row: 40,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty initializes two owned descriptors; all pointer arguments are valid.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        },
+        0
+    );
+    // SAFETY: these distinct successful openpty descriptors are transferred exactly once.
+    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    let mut reader = master.try_clone().unwrap();
+    let capture = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("read dashboard PTY: {error}"),
+            }
+        }
+        bytes
+    });
+    let mut command = fixture.process();
+    command
+        .args([
+            "--dashboard",
+            "--completions",
+            "off",
+            "--only",
+            "local/restart-fixture",
+            "--restart-after",
+        ])
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    // SAFETY: only async-signal-safe native calls occur in this pre-exec closure.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = TestChild(command.spawn().unwrap());
+    drop(command);
+    drop(slave);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run = loop {
+        let root = fixture.home.path().join("state/update-all/runs");
+        let ready = fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                fs::read_to_string(path.join("events.jsonl"))
+                    .is_ok_and(|events| events.contains("\"kind\":\"tasks_completed\""))
+            });
+        if let Some(run) = ready {
+            break run;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "dashboard exited before tasks completed"
+        );
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("dashboard tasks did not complete");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let metadata = json(run.join("run-meta.json"));
+    assert!(
+        matches!(metadata["status"].as_str(), Some("running" | "finalizing")),
+        "dashboard still owns the nonterminal run: {metadata}"
+    );
+    fixture.assert_no_restart();
+    // The task-completed journal event precedes lock release. Wait for the
+    // actual admission boundary rather than racing the first run's final writes.
+    let task_lock = fixture
+        .home
+        .path()
+        .join("state/update-all/runs/.update-all-task-run.lock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while task_lock.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "first dashboard exited unexpectedly"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "first run did not release task admission"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The first run released task admission but its dashboard is still open.
+    // Start a harmless second writer under the exact same admission root.
+    let second_ready = fixture.home.path().join("second-run.ready");
+    let release_second = fixture.home.path().join("release-second");
+    let script = r#"printf ready > "$HOME/second-run.ready"; while [ ! -f "$HOME/release-second" ]; do sleep 0.01; done"#;
+    fs::write(
+        fixture
+            .home
+            .path()
+            .join("config/update-all/catalog.d/local/blocker.toml"),
+        format!(
+            r#"
+[tasks."local/restart-blocker"]
+label="Harmless second-run writer fixture"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c", {}]
+policy_key="tool_update"
+"#,
+            serde_json::to_string(script).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut second_command = fixture.process();
+    second_command.args([
+        "--plain",
+        "--completions",
+        "off",
+        "--only",
+        "local/restart-blocker",
+    ]);
+    let mut second = TestChild(second_command.spawn().unwrap());
+    wait_for(&second_ready, &mut second);
+    assert!(second.try_wait().unwrap().is_none());
+    master.write_all(b"q").unwrap();
+    assert_eq!(wait_child(&mut child).code(), Some(1));
+    fixture.assert_no_restart();
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "restart guard must not kill the active updater"
+    );
+    let lock_payload = fs::read_to_string(&task_lock).unwrap();
+    assert!(
+        lock_payload
+            .lines()
+            .any(|line| line == format!("pid={}", second.id())),
+        "the second updater must retain admission after restart refusal: {lock_payload}"
+    );
+    assert_eq!(
+        json(run.join("run.json"))["status"],
+        "completed",
+        "completed first-run task evidence is preserved"
+    );
+    assert!(
+        !run.join("restart.json").exists(),
+        "no request is made while another run owns admission"
+    );
+    fs::write(release_second, "release").unwrap();
+    assert!(wait_child(&mut second).success());
+    assert!(
+        !task_lock.exists(),
+        "second updater did not release admission"
+    );
+    drop(master);
+    let bytes = capture.join().unwrap();
+    let screen = String::from_utf8_lossy(&bytes);
+    assert!(
+        screen.contains("\x1b[?1049h"),
+        "dashboard did not enter alternate screen"
+    );
+    assert!(
+        screen.contains("\x1b[?1049l"),
+        "dashboard did not leave alternate screen"
+    );
+    assert!(
+        screen.contains("restart withheld: cannot establish exclusive Update All task admission"),
+        "expected restart admission refusal, not unrelated cancellation: {screen}"
+    );
+    fixture.assert_no_restart();
 }
 
 #[test]
