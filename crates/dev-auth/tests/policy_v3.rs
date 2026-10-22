@@ -546,3 +546,312 @@ fn v3_policy_narrowing_checks_operation_scope_even_when_unused_by_a_workload() {
     let broad = parse_runtime_administrator(broad.as_bytes()).unwrap();
     broad.require_narrows(&administrator).unwrap();
 }
+
+fn projection_policy() -> String {
+    policy_text()
+        .replace("projections = [\"stdin\"]", "projections = [\"environment\"]")
+        .replace(
+            "max_duration_seconds = 172800",
+            "max_duration_seconds = 172800\nsecret_projections = [{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN' }]",
+        )
+}
+
+fn projection_user() -> String {
+    format!(
+        "{}\nprojections = ['environment']\n",
+        USER.replace("projections = [\"stdin\"]", "projections = [\"environment\"]")
+            .replace(
+                "duration_seconds = 86400",
+                "duration_seconds = 86400\nsecret_projections = [{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN' }]",
+            )
+    )
+}
+
+#[test]
+fn absent_declarative_projections_preserve_legacy_v3_launch_behavior() {
+    let system = parse_system_policy_v3(policy_text().as_bytes()).unwrap();
+    let user = parse_user_config_v3(USER.as_bytes()).unwrap();
+    assert!(system.workload_caps["build"].secret_projections.is_empty());
+    assert!(user.workloads[0].secret_projections.is_empty());
+    let resolved = resolve_policy_for_user(&system, "worker", &user).unwrap();
+    assert!(resolved["batch"].secret_projections.is_empty());
+    let runtime =
+        dev_auth::policy_v3::resolve_runtime_policy_for_user(&system, "worker", &user).unwrap();
+    assert!(runtime.workloads["batch"].secret_projections.is_empty());
+}
+
+#[test]
+fn declared_environment_projection_preserves_exact_selection_and_configured_launcher() {
+    let system = parse_system_policy_v3(projection_policy().as_bytes()).unwrap();
+    let user = parse_user_config_v3(projection_user().as_bytes()).unwrap();
+    let selected = &user.workloads[0].secret_projections;
+    assert_eq!(
+        serde_json::to_value(&selected[0]).unwrap(),
+        serde_json::json!({
+            "resource": "database",
+            "kind": "environment",
+            "target": "SERVICE_TOKEN"
+        })
+    );
+    let resolved = resolve_policy_for_user(&system, "worker", &user).unwrap();
+    assert_eq!(&resolved["batch"].secret_projections, selected);
+    let runtime =
+        dev_auth::policy_v3::resolve_runtime_policy_for_user(&system, "worker", &user).unwrap();
+    assert_eq!(&runtime.workloads["batch"].secret_projections, selected);
+    assert_eq!(
+        runtime.workloads["batch"].launcher_path,
+        system.trusted_launchers["worker"]
+    );
+    assert!(runtime.workloads["batch"].secret_references.is_empty());
+}
+
+#[test]
+fn declarative_projection_requires_exact_administrator_destination_and_resource() {
+    let mut system = parse_system_policy_v3(projection_policy().as_bytes()).unwrap();
+    let mut user = parse_user_config_v3(projection_user().as_bytes()).unwrap();
+    user.workloads[0].secret_projections[0].target =
+        dev_auth::secret_execution::Target::Environment("OTHER_TOKEN".into());
+    assert!(resolve_policy_for_user(&system, "worker", &user).is_err());
+
+    let mut second = system.credentials.resources["database"].clone();
+    second.reference = "op://Fixture/secondary/password".into();
+    system
+        .credentials
+        .resources
+        .insert("secondary".into(), second);
+    let selected = system.credentials.resource_caps["build"].resources["database"].clone();
+    system
+        .credentials
+        .resource_caps
+        .get_mut("build")
+        .unwrap()
+        .resources
+        .insert("secondary".into(), selected.clone());
+    user.authority_profiles
+        .get_mut("build")
+        .unwrap()
+        .resources
+        .insert("secondary".into(), selected.clone());
+    user.workloads[0]
+        .resources
+        .insert("secondary".into(), selected);
+    user.workloads[0].secret_projections[0].target =
+        dev_auth::secret_execution::Target::Environment("SERVICE_TOKEN".into());
+    user.workloads[0].secret_projections[0].resource = "secondary".into();
+    assert!(resolve_policy_for_user(&system, "worker", &user).is_err());
+
+    system
+        .workload_caps
+        .get_mut("build")
+        .unwrap()
+        .secret_projections = user.workloads[0].secret_projections.clone();
+    assert!(resolve_policy_for_user(&system, "worker", &user).is_ok());
+}
+
+#[test]
+fn declarative_projection_cannot_restore_resource_or_projection_rights_removed_by_selection() {
+    let system = parse_system_policy_v3(projection_policy().as_bytes()).unwrap();
+    let original = parse_user_config_v3(projection_user().as_bytes()).unwrap();
+    for layer in [
+        "workload_resource",
+        "workload_read",
+        "workload_projection",
+        "profile_projection",
+    ] {
+        let mut user = original.clone();
+        match layer {
+            "workload_resource" => {
+                user.workloads[0].resources.remove("database");
+            }
+            "workload_read" => {
+                let resource = user.workloads[0].resources.get_mut("database").unwrap();
+                resource.purposes = vec![dev_auth::logical_authority::ResourcePurpose::Public];
+                resource.projections.clear();
+            }
+            "workload_projection" => {
+                user.workloads[0]
+                    .resources
+                    .get_mut("database")
+                    .unwrap()
+                    .projections
+                    .clear();
+            }
+            "profile_projection" => {
+                user.authority_profiles
+                    .get_mut("build")
+                    .unwrap()
+                    .resources
+                    .get_mut("database")
+                    .unwrap()
+                    .projections
+                    .clear();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            resolve_policy_for_user(&system, "worker", &user).is_err(),
+            "{layer}"
+        );
+    }
+    let mut no_destination_cap = system.clone();
+    no_destination_cap
+        .workload_caps
+        .get_mut("build")
+        .unwrap()
+        .secret_projections
+        .clear();
+    assert!(resolve_policy_for_user(&no_destination_cap, "worker", &original).is_err());
+}
+
+#[test]
+fn declarative_caps_require_exportable_read_and_selected_projection_authority() {
+    for policy in [
+        projection_policy().replace("resource = 'database'", "resource = 'missing'"),
+        projection_policy().replace("kind = \"exportable\"", "kind = \"operation_only\""),
+        projection_policy().replace(
+            "[credentials.resource_caps.build.resources.database]\npurposes = [\"read\"]\nprojections = [\"environment\"]",
+            "[credentials.resource_caps.build.resources.database]\npurposes = [\"read\"]\nprojections = []",
+        ),
+    ] {
+        assert!(parse_system_policy_v3(policy.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn declarative_launch_rejects_non_environment_projection_kinds() {
+    for target in [
+        "{ resource = 'database', kind = 'stdin' }",
+        "{ resource = 'database', kind = 'descriptor', target = 7 }",
+        "{ resource = 'database', kind = 'file', target = 'SERVICE_TOKEN_FILE' }",
+    ] {
+        let declaration =
+            "{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN' }";
+        let policy = projection_policy().replace(declaration, target).replace(
+            "projections = [\"environment\"]",
+            "projections = ['stdin', 'descriptor', 'file', 'environment']",
+        );
+        let user = projection_user()
+            .replace(declaration, target)
+            .replace(
+                "projections = [\"environment\"]",
+                "projections = ['stdin', 'descriptor', 'file', 'environment']",
+            )
+            .replace(
+                "projections = ['environment']",
+                "projections = ['stdin', 'descriptor', 'file', 'environment']",
+            );
+        assert!(parse_system_policy_v3(policy.as_bytes()).is_err());
+        assert!(parse_user_config_v3(user.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn declarative_targets_reject_unknown_reserved_duplicate_and_oversized_definitions() {
+    let declaration = "{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN' }";
+    for target in [
+        "{ resource = 'database', kind = 'unknown', target = 'SERVICE_TOKEN' }",
+        "{ resource = 'database', kind = 'environment', target = 'DEV_AUTH_USER_SESSION' }",
+        "{ resource = 'database', kind = 'environment', target = 'PATH' }",
+        "{ resource = 'database', kind = 'environment', target = 'LD_PRELOAD' }",
+        "{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN', command = '/bin/false' }",
+    ] {
+        assert!(parse_system_policy_v3(
+            projection_policy().replace(declaration, target).as_bytes()
+        ).is_err());
+        assert!(parse_user_config_v3(
+            projection_user().replace(declaration, target).as_bytes()
+        ).is_err());
+    }
+    let duplicate = format!("{declaration}, {declaration}");
+    for count in [2, 33] {
+        let entries = if count == 2 {
+            duplicate.clone()
+        } else {
+            (0..count)
+                .map(|index| format!(
+                    "{{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN_{index}' }}"
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        assert!(parse_system_policy_v3(
+            projection_policy()
+                .replace(declaration, &entries)
+                .as_bytes()
+        )
+        .is_err());
+        assert!(
+            parse_user_config_v3(projection_user().replace(declaration, &entries).as_bytes())
+                .is_err()
+        );
+    }
+    let entries = (0..32)
+        .map(|index| {
+            format!(
+            "{{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN_{index}' }}"
+        )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let system = parse_system_policy_v3(
+        projection_policy()
+            .replace(declaration, &entries)
+            .as_bytes(),
+    )
+    .unwrap();
+    let user =
+        parse_user_config_v3(projection_user().replace(declaration, &entries).as_bytes()).unwrap();
+    assert_eq!(
+        resolve_policy_for_user(&system, "worker", &user).unwrap()["batch"]
+            .secret_projections
+            .len(),
+        32
+    );
+}
+
+#[test]
+fn administrator_overlay_can_remove_but_not_substitute_projection_destinations() {
+    let upper = parse_system_policy_v3(projection_policy().as_bytes()).unwrap();
+    let mut lower = upper.clone();
+    lower
+        .workload_caps
+        .get_mut("build")
+        .unwrap()
+        .secret_projections
+        .clear();
+    assert!(dev_auth::policy_v3::require_system_policy_narrows(&upper, &lower).is_ok());
+    assert!(dev_auth::policy_v3::require_system_policy_narrows(&lower, &upper).is_err());
+    let substituted = parse_system_policy_v3(
+        projection_policy()
+            .replace("SERVICE_TOKEN", "OTHER_TOKEN")
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(dev_auth::policy_v3::require_system_policy_narrows(&upper, &substituted).is_err());
+
+    let mut upper = upper;
+    let mut secondary = upper.credentials.resources["database"].clone();
+    secondary.reference = "op://Fixture/secondary/password".into();
+    upper
+        .credentials
+        .resources
+        .insert("secondary".into(), secondary);
+    let selection = upper.credentials.resource_caps["build"].resources["database"].clone();
+    upper
+        .credentials
+        .resource_caps
+        .get_mut("build")
+        .unwrap()
+        .resources
+        .insert("secondary".into(), selection);
+    let mut substituted_resource = upper.clone();
+    substituted_resource
+        .workload_caps
+        .get_mut("build")
+        .unwrap()
+        .secret_projections[0]
+        .resource = "secondary".into();
+    assert!(
+        dev_auth::policy_v3::require_system_policy_narrows(&upper, &substituted_resource,).is_err()
+    );
+}
