@@ -14,7 +14,10 @@ fn installed_public_composition_projects_into_native_child() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
-    sandbox.install_binary(&sandbox.root.join("product"));
+    let candidate = std::env::var_os("DEV_AUTH_TEST_PRODUCT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dev-auth")));
+    sandbox.install_binary_from(&candidate, &sandbox.root.join("product"));
     let store = enrolled_store::EnrolledStore::start(
         &sandbox.runtime,
         std::collections::BTreeMap::from([

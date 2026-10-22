@@ -102,6 +102,12 @@ Run the compiled public-binary composition fixture with:
 cargo test -p dev-auth --locked --test cli generic_projection::installed_public_composition_projects_into_native_child -- --exact --test-threads=1 --nocapture
 ```
 
+For a transferred test runner, set the fixture-only `DEV_AUTH_TEST_PRODUCT` to
+its matching ordinary product binary. This input is compiled into the test
+runner only; production Dev Auth does not recognize it. Verify both artifact
+hashes and source identity before running. No source checkout is needed at run
+time because the remaining fixture material is embedded.
+
 The fixture needs native Bubblewrap and a private disposable D-Bus daemon, uses
 only synthetic provider/enrollment material, and installs only inside its
 disposable native-user namespace. It exercises:

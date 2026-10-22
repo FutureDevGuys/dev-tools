@@ -1614,7 +1614,11 @@ impl NativeUserSandbox {
     }
 
     fn install_binary(&self, destination: &Path) {
-        fs::copy(env!("CARGO_BIN_EXE_dev-auth"), destination).unwrap();
+        self.install_binary_from(Path::new(env!("CARGO_BIN_EXE_dev-auth")), destination);
+    }
+
+    fn install_binary_from(&self, source: &Path, destination: &Path) {
+        fs::copy(source, destination).unwrap();
         assert!(Command::new("/usr/bin/strip")
             .arg("--strip-debug")
             .arg(destination)
