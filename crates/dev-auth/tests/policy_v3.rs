@@ -753,6 +753,11 @@ fn declarative_targets_reject_unknown_reserved_duplicate_and_oversized_definitio
         "{ resource = 'database', kind = 'environment', target = 'DEV_AUTH_USER_SESSION' }",
         "{ resource = 'database', kind = 'environment', target = 'PATH' }",
         "{ resource = 'database', kind = 'environment', target = 'LD_PRELOAD' }",
+        "{ resource = 'database', kind = 'environment', target = 'PYTHONPATH' }",
+        "{ resource = 'database', kind = 'environment', target = 'GIT_SSH_COMMAND' }",
+        "{ resource = 'database', kind = 'environment', target = 'SSH_AUTH_SOCK' }",
+        "{ resource = 'database', kind = 'environment', target = 'BASH_ENV' }",
+        "{ resource = 'database', kind = 'environment', target = 'GH_CONFIG_DIR' }",
         "{ resource = 'database', kind = 'environment', target = 'SERVICE_TOKEN', command = '/bin/false' }",
     ] {
         assert!(parse_system_policy_v3(
