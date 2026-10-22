@@ -165,6 +165,8 @@ resources = {}
     }
     let primary_calls = root.join("op-primary.calls");
     let calls = || fs::read(&primary_calls).unwrap();
+    let secondary_calls = root.join("op-secondary.calls");
+    let unchanged_secondary = fs::read(&secondary_calls).unwrap();
 
     let marker = root.join("generic-consumer-marker");
     let inner_result = root.join("generic-inner-result.json");
@@ -254,10 +256,35 @@ resources = {}
         if inner.exists() {
             assert_value_free(&output, &[&inner]);
         }
-        if index != 5 {
-            assert_eq!(calls(), before, "denial contacted provider: {index}");
+        let mut expected_calls = before;
+        if index == 5 {
+            expected_calls.extend_from_slice(b"read\n");
         }
+        assert_eq!(calls(), expected_calls, "wrong provider path: {index}");
+        assert_eq!(fs::read(&secondary_calls).unwrap(), unchanged_secondary);
+        assert_sessions_settled();
     }
+
+    // Retrieval is all-or-nothing even when a later provider operation fails.
+    let mut expected_calls = calls();
+    expected_calls.extend_from_slice(b"read\nread\n");
+    let marker = root.join("partially-retrieved-consumer");
+    let inner = root.join("partial-inner.json");
+    let outer = root.join("partial-outer.json");
+    let mut partial = launch(&installed, root, "secret-executor", &outer);
+    partial
+        .args(["secret", "exec", "--stdin", "token", "--env", "GENERIC_TOKEN=missing-token", "--result-file"])
+        .arg(&inner)
+        .args(["--", "/usr/bin/touch"])
+        .arg(&marker);
+    let output = bounded_output(&mut partial);
+    assert_eq!(output.status.code(), Some(4));
+    assert_report(&inner, "resource_denied", Some(false), 4);
+    assert!(!marker.exists());
+    assert_eq!(calls(), expected_calls);
+    assert_eq!(fs::read(&secondary_calls).unwrap(), unchanged_secondary);
+    assert_value_free(&output, &[&inner, &outer]);
+    assert_sessions_settled();
 
     // Fresh administrator approval is never inferred from noninteractive input.
     // This proves only the public no-start gate, not native Sudo authorization.
@@ -315,4 +342,10 @@ fn assert_value_free(output: &Output, reports: &[&Path]) {
     for forbidden in ["fixture-export", "fixture-enrollment", "op://", "ambient-value"] {
         assert!(!observations.contains(forbidden));
     }
+}
+
+fn assert_sessions_settled() {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let sessions = PathBuf::from(format!("/run/user/{uid}/dev-auth-v3/user-sessions"));
+    assert_eq!(fs::read_dir(sessions).unwrap().count(), 0);
 }
