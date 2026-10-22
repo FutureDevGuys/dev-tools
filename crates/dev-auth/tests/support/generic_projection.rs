@@ -325,7 +325,7 @@ resources = {}
         assert_sessions_settled();
     }
 
-    // Retrieval is all-or-nothing even when a later provider operation fails.
+    // Consumer startup is all-or-nothing even when a later provider operation fails.
     let mut expected_calls = calls();
     expected_calls.extend_from_slice(b"read\nread\n");
     let marker = root.join("partially-retrieved-consumer");
