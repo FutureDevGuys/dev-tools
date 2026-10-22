@@ -23,6 +23,10 @@ use wait_timeout::ChildExt;
 #[path = "support/enrolled_store.rs"]
 mod enrolled_store;
 
+#[cfg(target_os = "linux")]
+#[path = "support/generic_projection.rs"]
+mod generic_projection;
+
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
@@ -3824,7 +3828,7 @@ fn installed_user_only_workload_validates_selected_slots_without_key_export() {
         .unwrap()
         .unwrap();
     if user.name == "dev-auth-test" {
-        run_installed_user_only_validation_child();
+        run_installed_user_only_validation_child(false);
         return;
     }
     let sandbox = NativeUserSandbox::new();
@@ -3865,7 +3869,7 @@ fn installed_user_only_workload_validates_selected_slots_without_key_export() {
 }
 
 #[cfg(target_os = "linux")]
-fn run_installed_user_only_validation_child() {
+fn run_installed_user_only_validation_child(generic_projection: bool) {
     use dev_auth::setup::{
         install_at, reconcile_workload_launchers_at, InstallMode, InstallRequest, SetupPaths,
     };
@@ -4217,6 +4221,9 @@ products = ["fixture"]
         fs::read_to_string(primary.with_extension("calls")).unwrap(),
         "user\nread\nread\nread\nread\n"
     );
+    if generic_projection {
+        generic_projection::exercise(&paths, &root);
+    }
 }
 
 #[cfg(target_os = "linux")]
