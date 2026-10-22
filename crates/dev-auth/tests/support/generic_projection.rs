@@ -197,10 +197,29 @@ resources = {}
     assert!(String::from_utf8_lossy(&output.stdout).contains("generic child stdout"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("generic child stderr"));
     assert_value_free(&output, &[&inner_result, &outer_result]);
-    assert_report(&inner_result, "exited", true, 29);
-    assert_report(&outer_result, "exited", true, 29);
+    assert_report(&inner_result, "exited", Some(true), 29);
+    assert_report(&outer_result, "exited", None, 29);
     assert!(std::env::var_os("GENERIC_TOKEN").is_none());
     assert!(std::env::var_os("GENERIC_FILE").is_none());
+
+    // An unmodified system binary has no Dev Auth library or adapter.
+    let cat_outer = root.join("cat-outer.json");
+    let cat_inner = root.join("cat-inner.json");
+    let mut cat = launch(&installed, root, "secret-executor", &cat_outer);
+    cat.args(["secret", "exec", "--stdin", "token", "--result-file"])
+        .arg(&cat_inner)
+        .args(["--", "/usr/bin/cat"]);
+    let cat = bounded_output(&mut cat);
+    assert!(cat.status.success());
+    assert!(cat.stdout == b"fixture-export");
+    assert!(cat.stderr.is_empty());
+    assert_report(&cat_inner, "exited", Some(true), 0);
+    // Child stdout belongs to the consumer, not to value-free control output.
+    assert_value_free(&Output {
+        status: cat.status,
+        stdout: Vec::new(),
+        stderr: cat.stderr,
+    }, &[&cat_inner, &cat_outer]);
 
     for (index, workload, projection, resource, command, expected, outcome) in [
         (0, "secret-executor", "GENERIC_TOKEN", "unknown-resource", "/usr/bin/touch", 4, "resource_denied"),
@@ -229,7 +248,7 @@ resources = {}
         if outcome.is_empty() {
             assert!(!inner.exists());
         } else {
-            assert_report(&inner, outcome, false, expected);
+            assert_report(&inner, outcome, Some(false), expected);
         }
         assert_value_free(&output, &[&outer]);
         if inner.exists() {
@@ -261,7 +280,7 @@ resources = {}
             .arg(&marker),
     );
     assert_eq!(output.status.code(), Some(3));
-    assert_report(&result, "approval_required", false, 3);
+    assert_report(&result, "approval_required", Some(false), 3);
     assert_value_free(&output, &[&result]);
     assert!(!marker.exists());
     assert_eq!(calls(), before);
@@ -279,10 +298,10 @@ fn launch(installed: &Path, root: &Path, workload: &str, result: &Path) -> Comma
     command
 }
 
-fn assert_report(path: &Path, outcome: &str, started: bool, code: i32) {
+fn assert_report(path: &Path, outcome: &str, started: Option<bool>, code: i32) {
     let report: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(report["outcome"], outcome);
-    assert_eq!(report["started"], started);
+    assert_eq!(report["started"], serde_json::json!(started));
     assert_eq!(report["exit_code"], code);
 }
 
