@@ -497,19 +497,8 @@ fn validate_secret_projections(
     requests: &[crate::secret_execution::Request],
     resources: &BTreeMap<String, ResourceSelection>,
 ) -> Result<()> {
-    if requests.is_empty() {
-        return Ok(());
-    }
-    crate::secret_execution::validate(requests)?;
+    crate::secret_execution::validate_workload(requests)?;
     for request in requests {
-        // Descriptor-bearing projections remain an explicit secret-exec surface.
-        // Declarative launch must not replace the native monitor's owned FDs.
-        if !matches!(
-            request.target,
-            crate::secret_execution::Target::Environment(_)
-        ) {
-            bail!("declarative launch supports only environment secret projections");
-        }
         let resource = resources
             .get(&request.resource)
             .context("secret projection resource is outside selected authority")?;
