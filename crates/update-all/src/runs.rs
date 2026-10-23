@@ -502,6 +502,8 @@ fn valid_issue_evidence(task: &Value) -> bool {
                                             | "unchanged"
                                             | "failed"
                                             | "blocked"
+                                            | "deferred"
+                                            | "unconfirmed"
                                             | "skipped"
                                             | "info"
                                     )
@@ -585,7 +587,7 @@ fn count_issue_tasks(tasks: &[Value]) -> usize {
                                     rows.iter().any(|row| {
                                         matches!(
                                             row.get("status").and_then(Value::as_str),
-                                            Some("failed" | "blocked")
+                                            Some("failed" | "blocked" | "deferred" | "unconfirmed")
                                         )
                                     })
                                 })

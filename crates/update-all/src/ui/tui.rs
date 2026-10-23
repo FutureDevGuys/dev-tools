@@ -1,7 +1,7 @@
 use crate::ui::{
     is_report_meta_line, is_report_note_line, looks_like_interactive_prompt, DashboardEvent,
     DashboardQuitBehavior, DashboardReceiver, LogLevel, LogRecord, LogStream, LogViewTarget,
-    MouseRowStride, TaskState, UiControlEvent, RUN_LOG_SCOPE,
+    MouseRowStride, TaskPresentation, TaskState, UiControlEvent, RUN_LOG_SCOPE,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -36,6 +36,7 @@ struct TaskRow {
     accepts_input: bool,
     input_enabled: bool,
     state: TaskState,
+    presentation: Option<TaskPresentation>,
     detail: Option<String>,
     logs: VecDeque<LogRecord>,
     logs_dropped: u64,
@@ -378,6 +379,7 @@ impl Model {
                 accepts_input,
                 input_enabled: false,
                 state: TaskState::Pending,
+                presentation: None,
                 detail: None,
                 logs: pending_logs
                     .as_ref()
@@ -395,6 +397,7 @@ impl Model {
     fn set_task_state(&mut self, id: &str, state: TaskState, detail: Option<String>) {
         if let Some(task) = self.tasks.get_mut(id) {
             task.state = state;
+            task.presentation = None;
             task.detail = detail.map(|d| sanitize_log_line(&d));
         }
     }
@@ -689,8 +692,16 @@ pub fn run_dashboard(
                         generation,
                         reason: _,
                     } => model.cancel_prompt_request(&id, generation),
-                    DashboardEvent::TaskStateChanged { id, state, detail } => {
+                    DashboardEvent::TaskStateChanged {
+                        id,
+                        state,
+                        detail,
+                        presentation,
+                    } => {
                         model.set_task_state(&id, state, detail);
+                        if let Some(task) = model.tasks.get_mut(&id) {
+                            task.presentation = presentation;
+                        }
                     }
                     DashboardEvent::LogLine(rec) => model.push_task_log(rec),
                     DashboardEvent::DisplayLogsOmitted { task_id, count } => {
@@ -2231,35 +2242,35 @@ fn task_render_plan(model: &Model, visible_rows: usize, inner_width: usize) -> T
                 .regex
                 .as_ref()
                 .is_some_and(|re| task_matches_regex(row, re));
-            let status = match row.state {
-                TaskState::Pending => {
-                    let waiting = model.dependency_waiting_on(row);
-                    if waiting.is_empty() {
-                        "Pending".to_string()
-                    } else {
-                        format!("Pending ({})", waiting.join(","))
+            let status = row
+                .presentation
+                .map(|presentation| presentation.label().to_string())
+                .unwrap_or_else(|| match row.state {
+                    TaskState::Pending => {
+                        let waiting = model.dependency_waiting_on(row);
+                        if waiting.is_empty() {
+                            "Pending".to_string()
+                        } else {
+                            format!("Pending ({})", waiting.join(","))
+                        }
                     }
-                }
-                TaskState::Running => "Running".to_string(),
-                TaskState::Completed => "Completed".to_string(),
-                TaskState::Failed => "Failed".to_string(),
-                TaskState::Canceled => "Canceled".to_string(),
-                TaskState::Skipped => "Skipped".to_string(),
+                    TaskState::Running => "Running".to_string(),
+                    TaskState::Completed => "Completed".to_string(),
+                    TaskState::Failed => "Failed".to_string(),
+                    TaskState::Canceled => "Canceled".to_string(),
+                    TaskState::Skipped => "Skipped".to_string(),
+                });
+            let status_color = if row.presentation.is_some() {
+                Color::Yellow
+            } else {
+                state_color(row.state)
             };
-            let status_color = state_color(row.state);
             let mut marker_style = Style::default().fg(Color::DarkGray);
             let mut label_style = Style::default()
                 .fg(status_color)
                 .add_modifier(Modifier::BOLD);
             let mut status_style = Style::default().fg(status_color);
-            let mut detail_style = Style::default().fg(match row.state {
-                TaskState::Completed => Color::Green,
-                TaskState::Failed => Color::Red,
-                TaskState::Canceled => Color::Yellow,
-                TaskState::Running => Color::Cyan,
-                TaskState::Pending => Color::DarkGray,
-                TaskState::Skipped => Color::Blue,
-            });
+            let mut detail_style = Style::default().fg(status_color);
             let mut marker = if selected { "▶ " } else { "  " };
 
             if row.state == TaskState::Running {
@@ -4340,7 +4351,10 @@ fn render_help_lines() -> Vec<Line<'static>> {
         help_entry(&["n", "N"], "jump to next or previous search match"),
         help_entry(&["w"], "toggle wrap for task and global logs"),
         help_entry(&["c"], "clear logs in the visible log pane (memory only)"),
-        help_entry(&["m"], "open the selected task or run log in a live pager"),
+        help_entry(
+            &["m"],
+            "open task/run log (Less: q returns, F follows, Ctrl+C returns; tail: Ctrl+C)",
+        ),
         help_entry(&["r"], "rename this run"),
         help_entry(&["?"], "toggle this help overlay"),
         help_entry(&["Esc"], "close help, search, or prompt editor"),

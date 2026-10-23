@@ -273,6 +273,7 @@ impl BuiltinDetectionMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinReportParser {
     ArchUpdateServices,
+    OperationResult,
     Scoop,
     VersionLines,
     Winget,
@@ -283,6 +284,7 @@ impl BuiltinReportParser {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "arch_update_services" => Some(Self::ArchUpdateServices),
+            "operation_result" => Some(Self::OperationResult),
             "scoop" => Some(Self::Scoop),
             "version_lines" => Some(Self::VersionLines),
             "winget" => Some(Self::Winget),
@@ -294,6 +296,7 @@ impl BuiltinReportParser {
     pub fn supported_values() -> &'static [&'static str] {
         &[
             "arch_update_services",
+            "operation_result",
             "scoop",
             "version_lines",
             "winget",
@@ -304,6 +307,7 @@ impl BuiltinReportParser {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ArchUpdateServices => "arch_update_services",
+            Self::OperationResult => "operation_result",
             Self::Scoop => "scoop",
             Self::VersionLines => "version_lines",
             Self::Winget => "winget",
@@ -1532,11 +1536,11 @@ fn validate_non_empty_catalog_scalar(task_id: &str, field: &str, value: &str) ->
 fn validate_report_pattern_status(task_id: &str, idx: usize, status: &str) -> Result<()> {
     match status.trim().to_ascii_lowercase().as_str() {
         "updated" | "refreshed" | "refresh" | "passed" | "pass" | "unchanged" | "skipped"
-        | "failed" | "blocked" | "info" => {
+        | "failed" | "blocked" | "deferred" | "unconfirmed" | "info" => {
             Ok(())
         }
         _ => anyhow::bail!(
-            "built-in updater catalog task '{}' report pattern {} has invalid status '{}'; expected updated|refreshed|passed|pass|unchanged|skipped|failed|blocked|info",
+            "built-in updater catalog task '{}' report pattern {} has invalid status '{}'; expected updated|refreshed|passed|pass|unchanged|skipped|failed|blocked|deferred|unconfirmed|info",
             task_id,
             idx,
             status

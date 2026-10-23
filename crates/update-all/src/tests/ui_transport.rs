@@ -12,6 +12,37 @@ fn display_record(task_id: &str, line: impl Into<String>) -> DashboardEvent {
 }
 
 #[test]
+fn truthful_task_presentation_survives_transport_and_keeps_journal_state() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(RunLogSink::new(temp.path(), false).unwrap());
+    let (tx, rx) = DashboardSender::bounded(Some(log.clone()), 7, &["fixture".into()]);
+    tx.send(DashboardEvent::TaskStateChanged {
+        id: "fixture".into(),
+        state: TaskState::Completed,
+        detail: None,
+        presentation: Some(TaskPresentation::Deferred),
+    })
+    .unwrap();
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(
+        event,
+        DashboardEvent::TaskStateChanged {
+            state: TaskState::Completed,
+            presentation: Some(TaskPresentation::Deferred),
+            ..
+        }
+    ));
+    let journal = fs::read_to_string(log.run_dir().join("events.jsonl")).unwrap();
+    let event: serde_json::Value = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .find(|event: &serde_json::Value| event["kind"] == "task_state_changed")
+        .unwrap();
+    assert_eq!(event["payload"]["state"], "completed");
+    assert_eq!(event["payload"]["presentation"], "deferred");
+}
+
+#[test]
 fn dashboard_transport_bounds_flood_and_accounts_for_every_omitted_record() {
     let (tx, rx) = DashboardSender::bounded(None, 7, &["a".into(), "b".into()]);
     for index in 0..100_000 {
@@ -84,6 +115,7 @@ fn dashboard_transport_coalesces_prompt_flood_without_losing_current_generation(
         })
         .unwrap();
         tx.send(DashboardEvent::TaskStateChanged {
+            presentation: None,
             id: "task".into(),
             state: TaskState::Running,
             detail: Some(generation.to_string()),
