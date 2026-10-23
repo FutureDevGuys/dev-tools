@@ -70,7 +70,14 @@ impl Adapter {
                 values.push(("GOMODCACHE", shared.join("go-mod")));
                 values.push(("GOTMPDIR", repo.join("temp/go")));
             }
-            Self::Npm => values.push(("npm_config_cache", shared.join("npm"))),
+            Self::Npm => {
+                if !context.inherited.keys().any(|key| {
+                    key.eq_ignore_ascii_case("npm_config_cache")
+                        && !provenance::inherited_is_managed(&context.inherited, key)
+                }) {
+                    values.push(("npm_config_cache", shared.join("npm")));
+                }
+            }
             Self::Pnpm => {
                 values.push(("pnpm_config_store_dir", shared.join("pnpm-store")));
                 values.push(("pnpm_config_cache_dir", shared.join("pnpm-cache")));
