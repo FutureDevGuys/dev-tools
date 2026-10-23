@@ -1779,10 +1779,11 @@ impl App {
             Ok(result) => result,
             Err(err) => return Err(self.fail(EXIT_USAGE, &err.to_string())),
         };
-        if result.status != 0 {
+        if !result.status.success() {
             let message = format!(
-                "skills list {}--json failed",
-                if scope == "global" { "-g " } else { "" }
+                "skills list {}--json failed ({})",
+                if scope == "global" { "-g " } else { "" },
+                result.status
             );
             return Err(self.fail(EXIT_USAGE, &message));
         }
@@ -1902,7 +1903,7 @@ impl App {
             args.first().is_some_and(|arg| arg == "list"),
         )?;
         Ok(ChildResult {
-            status: output.status.code().unwrap_or(EXIT_USAGE),
+            status: output.status,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         })
     }
@@ -1926,7 +1927,7 @@ impl App {
                     return self.fail(EXIT_USAGE, &message);
                 }
             };
-            if output.status != 0 {
+            if !output.status.success() {
                 let mut message = format!("command failed: {}", planned.command);
                 if let Err(err) = self.apply_post_command_agent_cleanup() {
                     message.push_str(&format!("; post-command cleanup failed: {err}"));
@@ -2645,7 +2646,7 @@ impl Style {
 
 #[derive(Clone, Debug)]
 struct ChildResult {
-    status: i32,
+    status: std::process::ExitStatus,
     stdout: String,
 }
 

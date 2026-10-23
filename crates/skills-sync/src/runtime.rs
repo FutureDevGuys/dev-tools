@@ -81,10 +81,75 @@ pub(super) fn execute(
             .iter()
             .map(|failure| format!("{:?}", failure.operation()))
             .collect::<Vec<_>>();
-        if cleanup.is_empty() {
-            anyhow!("{error}")
-        } else {
-            anyhow!("{error}; cleanup failed: {}", cleanup.join(", "))
+        if error.io_error().is_none() && cleanup.is_empty() {
+            return anyhow::Error::new(error);
         }
+        let mut detail = error.to_string();
+        if let Some(source) = error.io_error() {
+            if let Some(errno) = source.raw_os_error() {
+                detail.push_str(&format!(" ({:?}, os error {errno})", source.kind()));
+            } else {
+                detail.push_str(&format!(" ({:?})", source.kind()));
+            }
+        }
+        if !cleanup.is_empty() {
+            detail.push_str(&format!("; cleanup failed: {}", cleanup.join(", ")));
+        }
+        anyhow::Error::new(error).context(detail)
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use dev_tools_command::{BoundedCommandError, BoundedCommandErrorKind};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn provider_spawn_failure_preserves_safe_errno_and_typed_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("invalid-provider");
+        std::fs::write(&program, b"not an executable format\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for public_listing in [false, true] {
+            let mut command = Command::new(&program);
+            command.arg("secret-fixture-argument");
+            let error = execute(command, Duration::from_secs(2), public_listing).unwrap_err();
+            let source = error
+                .downcast_ref::<BoundedCommandError>()
+                .expect("typed command cause");
+            assert_eq!(source.kind(), BoundedCommandErrorKind::Start);
+            let errno = source
+                .io_error()
+                .and_then(std::io::Error::raw_os_error)
+                .unwrap();
+            assert!(error.to_string().contains(&format!("os error {errno}")));
+            assert!(!format!("{error:#}").contains("secret-fixture-argument"));
+            assert!(!format!("{error:#}").contains("not an executable format"));
+        }
+    }
+
+    #[test]
+    fn provider_timeout_preserves_category_without_captured_output() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "runtime::tests::provider_wait_fixture",
+            "--nocapture",
+        ]);
+        let error = execute(command, Duration::from_millis(100), false).unwrap_err();
+        let source = error
+            .downcast_ref::<BoundedCommandError>()
+            .expect("typed timeout cause");
+        assert_eq!(source.kind(), BoundedCommandErrorKind::TimedOut);
+        assert!(!format!("{error:#}").contains("secret-fixture-output"));
+    }
+
+    #[test]
+    #[ignore = "owned subprocess fixture for timeout diagnostic containment"]
+    fn provider_wait_fixture() {
+        println!("secret-fixture-output");
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }
