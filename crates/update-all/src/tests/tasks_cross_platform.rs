@@ -3687,14 +3687,14 @@ fn failed_command_report_retains_pipx_before_inventory_without_claiming_refresh(
     assert_eq!(rows.len(), 7);
     assert!(rows
         .iter()
-        .all(|row| row.status == TaskReportStatus::Blocked));
+        .all(|row| serde_json::to_value(row.status).unwrap() == "unconfirmed"));
     for (name, version) in versions {
         let row = rows.iter().find(|row| row.name == name).unwrap();
         assert_eq!(row.before.as_deref(), Some(version.as_str()));
-        assert_eq!(row.after.as_deref(), Some("-"));
+        assert!(row.after.is_none());
         assert!(row.note.as_deref().unwrap().contains("not confirmed"));
     }
-    assert_eq!(summarize_task_items(&result), "blocked=7");
+    assert_eq!(summarize_task_items(&result), "unconfirmed=7");
 
     // A package completion observed before a later timeout remains an update
     // even when the final inventory is unavailable.
@@ -3786,7 +3786,7 @@ fn command_state_report_preserves_non_available_parenthetical_versions() {
 }
 
 #[test]
-fn builtin_command_tasks_limit_report_parsers_to_foundation_managers() {
+fn builtin_command_tasks_limit_bespoke_parsers_to_foundation_managers() {
     let allowed_parser_tasks = BTreeMap::from([
         (
             "builtin/arch-update-services",
@@ -3803,6 +3803,9 @@ fn builtin_command_tasks_limit_report_parsers_to_foundation_managers() {
         let Some(parser) = task.report_parser else {
             continue;
         };
+        if parser == BuiltinReportParser::OperationResult {
+            continue;
+        }
 
         assert_eq!(
             allowed_parser_tasks.get(task.id.as_str()).copied(),
@@ -5818,6 +5821,242 @@ fn structured_command_result_marks_a_successful_process_as_deferred() {
 }
 
 #[test]
+fn truthful_operation_reports_preserve_observed_versions_and_change_uncertainty() {
+    let parser = BuiltinReportParser::parse("operation_result");
+    assert!(
+        parser.is_some(),
+        "explicit generic result parser must be supported"
+    );
+    let legacy = build_command_report_sections(
+        parser,
+        r#"{
+        "product":"skills-sync","version":"0.2.0","changed":false,
+        "managed":true,"outcome":"no_op",
+        "path":"/fixture/products/skills-sync/versions/0.2.0/skills-sync"
+    }"#,
+    );
+    assert_eq!(legacy.len(), 1);
+    let row = &legacy[0].rows[0];
+    assert_eq!(row.name, "skills-sync");
+    assert!(row.before.is_none());
+    assert_eq!(row.after.as_deref(), Some("0.2.0"));
+    assert!(row.note.as_deref().unwrap().contains("no change reported"));
+    assert!(!row.note.as_deref().unwrap().contains("up to date"));
+    let diagnostic = build_command_report_sections(parser, "{\"product\":\"example\",\"version\":\"2.0\",\"managed\":true,\"changed\":false,\"outcome\":\"no_op\"}\nwarning: fixture diagnostic\n");
+    assert_eq!(diagnostic.len(), 1);
+    assert!(build_command_report_sections(parser, "{\"product\":\"example\",\"version\":\"2.0\",\"managed\":true,\"changed\":false,\"outcome\":\"no_op\"}\n{}\n").is_empty());
+    assert!(build_command_report_sections(parser, r#"{"schema":"dev-tools-operation-result-v2","product":"example","operation":"update_apply","outcome":"completed","exit_code":0}"#).is_empty());
+
+    let uncertain = build_command_report_sections(
+        parser,
+        r#"{
+        "schema":"dev-tools-operation-result-v2","product":"another-tool",
+        "operation":"update_apply","outcome":"failed","changed":null,
+        "available_version":"3.0","exit_code":1,"error_kind":"operational"
+    }"#,
+    );
+    assert_eq!(uncertain.len(), 1);
+    let row = &uncertain[0].rows[0];
+    assert!(row.before.is_none());
+    assert!(row.after.is_none());
+    assert!(row.note.as_deref().unwrap().contains("change unknown"));
+    assert!(row.note.as_deref().unwrap().contains("available: 3.0"));
+    assert!(
+        build_command_report_sections(None, r#"{"product":"example-tool","changed":true}"#)
+            .is_empty()
+    );
+}
+
+#[test]
+fn truthful_operation_result_rejects_invalid_required_v2_domains() {
+    let parser = Some(BuiltinReportParser::OperationResult);
+    let document = serde_json::json!({
+        "schema": "dev-tools-operation-result-v2",
+        "product": "example",
+        "operation": "update_apply",
+        "outcome": "completed",
+        "changed": false,
+        "installed_version": "2.0",
+        "exit_code": 0,
+        "future_observation": {"retained": true}
+    });
+    assert_eq!(
+        build_command_report_sections(parser, &document.to_string()).len(),
+        1
+    );
+    for operation in [
+        "doctor",
+        "update_status",
+        "update_check",
+        "update_install",
+        "update_apply",
+        "update_rollback",
+    ] {
+        let mut valid = document.clone();
+        valid["operation"] = serde_json::json!(operation);
+        assert_eq!(
+            build_command_report_sections(parser, &valid.to_string()).len(),
+            1,
+            "{operation}"
+        );
+    }
+    for exit_code in [0, 1, 2, 3, 4, 130] {
+        let mut valid = document.clone();
+        valid["exit_code"] = serde_json::json!(exit_code);
+        assert_eq!(
+            build_command_report_sections(parser, &valid.to_string()).len(),
+            1,
+            "{exit_code}"
+        );
+    }
+    for operation in ["", "unknown_operation"] {
+        let mut invalid = document.clone();
+        invalid["operation"] = serde_json::json!(operation);
+        assert!(
+            build_command_report_sections(parser, &invalid.to_string()).is_empty(),
+            "operation={operation:?}"
+        );
+    }
+    for exit_code in [-1, 5, 200] {
+        let mut invalid = document.clone();
+        invalid["exit_code"] = serde_json::json!(exit_code);
+        assert!(
+            build_command_report_sections(parser, &invalid.to_string()).is_empty(),
+            "exit_code={exit_code}"
+        );
+    }
+    for product in ["Example Product".to_string(), "a".repeat(65)] {
+        let mut invalid = document.clone();
+        invalid["product"] = serde_json::json!(product);
+        assert!(
+            build_command_report_sections(parser, &invalid.to_string()).is_empty(),
+            "product={product:?}"
+        );
+    }
+    for outcome in ["not_applicable", "externally_managed"] {
+        let mut invalid = document.clone();
+        invalid["outcome"] = serde_json::json!(outcome);
+        assert!(
+            build_command_report_sections(parser, &invalid.to_string()).is_empty(),
+            "outcome={outcome}"
+        );
+    }
+    assert_eq!(build_command_report_sections(parser, r#"{"product":"Legacy Subject","managed":false,"changed":false,"outcome":"not_applicable"}"#).len(), 1);
+}
+
+#[test]
+fn truthful_operation_report_allows_progress_but_rejects_additional_documents() {
+    let parser = BuiltinReportParser::parse("operation_result");
+    let document =
+        r#"{"product":"example","version":"2.0","managed":true,"changed":false,"outcome":"no_op"}"#;
+    for progress in [
+        "Checking installation",
+        "[download] fetching",
+        "[1/10] fetching",
+        "warning: fixture diagnostic",
+    ] {
+        assert_eq!(
+            build_command_report_sections(parser, &format!("{document}\n{progress}\n")).len(),
+            1,
+            "{progress}"
+        );
+    }
+    for extra in [
+        "{}",
+        "[]",
+        "[1, 2]",
+        "progress\n{\n  \"product\": \"second\"\n}",
+    ] {
+        assert!(
+            build_command_report_sections(parser, &format!("{document}\n{extra}\n")).is_empty(),
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn truthful_deferred_result_has_a_row_without_changing_dependency_health() {
+    let mut result = TaskResult::completed("Example Tool");
+    assert!(apply_structured_command_result(
+        &mut result,
+        "UPDATE_ALL_RESULT {\"outcome\":\"deferred\",\"detail\":\"close the application\",\"current\":\"1.0\",\"latest\":\"2.0\"}",
+    ));
+    assert_eq!(result.status, TaskStatus::Completed);
+    assert!(result.is_blocked_or_deferred());
+    assert!(!result.blocks_dependents());
+    assert_eq!(result.presentation(), Some(TaskPresentation::Deferred));
+    assert!(result.stops_new_admission());
+    assert!(dependency_ready("consumer", "example", &result));
+    assert_eq!(result.report_sections.len(), 1);
+    let row = &result.report_sections[0].rows[0];
+    assert_eq!(serde_json::to_value(row.status).unwrap(), "deferred");
+    assert_eq!(row.before.as_deref(), Some("1.0"));
+    assert!(row.after.is_none());
+    assert!(row.note.as_deref().unwrap().contains("available: 2.0"));
+    assert_eq!(summarize_task_items(&result), "deferred=1 advisories=1");
+    assert_eq!(
+        task_status_cell_from_parts(result.status, result.has_issues(), result.presentation()),
+        "Deferred"
+    );
+    assert!(task_outcome_message(&result).starts_with("task outcome: deferred - "));
+    result.advisories.clear();
+    result.report_sections[0].rows[0].status = TaskReportStatus::Unconfirmed;
+    assert_eq!(
+        task_status_cell_from_parts(result.status, result.has_issues(), result.presentation()),
+        "Unconfirmed"
+    );
+    assert!(task_outcome_message(&result).starts_with("task outcome: unconfirmed - "));
+}
+
+#[test]
+fn truthful_diagnostics_are_not_package_changes_or_version_observations() {
+    let section = command_diagnostic_report_section("error: fixture failure\n").unwrap();
+    assert!(section.rows[0].before.is_none());
+    assert!(section.rows[0].after.is_none());
+    let mut result = TaskResult::completed("Example Task");
+    result.report_sections.push(section);
+    let rendered = render_package_change_rollup_with_width(
+        [("example", &result)],
+        &BTreeMap::new(),
+        false,
+        crate::config::NoteVerbosity::None,
+        false,
+        120,
+    );
+    let text = rendered
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("Package Change Rollup"), "{text}");
+    assert!(text.contains("Command Diagnostics"), "{text}");
+    assert!(text.contains("Example Task"), "{text}");
+    assert!(text.contains("fixture failure"), "{text}");
+    assert!(!text.contains("Before"), "{text}");
+    assert!(!text.contains("After"), "{text}");
+}
+
+#[test]
+fn truthful_wrapper_failure_names_the_task_not_the_executable() {
+    let task = crate::updaters::builtin_catalog()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "builtin/dev-tools-dev-cache")
+        .unwrap();
+    let TaskKind::Command(cmd) = builtin_to_task_spec(task, false).kind else {
+        panic!("expected command task");
+    };
+    let result = failed_command_result_with_report_sections(
+        "Example Product",
+        "operation failed",
+        &cmd,
+        "operation failed",
+        None,
+    );
+    assert_eq!(result.report_sections[0].rows[0].name, "Example Product");
+}
+
+#[test]
 fn structured_command_result_rejects_missing_or_malformed_payloads() {
     let mut missing = TaskResult::completed("Missing");
     assert!(!apply_structured_command_result(
@@ -5897,6 +6136,7 @@ fn dashboard_sender_records_detachment_once_and_stays_in_plain_fallback() {
 
     assert!(event_tx
         .send(DashboardEvent::TaskStateChanged {
+            presentation: None,
             id: "builtin/demo".to_string(),
             state: TaskState::Running,
             detail: None,
@@ -5905,6 +6145,7 @@ fn dashboard_sender_records_detachment_once_and_stays_in_plain_fallback() {
     assert!(event_tx.is_detached());
     assert!(event_tx
         .send(DashboardEvent::TaskStateChanged {
+            presentation: None,
             id: "builtin/demo".to_string(),
             state: TaskState::Completed,
             detail: Some("updated".to_string()),
@@ -5998,6 +6239,7 @@ fn journal_failure_blocks_dashboard_delivery_without_faking_detachment() {
 
     assert!(event_tx
         .send(DashboardEvent::TaskStateChanged {
+            presentation: None,
             id: "builtin/demo".to_string(),
             state: TaskState::Running,
             detail: None,
@@ -6125,7 +6367,7 @@ exit 0
     assert!(saw_suspend, "dashboard was not suspended before pager");
     assert!(saw_resume, "dashboard was not resumed after pager");
     let pager_args = fs::read_to_string(marker).unwrap();
-    assert!(pager_args.contains("+F"), "{pager_args}");
+    assert!(pager_args.contains("+G"), "{pager_args}");
     assert!(pager_args.contains("-K"), "{pager_args}");
     assert!(pager_args.contains("task-npm.log"), "{pager_args}");
 }
@@ -6224,19 +6466,19 @@ exit 0
     assert!(saw_suspend, "dashboard was not suspended before pager");
     assert!(saw_resume, "dashboard was not resumed after pager");
     let pager_args = fs::read_to_string(marker).unwrap();
-    assert!(pager_args.contains("+F"), "{pager_args}");
+    assert!(pager_args.contains("+G"), "{pager_args}");
     assert!(pager_args.contains("-K"), "{pager_args}");
     assert!(pager_args.contains("task-npm.log"), "{pager_args}");
 }
 
 #[test]
-fn log_pager_less_args_follow_and_exit_on_interrupt() {
+fn log_pager_less_args_browse_at_end_and_exit_on_interrupt() {
     let args = log_pager_args(LogPagerKind::Less, Path::new("task-yay.log"))
         .into_iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
-    assert_eq!(args, vec!["+F", "-K", "-R", "-S", "task-yay.log"]);
+    assert_eq!(args, vec!["+G", "-K", "-R", "-S", "task-yay.log"]);
 }
 
 #[test]

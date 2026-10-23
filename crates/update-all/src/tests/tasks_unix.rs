@@ -653,9 +653,9 @@ exit 7
             .iter()
             .find(|row| row.name == "fixture-tool")
             .expect("observed installed package");
-        assert_eq!(row.status, TaskReportStatus::Blocked);
+        assert_eq!(row.status, TaskReportStatus::Unconfirmed);
         assert_eq!(row.before.as_deref(), Some("1.2.3"));
-        assert_eq!(row.after.as_deref(), Some("-"));
+        assert!(row.after.is_none());
         assert_eq!(
             row.note.as_deref(),
             Some("after-state not observed; update not confirmed")
@@ -2050,7 +2050,7 @@ exit 0
     let events = ui_thread.join().expect("ui thread");
     assert_eq!(events, vec!["suspend", "resume"]);
     let less_args = fs::read_to_string(&less_args_file).unwrap();
-    assert!(less_args.contains("+F"), "{less_args}");
+    assert!(less_args.contains("+G"), "{less_args}");
     assert!(less_args.contains("-K"), "{less_args}");
     assert!(less_args.contains("-R"), "{less_args}");
     assert!(less_args.contains("-S"), "{less_args}");
@@ -2093,6 +2093,22 @@ fn log_pager_accepts_only_less_interrupt_status() {
             .to_string()
             .contains("launch less")
     );
+}
+
+#[test]
+fn log_pager_accepts_only_tail_sigint() {
+    let temp = TempDir::new().unwrap();
+    let program = temp.path().join("pager");
+    let log = temp.path().join("run.log");
+    fs::write(&log, "log line\n").unwrap();
+
+    write_executable(&program, "#!/bin/sh\nkill -INT $$\n");
+    assert!(run_log_pager_command(LogPagerKind::Tail, &program, &log).is_ok());
+    for kind in [LogPagerKind::Less, LogPagerKind::Bat, LogPagerKind::More] {
+        assert!(run_log_pager_command(kind, &program, &log).is_err());
+    }
+    write_executable(&program, "#!/bin/sh\nkill -TERM $$\n");
+    assert!(run_log_pager_command(LogPagerKind::Tail, &program, &log).is_err());
 }
 
 #[test]
@@ -5228,4 +5244,105 @@ fn captured_npm_authority_failure_stops_guard_fallback_without_replaying() {
         fs::read_to_string(temp.path().join("partial-effect")).unwrap(),
         "retained"
     );
+}
+#[test]
+fn truthful_operation_result_cannot_be_satisfied_by_a_named_report_pattern() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let program = temp.path().join("operation-fixture");
+    write_executable(&program, "#!/bin/sh\nprintf 'done\\n'\n");
+    let task = crate::updaters::builtin_catalog()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "builtin/dev-tools-update-all")
+        .unwrap();
+    let mut spec = builtin_to_task_spec(task, false);
+    let TaskKind::Command(command) = &mut spec.kind else {
+        panic!("expected command task");
+    };
+    command.program = program.display().to_string();
+    command.args.clear();
+    command.report_parser = Some(BuiltinReportParser::OperationResult);
+    command.report_patterns = vec![CommandReportPattern {
+        regex: Regex::new("^done$").unwrap(),
+        section_key: "operation_results".to_string(),
+        section_title: "Operation Results".to_string(),
+        status: TaskReportStatus::Passed,
+        name: Some("example".to_string()),
+        before: None,
+        after: None,
+        note: None,
+    }];
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let TaskKind::Command(command) = &spec.kind else {
+        unreachable!()
+    };
+    let result = run_command_task(&ctx, &spec, command).unwrap();
+    assert_eq!(result.report_sections[0].rows[0].name, "example");
+    assert_eq!(
+        result.report_sections[0].rows[0].status,
+        TaskReportStatus::Passed
+    );
+    assert_eq!(result.status, TaskStatus::Failed, "{result:?}");
+    assert!(result
+        .details
+        .iter()
+        .any(|detail| detail.contains("required operation result was absent or invalid")));
+}
+
+#[test]
+fn truthful_declared_operation_result_rejects_missing_and_retains_failed_effects() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let program = temp.path().join("operation-fixture");
+    let task = crate::updaters::builtin_catalog()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "builtin/dev-tools-update-all")
+        .unwrap();
+    let mut spec = builtin_to_task_spec(task, false);
+    let TaskKind::Command(command) = &mut spec.kind else {
+        panic!("expected command task");
+    };
+    command.program = program.display().to_string();
+    command.args.clear();
+    command.report_parser = BuiltinReportParser::parse("operation_result");
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    for payload in [
+        "",
+        "not JSON",
+        "{\"schema\":\"wrong\",\"product\":\"example\",\"changed\":false,\"outcome\":\"no_op\"}",
+    ] {
+        write_executable(
+            &program,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\n"),
+        );
+        let TaskKind::Command(command) = &spec.kind else {
+            unreachable!()
+        };
+        let result = run_command_task(&ctx, &spec, command).unwrap();
+        assert_eq!(result.status, TaskStatus::Failed, "{result:?}");
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|detail| detail.contains("operation result")),
+            "{result:?}"
+        );
+    }
+    write_executable(&program, "#!/bin/sh\nprintf '%s\\n' '{\"schema\":\"dev-tools-operation-result-v2\",\"product\":\"example\",\"operation\":\"update_apply\",\"outcome\":\"failed\",\"changed\":true,\"installed_version\":\"2.0\",\"exit_code\":1}'\nexit 1\n");
+    let TaskKind::Command(command) = &spec.kind else {
+        unreachable!()
+    };
+    let result = run_command_task(&ctx, &spec, command).unwrap();
+    assert_eq!(result.status, TaskStatus::Failed);
+    let row = &result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "operation_results")
+        .unwrap()
+        .rows[0];
+    assert_eq!(row.after.as_deref(), Some("2.0"));
+    assert!(row.before.is_none());
+    assert!(row.note.as_deref().unwrap().contains("change reported"));
 }

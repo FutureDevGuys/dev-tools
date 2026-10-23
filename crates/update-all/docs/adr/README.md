@@ -55,6 +55,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0042](0042-explicit-configuration-read-selection.md) | Explicit configuration read selection | proposed | pending |
 | [0043](0043-regular-configuration-input-admission.md) | Regular configuration input admission | proposed | pending |
 | [0044](0044-preserving-run-artifact-replacement.md) | Preserving run artifact replacement | proposed | pending |
+| [0045](0045-truthful-operation-observations.md) | Truthful operation observations | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

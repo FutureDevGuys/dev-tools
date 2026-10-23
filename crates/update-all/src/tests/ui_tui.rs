@@ -3010,6 +3010,48 @@ fn dashboard_shows_evicted_log_counts_while_following_the_tail() {
 }
 
 #[test]
+fn truthful_dashboard_presentation_does_not_turn_deferred_work_green() {
+    for presentation in [
+        TaskPresentation::Deferred,
+        TaskPresentation::Blocked,
+        TaskPresentation::Unconfirmed,
+        TaskPresentation::CompletedWithIssues,
+    ] {
+        let mut model = Model::new(40, true, true);
+        model.register_task("fixture".into(), "Fixture".into(), Vec::new(), false);
+        model.register_task("next".into(), "Next".into(), vec!["fixture".into()], false);
+        model.set_task_state("fixture", TaskState::Completed, None);
+        model.tasks.get_mut("fixture").unwrap().presentation = Some(presentation);
+        assert_eq!(model.task_state_counts(), (1, 0, 1, 0, 0));
+        assert!(model.dependency_waiting_on(&model.tasks["next"]).is_empty());
+        let backend = ratatui::backend::TestBackend::new(200, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let layout = layout_for(
+            Rect::new(0, 0, 200, 40),
+            true,
+            model.right_pane_mode,
+            model.active_pane,
+        );
+        terminal
+            .draw(|frame| draw_dashboard(frame, &model, &layout))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let position = text
+            .find(presentation.label())
+            .unwrap_or_else(|| panic!("missing {}: {text}", presentation.label()));
+        let cell_position = text[..position].chars().count();
+        assert_eq!(buffer.content[cell_position].fg, Color::Yellow, "{text}");
+        model.set_task_state("fixture", TaskState::Failed, None);
+        assert!(model.tasks["fixture"].presentation.is_none());
+    }
+}
+
+#[test]
 fn diagnostic_report_warning_cells_use_warning_colors() {
     let spans = stylize_log_body(
         "warning  emitted  captured  Warning",

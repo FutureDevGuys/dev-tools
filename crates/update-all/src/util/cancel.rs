@@ -1,11 +1,16 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(any(test, not(target_os = "linux")))]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, not(target_os = "linux")))]
 static SIGNAL_CANCEL_SUPPRESSIONS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(any(test, not(target_os = "linux")))]
 #[derive(Debug)]
 pub struct SignalCancelSuppression;
 
+#[cfg(any(test, not(target_os = "linux")))]
 impl Drop for SignalCancelSuppression {
     fn drop(&mut self) {
         SIGNAL_CANCEL_SUPPRESSIONS.fetch_sub(1, Ordering::SeqCst);
@@ -13,6 +18,7 @@ impl Drop for SignalCancelSuppression {
 }
 
 pub fn request_cancel() {
+    #[cfg(any(test, not(target_os = "linux")))]
     if SIGNAL_CANCEL_SUPPRESSIONS.load(Ordering::SeqCst) > 0 {
         return;
     }
@@ -23,6 +29,7 @@ pub fn is_cancel_requested() -> bool {
     CANCEL_REQUESTED.load(Ordering::SeqCst)
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 pub fn suppress_signal_cancel() -> SignalCancelSuppression {
     SIGNAL_CANCEL_SUPPRESSIONS.fetch_add(1, Ordering::SeqCst);
     SignalCancelSuppression

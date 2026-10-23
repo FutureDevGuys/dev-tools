@@ -962,11 +962,11 @@ fn required_scoped_delta_scalar(
 fn validate_report_pattern_status(id: &str, idx: usize, status: &str) -> Result<()> {
     match status.trim().to_ascii_lowercase().as_str() {
         "updated" | "refreshed" | "refresh" | "passed" | "pass" | "unchanged" | "skipped"
-        | "failed" | "blocked" | "info" => {
+        | "failed" | "blocked" | "deferred" | "unconfirmed" | "info" => {
             Ok(())
         }
         _ => bail!(
-            "invalid updaters.tasks.{id}.report_patterns[{idx}].status '{}'; expected updated|refreshed|passed|pass|unchanged|skipped|failed|blocked|info",
+            "invalid updaters.tasks.{id}.report_patterns[{idx}].status '{}'; expected updated|refreshed|passed|pass|unchanged|skipped|failed|blocked|deferred|unconfirmed|info",
             status
         ),
     }

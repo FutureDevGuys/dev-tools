@@ -2463,7 +2463,8 @@ fn non_registry_dependency_source(spec: &str) -> Option<&'static str> {
     if trimmed.starts_with('/')
         || trimmed.starts_with("./")
         || trimmed.starts_with("../")
-        || trimmed.starts_with('~')
+        || (trimmed.starts_with('~')
+            && (trimmed == "~" || trimmed.contains('/') || trimmed.contains('\\')))
     {
         return Some("path");
     }
@@ -2615,6 +2616,8 @@ fn parse_semver(input: &str) -> Option<ParsedSemver> {
 }
 
 fn build_report_counts_line(rows: &[TaskReportRow]) -> String {
+    let mut deferred = 0usize;
+    let mut unconfirmed = 0usize;
     let mut updated = 0usize;
     let mut refreshed = 0usize;
     let mut unchanged = 0usize;
@@ -2630,13 +2633,22 @@ fn build_report_counts_line(rows: &[TaskReportRow]) -> String {
             TaskReportStatus::Unchanged => unchanged += 1,
             TaskReportStatus::Failed => failed += 1,
             TaskReportStatus::Blocked => blocked += 1,
+            TaskReportStatus::Deferred => deferred += 1,
+            TaskReportStatus::Unconfirmed => unconfirmed += 1,
             TaskReportStatus::Skipped => skipped += 1,
             TaskReportStatus::Info => info += 1,
         }
     }
-    format!(
+    let mut summary = format!(
         "NPM package report: updated={updated} refreshed={refreshed} unchanged={unchanged} failed={failed} blocked={blocked} skipped={skipped} info={info}"
-    )
+    );
+    if deferred > 0 {
+        summary.push_str(&format!(" deferred={deferred}"));
+    }
+    if unconfirmed > 0 {
+        summary.push_str(&format!(" unconfirmed={unconfirmed}"));
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -2727,6 +2739,42 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn npm_registry_tilde_ranges_are_not_local_dependency_paths() {
+        for selector in ["~1.0.0", "~1.0", "~1", "~ 1.0.0", "~1.0.0 || ~2.0.0"] {
+            let manifest = serde_json::json!({
+                "name": "fixture-root", "version": "1.0.0",
+                "dependencies": {"fixture-dependency": selector}
+            });
+            assert!(
+                parse_npm_manifest_protocol_issue_checked(
+                    &manifest.to_string(),
+                    "fixture-root",
+                    "1.0.0"
+                )
+                .unwrap()
+                .is_none(),
+                "registry range rejected: {selector}"
+            );
+        }
+        for selector in [
+            "~",
+            "~/local",
+            "~other/local",
+            "~\\local",
+            "./local",
+            "../local",
+            "/local",
+            "file:local",
+            "git+https://example.invalid/repository",
+        ] {
+            assert!(
+                non_registry_dependency_source(selector).is_some(),
+                "local source admitted: {selector}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

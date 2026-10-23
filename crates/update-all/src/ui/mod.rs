@@ -507,6 +507,26 @@ pub enum TaskState {
     Skipped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPresentation {
+    Deferred,
+    Blocked,
+    Unconfirmed,
+    CompletedWithIssues,
+}
+
+impl TaskPresentation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deferred => "Deferred",
+            Self::Blocked => "Blocked",
+            Self::Unconfirmed => "Unconfirmed",
+            Self::CompletedWithIssues => "Completed with issues",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Reason: trace level is reserved for future verbosity controls.
 pub enum LogLevel {
@@ -592,6 +612,7 @@ pub enum DashboardEvent {
         id: String,
         state: TaskState,
         detail: Option<String>,
+        presentation: Option<TaskPresentation>,
     },
     LogLine(LogRecord),
     DisplayLogsOmitted {

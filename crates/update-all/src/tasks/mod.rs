@@ -15,7 +15,7 @@ use crate::sections::Sections;
 use crate::ui::{
     looks_like_interactive_prompt, report_values_are_version_change, DashboardEvent,
     DashboardQuitBehavior, LogLevel, LogRecord, LogStream, LogViewTarget, MouseRowStride,
-    TaskState, UiControlEvent, UiModeResolved, RUN_LOG_SCOPE,
+    TaskPresentation, TaskState, UiControlEvent, UiModeResolved, RUN_LOG_SCOPE,
 };
 use crate::updaters::{
     builtin_windows_foundations, command_candidate_is_available, command_program_path,
@@ -206,19 +206,46 @@ impl TaskResult {
                 .advisories
                 .iter()
                 .any(|advisory| advisory.severity != AdvisorySeverity::Info)
-            || self.has_blocking_report_rows()
+            || self.has_incomplete_report_rows()
     }
 
     fn is_deferred(&self) -> bool {
         self.advisories
             .iter()
             .any(|advisory| advisory.code == "deferred")
+            || self.report_sections.iter().any(|section| {
+                section
+                    .rows
+                    .iter()
+                    .any(|row| row.status == TaskReportStatus::Deferred)
+            })
+    }
+
+    fn presentation(&self) -> Option<TaskPresentation> {
+        if !matches!(self.status, TaskStatus::Completed | TaskStatus::Skipped) {
+            return None;
+        }
+        if self.is_deferred() {
+            Some(TaskPresentation::Deferred)
+        } else if self.is_blocked_or_deferred() {
+            Some(
+                if self.has_blocking_report_rows() || self.has_blocking_advisory() {
+                    TaskPresentation::Blocked
+                } else {
+                    TaskPresentation::Unconfirmed
+                },
+            )
+        } else if self.status == TaskStatus::Completed && self.has_issues() {
+            Some(TaskPresentation::CompletedWithIssues)
+        } else {
+            None
+        }
     }
 
     fn is_blocked_or_deferred(&self) -> bool {
         self.is_deferred()
             || (matches!(self.status, TaskStatus::Completed | TaskStatus::Skipped)
-                && (self.has_blocking_report_rows()
+                && (self.has_incomplete_report_rows()
                     || self.advisories.iter().any(|advisory| {
                         advisory.severity != AdvisorySeverity::Info
                             && advisory.blocks_dependents
@@ -248,6 +275,18 @@ impl TaskResult {
         self.advisories.iter().any(|advisory| {
             advisory.severity != AdvisorySeverity::Info && advisory.blocks_dependents
         })
+    }
+
+    fn has_incomplete_report_rows(&self) -> bool {
+        self.has_blocking_report_rows()
+            || self.report_sections.iter().any(|section| {
+                section.rows.iter().any(|row| {
+                    matches!(
+                        row.status,
+                        TaskReportStatus::Deferred | TaskReportStatus::Unconfirmed
+                    )
+                })
+            })
     }
 
     fn blocks_dependents(&self) -> bool {
@@ -290,6 +329,8 @@ pub enum TaskReportStatus {
     Unchanged,
     Failed,
     Blocked,
+    Deferred,
+    Unconfirmed,
     Skipped,
     Info,
 }
@@ -303,6 +344,8 @@ impl TaskReportStatus {
             Self::Unchanged => "SAME",
             Self::Failed => "FAIL",
             Self::Blocked => "BLOCK",
+            Self::Deferred => "DEFER",
+            Self::Unconfirmed => "UNKNOWN",
             Self::Skipped => "SKIP",
             Self::Info => "INFO",
         }
@@ -316,6 +359,8 @@ impl TaskReportStatus {
             Self::Unchanged => "SAME",
             Self::Failed => "\x1b[31mFAIL\x1b[0m",
             Self::Blocked => "\x1b[38;2;255;165;0mBLOCK\x1b[0m",
+            Self::Deferred => "\x1b[33mDEFER\x1b[0m",
+            Self::Unconfirmed => "\x1b[33mUNKNOWN\x1b[0m",
             Self::Skipped => "\x1b[33mSKIP\x1b[0m",
             Self::Info => "\x1b[36mINFO\x1b[0m",
         }
@@ -563,10 +608,10 @@ fn journal_dashboard_event(log: &RunLogSink, event: &DashboardEvent) -> Result<(
             Some(id),
             serde_json::json!({"generation": generation, "reason": reason}),
         ),
-        DashboardEvent::TaskStateChanged { id, state, detail } => log.write_event(
+        DashboardEvent::TaskStateChanged { id, state, detail, presentation } => log.write_event(
             "task_state_changed",
             Some(id),
-            serde_json::json!({"state": task_state_name(*state), "detail": detail}),
+            serde_json::json!({"state": task_state_name(*state), "detail": detail, "presentation": presentation}),
         ),
         DashboardEvent::LogLine(record) => log.write_event(
             "log_line",
@@ -611,15 +656,22 @@ fn task_state_name(state: TaskState) -> &'static str {
 fn emit_dashboard_event_plain(event: &DashboardEvent) {
     match event {
         DashboardEvent::LogLine(rec) => crate::ua_outln!("[{}] {}", rec.task_id, rec.line),
-        DashboardEvent::TaskStateChanged { id, state, detail } => {
-            let state = match state {
-                TaskState::Pending => "pending",
-                TaskState::Running => "running",
-                TaskState::Completed => "completed",
-                TaskState::Failed => "failed",
-                TaskState::Canceled => "canceled",
-                TaskState::Skipped => "skipped",
-            };
+        DashboardEvent::TaskStateChanged {
+            id,
+            state,
+            detail,
+            presentation,
+        } => {
+            let state = presentation
+                .map(TaskPresentation::label)
+                .unwrap_or_else(|| match state {
+                    TaskState::Pending => "pending",
+                    TaskState::Running => "running",
+                    TaskState::Completed => "completed",
+                    TaskState::Failed => "failed",
+                    TaskState::Canceled => "canceled",
+                    TaskState::Skipped => "skipped",
+                });
             if let Some(detail) = detail {
                 crate::ua_outln!("[{id}] {state}: {detail}");
             } else {
@@ -1173,6 +1225,7 @@ impl SyncContext {
     pub fn set_task_state(&self, task_id: &str, state: TaskState, detail: Option<String>) {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(DashboardEvent::TaskStateChanged {
+                presentation: None,
                 id: task_id.to_string(),
                 state,
                 detail,
@@ -1938,6 +1991,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             accepts_input,
         });
         let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+            presentation: None,
             id: spec.id.clone(),
             state: TaskState::Pending,
             detail: if spec.depends_on.is_empty() {
@@ -2052,6 +2106,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                         let result = TaskResult::canceled(spec.label, "canceled by user");
                         emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &id, &result);
                         let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                            presentation: None,
                             id: id.clone(),
                             state: TaskState::Canceled,
                             detail: result.details.first().cloned(),
@@ -2232,6 +2287,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             }
             emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &blocked_id, &result);
             let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                presentation: None,
                 id: blocked_id.clone(),
                 state: TaskState::Canceled,
                 detail: result.details.first().cloned(),
@@ -2265,6 +2321,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 let result = TaskResult::canceled(spec.label, detail);
                 emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &task_id, &result);
                 let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                    presentation: None,
                     id: task_id.clone(),
                     state: TaskState::Canceled,
                     detail: result.details.first().cloned(),
@@ -2275,6 +2332,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             }
 
             let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                presentation: None,
                 id: task_id.clone(),
                 state: TaskState::Running,
                 detail: None,
@@ -2317,6 +2375,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             let state = to_task_state(result.status);
             let detail = result.details.first().cloned();
             let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                presentation: result.presentation(),
                 id: finished_id.clone(),
                 state,
                 detail,
@@ -2362,9 +2421,11 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
             let result = join_forced_canceled_task(task_id.clone(), handle);
             let state = to_task_state(result.status);
             let detail = result.details.first().cloned();
+            let presentation = result.presentation();
             emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &task_id, &result);
             done.insert(task_id.clone(), result);
             let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                presentation,
                 id: task_id,
                 state,
                 detail,
@@ -2378,6 +2439,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
                 emit_task_outcome_log_async(&event_tx, ctx.run_log.as_ref(), &task_id, &result);
                 done.insert(task_id.clone(), result);
                 let _ = event_tx.send(DashboardEvent::TaskStateChanged {
+                    presentation: None,
                     id: task_id,
                     state: TaskState::Canceled,
                     detail: Some("canceled by forced shutdown after quit".to_string()),
@@ -2994,6 +3056,7 @@ impl LogPagerKind {
 }
 
 fn run_log_pager(path: &Path) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
     let _signal_guard = cancel::suppress_signal_cancel();
     for kind in [
         LogPagerKind::Less,
@@ -3009,8 +3072,21 @@ fn run_log_pager(path: &Path) -> Result<()> {
 }
 
 fn run_log_pager_command(kind: LogPagerKind, program: &Path, path: &Path) -> Result<()> {
-    let status = Command::new(program)
-        .args(log_pager_args(kind, path))
+    let mut command = Command::new(program);
+    command.args(log_pager_args(kind, path));
+    #[cfg(target_os = "linux")]
+    let status = {
+        let output = dev_tools_command::run_prepared_inherited_command(command, || {
+            !cancel::is_cancel_requested()
+        })
+        .with_context(|| format!("launch {}", kind.command_name()))?;
+        if output.cancelled {
+            return Ok(());
+        }
+        output.status
+    };
+    #[cfg(not(target_os = "linux"))]
+    let status = command
         .status()
         .with_context(|| format!("launch {}", kind.command_name()))?;
     // `less -K` reports its normal Ctrl-C dismissal with QUIT_INTERRUPT (2).
@@ -3019,13 +3095,20 @@ fn run_log_pager_command(kind: LogPagerKind, program: &Path, path: &Path) -> Res
     if status.success() || (kind == LogPagerKind::Less && status.code() == Some(2)) {
         return Ok(());
     }
+    #[cfg(unix)]
+    if kind == LogPagerKind::Tail {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGINT) {
+            return Ok(());
+        }
+    }
     bail!("{} exited with status {status}", kind.command_name())
 }
 
 fn log_pager_args(kind: LogPagerKind, path: &Path) -> Vec<OsString> {
     let path = path.as_os_str();
     match kind {
-        LogPagerKind::Less => os_args(["+F", "-K", "-R", "-S"], path),
+        LogPagerKind::Less => os_args(["+G", "-K", "-R", "-S"], path),
         LogPagerKind::Tail => os_args(["-n", "+1", "-f"], path),
         LogPagerKind::Bat => os_args(["--paging=always", "--style=plain"], path),
         LogPagerKind::More => vec![path.to_os_string()],
@@ -4203,8 +4286,26 @@ fn run_command_task_inner(
     probe_rows.extend(after_report_output.probe_rows);
     let mut state_samples = before_report_output.state_samples;
     state_samples.extend(after_report_output.state_samples);
-    let mut report_sections =
-        build_command_report_sections_for_command(&cmd, &after_report_output.input);
+    let report_input = if cmd.report_parser == Some(BuiltinReportParser::OperationResult) {
+        &out
+    } else {
+        &after_report_output.input
+    };
+    let mut report_sections = build_command_report_sections(cmd.report_parser, report_input);
+    let operation_result_status = report_sections
+        .first()
+        .and_then(|section| section.rows.first())
+        .map(|row| row.status);
+    append_command_report_pattern_sections(
+        &mut report_sections,
+        &cmd.report_patterns,
+        report_input,
+    );
+    append_command_scoped_delta_sections(
+        &mut report_sections,
+        &cmd.report_scoped_deltas,
+        report_input,
+    );
     merge_report_sections(
         &mut report_sections,
         build_command_state_report_sections(state_samples),
@@ -4239,6 +4340,19 @@ fn run_command_task_inner(
             .map(|detail| render_command_template(detail, cmd.mode.as_deref())),
     );
     result.report_sections = report_sections;
+    if cmd.report_parser == Some(BuiltinReportParser::OperationResult) {
+        match operation_result_status {
+            Some(TaskReportStatus::Failed) => result.status = TaskStatus::Failed,
+            Some(_) => {}
+            None => {
+                result.status = TaskStatus::Failed;
+                result.details.insert(
+                    0,
+                    "required operation result was absent or invalid".to_string(),
+                );
+            }
+        }
+    }
     attach_command_output_diagnostics(&mut result, &after_report_output.input);
     attach_command_advisories(&mut result);
     let structured_result_applied = apply_structured_command_result(&mut result, &out);
@@ -4288,7 +4402,7 @@ fn apply_structured_command_result(result: &mut TaskResult, output: &str) -> boo
         "deferred" => result.advisories.push(TaskAdvisory {
             severity: AdvisorySeverity::Info,
             code: "deferred".to_string(),
-            summary: detail,
+            summary: detail.clone(),
             remediation: "retry when the blocking runtime condition is clear".to_string(),
             blocks_dependents: false,
         }),
@@ -4304,6 +4418,33 @@ fn apply_structured_command_result(result: &mut TaskResult, output: &str) -> boo
             );
         }
     }
+    let row_status = match protocol.outcome.as_str() {
+        "updated" => TaskReportStatus::Updated,
+        "no_op" => TaskReportStatus::Passed,
+        "not_applicable" | "cancelled" => TaskReportStatus::Skipped,
+        "deferred" => TaskReportStatus::Deferred,
+        "blocked" => TaskReportStatus::Blocked,
+        _ => TaskReportStatus::Failed,
+    };
+    let mut note = detail;
+    if protocol.outcome != "updated" {
+        if let Some(latest) = &protocol.latest {
+            note.push_str(&format!("; available: {latest}"));
+        }
+    }
+    result.report_sections.push(TaskReportSection {
+        key: "operation_results".to_string(),
+        title: "Operation Results".to_string(),
+        rows: vec![TaskReportRow {
+            name: result.label.clone(),
+            status: row_status,
+            before: protocol.current.clone(),
+            after: (protocol.outcome == "updated")
+                .then(|| protocol.latest.clone())
+                .flatten(),
+            note: Some(note),
+        }],
+    });
     if let (Some(current), Some(latest)) = (protocol.current, protocol.latest) {
         let version_detail = match protocol.outcome.as_str() {
             "updated" => format!("version: {current} -> {latest}"),
@@ -4334,7 +4475,7 @@ fn failed_command_result_with_report_sections(
             key: "task_failures".to_string(),
             title: "Task Failure Results".to_string(),
             rows: vec![TaskReportRow {
-                name: command_display_name(&cmd.program),
+                name: result.label.clone(),
                 status: TaskReportStatus::Failed,
                 before: Some("-".to_string()),
                 after: Some("-".to_string()),
@@ -4360,7 +4501,7 @@ fn attach_unconfirmed_before_report(result: &mut TaskResult, before_report: &Com
                 // A missing final inventory must not overwrite an explicit
                 // per-package completion or failure observed before timeout.
                 if known_report_value(row.after.as_deref()).is_none() {
-                    row.after = Some("-".to_string());
+                    row.after = None;
                 }
                 continue;
             }
@@ -4370,9 +4511,9 @@ fn attach_unconfirmed_before_report(result: &mut TaskResult, before_report: &Com
                 &sample.section_title,
                 TaskReportRow {
                     name: name.clone(),
-                    status: TaskReportStatus::Blocked,
+                    status: TaskReportStatus::Unconfirmed,
                     before: Some(version.clone()),
-                    after: Some("-".to_string()),
+                    after: None,
                     note: Some("after-state not observed; update not confirmed".to_string()),
                 },
             );
@@ -4478,8 +4619,8 @@ fn command_diagnostic_rows(output: &str) -> Vec<TaskReportRow> {
             TaskReportRow {
                 name: sample.kind.to_string(),
                 status: TaskReportStatus::Info,
-                before: Some("emitted".to_string()),
-                after: Some("captured".to_string()),
+                before: None,
+                after: None,
                 note: Some(note),
             }
         })
@@ -4646,7 +4787,8 @@ fn build_failed_command_report_sections_for_command(
             if row.status == TaskReportStatus::Refreshed
                 && known_report_value(row.after.as_deref()).is_none()
             {
-                row.status = TaskReportStatus::Blocked;
+                row.status = TaskReportStatus::Unconfirmed;
+                row.after = None;
                 row.note = Some("refresh not confirmed after failed command".to_string());
             }
         }
@@ -5559,6 +5701,8 @@ fn count_report_rows(sections: &[TaskReportSection]) -> ReportCounts {
                 TaskReportStatus::Unchanged => counts.unchanged += 1,
                 TaskReportStatus::Failed => counts.failed += 1,
                 TaskReportStatus::Blocked => counts.blocked += 1,
+                TaskReportStatus::Deferred => counts.deferred += 1,
+                TaskReportStatus::Unconfirmed => counts.unconfirmed += 1,
                 TaskReportStatus::Skipped => counts.skipped += 1,
                 TaskReportStatus::Info => counts.info += 1,
             }
@@ -5758,6 +5902,8 @@ fn is_handled_package_recovery_cause(cause: &RecoveryCause, handled_packages: &[
 
 #[derive(Default)]
 struct ReportCounts {
+    deferred: usize,
+    unconfirmed: usize,
     updated: usize,
     refreshed: usize,
     passed: usize,
@@ -9718,6 +9864,8 @@ fn report_pattern_status(status: &str) -> TaskReportStatus {
         "skipped" => TaskReportStatus::Skipped,
         "failed" => TaskReportStatus::Failed,
         "blocked" => TaskReportStatus::Blocked,
+        "deferred" => TaskReportStatus::Deferred,
+        "unconfirmed" => TaskReportStatus::Unconfirmed,
         "info" => TaskReportStatus::Info,
         _ => TaskReportStatus::Info,
     }
@@ -10047,7 +10195,10 @@ fn write_run_artifact<'a>(
                     section.rows.iter().any(|row| {
                         matches!(
                             row.status,
-                            TaskReportStatus::Failed | TaskReportStatus::Blocked
+                            TaskReportStatus::Failed
+                                | TaskReportStatus::Blocked
+                                | TaskReportStatus::Deferred
+                                | TaskReportStatus::Unconfirmed
                         )
                     })
                 })
@@ -10153,16 +10304,7 @@ fn resolve_parallel_jobs(jobs: &str, task_count: usize) -> Result<usize> {
 }
 
 fn print_async_task_line(label: &str, r: &TaskResult) {
-    let status = match r.status {
-        TaskStatus::Completed | TaskStatus::Skipped if r.is_blocked_or_deferred() => {
-            "Blocked/deferred"
-        }
-        TaskStatus::Completed if r.has_issues() => "Completed with issues",
-        TaskStatus::Completed => "Completed",
-        TaskStatus::Failed => "Failed",
-        TaskStatus::Canceled => "Canceled",
-        TaskStatus::Skipped => "Skipped",
-    };
+    let status = task_status_cell_from_parts(r.status, r.has_issues(), r.presentation());
     crate::ua_outln!("[{label}] {status}");
     for d in &r.details {
         crate::ua_outln!("  {d}");
@@ -10170,19 +10312,14 @@ fn print_async_task_line(label: &str, r: &TaskResult) {
 }
 
 fn task_outcome_message(result: &TaskResult) -> String {
+    if let Some(presentation) = result.presentation() {
+        return format!(
+            "task outcome: {} - {}",
+            presentation.label().to_ascii_lowercase(),
+            result.primary_detail()
+        );
+    }
     match result.status {
-        TaskStatus::Completed | TaskStatus::Skipped if result.is_blocked_or_deferred() => {
-            format!(
-                "task outcome: blocked/deferred - {}",
-                result.primary_detail()
-            )
-        }
-        TaskStatus::Completed if result.has_issues() => {
-            format!(
-                "task outcome: completed with issues - {}",
-                result.primary_detail()
-            )
-        }
         TaskStatus::Completed => {
             let detail = result.primary_detail();
             if detail == NO_TASK_DETAIL {
@@ -10264,12 +10401,156 @@ fn build_command_report_sections(
 ) -> Vec<TaskReportSection> {
     match parser {
         Some(BuiltinReportParser::ArchUpdateServices) => parse_arch_update_services_report(output),
+        Some(BuiltinReportParser::OperationResult) => parse_operation_result_report(output),
         Some(BuiltinReportParser::Scoop) => parse_scoop_report(output),
         Some(BuiltinReportParser::VersionLines) => parse_version_lines_report(output),
         Some(BuiltinReportParser::Winget) => parse_winget_report(&strip_progress_output(output)),
         Some(BuiltinReportParser::Yay) => parse_yay_report(output),
         None => Vec::new(),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ObservedCommonOperation {
+    Doctor,
+    UpdateStatus,
+    UpdateCheck,
+    UpdateInstall,
+    UpdateApply,
+    UpdateRollback,
+}
+
+#[derive(Deserialize)]
+struct ObservedOperationResult {
+    schema: Option<String>,
+    product: String,
+    operation: Option<ObservedCommonOperation>,
+    outcome: String,
+    #[serde(deserialize_with = "deserialize_operation_change")]
+    changed: Option<bool>,
+    installed_version: Option<String>,
+    available_version: Option<String>,
+    version: Option<String>,
+    managed: Option<bool>,
+    exit_code: Option<i32>,
+}
+
+fn deserialize_operation_change<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    Option::<bool>::deserialize(deserializer)
+}
+
+fn parse_operation_result_report(output: &str) -> Vec<TaskReportSection> {
+    if output.len() > 16 * 1024 {
+        return Vec::new();
+    }
+    let output = output.trim();
+    let mut documents =
+        serde_json::Deserializer::from_str(output).into_iter::<ObservedOperationResult>();
+    let Some(Ok(observation)) = documents.next() else {
+        return Vec::new();
+    };
+    let mut trailing = output[documents.byte_offset()..].trim_start();
+    while !trailing.is_empty() {
+        if trailing.starts_with(['{', '['])
+            && matches!(
+                serde_json::Deserializer::from_str(trailing)
+                    .into_iter::<serde_json::Value>()
+                    .next(),
+                Some(Ok(
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                ))
+            )
+        {
+            return Vec::new();
+        }
+        let Some((_, rest)) = trailing.split_once('\n') else {
+            break;
+        };
+        trailing = rest.trim_start();
+    }
+    let installed = match observation.schema.as_deref() {
+        Some("dev-tools-operation-result-v2")
+            if observation.operation.is_some()
+                && observation
+                    .exit_code
+                    .is_some_and(|code| matches!(code, 0..=4 | 130)) =>
+        {
+            if dev_tools_product::ProductId::parse(observation.product.as_str()).is_err()
+                || matches!(
+                    observation.outcome.as_str(),
+                    "not_applicable" | "externally_managed"
+                )
+            {
+                return Vec::new();
+            }
+            observation.installed_version
+        }
+        None if observation.managed.is_some() && observation.changed.is_some() => {
+            observation.version
+        }
+        _ => return Vec::new(),
+    };
+    if observation.product.trim().is_empty()
+        || [&observation.product, &observation.outcome]
+            .into_iter()
+            .chain(installed.iter())
+            .chain(observation.available_version.iter())
+            .any(|value| {
+                value.len() > STRUCTURED_TEXT_LIMIT_BYTES || value.chars().any(char::is_control)
+            })
+    {
+        return Vec::new();
+    }
+    let status = match observation.outcome.as_str() {
+        "failed" | "authenticity_violation" | "integrity_violation" | "authority_violation" => {
+            TaskReportStatus::Failed
+        }
+        "blocked" => TaskReportStatus::Blocked,
+        "deferred" | "requires_setup" | "unsupported" | "interrupted" => TaskReportStatus::Deferred,
+        "not_applicable" | "external" | "externally_managed" => TaskReportStatus::Skipped,
+        "unknown" | "stale" => TaskReportStatus::Unconfirmed,
+        "completed" | "no_op" | "current" | "installed" | "updated" | "rolled_back" => {
+            match observation.changed {
+                Some(true) => TaskReportStatus::Updated,
+                Some(false) => TaskReportStatus::Passed,
+                None => TaskReportStatus::Unconfirmed,
+            }
+        }
+        _ => return Vec::new(),
+    };
+    let status = if observation.exit_code.is_some_and(|code| code != 0)
+        && matches!(status, TaskReportStatus::Updated | TaskReportStatus::Passed)
+    {
+        TaskReportStatus::Failed
+    } else {
+        status
+    };
+    let change = match observation.changed {
+        Some(true) => "change reported",
+        Some(false) => "no change reported",
+        None => "change unknown",
+    };
+    let mut note = format!("{}; {change}", observation.outcome.replace('_', " "));
+    if let Some(available) = observation.available_version {
+        note.push_str(&format!("; available: {available}"));
+    }
+    if installed.is_none() {
+        note.push_str("; installed version not observed");
+    }
+    vec![TaskReportSection {
+        key: "operation_results".to_string(),
+        title: "Operation Results".to_string(),
+        rows: vec![TaskReportRow {
+            name: observation.product,
+            status,
+            before: None,
+            after: installed,
+            note: Some(note),
+        }],
+    }]
 }
 
 fn build_command_report_sections_for_command(
@@ -10520,8 +10801,10 @@ fn report_row_has_same_known_before_after(row: &TaskReportRow) -> bool {
 
 fn report_pattern_status_rank(status: TaskReportStatus) -> u8 {
     match status {
-        TaskReportStatus::Failed => 7,
-        TaskReportStatus::Blocked => 6,
+        TaskReportStatus::Failed => 9,
+        TaskReportStatus::Blocked => 8,
+        TaskReportStatus::Deferred => 7,
+        TaskReportStatus::Unconfirmed => 6,
         TaskReportStatus::Updated => 5,
         TaskReportStatus::Passed => 4,
         TaskReportStatus::Refreshed => 3,
@@ -11885,7 +12168,7 @@ struct FinalTaskRow {
     task: String,
     status: TaskStatus,
     has_issues: bool,
-    deferred: bool,
+    presentation: Option<TaskPresentation>,
     items: String,
     notes: String,
 }
@@ -11937,6 +12220,8 @@ struct ReportStatusCounts {
     passed: usize,
     failed: usize,
     blocked: usize,
+    deferred: usize,
+    unconfirmed: usize,
     warned: usize,
     unchanged: usize,
     removed: usize,
@@ -11965,6 +12250,8 @@ impl ReportStatusCounts {
             (_, TaskReportStatus::Unchanged) => self.unchanged += 1,
             (_, TaskReportStatus::Failed) => self.failed += 1,
             (_, TaskReportStatus::Blocked) => self.blocked += 1,
+            (_, TaskReportStatus::Deferred) => self.deferred += 1,
+            (_, TaskReportStatus::Unconfirmed) => self.unconfirmed += 1,
             (_, TaskReportStatus::Skipped) => self.skipped += 1,
             (_, TaskReportStatus::Info) => self.info += 1,
         }
@@ -12002,6 +12289,12 @@ impl ReportStatusCounts {
         if self.blocked > 0 {
             parts.push(format!("blocked={}", self.blocked));
         }
+        if self.deferred > 0 {
+            parts.push(format!("deferred={}", self.deferred));
+        }
+        if self.unconfirmed > 0 {
+            parts.push(format!("unconfirmed={}", self.unconfirmed));
+        }
         if self.unchanged > 0 {
             parts.push(format!("unchanged={}", self.unchanged));
         }
@@ -12026,9 +12319,13 @@ fn render_npm_package_footer<'a>(
 ) -> Vec<RenderedReportLine> {
     let mut lines = Vec::new();
     let mut sections: Vec<(String, String, Vec<&TaskReportRow>)> = Vec::new();
-
+    let summary = summary.into_iter().collect::<Vec<_>>();
+    let diagnostics = render_command_diagnostics(summary.iter().copied(), color);
     for result in summary {
         for section in &result.report_sections {
+            if section.key == "command_diagnostics" {
+                continue;
+            }
             if let Some((_, _, rows)) = sections
                 .iter_mut()
                 .find(|(key, title, _)| *key == section.key && *title == section.title)
@@ -12045,7 +12342,7 @@ fn render_npm_package_footer<'a>(
     }
 
     if sections.is_empty() {
-        return lines;
+        return diagnostics;
     }
 
     for (idx, (key, title, rows)) in sections.into_iter().enumerate() {
@@ -12188,7 +12485,49 @@ fn render_npm_package_footer<'a>(
             }
         }
     }
+    lines.extend(diagnostics);
     lines
+}
+
+fn render_command_diagnostics<'a>(
+    summary: impl IntoIterator<Item = &'a TaskResult>,
+    color: bool,
+) -> Vec<RenderedReportLine> {
+    let mut lines = Vec::new();
+    for result in summary {
+        for section in &result.report_sections {
+            if section.key != "command_diagnostics" || section.rows.is_empty() {
+                continue;
+            }
+            if lines.is_empty() {
+                lines.push(RenderedReportLine {
+                    text: "Command Diagnostics".to_string(),
+                    level: LogLevel::Info,
+                });
+            }
+            if !result.label.is_empty() {
+                lines.push(RenderedReportLine {
+                    text: sanitize_report_cell_text(&result.label),
+                    level: LogLevel::Info,
+                });
+            }
+            lines.extend(render_diagnostic_rows(&section.rows, color));
+        }
+    }
+    lines
+}
+
+fn render_diagnostic_rows(rows: &[TaskReportRow], color: bool) -> Vec<RenderedReportLine> {
+    rows.iter()
+        .map(|row| RenderedReportLine {
+            text: format!(
+                "  {} {}",
+                render_report_note_prefix_for_row("command_diagnostics", row, color),
+                sanitize_report_cell_text(row.note.as_deref().unwrap_or(&row.name))
+            ),
+            level: report_row_level("command_diagnostics", row),
+        })
+        .collect()
 }
 
 fn selected_task_ids(specs: &[TaskSpec]) -> Vec<String> {
@@ -12258,7 +12597,9 @@ fn render_package_change_rollup_with_width<'a>(
     debug_report: bool,
     target_width: usize,
 ) -> Vec<RenderedReportLine> {
-    let rows = ordered_task_results(summary, task_categories)
+    let entries = ordered_task_results(summary, task_categories);
+    let diagnostics = render_command_diagnostics(entries.iter().map(|entry| entry.result), color);
+    let rows = entries
         .into_iter()
         .flat_map(|entry| {
             let category = entry.category.clone();
@@ -12267,6 +12608,7 @@ fn render_package_change_rollup_with_width<'a>(
                 .result
                 .report_sections
                 .iter()
+                .filter(|section| section.key != "command_diagnostics")
                 .flat_map(move |section| {
                     let category = category.clone();
                     let task = task.clone();
@@ -12290,7 +12632,7 @@ fn render_package_change_rollup_with_width<'a>(
         .collect::<Vec<_>>();
 
     if rows.is_empty() {
-        return Vec::new();
+        return diagnostics;
     }
 
     let mut lines = vec![RenderedReportLine {
@@ -12494,6 +12836,7 @@ fn render_package_change_rollup_with_width<'a>(
         level: LogLevel::Info,
     });
 
+    lines.extend(diagnostics);
     lines
 }
 
@@ -12537,7 +12880,7 @@ fn render_final_task_overview<'a>(
             task: entry.label,
             status: entry.result.status,
             has_issues: entry.result.has_issues(),
-            deferred: entry.result.is_blocked_or_deferred(),
+            presentation: entry.result.presentation(),
             items: summarize_task_items(entry.result),
             notes: summarize_task_notes(entry.result),
         })
@@ -12574,7 +12917,7 @@ fn render_final_task_overview<'a>(
                 visible_width(task_status_cell_from_parts(
                     row.status,
                     row.has_issues,
-                    row.deferred,
+                    row.presentation,
                 ))
             })
             .max()
@@ -12646,8 +12989,12 @@ fn render_final_task_overview<'a>(
                     BoxCell::plain(&category_text, category_w),
                     BoxCell::plain(&task_text, task_w),
                     BoxCell {
-                        text: task_status_cell_from_parts(row.status, row.has_issues, row.deferred)
-                            .to_string(),
+                        text: task_status_cell_from_parts(
+                            row.status,
+                            row.has_issues,
+                            row.presentation,
+                        )
+                        .to_string(),
                         color: color_enabled
                             .then_some(task_status_color_from_parts(row.status, row.has_issues)),
                         width: outcome_w,
@@ -12860,7 +13207,9 @@ fn attention_rows<'a>(
             for row in &section.rows {
                 let severity = match row.status {
                     TaskReportStatus::Failed => AdvisorySeverity::Error,
-                    TaskReportStatus::Blocked => AdvisorySeverity::Warning,
+                    TaskReportStatus::Blocked
+                    | TaskReportStatus::Deferred
+                    | TaskReportStatus::Unconfirmed => AdvisorySeverity::Warning,
                     _ => continue,
                 };
                 emitted = true;
@@ -12958,6 +13307,8 @@ fn render_package_rollup_note(section_key: &str, row: &TaskReportRow) -> String 
             (_, TaskReportStatus::Passed) => "passed".to_string(),
             (_, TaskReportStatus::Unchanged) => "unchanged".to_string(),
             (_, TaskReportStatus::Blocked) => "blocked".to_string(),
+            (_, TaskReportStatus::Deferred) => "deferred".to_string(),
+            (_, TaskReportStatus::Unconfirmed) => "unconfirmed".to_string(),
             (_, TaskReportStatus::Skipped) => "skipped".to_string(),
             (_, TaskReportStatus::Failed) => "failed".to_string(),
             (_, TaskReportStatus::Info) => "info".to_string(),
@@ -13027,6 +13378,10 @@ fn render_per_task_changes<'a>(
                 text: format!("  {}", section.title),
                 level: LogLevel::Info,
             });
+            if section.key == "command_diagnostics" {
+                lines.extend(render_diagnostic_rows(&section.rows, color));
+                continue;
+            }
             let (item_header, before_header, after_header, notes_header) =
                 report_headers_for_section(&section.key);
             let (before_cap, after_cap) = report_value_width_caps_for_section(&section.key);
@@ -13346,6 +13701,7 @@ fn report_headers_for_section(
         "arch_update_services" => ("Service", "Before", "After", "Result"),
         "package_recovery" | "yay_recovery" => ("Item", "Before", "After", "Result"),
         "task_failures" => ("Task", "Before", "After", "Outcome"),
+        "operation_results" => ("Subject", "Before", "After", "Outcome"),
         "completion_generation" => ("Tool", "Provider", "Artifact", "Outcome"),
         "completion_audit" => ("Check", "Code", "Detail", "Outcome"),
         _ => ("Package", "Before", "After", "Outcome"),
@@ -13432,6 +13788,8 @@ fn report_status_cell(key: &str, status: TaskReportStatus) -> &'static str {
             TaskReportStatus::Skipped => "Removed",
             TaskReportStatus::Failed => "Error",
             TaskReportStatus::Info => "Info",
+            TaskReportStatus::Deferred => "Deferred",
+            TaskReportStatus::Unconfirmed => "Unconfirmed",
         },
         "arch_update_services" => match status {
             TaskReportStatus::Updated => "Restarted",
@@ -13442,6 +13800,8 @@ fn report_status_cell(key: &str, status: TaskReportStatus) -> &'static str {
             TaskReportStatus::Skipped => "Not Restarted",
             TaskReportStatus::Failed => "Error",
             TaskReportStatus::Info => "Info",
+            TaskReportStatus::Deferred => "Deferred",
+            TaskReportStatus::Unconfirmed => "Unconfirmed",
         },
         "completion_audit" => match status {
             TaskReportStatus::Passed => "Pass",
@@ -13452,6 +13812,8 @@ fn report_status_cell(key: &str, status: TaskReportStatus) -> &'static str {
             TaskReportStatus::Skipped => "Skip",
             TaskReportStatus::Failed => "Fail",
             TaskReportStatus::Info => "Info",
+            TaskReportStatus::Deferred => "Deferred",
+            TaskReportStatus::Unconfirmed => "Unconfirmed",
         },
         _ => match status {
             TaskReportStatus::Updated => "Updated",
@@ -13462,6 +13824,8 @@ fn report_status_cell(key: &str, status: TaskReportStatus) -> &'static str {
             TaskReportStatus::Skipped => "Skipped",
             TaskReportStatus::Failed => "Error",
             TaskReportStatus::Info => "Info",
+            TaskReportStatus::Deferred => "Deferred",
+            TaskReportStatus::Unconfirmed => "Unconfirmed",
         },
     }
 }
@@ -13499,6 +13863,8 @@ fn report_status_note_label(section_key: &str, status: TaskReportStatus) -> &'st
         (_, TaskReportStatus::Passed) => "passed",
         (_, TaskReportStatus::Unchanged) => "unchanged",
         (_, TaskReportStatus::Blocked) => "blocked",
+        (_, TaskReportStatus::Deferred) => "deferred",
+        (_, TaskReportStatus::Unconfirmed) => "unconfirmed",
         (_, TaskReportStatus::Skipped) => "skipped",
         (_, TaskReportStatus::Failed) => "failed",
         (_, TaskReportStatus::Info) => "info",
@@ -13574,6 +13940,9 @@ fn report_status_color(status: TaskReportStatus) -> crossterm::style::Color {
         TaskReportStatus::Passed => crossterm::style::Color::Green,
         TaskReportStatus::Unchanged => crossterm::style::Color::Cyan,
         TaskReportStatus::Blocked => blocked_report_color(),
+        TaskReportStatus::Deferred | TaskReportStatus::Unconfirmed => {
+            crossterm::style::Color::Yellow
+        }
         TaskReportStatus::Skipped => crossterm::style::Color::Yellow,
         TaskReportStatus::Failed => crossterm::style::Color::Red,
         TaskReportStatus::Info => crossterm::style::Color::Cyan,
@@ -13592,6 +13961,7 @@ fn report_status_level(status: TaskReportStatus) -> LogLevel {
     match status {
         TaskReportStatus::Failed => LogLevel::Error,
         TaskReportStatus::Blocked => LogLevel::Warn,
+        TaskReportStatus::Deferred | TaskReportStatus::Unconfirmed => LogLevel::Warn,
         TaskReportStatus::Info => LogLevel::Info,
         TaskReportStatus::Updated
         | TaskReportStatus::Refreshed
@@ -13746,6 +14116,7 @@ fn classify_row_note_kind(section_key: &str, status: TaskReportStatus) -> Inline
     match status {
         TaskReportStatus::Failed => InlineNoteKind::Failure,
         TaskReportStatus::Blocked => InlineNoteKind::Skip,
+        TaskReportStatus::Deferred | TaskReportStatus::Unconfirmed => InlineNoteKind::Skip,
         TaskReportStatus::Skipped => InlineNoteKind::Skip,
         TaskReportStatus::Unchanged => InlineNoteKind::Info,
         TaskReportStatus::Updated if matches!(section_key, "package_recovery" | "yay_recovery") => {
@@ -13945,10 +14316,12 @@ fn category_display_name(category: &str) -> String {
 fn task_status_cell_from_parts(
     status: TaskStatus,
     has_issues: bool,
-    deferred: bool,
+    presentation: Option<TaskPresentation>,
 ) -> &'static str {
+    if let Some(presentation) = presentation {
+        return presentation.label();
+    }
     match status {
-        TaskStatus::Completed | TaskStatus::Skipped if deferred => "Blocked/deferred",
         TaskStatus::Completed if has_issues => "Completed*",
         TaskStatus::Completed => "Completed",
         TaskStatus::Failed => "Failed",

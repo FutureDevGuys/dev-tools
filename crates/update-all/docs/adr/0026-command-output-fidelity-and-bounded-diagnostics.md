@@ -69,7 +69,7 @@ Crossterm remains a required dependency for terminal colors and width discovery 
 
 Ordinary command tasks preserve the execution owner's typed cancellation error through the primary command, pre-command and command retry boundaries so the scheduler records cancellation rather than a command failure. Diagnostic text, a nonzero process exit or a later cancellation request alone does not reclassify a completed task outcome. [ADR 0027](0027-execution-owned-cancellation-outcomes.md) defines cancellation ownership and preservation of already-observed outcomes. Optional report/recovery policies remain separate.
 
-The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt exit status 2 means the user dismissed that viewer with Ctrl-C, so it resumes the dashboard without a failure advisory. This status convention applies only to Less; launch errors, other nonzero statuses and signal termination remain failures. The existing signal-cancellation suppression during log viewing is unchanged, and updater cancellation outside the viewer remains independent.
+The foreground log viewer uses `less +G -K -R -S`. Active and completed logs open at the end in normal browsing mode, where `q` returns to the dashboard. `F` explicitly enters follow mode; Ctrl-C returns from that mode or ordinary browsing. The `tail -f` fallback still requires Ctrl-C, not `q`. Less's documented interrupt exit status 2 means the user dismissed that viewer with Ctrl-C, so it resumes the dashboard without a failure advisory. This numeric status convention applies only to Less. On Unix, the native tail fallback terminates on SIGINT when dismissed with Ctrl-C; that signal is accepted only for tail. Launch errors, other nonzero statuses and other signal termination remain failures. On Linux, the shared inherited-command owner gives the viewer its own foreground process group and restores dashboard ownership after it exits. Terminal Ctrl-C therefore reaches the viewer, not the updater. A process-directed SIGINT to the updater remains genuine cancellation: the existing signal handler requests cancellation and the inherited-command owner settles the viewer before returning. Non-Linux platforms retain the previous launch and signal-suppression behavior; this change does not qualify their interrupt isolation.
 
 ## Verification
 
@@ -123,6 +123,15 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 - `diagnostic_rollup_preserves_complete_notes_at_every_verbosity`
 - `diagnostic_rollup_colors_do_not_change_transaction_status`
 - `log_pager_accepts_only_less_interrupt_status`
+- `log_pager_accepts_only_tail_sigint`
+- `log_pager_less_args_browse_at_end_and_exit_on_interrupt`
+- `real_less_q_returns_from_completed_task_and_run_logs`
+- `real_less_q_returns_while_task_keeps_running`
+- `real_less_explicit_follow_ctrl_c_returns_without_canceling_task`
+- `real_less_owns_foreground_until_dashboard_resumes`
+- `direct_sigint_cancels_updater_and_reaps_foreground_pager`
+- `real_tail_ctrl_c_returns_without_canceling_task_or_warning`
+- `direct_sigint_cancels_updater_and_reaps_tail_fallback`
 - `command_task_preserves_typed_cancellation_from_primary_and_pre_command`
 - `command_task_does_not_infer_cancellation_from_failure_text`
 - `command_task_preserves_typed_cancellation_from_transient_retry`
@@ -131,7 +140,7 @@ The foreground log viewer uses `less +F -K -R -S`. Less's documented interrupt e
 
 Run a controlled catalog fixture with stdout and stderr diagnostics, more unique warnings than the sample budget, a late error and multiline result text. Verify complete disk logs, journal line boundaries, diagnostic severity and the omitted-sample notice. Check dashboard tail eviction counts. Repeat the npm lane against a disposable user-owned installation with a manifest-current but broken launcher and verify bounded recovery without persisted lifecycle trust. Native Windows and WSL acceptance and installed-release activation remain separate gates.
 
-In a real terminal, open active and completed task/run logs with the actual Less executable, dismiss with Ctrl-C, reopen, and verify dashboard recovery without a viewer-failure advisory or cancelled tasks. Separately verify that a genuine viewer error still emits the failure advisory and that the dashboard's cancel-all control still cancels its tasks after returning. A source-binary check is not signed-release acceptance. Independently cancel active ordinary commands without opening a pager and verify canceled task state/counts in the dashboard, event journal and task/run JSON. Repeat with a pre-command and a transient retry; completed successes and genuine earlier failures in the same run must keep their original outcomes.
+In a real terminal, open active and completed task/run logs with the actual Less executable, dismiss with `q`, reopen, and verify dashboard recovery without a viewer-failure advisory or cancelled tasks. Enter follow mode with `F`, observe newly appended output, and dismiss with Ctrl-C without cancelling the task. On Linux, verify that Less owns a foreground process group distinct from the updater and that dashboard foreground ownership returns on dismissal. Send SIGINT directly to the updater while the viewer is open and verify genuine cancellation, viewer cleanup and restored dashboard ownership. Repeat the Ctrl-C and direct-SIGINT checks with a PATH exposing the actual tail executable but no Less. Verify restored terminal modes after closing the dashboard. Separately verify that a genuine viewer error still emits the failure advisory and that the dashboard's cancel-all control still cancels its tasks after returning. A source-binary check is not signed-release acceptance. Independently cancel active ordinary commands without opening a pager and verify canceled task state/counts in the dashboard, event journal and task/run JSON. Repeat with a pre-command and a transient retry; completed successes and genuine earlier failures in the same run must keep their original outcomes.
 
 ## Supersession conditions
 
