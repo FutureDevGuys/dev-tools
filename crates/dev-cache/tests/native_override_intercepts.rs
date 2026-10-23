@@ -291,6 +291,8 @@ fn sccache_unroutable_persistent_configuration_delegates_unchanged() {
 fn other_fully_overridden_generic_intercepts_delegate_unchanged() {
     for (name, variables) in [
         ("npm", vec!["npm_config_cache"]),
+        ("npm", vec!["NPM_CONFIG_CACHE"]),
+        ("npm", vec!["Npm_Config_Cache"]),
         ("ccache", vec!["CCACHE_DIR", "CCACHE_TEMPDIR"]),
         ("zig", vec!["ZIG_GLOBAL_CACHE_DIR", "ZIG_LOCAL_CACHE_DIR"]),
     ] {
@@ -449,6 +451,8 @@ fn explicit_exec_without_resources_delegates_unchanged() {
     for (adapter, variables) in [
         ("sccache", vec!["SCCACHE_DIR"]),
         ("npm", vec!["npm_config_cache"]),
+        ("npm", vec!["NPM_CONFIG_CACHE"]),
+        ("npm", vec!["Npm_Config_Cache"]),
         ("temp", vec!["TMPDIR", "TEMP", "TMP"]),
     ] {
         let fixture = Fixture::new();
