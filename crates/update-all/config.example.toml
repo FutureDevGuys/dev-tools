@@ -54,9 +54,13 @@ enabled = false
 windows_foundations = ["scoop", "powershell", "winget"]
 
 # Task policies:
-# timeout_secs: hard timeout for a single attempt
-# retries: additional attempts after a failure/timeout
+# timeout_secs: hard timeout for one command attempt, including a whole batch.
+# retries: additional attempts for eligible non-timeout failures.
+# Command timeout failures are never retried.
 # retry_backoff_secs: exponential backoff base delay between retries (base * 2^n, capped at 60s)
+# Each [tasks.<key>] table replaces the complete fallback policy.
+# Omitted fields become timeout_secs = 60, retries = 0, retry_backoff_secs = 0.
+# A pipx_upgrade table also overrides UPDATE_ALL_PIPX_UPGRADE_TIMEOUT_SECS.
 
 [tasks.npm_install]
 timeout_secs = 180
