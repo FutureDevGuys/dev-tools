@@ -1296,31 +1296,43 @@ pub fn run_workload_alias_request_with_grant(
                     caller_uid,
                     &resolved.authority_profile,
                 )?;
-                let mut command = crate::binding_activation::launch_shell::command(
+                let command = crate::binding_activation::launch_shell::command(
                     caller_uid, workload, &resolved, arguments,
                 )?;
-                if privilege.is_some() {
-                    exec_barrier::prepare(&mut command)?;
-                }
-                let output = dev_tools_command::run_prepared_inherited_command_after_spawn(
+                let output = crate::workload_projection::run(
                     command,
-                    |child| {
-                        if privilege.is_some() {
-                            exec_barrier::await_exec(child)?;
-                        }
-                        launch_grant.activate()?;
-                        if privilege.is_some() {
-                            exec_barrier::release(child)?;
-                            launch_grant.commit_release()?;
-                        }
-                        launch_grant.commit();
-                        Ok(())
+                    &resolved,
+                    crate::workload_projection::LaunchIdentity {
+                        owner_uid: caller_uid,
+                        session_id: &verified_session,
+                        workload,
                     },
-                    || {
-                        deadline.is_none_or(|deadline| {
-                            crate::linux_platform::boot_time_millis()
-                                .is_ok_and(|now| now < deadline)
-                        })
+                    crate::broker_client::request_active,
+                    |mut command| {
+                        if privilege.is_some() {
+                            exec_barrier::prepare(&mut command)?;
+                        }
+                        dev_tools_command::run_prepared_inherited_command_after_spawn(
+                            command,
+                            |child| {
+                                if privilege.is_some() {
+                                    exec_barrier::await_exec(child)?;
+                                }
+                                launch_grant.activate()?;
+                                if privilege.is_some() {
+                                    exec_barrier::release(child)?;
+                                    launch_grant.commit_release()?;
+                                }
+                                launch_grant.commit();
+                                Ok(())
+                            },
+                            || {
+                                deadline.is_none_or(|deadline| {
+                                    crate::linux_platform::boot_time_millis()
+                                        .is_ok_and(|now| now < deadline)
+                                })
+                            },
+                        )
                     },
                 )?;
                 if output.cancelled {
@@ -1328,11 +1340,23 @@ pub fn run_workload_alias_request_with_grant(
                 }
                 return Ok(WorkloadLaunchOutcome::ChildExited(output.status));
             }
-            let error = crate::binding_activation::launch_shell::command(
+            let command = crate::binding_activation::launch_shell::command(
                 caller_uid, workload, &resolved, arguments,
-            )?
-            .exec();
-            Err(error).context("replace nested workload alias with its configured launcher")
+            )?;
+            crate::workload_projection::run(
+                command,
+                &resolved,
+                crate::workload_projection::LaunchIdentity {
+                    owner_uid: caller_uid,
+                    session_id: &verified_session,
+                    workload,
+                },
+                crate::broker_client::request_active,
+                |mut command| {
+                    Err(command.exec())
+                        .context("replace nested workload alias with its configured launcher")
+                },
+            )
         }
     }
 }
@@ -1647,8 +1671,10 @@ fn launch_user_only(
                 ])
                 .args(arguments);
             command
-        } else {
+        } else if workload.secret_projections.is_empty() {
             Command::new(launcher)
+        } else {
+            crate::workload_projection::retained_command(launcher)?
         };
         crate::binding_activation::launch_shell::configure_outer(
             &mut command,
@@ -1682,22 +1708,39 @@ fn launch_user_only(
         } else {
             command.env_remove(crate::binding_activation::launch_shell::SOURCE_FD_ENV);
         }
-        let mut child = command.spawn().context("run user-only admitted workload")?;
-        loop {
-            if let Some(status) = child.try_wait().context("poll user-only workload")? {
-                break Ok(status);
+        let execute = |mut command: Command| -> Result<ExitStatus> {
+            let mut child = command.spawn().context("run user-only admitted workload")?;
+            loop {
+                if let Some(status) = child.try_wait().context("poll user-only workload")? {
+                    break Ok(status);
+                }
+                let expired = hard_deadline.is_some_and(|deadline| {
+                    crate::linux_platform::boot_time_millis().map_or(true, |now| now >= deadline)
+                });
+                if expired || stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let kill = child.kill();
+                    let wait = child.wait();
+                    kill.context("stop user-only workload after authority loss")?;
+                    wait.context("settle stopped user-only workload")?;
+                    bail!("user-only workload authority ended");
+                }
+                thread::sleep(Duration::from_millis(200));
             }
-            let expired = hard_deadline.is_some_and(|deadline| {
-                crate::linux_platform::boot_time_millis().map_or(true, |now| now >= deadline)
-            });
-            if expired || stop.load(std::sync::atomic::Ordering::Acquire) {
-                let kill = child.kill();
-                let wait = child.wait();
-                kill.context("stop user-only workload after authority loss")?;
-                wait.context("settle stopped user-only workload")?;
-                bail!("user-only workload authority ended");
-            }
-            thread::sleep(Duration::from_millis(200));
+        };
+        if through_adapter {
+            execute(command)
+        } else {
+            crate::workload_projection::run(
+                command,
+                workload,
+                crate::workload_projection::LaunchIdentity {
+                    owner_uid,
+                    session_id: &session_id,
+                    workload: workload_name,
+                },
+                |request| crate::broker_client::request_at(&socket, request),
+                execute,
+            )
         }
     })();
 
@@ -2368,13 +2411,26 @@ pub fn run_supervisor_child_with_descriptors(
         let error = command.exec();
         return Err(error).context("replace supervisor gate with the sandbox adapter");
     }
+    if execution_release.is_some() {
+        protect_launch_monitor()?;
+    }
     let command = crate::binding_activation::launch_shell::command(
         identity.owner_uid,
         workload,
         resolved,
         arguments,
     )?;
-    launch_prepared_workload_with_release(command, startup, execution_release)
+    crate::workload_projection::run(
+        command,
+        resolved,
+        crate::workload_projection::LaunchIdentity {
+            owner_uid: identity.owner_uid,
+            session_id,
+            workload,
+        },
+        crate::broker_client::request_active,
+        |command| launch_prepared_workload_with_release(command, startup, execution_release),
+    )
 }
 
 /// The user-only outer supervisor spawns this installed native intermediate.
@@ -2737,13 +2793,26 @@ pub fn run_sandbox_child_with_startup(
         }
         crate::setup::InstallMode::UserOnly => validate_user_or_root_launcher(launcher, owner_uid)?,
     }
+    if release.is_some() {
+        protect_launch_monitor()?;
+    }
     let command = crate::binding_activation::launch_shell::command(
         owner_uid,
         workload_name,
         workload,
         arguments,
     )?;
-    launch_prepared_workload_with_release(command, startup, release)
+    crate::workload_projection::run(
+        command,
+        workload,
+        crate::workload_projection::LaunchIdentity {
+            owner_uid,
+            session_id,
+            workload: workload_name,
+        },
+        crate::broker_client::request_active,
+        |command| launch_prepared_workload_with_release(command, startup, release),
+    )
 }
 
 fn require_sandbox_network_namespace(
@@ -3970,6 +4039,7 @@ mod tests {
             profile: "main".into(),
             expires_at: "fixture".into(),
             hard_deadline_boot_ms: Some(12345),
+            launch_projection_digest: None,
         };
         let check = |response| {
             super::nested_deadline_for_workload(response, "session", "automation", 1000, "main")
@@ -4785,5 +4855,55 @@ mod tests {
             crate::policy_v2::WorkspaceAccess::ReadOnly
         );
         assert!(effective_mount_access(b"malformed\n", Path::new("/srv/read")).is_err());
+    }
+    #[test]
+    fn declared_projection_cannot_override_managed_runtime_or_shell_controls() {
+        let mut environment = BTreeMap::new();
+        apply_workload_command_safety(&mut environment);
+        let mut names = environment
+            .keys()
+            .map(|name| name.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        names.extend(
+            crate::runtime::GITHUB_AUTH_ENVIRONMENT
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        names.extend(
+            [
+                "DEV_AUTH_SESSION",
+                "LD_PRELOAD",
+                "DYLD_INSERT_LIBRARIES",
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "ARGV0",
+                "OP_SERVICE_ACCOUNT_TOKEN",
+                "SSH_AUTH_SOCK",
+                "SSH_AGENT_PID",
+                "SSH_ASKPASS",
+                "PYTHONPATH",
+                "PYTHONHOME",
+                "PERL5LIB",
+                "RUBYLIB",
+                "BASH_ENV",
+                "ENV",
+                "SHELLOPTS",
+                "BASHOPTS",
+                "ZDOTDIR",
+            ]
+            .map(str::to_owned),
+        );
+        for name in names {
+            assert!(crate::secret_execution::validate_workload(&[
+                crate::secret_execution::Request {
+                    resource: "token".into(),
+                    target: crate::secret_execution::Target::Environment(name),
+                }
+            ])
+            .is_err());
+        }
     }
 }

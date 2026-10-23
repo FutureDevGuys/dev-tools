@@ -50,6 +50,7 @@ fn dedicated_broker_retains_setup_lease_after_dispatcher_returns() {
                 authority: crate::linux_admission::SessionAuthorityGrant {
                     logical: None,
                     hard_deadline_boot_ms: None,
+                    launch_projection_digest: None,
                     github: None,
                     signing: None,
                     release_signing: None,

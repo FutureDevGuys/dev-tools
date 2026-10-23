@@ -394,6 +394,7 @@ pub struct ResolvedWorkload {
     pub launcher_path: String,
     pub authority_profile: String,
     pub secret_references: Vec<String>,
+    pub secret_projections: Vec<crate::secret_execution::Request>,
     pub workspace_roots: Vec<ResolvedWorkspaceRoot>,
     pub sandbox: ResolvedSandbox,
     pub desktop: Option<DesktopWorkloadConfig>,
@@ -1192,6 +1193,7 @@ fn resolve_policy_inner(
                 launcher_path: launcher_path.clone(),
                 authority_profile: workload.profile.clone(),
                 secret_references: workload.secret_references.clone(),
+                secret_projections: Vec::new(),
                 workspace_roots,
                 sandbox: ResolvedSandbox {
                     mode: workload.sandbox.mode,

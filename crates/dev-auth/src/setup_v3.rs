@@ -4845,6 +4845,7 @@ mod tests {
             launcher_path: launcher.display().to_string(),
             authority_profile: "main".into(),
             secret_references: Vec::new(),
+            secret_projections: Vec::new(),
             workspace_roots: Vec::new(),
             sandbox: crate::policy_v2::ResolvedSandbox {
                 mode: crate::policy_v2::SandboxMode::None,
@@ -4906,6 +4907,7 @@ mod tests {
                 launcher_path: "/usr/bin/true".into(),
                 authority_profile: "main".into(),
                 secret_references: Vec::new(),
+                secret_projections: Vec::new(),
                 workspace_roots: Vec::new(),
                 sandbox: crate::policy_v2::ResolvedSandbox {
                     mode: crate::policy_v2::SandboxMode::None,

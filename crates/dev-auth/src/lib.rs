@@ -59,6 +59,7 @@ pub mod release_manifest;
 pub mod resource_metadata;
 mod runtime;
 pub mod runtime_policy;
+pub mod secret_execution;
 #[cfg(unix)]
 pub mod setup;
 #[cfg(unix)]
@@ -77,6 +78,7 @@ pub mod supervisor;
 pub(crate) mod supervisor_descriptors;
 #[cfg(target_os = "linux")]
 pub mod update_status;
+mod workload_projection;
 
 pub use runtime::{
     agent_endpoint, credential_erase, credential_get, enroll_service_account_token, exec_profile,

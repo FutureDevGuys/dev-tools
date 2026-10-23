@@ -1413,6 +1413,7 @@ mod tests {
                     ]),
                 }),
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: None,
                 release_signing: None,
