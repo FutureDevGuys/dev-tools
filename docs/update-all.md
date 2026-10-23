@@ -19,6 +19,35 @@ or run-log creation, so no run artifact is expected. Configuration-writing
 commands such as `config init --path PATH` can still create an absent target.
 See [ADR 0042](../crates/update-all/docs/adr/0042-explicit-configuration-read-selection.md).
 
+Task policies are complete `[tasks.<key>]` tables, not field-by-field overrides.
+A table replaces the fallback policy for that key, including built-in keys.
+Omitted fields become `timeout_secs = 60`, `retries = 0`, and
+`retry_backoff_secs = 0`. A table containing only `retries` therefore selects a
+60-second timeout rather than retaining the built-in timeout.
+
+For `pipx_upgrade`, the complete table takes precedence over
+`UPDATE_ALL_PIPX_UPGRADE_TIMEOUT_SECS`. That environment variable supplies the
+fallback only when the table is absent; the built-in fallback is 180 seconds.
+This complete example retains that built-in timeout and disables configured
+additional attempts. When editing an existing policy, retain its custom timeout
+unless the timeout change is intentional.
+
+```toml
+[tasks.pipx_upgrade]
+timeout_secs = 180
+retries = 0
+retry_backoff_secs = 0
+```
+
+`timeout_secs` bounds one command attempt. For `pipx upgrade-all`, the bound
+covers the whole batch, not each package. `retries` allows additional attempts
+only for eligible non-timeout failures. Update All never retries a command
+timeout, even when `retries` is nonzero or partial output contains a network
+error. [ADR 0026](../crates/update-all/docs/adr/0026-command-output-fidelity-and-bounded-diagnostics.md)
+records the timeout and replay boundary. The
+[configuration example](../crates/update-all/config.example.toml) lists complete
+built-in policy tables.
+
 Prompt request, answer, and cancellation events are explicit journal records keyed by task and request generation; answer text is never persisted. One request generation accepts one answer and cannot be submitted again. Other tasks' waiting prompts queue without replacing the active draft; after submission, the dashboard shows the next waiting request or a submitted notice while execution retains request authority. Help, rename and search keep input until visibly closed. Printable letters, including `g/G/k/K/q/Q`, are ordinary answer text; `Ctrl+C` requests cancel-all before or after submission. Interactive transcript, status, and wrapper filenames use the same flat safe encoding as other task artifacts, so qualified task IDs never create nested artifact paths. If the frontend disconnects, the engine records `frontend_detached` and continues with complete plain output. If the authoritative journal cannot be written, the engine cancels pending and running work and exits unsuccessfully.
 
 Every task-scoped `log_line` record carries the task's exact qualified ID. Run-wide records have a null `task_id`, remain in the global pane and `run.log`, and never create a task-log artifact. The selected task pane replays all retained journal-delivered records for that ID, including records received before task registration.
