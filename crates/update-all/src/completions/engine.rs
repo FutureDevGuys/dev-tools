@@ -96,10 +96,18 @@ struct InventoryCandidate {
     metadata: ToolMetadata,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestedScope {
+    Complete,
+    ConfiguredSubset,
+    Incomplete,
+}
+
 #[derive(Clone, Debug)]
 struct ProviderInventory {
     provider: String,
     status: CompletionProviderInventoryStatus,
+    requested_scope: RequestedScope,
     reason: Option<String>,
     candidates: BTreeMap<CompletionCandidateSlot, InventoryCandidate>,
     explicit_removals: BTreeSet<String>,
@@ -110,6 +118,7 @@ impl ProviderInventory {
         Self {
             provider: provider.to_string(),
             status: CompletionProviderInventoryStatus::Complete,
+            requested_scope: RequestedScope::Complete,
             reason: None,
             candidates: BTreeMap::new(),
             explicit_removals: BTreeSet::new(),
@@ -120,6 +129,7 @@ impl ProviderInventory {
         Self {
             provider: provider.to_string(),
             status: CompletionProviderInventoryStatus::Failed,
+            requested_scope: RequestedScope::Incomplete,
             reason: Some(reason.into()),
             candidates: BTreeMap::new(),
             explicit_removals: BTreeSet::new(),
@@ -129,6 +139,7 @@ impl ProviderInventory {
     fn make_partial(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         self.status = CompletionProviderInventoryStatus::Partial;
+        self.requested_scope = RequestedScope::Incomplete;
         self.reason = Some(match self.reason.take() {
             Some(existing) if !existing.is_empty() => format!("{existing};{reason}"),
             _ => reason,
@@ -221,6 +232,7 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
 
     let mut events = Vec::new();
     let mut inventories = Vec::new();
+    let mut observation = super::result::CompletionObservation::default();
     let mut outcomes = BTreeMap::<CompletionCandidateSlot, CandidateOutcome>::new();
     let mut direct_records = Vec::<CompletionSyncRecord>::new();
     let mut retired = Vec::<(CompletionCandidateMemo, String)>::new();
@@ -304,6 +316,7 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
                         total
                     ));
                 }
+                let records_before = direct_records.len();
                 let candidate_ready = process_candidate(
                     item,
                     &generation_root,
@@ -312,6 +325,11 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
                     &mut outcomes,
                     &mut direct_records,
                 )?;
+                observe_requested_candidate(
+                    &mut observation,
+                    outcomes.get(&item.slot),
+                    &direct_records[records_before..],
+                );
                 retirement_blocked |= !candidate_ready;
                 processed += 1;
             }
@@ -398,6 +416,15 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
             }
         }
 
+        if inventory.status == CompletionProviderInventoryStatus::Failed {
+            observation.inventory_failed += 1;
+        } else {
+            match inventory.requested_scope {
+                RequestedScope::Complete => observation.inventory_complete += 1,
+                RequestedScope::ConfiguredSubset => observation.inventory_configured += 1,
+                RequestedScope::Incomplete => observation.inventory_incomplete += 1,
+            }
+        }
         let inventory_record = CompletionProviderInventoryRecord {
             provider: provider.clone(),
             status: inventory.status,
@@ -408,13 +435,20 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
         inventories.push(inventory_record);
     }
 
-    let (binding_memos, mut candidate_records, activation_updates) = activate_bindings(
-        args.rc_root.as_deref(),
-        &args.managed_root,
-        &candidates,
-        &previous_bindings,
-        &outcomes,
-    )?;
+    let (binding_memos, mut candidate_records, activation_updates, binding_changes) =
+        activate_bindings(
+            args.rc_root.as_deref(),
+            &args.managed_root,
+            &candidates,
+            &previous_bindings,
+            &outcomes,
+        )?;
+    observation.legacy_binding_changes = binding_changes;
+    observation.removed = retired.len();
+    observation.shadowed = candidate_records
+        .iter()
+        .filter(|record| record.status == CompletionSyncRecordStatus::Shadowed)
+        .count();
     direct_records.append(&mut candidate_records);
 
     prune_retired_candidate_artifacts(&generation_root, &candidates, &retired)?;
@@ -564,6 +598,8 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
     let outcome = summarize_sync_outcome(&direct_records, publication.as_ref());
 
     Ok(CompletionSyncResult {
+        observation,
+        publication,
         generated,
         unchanged,
         skipped,
@@ -579,6 +615,34 @@ pub(super) fn run_completion_sync(args: CompletionSyncArgs) -> Result<Completion
             .map(|shell| shell.as_event_name().to_string())
             .collect(),
     })
+}
+
+fn observe_requested_candidate(
+    observation: &mut super::result::CompletionObservation,
+    outcome: Option<&CandidateOutcome>,
+    records: &[CompletionSyncRecord],
+) {
+    // A managed-required failure can also retain a healthy prior artifact. Count
+    // the requested attempt once as failed, not twice as failed and retained.
+    if records
+        .iter()
+        .any(|record| record.status == CompletionSyncRecordStatus::Failed)
+    {
+        observation.failed += 1;
+    } else if let Some(outcome) = outcome {
+        match outcome.kind {
+            CandidateOutcomeKind::Generated => observation.refreshed += 1,
+            CandidateOutcomeKind::Unchanged
+            | CandidateOutcomeKind::ProbedUnchanged
+            | CandidateOutcomeKind::Reused => observation.unchanged += 1,
+            CandidateOutcomeKind::Retained => observation.retained_requested += 1,
+        }
+    } else if records
+        .iter()
+        .any(|record| record.status == CompletionSyncRecordStatus::Skipped)
+    {
+        observation.unsupported += 1;
+    }
 }
 
 fn completion_snapshot_retention_allowed(
@@ -751,7 +815,9 @@ fn collect_configured_inventory(
 ) -> ProviderInventory {
     let mut inventory = ProviderInventory::complete(provider);
     if !authoritative {
-        inventory.make_partial("discovery_disabled_configured_subset");
+        inventory.status = CompletionProviderInventoryStatus::Partial;
+        inventory.requested_scope = RequestedScope::ConfiguredSubset;
+        inventory.reason = Some("discovery_disabled_configured_subset".to_string());
     }
     for tool in index
         .enabled_by_provider
@@ -783,7 +849,9 @@ fn collect_npm_inventory(discover: bool, index: &CatalogIndex) -> ProviderInvent
         .unwrap_or_default();
     if !discover && configured.is_empty() {
         let mut inventory = ProviderInventory::complete("npm");
-        inventory.make_partial("discovery_disabled_configured_subset");
+        inventory.status = CompletionProviderInventoryStatus::Partial;
+        inventory.requested_scope = RequestedScope::ConfiguredSubset;
+        inventory.reason = Some("discovery_disabled_configured_subset".to_string());
         return inventory;
     }
     let prefix = match run_capture_stdout("npm", ["prefix", "-g"], Some(Duration::from_secs(5))) {
@@ -798,7 +866,9 @@ fn collect_npm_inventory(discover: bool, index: &CatalogIndex) -> ProviderInvent
     let bin_dir = Path::new(&prefix).join("bin");
     let mut inventory = ProviderInventory::complete("npm");
     if !discover {
-        inventory.make_partial("discovery_disabled_configured_subset");
+        inventory.status = CompletionProviderInventoryStatus::Partial;
+        inventory.requested_scope = RequestedScope::ConfiguredSubset;
+        inventory.reason = Some("discovery_disabled_configured_subset".to_string());
     }
     let tools = if discover {
         let entries = match fs::read_dir(&bin_dir) {
@@ -1679,7 +1749,12 @@ fn activate_bindings(
     candidates: &BTreeMap<CompletionCandidateSlot, CompletionCandidateMemo>,
     previous_bindings: &BTreeMap<CompletionBindingIdentity, CompletionBindingMemo>,
     outcomes: &BTreeMap<CompletionCandidateSlot, CandidateOutcome>,
-) -> Result<(Vec<CompletionBindingMemo>, Vec<CompletionSyncRecord>, usize)> {
+) -> Result<(
+    Vec<CompletionBindingMemo>,
+    Vec<CompletionSyncRecord>,
+    usize,
+    usize,
+)> {
     let mut grouped = BTreeMap::<CompletionBindingIdentity, Vec<&CompletionCandidateMemo>>::new();
     for memo in candidates.values() {
         grouped.entry(memo.binding.clone()).or_default().push(memo);
@@ -1690,6 +1765,7 @@ fn activate_bindings(
     let mut next_bindings = Vec::new();
     let mut records = Vec::new();
     let mut activation_updates = 0usize;
+    let mut binding_changes = 0usize;
     for binding in all_bindings {
         let mut binding_candidates = grouped.remove(&binding).unwrap_or_default();
         binding_candidates.sort_by(|left, right| left.slot.cmp(&right.slot));
@@ -1719,6 +1795,7 @@ fn activate_bindings(
                 .transpose()?
                 .unwrap_or(false)
         };
+        binding_changes += usize::from(overlay_changed);
         let activation_only_update = match winner {
             Some(winner) => outcomes.get(&winner.slot).map_or(true, |outcome| {
                 outcome.kind != CandidateOutcomeKind::Generated
@@ -1793,7 +1870,7 @@ fn activate_bindings(
             }
         }
     }
-    Ok((next_bindings, records, activation_updates))
+    Ok((next_bindings, records, activation_updates, binding_changes))
 }
 
 fn select_binding_winner<'a>(
@@ -2044,6 +2121,154 @@ printf 'warning: cache routing unavailable\n' >&2
             inventory.candidates.values().next().unwrap().tool,
             "fixture-command"
         );
+    }
+
+    #[test]
+    fn completion_result_empty_snapshot_then_repeat_and_failed_empty_inventory() {
+        let _env = env_guard();
+        let layout = TestLayout::new();
+        write_catalog(&layout.catalog, &[], vec![]);
+        let first = layout.sync_public("path", false, vec![CompletionShell::Zsh]);
+        assert!(first
+            .result_footer(false)
+            .contains("\"outcome\":\"updated\""));
+        assert_eq!(first.observation.refreshed, 0);
+        let second = layout.sync_public("path", false, vec![CompletionShell::Zsh]);
+        assert!(second
+            .result_footer(false)
+            .contains("\"outcome\":\"no_op\""));
+        let failed = layout.sync_public("unknown", false, vec![CompletionShell::Zsh]);
+        assert_eq!(failed.observation.inventory_failed, 1);
+        assert!(failed
+            .records
+            .iter()
+            .all(|record| record.status == CompletionSyncRecordStatus::Skipped));
+        assert!(failed
+            .result_footer(false)
+            .contains("\"outcome\":\"failed\""));
+    }
+
+    #[test]
+    fn completion_result_configured_subset_later_budget_partial_is_incomplete() {
+        let mut inventory = collect_configured_inventory(
+            "uv",
+            &CatalogIndex::default(),
+            PathBuf::new(),
+            "configured",
+            false,
+        );
+        assert_eq!(inventory.requested_scope, RequestedScope::ConfiguredSubset);
+        inventory.make_partial("provider_budget_exhausted");
+        assert_eq!(inventory.requested_scope, RequestedScope::Incomplete);
+    }
+
+    #[test]
+    fn completion_result_configured_subset_retains_unrequested_cache_without_deferral() {
+        let _env = env_guard();
+        let _probe_environment = clean_probe_environment();
+        let layout = TestLayout::new();
+        let bin = layout._temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let a = bin.join("a");
+        let b = bin.join("b");
+        write_native_command(&a, "a", "first");
+        write_native_command(&b, "b", "first");
+        let _path = path_with_first(&[&bin]);
+        let a_config = explicit_command_candidate("a", "uv", &a, None);
+        write_catalog(
+            &layout.catalog,
+            &["uv"],
+            vec![
+                a_config.clone(),
+                explicit_command_candidate("b", "uv", &b, None),
+            ],
+        );
+        layout.sync_public("uv", false, vec![CompletionShell::Zsh]);
+        write_catalog(&layout.catalog, &["uv"], vec![a_config]);
+        let result = layout.sync_public("uv", false, vec![CompletionShell::Zsh]);
+        assert_eq!(result.observation.inventory_configured, 1);
+        assert_eq!(result.observation.inventory_incomplete, 0);
+        assert_eq!(result.observation.unchanged, 1);
+        assert_eq!(result.observation.retained_requested, 0);
+        assert_eq!(
+            record_status(&result, "uv", "b"),
+            CompletionSyncRecordStatus::Retained
+        );
+        assert!(result
+            .result_footer(false)
+            .contains("\"outcome\":\"no_op\""));
+    }
+
+    #[test]
+    fn completion_result_requested_retention_survives_publication_and_required_failure_is_exclusive(
+    ) {
+        let _env = env_guard();
+        let _probe_environment = clean_probe_environment();
+        let layout = TestLayout::new();
+        let bin = layout._temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let a = bin.join("a");
+        let b = bin.join("b");
+        write_native_command(&a, "a", "first");
+        write_native_command(&b, "b", "first");
+        let _path = path_with_first(&[&bin]);
+        let mut a_config = explicit_command_candidate("a", "uv", &a, None);
+        a_config["managed_required"] = json!(false);
+        let b_config = explicit_command_candidate("b", "uv", &b, None);
+        write_catalog(
+            &layout.catalog,
+            &["uv"],
+            vec![a_config.clone(), b_config.clone()],
+        );
+        layout.sync_public("uv", false, vec![CompletionShell::Zsh]);
+        fs::remove_file(&a).unwrap();
+        write_native_command(&b, "b", "second");
+        let retained = layout.sync_public("uv", false, vec![CompletionShell::Zsh]);
+        assert_eq!(retained.observation.retained_requested, 1);
+        assert_eq!(retained.observation.refreshed, 1);
+        assert_eq!(retained.observation.failed, 0);
+        assert!(matches!(
+            retained.publication,
+            Some(CompletionSnapshotPublishOutcome::Published { .. })
+        ));
+        assert!(retained
+            .result_footer(false)
+            .contains("\"outcome\":\"deferred\""));
+        a_config["managed_required"] = json!(true);
+        write_catalog(&layout.catalog, &["uv"], vec![a_config, b_config]);
+        let failed = layout.sync_public("uv", false, vec![CompletionShell::Zsh]);
+        assert_eq!(failed.observation.failed, 1);
+        assert_eq!(failed.observation.retained_requested, 0);
+        assert_eq!(failed.observation.unchanged, 1);
+        assert!(failed
+            .result_footer(false)
+            .contains("\"outcome\":\"failed\""));
+    }
+
+    #[test]
+    fn completion_result_legacy_binding_repair_does_not_refresh_candidate() {
+        let _env = env_guard();
+        let _probe_environment = clean_probe_environment();
+        let layout = TestLayout::new();
+        let bin = layout._temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let demo = bin.join("demo");
+        write_native_command(&demo, "demo", "first");
+        let _path = path_with_first(&[&bin]);
+        write_catalog(
+            &layout.catalog,
+            &["path"],
+            vec![explicit_command_candidate("demo", "path", &demo, None)],
+        );
+        layout.sync("path", false);
+        fs::remove_file(layout.rc_root.join("shell/completions-managed/_demo")).unwrap();
+        let result = layout.sync("path", false);
+        assert_eq!(result.observation.refreshed, 0);
+        assert_eq!(result.observation.unchanged, 1);
+        assert_eq!(result.observation.legacy_binding_changes, 1);
+        assert!(result
+            .result_footer(false)
+            .contains("\"outcome\":\"updated\""));
     }
 
     struct EnvVarGuard {
@@ -2520,6 +2745,11 @@ exit 1
             CompletionSyncRecordStatus::ProbedUnchanged
         );
         assert_eq!(second.generated, 0);
+        assert_eq!(second.observation.refreshed, 0);
+        assert_eq!(second.observation.unchanged, 1);
+        assert!(second
+            .result_footer(false)
+            .contains("\"outcome\":\"no_op\""));
         assert!(second.records.iter().all(|record| {
             record.status != CompletionSyncRecordStatus::Generated
                 && record.status != CompletionSyncRecordStatus::Retired
@@ -2769,6 +2999,9 @@ exit 2
         );
 
         let result = layout.sync("path,uv", false);
+        assert_eq!(result.observation.refreshed, 2);
+        assert_eq!(result.observation.shadowed, 1);
+        assert_eq!(result.observation.failed, 0);
         assert_eq!(
             record_status(&result, "path", "demo"),
             CompletionSyncRecordStatus::Shadowed

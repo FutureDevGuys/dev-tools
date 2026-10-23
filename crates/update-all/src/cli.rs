@@ -1353,11 +1353,12 @@ impl CompletionsCli {
                     progress_cb: None,
                 })?;
 
-                for line in res.events {
+                for line in &res.events {
                     crate::ua_outln!("{line}");
                 }
                 crate::ua_outln!("completion_outcome={}", res.outcome.as_str());
 
+                let mut install_changed = false;
                 if cli.apply {
                     let rc_root = rc_root
                         .clone()
@@ -1374,7 +1375,8 @@ impl CompletionsCli {
                             powershell_root: powershell_root.clone(),
                         },
                     )?;
-                    for line in install.events {
+                    install_changed = install.changed;
+                    for line in &install.events {
                         crate::ua_outln!("{line}");
                     }
                     let managed_catalog = if audit_mode == "off" {
@@ -1402,6 +1404,9 @@ impl CompletionsCli {
                     for line in applied.events {
                         crate::ua_outln!("{line}");
                     }
+                }
+                if !crate::util::cancel::is_cancel_requested() {
+                    crate::ua_outln!("{}", res.result_footer(install_changed));
                 }
             }
             CompletionsCmd::Install(cli) => {

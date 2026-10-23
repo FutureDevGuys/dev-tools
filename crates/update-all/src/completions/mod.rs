@@ -2,6 +2,9 @@ mod engine;
 mod generator;
 mod native;
 pub(crate) mod registry;
+mod result;
+#[cfg(test)]
+mod result_tests;
 mod state;
 mod store;
 
@@ -76,6 +79,8 @@ pub struct CompletionSyncArgs {
 
 #[derive(Debug)]
 pub struct CompletionSyncResult {
+    pub(crate) observation: result::CompletionObservation,
+    pub(crate) publication: Option<CompletionSnapshotPublishOutcome>,
     pub generated: usize,
     pub unchanged: usize,
     pub skipped: usize,
@@ -86,6 +91,13 @@ pub struct CompletionSyncResult {
     pub effective_catalog: Registry,
     pub outcome: CompletionSyncOutcome,
     pub shells: Vec<String>,
+}
+
+impl CompletionSyncResult {
+    pub(crate) fn result_footer(&self, install_changed: bool) -> String {
+        self.observation
+            .result_footer(self.publication.as_ref(), install_changed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +244,7 @@ pub struct CompletionInstallArgs {
 
 #[derive(Debug)]
 pub struct CompletionInstallResult {
+    pub changed: bool,
     pub events: Vec<String>,
 }
 
@@ -648,6 +661,7 @@ unset _rc_comp_dir
     };
 
     Ok(CompletionInstallResult {
+        changed: bootstrap_changed || manifest_changed || retired_marker_removed || self_changed,
         events: vec![
             format!(
                 "{self_status}|self|update-all|{}",
@@ -699,6 +713,7 @@ fn completion_install_powershell(powershell_root: &Path) -> Result<CompletionIns
     };
 
     Ok(CompletionInstallResult {
+        changed: self_changed,
         events: vec![
             format!(
                 "{self_status}|self|update-all|{}",
