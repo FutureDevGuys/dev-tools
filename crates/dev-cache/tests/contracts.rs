@@ -362,6 +362,43 @@ fn nested_routing_replaces_only_values_with_exact_managed_provenance() {
 }
 
 #[test]
+fn npm_cache_routing_preserves_native_case_insensitive_overrides_and_managed_provenance() {
+    let mut context = AdapterContext {
+        worktree_cache: PathBuf::from("/root/workspaces/id"),
+        shared_cache: PathBuf::from("/root/cache"),
+        domain_id: "test-domain".to_owned(),
+        inherited: HashMap::new(),
+    };
+    let mut managed = Adapter::Npm.environment(&context);
+    assert_eq!(
+        managed,
+        HashMap::from([("npm_config_cache".to_owned(), "/root/cache/npm".to_owned())])
+    );
+    provenance::attach(&context.inherited, &mut managed, "npm");
+    context.shared_cache = PathBuf::from("/replacement/cache");
+    context.inherited = managed.clone();
+    assert_eq!(
+        Adapter::Npm.environment(&context),
+        HashMap::from([(
+            "npm_config_cache".to_owned(),
+            "/replacement/cache/npm".to_owned()
+        )])
+    );
+    for key in ["npm_config_cache", "NPM_CONFIG_CACHE", "Npm_Config_Cache"] {
+        for inherited in [HashMap::new(), managed.clone()] {
+            for value in ["", "/user/chosen/cache"] {
+                context.inherited = inherited.clone();
+                context.inherited.insert(key.to_owned(), value.to_owned());
+                assert!(
+                    Adapter::Npm.environment(&context).is_empty(),
+                    "native override {key}={value:?} must remain authoritative"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn cache_root_relocation_is_atomic_and_preserves_domain_identity() {
     let temp = tempfile::tempdir().expect("temporary parent");
     let original = temp.path().join("foreign-cache");
@@ -1371,18 +1408,24 @@ fn fully_overridden_adapter_delegates_even_when_the_managed_root_is_missing() {
     fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).expect("npm mode");
     let path =
         std::env::join_paths([intercept, upstream, PathBuf::from("/usr/bin")]).expect("PATH");
-    let output = Command::new(&alias)
-        .args(["install", "fixture"])
-        .env("PATH", path)
-        .env("DEV_CACHE_CONFIG", config_path)
-        .env("npm_config_cache", "")
-        .output()
-        .expect("delegate overridden npm");
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "CACHE=<>\nARGS=install fixture\n"
-    );
+    for variable in ["npm_config_cache", "NPM_CONFIG_CACHE", "Npm_Config_Cache"] {
+        let output = Command::new(&alias)
+            .args(["install", "fixture"])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", &path)
+            .env("DEV_CACHE_CONFIG", &config_path)
+            .env(variable, "")
+            .current_dir(temp.path())
+            .output()
+            .expect("delegate overridden npm");
+        assert!(output.status.success(), "{variable}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "CACHE=<>\nARGS=install fixture\n"
+        );
+        assert!(!config.root.as_ref().unwrap().exists());
+    }
 }
 
 #[cfg(unix)]
