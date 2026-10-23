@@ -2696,6 +2696,8 @@ fn yay_recovery_sections_render_recovery_headers_and_statuses() {
 #[test]
 fn completion_sync_records_render_generation_rows() {
     let sync = CompletionSyncResult {
+        observation: Default::default(),
+        publication: None,
         generated: 1,
         unchanged: 1,
         skipped: 1,
