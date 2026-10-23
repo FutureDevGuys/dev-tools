@@ -1167,6 +1167,7 @@ fn ready_response(
         expires_at: OffsetDateTime::from_unix_timestamp(session.expires_at_unix)?
             .format(&Rfc3339)?,
         hard_deadline_boot_ms: session.authority.hard_deadline_boot_ms,
+        launch_projection_digest: session.authority.launch_projection_digest.clone(),
     })
 }
 
@@ -2088,6 +2089,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: Some(crate::linux_admission::SessionGitHubGrant {
                     credential_slot: "automation".into(),
                     app_id: 42,
@@ -2883,6 +2885,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -2925,6 +2928,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: Some(crate::linux_admission::SessionGitHubGrant {
                     credential_slot: "automation".into(),
                     app_id: 42,
@@ -2977,6 +2981,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: Some(key.clone()),
                 release_signing: None,
@@ -3051,6 +3056,7 @@ mod tests {
             authority: crate::linux_admission::SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: Some(key.clone()),
                 release_signing: None,
@@ -3157,5 +3163,31 @@ mod tests {
         assert!(!json.contains("private-owner-sentinel"));
         assert!(!json.contains("private-repository-sentinel"));
         assert!(!json.contains("private-token-sentinel"));
+    }
+
+    #[test]
+    fn ready_response_preserves_the_session_launch_projection_digest() {
+        let mut session = github_session("0123456789abcdef0123456789abcdef");
+        let response = ready_response(&session).unwrap();
+        assert!(matches!(
+            response,
+            BrokerResponse::Ready {
+                launch_projection_digest: None,
+                ..
+            }
+        ));
+        let digest = "0123456789abcdef".repeat(4);
+        session.authority.launch_projection_digest = Some(digest.clone());
+        session.authority.hard_deadline_boot_ms = Some(u64::MAX);
+        session.authority.logical = Some(crate::policy_v3::LogicalSelection {
+            cap: "build".into(),
+            resources: Default::default(),
+        });
+        let response = ready_response(&session).unwrap();
+        assert!(matches!(response, BrokerResponse::Ready {
+            launch_projection_digest: Some(admitted),
+            hard_deadline_boot_ms: Some(u64::MAX),
+            ..
+        } if admitted == digest));
     }
 }
