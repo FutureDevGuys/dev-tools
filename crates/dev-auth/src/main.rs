@@ -15,7 +15,7 @@ mod grant_cli;
 mod linux_input;
 mod product_cli;
 mod secret_cli;
-mod secret_execution;
+use dev_auth::secret_execution;
 mod update_cli;
 mod validation_cli;
 mod workload_cli;

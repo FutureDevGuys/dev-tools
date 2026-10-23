@@ -46,6 +46,8 @@ pub struct WorkloadCap {
     pub admission: Vec<Admission>,
     pub max_duration_seconds: u64,
     #[serde(default)]
+    pub secret_projections: Vec<crate::secret_execution::Request>,
+    #[serde(default)]
     pub operations: crate::policy_v3_operations::OperationAuthority,
     #[serde(default)]
     pub workspace_caps: Vec<String>,
@@ -88,6 +90,8 @@ pub struct WorkloadConfigV3 {
     pub launcher: String,
     pub admission: Admission,
     pub duration_seconds: u64,
+    #[serde(default)]
+    pub secret_projections: Vec<crate::secret_execution::Request>,
     pub resources: BTreeMap<String, ResourceSelection>,
     #[serde(default)]
     pub operations: crate::policy_v3_operations::OperationSelection,
@@ -117,6 +121,7 @@ pub struct ResolvedWorkloadV3 {
     pub admission: Admission,
     pub duration_seconds: u64,
     pub allow_pinned_shell: bool,
+    pub secret_projections: Vec<crate::secret_execution::Request>,
     pub resources: BTreeMap<LogicalSecretName, ResolvedResource>,
     pub operations: crate::policy_v3_operations::ResolvedOperations,
     pub workspace_roots: Vec<ResolvedWorkspaceRoot>,
@@ -186,6 +191,9 @@ pub fn resolve_policy_for_user(
             &cap.resource_cap,
             &workload.resources,
         )?;
+        if !subset(&workload.secret_projections, &cap.secret_projections) {
+            bail!("workload secret projection is outside administrator authority");
+        }
         let operations = cap.operations.resolve(&workload.operations, &resources)?;
         let mut workspace_roots = Vec::new();
         for requested in &workload.workspace_roots {
@@ -222,6 +230,7 @@ pub fn resolve_policy_for_user(
                 admission: workload.admission,
                 duration_seconds: workload.duration_seconds,
                 allow_pinned_shell: cap.allow_pinned_shell,
+                secret_projections: workload.secret_projections.clone(),
                 resources,
                 operations,
                 workspace_roots,
@@ -351,6 +360,7 @@ pub fn resolve_runtime_policy_for_user(
                 launcher_path: authority.launcher_path.clone(),
                 authority_profile: requested.name.clone(),
                 secret_references: Vec::new(),
+                secret_projections: authority.secret_projections.clone(),
                 workspace_roots: authority.workspace_roots.clone(),
                 sandbox: authority.sandbox.clone(),
                 desktop: authority.desktop.clone(),
@@ -416,6 +426,7 @@ impl UserConfigV3 {
                 bail!("user configuration has duplicate workloads");
             }
             validate_selections(&workload.resources)?;
+            validate_secret_projections(&workload.secret_projections, &workload.resources)?;
             if workload.workspace_roots.len() > 64 || workload.sandbox.adapters.len() > 32 {
                 bail!("workload execution selection exceeds the declaration limit");
             }
@@ -478,6 +489,26 @@ fn validate_selections(resources: &BTreeMap<String, ResourceSelection>) -> Resul
     for (name, selected) in resources {
         LogicalSecretName::parse(name)?;
         require_narrowing(selected, selected)?;
+    }
+    Ok(())
+}
+
+fn validate_secret_projections(
+    requests: &[crate::secret_execution::Request],
+    resources: &BTreeMap<String, ResourceSelection>,
+) -> Result<()> {
+    crate::secret_execution::validate_workload(requests)?;
+    for request in requests {
+        let resource = resources
+            .get(&request.resource)
+            .context("secret projection resource is outside selected authority")?;
+        if !resource
+            .purposes
+            .contains(&crate::logical_authority::ResourcePurpose::Read)
+            || !resource.projections.contains(&request.projection())
+        {
+            bail!("secret projection requires selected read and projection authority");
+        }
     }
     Ok(())
 }
@@ -578,6 +609,7 @@ pub fn require_system_policy_narrows(upper: &SystemPolicyV3, lower: &SystemPolic
             || !subset(&cap.launchers, &allowed.launchers)
             || !subset(&cap.admission, &allowed.admission)
             || cap.max_duration_seconds > allowed.max_duration_seconds
+            || !subset(&cap.secret_projections, &allowed.secret_projections)
             || !subset(&cap.workspace_caps, &allowed.workspace_caps)
             || !subset(&cap.sandbox_adapters, &allowed.sandbox_adapters)
             || (allowed.require_sandbox && !cap.require_sandbox)
@@ -698,6 +730,7 @@ impl SystemPolicyV3 {
                 .resource_caps
                 .get(&cap.resource_cap)
                 .context("workload cap has no resource cap")?;
+            validate_secret_projections(&cap.secret_projections, &resources.resources)?;
             if cap
                 .users
                 .iter()

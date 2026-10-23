@@ -3655,7 +3655,6 @@ fn remove_automation_credential_environment(command: &mut Command) {
         .env("SSH_ASKPASS", "/usr/bin/false");
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) const GITHUB_AUTH_ENVIRONMENT: &[&str] = &[
     "GH_TOKEN",
     "GITHUB_TOKEN",

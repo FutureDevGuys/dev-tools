@@ -264,6 +264,7 @@ fn resolves_strict_policy_with_compatibility_defaults_and_narrowed_authority() {
     assert_eq!(workload.authority_profile, "publish");
     assert_eq!(workload.sandbox.mode, SandboxMode::Required);
     assert_eq!(workload.secret_references, Vec::<String>::new());
+    assert!(workload.secret_projections.is_empty());
     assert_eq!(workload.workspace_roots[0].system_cap, "source");
     assert_eq!(workload.workspace_roots[0].path, "/srv/source/api");
     assert_eq!(

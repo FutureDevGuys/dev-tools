@@ -222,8 +222,12 @@ pub(crate) fn command(
     workload: &ResolvedWorkload,
     arguments: &[OsString],
 ) -> Result<std::process::Command> {
-    let mut command = std::process::Command::new(&workload.launcher_path);
     let Some(selected) = selection(owner_uid, workload_name, workload)? else {
+        let mut command = if workload.secret_projections.is_empty() {
+            std::process::Command::new(&workload.launcher_path)
+        } else {
+            crate::workload_projection::retained_command(Path::new(&workload.launcher_path))?
+        };
         command.args(arguments).env_remove(SOURCE_FD_ENV);
         return Ok(command);
     };
@@ -247,6 +251,14 @@ pub(crate) fn command(
             arguments,
         );
     }
+    if !workload.secret_projections.is_empty() {
+        return crate::smart_binding::shell::retained_projected_shell_command(
+            &selected.binding,
+            source,
+            arguments,
+        );
+    }
+    let mut command = std::process::Command::new(&workload.launcher_path);
     crate::smart_binding::shell::attach_sealed_source(
         &mut command,
         &selected.binding,
@@ -598,6 +610,34 @@ mod tests {
             .unwrap();
         assert!(
             crate::smart_binding::shell::retained_shell_command(&receipt, source, &[]).is_err()
+        );
+    }
+    #[test]
+    fn projected_shell_retains_approved_content_without_requiring_original_inode() {
+        let mut receipt = definition();
+        if let BindingResolution::PinnedShell { identity, .. } = &mut receipt.active.resolved {
+            identity.inode = Some(identity.inode.unwrap().checked_add(1).unwrap());
+        }
+        let source = crate::smart_binding::sealed_shell_source(&receipt)
+            .unwrap()
+            .unwrap();
+        let command = crate::smart_binding::shell::retained_projected_shell_command(
+            &receipt,
+            source,
+            &[OsString::from("literal argument")],
+        )
+        .unwrap();
+        assert!(Path::new(command.get_program()).starts_with("/proc/self/fd"));
+        assert_eq!(command.get_args().last().unwrap(), "literal argument");
+        if let BindingResolution::PinnedShell { identity, .. } = &mut receipt.active.resolved {
+            identity.sha256 = "0".repeat(64);
+        }
+        let source = crate::smart_binding::sealed_shell_source(&receipt)
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::smart_binding::shell::retained_projected_shell_command(&receipt, source, &[],)
+                .is_err()
         );
     }
 }

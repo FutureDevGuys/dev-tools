@@ -1,23 +1,30 @@
+use crate::logical_authority::Projection;
 use anyhow::{bail, Result};
-#[cfg(target_os = "linux")]
-use dev_auth::logical_authority::Projection;
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Target {
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(
+    tag = "kind",
+    content = "target",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum Target {
     Stdin,
     Descriptor(i32),
     File(String),
     Environment(String),
 }
 
-pub(super) struct Request {
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    #[serde(flatten)]
     pub target: Target,
     pub resource: String,
 }
 
 impl Request {
-    #[cfg(target_os = "linux")]
     pub fn projection(&self) -> Projection {
         match self.target {
             Target::Stdin => Projection::Stdin,
@@ -28,7 +35,7 @@ impl Request {
     }
 }
 
-pub(super) fn validate(requests: &[Request]) -> Result<()> {
+pub fn validate(requests: &[Request]) -> Result<()> {
     if requests.is_empty() || requests.len() > 32 {
         bail!("projection count is invalid");
     }
@@ -54,6 +61,45 @@ pub(super) fn validate(requests: &[Request]) -> Result<()> {
     Ok(())
 }
 
+/// Validate policy-owned destinations without permitting managed runtime or shell controls.
+/// The first declarative workload slice is environment-only; standalone secret exec
+/// retains its separately admitted stdin, descriptor and anonymous-file contract.
+pub fn validate_workload(requests: &[Request]) -> Result<()> {
+    if requests.is_empty() {
+        return Ok(());
+    }
+    validate(requests)?;
+    for request in requests {
+        let Target::Environment(name) = &request.target else {
+            bail!("workload projections support only environment destinations");
+        };
+        if name.starts_with("GIT_")
+            || crate::runtime::GITHUB_AUTH_ENVIRONMENT.contains(&name.as_str())
+            || matches!(
+                name.as_str(),
+                "ARGV0"
+                    | "SSH_AUTH_SOCK"
+                    | "SSH_AGENT_PID"
+                    | "SSH_ASKPASS"
+                    | "PYTHONPATH"
+                    | "PYTHONHOME"
+                    | "PERL5LIB"
+                    | "RUBYLIB"
+                    | "GH_CONFIG_DIR"
+                    | "GH_PROMPT_DISABLED"
+                    | "BASH_ENV"
+                    | "ENV"
+                    | "SHELLOPTS"
+                    | "BASHOPTS"
+                    | "ZDOTDIR"
+            )
+        {
+            bail!("workload projection destination is reserved");
+        }
+    }
+    Ok(())
+}
+
 fn environment_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     name.len() <= 128
@@ -71,7 +117,7 @@ fn environment_name(name: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) struct Prepared {
+pub struct Prepared {
     command: std::process::Command,
     _files: Vec<std::fs::File>,
 }
@@ -81,7 +127,7 @@ impl Prepared {
     pub fn new(
         mut command: std::process::Command,
         requests: &[Request],
-        values: Vec<dev_auth::broker_protocol::SensitiveBytes>,
+        values: Vec<crate::broker_protocol::SensitiveBytes>,
     ) -> Result<Self> {
         use anyhow::Context;
         use std::fs::File;
@@ -189,6 +235,20 @@ impl Prepared {
         })
     }
 
+    /// Keep prepared material and callbacks alive through the product's existing
+    /// native lifecycle. The callback must synchronously complete spawn/exec and
+    /// settlement; it must not return or retain the command beyond this scope.
+    /// This does not install a second command runner.
+    pub(crate) fn with_command<T>(
+        self,
+        execute: impl FnOnce(std::process::Command) -> Result<T>,
+    ) -> Result<T> {
+        let Self { command, _files } = self;
+        let result = execute(command);
+        drop(_files);
+        result
+    }
+
     pub fn run(
         self,
         continue_running: impl FnMut() -> bool,
@@ -204,7 +264,7 @@ impl Prepared {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use dev_auth::broker_protocol::SensitiveBytes;
+    use crate::broker_protocol::SensitiveBytes;
     use std::fs::File;
     use std::process::{Command, Stdio};
 

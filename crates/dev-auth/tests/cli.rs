@@ -23,6 +23,10 @@ use wait_timeout::ChildExt;
 #[path = "support/enrolled_store.rs"]
 mod enrolled_store;
 
+#[cfg(target_os = "linux")]
+#[path = "support/generic_projection.rs"]
+mod generic_projection;
+
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
@@ -1610,7 +1614,11 @@ impl NativeUserSandbox {
     }
 
     fn install_binary(&self, destination: &Path) {
-        fs::copy(env!("CARGO_BIN_EXE_dev-auth"), destination).unwrap();
+        self.install_binary_from(Path::new(env!("CARGO_BIN_EXE_dev-auth")), destination);
+    }
+
+    fn install_binary_from(&self, source: &Path, destination: &Path) {
+        fs::copy(source, destination).unwrap();
         assert!(Command::new("/usr/bin/strip")
             .arg("--strip-debug")
             .arg(destination)
@@ -3824,7 +3832,7 @@ fn installed_user_only_workload_validates_selected_slots_without_key_export() {
         .unwrap()
         .unwrap();
     if user.name == "dev-auth-test" {
-        run_installed_user_only_validation_child();
+        run_installed_user_only_validation_child(None);
         return;
     }
     let sandbox = NativeUserSandbox::new();
@@ -3865,7 +3873,9 @@ fn installed_user_only_workload_validates_selected_slots_without_key_export() {
 }
 
 #[cfg(target_os = "linux")]
-fn run_installed_user_only_validation_child() {
+fn run_installed_user_only_validation_child(
+    exercise: Option<fn(&dev_auth::setup::SetupPaths, &Path)>,
+) {
     use dev_auth::setup::{
         install_at, reconcile_workload_launchers_at, InstallMode, InstallRequest, SetupPaths,
     };
@@ -4217,6 +4227,9 @@ products = ["fixture"]
         fs::read_to_string(primary.with_extension("calls")).unwrap(),
         "user\nread\nread\nread\nread\n"
     );
+    if let Some(exercise) = exercise {
+        exercise(&paths, &root);
+    }
 }
 
 #[cfg(target_os = "linux")]

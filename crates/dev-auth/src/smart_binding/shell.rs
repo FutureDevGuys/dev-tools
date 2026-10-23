@@ -71,6 +71,50 @@ pub(crate) fn retained_shell_command(
     Ok(command)
 }
 
+/// Retain the Strong boundary's already verified root-custodied copied pin.
+/// Its approved content identity is unchanged; its copied inode intentionally
+/// differs from the original receipt. The caller must verify native projection
+/// custody and the sealed source before entering this boundary.
+pub(crate) fn retained_projected_shell_command(
+    receipt: &BindingReceipt,
+    source: fs::File,
+    caller_arguments: &[OsString],
+) -> Result<std::process::Command> {
+    validate_binding_receipt_structure(receipt)?;
+    if !is_pinned_shell_resolution(&receipt.active.resolved) {
+        bail!("projected shell command requires a pinned shell definition");
+    }
+    let identity = receipt.active.resolved.identity();
+    let held = dev_tools_command::HeldExecutable::open_with_validation(
+        &identity.canonical_path,
+        |descriptor, _| {
+            let metadata = rustix::fs::fstat(descriptor)?;
+            if metadata.st_uid != 0 || metadata.st_mode & 0o022 != 0 {
+                bail!("projected shell requires root-custodied executable ancestry");
+            }
+            Ok(())
+        },
+    )?;
+    let observed = inspect_open_executable_identity(
+        &identity.canonical_path,
+        held.open_read_handle()?,
+        false,
+        None,
+    )?;
+    if observed.length != identity.length
+        || observed.sha256 != identity.sha256
+        || observed.authority != BindingAuthority::RootOwned
+    {
+        bail!("retained projected shell differs from the approved pin");
+    }
+    let mut command = held.into_command_above(
+        identity.canonical_path.as_os_str(),
+        crate::supervisor_descriptors::MIN_EXECUTABLE_DESCRIPTOR,
+    )?;
+    append_source(&mut command, source, caller_arguments)?;
+    Ok(command)
+}
+
 fn append_source(
     command: &mut std::process::Command,
     source: fs::File,

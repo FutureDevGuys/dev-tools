@@ -361,6 +361,7 @@ fn responses_reject_malformed_secrets_lifetimes_and_public_diagnostics() {
         },
         BrokerResponse::Ready {
             hard_deadline_boot_ms: None,
+            launch_projection_digest: None,
             session_id: request_id.clone(),
             owner_uid: 1000,
             execution_uid: 991,
@@ -375,5 +376,75 @@ fn responses_reject_malformed_secrets_lifetimes_and_public_diagnostics() {
             response,
         })
         .is_err());
+    }
+}
+
+fn ready_with_projection_digest(digest: Option<String>) -> BrokerResponseEnvelope {
+    BrokerResponseEnvelope {
+        version: BROKER_PROTOCOL_VERSION,
+        request_id: "0123456789abcdef0123456789abcdef".into(),
+        response: BrokerResponse::Ready {
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+            owner_uid: 1000,
+            execution_uid: 1000,
+            workload: "worker".into(),
+            profile: "build".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+            hard_deadline_boot_ms: Some(12345),
+            launch_projection_digest: digest,
+        },
+    }
+}
+
+#[test]
+fn ready_projection_digest_is_optional_and_preserves_legacy_wire_shape() {
+    let legacy = ready_with_projection_digest(None);
+    let frame = encode_response_frame(&legacy).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    assert!(json["response"].get("launch_projection_digest").is_none());
+    assert_eq!(decode_response_frame(&frame).unwrap(), legacy);
+
+    let digest = "0123456789abcdef".repeat(4);
+    let selected = ready_with_projection_digest(Some(digest.clone()));
+    let frame = encode_response_frame(&selected).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(json["response"]["launch_projection_digest"], digest);
+    assert_eq!(decode_response_frame(&frame).unwrap(), selected);
+}
+
+#[test]
+fn ready_projection_digest_rejects_invalid_syntax_and_unbounded_presence() {
+    for digest in [
+        String::new(),
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+        format!("{}\n", "a".repeat(63)),
+    ] {
+        let response = ready_with_projection_digest(Some(digest));
+        assert!(encode_response_frame(&response).is_err());
+        assert!(decode_response_frame(&serde_json::to_vec(&response).unwrap()).is_err());
+    }
+    let mut unbounded = ready_with_projection_digest(Some("a".repeat(64)));
+    let BrokerResponse::Ready {
+        hard_deadline_boot_ms,
+        ..
+    } = &mut unbounded.response
+    else {
+        unreachable!();
+    };
+    *hard_deadline_boot_ms = None;
+    assert!(encode_response_frame(&unbounded).is_err());
+    assert!(decode_response_frame(&serde_json::to_vec(&unbounded).unwrap()).is_err());
+
+    for wrong_type in [
+        serde_json::json!(7),
+        serde_json::json!(true),
+        serde_json::json!(["a".repeat(64)]),
+    ] {
+        let mut response = serde_json::to_value(ready_with_projection_digest(None)).unwrap();
+        response["response"]["launch_projection_digest"] = wrong_type;
+        assert!(decode_response_frame(&serde_json::to_vec(&response).unwrap()).is_err());
     }
 }

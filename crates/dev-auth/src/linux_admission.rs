@@ -70,6 +70,8 @@ pub struct PendingSessionRegistration {
 pub struct SessionAuthorityGrant {
     pub logical: Option<crate::policy_v3::LogicalSelection>,
     pub hard_deadline_boot_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_projection_digest: Option<String>,
     pub github: Option<SessionGitHubGrant>,
     pub signing: Option<SessionOperationKeyGrant>,
     pub release_signing: Option<SessionReleaseSigningGrant>,
@@ -90,6 +92,7 @@ pub(crate) fn session_authority_for_workload(
     workload: &crate::policy_v2::ResolvedWorkload,
 ) -> Result<SessionAuthorityGrant> {
     let mut authority = session_authority_from_resolved(profile);
+    authority.launch_projection_digest = crate::workload_projection::digest(workload)?;
     authority.hard_deadline_boot_ms = workload
         .duration_seconds
         .map(|seconds| {
@@ -166,6 +169,7 @@ pub fn session_authority_from_resolved(
     SessionAuthorityGrant {
         logical: profile.logical_authority.clone(),
         hard_deadline_boot_ms: None,
+        launch_projection_digest: None,
         github: profile.github.as_ref().map(|github| SessionGitHubGrant {
             credential_slot: github.credential_slot.clone(),
             app_id: github.app_id,
@@ -688,6 +692,14 @@ fn validate_session_authority(authority: &SessionAuthorityGrant) -> Result<()> {
     if authority.hard_deadline_expired()? {
         bail!("session approved hard deadline has expired");
     }
+    if let Some(digest) = &authority.launch_projection_digest {
+        if !crate::workload_projection::valid_digest(digest)
+            || authority.logical.is_none()
+            || authority.hard_deadline_boot_ms.is_none()
+        {
+            bail!("launch projection digest requires valid bounded logical authority");
+        }
+    }
     if let Some(logical) = &authority.logical {
         dev_tools_secret::LogicalSecretName::parse(&logical.cap)?;
         if authority.hard_deadline_boot_ms.is_none() || logical.resources.len() > 1024 {
@@ -842,6 +854,7 @@ mod tests {
             authority: SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -872,6 +885,7 @@ mod tests {
             authority: SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -957,6 +971,7 @@ mod tests {
             authority: SessionAuthorityGrant {
                 logical: None,
                 hard_deadline_boot_ms: None,
+                launch_projection_digest: None,
                 github: None,
                 signing: None,
                 release_signing: None,
@@ -1023,6 +1038,7 @@ mod tests {
                     authority: SessionAuthorityGrant {
                         logical: None,
                         hard_deadline_boot_ms: None,
+                        launch_projection_digest: None,
                         github: None,
                         signing: None,
                         release_signing: None,
@@ -1052,5 +1068,112 @@ mod tests {
                 .expires_at_unix,
             expired_at
         );
+    }
+
+    fn projection_session_authority() -> SessionAuthorityGrant {
+        SessionAuthorityGrant {
+            logical: Some(crate::policy_v3::LogicalSelection {
+                cap: "build".into(),
+                resources: BTreeMap::from([(
+                    "service-token".into(),
+                    crate::logical_authority::ResourceSelection {
+                        purposes: vec![crate::logical_authority::ResourcePurpose::Read],
+                        projections: vec![crate::logical_authority::Projection::Environment],
+                    },
+                )]),
+            }),
+            hard_deadline_boot_ms: Some(u64::MAX),
+            launch_projection_digest: Some("0123456789abcdef".repeat(4)),
+            github: None,
+            signing: None,
+            release_signing: None,
+            ssh: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn launch_projection_digest_requires_exact_syntax_and_bounded_logical_authority() {
+        let valid = projection_session_authority();
+        assert!(validate_session_authority(&valid).is_ok());
+        for digest in [
+            String::new(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.launch_projection_digest = Some(digest);
+            assert!(validate_session_authority(&invalid).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid.logical = None;
+        assert!(validate_session_authority(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.hard_deadline_boot_ms = None;
+        assert!(validate_session_authority(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.hard_deadline_boot_ms = Some(0);
+        assert!(validate_session_authority(&invalid).is_err());
+        let mut invalid = valid;
+        let logical = invalid.logical.as_mut().unwrap();
+        let rights = logical.resources["service-token"].clone();
+        logical.resources = (0..1025)
+            .map(|index| (format!("resource-{index}"), rights.clone()))
+            .collect();
+        assert!(validate_session_authority(&invalid).is_err());
+    }
+
+    #[test]
+    fn workload_authority_binds_projection_digest_but_profile_adaptation_does_not() {
+        let logical = projection_session_authority().logical;
+        let profile = crate::policy_v2::ResolvedAuthorityProfile {
+            system_cap: "build".into(),
+            credential_slots: Default::default(),
+            github: None,
+            signing: false,
+            signing_key: None,
+            release_signing_products: Default::default(),
+            release_signing_key: None,
+            ssh: false,
+            ssh_keys: Vec::new(),
+            git_identity: None,
+            secret_references: Default::default(),
+            logical_authority: logical,
+        };
+        assert!(session_authority_from_resolved(&profile)
+            .launch_projection_digest
+            .is_none());
+        let mut workload = crate::policy_v2::ResolvedWorkload {
+            launcher: "worker".into(),
+            launcher_path: "/opt/fixture/worker".into(),
+            authority_profile: "build".into(),
+            secret_references: Vec::new(),
+            secret_projections: vec![crate::secret_execution::Request {
+                resource: "service-token".into(),
+                target: crate::secret_execution::Target::Environment("SERVICE_TOKEN".into()),
+            }],
+            workspace_roots: Vec::new(),
+            sandbox: crate::policy_v2::ResolvedSandbox {
+                mode: crate::policy_v2::SandboxMode::None,
+                adapters: Vec::new(),
+            },
+            desktop: None,
+            admission: Some(crate::policy_v3::Admission::EnrolledNoninteractive),
+            duration_seconds: Some(60),
+            allow_pinned_shell: false,
+        };
+        let authority = session_authority_for_workload(&profile, &workload).unwrap();
+        assert!(authority.launch_projection_digest.is_some());
+        assert_eq!(
+            authority.launch_projection_digest,
+            crate::workload_projection::digest(&workload).unwrap()
+        );
+        assert!(authority.hard_deadline_boot_ms.is_some());
+        workload.secret_projections.clear();
+        assert!(session_authority_for_workload(&profile, &workload)
+            .unwrap()
+            .launch_projection_digest
+            .is_none());
     }
 }
