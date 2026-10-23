@@ -215,6 +215,8 @@ pub enum BrokerResponse {
         profile: String,
         expires_at: String,
         hard_deadline_boot_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_projection_digest: Option<String>,
     },
     GitCredential {
         username: String,
@@ -376,8 +378,15 @@ fn validate_response(response: &BrokerResponse) -> Result<()> {
             workload,
             profile,
             expires_at,
+            hard_deadline_boot_ms,
+            launch_projection_digest,
             ..
         } => {
+            if launch_projection_digest.as_ref().is_some_and(|digest| {
+                !crate::workload_projection::valid_digest(digest) || hard_deadline_boot_ms.is_none()
+            }) {
+                bail!("broker launch projection digest is invalid or unbounded");
+            }
             validate_request_id(session_id)?;
             validate_public_identifier(workload, "workload")?;
             validate_public_identifier(profile, "authority profile")?;
