@@ -377,6 +377,67 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_admission_deadline_expiring_during_acquisition_prevents_execution() {
+        let workload = workload();
+        let mut admitted = None;
+        let mut deadline = 0;
+        let mut calls = Vec::new();
+        let executed = Cell::new(false);
+        let result = run(
+            Command::new("/usr/bin/true"),
+            &workload,
+            identity(),
+            |request| {
+                calls.push(request.clone());
+                match request {
+                    BrokerRequest::Probe => {
+                        if admitted.is_none() {
+                            deadline = crate::linux_platform::boot_time_millis().unwrap() + 1_000;
+                            let mut response = ready(&workload);
+                            if let BrokerResponse::Ready {
+                                hard_deadline_boot_ms,
+                                ..
+                            } = &mut response
+                            {
+                                *hard_deadline_boot_ms = Some(deadline);
+                            }
+                            admitted = Some(response);
+                        }
+                        Ok(admitted.as_ref().unwrap().clone())
+                    }
+                    BrokerRequest::SecretRead { .. } => {
+                        let wait_limit =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while crate::linux_platform::boot_time_millis().unwrap() < deadline {
+                            assert!(std::time::Instant::now() < wait_limit);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Ok(material(b"synthetic-value"))
+                    }
+                    _ => panic!("unexpected projection operation"),
+                }
+            },
+            |_| {
+                executed.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls,
+            [
+                BrokerRequest::Probe,
+                BrokerRequest::SecretRead {
+                    resource: "token".into(),
+                    projection: Some(crate::logical_authority::Projection::Environment)
+                },
+                BrokerRequest::Probe
+            ]
+        );
+        assert!(!executed.get(), "expired admission started the consumer");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn empty_legacy_mapping_never_reads_provider() {
         let mut workload = workload();
         workload.secret_projections.clear();
