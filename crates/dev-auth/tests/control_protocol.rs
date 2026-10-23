@@ -21,6 +21,7 @@ fn registration() -> SessionRegistration {
         authority: SessionAuthorityGrant {
             logical: None,
             hard_deadline_boot_ms: None,
+            launch_projection_digest: None,
             github: None,
             signing: None,
             release_signing: None,
@@ -102,6 +103,7 @@ fn root_control_prepares_the_kernel_observed_execution_identity() {
                 authority: SessionAuthorityGrant {
                     logical: None,
                     hard_deadline_boot_ms: None,
+                    launch_projection_digest: None,
                     github: None,
                     signing: None,
                     release_signing: None,
@@ -143,4 +145,36 @@ fn control_protocol_rejects_invalid_identifiers_and_denial_text() {
         },
     };
     assert!(encode_control_response(&invalid).is_err());
+}
+
+#[test]
+fn control_authority_projection_digest_preserves_optional_wire_compatibility() {
+    let mut session = registration();
+    let legacy = serde_json::to_value(&session.authority).unwrap();
+    assert!(legacy.get("launch_projection_digest").is_none());
+    let decoded: SessionAuthorityGrant = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.launch_projection_digest.is_none());
+
+    let digest = "0123456789abcdef".repeat(4);
+    session.authority.launch_projection_digest = Some(digest.clone());
+    session.authority.logical = Some(dev_auth::policy_v3::LogicalSelection {
+        cap: "build".into(),
+        resources: std::collections::BTreeMap::new(),
+    });
+    session.authority.hard_deadline_boot_ms = Some(u64::MAX);
+    let request = ControlEnvelope {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: "abcdef0123456789abcdef0123456789".into(),
+        request: ControlRequest::Register {
+            session: Box::new(session),
+        },
+    };
+    let decoded = decode_control_request(&encode_control_request(&request).unwrap()).unwrap();
+    let ControlRequest::Register { session } = decoded.request else {
+        unreachable!();
+    };
+    assert_eq!(
+        session.authority.launch_projection_digest.as_deref(),
+        Some(digest.as_str())
+    );
 }
