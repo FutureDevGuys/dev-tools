@@ -128,7 +128,7 @@ impl App {
         let version = self
             .run_skills(&["--version".into()])
             .map_err(|error| self.fail(EXIT_USAGE, &error.to_string()))?;
-        if version.status != 0 || !supports_selected_updates(&version.stdout) {
+        if !version.status.success() || !supports_selected_updates(&version.stdout) {
             return Err(self.fail(EXIT_USAGE, "tracked updates require skills 1.5.25 or newer in the 1.x series; repair does not require the update interface"));
         }
         for plan in updates {
@@ -136,7 +136,7 @@ impl App {
             let result = self
                 .run_skills(arguments)
                 .map_err(|error| self.fail(EXIT_USAGE, &error.to_string()))?;
-            if result.status != 0 {
+            if !result.status.success() {
                 return Err(self.fail(EXIT_USAGE, "upstream tracked update failed; later restore and link operations were not run"));
             }
             self.payload.applied.push(AppliedPlan {

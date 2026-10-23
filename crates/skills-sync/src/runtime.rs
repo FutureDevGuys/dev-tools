@@ -81,11 +81,21 @@ pub(super) fn execute(
             .iter()
             .map(|failure| format!("{:?}", failure.operation()))
             .collect::<Vec<_>>();
-        if cleanup.is_empty() {
-            anyhow!("{error}")
-        } else {
-            anyhow!("{error}; cleanup failed: {}", cleanup.join(", "))
+        if error.io_error().is_none() && cleanup.is_empty() {
+            return anyhow::Error::new(error);
         }
+        let mut detail = error.to_string();
+        if let Some(source) = error.io_error() {
+            if let Some(errno) = source.raw_os_error() {
+                detail.push_str(&format!(" ({:?}, os error {errno})", source.kind()));
+            } else {
+                detail.push_str(&format!(" ({:?})", source.kind()));
+            }
+        }
+        if !cleanup.is_empty() {
+            detail.push_str(&format!("; cleanup failed: {}", cleanup.join(", ")));
+        }
+        anyhow::Error::new(error).context(detail)
     })
 }
 
