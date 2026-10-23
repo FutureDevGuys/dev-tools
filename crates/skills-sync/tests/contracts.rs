@@ -1,6 +1,63 @@
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
+fn provider_failure_json(script: &[u8]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join(".agents")).unwrap();
+    std::fs::write(
+        home.path().join(".agents/skills-lock.json"),
+        br#"{"version":3,"skills":{}}"#,
+    )
+    .unwrap();
+    let provider = home.path().join("invalid-provider");
+    std::fs::write(&provider, script).unwrap();
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_skills-sync"))
+        .env_clear()
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path())
+        .env("PATH", "/nonexistent")
+        .current_dir(home.path())
+        .args(["status", "--global", "--json", "--skills-cmd"])
+        .arg(format!("{} secret-fixture-argument", provider.display()))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["errors"].to_string()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_exit_error_json_preserves_status_without_command_arguments() {
+    let text = provider_failure_json(b"#!/bin/sh\nexit 7\n");
+    assert!(text.contains("skills list -g --json failed"), "{text}");
+    assert!(text.contains("exit status: 7"), "{text}");
+    assert!(!text.contains("secret-fixture-argument"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_signal_error_json_does_not_invent_exit_code() {
+    let text = provider_failure_json(b"#!/bin/sh\nkill -TERM $$\n");
+    assert!(text.contains("skills list -g --json failed"), "{text}");
+    assert!(text.contains("signal: 15"), "{text}");
+    assert!(!text.contains("exit status"), "{text}");
+    assert!(!text.contains("secret-fixture-argument"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_missing_interpreter_json_preserves_safe_os_cause() {
+    let text = provider_failure_json(b"#!/nonexistent/skills-sync-fixture-interpreter\n");
+    assert!(text.contains("NotFound"), "{text}");
+    assert!(text.contains("os error 2"), "{text}");
+    assert!(!text.contains("secret-fixture-argument"), "{text}");
+    assert!(!text.contains("skills-sync-fixture-interpreter"), "{text}");
+}
+
+#[cfg(target_os = "linux")]
 fn repair_result(home: &std::path::Path, mode: &str, dry_run: bool) -> serde_json::Value {
     // A native empty-inventory fixture: printf ignores the appended list argv.
     // No package runner, network access or user skill inventory is involved.
