@@ -101,13 +101,11 @@ phase revocation
 "$product" privilege grant revoke "$grant" --format json >"$scope-revoke.json"
 [[ $(jq -r '.grant.state' "$scope-revoke.json") == terminated ]]
 kill -0 "$sentinel"
-if sudo -n -- /usr/bin/true; then
-    printf '%s\n' 'managed revocation incorrectly fell back to native authorization' >&2
-    exit 1
-fi
-phase leave_after_revocation
-"$product" privilege leave --format json >"$scope-leave.json"
+phase native_after_revocation
+# ADR 0136: routing ends with its grant, so sudo regains its native behavior.
 sudo -n -- /usr/bin/true
+"$product" privilege leave --format json >"$scope-leave.json"
+jq -e '.changed == false' "$scope-leave.json"
 
 phase short_grant_approval
 "$product" privilege grant request --scope "$scope" --authority administrator --duration 4s --format json >"$scope-expiry-request.json"
@@ -126,11 +124,6 @@ for ((attempt = 0; attempt < 50; attempt++)); do
     sleep 0.1
 done
 [[ $(jq -r '.grant.state' "$scope-expiry-result.json") == terminated ]]
-if sudo -n -- /usr/bin/true; then
-    printf '%s\n' 'managed expiry incorrectly fell back to a warm native timestamp' >&2
-    exit 1
-fi
-"$product" privilege leave --format json >"$scope-expiry-leave.json"
 sudo -n -- /usr/bin/true
 phase complete
 printf '{"schema":"dev-auth-native-privilege-acceptance-v1","scope":"%s","passed":true}\n' "$scope" >"$scope-result.json"

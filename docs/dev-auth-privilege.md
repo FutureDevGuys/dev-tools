@@ -81,7 +81,7 @@ dev-auth privilege grant revoke GRANT_ID
 dev-auth privilege grant leave
 ```
 
-`status` observes only the caller's grants. `revoke` ends one grant and terminates its privileged descendants. `leave` ends the selected grant and removes managed sudo routing. Native grant, sudo, guardian and signed setup acceptance remain pending under ADR 0115 and ADR 0116, so this path is not an installed-support claim.
+`status` observes only the caller's grants. `revoke` ends one grant and terminates its privileged descendants. `leave` ends the selected grant, and with no selected grant it changes nothing. Managed sudo routing ends with its grant, however the grant ends, and sudo then has its native behavior. A user grant ends at logout only when logind reports that the account has no interactive session. A command that native sudo started keeps running if sudo exits or its completion channel closes, until the command exits or its grant ends. See [ADR 0136](adr/0136-grant-lifetime-sudo-routing-and-job-survival.md). Native grant, sudo, guardian and signed setup acceptance remain pending under ADR 0115 and ADR 0116, so this path is not an installed-support claim.
 
 ## Native acceptance harness
 

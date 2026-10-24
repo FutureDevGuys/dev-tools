@@ -121,11 +121,10 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
     if !descriptors.is_empty() {
         return Err(invalid());
     }
-    match response.decision {
-        Decision::Native if !routing => return Ok(state),
-        Decision::Managed => {}
-        Decision::Relay => state.relay = true,
-        _ => return Err(denied()),
+    match route(response.decision)? {
+        Route::Native => return Ok(state),
+        Route::Managed => {}
+        Route::Relay => state.relay = true,
     }
     client.deadline = Duration::from_millis(response.hard_deadline_milliseconds);
     client.grant = response.grant.ok_or_else(invalid)?;
@@ -142,6 +141,25 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
     }
     state.client = Some(client);
     Ok(state)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Native,
+    Managed,
+    Relay,
+}
+
+/// How this invocation proceeds after the coordinator's preflight answer. The
+/// authenticated coordinator owns routing: its native answer means no grant is
+/// selected, including when it withdrew a marker this invocation saw above.
+fn route(decision: Decision) -> io::Result<Route> {
+    match decision {
+        Decision::Native => Ok(Route::Native),
+        Decision::Managed => Ok(Route::Managed),
+        Decision::Relay => Ok(Route::Relay),
+        _ => Err(denied()),
+    }
 }
 
 /// Replace the namespace-local sudo process with an unprivileged product
@@ -515,6 +533,21 @@ mod tests {
         assert_eq!(credentials.pid(), nix::unistd::getpid().as_raw());
         assert_eq!(credentials.uid(), nix::unistd::geteuid().as_raw());
         assert_eq!(credentials.gid(), nix::unistd::getegid().as_raw());
+    }
+
+    // A routing marker read before the coordinator withdrew it must not deny
+    // the invocation once the coordinator answers that no grant is selected.
+    #[test]
+    fn coordinator_reported_native_routing_is_honored_after_a_marker_was_seen() {
+        assert_eq!(route(Decision::Native).unwrap(), Route::Native);
+        assert_eq!(route(Decision::Managed).unwrap(), Route::Managed);
+        assert_eq!(route(Decision::Relay).unwrap(), Route::Relay);
+        for denial in [Decision::Denied, Decision::Unavailable, Decision::Attached] {
+            assert_eq!(
+                route(denial).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
     }
 
     #[test]

@@ -53,6 +53,12 @@ pub(crate) fn receive_owned(fd: &impl AsRawFd) -> std::io::Result<Packet> {
     let control_length = message
         .msg_controllen
         .min(std::mem::size_of_val(&ancillary));
+    // A seqpacket frame, even an empty one, carries the kernel's sender
+    // credentials once the receiver passes them. Only end of stream has
+    // neither bytes nor control data.
+    if length == 0 && control_length == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
     let base = ancillary.as_ptr().cast::<u8>();
     let mut offset = 0;
     let header_size = std::mem::size_of::<nix::libc::cmsghdr>();
@@ -132,4 +138,61 @@ pub(crate) fn receive_owned(fd: &impl AsRawFd) -> std::io::Result<Packet> {
         descriptors,
         credentials,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::{self, MsgFlags, SockFlag, SockType, UnixAddr};
+
+    fn pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        let (receiver, sender) = socket::socketpair(
+            socket::AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )
+        .unwrap();
+        socket::setsockopt(&receiver, socket::sockopt::PassCred, &true).unwrap();
+        (receiver, sender)
+    }
+
+    #[test]
+    fn closed_peer_is_end_of_stream_not_a_malformed_frame() {
+        let (receiver, sender) = pair();
+        drop(sender);
+        assert_eq!(
+            receive_owned(&receiver).err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn peer_closed_with_unread_frames_is_a_reset() {
+        let (receiver, sender) = pair();
+        socket::send(receiver.as_raw_fd(), b"unread", MsgFlags::MSG_NOSIGNAL).unwrap();
+        drop(sender);
+        assert_eq!(
+            receive_owned(&receiver).err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::ConnectionReset)
+        );
+    }
+
+    #[test]
+    fn empty_frame_from_a_live_peer_is_malformed() {
+        let (receiver, sender) = pair();
+        socket::sendmsg::<UnixAddr>(
+            sender.as_raw_fd(),
+            &[std::io::IoSlice::new(&[])],
+            &[],
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            receive_owned(&receiver).err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+        drop(sender);
+    }
 }
