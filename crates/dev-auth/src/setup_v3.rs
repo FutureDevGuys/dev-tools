@@ -1028,44 +1028,229 @@ pub fn verify_setup_plan_v3(
     })
 }
 
-pub fn setup_apply_candidate_path(
-    plan: &SetupPlanV3,
-    approved_sha256: &str,
-) -> Result<Option<PathBuf>> {
-    let (_, digest) = render_setup_plan_v3(plan)?;
-    if digest != approved_sha256.to_ascii_lowercase() {
-        bail!("setup plan v3 does not match the approved digest");
+/// What every release reads from an approved setup plan to find and
+/// authenticate the release that installs it. These fields stay readable across
+/// releases, so an older release hands a newer release's plan to that release
+/// without judging contracts that only the newer release renders. Unknown
+/// fields are ignored here; the candidate's full validation rejects them.
+#[derive(Debug, Deserialize)]
+pub struct SetupPlanHandoff {
+    #[serde(skip)]
+    sha256: String,
+    intent: HandoffIntent,
+    installation: HandoffInstallation,
+    #[serde(default)]
+    accounts: Vec<HandoffAccount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffIntent {
+    #[serde(default)]
+    purpose: crate::deployment::SetupPurpose,
+    mode: DeploymentMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffInstallation {
+    request: HandoffRequest,
+    source_length: u64,
+    source_sha256: String,
+    #[serde(default)]
+    verified_release: Option<crate::release_manifest::VerifiedDevAuthRelease>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffRequest {
+    mode: crate::setup::InstallMode,
+    source_executable: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffAccount {
+    name: String,
+    uid: u32,
+}
+
+impl SetupPlanHandoff {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).context("parse setup plan")?;
+        let sha256 = sha256_hex(&serde_jcs::to_vec(&value).context("canonicalize setup plan")?);
+        let mut handoff: Self = serde_json::from_value(value)
+            .context("setup plan does not name the release that installs it")?;
+        handoff.sha256 = sha256;
+        Ok(handoff)
     }
-    require_apply_identity(plan)?;
-    revalidate_public_plan_inputs(plan)?;
-    let source = if let Some(release) = &plan.installation.verified_release {
-        let storage =
-            crate::stable_release::native_release_storage(plan.installation.request.mode)?;
-        let accepted = crate::stable_release::load_exact_accepted_release(&storage, release)?;
-        canonical_plan_release_source(
-            &plan.installation.request.source_executable,
-            release,
-            &accepted,
-        )?
-    } else if plan.intent.mode == DeploymentMode::Strong {
-        bail!("strong setup apply requires an authenticated accepted release")
-    } else {
-        plan.installation.request.source_executable.clone()
-    };
-    let (source_length, source_sha256) = crate::setup::setup_executable_identity(&source)?;
-    if source_length != plan.installation.source_length
-        || source_sha256 != plan.installation.source_sha256
-    {
-        bail!("verified setup candidate changed before apply handoff");
+
+    pub fn is_strong(&self) -> bool {
+        self.intent.mode == DeploymentMode::Strong
     }
+
+    /// The verified release executable that applies this plan, or `None` when
+    /// the running executable is that release.
+    pub fn candidate(&self, approved_sha256: &str) -> Result<Option<PathBuf>> {
+        if self.sha256 != approved_sha256.to_ascii_lowercase() {
+            bail!("setup plan v3 does not match the approved digest");
+        }
+        let sole_account = match self.accounts.as_slice() {
+            [account] => Some((account.name.as_str(), account.uid)),
+            _ => None,
+        };
+        require_native_apply_identity(self.intent.mode, self.intent.purpose, sole_account)?;
+        let installation = &self.installation;
+        if (installation.request.mode == crate::setup::InstallMode::Strong) != self.is_strong() {
+            bail!("setup plan installation mode differs from its deployment mode");
+        }
+        let source = match &installation.verified_release {
+            Some(release) => {
+                let storage =
+                    crate::stable_release::native_release_storage(installation.request.mode)?;
+                let accepted =
+                    crate::stable_release::load_exact_accepted_release(&storage, release)?;
+                canonical_plan_release_source(
+                    &installation.request.source_executable,
+                    release,
+                    &accepted,
+                )?
+            }
+            None if self.is_strong() => {
+                bail!("strong setup apply requires an authenticated accepted release")
+            }
+            None => installation.request.source_executable.clone(),
+        };
+        let identity = crate::setup::setup_executable_identity(&source)?;
+        if identity
+            != (
+                installation.source_length,
+                installation.source_sha256.clone(),
+            )
+        {
+            bail!("verified setup candidate changed before apply handoff");
+        }
+        Ok((running_identity()? != identity).then_some(source))
+    }
+}
+
+pub fn read_setup_plan_handoff_at(path: &Path) -> Result<SetupPlanHandoff> {
+    SetupPlanHandoff::parse(&read_bounded(path)?)
+}
+
+/// The handoff fields of a privileged setup transaction, read only from
+/// root-owned private custody.
+pub fn read_root_setup_plan_handoff_at(path: &Path) -> Result<SetupPlanHandoff> {
+    SetupPlanHandoff::parse(&read_root_setup_plan_bytes_at(path)?)
+}
+
+fn running_identity() -> Result<(u64, String)> {
     let current =
         fs::canonicalize(std::env::current_exe()?).context("resolve running setup executable")?;
-    let (current_length, current_sha256) = crate::setup::setup_executable_identity(&current)?;
-    if current_length == source_length && current_sha256 == source_sha256 {
-        Ok(None)
-    } else {
-        Ok(Some(source))
+    crate::setup::setup_executable_identity(&current)
+}
+
+/// Only a verified release renders the setup plan that installs it.
+fn require_rendering_release(
+    release: &crate::release_manifest::VerifiedDevAuthRelease,
+) -> Result<()> {
+    if running_identity()? != (release.artifact_length, release.artifact_sha256.clone()) {
+        return Err(PlanVersionSkew::Planner {
+            planner: env!("CARGO_PKG_VERSION").into(),
+            candidate: release.version.clone(),
+        }
+        .into());
     }
+    Ok(())
+}
+
+/// The first release that renders a setup plan handed to it by `setup plan`
+/// running in another release.
+const FIRST_PLANNING_HANDOFF: semver::Version = semver::Version::new(0, 5, 6);
+
+/// A setup plan and an executable from different releases. Each release
+/// renders a plan's action list, current-state inventory and component payloads
+/// from its own code, so only the release that a plan installs renders a plan
+/// that release accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanVersionSkew {
+    /// This executable was asked to render the plan for another release.
+    Planner { planner: String, candidate: String },
+    /// The selected release cannot render a plan handed to it.
+    Handoff { planner: String, candidate: String },
+    /// The plan carries parts that this release, which validates it as the
+    /// release it installs, does not render.
+    Rendered {
+        candidate: String,
+        differences: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for PlanVersionSkew {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Planner { planner, candidate } => write!(
+                formatter,
+                "Dev Auth {planner} cannot render the setup plan for Dev Auth {candidate}, because only the release a plan installs renders it; run `dev-auth setup plan` from the Dev Auth {candidate} candidate"
+            ),
+            Self::Handoff { planner, candidate } => write!(
+                formatter,
+                "Dev Auth {candidate} predates {FIRST_PLANNING_HANDOFF}, so Dev Auth {planner} cannot hand it the setup plan to render; run `dev-auth setup plan` from the Dev Auth {candidate} candidate"
+            ),
+            Self::Rendered {
+                candidate,
+                differences,
+            } => write!(
+                formatter,
+                "setup plan was not rendered by Dev Auth {candidate}, the release it installs: {}; regenerate it with the Dev Auth {candidate} candidate's `dev-auth setup plan` and approve its new digest",
+                differences.join("; ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanVersionSkew {}
+
+/// Who renders the setup plan for a selected release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanningRole {
+    /// The running executable is the selected release.
+    Candidate,
+    /// The selected release at its canonical accepted path renders the plan.
+    Delegate(PathBuf),
+}
+
+/// Decide who renders the setup plan for an accepted release. Only the exact
+/// accepted release in its canonical cache receives the planning handoff.
+pub fn planning_role(
+    mode: crate::setup::InstallMode,
+    release: &crate::release_manifest::VerifiedDevAuthRelease,
+) -> Result<PlanningRole> {
+    let storage = crate::stable_release::native_release_storage(mode)?;
+    let accepted = crate::stable_release::load_exact_accepted_release(&storage, release)?;
+    let source = canonical_plan_release_source(&release.artifact_path, release, &accepted)?;
+    if crate::setup::setup_executable_identity(&source)?
+        != (release.artifact_length, release.artifact_sha256.clone())
+    {
+        bail!("verified setup candidate changed before planning handoff");
+    }
+    planning_role_for(release, source, &running_identity()?)
+}
+
+fn planning_role_for(
+    release: &crate::release_manifest::VerifiedDevAuthRelease,
+    source: PathBuf,
+    running: &(u64, String),
+) -> Result<PlanningRole> {
+    if *running == (release.artifact_length, release.artifact_sha256.clone()) {
+        return Ok(PlanningRole::Candidate);
+    }
+    let version =
+        semver::Version::parse(&release.version).context("parse selected release version")?;
+    if version < FIRST_PLANNING_HANDOFF {
+        return Err(PlanVersionSkew::Handoff {
+            planner: env!("CARGO_PKG_VERSION").into(),
+            candidate: release.version.clone(),
+        }
+        .into());
+    }
+    Ok(PlanningRole::Delegate(source))
 }
 
 fn canonical_plan_release_source(
@@ -1080,16 +1265,30 @@ fn canonical_plan_release_source(
 }
 
 fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
+    let sole_account = match plan.accounts.as_slice() {
+        [account] => Some((account.name.as_str(), account.uid)),
+        _ => None,
+    };
+    require_native_apply_identity(plan.intent.mode, plan.intent.purpose, sole_account)
+}
+
+fn require_native_apply_identity(
+    mode: DeploymentMode,
+    purpose: crate::deployment::SetupPurpose,
+    sole_account: Option<(&str, u32)>,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
-    if plan.intent.mode == DeploymentMode::Strong {
+    if mode == DeploymentMode::Strong {
         crate::setup::require_independent_setup_execution()?;
-        if plan.intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly
+        if purpose == crate::deployment::SetupPurpose::PrivilegeOnly
             && nix::unistd::getegid().as_raw() != 0
         {
             bail!("privilege setup requires the native root primary group");
         }
     }
-    match plan.intent.mode {
+    #[cfg(not(target_os = "linux"))]
+    let _ = purpose;
+    match mode {
         DeploymentMode::Strong if !nix::unistd::Uid::effective().is_root() => {
             bail!("strong setup apply requires root")
         }
@@ -1097,9 +1296,7 @@ fn require_apply_identity(plan: &SetupPlanV3) -> Result<()> {
             let current = nix::unistd::User::from_uid(nix::unistd::Uid::effective())?
                 .context("effective native account does not exist")?;
             if current.uid.is_root()
-                || plan.accounts.len() != 1
-                || plan.accounts[0].uid != current.uid.as_raw()
-                || plan.accounts[0].name != current.name
+                || sole_account != Some((current.name.as_str(), current.uid.as_raw()))
             {
                 bail!("user-only setup apply requires its exact native account");
             }
@@ -2087,10 +2284,13 @@ pub fn build_setup_plan_v3(
     build_setup_plan_v3_at(intent, installation, true)
 }
 
+/// Render the setup plan for a verified release. Only that release renders it,
+/// because each release derives plan contracts from its own code.
 pub fn build_setup_plan_v3_for_verified_release(
     intent: DeploymentIntent,
     verified: crate::release_manifest::VerifiedDevAuthRelease,
 ) -> Result<SetupPlanV3> {
+    require_rendering_release(&verified)?;
     if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
         let installation = crate::setup::build_verified_privilege_release_plan(verified)?;
         return build_setup_plan_v3(intent, installation);
@@ -2152,6 +2352,9 @@ fn build_setup_plan_v3_with_reader(
 ) -> Result<SetupPlanV3> {
     if !cfg!(target_os = "linux") {
         bail!("full setup planning requires a qualified native platform backend");
+    }
+    if let Some(release) = &installation.verified_release {
+        require_rendering_release(release)?;
     }
     if intent.purpose == crate::deployment::SetupPurpose::PrivilegeOnly {
         #[cfg(target_os = "linux")]
@@ -2896,6 +3099,10 @@ pub fn read_setup_plan_v3_at(path: &Path) -> Result<SetupPlanV3> {
 /// plan content. World- or user-writable ancestors are not acceptable plan
 /// authority even when the leaf itself is a root-owned regular file.
 pub fn read_root_setup_plan_v3_at(path: &Path) -> Result<SetupPlanV3> {
+    parse_setup_plan_v3(&read_root_setup_plan_bytes_at(path)?)
+}
+
+fn read_root_setup_plan_bytes_at(path: &Path) -> Result<Vec<u8>> {
     validate_root_plan_path(path)?;
     let document = read_atomic_document(
         path,
@@ -2906,7 +3113,7 @@ pub fn read_root_setup_plan_v3_at(path: &Path) -> Result<SetupPlanV3> {
         },
     )?
     .context("root-owned setup plan v3 is absent")?;
-    parse_setup_plan_v3(&document.bytes)
+    Ok(document.bytes)
 }
 
 fn parse_setup_plan_v3(bytes: &[u8]) -> Result<SetupPlanV3> {
@@ -3068,20 +3275,13 @@ fn validate_setup_plan_v3_with_installation_check(
     if let Some((_, failure)) = contract.iter().find(|(satisfied, _)| !satisfied) {
         bail!("dev-auth setup plan v3 has an unsupported contract: {failure}");
     }
-    let expected_paths = expected_current_path_keys(
-        &plan.installation,
-        &plan.intent,
-        &plan.accounts,
-        &plan.retiring_accounts,
-        plan.authority_schema.as_deref(),
-    )?;
-    let recorded_paths = current_path_keys(&plan.current_paths);
-    if recorded_paths != expected_paths {
-        return Err(current_path_mismatch(
-            &recorded_paths,
-            &expected_paths,
-            &plan.installation.request.version,
-        ));
+    let differences = rendered_differences(plan)?;
+    if !differences.is_empty() {
+        return Err(PlanVersionSkew::Rendered {
+            candidate: env!("CARGO_PKG_VERSION").into(),
+            differences,
+        }
+        .into());
     }
     require_canonical_installation_layout(
         plan.intent.mode,
@@ -3102,57 +3302,60 @@ fn current_path_keys(paths: &[CurrentPathIdentity]) -> Vec<(String, String, Path
         .collect()
 }
 
-/// Reports the validator's own kinds and counts, and a candidate version only after
-/// it parsed as a maintenance-capable release, never other plan text.
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-fn current_path_mismatch(
+/// The plan parts that its renderer derives from its own code rather than from
+/// native observation, each named where it differs from what this release
+/// renders for the plan's inputs. The differences name only this release's
+/// kinds and counts, never other plan text.
+fn rendered_differences(plan: &SetupPlanV3) -> Result<Vec<String>> {
+    let mut differences = Vec::new();
+    if plan.actions != planned_action_contract(&plan.intent) {
+        differences.push("its action contract differs".to_owned());
+    }
+    let expected_paths = expected_current_path_keys(
+        &plan.installation,
+        &plan.intent,
+        &plan.accounts,
+        &plan.retiring_accounts,
+        plan.authority_schema.as_deref(),
+    )?;
+    let recorded_paths = current_path_keys(&plan.current_paths);
+    if recorded_paths != expected_paths {
+        differences.push(current_path_difference(&recorded_paths, &expected_paths));
+    }
+    #[cfg(target_os = "linux")]
+    if plan.intent.has_grants() && plan.grant_payload != grants::payload(&plan.installation)? {
+        differences.push("its grant payload differs".to_owned());
+    }
+    Ok(differences)
+}
+
+fn current_path_difference(
     recorded: &[(String, String, PathBuf)],
     expected: &[(String, String, PathBuf)],
-    candidate_version: &str,
-) -> anyhow::Error {
+) -> String {
     let missing = expected
         .iter()
         .filter(|key| !recorded.contains(key))
-        .collect::<Vec<_>>();
+        .map(|(kind, _, _)| kind.as_str())
+        .collect::<BTreeSet<_>>();
     let unexpected = recorded
         .iter()
         .filter(|key| !expected.contains(key))
         .count();
-    let kinds = missing
-        .iter()
-        .map(|(kind, _, _)| kind.as_str())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join(", ");
-    #[cfg(target_os = "linux")]
-    {
-        let introduced = crate::setup::maintenance_current_state_paths(candidate_version);
-        if !missing.is_empty()
-            && unexpected == 0
-            && recorded.len() + missing.len() == expected.len()
-            && missing.iter().all(|key| introduced.contains(key))
-        {
-            let first = crate::setup::maintenance::FIRST_VERSION;
-            return anyhow::anyhow!(
-                "setup plan omits only the current-state paths that Dev Auth {first} added for strong installations ({kinds}), so a planner older than {first} produced it for the {candidate_version} candidate; regenerate the plan with the {candidate_version} candidate's `dev-auth setup plan` and approve its new digest"
-            );
-        }
-    }
     let mut differences = Vec::new();
     if !missing.is_empty() {
-        differences.push(format!("missing {kinds}"));
+        differences.push(format!(
+            "lack {}",
+            missing.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
     if unexpected > 0 {
-        differences.push(format!("{unexpected} unexpected"));
+        differences.push(format!("include {unexpected} unexpected"));
     }
     if differences.is_empty() {
-        differences.push("entries are repeated or out of canonical order".into());
+        differences.push("are repeated or out of canonical order".into());
     }
-    anyhow::anyhow!(
-        "setup plan v3 current-state paths do not match the deployment authority: {}",
-        differences.join("; ")
-    )
+    format!("its current-state paths {}", differences.join(" and "))
 }
 
 fn expected_current_path_keys(
@@ -5996,48 +6199,147 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn skew(plan: &SetupPlanV3) -> PlanVersionSkew {
+        validate_setup_plan_v3_with_installation_check(plan, &|_| Ok(()))
+            .unwrap_err()
+            .downcast::<PlanVersionSkew>()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rendered(candidate: &str, difference: &str) -> PlanVersionSkew {
+        PlanVersionSkew::Rendered {
+            candidate: candidate.into(),
+            differences: vec![difference.into()],
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
-    fn current_state_mismatch_names_what_differs_without_guessing_skew() {
-        let mismatch = "setup plan v3 current-state paths do not match the deployment authority: ";
+    fn current_state_mismatch_names_what_differs_and_the_release_to_plan_with() {
         let without = |removed: &'static [&'static str]| {
-            strong_plan_for("0.5.2", move |inventory| {
+            strong_plan_for(THIS_RELEASE, move |inventory| {
                 inventory.retain(|(kind, _, _)| !removed.contains(&kind.as_str()))
             })
         };
         assert_eq!(
-            rejection(&without(&["administrator_policy"])),
-            format!("{mismatch}missing administrator_policy")
+            skew(&without(&["administrator_policy"])),
+            rendered(
+                THIS_RELEASE,
+                "its current-state paths lack administrator_policy"
+            )
         );
+        let older_planner = without(&[
+            "maintenance_helper_receipt",
+            "maintenance_policy",
+            "maintenance_polkit_action",
+            "privileged_maintenance_helper",
+        ]);
         assert_eq!(
-            rejection(&without(&["administrator_policy", "maintenance_policy"])),
-            format!("{mismatch}missing administrator_policy, maintenance_policy")
+            skew(&older_planner),
+            rendered(
+                THIS_RELEASE,
+                "its current-state paths lack maintenance_helper_receipt, maintenance_policy, maintenance_polkit_action, privileged_maintenance_helper"
+            )
         );
         let unrelated = (
             "unrecognized_state".to_owned(),
             "system".to_owned(),
             PathBuf::from("/etc/dev-auth/unrecognized"),
         );
-        let replaced = strong_plan_for("0.5.2", |inventory| {
+        let replaced = strong_plan_for(THIS_RELEASE, |inventory| {
             inventory.retain(|(kind, _, _)| kind != "maintenance_policy");
             inventory.push(unrelated.clone());
             inventory.sort();
         });
         assert_eq!(
-            rejection(&replaced),
-            format!("{mismatch}missing maintenance_policy; 1 unexpected")
+            skew(&replaced),
+            rendered(
+                THIS_RELEASE,
+                "its current-state paths lack maintenance_policy and include 1 unexpected"
+            )
         );
         let newer_inventory_for_older_candidate = strong_plan_for("0.4.0", |inventory| {
             inventory.extend(maintenance_inventory());
             inventory.sort();
         });
         assert_eq!(
-            rejection(&newer_inventory_for_older_candidate),
-            format!("{mismatch}4 unexpected")
+            skew(&newer_inventory_for_older_candidate),
+            rendered(THIS_RELEASE, "its current-state paths include 4 unexpected")
         );
         assert_eq!(
-            rejection(&strong_plan_for("0.5.2", |inventory| inventory.reverse())),
-            format!("{mismatch}entries are repeated or out of canonical order")
+            skew(&strong_plan_for(THIS_RELEASE, |inventory| inventory.reverse())),
+            rendered(
+                THIS_RELEASE,
+                "its current-state paths are repeated or out of canonical order"
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs the embedded native sudo payload; `just test` runs it"]
+    fn every_component_this_release_does_not_render_is_named_once() {
+        assert!(
+            !crate::privilege::grants::assets::SUDO_LIBRARY.is_empty(),
+            "the grant component needs the embedded native sudo payload; run `just test`"
+        );
+        let mut plan = strong_plan(THIS_RELEASE, true, |inventory| {
+            inventory.retain(|(kind, _, _)| kind != "grant_sudoers")
+        });
+        plan.actions
+            .retain(|action| action.kind != "install_grant_sudoers");
+        for (order, action) in plan.actions.iter_mut().enumerate() {
+            action.order = order as u32;
+        }
+        plan.grant_payload.insert(
+            "library".into(),
+            embedded_identity(b"dev-auth-sudo-build-v1:0.5.2:planner:end"),
+        );
+        assert_eq!(
+            skew(&plan),
+            PlanVersionSkew::Rendered {
+                candidate: THIS_RELEASE.into(),
+                differences: vec![
+                    "its action contract differs".into(),
+                    "its current-state paths lack grant_sudoers".into(),
+                    "its grant payload differs".into(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_selected_release_renders_its_own_plan() {
+        let release = verified_release(Path::new("/var/lib/dev-auth/releases/cache/artifact"));
+        let canonical = release.artifact_path.clone();
+        let identity = (release.artifact_length, release.artifact_sha256.clone());
+        assert_eq!(
+            planning_role_for(&release, canonical.clone(), &identity).unwrap(),
+            PlanningRole::Candidate
+        );
+
+        let older_planner = (identity.0, "1".repeat(64));
+        let mut newer = release.clone();
+        newer.version = FIRST_PLANNING_HANDOFF.to_string();
+        assert_eq!(
+            planning_role_for(&newer, canonical.clone(), &older_planner).unwrap(),
+            PlanningRole::Delegate(canonical.clone())
+        );
+
+        let mut predating = release;
+        predating.version = "0.5.5".into();
+        assert_eq!(
+            planning_role_for(&predating, canonical, &older_planner)
+                .unwrap_err()
+                .downcast::<PlanVersionSkew>()
+                .unwrap(),
+            PlanVersionSkew::Handoff {
+                planner: env!("CARGO_PKG_VERSION").into(),
+                candidate: "0.5.5".into(),
+            }
         );
     }
 

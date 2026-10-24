@@ -570,8 +570,6 @@ pub(super) fn validate_component(plan: &SetupPlanV3) -> Result<()> {
         || plan.installation.request.mode != crate::setup::InstallMode::Strong
         || !plan.intent.has_grants()
         || plan.installation.request.purpose != plan.intent.purpose
-        || plan.grant_payload != payload(&plan.installation)?
-        || plan.actions != planned_action_contract(&plan.intent)
     {
         bail!("privilege setup plan has an incompatible closed authority contract");
     }

@@ -37,7 +37,8 @@ test:
     if [[ "$(uname -s)" == Linux ]]; then
         cargo test -p dev-auth --lib --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' -- --ignored --exact --test-threads=1 \
             setup_v3::grants::native_acceptance::native_fixture_embedded_sudo_payload_available \
-            setup_v3::tests::older_planner_grant_payload_names_the_release_to_plan_with
+            setup_v3::tests::older_planner_grant_payload_names_the_release_to_plan_with \
+            setup_v3::tests::every_component_this_release_does_not_render_is_named_once
     fi
 
 # Compile Dev Auth and embed its version/target/source-matched Linux sudo helper

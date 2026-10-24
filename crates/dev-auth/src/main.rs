@@ -70,7 +70,7 @@ fn workload_status_code(status: std::process::ExitStatus) -> Result<i32> {
 }
 
 fn base_usage() -> &'static str {
-    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|privilege-deployment|credential-grant-deployment|administrator-grant-policy|binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth setup template administrator-grant-policy [--user NAME --maximum-duration DURATION [--scope user|workload]... [--authority administrator] [--allow-delegation]]\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--grant-policy PATH] [--mode strong|user-only] [--channel stable] [--offline] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
+    "Usage:\n  dev-auth build-info\n  dev-auth setup template deployment|administrator-policy|user-only-policy|user-config|privilege-deployment|credential-grant-deployment|administrator-grant-policy|binding-deployment|binding-user-only-policy|binding-user-config\n  dev-auth setup template administrator-grant-policy [--user NAME --maximum-duration DURATION [--scope user|workload]... [--authority administrator] [--allow-delegation]]\n  dev-auth setup discover [--mode strong|user-only] [--administrator-policy PATH] [--user-config USER=PATH]...\n  dev-auth setup readiness [--mode strong|user-only]\n  dev-auth setup verify-release --root PATH --manifest PATH --artifact PATH\n  dev-auth setup plan-release --root PATH --manifest PATH --artifact PATH [--mode strong|user-only] --output PATH\n  dev-auth setup plan [--deployment PATH] [--purpose credentials|privilege-only] [--grant-policy PATH] [--mode strong|user-only] [--channel stable] [--offline] [--accepted-release] [--release-root PATH --release-manifest PATH --release-artifact PATH] [--activation transparent|inactive] [--administrator-policy PATH] [--user-config USER=PATH]... [--user-policy USER=PATH]... [--credential-intent SLOT=preserve|enroll-if-absent|rotate|revoke]... --output PATH [--format human|json]\n  dev-auth setup apply --plan PATH --sha256 HEX [--authorize sudo|polkit] [--credential-stdin SLOT] [--credential-fd SLOT=FD]... [--credential-file SLOT=PATH]... [--format human|json]\n  dev-auth setup verify --plan PATH --sha256 HEX [--format human|json]\n  dev-auth setup migrate-v1-preview --output PATH\n  dev-auth setup migrate-v1 --config PATH --sha256 HEX --v1-sha256 HEX\n  dev-auth setup install-policy --source PATH --sha256 HEX\n  dev-auth setup update-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-policy --source PATH --sha256 HEX\n  dev-auth setup update-user-policy --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup install-user-config --source PATH --sha256 HEX\n  dev-auth setup update-user-config --source PATH --sha256 HEX --current-sha256 HEX\n  dev-auth setup enroll-system|enroll-user\n  dev-auth setup rotate-system|rotate-user\n  dev-auth setup revoke-system|revoke-user\n  dev-auth setup start-system\n  dev-auth setup stop-system\n  dev-auth setup verify [--mode strong|user-only]\n  dev-auth setup repair [--mode strong|user-only]\n  dev-auth setup rollback [--mode strong|user-only]\n  dev-auth setup deactivate [--mode strong|user-only]\n  dev-auth setup uninstall [--mode strong|user-only]\n  dev-auth setup purge-system-state|purge-user-state\n  dev-auth reconcile plan --source PATH --output PLAN --format json\n  dev-auth reconcile apply --plan PLAN --sha256 HEX --format json\n  dev-auth reconcile verify --source PATH --format json\n  dev-auth broker serve\n  dev-auth sign-release-manifest --profile NAME\n  dev-auth enroll\n  dev-auth validate [--online]\n  dev-auth workspace-status\n  dev-auth exec --profile NAME -- COMMAND [args...]\n  dev-auth agent --profile NAME\n  dev-auth agent-endpoint\n  dev-auth ssh-load --profile NAME\n  dev-auth ssh-public --profile NAME --purpose authentication|signing\n  dev-auth status [--broker]\n  dev-auth explain git|gh\n  dev-auth purge"
 }
 
 fn usage() -> String {
@@ -850,27 +850,49 @@ fn parse_setup_helper_apply(
     })
 }
 
-#[cfg(target_os = "linux")]
-fn run_setup_helper_os() -> Result<i32> {
+/// Replace this process with the verified setup candidate as `arg0`, with a
+/// cleared environment in the root directory. Returns only the failure.
+#[cfg(unix)]
+fn exec_setup_candidate<I, S>(
+    candidate: &std::path::Path,
+    arg0: &str,
+    arguments: I,
+) -> anyhow::Error
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     use std::os::unix::process::CommandExt;
 
+    let error = std::process::Command::new(candidate)
+        .arg0(arg0)
+        .args(arguments)
+        .env_clear()
+        .current_dir("/")
+        .exec();
+    anyhow::Error::new(error).context(format!(
+        "execute verified setup candidate {}",
+        candidate.display()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn run_setup_helper_os() -> Result<i32> {
     let request = parse_setup_helper_apply(std::env::args_os().skip(1))?;
-    let plan = dev_auth::setup_v3::read_root_setup_plan_v3_at(&request.plan)
+    let handoff = dev_auth::setup_v3::read_root_setup_plan_handoff_at(&request.plan)
         .context("setup helper accepts only a root-custodied full setup plan")?;
-    if plan.intent.mode != dev_auth::deployment::DeploymentMode::Strong {
+    if !handoff.is_strong() {
         bail!("setup helper accepts only strong setup plans")
     }
-    if let Some(candidate) = dev_auth::setup_v3::setup_apply_candidate_path(&plan, &request.digest)?
-    {
-        let error = std::process::Command::new(&candidate)
-            .arg0("dev-auth-setup-helper")
-            .args(&request.canonical_arguments)
-            .env_clear()
-            .current_dir("/")
-            .exec();
-        return Err(error)
-            .with_context(|| format!("execute verified setup candidate {}", candidate.display()));
+    if let Some(candidate) = handoff.candidate(&request.digest)? {
+        return Err(exec_setup_candidate(
+            &candidate,
+            "dev-auth-setup-helper",
+            &request.canonical_arguments,
+        ));
     }
+    let plan = dev_auth::setup_v3::read_root_setup_plan_v3_at(&request.plan)
+        .context("setup helper accepts only a root-custodied full setup plan")?;
 
     let current = std::fs::canonicalize(std::env::current_exe()?)
         .context("resolve running setup helper executable")?;
@@ -1075,12 +1097,15 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             Ok(0)
         }
         "plan" => {
+            let supplied = arguments.collect::<Vec<_>>();
+            let mut arguments = supplied.iter().cloned();
             let mut deployment = None;
             let mut output = None;
             let mut format = None;
             let mut release_root = None;
             let mut release_manifest = None;
             let mut release_artifact = None;
+            let mut accepted_release = false;
             let mut cli = dev_auth::deployment::DeploymentCliInput::default();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
@@ -1118,6 +1143,7 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                         )
                     }
                     "--offline" if cli.offline.is_none() => cli.offline = Some(true),
+                    "--accepted-release" if !accepted_release => accepted_release = true,
                     "--release-root" if release_root.is_none() => {
                         release_root =
                             Some(arguments.next().context("--release-root requires a path")?)
@@ -1243,9 +1269,25 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
             } else {
                 dev_auth::stable_release::stage_latest_stable_release(
                     &release_storage,
-                    intent.offline,
+                    intent.offline || accepted_release,
                 )?
             };
+            match dev_auth::setup_v3::planning_role(install_mode, &staged.verified)? {
+                dev_auth::setup_v3::PlanningRole::Candidate => {}
+                dev_auth::setup_v3::PlanningRole::Delegate(_) if accepted_release => {
+                    bail!("the accepted Dev Auth release changed after it was selected; run setup plan again")
+                }
+                dev_auth::setup_v3::PlanningRole::Delegate(candidate) => {
+                    return Err(exec_setup_candidate(
+                        &candidate,
+                        "dev-auth",
+                        ["setup", "plan"]
+                            .into_iter()
+                            .chain(supplied.iter().map(String::as_str))
+                            .chain(["--accepted-release"]),
+                    ));
+                }
+            }
             let plan = dev_auth::setup_v3::build_setup_plan_v3_for_verified_release(
                 intent,
                 staged.verified,
@@ -1409,26 +1451,17 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 #[cfg(not(target_os = "linux"))]
                 bail!("setup apply authorization is unavailable on this platform");
             }
+            let handoff = dev_auth::setup_v3::read_setup_plan_handoff_at(&plan_path)
+                .context("setup apply accepts only a full setup plan")?;
+            if let Some(candidate) = handoff.candidate(&digest)? {
+                return Err(exec_setup_candidate(
+                    &candidate,
+                    "dev-auth",
+                    std::env::args_os().skip(1),
+                ));
+            }
             let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan_path)
                 .context("setup apply accepts only a full setup plan")?;
-            if let Some(candidate) = dev_auth::setup_v3::setup_apply_candidate_path(&plan, &digest)?
-            {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    let error = std::process::Command::new(&candidate)
-                        .arg0("dev-auth")
-                        .args(std::env::args_os().skip(1))
-                        .env_clear()
-                        .current_dir("/")
-                        .exec();
-                    return Err(error).with_context(|| {
-                        format!("execute verified setup candidate {}", candidate.display())
-                    });
-                }
-                #[cfg(not(unix))]
-                bail!("setup candidate handoff is unavailable on this platform");
-            }
             apply_setup_plan_v3_with_sources(&plan, &digest, &credential_sources, format)
         }
         "migrate-v1-preview" => {
@@ -1647,12 +1680,19 @@ fn run_setup(mut arguments: impl Iterator<Item = String>) -> Result<i32> {
                 if !matches!(format, "human" | "json") {
                     bail!("setup verify format must be human or json");
                 }
+                let digest = digest.context("setup verify requires --sha256 HEX with --plan")?;
+                let handoff = dev_auth::setup_v3::read_setup_plan_handoff_at(&plan)
+                    .context("setup verify accepts only a full setup plan")?;
+                if let Some(candidate) = handoff.candidate(&digest)? {
+                    return Err(exec_setup_candidate(
+                        &candidate,
+                        "dev-auth",
+                        std::env::args_os().skip(1),
+                    ));
+                }
                 let plan = dev_auth::setup_v3::read_setup_plan_v3_at(&plan)
                     .context("setup verify accepts only a full setup plan")?;
-                let report = dev_auth::setup_v3::verify_setup_plan_v3(
-                    &plan,
-                    &digest.context("setup verify requires --sha256 HEX with --plan")?,
-                )?;
+                let report = dev_auth::setup_v3::verify_setup_plan_v3(&plan, &digest)?;
                 if format == "json" {
                     println!("{}", serde_json::to_string(&report)?);
                 } else {
