@@ -5202,24 +5202,39 @@ exit 29
             .unwrap()
     }
 
+    /// Writes a fixture executable from a child process. One written in this
+    /// multithreaded harness can fail to start with ETXTBSY while a concurrent
+    /// test's not-yet-executed child still holds a copy of its writer.
+    #[cfg(target_os = "linux")]
+    fn install_linux_executable(path: &Path, contents: &str, mode: u32) {
+        let source = path.with_extension("fixture-source");
+        fs::write(&source, contents).unwrap();
+        assert!(std::process::Command::new("/usr/bin/install")
+            .arg(format!("--mode={mode:o}"))
+            .arg(&source)
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_file(&source).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     fn write_linux_test_program(path: &Path, output: &str, mode: u32) {
-        fs::write(path, format!("#!/bin/sh\nprintf {output}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        install_linux_executable(path, &format!("#!/bin/sh\nprintf {output}\n"), mode);
     }
 
     #[cfg(target_os = "linux")]
     fn write_linux_op_program(directory: &Path, body: &str) -> PathBuf {
         let path = directory.join("op");
-        fs::write(&path, format!("#!/usr/bin/bash\nset -eu\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        install_linux_executable(&path, &format!("#!/usr/bin/bash\nset -eu\n{body}\n"), 0o700);
         path
     }
 
     #[cfg(target_os = "linux")]
     fn write_linux_provider_child(directory: &Path) -> PathBuf {
         let path = directory.join("dev-auth-provider-exec-test");
-        fs::write(
+        install_linux_executable(
             &path,
             "#!/usr/bin/bash\n\
 set -eu\n\
@@ -5235,9 +5250,8 @@ case \"$9\" in\n\
   --current-account) exec \"/proc/self/fd/$4\" user get --me --format json ;;\n\
   *) exit 99 ;;\n\
 esac\n",
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         path
     }
 
