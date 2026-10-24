@@ -96,6 +96,16 @@ fn sudo_calls(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Authentication tries a harmless system `true` through `sudo -n --` before it
+/// prompts. Native installations provide it at one of these fixed locations.
+fn authorization_probe() -> String {
+    let probe = ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .expect("system true");
+    format!("-n -- {probe}")
+}
+
 fn executable_script(path: &Path, script: &str) {
     fs::write(path, script).expect("write executable script");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod executable script");
@@ -138,7 +148,9 @@ fn authentication_failures_identify_stage_without_echoing_executable_authority()
     );
 
     executable_script(&sudo, "#!/bin/sh\nexit 17\n");
-    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).unwrap();
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .unwrap()
+        .with_foreground_terminal_for_test(true);
     let error = session.ensure_authenticated().unwrap_err();
     let diagnostic = format!("{error}");
     assert!(diagnostic.contains("prompt"));
@@ -173,7 +185,9 @@ fn authentication_failure_preserves_signal_termination() {
     let root = TempDir::new().expect("temp root");
     let sudo = root.path().join("sudo");
     executable_script(&sudo, "#!/bin/sh\nkill -TERM \"$$\"\n");
-    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).unwrap();
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .unwrap()
+        .with_foreground_terminal_for_test(true);
     assert!(matches!(
         session.ensure_authenticated().unwrap_err(),
         PrivilegeError::Authentication {
@@ -248,7 +262,9 @@ fn one_visible_authentication_is_reused_for_exact_noninteractive_commands() {
     let root = TempDir::new().expect("temp root");
     let sudo = fake_sudo(root.path(), SudoPolicy::default());
     let marker = root.path().join("marker");
-    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .expect("session")
+        .with_foreground_terminal_for_test(true);
 
     session.ensure_authenticated().expect("authenticate");
     session.ensure_authenticated().expect("reuse");
@@ -257,15 +273,14 @@ fn one_visible_authentication_is_reused_for_exact_noninteractive_commands() {
         .expect("privileged command");
 
     assert!(marker.is_file());
-    let calls = fs::read_to_string(root.path().join("sudo.log")).expect("sudo log");
-    assert_eq!(calls.lines().filter(|line| *line == "-n -v").count(), 1);
-    assert_eq!(calls.lines().filter(|line| *line == "-v").count(), 1);
     assert_eq!(
-        calls
-            .lines()
-            .filter(|line| line.starts_with("-n -- "))
-            .count(),
-        1
+        sudo_calls(root.path()),
+        [
+            "-n -v".to_owned(),
+            authorization_probe(),
+            "-v".to_owned(),
+            format!("-n -- /usr/bin/touch {}", marker.display()),
+        ]
     );
 }
 
@@ -314,16 +329,13 @@ fn a_noninteractive_sudo_policy_authenticates_without_a_prompt() {
         .expect("privileged command runs under the policy");
 
     assert!(marker.is_file());
-    let calls = sudo_calls(root.path());
-    assert_eq!(calls.len(), 3, "{calls:?}");
-    assert_eq!(calls[0], "-n -v");
-    assert!(
-        matches!(calls[1].as_str(), "-n -- /usr/bin/true" | "-n -- /bin/true"),
-        "{calls:?}"
-    );
     assert_eq!(
-        calls[2],
-        format!("-n -- /usr/bin/touch {}", marker.display())
+        sudo_calls(root.path()),
+        [
+            "-n -v".to_owned(),
+            authorization_probe(),
+            format!("-n -- /usr/bin/touch {}", marker.display()),
+        ]
     );
 }
 
@@ -339,7 +351,9 @@ fn failed_authentication_never_runs_the_requested_command() {
         },
     );
     let marker = root.path().join("marker");
-    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .expect("session")
+        .with_foreground_terminal_for_test(true);
 
     let error = session.ensure_authenticated().expect_err("auth must fail");
     assert!(error.to_string().contains("authenticate"));
@@ -608,7 +622,7 @@ fn authentication_prompts_only_from_the_terminal_foreground() {
         // async-signal-safe and run only in the forked child.
         unsafe {
             foreground.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -686,15 +700,25 @@ fn refused_prompt_role() {
     );
     let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
 
-    session
+    let error = session
         .ensure_authenticated()
         .expect_err("authentication outside the terminal foreground");
 
-    assert!(!session.is_authenticated());
-    let calls = sudo_calls(root.path());
     assert!(
-        !calls.iter().any(|call| call == "-v"),
-        "prompted outside the terminal foreground: {calls:?}"
+        matches!(error, PrivilegeError::PromptUnavailable),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("sudo -n -v"), "{error}");
+    assert!(!session.is_authenticated());
+    assert_eq!(
+        sudo_calls(root.path()),
+        ["-n -v".to_owned(), authorization_probe()],
+        "prompted outside the terminal foreground"
+    );
+    let diagnostic = sync_configs::engine::EngineError::Privilege(error).failure_diagnostic();
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap(),
+        serde_json::json!({"kind": "authentication_prompt_unavailable"})
     );
 }
 
@@ -736,8 +760,8 @@ fn open_pty() -> (fs::File, fs::File) {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());

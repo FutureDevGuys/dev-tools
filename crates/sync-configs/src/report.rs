@@ -28,6 +28,7 @@ pub enum FailureDiagnostic {
         code: Option<i32>,
         signal: Option<i32>,
     },
+    AuthenticationPromptUnavailable,
     #[serde(other)]
     ConvergenceFailed,
 }
