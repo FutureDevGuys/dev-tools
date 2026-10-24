@@ -1,21 +1,15 @@
-#[path = "../src/overlay/mod.rs"]
-mod overlay;
-#[allow(dead_code)]
-#[path = "../src/paths.rs"]
-mod paths;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use overlay::json::{self, JsonOverlayOptions};
-use overlay::toml::{
+use serde_json::json;
+use sync_configs::overlay::json::{self, JsonOverlayOptions};
+use sync_configs::overlay::toml::{
     self, CommentedTargetPolicy, ExclusiveSiblingGroup, TomlConflictPolicy, TomlOverlayOptions,
 };
-use overlay::PathKey;
-use paths::PathPlatform;
-use serde_json::json;
+use sync_configs::overlay::{self, PathKey};
+use sync_configs::paths::PathPlatform;
 use tempfile::tempdir;
 
 fn key(parts: &[&str]) -> PathKey {
@@ -105,22 +99,6 @@ fn ownership_receipt_state_root_rejects_a_relative_home_fallback() {
     .expect_err("relative HOME must not anchor ownership receipts");
 
     assert!(format!("{error:#}").contains("absolute"));
-}
-
-#[test]
-fn non_symlink_reparse_leaf_classification_is_fail_closed() {
-    for (is_symlink, is_reparse_point, expected) in [
-        (false, false, false),
-        (true, true, false),
-        (true, false, false),
-        (false, true, true),
-    ] {
-        assert_eq!(
-            overlay::ownership::is_unsupported_reparse_leaf(is_symlink, is_reparse_point),
-            expected,
-            "is_symlink={is_symlink}, is_reparse_point={is_reparse_point}"
-        );
-    }
 }
 
 #[test]
@@ -375,111 +353,37 @@ fn toml_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
 
 #[cfg(unix)]
 #[test]
-fn target_snapshot_rejects_a_symlinked_parent_before_reading() {
+fn managed_overlay_rejects_a_symlinked_receipt_parent_without_external_effects() {
     use std::os::unix::fs::symlink;
 
     let directory = tempdir().expect("tempdir");
-    let external = directory.path().join("external");
-    let target_parent = directory.path().join("target-parent");
-    let external_target = external.join("target.json");
-    fs::create_dir(&external).unwrap();
-    fs::write(&external_target, "{\"private\":\"unchanged\"}\n").unwrap();
-    symlink(&external, &target_parent).unwrap();
-
-    let error = overlay::ownership::snapshot_file(&target_parent.join("target.json"))
-        .expect_err("snapshot parent symlink must fail closed");
-
-    assert!(
-        format!("{error:#}").contains("overlay target snapshot parent must be a real directory")
-    );
-    assert_eq!(
-        fs::read_to_string(&external_target).unwrap(),
-        "{\"private\":\"unchanged\"}\n"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn atomic_target_write_rejects_a_symlinked_parent_without_external_effects() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempdir().expect("tempdir");
-    let external = directory.path().join("external");
-    let target_parent = directory.path().join("target-parent");
-    let external_target = external.join("target.json");
-    fs::create_dir(&external).unwrap();
-    fs::write(&external_target, "{\"private\":\"unchanged\"}\n").unwrap();
-    symlink(&external, &target_parent).unwrap();
-
-    let error = overlay::ownership::atomic_write_preserving_target(
-        &target_parent.join("target.json"),
-        b"{\"managed\":true}\n",
-    )
-    .expect_err("write parent symlink must fail closed");
-
-    assert!(format!("{error:#}").contains("overlay target parent must be a real directory"));
-    assert_eq!(
-        fs::read_to_string(&external_target).unwrap(),
-        "{\"private\":\"unchanged\"}\n"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn ownership_receipt_write_rejects_a_symlinked_parent_without_external_effects() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempdir().expect("tempdir");
+    let source = directory.path().join("source.json");
+    let target = directory.path().join("target.json");
     let state = directory.path().join("state");
     let external = directory.path().join("external");
+    fs::write(&source, "{\"managed\":true}\n").unwrap();
+    fs::write(&target, "{\"local\":true}\n").unwrap();
     fs::create_dir_all(&state).unwrap();
     fs::create_dir(&external).unwrap();
     symlink(&external, state.join("overlays")).unwrap();
-    let receipt = state.join("overlays/fixture.json");
-    let paths = BTreeSet::from([key(&["managed"])]);
 
-    let error = overlay::ownership::write_paths_atomic(&receipt, "fixture", &paths)
-        .expect_err("receipt parent symlink must fail closed");
+    let error = json::overlay_json_file(
+        &source,
+        &target,
+        &JsonOverlayOptions {
+            reconcile_removed_keys: true,
+            managed_overlay_id: Some("fixture".to_owned()),
+            state_root: Some(state),
+            ..JsonOverlayOptions::default()
+        },
+    )
+    .expect_err("receipt parent symlink must fail closed");
 
     assert!(
         format!("{error:#}").contains("overlay ownership receipt parent must be a real directory")
     );
-    assert!(!external.join("fixture.json").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn rollback_rejects_a_symlinked_target_parent_without_touching_the_referent() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempdir().expect("tempdir");
-    let target_parent = directory.path().join("target-parent");
-    let displaced_parent = directory.path().join("displaced-parent");
-    let external = directory.path().join("external");
-    let target = target_parent.join("target.json");
-    fs::create_dir(&target_parent).unwrap();
-    fs::write(&target, "{\"before\":true}\n").unwrap();
-    let snapshot = overlay::ownership::snapshot_file(&target).expect("snapshot safe target");
-    fs::rename(&target_parent, &displaced_parent).unwrap();
-    fs::create_dir(&external).unwrap();
-    let external_target = external.join("target.json");
-    fs::write(&external_target, "{\"external\":\"unchanged\"}\n").unwrap();
-    symlink(&external, &target_parent).unwrap();
-
-    let error = overlay::ownership::restore_file(&target, &snapshot)
-        .expect_err("rollback parent symlink must fail closed");
-
-    assert!(
-        format!("{error:#}").contains("overlay target rollback parent must be a real directory")
-    );
-    assert_eq!(
-        fs::read_to_string(&external_target).unwrap(),
-        "{\"external\":\"unchanged\"}\n"
-    );
-    assert_eq!(
-        fs::read_to_string(displaced_parent.join("target.json")).unwrap(),
-        "{\"before\":true}\n"
-    );
+    assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "{\"local\":true}\n");
 }
 
 #[cfg(unix)]

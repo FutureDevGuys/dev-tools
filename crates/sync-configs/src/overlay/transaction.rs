@@ -38,6 +38,16 @@ pub(crate) enum Operation {
     TomlRemove,
 }
 
+impl Operation {
+    fn target_label(self) -> &'static str {
+        match self {
+            Self::JsonOverlay => "JSON overlay target",
+            Self::TomlOverlay => "TOML overlay target",
+            Self::TomlRemove => "TOML removal target",
+        }
+    }
+}
+
 pub(crate) struct ReceiptSpec {
     pub id: String,
     pub path: PathBuf,
@@ -113,7 +123,8 @@ struct SelectedLeaf {
 }
 
 impl SelectedLeaf {
-    fn prepare(path: PathBuf) -> Result<Self> {
+    fn prepare(path: PathBuf, label: &str) -> Result<Self> {
+        ownership::validate_real_parent_chain(&path, label)?;
         let parent_path = path.parent().context("overlay leaf has no parent")?;
         let preparation = DocumentDirectoryPreparation::observe(parent_path, uid(), 0o700)?;
         let (directory, _) = preparation.prepare()?;
@@ -247,7 +258,7 @@ impl Transaction {
         {
             bail!("overlay target uses the reserved transaction namespace");
         }
-        let target = SelectedLeaf::prepare(target_path)?;
+        let target = SelectedLeaf::prepare(target_path, operation.target_label())?;
         let journal_name = sibling_name(&target.name, ".json");
         let receipt = receipt
             .map(|mut spec| -> Result<_> {
@@ -263,7 +274,7 @@ impl Transaction {
                 {
                     bail!("overlay receipt uses the reserved transaction namespace");
                 }
-                let leaf = SelectedLeaf::prepare(spec.path.clone())?;
+                let leaf = SelectedLeaf::prepare(spec.path.clone(), "overlay ownership receipt")?;
                 Ok((spec, leaf))
             })
             .transpose()?;

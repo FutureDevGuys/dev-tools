@@ -1,19 +1,16 @@
-//! Fail-closed ownership receipts and atomic overlay file replacement.
-
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, Metadata, Permissions};
+use std::fs::{self, Metadata};
 #[cfg(not(target_os = "linux"))]
 use std::fs::{File, OpenOptions};
+use std::io;
 #[cfg(not(target_os = "linux"))]
 use std::io::Read;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
 use super::PathKey;
 use crate::paths::{is_absolute_for, platform_join, PathPlatform};
@@ -27,42 +24,6 @@ struct OwnershipReceipt {
     schema_version: u64,
     managed_overlay_id: String,
     managed_paths: Vec<PathKey>,
-}
-
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) enum FileSnapshot {
-    Missing,
-    Symlink(PathBuf),
-    Regular {
-        content: Vec<u8>,
-        metadata: PreservedMetadata,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PreservedMetadata {
-    permissions: Permissions,
-    #[cfg(unix)]
-    uid: u32,
-    #[cfg(unix)]
-    gid: u32,
-}
-
-impl PreservedMetadata {
-    #[cfg(test)]
-    fn from_metadata(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        Self {
-            permissions: metadata.permissions(),
-            #[cfg(unix)]
-            uid: metadata.uid(),
-            #[cfg(unix)]
-            gid: metadata.gid(),
-        }
-    }
 }
 
 /// Return the platform-native product state root for sync-configs ownership receipts.
@@ -238,22 +199,7 @@ pub(crate) fn decode_paths(bytes: &[u8], managed_id: &str) -> Result<BTreeSet<Pa
     Ok(paths)
 }
 
-pub fn write_paths_atomic(path: &Path, managed_id: &str, paths: &BTreeSet<PathKey>) -> Result<()> {
-    let bytes = encode_paths(managed_id, paths)?;
-    validate_real_parent_chain(path, "overlay ownership receipt")?;
-    ensure_private_parent(path)?;
-    validate_real_parent_chain(path, "overlay ownership receipt")?;
-    reject_non_regular_destination(path, "overlay ownership receipt", false)?;
-    atomic_write(
-        path,
-        bytes.as_bytes(),
-        None,
-        "overlay ownership receipt",
-        false,
-    )
-    .with_context(|| format!("cannot write overlay ownership receipt {}", path.display()))
-}
-
+#[cfg(target_os = "linux")]
 pub(crate) fn encode_paths(managed_id: &str, paths: &BTreeSet<PathKey>) -> Result<String> {
     validate_managed_id(managed_id)?;
     if paths
@@ -274,169 +220,6 @@ pub(crate) fn encode_paths(managed_id: &str, paths: &BTreeSet<PathKey>) -> Resul
         bail!("overlay ownership receipt exceeds its size bound");
     }
     Ok(text)
-}
-
-#[cfg(test)]
-pub(crate) fn snapshot_file(path: &Path) -> Result<FileSnapshot> {
-    validate_real_parent_chain(path, "overlay target snapshot")?;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(FileSnapshot::Missing),
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", path.display()))
-        }
-    };
-    if metadata_is_unsupported_reparse_leaf(&metadata) {
-        bail!(
-            "overlay target snapshot must not cross a non-symlink reparse point: {}",
-            path.display()
-        );
-    }
-    if metadata.file_type().is_symlink() {
-        validate_real_parent_chain(path, "overlay target snapshot")?;
-        return Ok(FileSnapshot::Symlink(fs::read_link(path).with_context(
-            || format!("cannot read symbolic link {}", path.display()),
-        )?));
-    }
-    if !metadata.is_file() {
-        bail!(
-            "overlay target must be a regular file path: {}",
-            path.display()
-        );
-    }
-    validate_real_parent_chain(path, "overlay target snapshot")?;
-    Ok(FileSnapshot::Regular {
-        content: fs::read(path).with_context(|| format!("cannot read {}", path.display()))?,
-        metadata: PreservedMetadata::from_metadata(&metadata),
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn restore_file(path: &Path, snapshot: &FileSnapshot) -> Result<()> {
-    validate_real_parent_chain(path, "overlay target rollback")?;
-    match snapshot {
-        FileSnapshot::Missing => remove_existing_leaf(path, "overlay target rollback"),
-        FileSnapshot::Symlink(target) => {
-            remove_existing_leaf(path, "overlay target rollback")?;
-            validate_real_parent_chain(path, "overlay target rollback")?;
-            create_symlink(target, path)
-                .with_context(|| format!("cannot restore symbolic link {}", path.display()))
-        }
-        FileSnapshot::Regular { content, metadata } => atomic_write(
-            path,
-            content,
-            Some(metadata),
-            "overlay target rollback",
-            true,
-        ),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn atomic_write_preserving_target(path: &Path, bytes: &[u8]) -> Result<()> {
-    validate_real_parent_chain(path, "overlay target")?;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata_is_unsupported_reparse_leaf(&metadata) => bail!(
-            "overlay target must not be a non-symlink reparse point: {}",
-            path.display()
-        ),
-        Ok(metadata) if metadata.file_type().is_symlink() => None,
-        Ok(metadata) if metadata.is_file() => Some(PreservedMetadata::from_metadata(&metadata)),
-        Ok(_) => bail!(
-            "overlay target must be a regular file path: {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", path.display()))
-        }
-    };
-    validate_real_parent_chain(path, "overlay target")?;
-    atomic_write(path, bytes, metadata.as_ref(), "overlay target", true)
-}
-
-fn atomic_write(
-    path: &Path,
-    bytes: &[u8],
-    metadata: Option<&PreservedMetadata>,
-    label: &str,
-    allow_file_symlink: bool,
-) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("overlay path has no parent: {}", path.display()))?;
-    create_real_parent_chain(path, label)?;
-    validate_real_parent_chain(path, label)?;
-    reject_non_regular_destination(path, label, allow_file_symlink)?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("cannot stage overlay beside {}", path.display()))?;
-    temporary
-        .write_all(bytes)
-        .with_context(|| format!("cannot stage overlay beside {}", path.display()))?;
-    temporary
-        .as_file_mut()
-        .flush()
-        .with_context(|| format!("cannot flush staged overlay beside {}", path.display()))?;
-
-    if let Some(metadata) = metadata {
-        apply_metadata(temporary.path(), metadata)?;
-    }
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("cannot sync staged overlay beside {}", path.display()))?;
-    validate_real_parent_chain(path, label)?;
-    reject_non_regular_destination(path, label, allow_file_symlink)?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| {
-            format!(
-                "cannot atomically replace overlay target {}",
-                path.display()
-            )
-        })?;
-    Ok(())
-}
-
-fn apply_metadata(path: &Path, metadata: &PreservedMetadata) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::chown;
-
-        chown(path, Some(metadata.uid), Some(metadata.gid)).with_context(|| {
-            format!(
-                "cannot preserve overlay target ownership at {}",
-                path.display()
-            )
-        })?;
-    }
-    fs::set_permissions(path, metadata.permissions.clone()).with_context(|| {
-        format!(
-            "cannot preserve overlay target permissions at {}",
-            path.display()
-        )
-    })
-}
-
-fn reject_non_regular_destination(
-    path: &Path,
-    label: &str,
-    allow_file_symlink: bool,
-) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata_is_unsupported_reparse_leaf(&metadata) => bail!(
-            "{label} must not be a non-symlink reparse point: {}",
-            path.display()
-        ),
-        Ok(metadata) if allow_file_symlink && metadata.file_type().is_symlink() => Ok(()),
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => bail!("{label} must be a regular file: {}", path.display()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("cannot inspect {label} {}", path.display()))
-        }
-    }
 }
 
 fn validate_receipt_metadata(path: &Path, metadata: &Metadata) -> Result<()> {
@@ -474,42 +257,6 @@ fn validate_receipt_metadata(path: &Path, metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
-fn ensure_private_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        anyhow!(
-            "overlay ownership receipt has no parent: {}",
-            path.display()
-        )
-    })?;
-    create_real_parent_chain(path, "overlay ownership receipt")?;
-    validate_real_parent_chain(path, "overlay ownership receipt")?;
-    let metadata = fs::symlink_metadata(parent).with_context(|| {
-        format!(
-            "cannot inspect overlay receipt directory {}",
-            parent.display()
-        )
-    })?;
-    if !metadata.is_dir() || metadata_is_link_boundary(&metadata) {
-        bail!(
-            "overlay ownership receipt parent must be a real directory: {}",
-            parent.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        validate_real_parent_chain(path, "overlay ownership receipt")?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!(
-                "cannot make overlay receipt directory owner-only: {}",
-                parent.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_real_parent_chain(path: &Path, label: &str) -> Result<()> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -537,83 +284,6 @@ pub(crate) fn validate_real_parent_chain(path: &Path, label: &str) -> Result<()>
         }
     }
     Ok(())
-}
-
-fn create_real_parent_chain(path: &Path, label: &str) -> Result<()> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .with_context(|| format!("cannot resolve {label} from the current directory"))?
-            .join(path)
-    };
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| anyhow!("{label} has no parent: {}", path.display()))?;
-    for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
-        let candidate = ancestor.to_path_buf();
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.is_dir() && !metadata_is_link_boundary(&metadata) => {}
-            Ok(_) => bail!(
-                "{label} parent must be a real directory: {}",
-                candidate.display()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::create_dir(&candidate) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let metadata = fs::symlink_metadata(&candidate).with_context(|| {
-                            format!(
-                                "cannot inspect raced {label} parent {}",
-                                candidate.display()
-                            )
-                        })?;
-                        if !metadata.is_dir() || metadata_is_link_boundary(&metadata) {
-                            bail!(
-                                "{label} parent must be a real directory: {}",
-                                candidate.display()
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("cannot create {label} parent {}", candidate.display())
-                        })
-                    }
-                }
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("cannot inspect {label} parent {}", candidate.display())
-                })
-            }
-        }
-    }
-    validate_real_parent_chain(path, label)
-}
-
-#[cfg(test)]
-pub(crate) fn remove_existing_leaf(path: &Path, label: &str) -> Result<()> {
-    validate_real_parent_chain(path, label)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata_is_unsupported_reparse_leaf(&metadata) => bail!(
-            "{label} must not cross a non-symlink reparse point: {}",
-            path.display()
-        ),
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            bail!(
-                "refusing to replace directory while restoring {}",
-                path.display()
-            )
-        }
-        Ok(_) => {
-            validate_real_parent_chain(path, label)?;
-            fs::remove_file(path)
-                .with_context(|| format!("cannot remove {} while restoring", path.display()))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
-    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -653,36 +323,4 @@ fn metadata_is_link_boundary(metadata: &Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
-}
-
-pub(crate) fn is_unsupported_reparse_leaf(
-    file_type_is_symlink: bool,
-    has_reparse_attribute: bool,
-) -> bool {
-    has_reparse_attribute && !file_type_is_symlink
-}
-
-fn metadata_is_unsupported_reparse_leaf(metadata: &Metadata) -> bool {
-    is_unsupported_reparse_leaf(
-        metadata.file_type().is_symlink(),
-        metadata_is_link_boundary(metadata),
-    )
-}
-
-#[cfg(all(test, unix))]
-fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(all(test, windows))]
-fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
-    std::os::windows::fs::symlink_file(target, link)
-}
-
-#[cfg(all(test, not(any(unix, windows))))]
-fn create_symlink(_target: &Path, _link: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "symbolic-link restoration is unsupported on this platform",
-    ))
 }

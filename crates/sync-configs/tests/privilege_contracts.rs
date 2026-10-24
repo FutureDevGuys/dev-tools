@@ -97,13 +97,19 @@ fn sudo_calls(root: &Path) -> Vec<String> {
 }
 
 /// Authentication tries a harmless system `true` through `sudo -n --` before it
-/// prompts. Native installations provide it at one of these fixed locations.
-fn authorization_probe() -> String {
+/// prompts.
+fn pathless_authorization_probe() -> String {
     let probe = ["/usr/bin/true", "/bin/true"]
         .into_iter()
         .find(|candidate| Path::new(candidate).is_file())
         .expect("system true");
     format!("-n -- {probe}")
+}
+
+fn environment_without_path() -> BTreeMap<OsString, OsString> {
+    std::env::vars_os()
+        .filter(|(name, _)| name != "PATH")
+        .collect()
 }
 
 fn executable_script(path: &Path, script: &str) {
@@ -264,6 +270,7 @@ fn one_visible_authentication_is_reused_for_exact_noninteractive_commands() {
     let marker = root.path().join("marker");
     let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
         .expect("session")
+        .with_environment_for_test(environment_without_path())
         .with_foreground_terminal_for_test(true);
 
     session.ensure_authenticated().expect("authenticate");
@@ -277,7 +284,7 @@ fn one_visible_authentication_is_reused_for_exact_noninteractive_commands() {
         sudo_calls(root.path()),
         [
             "-n -v".to_owned(),
-            authorization_probe(),
+            pathless_authorization_probe(),
             "-v".to_owned(),
             format!("-n -- /usr/bin/touch {}", marker.display()),
         ]
@@ -319,7 +326,9 @@ fn a_noninteractive_sudo_policy_authenticates_without_a_prompt() {
         },
     );
     let marker = root.path().join("marker");
-    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .expect("session")
+        .with_environment_for_test(environment_without_path());
 
     session
         .ensure_authenticated()
@@ -333,9 +342,85 @@ fn a_noninteractive_sudo_policy_authenticates_without_a_prompt() {
         sudo_calls(root.path()),
         [
             "-n -v".to_owned(),
-            authorization_probe(),
+            pathless_authorization_probe(),
             format!("-n -- /usr/bin/touch {}", marker.display()),
         ]
+    );
+}
+
+#[test]
+fn the_authorization_probe_resolves_true_through_the_session_path() {
+    let _guard = process_test_guard();
+    let root = TempDir::new().expect("temp root");
+    let sudo = fake_sudo(
+        root.path(),
+        SudoPolicy {
+            granted: true,
+            prompt_fails: true,
+            ..SudoPolicy::default()
+        },
+    );
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).expect("PATH directory");
+    let probe = bin.join("true");
+    executable_script(&probe, "#!/bin/sh\nexit 0\n");
+    let mut session = PrivilegeSession::new_fully_injected_for_test(sudo)
+        .expect("session")
+        .with_environment_for_test(BTreeMap::from([(
+            OsString::from("PATH"),
+            bin.into_os_string(),
+        )]))
+        .with_foreground_terminal_for_test(false);
+
+    session
+        .ensure_authenticated()
+        .expect("the only true on PATH detects the policy grant");
+
+    assert!(session.is_authenticated());
+    assert_eq!(
+        sudo_calls(root.path()),
+        ["-n -v".to_owned(), format!("-n -- {}", probe.display())]
+    );
+}
+
+#[test]
+fn a_session_path_without_a_usable_true_falls_through_to_the_prompt_decision() {
+    let _guard = process_test_guard();
+    let root = TempDir::new().expect("temp root");
+    let sudo = fake_sudo(root.path(), SudoPolicy::default());
+    let empty = root.path().join("empty");
+    let directory = root.path().join("directory");
+    let unexecutable = root.path().join("unexecutable");
+    fs::create_dir(&empty).expect("empty PATH directory");
+    fs::create_dir_all(directory.join("true")).expect("directory named true");
+    fs::create_dir(&unexecutable).expect("unexecutable PATH directory");
+    fs::write(unexecutable.join("true"), "#!/bin/sh\nexit 0\n").expect("unexecutable true");
+    fs::set_permissions(unexecutable.join("true"), fs::Permissions::from_mode(0o600))
+        .expect("chmod unexecutable true");
+    let path = std::env::join_paths([empty, directory, unexecutable]).expect("PATH");
+    let mut session = PrivilegeSession::new_fully_injected_for_test(sudo)
+        .expect("session")
+        .with_environment_for_test(BTreeMap::from([(OsString::from("PATH"), path)]))
+        .with_foreground_terminal_for_test(false);
+
+    let error = session
+        .ensure_authenticated()
+        .expect_err("no grant, no timestamp and no foreground prompt");
+
+    assert!(
+        matches!(error, PrivilegeError::PromptUnavailable),
+        "{error:?}"
+    );
+    assert!(!session.is_authenticated());
+    let calls = sudo_calls(root.path());
+    assert_eq!(calls[0], "-n -v", "{calls:?}");
+    assert!(calls.len() <= 2, "{calls:?}");
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|call| call.starts_with("-n -- /")
+                && !call.contains(&*root.path().to_string_lossy())),
+        "an unusable PATH candidate ran: {calls:?}"
     );
 }
 
@@ -698,7 +783,9 @@ fn refused_prompt_role() {
             ..SudoPolicy::default()
         },
     );
-    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo).expect("session");
+    let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
+        .expect("session")
+        .with_environment_for_test(environment_without_path());
 
     let error = session
         .ensure_authenticated()
@@ -712,7 +799,7 @@ fn refused_prompt_role() {
     assert!(!session.is_authenticated());
     assert_eq!(
         sudo_calls(root.path()),
-        ["-n -v".to_owned(), authorization_probe()],
+        ["-n -v".to_owned(), pathless_authorization_probe()],
         "prompted outside the terminal foreground"
     );
     let diagnostic = sync_configs::engine::EngineError::Privilege(error).failure_diagnostic();
