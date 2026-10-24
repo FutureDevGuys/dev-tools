@@ -708,6 +708,14 @@ COMP_WORDS=(dev-auth secret metadata build-token --non-i)
 COMP_CWORD=4
 "$function_name" dev-auth --non-i build-token
 printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth setup template administrator-grant-policy --maximum-d)
+COMP_CWORD=4
+"$function_name" dev-auth --maximum-d administrator-grant-policy
+printf '%s\n' "${COMPREPLY[@]}"
+COMP_WORDS=(dev-auth setup template administrator-grant-policy --scope w)
+COMP_CWORD=5
+"$function_name" dev-auth w --scope
+printf '%s\n' "${COMPREPLY[@]}"
 "#;
     let output = bounded_output(
         Command::new("/usr/bin/bash")
@@ -724,7 +732,7 @@ printf '%s\n' "${COMPREPLY[@]}"
     );
     assert_eq!(
         output.stdout,
-        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\n--user\nstructured\nmutable\n--desktop-entry\n--caller-argument-index\nproviders\n--non-interactive\n"
+        b"--json\n--purpose\n--credential-stdin\n--credential-fd\nuser-only\nstable\n--json\n--offline\n--command-name\n--user\nstructured\nmutable\n--desktop-entry\n--caller-argument-index\nproviders\n--non-interactive\n--maximum-duration\nworkload\n"
     );
 }
 
