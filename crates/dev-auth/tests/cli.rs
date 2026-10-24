@@ -28,6 +28,11 @@ mod enrolled_store;
 mod generic_projection;
 
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Native setup and recovery subprocess bounds only catch hangs. A recovery
+/// stage spends about a second of CPU on dozens of fsyncs, so its wall time
+/// follows host disk contention rather than product work.
+#[cfg(target_os = "linux")]
+const NATIVE_SETUP_SCALE: u32 = 4;
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 #[test]
@@ -3048,7 +3053,7 @@ intent = "enroll-if-absent"
         fs::write(&transition_path, serde_json::to_vec(&accepted).unwrap()).unwrap();
         let rejected = run(
             "reject accepted binary recovery replay",
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
         );
         assert_eq!(
             rejected.status.code(),
@@ -3067,12 +3072,12 @@ intent = "enroll-if-absent"
         fs::write(&transition_path, &retained).unwrap();
         // This new upgrade path restores and verifies the prior installation,
         // then verifies and activates a distinct candidate. Each binary stage
-        // retains the fixture's 20-second budget; other recovery paths do not
+        // retains the fixture's per-stage budget; other recovery paths do not
         // acquire this extra allowance. Release performance is a separate gate.
         let forward_budget = if uncommitted && prior_binary_receipts.is_some() {
-            Duration::from_secs(40)
+            Duration::from_secs(40) * NATIVE_SETUP_SCALE
         } else {
-            Duration::from_secs(20)
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE
         };
         let recovered = run("complete pending binary recovery", forward_budget);
         assert_eq!(
@@ -3104,7 +3109,10 @@ intent = "enroll-if-absent"
             })));
         assert_eq!(fs::read(&receipt_path).unwrap(), expected_receipt);
         assert!(!journal_path.exists());
-        let repeated = run("repeat completed binary recovery", Duration::from_secs(20));
+        let repeated = run(
+            "repeat completed binary recovery",
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
+        );
         assert_eq!(repeated.status.code(), Some(3));
         let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
         assert_eq!(repeated["changed"], false);
@@ -3165,7 +3173,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(120),
+                Duration::from_secs(120) * NATIVE_SETUP_SCALE,
                 "forward recovery retires partially published candidate integrations",
             );
             assert_eq!(
@@ -3213,7 +3221,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(120),
+                Duration::from_secs(120) * NATIVE_SETUP_SCALE,
                 "retained native restoration",
             )
         };
@@ -3253,7 +3261,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(120),
+                Duration::from_secs(120) * NATIVE_SETUP_SCALE,
                 "initial restoration process-death boundary",
             );
             assert!(!killed.status.success());
@@ -3344,7 +3352,7 @@ intent = "enroll-if-absent"
                     "json",
                 ])
                 .env_clear(),
-            Duration::from_secs(15),
+            Duration::from_secs(15) * NATIVE_SETUP_SCALE,
             "restored generation rejects forward recovery",
         );
         assert_eq!(forward.status.code(), Some(3));
@@ -3434,7 +3442,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "setup verification must not recover a binary journal",
         );
         assert!(!observation.status.success());
@@ -3453,7 +3461,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "reject differently hashed recovery executable",
         );
         assert_eq!(wrong.status.code(), Some(4));
@@ -3487,7 +3495,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "recovery rejects an unapproved prior endpoint before mutation",
         );
         assert_eq!(rejected_journal.status.code(), Some(4));
@@ -3513,7 +3521,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "explicit recovery settles the retained candidate's committed binary journal",
         );
         assert_eq!(recovered_journal.status.code(), Some(3));
@@ -3541,7 +3549,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(45),
+            Duration::from_secs(45) * NATIVE_SETUP_SCALE,
             "candidate-independent setup recovery",
         );
         assert_eq!(
@@ -3589,7 +3597,7 @@ intent = "enroll-if-absent"
                     .env_clear()
                     .env("HOME", &user.dir)
                     .env("PATH", "/usr/bin:/bin"),
-                Duration::from_secs(30),
+                Duration::from_secs(30) * NATIVE_SETUP_SCALE,
                 "recovery failure progress boundary",
             );
             assert_eq!(failed.status.code(), Some(exit));
@@ -3616,7 +3624,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(15),
+                Duration::from_secs(15) * NATIVE_SETUP_SCALE,
                 "restoration direction must reject forward recovery",
             );
             assert_eq!(output.status.code(), Some(3));
@@ -3854,7 +3862,7 @@ fn missing_credential_stages_no_workload_launchers() {
             "missing_credential_stages_no_workload_launchers",
             "--nocapture",
         ]),
-        Duration::from_secs(90),
+        Duration::from_secs(90) * NATIVE_SETUP_SCALE,
         "inactive setup acceptance subprocess",
     );
     assert!(
@@ -4299,7 +4307,7 @@ fn logical_setup_stages_versioned_authority_and_resumes_without_activation() {
             "logical_setup_stages_versioned_authority_and_resumes_without_activation",
             "--nocapture",
         ]),
-        Duration::from_secs(90),
+        Duration::from_secs(90) * NATIVE_SETUP_SCALE,
         "logical setup native subprocess",
     );
     assert!(
@@ -4394,9 +4402,9 @@ fn run_binary_receipt_recovery_test(recovery: SetupRecoveryFixture, test_name: &
             SetupRecoveryFixture::UncommittedUpgradeBinary
                 | SetupRecoveryFixture::UnstagedUpgradeBinary
         ) {
-            Duration::from_secs(120)
+            Duration::from_secs(120) * NATIVE_SETUP_SCALE
         } else {
-            Duration::from_secs(90)
+            Duration::from_secs(90) * NATIVE_SETUP_SCALE
         },
         "product receipt recovery native subprocess",
     );
@@ -4442,7 +4450,7 @@ fn native_user_setup_restores_retained_generation_inactive() {
                 "native_user_setup_restores_retained_generation_inactive",
                 "--nocapture",
             ]),
-        Duration::from_secs(240),
+        Duration::from_secs(240) * NATIVE_SETUP_SCALE,
         "retained generation restoration native subprocess",
     );
     assert!(
@@ -4484,7 +4492,7 @@ fn native_user_setup_restores_initial_installation_absence() {
                 "native_user_setup_restores_initial_installation_absence",
                 "--nocapture",
             ]),
-        Duration::from_secs(240),
+        Duration::from_secs(240) * NATIVE_SETUP_SCALE,
         "initial absence restoration native subprocess",
     );
     assert!(
@@ -4528,7 +4536,7 @@ fn native_user_setup_restoration_resumes_after_process_death() {
                 "--ignored",
                 "--nocapture",
             ]),
-        Duration::from_secs(240),
+        Duration::from_secs(240) * NATIVE_SETUP_SCALE,
         "initial restoration process-death native subprocess",
     );
     assert!(
