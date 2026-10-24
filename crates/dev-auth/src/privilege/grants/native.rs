@@ -2,10 +2,18 @@ use super::policy::{Account, NativeScope};
 use super::Failure;
 use crate::linux_admission::LinuxPeerEvidence;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+
+/// What one look at native state found.
+pub(super) type Look<T> = Result<T, Unobserved>;
+
+/// A look at native state that could not be taken. It is never evidence that
+/// a process, a workload or a trust input changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Unobserved(pub io::ErrorKind);
 
 pub(super) struct Caller {
     pub peer: LinuxPeerEvidence,

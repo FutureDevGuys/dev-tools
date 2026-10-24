@@ -14,7 +14,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
     if peer.uid != 0
         || !native::alive(peer.peer_pidfd())
-        || !native::same_file(&executable, &service.sudo_file)?
+        || !native::same_file(&executable, &service.sudo.file)?
         || !policy_unchanged(&service)
     {
         return Err(Failure::AuthorityDenied);
@@ -81,7 +81,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
             Err(failure) => return Err(failure),
         };
         let grant = state.registry.get(id).ok_or(Failure::NoGrant)?;
-        if state.stopping
+        if state.phase != Phase::Serving
             || grant.lifetime.state() != LeaseState::Active
             || !grant.scope.contains(&caller.scope)
         {
@@ -148,7 +148,9 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
     };
     let descriptors = {
         let mut state = service.state.lock().await;
-        if state.stopping || (relay_job.is_none() && state.jobs.len() >= MAX_EXECUTIONS) {
+        if state.phase != Phase::Serving
+            || (relay_job.is_none() && state.jobs.len() >= MAX_EXECUTIONS)
+        {
             return Err(Failure::Busy);
         }
         let grant = state.registry.get(id).ok_or(Failure::NoGrant)?;
@@ -360,7 +362,7 @@ async fn admitted(
             File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
         let group = crate::linux_admission::read_unified_cgroup(peer.pid)
             .map_err(|_| Failure::AuthorityDenied)?;
-        if !native::same_file(&executable, &service.sudo_file)?
+        if !native::same_file(&executable, &service.sudo.file)?
             || !native::same_file(&root_file(&group, true)?, job.boundary.directory())?
             || !native::alive(peer.peer_pidfd())
         {

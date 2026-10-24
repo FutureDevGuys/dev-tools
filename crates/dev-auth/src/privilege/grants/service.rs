@@ -1,5 +1,5 @@
 use super::model::{Envelope, FRAME_LIMIT, WIRE_SCHEMA};
-use super::native::{self, Caller};
+use super::native::{self, Caller, Look, Unobserved};
 use super::policy::{Account, NativeScope, Policy};
 use super::{
     Authority, ControlRequest, ControlResult, Failure, Grant, GrantRequest, GrantScope, GrantState,
@@ -105,12 +105,16 @@ impl LaunchOwner {
                 .is_some_and(|deadline| now().is_ok_and(|observed| observed < deadline))
     }
 
+    fn presence(&self) -> Look<bool> {
+        Ok(self.present())
+    }
+
     fn revocation_reason(&self) -> Option<StopReason> {
-        (!self.present()
-            || self
-                .release_deadline
-                .is_some_and(|deadline| !now().is_ok_and(|observed| observed < deadline)))
-        .then_some(StopReason::WorkloadEnded)
+        launch_revocation(
+            self.presence(),
+            self.release_deadline
+                .is_some_and(|deadline| !now().is_ok_and(|observed| observed < deadline)),
+        )
     }
 
     fn matches(&self, caller: &Caller) -> bool {
@@ -182,7 +186,23 @@ struct State {
     selected: BTreeMap<NativeScope, GrantId>,
     jobs: BTreeMap<GrantId, Job>,
     pending_relays: BTreeMap<u32, PendingRelay>,
-    stopping: bool,
+    phase: Phase,
+}
+
+/// Whether the coordinator admits new managed work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Serving,
+    /// Shutdown stopped every grant.
+    Stopping,
+}
+
+impl Phase {
+    /// The changed trust input to exit for once a draining coordinator runs
+    /// no managed job.
+    fn drained(self, _running_jobs: usize) -> Option<Input> {
+        None
+    }
 }
 
 struct PendingRelay {
@@ -193,14 +213,11 @@ struct PendingRelay {
 
 struct Service {
     policy: Policy,
-    policy_file: File,
-    policy_stamp: FileStamp,
-    policy_path: PathBuf,
+    policy_source: Bound,
     parent: File,
     runtime: PathBuf,
     coordinator: OwnedFd,
-    sudo_file: File,
-    sudo_stamp: FileStamp,
+    sudo: Bound,
     product_file: File,
     state: Mutex<State>,
     pending: std::sync::Mutex<BTreeSet<Account>>,
@@ -248,10 +265,10 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
         .map_err(|_| Failure::AuthorityDenied)?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Failure::Busy)?;
     clear_markers(&configuration.runtime)?;
-    let policy_file = root_file(&configuration.policy, false)?;
-    let policy_stamp = FileStamp::of(&policy_file)?;
+    let policy_source = Bound::open(Input::Policy, &configuration.policy)?;
     let mut bytes = Vec::new();
-    policy_file
+    policy_source
+        .file
         .try_clone()
         .map_err(|_| Failure::NativeUnavailable)?
         .take(1024 * 1024 + 1)
@@ -262,9 +279,8 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
     }
     let policy: Policy = serde_json::from_slice(&bytes).map_err(|_| Failure::InvalidRequest)?;
     policy.validate()?;
-    let sudo_file = root_file(Path::new(&policy.sudo_program), false)?;
-    let sudo_stamp = FileStamp::of(&sudo_file)?;
-    if FileStamp::of(&policy_file)? != policy_stamp {
+    let sudo = Bound::open(Input::SudoProgram, Path::new(&policy.sudo_program))?;
+    if FileStamp::of(&policy_source.file)? != policy_source.stamp {
         return Err(Failure::AuthorityDenied);
     }
     let parent_path = own_service_cgroup()?;
@@ -293,14 +309,11 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
     let sudo_listener = create_listener(&configuration.runtime.join("sudo.sock"))?;
     let service = Arc::new(Service {
         policy,
-        policy_file,
-        policy_stamp,
-        policy_path: configuration.policy,
+        policy_source,
         parent,
         runtime: configuration.runtime,
         coordinator,
-        sudo_file,
-        sudo_stamp,
+        sudo,
         product_file,
         state: Mutex::new(State {
             registry: GrantRegistry::new(MAX_GRANTS).map_err(|_| Failure::RuntimeFailure)?,
@@ -308,7 +321,7 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
             selected: BTreeMap::new(),
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
-            stopping: false,
+            phase: Phase::Serving,
         }),
         pending: std::sync::Mutex::new(BTreeSet::new()),
     });
@@ -377,6 +390,7 @@ async fn run(
     let mut connections = tokio::task::JoinSet::new();
     let mut login_tick = 0_u32;
     let mut login_check: Option<tokio::task::JoinHandle<()>> = None;
+    let mut drained = None;
     loop {
         tokio::select! {
             biased;
@@ -387,6 +401,13 @@ async fn run(
                 let mut bytes = [0_u8; 8];
                 let _ = readiness.try_io(|fd| nix::unistd::read(fd.get_ref(), &mut bytes).map_err(io::Error::from));
                 reap(&service).await.map_err(integrity_lost)?;
+                if connections.is_empty() {
+                    let state = service.state.lock().await;
+                    drained = state.phase.drained(state.jobs.len());
+                    if drained.is_some() {
+                        break;
+                    }
+                }
                 login_tick += 1;
                 if login_tick >= 10 {
                     login_tick = 0;
@@ -427,9 +448,14 @@ async fn run(
             }
         }
     }
+    if let Some(input) = drained {
+        eprintln!(
+            "dev-auth grant coordinator exiting: the {input} changed and no managed job remains; the service manager starts a coordinator that binds the new state"
+        );
+    }
     {
         let mut state = service.state.lock().await;
-        state.stopping = true;
+        state.phase = Phase::Stopping;
         state.registry.stop_all(StopReason::BrokerShutdown, now()?);
     }
     for _ in 0..50 {
@@ -462,7 +488,10 @@ async fn run(
     {
         return Err(Failure::CleanupFailed);
     }
-    Ok(())
+    match drained {
+        Some(_) => Err(Failure::AuthorityDenied),
+        None => Ok(()),
+    }
 }
 
 async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Result<(), Failure> {
@@ -527,7 +556,7 @@ async fn dispatch(
     if let Err(failure) = sweep_abandoned_launches(service).await {
         return ControlResult::failure(operation, failure, Some(false));
     }
-    if !policy_unchanged(service) {
+    if admits_new_work(&request) && !policy_unchanged(service) {
         let mut state = service.state.lock().await;
         if let Ok(now) = now() {
             state.registry.stop_all(StopReason::AuthorityChanged, now);
@@ -695,7 +724,7 @@ async fn issue(
             .pending
             .lock()
             .map_err(|_| Failure::RuntimeFailure)?;
-        if state.stopping
+        if state.phase != Phase::Serving
             || pending.len() >= 4
             || state.registry.iter().count() + pending.len() >= MAX_GRANTS
             || !pending.insert(scope.account.clone())
@@ -712,9 +741,8 @@ async fn issue(
     drop(pending);
     approval?;
     let _setup = setup_admission(service)?;
-    if state.stopping
+    if admission(state.phase, service.trust()).is_err()
         || !caller.still_present()
-        || !policy_unchanged(service)
         || launch_owner
             .as_ref()
             .is_some_and(|owner| !owner.matches(caller))
@@ -914,8 +942,7 @@ fn require_launch_state(
     caller: &Caller,
     phase: LaunchPhase,
 ) -> Result<(), Failure> {
-    if state.stopping
-        || !policy_unchanged(service)
+    if admission(state.phase, service.trust()).is_err()
         || state
             .registry
             .get(id)
@@ -1228,7 +1255,7 @@ async fn delegate(
     let now = now()?;
     let id = new_id()?;
     let mut state = service.state.lock().await;
-    if state.stopping {
+    if state.phase != Phase::Serving {
         return Err(Failure::NativeUnavailable);
     }
     if depth(&state, parent) >= 16 {
@@ -1349,7 +1376,7 @@ async fn execute(
         captured_relay,
     ) = {
         let mut state = service.state.lock().await;
-        if state.stopping || state.jobs.len() >= MAX_EXECUTIONS {
+        if state.phase != Phase::Serving || state.jobs.len() >= MAX_EXECUTIONS {
             return Err(Failure::Busy);
         }
         let grant_id = select(&state, &caller.scope, selected)?;
@@ -1630,7 +1657,8 @@ async fn execute(
     } else if sudo_relay {
         Some(
             service
-                .sudo_file
+                .sudo
+                .file
                 .try_clone()
                 .map_err(|_| Failure::NativeUnavailable)?,
         )
@@ -1688,7 +1716,10 @@ async fn execute(
                 let _ = metadata.boundary.stop();
             }
         }
-        if !caller.still_present() || connection_closed(connection) {
+        if client_left(
+            Ok(caller.still_present()),
+            Ok(connection_closed(connection)),
+        ) {
             let mut state = service.state.lock().await;
             if let Some(job) = state.jobs.get_mut(&job_id) {
                 let _ = job.boundary.stop();
@@ -1850,7 +1881,10 @@ async fn execute_captured(
     let mut cleanup_deadline = failure.map(|_| std::time::Instant::now() + Duration::from_secs(5));
     loop {
         let expired = !self::now().is_ok_and(|now| now < hard_deadline);
-        let disconnected = !caller.still_present() || connection_closed(connection);
+        let disconnected = client_left(
+            Ok(caller.still_present()),
+            Ok(connection_closed(connection)),
+        );
         let signal = super::execution_io::receive_signal(&events);
         let mut state = service.state.lock().await;
         let job = state.jobs.get_mut(&job_id).ok_or(Failure::CleanupFailed)?;
@@ -2180,9 +2214,7 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
     state.pending_relays.retain(|_, pending| {
         now < pending.expires && native::alive(pending.caller.peer.peer_pidfd())
     });
-    if !policy_unchanged(service) {
-        state.registry.stop_all(StopReason::AuthorityChanged, now);
-    }
+    watch_trust(&mut state, service.trust());
     let ended: Vec<_> = state
         .metadata
         .iter()
@@ -2190,11 +2222,8 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
             metadata
                 .workload
                 .as_ref()
-                .and_then(|workload| match cgroup_empty(workload) {
-                    Ok(false) => None,
-                    Ok(true) => Some((*id, StopReason::WorkloadEnded)),
-                    Err(_) => Some((*id, StopReason::AuthorityChanged)),
-                })
+                .and_then(|workload| workload_end(population(workload)))
+                .map(|reason| (*id, reason))
         })
         .collect();
     for (id, reason) in ended {
@@ -2592,20 +2621,109 @@ fn session_failure(error: SessionError) -> Failure {
 }
 
 fn policy_unchanged(service: &Service) -> bool {
-    let Ok(current) = root_file(&service.policy_path, false) else {
-        return false;
-    };
-    FileStamp::of(&current).ok() == Some(service.policy_stamp)
-        && FileStamp::of(&service.policy_file).ok() == Some(service.policy_stamp)
-        && FileStamp::of(&service.sudo_file).ok() == Some(service.sudo_stamp)
-        && root_file(Path::new(&service.policy.sudo_program), false)
-            .ok()
-            .as_ref()
-            .and_then(|file| FileStamp::of(file).ok())
-            == Some(service.sudo_stamp)
+    service.trust() == Ok(None)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// A trust input the coordinator binds at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Input {
+    Policy,
+    SudoProgram,
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Policy => "grant policy",
+            Self::SudoProgram => "sudo program",
+        })
+    }
+}
+
+/// A trust input bound at startup: its path, the file that path named then,
+/// held open, and that file's stamp.
+struct Bound {
+    input: Input,
+    path: PathBuf,
+    file: File,
+    stamp: FileStamp,
+}
+
+impl Bound {
+    fn open(input: Input, path: &Path) -> Result<Self, Failure> {
+        let file = root_file(path, false)?;
+        Ok(Self {
+            input,
+            path: path.to_owned(),
+            stamp: FileStamp::of(&file)?,
+            file,
+        })
+    }
+
+    /// Whether the file the path names now is still the one bound at startup.
+    fn look(&self) -> Look<bool> {
+        let named = protected_file(&self.path, false)
+            .and_then(|file| file.as_ref().map(FileStamp::look).transpose());
+        unchanged(self.stamp, FileStamp::look(&self.file), named)
+    }
+}
+
+impl Service {
+    /// The first watched trust input a look finds changed.
+    fn trust(&self) -> Look<Option<Input>> {
+        changed_input([&self.policy_source, &self.sudo].map(|bound| (bound.input, bound.look())))
+    }
+}
+
+/// Whether a bound input still names the file the coordinator trusted, from
+/// the stamp of the descriptor held since startup and the stamp of the file
+/// its path names now, which is `None` when the path names no protected file.
+fn unchanged(
+    bound: FileStamp,
+    held: Look<FileStamp>,
+    named: Look<Option<FileStamp>>,
+) -> Look<bool> {
+    Ok(held == Ok(bound) && named == Ok(Some(bound)))
+}
+
+fn changed_input<const N: usize>(looks: [(Input, Look<bool>); N]) -> Look<Option<Input>> {
+    let mut unobserved = None;
+    for (input, look) in looks {
+        match look {
+            Ok(true) => {}
+            Ok(false) => return Ok(Some(input)),
+            Err(failure) => unobserved = unobserved.or(Some(failure)),
+        }
+    }
+    unobserved.map_or(Ok(None), Err)
+}
+
+/// Admission needs a serving coordinator and a look that finds every watched
+/// trust input unchanged.
+fn admission(phase: Phase, trust: Look<Option<Input>>) -> Result<(), Failure> {
+    match (phase, trust) {
+        (Phase::Serving, Ok(None)) => Ok(()),
+        (Phase::Stopping, _) => Err(Failure::Busy),
+        (Phase::Serving, _) => Err(Failure::AuthorityDenied),
+    }
+}
+
+/// Apply one look at the watched trust inputs to the coordinator.
+fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
+    if look != Ok(None) {
+        if let Ok(now) = now() {
+            state.registry.stop_all(StopReason::AuthorityChanged, now);
+        }
+    }
+}
+
+/// Whether a control request admits new managed work, and so needs the trust
+/// the coordinator bound at startup.
+fn admits_new_work(_request: &ControlRequest) -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     device: u64,
     inode: u64,
@@ -2618,7 +2736,11 @@ struct FileStamp {
 
 impl FileStamp {
     fn of(file: &File) -> Result<Self, Failure> {
-        let metadata = file.metadata().map_err(|_| Failure::AuthorityDenied)?;
+        Self::look(file).map_err(|_| Failure::AuthorityDenied)
+    }
+
+    fn look(file: &File) -> Look<Self> {
+        let metadata = file.metadata().map_err(|error| Unobserved(error.kind()))?;
         Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -2629,6 +2751,10 @@ impl FileStamp {
             ctime_ns: metadata.ctime_nsec(),
         })
     }
+}
+
+fn protected_file(path: &Path, directory: bool) -> Look<Option<File>> {
+    Ok(root_file(path, directory).ok())
 }
 
 fn root_file(path: &Path, directory: bool) -> Result<File, Failure> {
@@ -2849,6 +2975,30 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
         return Err(Mismatch);
     }
     Ok(())
+}
+
+/// The held workload cgroup's population: `true` when it has no member.
+fn population(directory: &File) -> Look<bool> {
+    cgroup_empty(directory).map_err(|_| Unobserved(io::ErrorKind::Other))
+}
+
+/// How one look at a workload's population ends its grant.
+fn workload_end(population: Look<bool>) -> Option<StopReason> {
+    match population {
+        Ok(true) => Some(StopReason::WorkloadEnded),
+        Ok(false) => None,
+        Err(_) => Some(StopReason::AuthorityChanged),
+    }
+}
+
+/// How one look at a pending launch's native owner revokes its grant.
+fn launch_revocation(presence: Look<bool>, release_expired: bool) -> Option<StopReason> {
+    (presence != Ok(true) || release_expired).then_some(StopReason::WorkloadEnded)
+}
+
+/// Whether an execution's client has left, which stops its job.
+fn client_left(presence: Look<bool>, hung_up: Look<bool>) -> bool {
+    presence != Ok(true) || hung_up != Ok(false)
 }
 
 fn cgroup_empty(directory: &File) -> Result<bool, Failure> {
@@ -3419,7 +3569,7 @@ mod tests {
             selected,
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
-            stopping: false,
+            phase: Phase::Serving,
         }
     }
 
@@ -3689,6 +3839,190 @@ mod tests {
             calls.get()
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    fn active(state: &State, id: GrantId) -> bool {
+        state
+            .registry
+            .get(id)
+            .is_some_and(|grant| grant.lifetime.state() == LeaseState::Active)
+    }
+
+    const UNREADABLE: Unobserved = Unobserved(io::ErrorKind::Interrupted);
+
+    // Replacing the sudo program or editing the policy stopped every grant,
+    // and with it every running job, including the job that replaced sudo.
+    #[test]
+    fn a_changed_trust_input_closes_admission_and_keeps_running_grants() {
+        for input in [Input::SudoProgram, Input::Policy] {
+            let scope = user_scope(1000);
+            let mut state = routing_state(&[(1, scope.clone())]);
+            watch_trust(&mut state, Ok(Some(input)));
+            assert!(
+                active(&state, 1),
+                "{input}: the grant and its job keep running"
+            );
+            assert_eq!(
+                select(&state, &scope, None),
+                Ok(1),
+                "{input}: routing stays"
+            );
+            assert!(
+                admission(state.phase, Ok(None)).is_err(),
+                "{input}: nothing new is admitted under the old trust, even after a clean look"
+            );
+            assert_eq!(
+                state.phase.drained(1),
+                None,
+                "{input}: waits for its running job"
+            );
+            assert_eq!(
+                state.phase.drained(0),
+                Some(input),
+                "{input}: exits for a restart once no job runs"
+            );
+        }
+    }
+
+    #[test]
+    fn ending_and_observing_grants_never_wait_for_trust() {
+        let grant = "0123456789abcdef0123456789abcdef".to_owned();
+        for request in [
+            ControlRequest::Status,
+            ControlRequest::Inspect {
+                grant: grant.clone(),
+            },
+            ControlRequest::Revoke {
+                grant: grant.clone(),
+            },
+            ControlRequest::Leave,
+        ] {
+            assert!(!admits_new_work(&request), "{}", request.operation());
+        }
+        for request in [
+            ControlRequest::CommitLaunch {
+                grant: grant.clone(),
+            },
+            ControlRequest::ActivateLaunch {
+                grant,
+                bootstrap: false,
+            },
+        ] {
+            assert!(admits_new_work(&request), "{}", request.operation());
+        }
+    }
+
+    // An unreadable policy file counted as a policy change and ended every grant.
+    #[test]
+    fn a_trust_input_that_cannot_be_read_is_not_a_change() {
+        let bound = FileStamp {
+            device: 1,
+            inode: 2,
+            length: 3,
+            mtime: 4,
+            mtime_ns: 5,
+            ctime: 6,
+            ctime_ns: 7,
+        };
+        let replaced = FileStamp { inode: 9, ..bound };
+        assert_eq!(unchanged(bound, Ok(bound), Ok(Some(bound))), Ok(true));
+        assert_eq!(
+            unchanged(bound, Ok(bound), Err(UNREADABLE)),
+            Err(UNREADABLE),
+            "a path that cannot be opened now"
+        );
+        assert_eq!(
+            unchanged(bound, Err(UNREADABLE), Ok(Some(bound))),
+            Err(UNREADABLE),
+            "a held descriptor that cannot be stamped now"
+        );
+        assert_eq!(unchanged(bound, Ok(bound), Ok(Some(replaced))), Ok(false));
+        assert_eq!(unchanged(bound, Ok(replaced), Ok(Some(bound))), Ok(false));
+        assert_eq!(unchanged(bound, Ok(bound), Ok(None)), Ok(false));
+        assert_eq!(
+            unchanged(bound, Ok(replaced), Err(UNREADABLE)),
+            Ok(false),
+            "an observed change wins over a look that failed"
+        );
+        assert_eq!(
+            changed_input([
+                (Input::Policy, Err(UNREADABLE)),
+                (Input::SudoProgram, Ok(true))
+            ]),
+            Err(UNREADABLE)
+        );
+        let scope = user_scope(1000);
+        let mut state = routing_state(&[(1, scope.clone())]);
+        watch_trust(&mut state, Err(UNREADABLE));
+        assert!(active(&state, 1), "the grant and its job keep running");
+        assert!(
+            admission(state.phase, Err(UNREADABLE)).is_err(),
+            "only this admission is refused"
+        );
+        assert_eq!(
+            admission(state.phase, Ok(None)),
+            Ok(()),
+            "and the next is not"
+        );
+        assert_eq!(state.phase.drained(0), None);
+    }
+
+    // An unreadable workload cgroup ended that workload's grant.
+    #[test]
+    fn a_workload_population_that_cannot_be_read_does_not_end_its_grant() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let held = File::open(cgroup.path()).unwrap();
+        let events = cgroup.path().join("cgroup.events");
+        std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+        assert_eq!(population(&held), Ok(false));
+        assert_eq!(workload_end(population(&held)), None);
+        std::fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
+        assert_eq!(
+            workload_end(population(&held)),
+            Some(StopReason::WorkloadEnded)
+        );
+        std::fs::remove_file(&events).unwrap();
+        assert_eq!(
+            population(&held),
+            Ok(true),
+            "a removed cgroup has no member"
+        );
+        let unreadable: [fn(&Path); 2] = [
+            |events| std::fs::create_dir(events).unwrap(),
+            |events| std::fs::write(events, "populated 2\n").unwrap(),
+        ];
+        for unreadable in unreadable {
+            let _ = std::fs::remove_dir(&events);
+            let _ = std::fs::remove_file(&events);
+            unreadable(&events);
+            assert!(population(&held).is_err());
+            assert_eq!(workload_end(population(&held)), None);
+        }
+    }
+
+    #[test]
+    fn a_launch_owner_that_cannot_be_observed_is_not_revoked() {
+        assert_eq!(launch_revocation(Ok(true), false), None);
+        assert_eq!(launch_revocation(Err(UNREADABLE), false), None);
+        for (presence, expired) in [
+            (Ok(false), false),
+            (Ok(true), true),
+            (Err(UNREADABLE), true),
+        ] {
+            assert_eq!(
+                launch_revocation(presence, expired),
+                Some(StopReason::WorkloadEnded)
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_observed_has_not_left() {
+        assert!(!client_left(Ok(true), Ok(false)));
+        assert!(!client_left(Err(UNREADABLE), Ok(false)));
+        assert!(!client_left(Ok(true), Err(UNREADABLE)));
+        assert!(client_left(Ok(false), Err(UNREADABLE)));
+        assert!(client_left(Err(UNREADABLE), Ok(true)));
     }
 
     // check_logins stops every user grant of the account, and with it all of
