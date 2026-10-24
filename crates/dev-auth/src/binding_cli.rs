@@ -13,6 +13,11 @@ fn value(name: &'static str) -> Arg {
 fn path(name: &'static str) -> Arg {
     value(name).value_hint(ValueHint::FilePath)
 }
+fn choice<const N: usize>(name: &'static str, values: [&'static str; N]) -> Arg {
+    value(name)
+        .value_hint(ValueHint::Unknown)
+        .value_parser(values)
+}
 fn flag(name: &'static str) -> Arg {
     Arg::new(name).long(name).action(ArgAction::SetTrue)
 }
@@ -32,12 +37,12 @@ fn plan_command(name: &'static str, rebind: bool) -> Command {
     command(name).arg(Arg::new("name").required(true)).args([
         value("workload").required(true),
         value("command-name").required(true),
-        value("target")
-            .value_parser(["current-resolution", "structured", "pinned-shell"])
-            .required(true),
-        value("code-trust")
-            .value_parser(["pinned", "mutable"])
-            .default_value("pinned"),
+        choice(
+            "target",
+            ["current-resolution", "structured", "pinned-shell"],
+        )
+        .required(true),
+        choice("code-trust", ["pinned", "mutable"]).default_value("pinned"),
         flag("desktop-entry"),
         path("executable"),
         value("arg")
