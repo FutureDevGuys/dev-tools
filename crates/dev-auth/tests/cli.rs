@@ -1202,7 +1202,10 @@ fn full_setup_apply_never_falls_back_to_a_binary_only_v2_plan() {
     );
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("accepts only a full setup plan v3"));
+    assert!(
+        error.contains("setup apply accepts only a full setup plan"),
+        "{error}"
+    );
 }
 
 #[cfg(target_os = "linux")]

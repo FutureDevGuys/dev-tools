@@ -556,7 +556,7 @@ fn setup_cli_never_treats_a_binary_install_plan_as_full_desired_state() {
     );
     assert!(
         String::from_utf8_lossy(&rejected_even_with_the_matching_digest.stderr)
-            .contains("accepts only a full setup plan v3")
+            .contains("setup apply accepts only a full setup plan")
     );
 }
 
