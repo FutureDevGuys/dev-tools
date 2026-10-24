@@ -3017,38 +3017,71 @@ fn validate_setup_plan_v3_with_installation_check(
     {
         bail!("setup plan has an unsupported authority schema");
     }
-    if plan.schema != expected_setup_plan_schema(plan)
-        || plan.installation.request.purpose != plan.intent.purpose
-        || plan.intent_sha256 != sha256_hex(&canonical_deployment_intent(&plan.intent)?)
-        || plan.source_documents.is_empty()
-        || (!privilege_only && plan.accounts.is_empty())
-        || plan.actions.is_empty()
-        || plan.current_state_sha256
-            != stored_current_state_digest_with_grants(
-                &plan.current_paths,
-                &plan.current_credential_ready,
-                &plan.current_broker_state,
-                plan.grant_current_state.as_deref(),
-            )?
-        || plan.actions.last().map(|action| action.kind.as_str()) != Some("verify")
-        || plan
-            .actions
-            .iter()
-            .enumerate()
-            .any(|(index, action)| action.order != index as u32)
-    {
-        bail!("dev-auth setup plan v3 has an unsupported contract");
+    let expected_schema = expected_setup_plan_schema(plan);
+    if plan.schema != expected_schema {
+        bail!(
+            "dev-auth setup plan v3 has an unsupported contract: its schema is not {expected_schema}"
+        );
     }
-    if current_path_keys(&plan.current_paths)
-        != expected_current_path_keys(
-            &plan.installation,
-            &plan.intent,
-            &plan.accounts,
-            &plan.retiring_accounts,
-            plan.authority_schema.as_deref(),
-        )?
-    {
-        bail!("setup plan v3 current-state paths do not match the deployment authority");
+    let intent_sha256 = sha256_hex(&canonical_deployment_intent(&plan.intent)?);
+    let current_state_sha256 = stored_current_state_digest_with_grants(
+        &plan.current_paths,
+        &plan.current_credential_ready,
+        &plan.current_broker_state,
+        plan.grant_current_state.as_deref(),
+    )?;
+    let contract = [
+        (
+            plan.installation.request.purpose == plan.intent.purpose,
+            "its installation purpose differs from its deployment intent",
+        ),
+        (
+            plan.intent_sha256 == intent_sha256,
+            "its intent digest does not match its deployment intent",
+        ),
+        (
+            !plan.source_documents.is_empty(),
+            "it records no source documents",
+        ),
+        (
+            privilege_only || !plan.accounts.is_empty(),
+            "it names no native accounts",
+        ),
+        (
+            plan.current_state_sha256 == current_state_sha256,
+            "its current-state digest does not match its recorded current state",
+        ),
+        (
+            plan.actions
+                .last()
+                .is_some_and(|action| action.kind == "verify"),
+            "its actions do not end with verify",
+        ),
+        (
+            plan.actions
+                .iter()
+                .enumerate()
+                .all(|(index, action)| action.order == index as u32),
+            "its action order is not contiguous from zero",
+        ),
+    ];
+    if let Some((_, failure)) = contract.iter().find(|(satisfied, _)| !satisfied) {
+        bail!("dev-auth setup plan v3 has an unsupported contract: {failure}");
+    }
+    let expected_paths = expected_current_path_keys(
+        &plan.installation,
+        &plan.intent,
+        &plan.accounts,
+        &plan.retiring_accounts,
+        plan.authority_schema.as_deref(),
+    )?;
+    let recorded_paths = current_path_keys(&plan.current_paths);
+    if recorded_paths != expected_paths {
+        return Err(current_path_mismatch(
+            &recorded_paths,
+            &expected_paths,
+            &plan.installation.request.version,
+        ));
     }
     require_canonical_installation_layout(
         plan.intent.mode,
@@ -3067,6 +3100,59 @@ fn current_path_keys(paths: &[CurrentPathIdentity]) -> Vec<(String, String, Path
         .iter()
         .map(|path| (path.kind.clone(), path.subject.clone(), path.path.clone()))
         .collect()
+}
+
+/// Reports the validator's own kinds and counts, and a candidate version only after
+/// it parsed as a maintenance-capable release, never other plan text.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn current_path_mismatch(
+    recorded: &[(String, String, PathBuf)],
+    expected: &[(String, String, PathBuf)],
+    candidate_version: &str,
+) -> anyhow::Error {
+    let missing = expected
+        .iter()
+        .filter(|key| !recorded.contains(key))
+        .collect::<Vec<_>>();
+    let unexpected = recorded
+        .iter()
+        .filter(|key| !expected.contains(key))
+        .count();
+    let kinds = missing
+        .iter()
+        .map(|(kind, _, _)| kind.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    #[cfg(target_os = "linux")]
+    {
+        let introduced = crate::setup::maintenance_current_state_paths(candidate_version);
+        if !missing.is_empty()
+            && unexpected == 0
+            && recorded.len() + missing.len() == expected.len()
+            && missing.iter().all(|key| introduced.contains(key))
+        {
+            let first = crate::setup::maintenance::FIRST_VERSION;
+            return anyhow::anyhow!(
+                "setup plan omits only the current-state paths that Dev Auth {first} added for strong installations ({kinds}), so a planner older than {first} produced it for the {candidate_version} candidate; regenerate the plan with the {candidate_version} candidate's `dev-auth setup plan` and approve its new digest"
+            );
+        }
+    }
+    let mut differences = Vec::new();
+    if !missing.is_empty() {
+        differences.push(format!("missing {kinds}"));
+    }
+    if unexpected > 0 {
+        differences.push(format!("{unexpected} unexpected"));
+    }
+    if differences.is_empty() {
+        differences.push("entries are repeated or out of canonical order".into());
+    }
+    anyhow::anyhow!(
+        "setup plan v3 current-state paths do not match the deployment authority: {}",
+        differences.join("; ")
+    )
 }
 
 fn expected_current_path_keys(
