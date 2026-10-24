@@ -707,6 +707,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn grant_admission_requires_accepted_retention_and_a_short_shared_lease() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::grant_admission_requires_accepted_retention_and_a_short_shared_lease"
+        )) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let paths = SetupPaths {
             data_root: root.path().join("data"),
@@ -1149,6 +1155,12 @@ mod tests {
 
     #[test]
     fn pending_survives_writer_exit_and_only_matching_acceptance_reopens() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::pending_survives_writer_exit_and_only_matching_acceptance_reopens"
+        )) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let paths = SetupPaths {
             data_root: temp.path().join("data"),

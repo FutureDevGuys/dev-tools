@@ -831,6 +831,12 @@ mod tests {
 
     #[test]
     fn inherited_worker_lock_remains_exclusive_after_parent_closes_its_copy() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::inherited_worker_lock_remains_exclusive_after_parent_closes_its_copy"
+        )) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let lock_path = root.path().join("update.lock");
         let parent = fs::OpenOptions::new()

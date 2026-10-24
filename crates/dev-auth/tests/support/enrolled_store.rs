@@ -4,9 +4,9 @@ use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Type, Value};
 
 const SERVICE: &str = "/org/freedesktop/secrets";
@@ -101,6 +101,7 @@ impl Item {
 
 pub struct EnrolledStore {
     child: Child,
+    _address: Option<ChildStdout>,
     connection: Option<zbus::blocking::Connection>,
     pub observations: Arc<Mutex<Observations>>,
 }
@@ -114,28 +115,21 @@ impl EnrolledStore {
             "<busconfig><type>session</type><listen>{address}</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow user=\"*\"/><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/></policy></busconfig>"
         )).unwrap();
         let child = Command::new("/usr/bin/dbus-daemon")
-            .args(["--nofork", "--nopidfile"])
+            .args(["--nofork", "--nopidfile", "--print-address"])
             .arg(format!("--config-file={}", config.display()))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("installed fixture requires native dbus-daemon");
         let observations = Arc::new(Mutex::new(Observations::default()));
         let mut fixture = Self {
             child,
+            _address: None,
             connection: None,
             observations: Arc::clone(&observations),
         };
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !socket.exists() {
-            assert!(
-                fixture.child.try_wait().unwrap().is_none(),
-                "fixture bus exited"
-            );
-            assert!(Instant::now() < deadline, "fixture bus did not start");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        fixture._address = Some(await_listening(&mut fixture.child, &address));
         let store = Store {
             state: observations,
             slots,
@@ -161,6 +155,28 @@ impl EnrolledStore {
         fixture.connection = Some(builder.build().unwrap());
         fixture
     }
+}
+
+/// dbus-daemon creates its socket path at bind() but refuses connections until
+/// listen(). `--print-address` reports the address only once it is listening.
+fn await_listening(child: &mut Child, address: &str) -> ChildStdout {
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let read = std::io::BufRead::read_line(&mut reader, &mut line);
+        let _ = sender.send((read.map(|_| line), reader.into_inner()));
+    });
+    let (line, stdout) = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("fixture bus did not start listening");
+    let line = line.unwrap();
+    assert!(
+        line.starts_with(&format!("{address},")),
+        "fixture bus did not report its listening address: {line:?}"
+    );
+    stdout
 }
 
 impl Drop for EnrolledStore {

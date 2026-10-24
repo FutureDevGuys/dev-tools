@@ -189,6 +189,12 @@ mod tests {
 
     #[test]
     fn truncated_descriptor_messages_close_every_installed_pipe_writer() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::truncated_descriptor_messages_close_every_installed_pipe_writer"
+        )) {
+            return;
+        }
         let (sender, receiver) = nix::sys::socket::socketpair(
             AddressFamily::Unix,
             SockType::SeqPacket,

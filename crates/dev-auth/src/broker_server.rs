@@ -2583,6 +2583,12 @@ mod tests {
 
     #[test]
     fn one_close_deadline_bounds_drain_before_provider_cleanup() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::one_close_deadline_bounds_drain_before_provider_cleanup"
+        )) {
+            return;
+        }
         let session_id = "0123456789abcdef0123456789abcdef";
         let operations = SessionOperations::default();
         let temp = tempfile::tempdir().unwrap();

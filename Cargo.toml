@@ -38,3 +38,8 @@ signature = "2"
 # without SHA instructions; retain every verification and the existing bounds.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Setup tests hash test and product executables against the 256 MiB product
+# executable bound. Full DWARF puts debug builds over it.
+[profile.test]
+debug = "line-tables-only"

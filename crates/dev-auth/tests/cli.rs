@@ -28,6 +28,11 @@ mod enrolled_store;
 mod generic_projection;
 
 const PUBLIC_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Native setup and recovery subprocess bounds only catch hangs. A recovery
+/// stage spends about a second of CPU on dozens of fsyncs, so its wall time
+/// follows host disk contention rather than product work.
+#[cfg(target_os = "linux")]
+const NATIVE_SETUP_SCALE: u32 = 4;
 const PUBLIC_SUBPROCESS_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 #[test]
@@ -763,6 +768,10 @@ fn setup_restoration_has_closed_arguments_and_value_free_native_gates() {
 #[test]
 fn internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider() {
     use std::os::unix::process::CommandExt;
+    if run_isolated("internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider")
+    {
+        return;
+    }
 
     let directory = tempfile::tempdir().unwrap();
     let provider = directory.path().join("op");
@@ -1086,6 +1095,32 @@ fn bounded_output(command: &mut Command) -> Output {
         PUBLIC_SUBPROCESS_TIMEOUT,
         "public dev-auth subprocess",
     )
+}
+
+/// Runs one test alone in a fresh harness process and returns `false` inside
+/// it. A concurrent test's child holds copies of this process's descriptors,
+/// close-on-exec ones included, until it executes; an executable written here
+/// can meanwhile fail to start with ETXTBSY.
+#[cfg(target_os = "linux")]
+fn run_isolated(name: &str) -> bool {
+    const MARKER: &str = "DEV_AUTH_ISOLATED_CLI_TEST";
+    if std::env::var_os(MARKER).is_some_and(|value| value == name) {
+        return false;
+    }
+    let output = bounded_output_with_timeout(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(MARKER, name),
+        Duration::from_secs(150),
+        name,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "isolated {name}: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 fn bounded_output_with_timeout(
@@ -1618,6 +1653,12 @@ impl NativeUserSandbox {
 
     fn install_binary(&self, destination: &Path) {
         self.install_binary_from(Path::new(env!("CARGO_BIN_EXE_dev-auth")), destination);
+    }
+
+    /// User-only setup observes enrollment metadata on the account session bus
+    /// and fails closed without one; serve a Secret Service with no items.
+    fn unenrolled_secret_service(&self) -> enrolled_store::EnrolledStore {
+        enrolled_store::EnrolledStore::start(&self.runtime, Default::default())
     }
 
     fn install_binary_from(&self, source: &Path, destination: &Path) {
@@ -3012,7 +3053,7 @@ intent = "enroll-if-absent"
         fs::write(&transition_path, serde_json::to_vec(&accepted).unwrap()).unwrap();
         let rejected = run(
             "reject accepted binary recovery replay",
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
         );
         assert_eq!(
             rejected.status.code(),
@@ -3031,12 +3072,12 @@ intent = "enroll-if-absent"
         fs::write(&transition_path, &retained).unwrap();
         // This new upgrade path restores and verifies the prior installation,
         // then verifies and activates a distinct candidate. Each binary stage
-        // retains the fixture's 20-second budget; other recovery paths do not
+        // retains the fixture's per-stage budget; other recovery paths do not
         // acquire this extra allowance. Release performance is a separate gate.
         let forward_budget = if uncommitted && prior_binary_receipts.is_some() {
-            Duration::from_secs(40)
+            Duration::from_secs(40) * NATIVE_SETUP_SCALE
         } else {
-            Duration::from_secs(20)
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE
         };
         let recovered = run("complete pending binary recovery", forward_budget);
         assert_eq!(
@@ -3068,7 +3109,10 @@ intent = "enroll-if-absent"
             })));
         assert_eq!(fs::read(&receipt_path).unwrap(), expected_receipt);
         assert!(!journal_path.exists());
-        let repeated = run("repeat completed binary recovery", Duration::from_secs(20));
+        let repeated = run(
+            "repeat completed binary recovery",
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
+        );
         assert_eq!(repeated.status.code(), Some(3));
         let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
         assert_eq!(repeated["changed"], false);
@@ -3129,7 +3173,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(120),
+                Duration::from_secs(120) * NATIVE_SETUP_SCALE,
                 "forward recovery retires partially published candidate integrations",
             );
             assert_eq!(
@@ -3177,7 +3221,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(120),
+                Duration::from_secs(120) * NATIVE_SETUP_SCALE,
                 "retained native restoration",
             )
         };
@@ -3217,7 +3261,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(120),
+                Duration::from_secs(120) * NATIVE_SETUP_SCALE,
                 "initial restoration process-death boundary",
             );
             assert!(!killed.status.success());
@@ -3308,7 +3352,7 @@ intent = "enroll-if-absent"
                     "json",
                 ])
                 .env_clear(),
-            Duration::from_secs(15),
+            Duration::from_secs(15) * NATIVE_SETUP_SCALE,
             "restored generation rejects forward recovery",
         );
         assert_eq!(forward.status.code(), Some(3));
@@ -3398,7 +3442,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "setup verification must not recover a binary journal",
         );
         assert!(!observation.status.success());
@@ -3417,7 +3461,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "reject differently hashed recovery executable",
         );
         assert_eq!(wrong.status.code(), Some(4));
@@ -3451,7 +3495,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "recovery rejects an unapproved prior endpoint before mutation",
         );
         assert_eq!(rejected_journal.status.code(), Some(4));
@@ -3477,7 +3521,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(20),
+            Duration::from_secs(20) * NATIVE_SETUP_SCALE,
             "explicit recovery settles the retained candidate's committed binary journal",
         );
         assert_eq!(recovered_journal.status.code(), Some(3));
@@ -3505,7 +3549,7 @@ intent = "enroll-if-absent"
                 .env_clear()
                 .env("HOME", &user.dir)
                 .env("PATH", "/usr/bin:/bin"),
-            Duration::from_secs(45),
+            Duration::from_secs(45) * NATIVE_SETUP_SCALE,
             "candidate-independent setup recovery",
         );
         assert_eq!(
@@ -3553,7 +3597,7 @@ intent = "enroll-if-absent"
                     .env_clear()
                     .env("HOME", &user.dir)
                     .env("PATH", "/usr/bin:/bin"),
-                Duration::from_secs(30),
+                Duration::from_secs(30) * NATIVE_SETUP_SCALE,
                 "recovery failure progress boundary",
             );
             assert_eq!(failed.status.code(), Some(exit));
@@ -3580,7 +3624,7 @@ intent = "enroll-if-absent"
                         "json",
                     ])
                     .env_clear(),
-                Duration::from_secs(15),
+                Duration::from_secs(15) * NATIVE_SETUP_SCALE,
                 "restoration direction must reject forward recovery",
             );
             assert_eq!(output.status.code(), Some(3));
@@ -3808,6 +3852,7 @@ fn missing_credential_stages_no_workload_launchers() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     let current = std::env::current_exe().unwrap();
@@ -3817,7 +3862,7 @@ fn missing_credential_stages_no_workload_launchers() {
             "missing_credential_stages_no_workload_launchers",
             "--nocapture",
         ]),
-        Duration::from_secs(90),
+        Duration::from_secs(90) * NATIVE_SETUP_SCALE,
         "inactive setup acceptance subprocess",
     );
     assert!(
@@ -4246,6 +4291,7 @@ fn logical_setup_stages_versioned_authority_and_resumes_without_activation() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4261,7 +4307,7 @@ fn logical_setup_stages_versioned_authority_and_resumes_without_activation() {
             "logical_setup_stages_versioned_authority_and_resumes_without_activation",
             "--nocapture",
         ]),
-        Duration::from_secs(90),
+        Duration::from_secs(90) * NATIVE_SETUP_SCALE,
         "logical setup native subprocess",
     );
     assert!(
@@ -4336,6 +4382,7 @@ fn run_binary_receipt_recovery_test(recovery: SetupRecoveryFixture, test_name: &
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     // Native CLI behavior does not require debug or static symbol tables. Keep
@@ -4355,9 +4402,9 @@ fn run_binary_receipt_recovery_test(recovery: SetupRecoveryFixture, test_name: &
             SetupRecoveryFixture::UncommittedUpgradeBinary
                 | SetupRecoveryFixture::UnstagedUpgradeBinary
         ) {
-            Duration::from_secs(120)
+            Duration::from_secs(120) * NATIVE_SETUP_SCALE
         } else {
-            Duration::from_secs(90)
+            Duration::from_secs(90) * NATIVE_SETUP_SCALE
         },
         "product receipt recovery native subprocess",
     );
@@ -4383,6 +4430,7 @@ fn native_user_setup_restores_retained_generation_inactive() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4402,7 +4450,7 @@ fn native_user_setup_restores_retained_generation_inactive() {
                 "native_user_setup_restores_retained_generation_inactive",
                 "--nocapture",
             ]),
-        Duration::from_secs(240),
+        Duration::from_secs(240) * NATIVE_SETUP_SCALE,
         "retained generation restoration native subprocess",
     );
     assert!(
@@ -4427,6 +4475,7 @@ fn native_user_setup_restores_initial_installation_absence() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4443,7 +4492,7 @@ fn native_user_setup_restores_initial_installation_absence() {
                 "native_user_setup_restores_initial_installation_absence",
                 "--nocapture",
             ]),
-        Duration::from_secs(240),
+        Duration::from_secs(240) * NATIVE_SETUP_SCALE,
         "initial absence restoration native subprocess",
     );
     assert!(
@@ -4469,6 +4518,7 @@ fn native_user_setup_restoration_resumes_after_process_death() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4486,7 +4536,7 @@ fn native_user_setup_restoration_resumes_after_process_death() {
                 "--ignored",
                 "--nocapture",
             ]),
-        Duration::from_secs(240),
+        Duration::from_secs(240) * NATIVE_SETUP_SCALE,
         "initial restoration process-death native subprocess",
     );
     assert!(
@@ -4707,6 +4757,17 @@ fn configured_git_resolves_literal_origin_without_caller_path_fallback() {
         .status()
         .unwrap()
         .success());
+    // An unprivileged Bubblewrap user namespace shows root-owned host files
+    // as the overflow user, which program custody rejects. Configure an
+    // account-owned copy of the native Git executable instead. A child process
+    // writes it, so no writer of it can outlive the copy in this harness.
+    let configured_git = directory.join("configured-git");
+    assert!(Command::new("/usr/bin/install")
+        .args(["-m", "0700", "/usr/bin/git"])
+        .arg(&configured_git)
+        .status()
+        .unwrap()
+        .success());
     let home = &sandbox.home;
     let config_dir = home.join(".config/dev-auth");
     fs::create_dir_all(&config_dir).unwrap();
@@ -4714,11 +4775,12 @@ fn configured_git_resolves_literal_origin_without_caller_path_fallback() {
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        r#"version = 1
+        format!(
+            r#"version = 1
 [programs]
 op = "/usr/bin/false"
 gh = "/usr/bin/false"
-git = "/usr/bin/git"
+git = "{}"
 ssh_add = "/usr/bin/false"
 ssh_keygen = "/usr/bin/false"
 [github]
@@ -4726,8 +4788,10 @@ app_id = 42
 private_key_ref = "op://Automation/app/private key"
 repository_selection = "all"
 discover_installations = true
-permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 "#,
+            configured_git.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(

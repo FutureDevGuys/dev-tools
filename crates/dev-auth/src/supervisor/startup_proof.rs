@@ -326,11 +326,7 @@ pub(crate) fn await_ready(reader: &OwnedFd, owner: &RootSpawnOwner) -> Result<Pr
         if Instant::now() >= deadline {
             bail!("kernel-authenticated startup proof timed out");
         }
-        let mut poller = [PollFd::new(
-            reader.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
+        wait_interval(reader)?;
         let Some(message) = receive(reader)? else {
             continue;
         };
@@ -338,6 +334,19 @@ pub(crate) fn await_ready(reader: &OwnedFd, owner: &RootSpawnOwner) -> Result<Pr
             bail!("configured workload did not prove its final exec");
         }
         return owner.verify(message);
+    }
+}
+
+/// Waits at most one 20 ms interval for input. A handled signal interrupts
+/// poll without restart; callers recheck their deadline and poll again.
+fn wait_interval(fd: &impl AsFd) -> Result<()> {
+    let mut poller = [PollFd::new(
+        fd.as_fd(),
+        PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+    )];
+    match poll(&mut poller, PollTimeout::from(20_u16)) {
+        Ok(_) | Err(nix::errno::Errno::EINTR) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -384,11 +393,7 @@ pub(crate) fn await_release_witness(
         if Instant::now() >= deadline {
             bail!("native release witness timed out");
         }
-        let mut poller = [PollFd::new(
-            socket.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
+        wait_interval(socket)?;
         let Some(message) = receive(socket)? else {
             continue;
         };
@@ -416,11 +421,7 @@ pub(crate) fn await_commit_receipt(socket: &File) -> Result<()> {
         if Instant::now() >= deadline {
             bail!("release commit receipt timed out");
         }
-        let mut poller = [PollFd::new(
-            socket.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
+        wait_interval(socket)?;
         let mut bytes = [0_u8; 2];
         match nix::sys::socket::recv(
             socket.as_raw_fd(),
@@ -547,6 +548,12 @@ mod tests {
 
     #[test]
     fn unexpected_native_rights_are_closed_before_proof_rejection() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::unexpected_native_rights_are_closed_before_proof_rejection"
+        )) {
+            return;
+        }
         let (reader, writer) = pair().unwrap();
         let (pipe_reader, pipe_writer) =
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK)
@@ -564,5 +571,47 @@ mod tests {
         assert!(receive(&reader).is_err());
         let mut byte = [0_u8];
         assert_eq!(nix::unistd::read(&pipe_reader, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn handled_signals_do_not_end_a_commit_receipt_wait() {
+        use std::os::unix::thread::JoinHandleExt;
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::handled_signals_do_not_end_a_commit_receipt_wait"
+        )) {
+            return;
+        }
+        extern "C" fn handled(_: nix::libc::c_int) {}
+        // SAFETY: installs an empty handler in this isolated test process.
+        // poll is not restarted after a handler even with SA_RESTART.
+        unsafe {
+            nix::sys::signal::sigaction(
+                nix::sys::signal::Signal::SIGUSR1,
+                &nix::sys::signal::SigAction::new(
+                    nix::sys::signal::SigHandler::Handler(handled),
+                    nix::sys::signal::SaFlags::SA_RESTART,
+                    nix::sys::signal::SigSet::empty(),
+                ),
+            )
+        }
+        .unwrap();
+        let (receiver, sender) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let waiter = std::thread::spawn(move || await_commit_receipt(&File::from(receiver)));
+        for _ in 0..50 {
+            // SAFETY: the joinable waiter's thread handle stays valid until join.
+            unsafe { nix::libc::pthread_kill(waiter.as_pthread_t(), nix::libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sent = send_commit_receipt(&sender);
+        let result = waiter.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        sent.unwrap();
     }
 }

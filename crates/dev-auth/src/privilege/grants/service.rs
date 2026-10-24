@@ -2978,7 +2978,21 @@ mod tests {
                     .unwrap(),
             );
             let pid = controller.0.id();
-            let image = File::open(format!("/proc/{pid}/exe")).unwrap();
+            // A vfork-based spawn resumes the parent before the child's new
+            // image is installed, so /proc/PID/exe can still name this test.
+            let controller_image = File::open("/usr/bin/sleep").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let image = loop {
+                let image = File::open(format!("/proc/{pid}/exe")).unwrap();
+                if native::same_file(&image, &controller_image).unwrap() {
+                    break image;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "controller never executed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
             let owner = LaunchOwner {
                 pid,
                 pidfd: rustix::process::pidfd_open(
