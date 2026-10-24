@@ -763,6 +763,10 @@ fn setup_restoration_has_closed_arguments_and_value_free_native_gates() {
 #[test]
 fn internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider() {
     use std::os::unix::process::CommandExt;
+    if run_isolated("internal_provider_child_reads_only_a_sealed_fd_and_executes_the_held_provider")
+    {
+        return;
+    }
 
     let directory = tempfile::tempdir().unwrap();
     let provider = directory.path().join("op");
@@ -1086,6 +1090,32 @@ fn bounded_output(command: &mut Command) -> Output {
         PUBLIC_SUBPROCESS_TIMEOUT,
         "public dev-auth subprocess",
     )
+}
+
+/// Runs one test alone in a fresh harness process and returns `false` inside
+/// it. A concurrent test's child holds copies of this process's descriptors,
+/// close-on-exec ones included, until it executes; an executable written here
+/// can meanwhile fail to start with ETXTBSY.
+#[cfg(target_os = "linux")]
+fn run_isolated(name: &str) -> bool {
+    const MARKER: &str = "DEV_AUTH_ISOLATED_CLI_TEST";
+    if std::env::var_os(MARKER).is_some_and(|value| value == name) {
+        return false;
+    }
+    let output = bounded_output_with_timeout(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(MARKER, name),
+        Duration::from_secs(150),
+        name,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "isolated {name}: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 fn bounded_output_with_timeout(

@@ -606,6 +606,12 @@ mod tests {
 
     #[test]
     fn staging_collection_keeps_live_and_foreign_documents() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::staging_collection_keeps_live_and_foreign_documents"
+        )) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let uid = nix::unistd::geteuid().as_raw();
         let staging = root.path().join("dev-auth-update-sources-test");

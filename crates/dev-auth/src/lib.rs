@@ -76,6 +76,8 @@ mod strict_serde;
 pub mod supervisor;
 #[cfg(target_os = "linux")]
 pub(crate) mod supervisor_descriptors;
+#[cfg(test)]
+mod test_isolation;
 #[cfg(target_os = "linux")]
 pub mod update_status;
 mod workload_projection;

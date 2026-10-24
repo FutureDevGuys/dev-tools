@@ -547,6 +547,12 @@ mod tests {
 
     #[test]
     fn unexpected_native_rights_are_closed_before_proof_rejection() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::unexpected_native_rights_are_closed_before_proof_rejection"
+        )) {
+            return;
+        }
         let (reader, writer) = pair().unwrap();
         let (pipe_reader, pipe_writer) =
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK)
