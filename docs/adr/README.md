@@ -11,6 +11,7 @@ SyncConfigs also maintains product-local records, including [durable overlay pub
 
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0138](0138-trust-change-drain-and-observed-supervision.md) | Dev Auth drains the grant coordinator when its policy or sudo program changes, acts only on observed native state, and gives native sudo to an unanswered invocation that the coordinator does not own | proposed | hermetic source tests passed; native acceptance pending |
 | [0137](0137-coordinator-fault-containment-and-sudo-refusal-reasons.md) | Dev Auth ends the grant coordinator only on an integrity failure, retries unit verification at startup, and prints why its sudo plugin refused | proposed | hermetic source tests passed; native acceptance pending |
 | [0136](0136-grant-lifetime-sudo-routing-and-job-survival.md) | Dev Auth ends sudo routing with its grant and keeps an attached managed job running when sudo or its completion channel is lost | proposed | hermetic source tests passed; native acceptance pending |
 | [0135](0135-admission-bound-workload-environment-projections.md) | Dev Auth binds generic environment projection destinations to its configured workload consumer | proposed | synthetic Linux user-only acceptance passed; Strong and signed delivery pending |

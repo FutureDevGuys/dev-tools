@@ -7,13 +7,40 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-/// What one look at native state found.
+/// What one look at native state found. Supervision ends a grant or stops a
+/// job only on an observed answer (ADR 0138).
 pub(super) type Look<T> = Result<T, Unobserved>;
 
 /// A look at native state that could not be taken. It is never evidence that
 /// a process, a workload or a trust input changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Unobserved(pub io::ErrorKind);
+
+/// A read of a process's `/proc` entry: `None` when the process has exited,
+/// which Linux reports as ENOENT or ESRCH.
+pub(super) fn process_look<T>(read: io::Result<T>) -> Look<Option<T>> {
+    read.map_or_else(|error| exited(&error), |value| Ok(Some(value)))
+}
+
+/// A process's unified cgroup, or `None` when the process has exited.
+pub(super) fn cgroup_look(pid: u32) -> Look<Option<std::path::PathBuf>> {
+    crate::linux_admission::read_unified_cgroup(pid).map_or_else(
+        |error| {
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .map_or(Err(Unobserved(io::ErrorKind::InvalidData)), exited)
+        },
+        |path| Ok(Some(path)),
+    )
+}
+
+fn exited<T>(error: &io::Error) -> Look<Option<T>> {
+    match error.raw_os_error() {
+        Some(nix::libc::ENOENT | nix::libc::ESRCH) => Ok(None),
+        _ => Err(Unobserved(error.kind())),
+    }
+}
 
 pub(super) struct Caller {
     pub peer: LinuxPeerEvidence,
@@ -173,28 +200,37 @@ impl Caller {
     }
 
     pub fn still_present(&self) -> bool {
-        if !alive(self.peer.peer_pidfd()) {
-            return false;
+        self.presence() == Ok(true)
+    }
+
+    /// One look at whether the caller is still the process that connected:
+    /// the same live process, namespaces, directory, identity and cgroup.
+    pub fn presence(&self) -> Look<bool> {
+        if readable(self.peer.peer_pidfd())? {
+            return Ok(false);
         }
-        let Ok(namespace) = File::open(format!("/proc/{}/ns/user", self.peer.pid)) else {
-            return false;
-        };
-        if !same_file(&namespace, &self.user_namespace).unwrap_or(false) {
-            return false;
-        }
-        for (name, retained) in [("ns/mnt", &self.mount_namespace), ("cwd", &self.directory)] {
-            let Ok(observed) = File::open(format!("/proc/{}/{name}", self.peer.pid)) else {
-                return false;
+        let pid = self.peer.pid;
+        for (name, retained) in [
+            ("ns/user", &self.user_namespace),
+            ("ns/mnt", &self.mount_namespace),
+            ("cwd", &self.directory),
+        ] {
+            let Some(observed) = process_look(File::open(format!("/proc/{pid}/{name}")))? else {
+                return Ok(false);
             };
-            if !same_file(&observed, retained).unwrap_or(false) {
-                return false;
+            if !identical(&observed, retained)? {
+                return Ok(false);
             }
         }
-        let Ok(status) = read_bounded(
-            Path::new(&format!("/proc/{}/status", self.peer.pid)),
+        let Some(status) = process_look(read_limited(
+            Path::new(&format!("/proc/{pid}/status")),
             64 * 1024,
-        ) else {
-            return false;
+        ))?
+        else {
+            return Ok(false);
+        };
+        let Some(cgroup) = cgroup_look(pid)? else {
+            return Ok(false);
         };
         let effective = |name: &[u8]| {
             status.split(|byte| *byte == b'\n').find_map(|line| {
@@ -207,25 +243,28 @@ impl Caller {
                     .ok()
             })
         };
-        effective(b"Uid:") == Some(self.peer.uid)
+        Ok(effective(b"Uid:") == Some(self.peer.uid)
             && effective(b"Gid:") == Some(self.peer.gid)
-            && crate::linux_admission::read_unified_cgroup(self.peer.pid)
-                .ok()
-                .as_ref()
-                == Some(&self.peer.unified_cgroup)
-            && alive(self.peer.peer_pidfd())
+            && cgroup == self.peer.unified_cgroup
+            && !readable(self.peer.peer_pidfd())?)
     }
 }
 
+/// Admission needs a positive look that the process is alive.
 pub(super) fn alive(fd: impl AsFd) -> bool {
+    readable(fd) == Ok(false)
+}
+
+/// Whether a held descriptor is readable now: a pidfd whose process exited,
+/// or a connection whose peer hung up or sent data.
+pub(super) fn readable(fd: impl AsFd) -> Look<bool> {
     let mut descriptors = [nix::poll::PollFd::new(
         fd.as_fd(),
         nix::poll::PollFlags::POLLIN,
     )];
-    matches!(
-        nix::poll::poll(&mut descriptors, nix::poll::PollTimeout::ZERO),
-        Ok(0)
-    )
+    nix::poll::poll(&mut descriptors, nix::poll::PollTimeout::ZERO)
+        .map(|ready| ready > 0)
+        .map_err(|error| Unobserved(io::Error::from(error).kind()))
 }
 
 pub(super) fn clone_fd(fd: impl AsFd) -> Result<OwnedFd, Failure> {
@@ -235,20 +274,71 @@ pub(super) fn clone_fd(fd: impl AsFd) -> Result<OwnedFd, Failure> {
 }
 
 pub(super) fn same_file(left: &File, right: &File) -> Result<bool, Failure> {
-    let left = left.metadata().map_err(|_| Failure::AuthorityDenied)?;
-    let right = right.metadata().map_err(|_| Failure::AuthorityDenied)?;
+    identical(left, right).map_err(|_| Failure::AuthorityDenied)
+}
+
+pub(super) fn identical(left: &File, right: &File) -> Look<bool> {
+    let left = left.metadata().map_err(|error| Unobserved(error.kind()))?;
+    let right = right.metadata().map_err(|error| Unobserved(error.kind()))?;
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
 pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, Failure> {
+    read_limited(path, limit).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            Failure::ProtocolViolation
+        } else {
+            Failure::NativeUnavailable
+        }
+    })
+}
+
+fn read_limited(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|_| Failure::NativeUnavailable)?
+    File::open(path)?
         .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
-        return Err(Failure::ProtocolViolation);
+        return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_exited_process_is_gone_from_proc() {
+        for exited in [nix::libc::ENOENT, nix::libc::ESRCH] {
+            assert_eq!(
+                process_look::<()>(Err(io::Error::from_raw_os_error(exited))),
+                Ok(None)
+            );
+        }
+        for unobserved in [nix::libc::EMFILE, nix::libc::ENOMEM, nix::libc::EACCES] {
+            assert!(
+                process_look::<()>(Err(io::Error::from_raw_os_error(unobserved))).is_err(),
+                "errno {unobserved}"
+            );
+        }
+        assert_eq!(process_look(Ok(7)), Ok(Some(7)));
+    }
+
+    #[test]
+    fn a_held_connection_is_readable_only_once_its_peer_hangs_up() {
+        use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+        let (held, peer) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        assert_eq!(readable(&held), Ok(false));
+        assert!(alive(&held));
+        drop(peer);
+        assert_eq!(readable(&held), Ok(true));
+        assert!(!alive(&held));
+    }
 }

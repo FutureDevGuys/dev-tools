@@ -20,7 +20,7 @@ A grant requires fresh native administrator approval of an explicit workload or 
 
 Authority is typed, exact-plan, or separately permitted `administrator` authority. Administrator authority is the unrestricted root-equivalent exception in ADR0004; approval discloses that completed effects cannot be undone and deliberately hostile root commands can disable enforcement. Narrowed delegation conserves scope, authority, hard expiry and any parent use budget. Failed cleanup remains failure. Denied managed Sudo never falls back to a cached native authorization or a broader grant; explicit `leave` removes managed routing without granting authority. Unbound Sudo retains its native behavior.
 
-[ADR 0136](0136-grant-lifetime-sudo-routing-and-job-survival.md) limits that routing rule to an active grant, so routing ends with its grant. It also makes only an observed logout end user scope, and it keeps an attached managed job running when sudo or its completion channel is lost. The grant's deadline, revocation, logout and policy checks still stop that job.
+[ADR 0136](0136-grant-lifetime-sudo-routing-and-job-survival.md) limits that routing rule to an active grant, so routing ends with its grant. It also makes only an observed logout end user scope, and it keeps an attached managed job running when sudo or its completion channel is lost. The grant's deadline, revocation and logout still stop that job. [ADR 0138](0138-trust-change-drain-and-observed-supervision.md) closes admission when the grant policy or sudo program changes, lets running jobs finish, and then restarts the coordinator so that it binds the new state.
 
 ## Shared accounting and native ownership
 

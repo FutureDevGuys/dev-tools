@@ -77,7 +77,10 @@ pub(super) fn receive_signal(events: &OwnedFd) -> Result<Option<Signal>, Failure
         &mut bytes,
         MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC,
     ) {
-        Err(nix::errno::Errno::EAGAIN) => Ok(None),
+        // A receive that could not run now is retried on the next poll.
+        Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR | nix::errno::Errno::ENOMEM) => {
+            Ok(None)
+        }
         Ok(2) if bytes[0] == 0 => {
             let signal =
                 Signal::try_from(i32::from(bytes[1])).map_err(|_| Failure::ProtocolViolation)?;

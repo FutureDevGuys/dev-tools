@@ -127,7 +127,7 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> Result
     }
     let peer = socket::getsockopt(&socket, socket::sockopt::PeerCredentials)?;
     let coordinator = socket::getsockopt(&socket, socket::sockopt::PeerPidfd)?;
-    if peer.uid() != 0 || !quiet(&coordinator)? {
+    if peer.uid() != 0 {
         return Err(Refusal::Denied);
     }
     let mut client = Client {
@@ -136,7 +136,8 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> Result
         deadline: Duration::ZERO,
         grant: String::new(),
     };
-    let Some(response) = consult(&mut client, uid, |_| Ok(routing))? else {
+    let owned = |client: &Client| Ok(routing || managed_job(peer.pid(), &client.coordinator)?);
+    let Some(response) = consult(&mut client, uid, owned)? else {
         return Ok(state);
     };
     match route(response.decision)? {
@@ -179,13 +180,52 @@ fn coordinator_unreachable(routing: bool, error: io::ErrorKind) -> Result<(), Re
 
 /// The coordinator's preflight answer, or `None` when this invocation has
 /// native sudo because the coordinator never answered and `owned` finds that
-/// the coordinator owns nothing here.
+/// the coordinator owns nothing here, as when no coordinator runs. Ownership
+/// that cannot be read denies (ADR 0138).
 fn consult(
     client: &mut Client,
     uid: u32,
-    _owned: impl FnOnce(&Client) -> io::Result<bool>,
+    owned: impl FnOnce(&Client) -> io::Result<bool>,
 ) -> Result<Option<Response>, Refusal> {
-    preflight(client, uid).map(Some)
+    match preflight(client, uid) {
+        Err(Refusal::Unanswered) if !owned(client).unwrap_or(true) => Ok(None),
+        answer => answer.map(Some),
+    }
+}
+
+/// Whether this process runs beneath the coordinator's own cgroup, where
+/// every process belongs to one of its managed jobs and routes through that
+/// job's grant without a routing marker.
+fn managed_job(coordinator: i32, identity: &OwnedFd) -> io::Result<bool> {
+    if coordinator <= 0 {
+        return Err(denied());
+    }
+    let own = unified_cgroup(Path::new("/proc/self/cgroup"))?;
+    let theirs = unified_cgroup(Path::new(&format!("/proc/{coordinator}/cgroup")))?;
+    if !quiet(identity)? {
+        return Err(denied());
+    }
+    match (own, theirs) {
+        (Some(own), Some(theirs)) => Ok(beneath(&own, &theirs)),
+        _ => Err(invalid()),
+    }
+}
+
+fn beneath(cgroup: &str, ancestor: &str) -> bool {
+    cgroup
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn unified_cgroup(record: &Path) -> io::Result<Option<String>> {
+    let membership = std::fs::read_to_string(record)?;
+    if membership.len() > 8192 {
+        return Err(invalid());
+    }
+    Ok(membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::to_owned))
 }
 
 fn preflight(client: &mut Client, uid: u32) -> Result<Response, Refusal> {
@@ -445,11 +485,7 @@ fn managed_routing(runtime: &Path, uid: u32) -> io::Result<bool> {
         Err(error) => return Err(error),
     }
     let mut names = vec![format!("user-{uid}")];
-    let membership = std::fs::read_to_string("/proc/self/cgroup")?;
-    if membership.len() > 8192 {
-        return Err(invalid());
-    }
-    if let Some(path) = membership.lines().find_map(|line| line.strip_prefix("0::")) {
+    if let Some(path) = unified_cgroup(Path::new("/proc/self/cgroup"))? {
         if let Some(id) = path
             .strip_prefix("/system.slice/dev-auth-workload-")
             .and_then(|tail| tail.strip_suffix(".service"))
@@ -731,8 +767,6 @@ mod tests {
         socket::send(coordinator.as_raw_fd(), &response, MsgFlags::MSG_NOSIGNAL).unwrap();
     }
 
-    // A coordinator holding a stale sudo stamp accepts and closes every
-    // connection, and that refused sudo to accounts it never routed.
     #[test]
     fn an_unanswered_invocation_has_native_sudo_unless_the_coordinator_owns_it() {
         assert!(
@@ -756,6 +790,24 @@ mod tests {
             Some(Decision::Native),
             "an answering coordinator decides"
         );
+    }
+
+    #[test]
+    fn only_a_cgroup_beneath_the_coordinators_runs_its_jobs() {
+        let unit = "/system.slice/example.service";
+        assert!(beneath(
+            &format!("{unit}/grant-{0:032x}/exec-{0:032x}", 1),
+            unit
+        ));
+        assert!(
+            !beneath(unit, unit),
+            "the coordinator's own cgroup runs no job"
+        );
+        assert!(!beneath("/system.slice/example.service-sibling/job", unit));
+        assert!(!beneath(
+            "/user.slice/user-1000.slice/session-1.scope",
+            unit
+        ));
     }
 
     #[test]
