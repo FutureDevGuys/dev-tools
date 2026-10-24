@@ -1,4 +1,4 @@
-# Dev Auth delivery verification. No hosted CI or release publication is configured.
+# No hosted CI or release publication is configured.
 # Uses Bash (including Git Bash on Windows) and the checked-out Cargo lockfile.
 # Examples: just ci; just ci-target x86_64-pc-windows-gnu; just test
 
@@ -8,7 +8,7 @@ set positional-arguments
 export CARGO_PROFILE_TEST_DEBUG := "0"
 export CARGO_INCREMENTAL := "0"
 
-# List the local Dev Auth build and verification commands
+# List the local Dev Auth and Sync Configs build and verification commands
 default:
     @just --list
 
@@ -17,14 +17,14 @@ ci: fmt-check lint build test
 
 # Verify formatting without rewriting Rust source
 fmt-check:
-    cargo fmt -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation -- --check
+    cargo fmt -p dev-auth -p dev-auth-sudo -p sync-configs -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation -- --check
 
-# Check Dev Auth and execution, authorization, and installation foundations with warnings treated as errors
+# Check Dev Auth, Sync Configs, and execution, authorization, and installation foundations with warnings treated as errors
 lint:
-    cargo clippy -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --all-targets --locked -j 2 -- -D warnings
+    cargo clippy -p dev-auth -p dev-auth-sudo -p sync-configs -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --all-targets --locked -j 2 -- -D warnings
 
 # Keep custody hashing representative without relaxing subprocess deadlines.
-# Run noninteractive Dev Auth and changed foundation tests with a source-matched Linux sudo helper
+# Run noninteractive Dev Auth, Sync Configs, and execution, authorization, and installation foundation tests with a source-matched Linux sudo helper
 test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -33,7 +33,7 @@ test:
         export DEV_AUTH_SUDO_ARTIFACT="$helper"
     fi
     # libtest reads the thread limit from the environment; custom-harness targets accept no flags.
-    RUST_TEST_THREADS=2 cargo test -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --locked -j 2 --config 'profile.test.package.sha2.opt-level=3'
+    RUST_TEST_THREADS=2 cargo test -p dev-auth -p dev-auth-sudo -p sync-configs -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --locked -j 2 --config 'profile.test.package.sha2.opt-level=3'
     if [[ "$(uname -s)" == Linux ]]; then
         cargo test -p dev-auth --lib --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' setup_v3::grants::native_acceptance::native_fixture_embedded_sudo_payload_available -- --ignored --exact --test-threads=1
     fi
@@ -48,9 +48,9 @@ build:
     fi
     cargo build -p dev-auth --locked -j 2
 
-# Compile Dev Auth code and test targets; missing target SDKs are failures, not skips
+# Compile Dev Auth, Sync Configs, and execution, authorization, and installation foundation code and test targets; missing target SDKs are failures, not skips
 ci-target target:
-    cargo check -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --all-targets --locked -j 2 --target "$1"
+    cargo check -p dev-auth -p dev-auth-sudo -p sync-configs -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --all-targets --locked -j 2 --target "$1"
 
 # Compare the Linux sudo bridge layout against the installed upstream native header
 accept-sudo-abi:
