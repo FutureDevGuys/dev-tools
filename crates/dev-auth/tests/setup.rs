@@ -560,6 +560,260 @@ fn setup_cli_never_treats_a_binary_install_plan_as_full_desired_state() {
     );
 }
 
+#[cfg(target_os = "linux")]
+const FIXTURE_OPERATOR: &str = "fixture-operator";
+
+/// One strong account's current-state inventory as a planner older than 0.5.0
+/// records it: everything a strong installation owns except the maintenance helper.
+#[cfg(target_os = "linux")]
+fn pre_maintenance_strong_inventory() -> Vec<(String, String, std::path::PathBuf)> {
+    use std::path::{Path, PathBuf};
+
+    let data = Path::new("/usr/local/lib/dev-auth");
+    let bin = Path::new("/usr/local/bin");
+    let home = Path::new("/home").join(FIXTURE_OPERATOR);
+    let system = |kind: &str, path: PathBuf| (kind.to_owned(), "system".to_owned(), path);
+    let mut inventory = vec![
+        system("installation_receipt", data.join("install-v2.json")),
+        system(
+            "shared_installation_receipt",
+            data.join("installation-receipt-v1.json"),
+        ),
+        system("active_release_pointer", data.join("active")),
+        system("previous_release_pointer", data.join("previous")),
+        system(
+            "privileged_workload_launcher",
+            data.join("dev-auth-workload-launcher"),
+        ),
+        system(
+            "privileged_setup_helper",
+            data.join("dev-auth-setup-helper"),
+        ),
+        system("setup_helper_receipt", data.join("setup-helper-v1.json")),
+        system(
+            "credential_actions",
+            data.join("credential-actions-v2.json"),
+        ),
+        system("setup_transition", data.join("setup-transition-v1.json")),
+        system("administrator_policy", "/etc/dev-auth/policy.toml".into()),
+    ];
+    for alias in [
+        "dev-auth",
+        "git-credential-dev-auth",
+        "git-dev-auth",
+        "gh-dev-auth",
+        "ssh-keygen-dev-auth",
+    ] {
+        inventory.push(("product_launcher".into(), alias.into(), bin.join(alias)));
+    }
+    for alias in ["git", "gh"] {
+        inventory.push(("transparent_launcher".into(), alias.into(), bin.join(alias)));
+    }
+    for (path, _, _) in dev_auth::setup::linux_system_assets() {
+        inventory.push((
+            "system_integration".into(),
+            path.display().to_string(),
+            path.into(),
+        ));
+    }
+    for (kind, relative) in [
+        (
+            "workload_launcher_receipt",
+            ".local/share/dev-auth/workload-aliases-v1.json",
+        ),
+        (
+            "desktop_entry_receipt",
+            ".local/share/dev-auth/desktop-entries-v1.json",
+        ),
+        ("user_configuration", ".config/dev-auth/config-v2.toml"),
+        (
+            "retained_user_configuration",
+            ".config/dev-auth/config-v3.toml",
+        ),
+    ] {
+        inventory.push((kind.into(), FIXTURE_OPERATOR.into(), home.join(relative)));
+    }
+    inventory
+}
+
+#[cfg(target_os = "linux")]
+fn strong_credential_plan(
+    candidate_version: &str,
+    mut inventory: Vec<(String, String, std::path::PathBuf)>,
+) -> dev_auth::setup_v3::SetupPlanV3 {
+    use dev_auth::deployment::{
+        canonical_deployment_intent, Activation, Channel, DeploymentIntent, DeploymentMode,
+        DeploymentUser,
+    };
+    use dev_auth::setup::SetupPlan;
+    use dev_auth::setup_v3::{
+        planned_action_contract, CurrentPathIdentity, DocumentIdentity, NativeAccountIdentity,
+        SetupPlanV3,
+    };
+    use sha2::{Digest, Sha256};
+
+    let sha256 = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let home = std::path::Path::new("/home").join(FIXTURE_OPERATOR);
+    let intent = DeploymentIntent {
+        purpose: Default::default(),
+        schema: "dev-auth-deployment-intent-v1".into(),
+        mode: DeploymentMode::Strong,
+        channel: Channel::Stable,
+        offline: true,
+        activation: Activation::Inactive,
+        administrator_policy: "/etc/dev-auth/candidate-policy.toml".into(),
+        grant_policy: None,
+        users: vec![DeploymentUser {
+            name: FIXTURE_OPERATOR.into(),
+            config: home.join("candidate-config.toml"),
+            policy: None,
+        }],
+        credentials: Vec::new(),
+        bindings: Vec::new(),
+    };
+    inventory.sort();
+    let current_paths = inventory
+        .into_iter()
+        .map(|(kind, subject, path)| CurrentPathIdentity {
+            kind,
+            subject,
+            path,
+            identity: None,
+        })
+        .collect::<Vec<_>>();
+    let current_credential_ready = std::collections::BTreeSet::new();
+    let current_broker_state = "inactive".to_owned();
+    // Every planner binds its recorded inventory to the plan with this digest.
+    let current_state_sha256 = sha256(
+        &serde_jcs::to_vec(&serde_json::json!({
+            "files": current_paths,
+            "credential_ready": current_credential_ready,
+            "broker": current_broker_state,
+        }))
+        .unwrap(),
+    );
+    SetupPlanV3 {
+        credential_preservation: None,
+        grant_previous_block: None,
+        grant_current_state: None,
+        grant_payload: Default::default(),
+        authority_schema: None,
+        schema: "dev-auth-setup-plan-v3".into(),
+        intent_sha256: sha256(&canonical_deployment_intent(&intent).unwrap()),
+        actions: planned_action_contract(&intent),
+        installation: SetupPlan {
+            schema: "dev-auth-setup-plan-v2".into(),
+            paths: SetupPaths::strong(),
+            request: InstallRequest {
+                purpose: Default::default(),
+                mode: InstallMode::Strong,
+                version: candidate_version.into(),
+                source_executable: "/var/cache/dev-auth/candidate/dev-auth".into(),
+                native_git: "/usr/bin/git".into(),
+                native_gh: "/usr/bin/gh".into(),
+                activate_transparent_launchers: false,
+            },
+            source_length: 1,
+            source_sha256: "a".repeat(64),
+            verified_release: None,
+        },
+        source_documents: vec![DocumentIdentity {
+            kind: "administrator_policy".into(),
+            subject: "system".into(),
+            path: intent.administrator_policy.clone(),
+            length: 1,
+            sha256: "b".repeat(64),
+        }],
+        accounts: vec![NativeAccountIdentity {
+            name: FIXTURE_OPERATOR.into(),
+            uid: 60_001,
+            gid: 60_001,
+            home,
+        }],
+        retiring_accounts: Vec::new(),
+        intent,
+        current_paths,
+        current_credential_ready,
+        current_broker_state,
+        current_state_sha256,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rejected_plan_diagnostic(operation: &str, plan: &dev_auth::setup_v3::SetupPlanV3) -> String {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("setup-plan.json");
+    fs::write(&path, serde_json::to_vec(plan).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+        .args([
+            "setup",
+            operation,
+            "--plan",
+            path.to_str().unwrap(),
+            "--sha256",
+            &"0".repeat(64),
+            "--format",
+            "json",
+        ])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "setup {operation} accepted the plan"
+    );
+    assert!(output.stdout.is_empty());
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn older_planner_strong_plan_names_its_version_skew_and_remedy() {
+    const SKEW: &str = "setup plan omits only the current-state paths that Dev Auth 0.5.0 added for strong installations (maintenance_helper_receipt, maintenance_policy, maintenance_polkit_action, privileged_maintenance_helper), so a planner older than 0.5.0 produced it for the 0.5.2 candidate; regenerate the plan with the 0.5.2 candidate's `dev-auth setup plan` and approve its new digest";
+    let older = strong_credential_plan("0.5.2", pre_maintenance_strong_inventory());
+    for operation in ["apply", "verify"] {
+        let diagnostic = rejected_plan_diagnostic(operation, &older);
+        assert!(
+            diagnostic.contains(&format!(
+                "setup {operation} accepts only a full setup plan: {SKEW}"
+            )),
+            "{diagnostic}"
+        );
+    }
+
+    let mut current = pre_maintenance_strong_inventory();
+    current.extend(
+        [
+            (
+                "privileged_maintenance_helper",
+                "/usr/local/lib/dev-auth/dev-auth-maintenance-helper",
+            ),
+            (
+                "maintenance_helper_receipt",
+                "/usr/local/lib/dev-auth/maintenance-helper-v1.json",
+            ),
+            (
+                "maintenance_polkit_action",
+                "/usr/share/polkit-1/actions/com.futuredevguys.dev-auth.maintenance.policy",
+            ),
+            (
+                "maintenance_policy",
+                "/etc/dev-auth/privilege-policy-v1.json",
+            ),
+        ]
+        .map(|(kind, path)| (kind.into(), "system".into(), path.into())),
+    );
+    let matching = strong_credential_plan("0.5.2", current);
+    for operation in ["apply", "verify"] {
+        let diagnostic = rejected_plan_diagnostic(operation, &matching);
+        assert!(
+            !diagnostic.contains("current-state paths") && !diagnostic.contains("planner older"),
+            "a 0.5.0 inventory passes the current-state check: {diagnostic}"
+        );
+    }
+}
+
 #[test]
 fn strong_setup_owns_hardened_socket_activated_service_assets() {
     let assets = dev_auth::setup::linux_system_assets();

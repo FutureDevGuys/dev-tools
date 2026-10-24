@@ -5763,4 +5763,191 @@ mod tests {
             .identity = None;
         validate_retained_maintenance_ownership(&generation).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    fn strong_plan_for(
+        candidate_version: &str,
+        edit_inventory: impl FnOnce(&mut Vec<(String, String, PathBuf)>),
+    ) -> SetupPlanV3 {
+        use crate::setup::{InstallMode, InstallRequest, SetupPaths};
+        let intent = DeploymentIntent {
+            bindings: Vec::new(),
+            purpose: Default::default(),
+            grant_policy: None,
+            schema: "dev-auth-deployment-intent-v1".into(),
+            mode: DeploymentMode::Strong,
+            channel: crate::deployment::Channel::Stable,
+            offline: true,
+            activation: Activation::Inactive,
+            administrator_policy: "/etc/dev-auth/candidate-policy.toml".into(),
+            users: vec![crate::deployment::DeploymentUser {
+                name: "operator".into(),
+                config: "/home/operator/candidate-config.toml".into(),
+                policy: None,
+            }],
+            credentials: vec![],
+        };
+        let installation = SetupPlan {
+            schema: "dev-auth-setup-plan-v2".into(),
+            paths: SetupPaths::strong(),
+            request: InstallRequest {
+                purpose: Default::default(),
+                mode: InstallMode::Strong,
+                version: candidate_version.into(),
+                source_executable: "/candidate/dev-auth".into(),
+                native_git: "/usr/bin/git".into(),
+                native_gh: "/usr/bin/gh".into(),
+                activate_transparent_launchers: false,
+            },
+            source_length: 1,
+            source_sha256: "a".repeat(64),
+            verified_release: None,
+        };
+        let accounts = vec![NativeAccountIdentity {
+            name: "operator".into(),
+            uid: 60_001,
+            gid: 60_001,
+            home: "/home/operator".into(),
+        }];
+        let mut inventory =
+            expected_current_path_keys(&installation, &intent, &accounts, &[], None).unwrap();
+        edit_inventory(&mut inventory);
+        let current_paths = inventory
+            .into_iter()
+            .map(|(kind, subject, path)| CurrentPathIdentity {
+                kind,
+                subject,
+                path,
+                identity: None,
+            })
+            .collect::<Vec<_>>();
+        let current_state_sha256 =
+            stored_current_state_digest(&current_paths, &BTreeSet::new(), "inactive").unwrap();
+        SetupPlanV3 {
+            credential_preservation: None,
+            grant_previous_block: None,
+            grant_current_state: None,
+            grant_payload: BTreeMap::new(),
+            authority_schema: None,
+            schema: "dev-auth-setup-plan-v3".into(),
+            intent_sha256: sha256_hex(&canonical_deployment_intent(&intent).unwrap()),
+            actions: planned_action_contract(&intent),
+            source_documents: vec![DocumentIdentity {
+                kind: "administrator_policy".into(),
+                subject: "system".into(),
+                path: intent.administrator_policy.clone(),
+                length: 1,
+                sha256: "b".repeat(64),
+            }],
+            intent,
+            installation,
+            accounts,
+            retiring_accounts: vec![],
+            current_paths,
+            current_credential_ready: BTreeSet::new(),
+            current_broker_state: "inactive".into(),
+            current_state_sha256,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rejection(plan: &SetupPlanV3) -> String {
+        let error = validate_setup_plan_v3_with_installation_check(plan, &|_| Ok(())).unwrap_err();
+        format!("{error:#}")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn maintenance_inventory() -> Vec<(String, String, PathBuf)> {
+        crate::setup::maintenance_current_state_paths("0.5.0")
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strong_inventory_follows_the_candidate_release() {
+        for version in ["0.4.0", "0.5.2"] {
+            validate_setup_plan_v3_with_installation_check(
+                &strong_plan_for(version, |_| {}),
+                &|_| Ok(()),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn current_state_mismatch_names_what_differs_without_guessing_skew() {
+        let mismatch = "setup plan v3 current-state paths do not match the deployment authority: ";
+        let without = |removed: &'static [&'static str]| {
+            strong_plan_for("0.5.2", move |inventory| {
+                inventory.retain(|(kind, _, _)| !removed.contains(&kind.as_str()))
+            })
+        };
+        assert_eq!(
+            rejection(&without(&["administrator_policy"])),
+            format!("{mismatch}missing administrator_policy")
+        );
+        assert_eq!(
+            rejection(&without(&["administrator_policy", "maintenance_policy"])),
+            format!("{mismatch}missing administrator_policy, maintenance_policy")
+        );
+        let unrelated = (
+            "unrecognized_state".to_owned(),
+            "system".to_owned(),
+            PathBuf::from("/etc/dev-auth/unrecognized"),
+        );
+        let replaced = strong_plan_for("0.5.2", |inventory| {
+            inventory.retain(|(kind, _, _)| kind != "maintenance_policy");
+            inventory.push(unrelated.clone());
+            inventory.sort();
+        });
+        assert_eq!(
+            rejection(&replaced),
+            format!("{mismatch}missing maintenance_policy; 1 unexpected")
+        );
+        let newer_inventory_for_older_candidate = strong_plan_for("0.4.0", |inventory| {
+            inventory.extend(maintenance_inventory());
+            inventory.sort();
+        });
+        assert_eq!(
+            rejection(&newer_inventory_for_older_candidate),
+            format!("{mismatch}4 unexpected")
+        );
+        assert_eq!(
+            rejection(&strong_plan_for("0.5.2", |inventory| inventory.reverse())),
+            format!("{mismatch}entries are repeated or out of canonical order")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unsupported_plan_contract_names_the_failing_check() {
+        let unsupported = "dev-auth setup plan v3 has an unsupported contract: ";
+        let plan = strong_plan_for("0.5.2", |_| {});
+        let mut schema = plan.clone();
+        schema.schema = "dev-auth-setup-plan-v4".into();
+        assert_eq!(
+            rejection(&schema),
+            format!("{unsupported}its schema is not dev-auth-setup-plan-v3")
+        );
+        let mut documents = plan.clone();
+        documents.source_documents.clear();
+        assert_eq!(
+            rejection(&documents),
+            format!("{unsupported}it records no source documents")
+        );
+        let mut digest = plan.clone();
+        digest.current_state_sha256 = "0".repeat(64);
+        assert_eq!(
+            rejection(&digest),
+            format!(
+                "{unsupported}its current-state digest does not match its recorded current state"
+            )
+        );
+        let mut unverified = plan;
+        unverified.actions.pop();
+        assert_eq!(
+            rejection(&unverified),
+            format!("{unsupported}its actions do not end with verify")
+        );
+    }
 }
