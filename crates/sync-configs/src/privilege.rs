@@ -362,8 +362,8 @@ impl PrivilegeSession {
         }
     }
 
-    /// `sudo -v` validates only the timestamp, so policy that authorizes
-    /// commands without one is visible only by running a command.
+    /// `sudo -v` can fail under policy that still authorizes commands, such as
+    /// a per-command NOPASSWD rule, so a command shows what privileged work sees.
     #[cfg(unix)]
     fn noninteractive_command_authorized(&self) -> Result<bool, PrivilegeError> {
         let path = self.environment.get(OsStr::new("PATH"));

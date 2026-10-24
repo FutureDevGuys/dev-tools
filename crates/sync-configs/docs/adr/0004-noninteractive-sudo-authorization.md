@@ -5,7 +5,7 @@ verification: source fixtures pass; native sudo acceptance pending
 
 ## Context
 
-`sudo -v` validates only the sudo timestamp. Policy that authorizes commands without a timestamp, such as a sudoers `NOPASSWD` rule or a plugin-managed grant, leaves `sudo -n -v` failing while `sudo -n -- COMMAND` succeeds. Without a command check, a session authorized that way still prompts.
+`sudo -v` validates the sudo timestamp. Policy that authorizes some commands without a timestamp, such as a sudoers `NOPASSWD` rule for specific commands, leaves `sudo -n -v` failing while `sudo -n -- COMMAND` succeeds. Without a command check, a session authorized that way still prompts. A command check in the exact form of later privileged work also reports what a sudo policy or approval plugin decides, whatever it answers for `-v`.
 
 The interactive `sudo -v` reads its reply from the controlling terminal. A process outside the terminal's foreground process group stops on that read with `SIGTTIN`, so its prompt shows, the typed reply echoes unread, and sudo eventually times out. A wrapper that launches `sync-configs` in its own process group produces that state.
 
