@@ -15,8 +15,11 @@ const NAME: &str = "dev-auth-maintenance-helper";
 const SIDECAR: &str = "maintenance-helper-v1.json";
 const SCHEMA: &str = "dev-auth-maintenance-helper-v1";
 
+/// The first release whose strong installations own this helper.
+pub(crate) const FIRST_VERSION: semver::Version = semver::Version::new(0, 5, 0);
+
 pub(crate) fn supports_version(version: &str) -> bool {
-    semver::Version::parse(version).is_ok_and(|version| version >= semver::Version::new(0, 5, 0))
+    semver::Version::parse(version).is_ok_and(|version| version >= FIRST_VERSION)
 }
 fn supports(receipt: &InstallReceipt) -> bool {
     receipt.mode == InstallMode::Strong && supports_version(&receipt.version)

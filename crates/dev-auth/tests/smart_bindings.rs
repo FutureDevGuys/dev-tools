@@ -1054,8 +1054,6 @@ fn cli_plans_a_structured_alias_without_path_discovery_or_execution() {
             "batch",
             "--caller-argument-index",
             "1",
-            "--code-trust",
-            "mutable",
             "--output",
         ])
         .arg(&output)

@@ -18,19 +18,17 @@ fn provider() -> &'static Path {
         .get_or_init(|| {
             let temp = TempDir::new().unwrap();
             let binary = temp.path().join("provider");
-            assert!(
-                Command::new("rustc")
-                    .args(["--edition=2024", "-C", "debuginfo=0"])
-                    .arg(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/tests/fixtures/npm_staging.rs"
-                    ))
-                    .arg("-o")
-                    .arg(&binary)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(Command::new("rustc")
+                .args(["--edition=2024", "-C", "debuginfo=0"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/npm_staging.rs"
+                ))
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success());
             (temp, binary)
         })
         .1
@@ -124,18 +122,16 @@ fn exercise(engine: &str, canonical: bool, success: bool, retained: bool) -> (Te
                 "lost {path}; canonical={canonical} success={success} engine={engine}"
             );
         }
-        assert!(
-            root.join(".linked-retained")
-                .symlink_metadata()
-                .unwrap()
-                .is_symlink()
-        );
-        assert!(
-            root.join("@linked")
-                .symlink_metadata()
-                .unwrap()
-                .is_symlink()
-        );
+        assert!(root
+            .join(".linked-retained")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+        assert!(root
+            .join("@linked")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
         assert_eq!(
             fs::read_to_string(home.path().join("outside/.outside-only/contents")).unwrap(),
             "untouched"
@@ -171,11 +167,9 @@ fn npm_preserves_scoped_unscoped_and_unrelated_hidden_directories() {
                     if success { "completed" } else { "failed" }
                 );
                 if !success {
-                    assert!(
-                        advisories
-                            .iter()
-                            .any(|a| a["code"] == "npm-storage-exhausted")
-                    );
+                    assert!(advisories
+                        .iter()
+                        .any(|a| a["code"] == "npm-storage-exhausted"));
                     let calls = fs::read_to_string(_home.path().join("calls")).unwrap();
                     assert_eq!(
                         calls
@@ -194,12 +188,10 @@ fn npm_preserves_scoped_unscoped_and_unrelated_hidden_directories() {
 fn npm_ordinary_success_does_not_report_retained_staging() {
     for engine in ["sync", "async"] {
         let (_home, artifact) = exercise(engine, true, true, false);
-        assert!(
-            !artifact["tasks"][0]["advisories"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|a| a["code"] == "npm-hidden-directories-preserved")
-        );
+        assert!(!artifact["tasks"][0]["advisories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["code"] == "npm-hidden-directories-preserved"));
     }
 }

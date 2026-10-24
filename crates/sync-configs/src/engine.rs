@@ -127,28 +127,27 @@ impl EngineError {
             }
             Self::Privilege(source)
             | Self::Hook(crate::hooks::HookError::Privilege(source))
-            | Self::PrivilegedTarget(PrivilegedTargetError::PrivilegedCommand {
-                source,
-                ..
-            }) => match source {
-                PrivilegeError::TimedOut => FailureDiagnostic::PrivilegedCommandTimedOut,
-                PrivilegeError::Authentication { stage, failure } => match failure {
-                    AuthenticationFailure::Process { os_code, .. } => {
-                        FailureDiagnostic::AuthenticationProcess {
-                            stage: *stage,
-                            os_code: *os_code,
+            | Self::PrivilegedTarget(PrivilegedTargetError::PrivilegedCommand { source, .. }) => {
+                match source {
+                    PrivilegeError::TimedOut => FailureDiagnostic::PrivilegedCommandTimedOut,
+                    PrivilegeError::Authentication { stage, failure } => match failure {
+                        AuthenticationFailure::Process { os_code, .. } => {
+                            FailureDiagnostic::AuthenticationProcess {
+                                stage: *stage,
+                                os_code: *os_code,
+                            }
                         }
-                    }
-                    AuthenticationFailure::Exit { code, signal } => {
-                        FailureDiagnostic::AuthenticationExit {
-                            stage: *stage,
-                            code: *code,
-                            signal: *signal,
+                        AuthenticationFailure::Exit { code, signal } => {
+                            FailureDiagnostic::AuthenticationExit {
+                                stage: *stage,
+                                code: *code,
+                                signal: *signal,
+                            }
                         }
-                    }
-                },
-                _ => FailureDiagnostic::ConvergenceFailed,
-            },
+                    },
+                    _ => FailureDiagnostic::ConvergenceFailed,
+                }
+            }
             _ => FailureDiagnostic::ConvergenceFailed,
         }
     }
