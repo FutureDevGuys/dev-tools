@@ -42,12 +42,13 @@ Expiry and revocation cannot undo completed effects. Successful cleanup requires
 
 ## Authorizing an account for administrator grants
 
-`dev-auth setup template administrator-grant-policy --user NAME --maximum-duration DURATION` prints the deny-all policy with exactly one subject: the named existing non-root account, resolved to its numeric uid through the native account database. By default that account may request `user` and `workload` scopes with `administrator` authority for at most the maximum duration, and cannot delegate. Repeat `--scope` to choose scopes explicitly and add `--allow-delegation` to permit narrowed delegation. The command prints nothing and fails for a missing or root account, a zero or malformed duration, or any subject that the policy's own validation refuses. The document keeps the schema's `/usr/bin/sudo`, the only sudo program setup accepts. Outside Linux the options are unsupported. The 0.5.2 release prints only the deny-all template; these options are in its successor source. The policy document itself does not depend on the binary that wrote it.
+`dev-auth setup template administrator-grant-policy --user NAME --maximum-duration DURATION` prints the deny-all policy with exactly one subject: the named existing non-root account, resolved to its numeric uid through the native account database. By default that account may request `user` and `workload` scopes with `administrator` authority for at most the maximum duration, and cannot delegate. Repeat `--scope` to choose scopes explicitly and add `--allow-delegation` to permit narrowed delegation. Only `--scope command` lets the account use [`privilege run`](#running-one-program-under-its-own-grant). The default leaves it out. A subject that lists `command` cannot set an idle cutoff or a use budget. The command prints nothing and fails for a missing or root account, a zero or malformed duration, or any subject that the policy's own validation refuses. The document keeps the schema's `/usr/bin/sudo`, the only sudo program setup accepts. Outside Linux the options are unsupported. The 0.5.2 release prints only the deny-all template; these options are in its successor source. The policy document itself does not depend on the binary that wrote it.
 
 Review the document, then install it where only root can change it. Setup reads only a regular, singly linked source that is not group- or world-writable.
 
 ```text
 dev-auth setup template administrator-grant-policy --user account-name --maximum-duration 12h > /absolute/private/administrator-grants-v1.json
+dev-auth setup template administrator-grant-policy --user account-name --maximum-duration 4h --scope command > /absolute/private/administrator-grants-v1.json
 sudo install -d -m 0755 /etc/dev-auth/source
 sudo install -m 0644 /absolute/private/administrator-grants-v1.json /etc/dev-auth/source/administrator-grants-v1.json
 ```
@@ -82,6 +83,59 @@ dev-auth privilege grant leave
 ```
 
 `status` observes only the caller's grants. `revoke` ends one grant and terminates its privileged descendants. `leave` ends the selected grant, and with no selected grant it changes nothing. Managed sudo routing ends with its grant, however the grant ends, and sudo then has its native behavior. A user grant ends at logout only when logind reports that the account has no interactive session. A command that native sudo started keeps running if sudo exits or its completion channel closes, until the command exits or its grant ends. See [ADR 0136](adr/0136-grant-lifetime-sudo-routing-and-job-survival.md). When the sudo plugin refuses an invocation, it prints one line with the reason and the step that restores native sudo. A failure that belongs to one grant never stops the coordinator. If the coordinator itself exits, every grant ends and the service manager stops every managed job. See [ADR 0137](adr/0137-coordinator-fault-containment-and-sudo-refusal-reasons.md). If the grant policy or the sudo program changes, the coordinator admits nothing new, keeps `status`, `revoke` and `leave` working, and lets running jobs finish under their grants. It then exits, and the service manager starts a coordinator that binds the new state. A look at native state that fails is retried and never ends a grant. When the coordinator accepts a sudo connection but does not answer, an account that it does not route has native sudo. See [ADR 0138](adr/0138-trust-change-drain-and-observed-supervision.md). Native grant, sudo, guardian and signed setup acceptance remain pending under ADR 0115 and ADR 0116, so this path is not an installed-support claim.
+
+## Running one program under its own grant
+
+`privilege run` gives root to one program's process tree and to nothing else. It asks for one fresh approval, runs the program as you, routes sudo from that program and its descendants through the new grant, and ends the grant when the program exits. The subject's policy must list the `command` scope, without an idle cutoff or a use budget. `privilege grant run` is the same command.
+
+```text
+dev-auth privilege run --duration 2h -- just converge
+dev-auth privilege run --duration 2h --preserve-env SSH_AUTH_SOCK --format json --result-file /absolute/private/run.json -- /usr/bin/bash ./converge.sh
+```
+
+`--duration` must be within the policy maximum, and `run` refuses a longer one before it prompts. `--authority` accepts only `administrator`, its default. The exit status is the program's own, and a program ended by a signal ends `run` with that signal. A failure of `run` itself exits 2 for an invalid request, 3 when approval is required or the coordinator is absent or busy, 4 when approval is denied or the policy refuses, and 1 when the program could not start or its cleanup failed. Use `--result-file` to tell those apart from the program's own status. With `--format json`, `--result-file` receives the result, because the program keeps your terminal and streams. The result names the operation `run`, carries `child_exit_code` or `child_signal`, and carries the final `grant` with its `stop_reason`. `--non-interactive` returns `approval_required` and starts nothing. An interrupt while the approval is pending cancels the request.
+
+`run` resolves the program through your `PATH` and opens it read-only as you, so you need read and execute access to it. The program must be a native ELF executable on a filesystem that is neither FUSE nor mounted `noexec`. To run a script, name its interpreter, as in the second example. The program gets only `PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`, `TERM` and `LANG` from your environment, and each variable you name with `--preserve-env`. The approval names the program's canonical path, its SHA-256 digest, its device, inode and owner, every argument, the working directory, every environment variable and the duration. It also says that the authority is unrestricted root for that process tree. The coordinator executes the exact file it digested. `run` refuses a caller that runs with no-new-privileges, under a seccomp filter, or in another user, network, PID, IPC, UTS, cgroup or time namespace, because the program would run outside that confinement.
+
+The program runs inside a cgroup that the grant coordinator owns, with your uid, groups, umask, working directory and streams, in a session of its own with a new, empty session keyring. Only processes in that cgroup can use the grant. Another process of your account cannot join the cgroup, and naming the grant ID from outside is refused. A process that the program starts through another service manager, such as `systemd-run --user`, runs outside the tree, and its sudo is not routed. The coordinator unit's `TasksMax=4096` and `LimitNOFILE=8192` apply to the whole tree. The program has no logind session of its own, so PolicyKit actions that an active session may take without authentication ask for authentication inside `run`.
+
+The grant ends when the program exits, at its hard deadline, on revocation, at an observed logout, or when the coordinator stops. When the grant ends, everything in its cgroup stops, the program included, so `privilege leave` from inside the tree ends the program. At the hard deadline the whole tree stops, and the result reports the signal and a `stop_reason` of `HardExpired`. Choose a duration that covers the whole run, because nothing extends a grant. If the program upgrades the sudo program or edits the grant policy, the coordinator refuses every later sudo in the run and restarts after the program exits (ADR 0138).
+
+Another process of your account can still reach the tree in a few ways. When `kernel.yama.ptrace_scope` is 0, it can attach to the program with `ptrace`, so set it to 1 or higher. It can write into the program's standard input through `/proc`, and it can drive your terminal, for example through a terminal multiplexer. It can also change scripts, configuration and preserved variables that the program reads. See [ADR 0139](adr/0139-command-scoped-grants-and-remaining-time-checks.md) for the security analysis.
+
+## Checking the remaining time of a grant
+
+Work that runs under an existing grant can check, before a long privileged step, that its grant lasts long enough:
+
+```text
+dev-auth privilege grant status --require-remaining 30m --format json
+dev-auth privilege grant status --require-remaining 30m --scope user --format json
+```
+
+Without `--scope`, the check applies to the grant that sudo routing selects for the calling process: the grant of the job, workload or command that the process runs in, and otherwise the account's user grant. With `--scope user`, `--scope workload` or `--scope command`, it applies to the caller's routable grant of that scope, which need not be the grant that sudo uses. The check uses the hard deadline. An idle cutoff that the policy sets on a user or workload grant can end that grant sooner.
+
+| Outcome | `error_kind` | Exit |
+| --- | --- | --- |
+| The covering grant is active and has at least the duration left | `null` | 0 |
+| No routable grant covers the caller | `no_grant` | 3 |
+| The covering grant ends sooner | `insufficient_remaining` | 3 |
+| No coordinator runs | `requires_setup` | 3 |
+| The duration or scope is invalid | `invalid_request` | 2 |
+
+Every `status` document has `schema` `dev-auth-administrator-grant-result-v1`, `operation` `status`, `changed` `false` and `error_kind`. `grants` lists each of the caller's grants and is absent when there are none. With `--require-remaining`, `grant` is the covering grant whenever one exists. Each grant has these fields:
+
+| Field | Value |
+| --- | --- |
+| `id` | 32 lowercase hexadecimal digits |
+| `scope` | `user`, `workload` or `command` |
+| `authority` | `{"kind":"administrator"}`, `{"kind":"exact-plan","sha256":...}` or `{"kind":"typed","operations":[...]}` |
+| `state` | `pending`, `active`, `stopping` or `terminated` |
+| `duration_seconds` | the approved duration |
+| `remaining_milliseconds` | time until the hard deadline, 0 once it passes |
+| `idle_seconds` | the idle cutoff, or `null` |
+| `remaining_uses` | the use budget left, or `null` |
+| `stop_reason` | `null` while active, otherwise the reason, such as `HardExpired`, `Revoked`, `Logout` or `WorkloadEnded` |
+| `cleanup_failed` | whether cleanup of the grant's processes failed |
 
 ## Native acceptance harness
 

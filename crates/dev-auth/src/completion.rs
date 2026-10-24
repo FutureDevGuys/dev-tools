@@ -64,7 +64,7 @@ pub(super) fn setup_template_command() -> Command {
                 .value_name("DURATION")
                 .requires("user")
                 .help("Longest grant the account may request, such as 30m, 12h or 2d"),
-            choice("scope", ["user", "workload"])
+            choice("scope", ["user", "workload", "command"])
                 .action(ArgAction::Append)
                 .default_values(["user", "workload"])
                 .requires("user")

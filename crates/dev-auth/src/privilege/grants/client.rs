@@ -4,7 +4,22 @@ use super::{ControlRequest, ControlResult, Failure};
 /// Send one control request over an authenticated native connection. This never
 /// obtains a password or retries an entered mutation after an uncertain reply.
 pub fn control(request: ControlRequest) -> ControlResult {
-    control_inner(request, None)
+    control_inner(request, None, None)
+}
+
+/// Send one `run` request with the program's open descriptor beside it. The
+/// coordinator digests and executes exactly that descriptor (ADR 0139).
+pub fn run_program(request: ControlRequest, program: &std::fs::File) -> ControlResult {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        control_inner(request, None, Some(program.as_raw_fd()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = program;
+        control_inner(request, None, None)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -21,13 +36,21 @@ pub(crate) fn activate_bootstrap(
             bootstrap: true,
         },
         Some([proof.as_raw_fd(), spawn.as_raw_fd(), release.as_raw_fd()]),
+        None,
     )
 }
 
-fn control_inner(request: ControlRequest, launch: Option<[i32; 3]>) -> ControlResult {
+fn control_inner(
+    request: ControlRequest,
+    launch: Option<[i32; 3]>,
+    program: Option<i32>,
+) -> ControlResult {
     let operation = request.operation();
     if let Err(failure) = request.validate() {
         return ControlResult::failure(operation, failure, Some(false));
+    }
+    if matches!(request, ControlRequest::Run { .. }) != program.is_some() {
+        return ControlResult::failure(operation, Failure::InvalidRequest, Some(false));
     }
     let frame = serde_json::to_vec(&Envelope {
         schema: WIRE_SCHEMA.to_owned(),
@@ -40,10 +63,13 @@ fn control_inner(request: ControlRequest, launch: Option<[i32; 3]>) -> ControlRe
     #[cfg(target_os = "linux")]
     {
         let execution = request.execution_terminal();
-        let deadline = if matches!(
+        let approval = matches!(
             request,
-            ControlRequest::Request { .. } | ControlRequest::LaunchRequest { .. }
-        ) {
+            ControlRequest::Request { .. }
+                | ControlRequest::LaunchRequest { .. }
+                | ControlRequest::Run { .. }
+        );
+        let deadline = if approval {
             330
         } else if matches!(
             request,
@@ -64,10 +90,6 @@ fn control_inner(request: ControlRequest, launch: Option<[i32; 3]>) -> ControlRe
         if !endpoint.is_absolute() {
             return ControlResult::failure(operation, Failure::InvalidRequest, Some(false));
         }
-        let approval = matches!(
-            request,
-            ControlRequest::Request { .. } | ControlRequest::LaunchRequest { .. }
-        );
         let response = if let Some(launch) = &launch {
             super::transport::exchange_with_launch_descriptors(
                 &endpoint,
@@ -78,7 +100,7 @@ fn control_inner(request: ControlRequest, launch: Option<[i32; 3]>) -> ControlRe
                 Some(launch),
             )
         } else {
-            super::transport::exchange(&endpoint, &frame, execution, deadline, approval)
+            super::transport::exchange(&endpoint, &frame, execution, deadline, approval, program)
         };
         match response {
             Ok(bytes) => match serde_json::from_slice::<ControlResult>(&bytes) {
@@ -107,7 +129,7 @@ fn control_inner(request: ControlRequest, launch: Option<[i32; 3]>) -> ControlRe
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (frame, launch);
+        let _ = (frame, launch, program);
         ControlResult::failure(operation, Failure::NativeUnavailable, Some(false))
     }
 }

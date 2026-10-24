@@ -295,6 +295,7 @@ impl Relay {
             effective_uid: 0,
             gid: 0,
             supplementary_groups: vec![],
+            user_session: None,
             controlling_terminal: false,
             inherited_files: self.inherited,
         };
@@ -1137,6 +1138,7 @@ mod tests {
             effective_uid: 0,
             gid: 0,
             supplementary_groups: vec![],
+            user_session: None,
             controlling_terminal: false,
             inherited_files,
         };

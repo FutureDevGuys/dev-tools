@@ -21,8 +21,17 @@ pub(super) fn exchange(
     execution: Option<bool>,
     deadline_seconds: u32,
     approval: bool,
+    program: Option<std::os::fd::RawFd>,
 ) -> Result<Vec<u8>, (Failure, Option<bool>)> {
-    exchange_with_launch_descriptors(path, request, execution, deadline_seconds, approval, None)
+    exchange_descriptors(
+        path,
+        request,
+        execution,
+        deadline_seconds,
+        approval,
+        None,
+        program,
+    )
 }
 
 pub(super) fn exchange_with_launch_descriptors(
@@ -33,7 +42,31 @@ pub(super) fn exchange_with_launch_descriptors(
     approval: bool,
     launch: Option<&[std::os::fd::RawFd; 3]>,
 ) -> Result<Vec<u8>, (Failure, Option<bool>)> {
-    if launch.is_some() && (execution.is_some() || approval) {
+    exchange_descriptors(
+        path,
+        request,
+        execution,
+        deadline_seconds,
+        approval,
+        launch,
+        None,
+    )
+}
+
+/// A `run` program descriptor travels after the execution streams, and only
+/// with them.
+fn exchange_descriptors(
+    path: &Path,
+    request: &[u8],
+    execution: Option<bool>,
+    deadline_seconds: u32,
+    approval: bool,
+    launch: Option<&[std::os::fd::RawFd; 3]>,
+    program: Option<std::os::fd::RawFd>,
+) -> Result<Vec<u8>, (Failure, Option<bool>)> {
+    if launch.is_some() && (execution.is_some() || approval)
+        || program.is_some() && (execution.is_none() || !approval)
+    {
         return Err((Failure::InvalidRequest, Some(false)));
     }
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
@@ -82,7 +115,7 @@ pub(super) fn exchange_with_launch_descriptors(
     if hello.bytes != HELLO || !hello.descriptors.is_empty() || !alive(&peer_pidfd) {
         return Err((Failure::ProtocolViolation, Some(false)));
     }
-    let _agent = if approval {
+    let agent = if approval {
         super::tty_agent::TtyAgent::for_request().map_err(|failure| (failure, Some(false)))?
     } else {
         None
@@ -95,9 +128,12 @@ pub(super) fn exchange_with_launch_descriptors(
         .map(|_| super::execution_io::Signals::new())
         .transpose()
         .map_err(|failure| (failure, Some(false)))?;
-    let streams = events
-        .as_ref()
-        .map(|(_, server)| [0, 1, 2, server.as_raw_fd()]);
+    let streams = events.as_ref().map(|(_, server)| {
+        [0, 1, 2, server.as_raw_fd()]
+            .into_iter()
+            .chain(program)
+            .collect::<Vec<_>>()
+    });
     let controls = if let Some(streams) = &streams {
         vec![ControlMessage::ScmRights(streams)]
     } else if let Some(launch) = launch {
@@ -119,16 +155,22 @@ pub(super) fn exchange_with_launch_descriptors(
             if sent == 0 { Some(false) } else { None },
         ));
     }
-    wait_readable(
-        &socket,
-        if execution.is_some() {
-            10
-        } else {
-            deadline_seconds
-        },
-    )
+    match &signals {
+        Some(signals) if approval => signals.wait_for_answer(&socket, deadline_seconds),
+        _ => wait_readable(
+            &socket,
+            if execution.is_some() {
+                10
+            } else {
+                deadline_seconds
+            },
+        ),
+    }
     .map_err(|failure| (failure, None))?;
     let mut packet = receive_owned(&socket).map_err(|_| (Failure::ProtocolViolation, None))?;
+    // Approval has ended. The terminal agent must not contend with a program
+    // that now owns the relayed terminal.
+    drop(agent);
     if !alive(&peer_pidfd) {
         return Err((Failure::ProtocolViolation, None));
     }

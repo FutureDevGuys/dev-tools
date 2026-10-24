@@ -299,6 +299,7 @@ mod alias_grammar {
             ("exec", DirectGrantCommand::Exec),
             ("delegate", DirectGrantCommand::Delegate),
             ("leave", DirectGrantCommand::Leave),
+            ("run", DirectGrantCommand::Run),
         ] {
             assert_eq!(DirectGrantCommand::from_name(OsStr::new(name)), Some(kind));
             assert_eq!(kind.name(), name);

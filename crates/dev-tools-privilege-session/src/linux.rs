@@ -387,10 +387,59 @@ pub struct NativeContext {
     pub effective_uid: u32,
     pub gid: u32,
     pub supplementary_groups: Vec<u32>,
+    /// Set when the image starts an ordinary user's process rather than a
+    /// privileged job. `None` keeps the owner's process state.
+    pub user_session: Option<UserSession>,
     pub controlling_terminal: bool,
     /// Extra owned descriptors retained at their existing numbers across exec.
     /// Keeping them open in the parent prevents collision with spawn internals.
     pub inherited_files: Vec<OwnedFd>,
+}
+
+/// The process state a user's process starts with, as a login gives it: the
+/// user's file-creation mask, a session and a session keyring of its own,
+/// and no descriptor beyond its streams and the explicitly inherited files.
+#[derive(Debug, Clone, Copy)]
+pub struct UserSession {
+    pub umask: u32,
+}
+
+/// `KEYCTL_JOIN_SESSION_KEYRING` from the Linux `keyctl.h` UAPI.
+const KEYCTL_JOIN_SESSION_KEYRING: nix::libc::c_long = 1;
+
+/// Give a forked child about to exec a user's image that user's process
+/// state, so it shares no session, process group, keyring or descriptor with
+/// the root owner that starts it. It uses only async-signal-safe system calls
+/// and allocates nothing.
+fn enter_user_session(session: UserSession) -> io::Result<()> {
+    // SAFETY: each call changes only this process's own mask, session,
+    // keyring or descriptor flags, and passes no pointer except a null name.
+    unsafe {
+        nix::libc::umask(session.umask as nix::libc::mode_t);
+        // A terminal job already leads the session it created for its terminal.
+        if nix::libc::getsid(0) != nix::libc::getpid() && nix::libc::setsid() < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if nix::libc::syscall(
+            nix::libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<nix::libc::c_char>(),
+        ) < 0
+            && io::Error::last_os_error().raw_os_error() != Some(nix::libc::ENOSYS)
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if nix::libc::syscall(
+            nix::libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            nix::libc::CLOSE_RANGE_CLOEXEC,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 impl SpawnPermit {
@@ -450,6 +499,9 @@ impl SpawnPermit {
         }
         if context.inherited_files.len() > 16
             || context.inherited_files.iter().any(|fd| fd.as_raw_fd() < 3)
+            || context
+                .user_session
+                .is_some_and(|session| session.umask > 0o777)
         {
             return Err(invalid());
         }
@@ -535,6 +587,9 @@ impl SpawnPermit {
                     ) != 0
                 {
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(session) = context.user_session {
+                    enter_user_session(session)?;
                 }
                 for source in &context.inherited_files {
                     let flags = nix::libc::fcntl(source.as_raw_fd(), nix::libc::F_GETFD);
@@ -634,6 +689,72 @@ mod tests {
     use super::*;
     use nix::fcntl::OFlag;
     use nix::unistd::pipe2;
+
+    /// `keyctl.h`: `KEYCTL_GET_KEYRING_ID` and `KEY_SPEC_SESSION_KEYRING`.
+    const KEYCTL_GET_KEYRING_ID: nix::libc::c_long = 0;
+    const KEY_SPEC_SESSION_KEYRING: nix::libc::c_long = -3;
+
+    /// What a forked child sees of its own state, as bits of its exit code:
+    /// 1 when its mask is not 0o027, 2 when `stray` would cross exec, 4 when
+    /// its session keyring is the one it inherited, and 8 when it does not
+    /// lead its own session.
+    fn child_view(session: Option<UserSession>, stray: i32) -> i32 {
+        // SAFETY: the child calls only async-signal-safe system calls and
+        // `_exit`; it never returns into the test harness.
+        match unsafe { nix::unistd::fork() }.unwrap() {
+            nix::unistd::ForkResult::Child => unsafe {
+                let keyring = || {
+                    nix::libc::syscall(
+                        nix::libc::SYS_keyctl,
+                        KEYCTL_GET_KEYRING_ID,
+                        KEY_SPEC_SESSION_KEYRING,
+                        0,
+                    )
+                };
+                let inherited = keyring();
+                nix::libc::umask(0o022);
+                if let Some(session) = session {
+                    if enter_user_session(session).is_err() {
+                        nix::libc::_exit(64);
+                    }
+                }
+                let mut seen = 0;
+                if nix::libc::umask(0) != 0o027 {
+                    seen |= 1;
+                }
+                if nix::libc::fcntl(stray, nix::libc::F_GETFD) & nix::libc::FD_CLOEXEC == 0 {
+                    seen |= 2;
+                }
+                if inherited >= 0 && keyring() == inherited {
+                    seen |= 4;
+                }
+                if nix::libc::getsid(0) != nix::libc::getpid() {
+                    seen |= 8;
+                }
+                nix::libc::_exit(seen)
+            },
+            nix::unistd::ForkResult::Parent { child } => {
+                match nix::sys::wait::waitpid(child, None).unwrap() {
+                    nix::sys::wait::WaitStatus::Exited(_, code) => code,
+                    other => panic!("child did not exit: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_user_session_starts_with_its_mask_and_none_of_the_owners_descriptors() {
+        let (stray, _writer) = nix::unistd::pipe().unwrap();
+        let stray = stray.as_raw_fd();
+        let owner = child_view(None, stray);
+        let user = child_view(Some(UserSession { umask: 0o027 }), stray);
+        assert_eq!(
+            owner & 0b1011,
+            0b1011,
+            "control: the owner's state reaches the child"
+        );
+        assert_eq!(user, 0, "mask=1 descriptor=2 keyring=4 session=8");
+    }
 
     #[test]
     fn revocation_reaches_a_child_that_inherited_the_entire_descriptor_table() {

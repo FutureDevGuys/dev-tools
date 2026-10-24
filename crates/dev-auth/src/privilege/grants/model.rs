@@ -11,6 +11,22 @@ pub(super) const FRAME_LIMIT: usize = 60 * 1024;
 pub enum GrantScope {
     User,
     Workload,
+    /// The process tree of one program that `privilege run` starts in a
+    /// boundary the coordinator owns (ADR 0139).
+    Command,
+}
+
+impl GrantScope {
+    /// Whether `request` and `delegate` can ask for this scope. Only `run`
+    /// creates the boundary of a command scope.
+    pub const fn requestable(self) -> bool {
+        matches!(self, Self::User | Self::Workload)
+    }
+
+    /// Whether an observed logout ends grants of this scope (ADR 0136).
+    pub const fn ends_at_logout(self) -> bool {
+        matches!(self, Self::User | Self::Command)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +97,18 @@ pub struct GrantRequest {
 }
 
 impl GrantRequest {
+    /// The grant one `run` request asks for: no requested idle cutoff or use
+    /// budget, although the subject's policy may still impose them.
+    pub fn command(authority: Authority, duration_seconds: u64) -> Self {
+        Self {
+            scope: GrantScope::Command,
+            authority,
+            duration_seconds,
+            idle_seconds: None,
+            uses: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), Failure> {
         self.authority.validate()?;
         #[cfg(target_os = "linux")]
@@ -116,11 +144,48 @@ pub struct Execution {
     pub terminal: bool,
 }
 
+/// A remaining-time check on the grant that covers a status caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantRequirement {
+    pub remaining_seconds: u64,
+    /// Check the caller's routable grant of this scope instead of the one
+    /// sudo routing selects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<GrantScope>,
+}
+
+impl GrantRequirement {
+    pub fn validate(&self) -> Result<(), Failure> {
+        if self.remaining_seconds == 0 || self.remaining_seconds.checked_mul(1_000).is_none() {
+            return Err(Failure::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    /// Whether a covering grant is active with at least the required time
+    /// left before its hard deadline.
+    pub fn met_by(&self, grant: &Grant) -> bool {
+        grant.state == GrantState::Active
+            && grant.remaining_milliseconds >= self.remaining_seconds.saturating_mul(1_000)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlRequest {
     Request {
         request: GrantRequest,
+    },
+    /// One freshly approved command-scoped grant for the program it starts as
+    /// the caller. The program's open descriptor travels beside the request;
+    /// `executable` is its canonical path, which the coordinator verifies.
+    Run {
+        authority: Authority,
+        duration_seconds: u64,
+        #[serde(with = "super::native_text")]
+        executable: OsString,
+        execution: Execution,
     },
     #[doc(hidden)]
     LaunchRequest {
@@ -136,8 +201,10 @@ pub enum ControlRequest {
     CommitLaunch {
         grant: String,
     },
-    #[serde(deserialize_with = "crate::strict_serde::empty_variant")]
-    Status,
+    Status {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requirement: Option<GrantRequirement>,
+    },
     Inspect {
         grant: String,
     },
@@ -172,7 +239,8 @@ impl ControlRequest {
             Self::Request { .. } | Self::LaunchRequest { .. } => "request",
             Self::ActivateLaunch { .. } => "activate_launch",
             Self::CommitLaunch { .. } => "commit_launch",
-            Self::Status => "status",
+            Self::Run { .. } => "run",
+            Self::Status { .. } => "status",
             Self::Inspect { .. } => "inspect",
             Self::Exec { .. } | Self::SudoRelay { .. } | Self::RunPlan { .. } => "exec",
             Self::Delegate { .. } => "delegate",
@@ -182,16 +250,35 @@ impl ControlRequest {
     }
 
     pub fn is_observation(&self) -> bool {
-        matches!(self, Self::Status | Self::Inspect { .. })
+        matches!(self, Self::Status { .. } | Self::Inspect { .. })
     }
 
     pub fn validate(&self) -> Result<(), Failure> {
         match self {
-            Self::Request { request } | Self::LaunchRequest { request } => request.validate(),
+            Self::Request { request } | Self::LaunchRequest { request } => {
+                requestable(request)?;
+                request.validate()
+            }
+            Self::Run {
+                authority,
+                duration_seconds,
+                executable,
+                execution,
+            } => {
+                if *authority != Authority::Administrator
+                    || !std::path::Path::new(executable).is_absolute()
+                    || executable.as_encoded_bytes().contains(&0)
+                {
+                    return Err(Failure::InvalidRequest);
+                }
+                GrantRequest::command(authority.clone(), *duration_seconds).validate()?;
+                validate_execution(execution)
+            }
             Self::ActivateLaunch { grant, .. } | Self::CommitLaunch { grant } => validate_id(grant),
             Self::Inspect { grant } | Self::Revoke { grant } => validate_id(grant),
             Self::Delegate { grant, request } => {
                 validate_id(grant)?;
+                requestable(request)?;
                 request.validate()
             }
             Self::RunPlan {
@@ -211,42 +298,55 @@ impl ControlRequest {
                 if let Some(grant) = grant {
                     validate_id(grant)?;
                 }
-                if execution.program.is_empty()
-                    || !std::path::Path::new(&execution.working_directory).is_absolute()
-                    || execution.arguments.len() > 1024
-                    || execution.environment.len() > 1024
-                {
-                    return Err(Failure::InvalidRequest);
-                }
-                validate_native_command(
-                    &execution.program,
-                    &execution.arguments,
-                    &execution.working_directory,
-                    &execution.environment,
-                )
+                validate_execution(execution)
             }
             Self::SudoRelay { grant, execution } => {
                 validate_id(grant)?;
-                Self::Exec {
-                    grant: Some(grant.clone()),
-                    execution: execution.clone(),
-                }
-                .validate()
+                validate_execution(execution)
             }
-            Self::Status | Self::Leave => Ok(()),
+            Self::Status { requirement } => requirement
+                .as_ref()
+                .map_or(Ok(()), GrantRequirement::validate),
+            Self::Leave => Ok(()),
         }
     }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn execution_terminal(&self) -> Option<bool> {
         match self {
-            Self::Exec { execution, .. } | Self::SudoRelay { execution, .. } => {
-                Some(execution.terminal)
-            }
+            Self::Exec { execution, .. }
+            | Self::SudoRelay { execution, .. }
+            | Self::Run { execution, .. } => Some(execution.terminal),
             Self::RunPlan { terminal, .. } => Some(*terminal),
             _ => None,
         }
     }
+}
+
+/// `request` and `delegate` cannot ask for a command scope, because only
+/// `run` creates the boundary that scope names (ADR 0139).
+fn requestable(request: &GrantRequest) -> Result<(), Failure> {
+    if request.scope.requestable() {
+        Ok(())
+    } else {
+        Err(Failure::InvalidRequest)
+    }
+}
+
+fn validate_execution(execution: &Execution) -> Result<(), Failure> {
+    if execution.program.is_empty()
+        || !std::path::Path::new(&execution.working_directory).is_absolute()
+        || execution.arguments.len() > 1024
+        || execution.environment.len() > 1024
+    {
+        return Err(Failure::InvalidRequest);
+    }
+    validate_native_command(
+        &execution.program,
+        &execution.arguments,
+        &execution.working_directory,
+        &execution.environment,
+    )
 }
 
 pub(super) fn validate_native_command(
@@ -313,6 +413,8 @@ pub enum Failure {
     ProtocolViolation,
     RuntimeFailure,
     OutputLimit,
+    /// The covering grant ends before a status requirement's remaining time.
+    InsufficientRemaining,
     Interrupted,
 }
 
@@ -324,7 +426,8 @@ impl Failure {
             | Self::ApprovalRequired
             | Self::NoGrant
             | Self::NativeUnavailable
-            | Self::Busy => 3,
+            | Self::Busy
+            | Self::InsufficientRemaining => 3,
             Self::ApprovalDenied
             | Self::AuthorityDenied
             | Self::GrantExpired
@@ -355,6 +458,9 @@ impl Failure {
                 "administrator operation failed; entered mutation may be incomplete"
             }
             Self::OutputLimit => "approved command graph exceeded its external output budget",
+            Self::InsufficientRemaining => {
+                "the covering administrator grant ends before the required remaining time"
+            }
             Self::Interrupted => "administrator operation was interrupted",
         }
     }
