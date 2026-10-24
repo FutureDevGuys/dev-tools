@@ -12,9 +12,10 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         .map_err(|_| Failure::AuthorityDenied)?;
     let executable =
         File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
+    let sudo = service.sudo_program()?;
     if peer.uid != 0
         || !native::alive(peer.peer_pidfd())
-        || !native::same_file(&executable, &service.sudo.file)?
+        || !native::same_file(&executable, &sudo)?
         || admission(service.state.lock().await.phase, service.trust()).is_err()
     {
         return Err(Failure::AuthorityDenied);

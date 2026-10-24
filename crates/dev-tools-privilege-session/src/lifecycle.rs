@@ -11,6 +11,7 @@ pub(crate) struct LifecycleCore {
     last_observed: Duration,
     remaining: Option<u64>,
     state: LeaseState,
+    attached: u32,
 }
 
 impl LifecycleCore {
@@ -32,6 +33,7 @@ impl LifecycleCore {
             last_observed: now,
             remaining: uses.map(NonZeroU64::get),
             state: LeaseState::Active,
+            attached: 0,
         })
     }
 
@@ -117,6 +119,21 @@ impl LifecycleCore {
             .checked_add(self.limits.idle_timeout())
             .unwrap_or(self.hard_deadline)
             .min(self.hard_deadline);
+    }
+
+    /// One more job runs under this grant.
+    pub(crate) fn attach(&mut self) -> Result<(), SessionError> {
+        self.attached = self.attached.checked_add(1).ok_or(SessionError::Capacity)?;
+        Ok(())
+    }
+
+    /// One job under this grant ended at `now`.
+    pub(crate) fn detach(&mut self, _now: Duration) -> Result<(), SessionError> {
+        self.attached = self
+            .attached
+            .checked_sub(1)
+            .ok_or(SessionError::InvalidTransition)?;
+        Ok(())
     }
 
     pub(crate) fn stop(&mut self, reason: StopReason) {

@@ -44,6 +44,9 @@ pub(crate) enum Decision {
     Attached,
     Denied,
     Unavailable,
+    /// The coordinator drains and admits no new sudo through a grant that
+    /// routes this invocation (ADR 0141).
+    Draining,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

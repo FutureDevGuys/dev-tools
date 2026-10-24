@@ -12,14 +12,25 @@ pub(super) struct State {
     pub enabled: bool,
 }
 
+/// How long setup waits for `systemctl stop` of the coordinator.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
 pub(super) fn run(program: &Path, arguments: &[std::ffi::OsString]) -> Result<Vec<u8>> {
+    run_within(program, arguments, Duration::from_secs(10))
+}
+
+fn run_within(
+    program: &Path,
+    arguments: &[std::ffi::OsString],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     crate::setup::validate_root_owned_executable(program, "native privilege setup tool")?;
     let output = dev_tools_command::run_bounded_command(&dev_tools_command::BoundedCommand {
         executable: program,
         arguments,
         environment: &BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: Some(Path::new("/")),
-        timeout: Duration::from_secs(10),
+        timeout,
         output_limit: DOCUMENT_LIMIT as usize,
     })?;
     if !output.status.success() {
@@ -29,12 +40,16 @@ pub(super) fn run(program: &Path, arguments: &[std::ffi::OsString]) -> Result<Ve
 }
 
 fn systemctl(arguments: &[&str]) -> Result<Vec<u8>> {
+    systemctl_within(arguments, Duration::from_secs(10))
+}
+
+fn systemctl_within(arguments: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let arguments = ["--system", "--no-pager", "--no-ask-password"]
         .into_iter()
         .chain(arguments.iter().copied())
         .map(std::ffi::OsString::from)
         .collect::<Vec<_>>();
-    run(Path::new("/usr/bin/systemctl"), &arguments)
+    run_within(Path::new("/usr/bin/systemctl"), &arguments, timeout)
 }
 
 pub(super) fn observe() -> Result<State> {
@@ -123,7 +138,7 @@ pub(super) fn stop() -> Result<bool> {
         systemctl(&["disable", "--runtime", UNIT])?;
     }
     if !before.stopped {
-        systemctl(&["stop", UNIT])?;
+        systemctl_within(&["stop", UNIT], STOP_WAIT)?;
     }
     let until = Instant::now() + Duration::from_secs(5);
     loop {
@@ -168,21 +183,41 @@ pub(super) fn sudo_compatibility(owned_group: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn observation() -> String {
+    fn observation(kill_mode: &str, stop_timeout: &str) -> String {
         format!(
-            "Id={UNIT}\nLoadState=loaded\nActiveState=inactive\nSubState=dead\nFragmentPath={SERVICE}\nDropInPaths=\nControlGroup=\nMainPID=0\nControlPID=0\nJob=\nUnitFileState=disabled\nKillMode=control-group\nSendSIGKILL=yes\nDelegate=no\nExitType=main\nRemainAfterExit=no\nTimeoutStopUSec=5s\n"
+            "Id={UNIT}\nLoadState=loaded\nActiveState=inactive\nSubState=dead\nFragmentPath={SERVICE}\nDropInPaths=\nControlGroup=\nMainPID=0\nControlPID=0\nJob=\nUnitFileState=disabled\nKillMode={kill_mode}\nSendSIGKILL=yes\nDelegate=no\nExitType=main\nRemainAfterExit=no\nTimeoutStopUSec={stop_timeout}\n"
         )
     }
 
     #[test]
+    fn setup_waits_out_the_coordinators_whole_stop() {
+        let stop_timeout = crate::privilege::grants::assets::SERVICE
+            .lines()
+            .find_map(|line| line.strip_prefix("TimeoutStopSec="))
+            .and_then(|value| value.strip_suffix('s'))
+            .and_then(|seconds| seconds.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap();
+        assert!(STOP_WAIT > stop_timeout, "{STOP_WAIT:?} {stop_timeout:?}");
+    }
+
+    #[test]
+    fn setup_still_observes_the_previous_unit_so_it_can_stop_that_coordinator() {
+        let previous = observation("control-group", "5s");
+        assert!(parse(previous.as_bytes()).unwrap().stopped);
+        assert!(parse(observation("control-group", "1min 30s").as_bytes()).is_err());
+    }
+
+    #[test]
     fn service_identity_and_teardown_are_not_inferred_from_an_inactive_label() {
-        let before = observation();
+        let before = observation("mixed", "1min 30s");
         assert!(parse(before.as_bytes()).unwrap().stopped);
         for (from, to) in [
             ("MainPID=0", "MainPID=42"),
             ("Delegate=no", "Delegate=yes"),
-            ("KillMode=control-group", "KillMode=process"),
-            ("TimeoutStopUSec=5s", "TimeoutStopUSec=90s"),
+            ("KillMode=mixed", "KillMode=process"),
+            ("SendSIGKILL=yes", "SendSIGKILL=no"),
+            ("TimeoutStopUSec=1min 30s", "TimeoutStopUSec=5s"),
             ("DropInPaths=", "DropInPaths=/independent.conf"),
             ("Job=", "Job=45"),
         ] {

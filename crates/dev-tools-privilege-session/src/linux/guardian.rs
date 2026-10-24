@@ -56,7 +56,16 @@ impl DeadlineGuard {
     /// disposition stable while this owner exists. The checked boundary creates
     /// the guardian before exposing a fresh target cgroup to any admission;
     /// the guardian remains in the coordinator's outer service cgroup.
-    pub(super) fn start(kill: File, gate: OwnedFd, deadline: Duration) -> io::Result<Self> {
+    /// `events` is the boundary's `cgroup.events`, opened for this guardian
+    /// alone. `grace` separates the end of admission from `cgroup.kill`.
+    pub(super) fn start(
+        kill: File,
+        gate: OwnedFd,
+        events: File,
+        deadline: Duration,
+        grace: Duration,
+    ) -> io::Result<Self> {
+        let _ = (events, grace);
         if deadline > super::MAX_BOOT_DEADLINE
             || !cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
         {
@@ -411,4 +420,118 @@ unsafe fn finish_child(kill: i32, gate: i32, observed: bool) -> ! {
     } == 1;
     // SAFETY: _exit ends this raw child without Rust/foreign teardown or unwinding.
     unsafe { nix::libc::_exit(if observed && revoked && killed { 0 } else { 1 }) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::eventfd::{EfdFlags, EventFd};
+    use std::path::PathBuf;
+
+    const GRACE: Duration = Duration::from_millis(400);
+
+    /// Ordinary files that stand in for a boundary's `cgroup.kill` and
+    /// `cgroup.events`, and the boundary's admission gate.
+    struct Boundary {
+        _directory: tempfile::TempDir,
+        kill: PathBuf,
+        events: PathBuf,
+        gate: EventFd,
+    }
+
+    impl Boundary {
+        fn new(populated: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let kill = directory.path().join("cgroup.kill");
+            let events = directory.path().join("cgroup.events");
+            std::fs::write(&kill, b"").unwrap();
+            std::fs::write(
+                &events,
+                format!("populated {}\nfrozen 0\n", u8::from(populated)),
+            )
+            .unwrap();
+            Self {
+                _directory: directory,
+                kill,
+                events,
+                gate: EventFd::from_value_and_flags(
+                    0,
+                    EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+                )
+                .unwrap(),
+            }
+        }
+
+        fn guard(&self, deadline: Duration) -> DeadlineGuard {
+            DeadlineGuard::start(
+                File::options().write(true).open(&self.kill).unwrap(),
+                self.gate.as_fd().try_clone_to_owned().unwrap(),
+                File::open(&self.events).unwrap(),
+                deadline,
+                GRACE,
+            )
+            .unwrap()
+        }
+
+        fn close_gate(&self) {
+            self.gate.write(1).unwrap();
+        }
+
+        fn gate_closed(&self) -> bool {
+            let mut descriptor = [nix::poll::PollFd::new(
+                self.gate.as_fd(),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            nix::poll::poll(&mut descriptor, nix::poll::PollTimeout::ZERO).unwrap() == 1
+        }
+
+        fn killed(&self) -> bool {
+            std::fs::read(&self.kill).unwrap() == b"1"
+        }
+    }
+
+    fn from_now(delay: Duration) -> Duration {
+        super::super::boot_time().unwrap() + delay
+    }
+
+    #[test]
+    fn a_closed_gate_leaves_the_members_their_grace_before_the_kill() {
+        let boundary = Boundary::new(true);
+        let mut guard = boundary.guard(from_now(Duration::from_secs(60)));
+        let closed = Instant::now();
+        boundary.close_gate();
+        std::thread::sleep(GRACE / 2);
+        assert!(!boundary.killed(), "the members still have the grace");
+        guard.join().unwrap();
+        assert!(boundary.killed());
+        assert!(closed.elapsed() >= GRACE, "{:?}", closed.elapsed());
+    }
+
+    #[test]
+    fn an_empty_boundary_releases_its_guardian_at_once() {
+        let boundary = Boundary::new(false);
+        let mut guard = boundary.guard(from_now(Duration::from_secs(60)));
+        let closed = Instant::now();
+        boundary.close_gate();
+        guard.join().unwrap();
+        assert!(closed.elapsed() < GRACE, "{:?}", closed.elapsed());
+    }
+
+    #[test]
+    fn the_deadline_closes_admission_and_kills_after_the_grace() {
+        let boundary = Boundary::new(true);
+        let deadline = from_now(Duration::from_millis(200));
+        let mut guard = boundary.guard(deadline);
+        while super::super::boot_time().unwrap() < deadline + GRACE / 4 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(boundary.gate_closed(), "admission closes at the deadline");
+        assert!(
+            !boundary.killed(),
+            "the members have the grace after the deadline"
+        );
+        guard.join().unwrap();
+        assert!(boundary.killed());
+        assert!(super::super::boot_time().unwrap() >= deadline + GRACE);
+    }
 }

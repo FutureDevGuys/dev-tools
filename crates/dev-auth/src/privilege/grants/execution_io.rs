@@ -234,6 +234,11 @@ fn nonblocking(fd: &OwnedFd) -> Result<(), Failure> {
 
 /// Pump a descriptor-owned PTY without mixing protocol/result bytes into child
 /// output. Non-TTY execution uses the same signal channel and hard wait bound.
+/// Whether a client stops waiting for its result at boot time `now`.
+fn abandoned(now: Duration, hard_deadline: Duration) -> bool {
+    now > hard_deadline.saturating_add(Duration::from_secs(5))
+}
+
 pub(super) fn wait_execution(
     connection: &OwnedFd,
     events: OwnedFd,
@@ -285,7 +290,7 @@ pub(super) fn wait_execution(
     loop {
         let now = dev_tools_privilege_session::linux::boot_time()
             .map_err(|_| Failure::NativeUnavailable)?;
-        if now > hard_deadline.saturating_add(Duration::from_secs(5)) {
+        if abandoned(now, hard_deadline) {
             return Err(Failure::GrantExpired);
         }
         if result.is_none() && completion_by.is_some_and(|deadline| now >= deadline) {
@@ -497,6 +502,16 @@ fn write_buffer(fd: &impl AsFd, buffer: &mut VecDeque<u8>) -> Result<(), Failure
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_waits_for_the_result_of_work_stopped_at_its_deadline() {
+        let deadline = Duration::from_secs(1000);
+        assert!(
+            !abandoned(deadline + Duration::from_secs(25), deadline),
+            "SIGKILL comes 10 seconds after the deadline, then up to 15 seconds of cleanup"
+        );
+        assert!(abandoned(deadline + Duration::from_secs(3600), deadline));
+    }
     use std::time::Instant;
 
     #[test]

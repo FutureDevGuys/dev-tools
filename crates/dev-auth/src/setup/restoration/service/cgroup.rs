@@ -61,6 +61,14 @@ fn require_maintenance_absence_in(root: &KernelDirectory) -> Result<()> {
     root.validate()
 }
 
+/// Setup restarts the grant coordinator, which ends every managed job, so it
+/// refuses while one runs (ADR 0141). `populations` holds one look at each
+/// boundary inside the coordinator's unit.
+fn refuse_running_grant_work(populations: impl IntoIterator<Item = Result<bool>>) -> Result<()> {
+    let _ = populations;
+    Ok(())
+}
+
 fn maintenance_unit_name(name: &[u8]) -> Result<bool> {
     const PREFIX: &[u8] = b"dev-auth-maintenance-";
     if !name.starts_with(PREFIX) {
@@ -279,6 +287,23 @@ mod tests {
             assert!(maintenance_unit_name(invalid.as_bytes()).is_err());
         }
         assert!(maintenance_unit_name(b"dev-auth-maintenance-\xff.service").is_err());
+    }
+
+    #[test]
+    fn setup_refuses_to_restart_the_coordinator_while_managed_work_runs() {
+        assert!(refuse_running_grant_work([]).is_ok(), "no grant");
+        assert!(
+            refuse_running_grant_work([Ok(false), Ok(false)]).is_ok(),
+            "grants without a running job"
+        );
+        let refusal = refuse_running_grant_work([Ok(false), Ok(true)])
+            .expect_err("a grant with a running job")
+            .to_string();
+        assert!(refusal.contains("revoke"), "{refusal}");
+        assert!(
+            refuse_running_grant_work([Err(anyhow::anyhow!("unreadable")), Ok(false)]).is_err(),
+            "a boundary that cannot be observed"
+        );
     }
 
     #[test]

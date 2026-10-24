@@ -259,3 +259,94 @@ fn an_unlimited_use_count_still_has_a_finite_nonrenewable_deadline() {
         .iter()
         .all(|grant| grant.lifetime.state() != LeaseState::Active));
 }
+
+fn idle_limits(idle: u64, hard: u64) -> GrantLimits {
+    GrantLimits::from_administrator_policy(at(idle), at(hard)).unwrap()
+}
+
+fn idle_grant(registry: &mut GrantRegistry<Scope, Permission>, id: u128) {
+    registry
+        .issue(
+            id,
+            Scope(1000, None),
+            Permission(1),
+            idle_limits(10, 100),
+            None,
+            at(0),
+        )
+        .unwrap();
+}
+
+fn state(registry: &GrantRegistry<Scope, Permission>, id: u128) -> LeaseState {
+    registry.get(id).unwrap().lifetime.state()
+}
+
+#[test]
+fn a_grant_with_attached_work_is_not_idle_until_that_work_ends() {
+    let mut registry = GrantRegistry::new(8).unwrap();
+    idle_grant(&mut registry, 1);
+    registry.attach(1).unwrap();
+    assert_eq!(
+        registry.get(1).unwrap().lifetime.next_deadline(),
+        Some(at(100)),
+        "only the hard deadline can end a grant that runs a job"
+    );
+    registry.poll(at(50));
+    assert_eq!(state(&registry, 1), LeaseState::Active, "a running job");
+    registry.detach(1, at(60)).unwrap();
+    registry.poll(at(69));
+    assert_eq!(
+        state(&registry, 1),
+        LeaseState::Active,
+        "idleness counts from the end of the job"
+    );
+    registry.poll(at(70));
+    assert!(matches!(
+        state(&registry, 1),
+        LeaseState::Stopping {
+            reason: StopReason::IdleExpired,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn attached_work_does_not_outlast_the_hard_deadline() {
+    let mut registry = GrantRegistry::new(8).unwrap();
+    idle_grant(&mut registry, 1);
+    registry.attach(1).unwrap();
+    registry.poll(at(100));
+    assert!(matches!(
+        state(&registry, 1),
+        LeaseState::Stopping {
+            reason: StopReason::HardExpired,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_delegated_grants_attached_work_keeps_its_parent_from_idling() {
+    let mut registry = GrantRegistry::new(8).unwrap();
+    idle_grant(&mut registry, 1);
+    registry
+        .delegate(
+            1,
+            &Scope(1000, None),
+            2,
+            Scope(1000, Some(7)),
+            Permission(1),
+            idle_limits(10, 90),
+            None,
+            at(1),
+        )
+        .unwrap();
+    registry.attach(2).unwrap();
+    registry.poll(at(50));
+    assert_eq!(state(&registry, 1), LeaseState::Active, "the parent");
+    assert_eq!(
+        state(&registry, 2),
+        LeaseState::Active,
+        "the delegated grant"
+    );
+}
