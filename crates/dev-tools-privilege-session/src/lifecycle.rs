@@ -11,6 +11,7 @@ pub(crate) struct LifecycleCore {
     last_observed: Duration,
     remaining: Option<u64>,
     state: LeaseState,
+    attached: u32,
 }
 
 impl LifecycleCore {
@@ -32,6 +33,7 @@ impl LifecycleCore {
             last_observed: now,
             remaining: uses.map(NonZeroU64::get),
             state: LeaseState::Active,
+            attached: 0,
         })
     }
 
@@ -52,7 +54,13 @@ impl LifecycleCore {
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Duration> {
-        (self.state == LeaseState::Active).then(|| self.hard_deadline.min(self.idle_deadline))
+        (self.state == LeaseState::Active).then(|| {
+            if self.attached == 0 {
+                self.hard_deadline.min(self.idle_deadline)
+            } else {
+                self.hard_deadline
+            }
+        })
     }
 
     pub(crate) fn poll(&mut self, now: Duration) -> LeaseState {
@@ -63,7 +71,8 @@ impl LifecycleCore {
                 self.last_observed = now;
                 if now >= self.hard_deadline {
                     self.stop(StopReason::HardExpired);
-                } else if now >= self.idle_deadline {
+                } else if self.attached == 0 && now >= self.idle_deadline {
+                    // A grant with a running job is not idle (ADR 0141).
                     self.stop(StopReason::IdleExpired);
                 }
             }
@@ -117,6 +126,26 @@ impl LifecycleCore {
             .checked_add(self.limits.idle_timeout())
             .unwrap_or(self.hard_deadline)
             .min(self.hard_deadline);
+    }
+
+    /// One more job runs under this grant.
+    pub(crate) fn attach(&mut self) -> Result<(), SessionError> {
+        self.attached = self.attached.checked_add(1).ok_or(SessionError::Capacity)?;
+        Ok(())
+    }
+
+    /// One job under this grant ended at `now`.
+    /// One job under this grant ended at `now`. Once none remains, the idle
+    /// cutoff counts from `now`.
+    pub(crate) fn detach(&mut self, now: Duration) -> Result<(), SessionError> {
+        self.attached = self
+            .attached
+            .checked_sub(1)
+            .ok_or(SessionError::InvalidTransition)?;
+        if self.attached == 0 && self.state == LeaseState::Active && now >= self.last_observed {
+            self.touch(now);
+        }
+        Ok(())
     }
 
     pub(crate) fn stop(&mut self, reason: StopReason) {

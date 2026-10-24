@@ -94,7 +94,7 @@ case ${1:-} in
         published=true
         runtime_limit=10m
         [[ "$selected_scope" == overnight ]] && runtime_limit=13h
-        systemd-run --unit="$unit" --property=KillMode=control-group --property=SendSIGKILL=yes --property=ExitType=main --property=TimeoutStopSec=5s --property="RuntimeMaxSec=$runtime_limit" --property=Delegate=no "$fixture/dev-auth" grant-daemon --policy "$fixture/policy.json" --runtime "$fixture"
+        systemd-run --unit="$unit" --property=KillMode=mixed --property=SendSIGKILL=yes --property=ExitType=main --property=TimeoutStopSec=90s --property=OOMPolicy=continue --property=OOMScoreAdjust=-900 --property="RuntimeMaxSec=$runtime_limit" --property=Delegate=no "$fixture/dev-auth" grant-daemon --policy "$fixture/policy.json" --runtime "$fixture"
         for ((attempt = 0; attempt < 100; attempt++)); do [[ -S "$fixture/control.sock" && -S "$fixture/sudo.sock" ]] && break; sleep 0.1; done
         [[ -S "$fixture/control.sock" && -S "$fixture/sudo.sock" ]]
         if [[ "$selected_scope" == both || "$selected_scope" == user ]]; then

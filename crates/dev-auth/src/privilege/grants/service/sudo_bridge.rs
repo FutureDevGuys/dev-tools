@@ -12,10 +12,11 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         .map_err(|_| Failure::AuthorityDenied)?;
     let executable =
         File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
-    if peer.uid != 0
-        || !native::alive(peer.peer_pidfd())
-        || !native::same_file(&executable, &service.sudo.file)?
-        || admission(service.state.lock().await.phase, service.trust()).is_err()
+    // The connecting process must run the sudo program that managed sudo
+    // admits through now (ADR 0141). A drain still answers it, so that a
+    // routed invocation learns why it is refused.
+    let sudo = service.sudo_program()?;
+    if peer.uid != 0 || !native::alive(peer.peer_pidfd()) || !native::same_file(&executable, &sudo)?
     {
         return Err(Failure::AuthorityDenied);
     }
@@ -71,21 +72,28 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         } else {
             select(&state, &caller.scope, None)
         };
-        let id = match selection {
-            Ok(id) => id,
-            Err(Failure::NoGrant) => {
+        let answer = preflight_answer(selection, service.grant_use(state.phase))?;
+        let id = match answer {
+            Preflight::Admit(id) => id,
+            Preflight::Native | Preflight::Draining => {
                 drop(state);
-                reply(&descriptor, Decision::Native, Duration::ZERO, &[], None).await?;
+                let decision = if answer == Preflight::Native {
+                    Decision::Native
+                } else {
+                    Decision::Draining
+                };
+                reply(&descriptor, decision, Duration::ZERO, &[], None).await?;
                 return Ok(());
             }
-            Err(failure) => return Err(failure),
         };
         let grant = state.registry.get(id).ok_or(Failure::NoGrant)?;
-        if state.phase != Phase::Serving
-            || grant.lifetime.state() != LeaseState::Active
-            || !grant.scope.contains(&caller.scope)
-        {
+        if grant.lifetime.state() != LeaseState::Active || !grant.scope.contains(&caller.scope) {
             return Err(Failure::GrantRevoked);
+        }
+        if !native::same_file(&sudo, &service.sudo.file)? {
+            eprintln!(
+                "dev-auth managed sudo through the replaced sudo program: grant={id:032x}; the coordinator binds it at its restart"
+            );
         }
         (
             id,
@@ -133,7 +141,10 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         return Err(Failure::InvalidRequest);
     };
     if !caller.still_present()
-        || admission(service.state.lock().await.phase, service.trust()).is_err()
+        || service
+            .grant_use(service.state.lock().await.phase)
+            .admits()
+            .is_err()
         || !native::same_file(
             &File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?,
             &executable,
@@ -148,7 +159,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
     };
     let descriptors = {
         let mut state = service.state.lock().await;
-        if state.phase != Phase::Serving
+        if service.grant_use(state.phase).admits().is_err()
             || (relay_job.is_none() && state.jobs.len() >= MAX_EXECUTIONS)
         {
             return Err(Failure::Busy);
@@ -216,7 +227,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
             return Err(Failure::Busy);
         }
         if let Some(boundary) = new_boundary {
-            state.jobs.insert(
+            state.attach_job(
                 job_id,
                 Job {
                     grant: id,
@@ -228,7 +239,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
                     relay: RelayAdmission::Ordinary,
                     captured: None,
                 },
-            );
+            )?;
         }
         descriptors
     };
@@ -242,6 +253,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
             deadline,
             descriptors,
             setup_lease,
+            sudo: executable,
         },
     )
     .await;
@@ -260,6 +272,8 @@ struct Admission {
     deadline: Duration,
     descriptors: Vec<OwnedFd>,
     setup_lease: Option<dev_tools_installation::InstallationLock>,
+    /// The sudo image the invocation was admitted with.
+    sudo: File,
 }
 
 async fn admitted(
@@ -274,6 +288,7 @@ async fn admitted(
         deadline,
         descriptors,
         setup_lease,
+        sudo,
     } = admission;
     reply(
         descriptor,
@@ -297,7 +312,7 @@ async fn admitted(
             .registry
             .get(grant_id)
             .is_none_or(|grant| grant.lifetime.state() != LeaseState::Active)
-            || super::admission(state.phase, service.trust()).is_err()
+            || service.grant_use(state.phase).admits().is_err()
         {
             return Err(Failure::GrantRevoked);
         }
@@ -365,7 +380,7 @@ async fn admitted(
     let verified = {
         let state = service.state.lock().await;
         let job = state.jobs.get(&job_id).ok_or(Failure::NoGrant)?;
-        completed_by_sudo(peer, &service.sudo.file, job.boundary.directory())
+        completed_by_sudo(peer, &sudo, job.boundary.directory())
     };
     match verified {
         Ok(true) => {}
@@ -389,7 +404,7 @@ async fn admitted(
 }
 
 /// One look at whether completion came from the admitted sudo: alive, still
-/// running the bound sudo image, inside the job's boundary.
+/// running the image it was admitted with, inside the job's boundary.
 fn completed_by_sudo(
     peer: &crate::linux_admission::LinuxPeerEvidence,
     sudo: &File,

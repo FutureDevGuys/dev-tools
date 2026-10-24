@@ -36,6 +36,8 @@ pub(crate) enum Refusal {
     Unreachable,
     Unanswered,
     Denied,
+    /// The coordinator drains and admits no new sudo (ADR 0141).
+    Draining,
 }
 
 impl Refusal {
@@ -44,6 +46,7 @@ impl Refusal {
             Self::Unreachable => c"dev-auth: managed sudo routing is selected, but the grant coordinator is unreachable; start dev-auth-grants.service to restore native sudo\n",
             Self::Unanswered => c"dev-auth: the grant coordinator did not answer; retry, or restart dev-auth-grants.service to end every grant and restore native sudo\n",
             Self::Denied => c"dev-auth: managed sudo admission denied; see `dev-auth privilege grant status`, or run `dev-auth privilege leave` to restore native sudo\n",
+            Self::Draining => c"dev-auth: the grant coordinator is draining and admits no new sudo; running commands continue; rerun this step once it restarts\n",
         }
     }
 }
@@ -254,12 +257,13 @@ enum Route {
 /// How this invocation proceeds after the coordinator's preflight answer. The
 /// authenticated coordinator owns routing: its native answer means no grant is
 /// selected, including when it withdrew a marker this invocation saw above.
-fn route(decision: Decision) -> io::Result<Route> {
+fn route(decision: Decision) -> Result<Route, Refusal> {
     match decision {
         Decision::Native => Ok(Route::Native),
         Decision::Managed => Ok(Route::Managed),
         Decision::Relay => Ok(Route::Relay),
-        _ => Err(denied()),
+        Decision::Draining => Err(Refusal::Draining),
+        _ => Err(Refusal::Denied),
     }
 }
 
@@ -640,11 +644,13 @@ mod tests {
         assert_eq!(route(Decision::Managed).unwrap(), Route::Managed);
         assert_eq!(route(Decision::Relay).unwrap(), Route::Relay);
         for denial in [Decision::Denied, Decision::Unavailable, Decision::Attached] {
-            assert_eq!(
-                route(denial).unwrap_err().kind(),
-                io::ErrorKind::PermissionDenied
-            );
+            assert_eq!(route(denial), Err(Refusal::Denied));
         }
+    }
+
+    #[test]
+    fn a_draining_coordinator_tells_the_user_to_rerun_the_step() {
+        assert_eq!(route(Decision::Draining), Err(Refusal::Draining));
     }
 
     #[test]
@@ -816,6 +822,7 @@ mod tests {
             (Refusal::Unreachable, "start dev-auth-grants.service"),
             (Refusal::Unanswered, "restart dev-auth-grants.service"),
             (Refusal::Denied, "dev-auth privilege leave"),
+            (Refusal::Draining, "rerun this step"),
         ] {
             let text = refusal.message().to_str().unwrap();
             assert!(text.starts_with("dev-auth: "), "{text}");

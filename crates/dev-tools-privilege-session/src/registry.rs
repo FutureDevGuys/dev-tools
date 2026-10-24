@@ -147,6 +147,31 @@ impl<S: Constraint, A: Constraint> GrantRegistry<S, A> {
         Ok(())
     }
 
+    /// A job starts under `id`. The grant and each ancestor count it as
+    /// attached work until `detach` reports its end.
+    pub fn attach(&mut self, id: GrantId) -> Result<(), SessionError> {
+        for grant in self.lineage(id)? {
+            self.records
+                .get_mut(&grant)
+                .ok_or(SessionError::UnknownGrant)?
+                .lifetime
+                .attach()?;
+        }
+        Ok(())
+    }
+
+    /// A job under `id` ended at `now`.
+    pub fn detach(&mut self, id: GrantId, now: Duration) -> Result<(), SessionError> {
+        for grant in self.lineage(id)? {
+            self.records
+                .get_mut(&grant)
+                .ok_or(SessionError::UnknownGrant)?
+                .lifetime
+                .detach(now)?;
+        }
+        Ok(())
+    }
+
     /// Expiry and parent loss become denial before native cleanup starts.
     pub fn poll(&mut self, now: Duration) {
         for record in self.records.values_mut() {
@@ -260,6 +285,12 @@ impl<S: Constraint, A: Constraint> GrantRegistry<S, A> {
             return Err(SessionError::Capacity);
         }
         Ok(())
+    }
+
+    fn lineage(&self, id: GrantId) -> Result<Vec<GrantId>, SessionError> {
+        let mut lineage = vec![id];
+        lineage.extend(self.ancestors(id)?);
+        Ok(lineage)
     }
 
     fn ancestors(&self, mut id: GrantId) -> Result<Vec<GrantId>, SessionError> {

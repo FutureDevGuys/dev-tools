@@ -46,6 +46,8 @@ Rebinding in place would add a second trust path that must match startup. It wou
 
 The exit waits for running jobs, so `KillMode=control-group` finds no managed job to stop. Grants without a running job end at the exit, and their accounts have native sudo after the restart. A drain lasts at most until the latest hard deadline among the grants that still run a job.
 
+[ADR 0141](0141-graceful-ends-and-drained-stops-for-managed-work.md) keeps new work under active grants admitted across a sudo-program change, answers a routed sudo with `draining` during any drain, and adds a bounded drain for an orderly stop.
+
 ### Supervision acts only on an observed answer
 
 Reaping and supervision end a grant or stop a job only on an observed answer. A look that could not be taken changes nothing and is retried on the next pass. Admission still needs a positive look: a trust input, caller, launch owner or sudo peer that could not be observed refuses that one admission. Each observation is classified as follows.

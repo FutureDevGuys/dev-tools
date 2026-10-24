@@ -44,6 +44,8 @@ The unit keeps `KillMode=control-group`, `SendSIGKILL=yes` and `TimeoutStopSec=5
 
 The coordinator therefore exits only when its own state is lost.
 
+[ADR 0141](0141-graceful-ends-and-drained-stops-for-managed-work.md) replaces `KillMode=control-group` and the 5-second stop timeout with `KillMode=mixed` and `TimeoutStopSec=90s`, so that an orderly stop drains, and keeps the rule that a coordinator exit stops every managed job.
+
 ### Startup retries an unanswered service manager
 
 Startup confirms the unit's crash-cleanup contract before it creates any listener, so admission stays closed while the unit is unverified. Each attempt waits up to three seconds for an answer. An attempt is unanswered when it times out, when the system bus cannot be reached, or when the bus replies that the service manager has no name owner, cannot be started or did not reply. An unanswered attempt is retried after 250 milliseconds, then after a delay that doubles up to five seconds. After 60 seconds without an answer the coordinator exits, and `Restart=on-failure` starts it again two seconds later. Any other reply fails at once, including an error from the service manager and an answer that shows the unit breaks the contract. Each retry writes one journal line.

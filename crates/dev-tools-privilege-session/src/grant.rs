@@ -122,6 +122,14 @@ impl GrantLifecycle {
         self.core.record_activity(now)
     }
 
+    pub(crate) fn attach(&mut self) -> Result<(), SessionError> {
+        self.core.attach()
+    }
+
+    pub(crate) fn detach(&mut self, now: Duration) -> Result<(), SessionError> {
+        self.core.detach(now)
+    }
+
     pub fn stop(&mut self, reason: StopReason) {
         self.core.stop(reason);
     }

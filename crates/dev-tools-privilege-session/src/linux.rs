@@ -19,6 +19,12 @@ use std::time::Duration;
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 /// Absolute Linux timer deadlines must fit the kernel's signed nanosecond ktime.
 pub const MAX_BOOT_DEADLINE: Duration = Duration::from_nanos(i64::MAX as u64);
+/// How long a stopped boundary's members have between SIGTERM and SIGKILL.
+/// It is fixed: no caller, request or policy chooses it (ADR 0141).
+pub const TERMINATION_GRACE: Duration = Duration::from_secs(10);
+/// The OOM score adjustment every job starts with: the kernel's ordinary
+/// ranking, never the coordinator's protected value (ADR 0141).
+const JOB_OOM_SCORE_ADJ: &std::ffi::CStr = c"0";
 
 pub fn boot_time() -> io::Result<Duration> {
     let time =
@@ -41,7 +47,7 @@ pub struct ExecutionBoundary {
     events: File,
     kill: File,
     gate: AdmissionGate,
-    stopping: bool,
+    ending: Ending,
     deadline: Duration,
     removed: bool,
     deadline_guard: Option<guardian::DeadlineGuard>,
@@ -49,7 +55,9 @@ pub struct ExecutionBoundary {
 
 impl ExecutionBoundary {
     pub fn create(parent: &File, name: &str, deadline: Duration) -> io::Result<Self> {
-        if deadline > MAX_BOOT_DEADLINE
+        if deadline
+            .checked_add(TERMINATION_GRACE)
+            .is_none_or(|kill_at| kill_at > MAX_BOOT_DEADLINE)
             || name.is_empty()
             || name.len() > 96
             || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -72,10 +80,14 @@ impl ExecutionBoundary {
             let events = open_control(&directory, "cgroup.events", OFlags::RDONLY)?;
             let kill = open_control(&directory, "cgroup.kill", OFlags::WRONLY)?;
             let gate = AdmissionGate::new()?;
+            // The guardian reads its own open file description, so this
+            // owner's reads never consume the change notifications it waits on.
             let deadline_guard = guardian::DeadlineGuard::start(
                 kill.try_clone()?,
                 gate.event.as_fd().try_clone_to_owned()?,
+                open_control(&directory, "cgroup.events", OFlags::RDONLY)?,
                 deadline,
+                TERMINATION_GRACE,
             )?;
             Ok(Self {
                 parent: parent.try_clone()?,
@@ -84,7 +96,7 @@ impl ExecutionBoundary {
                 events,
                 kill,
                 gate,
-                stopping: false,
+                ending: Ending::Running,
                 deadline,
                 removed: false,
                 deadline_guard: Some(deadline_guard),
@@ -124,7 +136,7 @@ impl ExecutionBoundary {
     }
 
     pub fn permit(&self, ancestor_gates: Vec<OwnedFd>) -> io::Result<SpawnPermit> {
-        if self.stopping || self.removed || boot_time()? >= self.deadline {
+        if self.ending != Ending::Running || self.removed || boot_time()? >= self.deadline {
             return Err(denied());
         }
         let procs = open_control(&self.directory, "cgroup.procs", OFlags::WRONLY)?;
@@ -150,7 +162,7 @@ impl ExecutionBoundary {
     /// The recipient writes its own PID using the kernel's zero selector; it
     /// does not ask a coordinator to migrate an unretained numeric PID.
     pub fn attachment(&self) -> io::Result<(OwnedFd, OwnedFd, Duration)> {
-        if self.stopping || self.removed || boot_time()? >= self.deadline {
+        if self.ending != Ending::Running || self.removed || boot_time()? >= self.deadline {
             return Err(denied());
         }
         Ok((
@@ -160,35 +172,87 @@ impl ExecutionBoundary {
         ))
     }
 
+    /// End this boundary's work: close its admission gate, send SIGTERM to
+    /// every member, and write `cgroup.kill` once `TERMINATION_GRACE` has
+    /// passed (ADR 0141). It never waits; call it again to advance the end.
+    /// The deadline guardian kills at the same time if this owner cannot.
     pub fn stop(&mut self) -> io::Result<()> {
-        self.stopping = true;
+        self.end(true)
+    }
+
+    /// End a boundary whose members all live in nested boundaries that its
+    /// owner stops with it: close the gate and kill what remains once the
+    /// grace passes, but send no signal, so that each member receives one
+    /// SIGTERM, from its own boundary.
+    pub fn stop_enclosing(&mut self) -> io::Result<()> {
+        self.end(false)
+    }
+
+    fn end(&mut self, ask: bool) -> io::Result<()> {
         let gate = self.gate.revoke();
-        let kill = if self.removed {
-            Ok(())
-        } else {
-            self.kill.write_at(b"1", 0).and_then(|written| {
-                if written == 1 {
-                    Ok(())
-                } else {
-                    Err(io::ErrorKind::WriteZero.into())
+        let step = match boot_time() {
+            Ok(now) => self.ending.advance(now, self.deadline, TERMINATION_GRACE),
+            Err(_) => {
+                self.ending = Ending::Killed;
+                Step::Kill
+            }
+        };
+        let ended = match step {
+            // SIGTERM is a request; the kill at the end of the grace is the
+            // guarantee, so a member that the walk misses is still ended.
+            Step::Terminate => {
+                if ask {
+                    let _ = self.terminate();
                 }
-            })
+                Ok(())
+            }
+            Step::Kill => self.kill(),
+            Step::Wait => Ok(()),
         };
         let guard = if gate.is_ok() {
-            match self.deadline_guard.as_mut() {
-                Some(guard) => match guard.join() {
-                    Ok(()) => {
-                        self.deadline_guard.take();
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                },
-                None => Ok(()),
-            }
+            self.settle_guardian()
         } else {
             Err(denied())
         };
-        gate.and(kill).and(guard)
+        gate.and(ended).and(guard)
+    }
+
+    /// Whether this boundary's work has begun to end.
+    pub fn stopping(&self) -> bool {
+        self.ending != Ending::Running
+    }
+
+    /// Reap the deadline guardian once it has exited, without waiting.
+    fn settle_guardian(&mut self) -> io::Result<()> {
+        if let Some(guard) = self.deadline_guard.as_mut() {
+            if guard.try_join()? {
+                self.deadline_guard.take();
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask every member to exit: SIGTERM, then SIGCONT so that a stopped
+    /// member also sees the request.
+    fn terminate(&self) -> io::Result<()> {
+        if self.removed {
+            return Ok(());
+        }
+        self.signal(nix::sys::signal::Signal::SIGTERM)?;
+        self.signal(nix::sys::signal::Signal::SIGCONT)
+    }
+
+    fn kill(&self) -> io::Result<()> {
+        if self.removed {
+            return Ok(());
+        }
+        self.kill.write_at(b"1", 0).and_then(|written| {
+            if written == 1 {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::WriteZero.into())
+            }
+        })
     }
 
     pub fn is_empty(&self) -> io::Result<bool> {
@@ -229,9 +293,12 @@ impl ExecutionBoundary {
             }
             validate_directory(&directory)?;
             let mut text = String::new();
-            open_control(&directory, "cgroup.procs", OFlags::RDONLY)?
-                .take(65_537)
-                .read_to_string(&mut text)?;
+            match open_control(&directory, "cgroup.procs", OFlags::RDONLY) {
+                Ok(procs) => procs.take(65_537).read_to_string(&mut text)?,
+                // A nested cgroup removed during the walk has no member left.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if text.len() > 65_536 {
                 return Err(invalid());
             }
@@ -245,12 +312,16 @@ impl ExecutionBoundary {
             for entry in std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
-                    directories.push(File::from(rustix::fs::openat(
+                    match rustix::fs::openat(
                         &directory,
                         entry.file_name(),
                         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
-                    )?));
+                    ) {
+                        Ok(nested) => directories.push(File::from(nested)),
+                        Err(rustix::io::Errno::NOENT) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
         }
@@ -268,7 +339,12 @@ impl ExecutionBoundary {
             let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
             let membership = match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
                 Ok(membership) => membership,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(nix::libc::ESRCH) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(error),
             };
             let within = membership
@@ -297,12 +373,14 @@ impl ExecutionBoundary {
         if self.removed {
             return Ok(());
         }
-        if !self.stopping
-            || !self.gate.revoked
-            || self.deadline_guard.is_some()
-            || !self.is_empty()?
-        {
+        if self.ending == Ending::Running || !self.gate.revoked || !self.is_empty()? {
             return Err(denied());
+        }
+        // The guardian of an empty boundary whose gate is closed exits at
+        // once, so this bounded join only proves that it did.
+        if let Some(guard) = self.deadline_guard.as_mut() {
+            guard.join()?;
+            self.deadline_guard.take();
         }
         let current = File::from(rustix::fs::openat(
             &self.parent,
@@ -325,9 +403,59 @@ impl Drop for ExecutionBoundary {
     fn drop(&mut self) {
         // Drop is fail-closed best effort, never the proof used for a successful
         // revocation result. The product also retains service-manager cleanup.
-        let _ = self.stop();
+        // A boundary dropped without a stop gets no grace.
+        let _ = self.gate.revoke();
+        let _ = self.kill();
+        self.ending = Ending::Killed;
+        if let Some(mut guard) = self.deadline_guard.take() {
+            let _ = guard.join();
+        }
         if self.is_empty().unwrap_or(false) {
             let _ = self.remove();
+        }
+    }
+}
+
+/// Where a boundary is in ending its members' work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Running,
+    /// The members were asked to exit, and SIGKILL follows at `kill_at`.
+    Terminating {
+        kill_at: Duration,
+    },
+    Killed,
+}
+
+/// What a stopping boundary does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Terminate,
+    Kill,
+    Wait,
+}
+
+impl Ending {
+    /// The next step at boot time `now` for a boundary whose hard deadline is
+    /// `deadline`. The members are asked to exit when the stop starts, and
+    /// killed once `grace` has passed since the stop or the deadline,
+    /// whichever came first.
+    fn advance(&mut self, now: Duration, deadline: Duration, grace: Duration) -> Step {
+        let kill_at = match *self {
+            Self::Running => now.min(deadline).saturating_add(grace),
+            Self::Terminating { kill_at } => kill_at,
+            Self::Killed => return Step::Kill,
+        };
+        if now >= kill_at {
+            *self = Self::Killed;
+            return Step::Kill;
+        }
+        let started = *self == Self::Running;
+        *self = Self::Terminating { kill_at };
+        if started {
+            Step::Terminate
+        } else {
+            Step::Wait
         }
     }
 }
@@ -416,7 +544,7 @@ fn enter_user_session(session: UserSession) -> io::Result<()> {
     // keyring or descriptor flags, and passes no pointer except a null name.
     unsafe {
         nix::libc::umask(session.umask as nix::libc::mode_t);
-        // A terminal job already leads the session it created for its terminal.
+        // A job already leads the session it created in `enter_job`.
         if nix::libc::getsid(0) != nix::libc::getpid() && nix::libc::setsid() < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -435,6 +563,64 @@ fn enter_user_session(session: UserSession) -> io::Result<()> {
             u32::MAX,
             nix::libc::CLOSE_RANGE_CLOEXEC,
         ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Restore the default action of the signals that ask a process to exit, so
+/// that a child which receives one before it executes its image ends instead
+/// of running a handler inherited from its owner. It uses only
+/// async-signal-safe system calls and allocates nothing.
+fn default_termination_signals() -> io::Result<()> {
+    for signal in [
+        nix::libc::SIGTERM,
+        nix::libc::SIGINT,
+        nix::libc::SIGHUP,
+        nix::libc::SIGQUIT,
+    ] {
+        // SAFETY: the zeroed action is SIG_DFL with an empty mask and no
+        // flags; sigaction only reads it and writes no old action.
+        unsafe {
+            let action: nix::libc::sigaction = std::mem::zeroed();
+            if nix::libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Give a forked child about to exec a job the process state every job
+/// starts with (ADR 0141): `oom_score_adj` as its OOM score adjustment, so it
+/// never inherits the coordinator's protection, and a session and process
+/// group of its own, so a signal to its group never reaches the coordinator.
+/// A terminal job's session is controlled by its relayed terminal. Call it
+/// before entering a caller's mount namespace, whose `/proc` the caller may
+/// have mounted. It uses only async-signal-safe system calls and allocates
+/// nothing.
+fn enter_job(controlling_terminal: bool, oom_score_adj: &std::ffi::CStr) -> io::Result<()> {
+    let value = oom_score_adj.to_bytes();
+    // SAFETY: each call changes only this process's own OOM score, session or
+    // terminal, and passes only the static path and the borrowed value.
+    unsafe {
+        let descriptor = nix::libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            nix::libc::O_WRONLY | nix::libc::O_CLOEXEC,
+        );
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let written = nix::libc::write(descriptor, value.as_ptr().cast(), value.len());
+        let error = io::Error::last_os_error();
+        nix::libc::close(descriptor);
+        if written != value.len() as isize {
+            return Err(error);
+        }
+        if nix::libc::setsid() < 0
+            || (controlling_terminal && nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) != 0)
         {
             return Err(io::Error::last_os_error());
         }
@@ -536,6 +722,7 @@ impl SpawnPermit {
         // checking the closed gate makes both sides of revocation fail closed.
         unsafe {
             command.pre_exec(move || {
+                default_termination_signals()?;
                 if nix::libc::write(self.procs.as_raw_fd(), b"0".as_ptr().cast(), 1) != 1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -563,16 +750,11 @@ impl SpawnPermit {
                 {
                     return Err(denied());
                 }
+                enter_job(context.controlling_terminal, JOB_OOM_SCORE_ADJ)?;
                 if let Some(namespace) = &context.mount_namespace {
                     if nix::libc::setns(namespace.as_raw_fd(), nix::libc::CLONE_NEWNS) != 0 {
                         return Err(io::Error::last_os_error());
                     }
-                }
-                if context.controlling_terminal
-                    && (nix::libc::setsid() < 0
-                        || nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) != 0)
-                {
-                    return Err(io::Error::last_os_error());
                 }
                 if nix::libc::fchdir(context.working_directory.as_raw_fd()) != 0
                     || nix::libc::setgroups(
@@ -754,6 +936,148 @@ mod tests {
             "control: the owner's state reaches the child"
         );
         assert_eq!(user, 0, "mask=1 descriptor=2 keyring=4 session=8");
+    }
+
+    /// What a forked child sees after it enters a job whose OOM score
+    /// adjustment is `oom`, as bits of its exit code: 1 when it does not lead
+    /// its own session, 2 when it still shares its parent's process group, and
+    /// 4 when its adjustment is not `oom`.
+    fn job_view(oom: &std::ffi::CStr) -> i32 {
+        // SAFETY: the child calls only async-signal-safe system calls and
+        // `_exit`; it never returns into the test harness.
+        match unsafe { nix::unistd::fork() }.unwrap() {
+            nix::unistd::ForkResult::Child => unsafe {
+                let parent_group = nix::libc::getpgrp();
+                if enter_job(false, oom).is_err() {
+                    nix::libc::_exit(64);
+                }
+                let mut seen = 0;
+                if nix::libc::getsid(0) != nix::libc::getpid() {
+                    seen |= 1;
+                }
+                if nix::libc::getpgrp() == parent_group {
+                    seen |= 2;
+                }
+                let descriptor = nix::libc::open(
+                    c"/proc/self/oom_score_adj".as_ptr(),
+                    nix::libc::O_RDONLY | nix::libc::O_CLOEXEC,
+                );
+                let mut buffer = [0_u8; 16];
+                let length = if descriptor < 0 {
+                    -1
+                } else {
+                    nix::libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len())
+                };
+                let expected = oom.to_bytes();
+                if length != expected.len() as isize + 1
+                    || buffer.get(..expected.len()) != Some(expected)
+                {
+                    seen |= 4;
+                }
+                nix::libc::_exit(seen)
+            },
+            nix::unistd::ForkResult::Parent { child } => {
+                match nix::sys::wait::waitpid(child, None).unwrap() {
+                    nix::sys::wait::WaitStatus::Exited(_, code) => code,
+                    other => panic!("child did not exit: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_job_leads_its_own_session_and_takes_its_own_oom_score() {
+        // An unprivileged test may only raise its adjustment, as a job of the
+        // coordinator raises the protected -900 to 0, so it asks for one more
+        // than it has.
+        let current: i32 = std::fs::read_to_string("/proc/self/oom_score_adj")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let wanted = std::ffi::CString::new((current + 1).min(1000).to_string()).unwrap();
+        assert_eq!(job_view(&wanted), 0, "session=1 group=2 oom=4");
+    }
+
+    extern "C" fn inherited_handler(_: nix::libc::c_int) {}
+
+    #[test]
+    fn a_job_that_is_asked_to_exit_before_it_runs_takes_the_default_action() {
+        // SAFETY: the child installs a handler in its own copy of the
+        // process, calls only async-signal-safe functions and `_exit`.
+        match unsafe { nix::unistd::fork() }.unwrap() {
+            nix::unistd::ForkResult::Child => unsafe {
+                let mut owner: nix::libc::sigaction = std::mem::zeroed();
+                owner.sa_sigaction = inherited_handler as extern "C" fn(nix::libc::c_int) as usize;
+                if nix::libc::sigaction(nix::libc::SIGTERM, &owner, std::ptr::null_mut()) != 0
+                    || default_termination_signals().is_err()
+                {
+                    nix::libc::_exit(64);
+                }
+                let mut current: nix::libc::sigaction = std::mem::zeroed();
+                nix::libc::sigaction(nix::libc::SIGTERM, std::ptr::null(), &mut current);
+                nix::libc::_exit(i32::from(current.sa_sigaction != nix::libc::SIG_DFL))
+            },
+            nix::unistd::ForkResult::Parent { child } => assert_eq!(
+                nix::sys::wait::waitpid(child, None).unwrap(),
+                nix::sys::wait::WaitStatus::Exited(child, 0),
+                "the owner's SIGTERM handler survived into the job"
+            ),
+        }
+    }
+
+    fn at(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_stopped_boundary_asks_its_members_to_exit_before_it_kills_them() {
+        let deadline = at(1000);
+        let mut ending = Ending::Running;
+        assert_eq!(
+            ending.advance(at(100), deadline, TERMINATION_GRACE),
+            Step::Terminate
+        );
+        assert_eq!(
+            ending.advance(at(109), deadline, TERMINATION_GRACE),
+            Step::Wait,
+            "the members still have the grace"
+        );
+        assert_eq!(
+            ending.advance(at(110), deadline, TERMINATION_GRACE),
+            Step::Kill
+        );
+        assert_eq!(
+            ending.advance(at(111), deadline, TERMINATION_GRACE),
+            Step::Kill,
+            "a later look kills again"
+        );
+        assert_eq!(TERMINATION_GRACE, at(10), "the grace ADR 0141 states");
+    }
+
+    #[test]
+    fn no_member_outlives_its_hard_deadline_by_more_than_the_grace() {
+        let deadline = at(1000);
+        let mut late = Ending::Running;
+        assert_eq!(
+            late.advance(at(1004), deadline, TERMINATION_GRACE),
+            Step::Terminate
+        );
+        assert_eq!(
+            late.advance(at(1009), deadline, TERMINATION_GRACE),
+            Step::Wait
+        );
+        assert_eq!(
+            late.advance(at(1010), deadline, TERMINATION_GRACE),
+            Step::Kill,
+            "the grace counts from the deadline"
+        );
+        let mut wedged = Ending::Running;
+        assert_eq!(
+            wedged.advance(at(1010), deadline, TERMINATION_GRACE),
+            Step::Kill,
+            "a stop that begins after the deadline's grace kills at once"
+        );
     }
 
     #[test]

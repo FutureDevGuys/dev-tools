@@ -5,7 +5,7 @@ use super::{
     Authority, ControlRequest, ControlResult, Failure, Grant, GrantRequest, GrantRequirement,
     GrantScope, GrantState,
 };
-use dev_tools_privilege_session::linux::{boot_time, ExecutionBoundary};
+use dev_tools_privilege_session::linux::{boot_time, ExecutionBoundary, TERMINATION_GRACE};
 use dev_tools_privilege_session::Constraint;
 use dev_tools_privilege_session::{
     Cleanup, GrantId, GrantRegistry, LeaseState, SessionError, StopReason,
@@ -200,25 +200,71 @@ struct State {
     unseen: Unseen,
 }
 
-/// Whether the coordinator admits new managed work (ADR 0138).
+/// Whether the coordinator admits new managed work (ADR 0138, ADR 0141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Serving,
-    /// A watched trust input changed. Nothing new is admitted under the old
-    /// trust, running jobs finish under their grants, and the coordinator then
-    /// exits so the service manager starts one that binds the new state.
-    Draining(Input),
+    /// Nothing new is admitted, and running jobs finish under their grants.
+    Draining(Drain),
     /// Shutdown stopped every grant.
     Stopping,
 }
 
+/// Why a coordinator drains, which decides when the drain ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// A watched trust input changed. The drain ends once no managed job or
+    /// connection remains, and the coordinator then exits so the service
+    /// manager starts one that binds the new state.
+    Changed(Input),
+    /// The service manager asked the coordinator to stop. The drain ends
+    /// once no managed job remains, or at boot time `until`.
+    Stop { until: Duration },
+}
+
+/// Why the coordinator stops serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    Stopped,
+    Changed(Input),
+}
+
 impl Phase {
-    /// The changed trust input to exit for once a draining coordinator runs
-    /// no managed job.
-    fn drained(self, running_jobs: usize) -> Option<Input> {
+    /// The phase once the service manager asks the coordinator to stop at
+    /// boot time `now`.
+    fn stop_requested(self, now: Duration) -> Self {
         match self {
-            Self::Draining(input) if running_jobs == 0 => Some(input),
-            _ => None,
+            Self::Serving | Self::Draining(Drain::Changed(_)) => Self::Draining(Drain::Stop {
+                until: now.saturating_add(STOP_DRAIN),
+            }),
+            Self::Draining(Drain::Stop { .. }) | Self::Stopping => self,
+        }
+    }
+
+    /// Why a coordinator in this phase stops serving at boot time `now`, with
+    /// `running_jobs` managed jobs, `active_grants` active grants and, when
+    /// `connections_idle`, no open connection. Grants keep their use across a
+    /// sudo-program change, so that drain also waits for them to end.
+    fn drained(
+        self,
+        running_jobs: usize,
+        active_grants: usize,
+        connections_idle: bool,
+        now: Duration,
+    ) -> Option<Exit> {
+        match self {
+            Self::Draining(Drain::Changed(input))
+                if running_jobs == 0
+                    && connections_idle
+                    && (input != Input::SudoProgram || active_grants == 0) =>
+            {
+                Some(Exit::Changed(input))
+            }
+            Self::Draining(Drain::Stop { until }) if running_jobs == 0 || now >= until => {
+                Some(Exit::Stopped)
+            }
+            Self::Stopping => Some(Exit::Stopped),
+            Self::Serving | Self::Draining(_) => None,
         }
     }
 }
@@ -259,6 +305,16 @@ impl Unseen {
             Ok(_) if self.0.remove(&subject) => eprintln!("dev-auth observes {subject} again"),
             _ => {}
         }
+    }
+}
+
+impl State {
+    /// Record a job under its grant, which counts it as attached work and so
+    /// does not idle while it runs (ADR 0141).
+    fn attach_job(&mut self, id: GrantId, job: Job) -> Result<(), Failure> {
+        self.registry.attach(job.grant).map_err(session_failure)?;
+        self.jobs.insert(id, job);
+        Ok(())
     }
 }
 
@@ -336,7 +392,7 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
     }
     let policy: Policy = serde_json::from_slice(&bytes).map_err(|_| Failure::InvalidRequest)?;
     policy.validate()?;
-    let sudo = Bound::open(Input::SudoProgram, Path::new(&policy.sudo_program))?;
+    let sudo = bind_sudo(&policy)?;
     if FileStamp::of(&policy_source.file)? != policy_source.stamp {
         return Err(Failure::AuthorityDenied);
     }
@@ -449,22 +505,25 @@ async fn run(
     let mut connections = tokio::task::JoinSet::new();
     let mut login_tick = 0_u32;
     let mut login_check: Option<tokio::task::JoinHandle<()>> = None;
-    let mut drained = None;
-    loop {
+    let exit = loop {
         tokio::select! {
             biased;
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
+            _ = terminate.recv() => {
+                if let Some(exit) = request_stop(&service, connections.is_empty()).await { break exit; }
+            }
+            _ = interrupt.recv() => {
+                if let Some(exit) = request_stop(&service, connections.is_empty()).await { break exit; }
+            }
             readiness = timer.readable() => {
                 let mut readiness = readiness.map_err(|_| Failure::NativeUnavailable)?;
                 let mut bytes = [0_u8; 8];
                 let _ = readiness.try_io(|fd| nix::unistd::read(fd.get_ref(), &mut bytes).map_err(io::Error::from));
                 reap(&service).await.map_err(integrity_lost)?;
-                if connections.is_empty() {
+                {
                     let state = service.state.lock().await;
-                    drained = state.phase.drained(state.jobs.len());
-                    if drained.is_some() {
-                        break;
+                    let observed = self::now().map_err(|_| integrity_lost(Integrity::Clock))?;
+                    if let Some(exit) = state.phase.drained(state.jobs.len(), active_grants(&state), connections.is_empty(), observed) {
+                        break exit;
                     }
                 }
                 login_tick += 1;
@@ -472,7 +531,7 @@ async fn run(
                     login_tick = 0;
                     if login_check.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
                         if let Some(finished) = login_check.take() {
-                            if finished.await.is_err() { break; }
+                            if finished.await.is_err() { break Exit::Stopped; }
                         }
                         let service = Arc::clone(&service);
                         login_check = Some(tokio::spawn(async move { check_logins(&service).await; }));
@@ -480,7 +539,7 @@ async fn run(
                 }
             }
             completed = connections.join_next(), if !connections.is_empty() => {
-                if completed.is_some_and(|result| result.is_err()) { break; }
+                if completed.is_some_and(|result| result.is_err()) { break Exit::Stopped; }
             }
             readiness = listener.readable(), if connections.len() < MAX_CONNECTIONS => {
                 let mut readiness = readiness.map_err(|_| Failure::NativeUnavailable)?;
@@ -506,50 +565,121 @@ async fn run(
                 }
             }
         }
-    }
-    if let Some(input) = drained {
+    };
+    if let Exit::Changed(input) = exit {
         eprintln!(
             "dev-auth grant coordinator exiting: the {input} changed and no managed job remains; the service manager starts a coordinator that binds the new state"
         );
     }
     {
         let mut state = service.state.lock().await;
+        if matches!(state.phase, Phase::Draining(Drain::Stop { .. })) {
+            eprintln!(
+                "dev-auth grant coordinator stopping {} grant(s); {} job(s) still running receive SIGTERM and are killed {} seconds later",
+                state.registry.iter().filter(|grant| !grant.lifetime.state().is_terminal()).count(),
+                state.jobs.len(),
+                TERMINATION_GRACE.as_secs()
+            );
+        }
         state.phase = Phase::Stopping;
         state.registry.stop_all(StopReason::BrokerShutdown, now()?);
     }
-    for _ in 0..50 {
-        reap(&service).await.map_err(integrity_lost)?;
-        if service
-            .state
-            .lock()
-            .await
-            .registry
-            .iter()
-            .all(|grant| grant.lifetime.state().is_terminal())
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    connections.abort_all();
-    while connections.join_next().await.is_some() {}
+    let ended = settle(&service, None).await.map_err(integrity_lost)?;
+    finish_connections(&mut connections, CONNECTION_SETTLE).await;
     if let Some(login_check) = login_check {
         login_check.abort();
         let _ = login_check.await;
     }
-    if service
-        .state
-        .lock()
-        .await
-        .registry
-        .iter()
-        .any(|grant| !grant.lifetime.state().is_terminal())
-    {
+    if !ended {
         return Err(Failure::CleanupFailed);
     }
-    match drained {
-        Some(_) => Err(Failure::AuthorityDenied),
-        None => Ok(()),
+    match exit {
+        Exit::Changed(_) => Err(Failure::AuthorityDenied),
+        Exit::Stopped => Ok(()),
+    }
+}
+
+/// How long an orderly stop waits for running jobs to finish (ADR 0141).
+const STOP_DRAIN: Duration = Duration::from_secs(60);
+/// How long stopped work has to end (ADR 0141).
+const SETTLE: Duration = super::STOP_SETTLE;
+/// How long a stopping coordinator lets its connections deliver their
+/// results once every grant has ended (ADR 0141).
+const CONNECTION_SETTLE: Duration = Duration::from_secs(5);
+/// The longest orderly stop, which the unit's stop timeout must cover.
+const STOP_BUDGET: Duration = STOP_DRAIN
+    .saturating_add(SETTLE)
+    .saturating_add(CONNECTION_SETTLE);
+
+/// Apply the service manager's stop request, and report whether the
+/// coordinator stops serving at once.
+async fn request_stop(service: &Service, connections_idle: bool) -> Option<Exit> {
+    let mut state = service.state.lock().await;
+    let Ok(observed) = now() else {
+        return Some(Exit::Stopped);
+    };
+    let phase = state.phase.stop_requested(observed);
+    if phase != state.phase {
+        eprintln!(
+            "dev-auth grant coordinator stopping: admission is closed and {} running job(s) have up to {} seconds to finish",
+            state.jobs.len(),
+            STOP_DRAIN.as_secs()
+        );
+    }
+    state.phase = phase;
+    state.phase.drained(
+        state.jobs.len(),
+        active_grants(&state),
+        connections_idle,
+        observed,
+    )
+}
+
+fn active_grants(state: &State) -> usize {
+    state
+        .registry
+        .iter()
+        .filter(|grant| grant.lifetime.state() == LeaseState::Active)
+        .count()
+}
+
+/// Let connection tasks finish delivering their results for at most
+/// `budget`, then cancel the rest.
+async fn finish_connections(connections: &mut tokio::task::JoinSet<()>, budget: Duration) {
+    let _ = tokio::time::timeout(budget, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+}
+
+/// Reap until grant `id`, or every grant when `id` is `None`, reaches its
+/// terminal state, for at most `SETTLE`. Reports whether it did.
+async fn settle(service: &Service, id: Option<GrantId>) -> Result<bool, Integrity> {
+    let until = tokio::time::Instant::now() + SETTLE;
+    loop {
+        reap(service).await?;
+        let ended = {
+            let state = service.state.lock().await;
+            match id {
+                Some(id) => state
+                    .registry
+                    .get(id)
+                    .is_none_or(|grant| grant.lifetime.state().is_terminal()),
+                None => state
+                    .registry
+                    .iter()
+                    .all(|grant| grant.lifetime.state().is_terminal()),
+            }
+        };
+        if ended {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= until {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -618,7 +748,12 @@ async fn dispatch(
     }
     if admits_new_work(&request) {
         let phase = service.state.lock().await.phase;
-        if let Err(failure) = admission(phase, service.trust()) {
+        let admitted = if uses_existing_grant(&request) {
+            service.grant_use(phase).admits()
+        } else {
+            admission(phase, service.trust())
+        };
+        if let Err(failure) = admitted {
             return ControlResult::failure(operation, failure, Some(false));
         }
     }
@@ -893,7 +1028,7 @@ async fn issue(
                 .stop(id, StopReason::Revoked, now)
                 .map_err(session_failure)?;
             if let Some(metadata) = state.metadata.get_mut(&id) {
-                let _ = metadata.boundary.stop();
+                let _ = metadata.boundary.stop_enclosing();
             }
             return Err(failure);
         }
@@ -970,8 +1105,8 @@ async fn activate_launch(
         None
     };
     {
-        let observed = now()?;
         let mut state = service.state.lock().await;
+        let observed = now()?;
         state.registry.poll(observed);
         require_launch_state(service, &state, id, caller, LaunchPhase::Pending)?;
         if let Some(bootstrap) = &bootstrap {
@@ -1179,7 +1314,10 @@ fn withdraw_uncommitted_launch(
     id: GrantId,
 ) -> Result<(), Failure> {
     let metadata = state.metadata.get_mut(&id).ok_or(Failure::NoGrant)?;
-    let stopped = metadata.boundary.stop().map_err(|_| Failure::CleanupFailed);
+    let stopped = metadata
+        .boundary
+        .stop_enclosing()
+        .map_err(|_| Failure::CleanupFailed);
     if state.selected.get(&metadata.scope) == Some(&id) {
         remove_marker(service, &metadata.scope)?;
         state.selected.remove(&metadata.scope);
@@ -1327,25 +1465,20 @@ async fn revoke(
         progress.changed();
         (id, scope)
     };
-    for _ in 0..50 {
-        reap(service).await?;
-        let mut state = service.state.lock().await;
-        let grant = state.registry.get(id).ok_or(Failure::NoGrant)?;
-        if grant.lifetime.state().is_terminal() {
-            let mut response = ControlResult::success(if leave { "leave" } else { "revoke" }, true);
-            response.grant = Some(snapshot(&state, id, now()?)?);
-            if leave {
-                remove_marker(service, &scope)?;
-                if state.selected.get(&scope) == Some(&id) {
-                    state.selected.remove(&scope);
-                }
-            }
-            return Ok(response);
-        }
-        drop(state);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    if !settle(service, Some(id)).await? {
+        return Err(Failure::CleanupFailed);
     }
-    Err(Failure::CleanupFailed)
+    let mut state = service.state.lock().await;
+    state.registry.get(id).ok_or(Failure::NoGrant)?;
+    let mut response = ControlResult::success(if leave { "leave" } else { "revoke" }, true);
+    response.grant = Some(snapshot(&state, id, now()?)?);
+    if leave {
+        remove_marker(service, &scope)?;
+        if state.selected.get(&scope) == Some(&id) {
+            state.selected.remove(&scope);
+        }
+    }
+    Ok(response)
 }
 
 async fn delegate(
@@ -1369,9 +1502,9 @@ async fn delegate(
         .policy
         .approve_limits(&caller.scope.account, &request)?;
     request.idle_seconds = effective_idle(&service.policy, &scope.account, &request)?;
-    let now = now()?;
     let id = new_id()?;
     let mut state = service.state.lock().await;
+    let now = now()?;
     if state.phase != Phase::Serving {
         return Err(Failure::NativeUnavailable);
     }
@@ -1477,9 +1610,9 @@ async fn execute(
     if streams.len() != 4 {
         return Err(Failure::InvalidRequest);
     }
+    let relay_sudo = sudo_relay.then(|| service.sudo_program()).transpose()?;
     let terminal = execution.terminal;
     caller.verify_directory(&execution.working_directory)?;
-    let now = now()?;
     let job_id = new_id()?;
     let (
         grant_id,
@@ -1493,7 +1626,8 @@ async fn execute(
         captured_relay,
     ) = {
         let mut state = service.state.lock().await;
-        if state.phase != Phase::Serving || state.jobs.len() >= MAX_EXECUTIONS {
+        let now = now()?;
+        if service.grant_use(state.phase) != GrantUse::Open || state.jobs.len() >= MAX_EXECUTIONS {
             return Err(Failure::Busy);
         }
         let grant_id = select(&state, &caller.scope, selected)?;
@@ -1674,7 +1808,7 @@ async fn execute(
         } else {
             (streams, master, None, None)
         };
-        state.jobs.insert(
+        state.attach_job(
             job_id,
             Job {
                 grant: grant_id,
@@ -1690,7 +1824,7 @@ async fn execute(
                 },
                 captured,
             },
-        );
+        )?;
         (
             grant_id,
             permit,
@@ -1745,16 +1879,8 @@ async fn execute(
                 .try_clone()
                 .map_err(|_| Failure::NativeUnavailable)?,
         )
-    } else if sudo_relay {
-        Some(
-            service
-                .sudo
-                .file
-                .try_clone()
-                .map_err(|_| Failure::NativeUnavailable)?,
-        )
     } else {
-        None
+        relay_sudo
     };
     let spawned = tokio::task::spawn_blocking(move || {
         if let Some(executable) = held_sudo {
@@ -1816,7 +1942,7 @@ async fn execute(
         }
     }
     if graph_execution && !status.success() {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + SETTLE;
         loop {
             let empty = {
                 let state = service.state.lock().await;
@@ -1903,7 +2029,7 @@ async fn wait_leader(
                 .stop(grant_id, StopReason::HardExpired, self::now()?)
                 .map_err(session_failure)?;
             if let Some(metadata) = state.metadata.get_mut(&grant_id) {
-                let _ = metadata.boundary.stop();
+                let _ = metadata.boundary.stop_enclosing();
             }
         }
         let presence = caller.presence();
@@ -2027,7 +2153,7 @@ async fn execute_captured(
     } else {
         Some(Failure::RuntimeFailure)
     };
-    let mut cleanup_deadline = failure.map(|_| std::time::Instant::now() + Duration::from_secs(5));
+    let mut cleanup_deadline = failure.map(|_| std::time::Instant::now() + SETTLE);
     let mut unseen = Unseen::default();
     loop {
         let expired = !self::now().is_ok_and(|now| now < hard_deadline);
@@ -2046,8 +2172,7 @@ async fn execute_captured(
                     Failure::Interrupted
                 });
             }
-            cleanup_deadline
-                .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+            cleanup_deadline.get_or_insert_with(|| std::time::Instant::now() + SETTLE);
             if job.boundary.stop().is_err() {
                 job.captured
                     .as_mut()
@@ -2057,8 +2182,7 @@ async fn execute_captured(
         } else if let Ok(Some(signal)) = signal {
             if job.boundary.signal(signal).is_err() {
                 failure = Some(Failure::RuntimeFailure);
-                cleanup_deadline
-                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+                cleanup_deadline.get_or_insert_with(|| std::time::Instant::now() + SETTLE);
                 if job.boundary.stop().is_err() {
                     job.captured
                         .as_mut()
@@ -2076,8 +2200,7 @@ async fn execute_captured(
         }
         if captured.counters.exceeded() {
             failure = Some(Failure::OutputLimit);
-            cleanup_deadline
-                .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+            cleanup_deadline.get_or_insert_with(|| std::time::Instant::now() + SETTLE);
         } else if captured.spawn_failed
             || captured.drain_failed
             || captured.wait_failed
@@ -2088,16 +2211,14 @@ async fn execute_captured(
                 .is_some_and(|status| !status.success())
         {
             failure.get_or_insert(Failure::RuntimeFailure);
-            cleanup_deadline
-                .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+            cleanup_deadline.get_or_insert_with(|| std::time::Instant::now() + SETTLE);
         }
         let joined = job.leader_done;
         let empty = joined && job.boundary.is_empty().unwrap_or(false);
         let timed_out =
             cleanup_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
         if joined && !empty {
-            cleanup_deadline
-                .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+            cleanup_deadline.get_or_insert_with(|| std::time::Instant::now() + SETTLE);
         }
         if (joined && empty) || timed_out {
             let mut output = captured.counters.observation(joined)?;
@@ -2335,13 +2456,21 @@ fn integrity_lost(integrity: Integrity) -> Failure {
     integrity.into()
 }
 
+/// Every look at the clock that reaches the registry is taken while the
+/// state lock is held, so the registry sees observations in lock order. An
+/// observation taken before waiting for the lock can be older than one that
+/// another task recorded meanwhile, and the registry would stop every active
+/// grant as a regressed clock.
 async fn reap(service: &Service) -> Result<(), Integrity> {
-    let now = now().map_err(|_| Integrity::Clock)?;
     let mut state = service.state.lock().await;
+    let now = now().map_err(|_| Integrity::Clock)?;
     state.pending_relays.retain(|_, pending| {
         now < pending.expires && native::alive(pending.caller.peer.peer_pidfd())
     });
-    if state.phase == Phase::Serving {
+    if matches!(
+        state.phase,
+        Phase::Serving | Phase::Draining(Drain::Changed(Input::SudoProgram))
+    ) {
         let look = service.trust();
         watch_trust(&mut state, look);
     }
@@ -2376,7 +2505,7 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
         .collect();
     for (id, metadata) in &mut state.metadata {
         if stopped.contains(id) {
-            let _ = metadata.boundary.stop();
+            let _ = metadata.boundary.stop_enclosing();
         }
     }
     let mut completed = Vec::new();
@@ -2396,7 +2525,8 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
             job.leader_done = true;
             job.preparing = false;
         }
-        if stopped.contains(&job.grant) && job.boundary.stop().is_err() {
+        if (stopped.contains(&job.grant) || job.boundary.stopping()) && job.boundary.stop().is_err()
+        {
             if let Some(captured) = &mut job.captured {
                 captured.cleanup_failed = true;
             }
@@ -2426,7 +2556,12 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
         }
     }
     for id in completed {
-        state.jobs.remove(&id);
+        if let Some(job) = state.jobs.remove(&id) {
+            state
+                .registry
+                .detach(job.grant, now)
+                .map_err(|_| Integrity::RecordsDisagree(job.grant))?;
+        }
     }
     let mut stopping: Vec<_> = state
         .registry
@@ -2891,15 +3026,35 @@ fn admission(phase: Phase, trust: Look<Option<Input>>) -> Result<(), Failure> {
 /// Apply one look at the watched trust inputs. A change closes admission for
 /// good and leaves every grant and job running; a look that could not be
 /// taken changes nothing.
+/// A policy change during a sudo-program drain ends the use that grants
+/// kept across that drain (ADR 0141).
 fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
     state.unseen.note(Subject::Trust, &look);
-    if let (Phase::Serving, Ok(Some(input))) = (state.phase, look) {
-        state.phase = Phase::Draining(input);
+    let changed = match (state.phase, look) {
+        (Phase::Serving, Ok(Some(input))) => Some(input),
+        (Phase::Draining(Drain::Changed(Input::SudoProgram)), Ok(Some(Input::Policy))) => {
+            Some(Input::Policy)
+        }
+        _ => None,
+    };
+    if let Some(input) = changed {
+        state.phase = Phase::Draining(Drain::Changed(input));
         eprintln!(
             "dev-auth grant trust changed: the {input} is not the one bound at startup; admission is closed and {} running job(s) continue under their grants",
             state.jobs.len()
         );
     }
+}
+
+/// Whether an admitted request runs new work under a grant that is already
+/// active, and so follows `grant_use` instead of `admission` (ADR 0141).
+fn uses_existing_grant(request: &ControlRequest) -> bool {
+    matches!(
+        request,
+        ControlRequest::Exec { .. }
+            | ControlRequest::RunPlan { .. }
+            | ControlRequest::SudoRelay { .. }
+    )
 }
 
 /// Whether a control request admits new managed work, and so needs the trust
@@ -2919,6 +3074,105 @@ fn admits_new_work(request: &ControlRequest) -> bool {
         | ControlRequest::RunPlan { .. }
         | ControlRequest::SudoRelay { .. }
         | ControlRequest::Delegate { .. } => true,
+    }
+}
+
+/// Bind the sudo program that `policy` names. Startup and every later
+/// selection of a replaced program use this one validation (ADR 0141).
+fn bind_sudo(policy: &Policy) -> Result<Bound, Failure> {
+    Bound::open(Input::SudoProgram, Path::new(&policy.sudo_program))
+}
+
+/// The sudo program that managed sudo admits through now (ADR 0141), from
+/// one look at the program bound at startup: that program while the look
+/// finds it unchanged, and after an observed change the file that `rebind`
+/// validates now. A look that could not be taken selects nothing.
+fn current_sudo(
+    look: Look<bool>,
+    bound: &File,
+    rebind: impl FnOnce() -> Result<File, Failure>,
+) -> Result<File, Failure> {
+    match look {
+        Ok(true) => bound.try_clone().map_err(|_| Failure::NativeUnavailable),
+        Ok(false) => rebind(),
+        Err(_) => Err(Failure::NativeUnavailable),
+    }
+}
+
+impl Service {
+    fn sudo_program(&self) -> Result<File, Failure> {
+        current_sudo(self.sudo.look(), &self.sudo.file, || {
+            bind_sudo(&self.policy).map(|bound| bound.file)
+        })
+    }
+
+    /// Admission of new work under an active grant now, from a fresh look at
+    /// the grant policy.
+    fn grant_use(&self, phase: Phase) -> GrantUse {
+        grant_use(phase, self.policy_source.look())
+    }
+}
+
+impl GrantUse {
+    fn admits(self) -> Result<(), Failure> {
+        match self {
+            Self::Open => Ok(()),
+            Self::Draining => Err(Failure::AuthorityDenied),
+            Self::Unobserved => Err(Failure::NativeUnavailable),
+        }
+    }
+}
+
+/// Whether new work runs under a grant that is already active (ADR 0141):
+/// managed sudo, a sudo relay, `exec` or `run-plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantUse {
+    Open,
+    /// The coordinator drains and refuses new work under every grant.
+    Draining,
+    /// The grant policy could not be observed, which refuses this admission.
+    Unobserved,
+}
+
+/// Admission of new work under an active grant in `phase`, from one look at
+/// whether the grant policy is unchanged. Grants approved under the policy
+/// keep their use across a change of the sudo program, whose replacement
+/// managed sudo validates as startup does, and lose it on a policy change or
+/// a stop.
+fn grant_use(phase: Phase, policy: Look<bool>) -> GrantUse {
+    let kept = matches!(
+        phase,
+        Phase::Serving | Phase::Draining(Drain::Changed(Input::SudoProgram))
+    );
+    match policy {
+        Ok(true) if kept => GrantUse::Open,
+        Err(_) if kept => GrantUse::Unobserved,
+        _ => GrantUse::Draining,
+    }
+}
+
+/// How the bridge answers a sudo preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preflight {
+    Native,
+    Admit(GrantId),
+    Draining,
+}
+
+/// The preflight answer for an invocation whose grant `selection` found,
+/// under `admission` (ADR 0141).
+fn preflight_answer(
+    selection: Result<GrantId, Failure>,
+    admission: GrantUse,
+) -> Result<Preflight, Failure> {
+    match selection {
+        Err(Failure::NoGrant) => Ok(Preflight::Native),
+        Err(failure) => Err(failure),
+        Ok(id) => match admission {
+            GrantUse::Open => Ok(Preflight::Admit(id)),
+            GrantUse::Draining => Ok(Preflight::Draining),
+            GrantUse::Unobserved => Err(Failure::NativeUnavailable),
+        },
     }
 }
 
@@ -3190,24 +3444,51 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
         .get(service_interface, "TimeoutStopUSec")
         .await
         .map_err(|error| fdo_fault(&error))?;
-    let main_pid = u32::try_from(main_pid).map_err(|_| Mismatch)?;
-    let kill_mode = String::try_from(kill_mode).map_err(|_| Mismatch)?;
-    let send_kill = bool::try_from(send_kill).map_err(|_| Mismatch)?;
-    let group = String::try_from(group).map_err(|_| Mismatch)?;
-    let exit_type = String::try_from(exit_type).map_err(|_| Mismatch)?;
-    let remain = bool::try_from(remain).map_err(|_| Mismatch)?;
-    let delegated = bool::try_from(delegated).map_err(|_| Mismatch)?;
-    let stop_timeout = u64::try_from(stop_timeout).map_err(|_| Mismatch)?;
-    if main_pid != std::process::id()
-        || kill_mode != "control-group"
-        || !send_kill
-        || exit_type != "main"
-        || remain
-        || delegated
-        || stop_timeout > 5_000_000
-        || Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')) != cgroup
+    unit_contract(
+        &UnitProperties {
+            main_pid: u32::try_from(main_pid).map_err(|_| Mismatch)?,
+            kill_mode: String::try_from(kill_mode).map_err(|_| Mismatch)?,
+            send_kill: bool::try_from(send_kill).map_err(|_| Mismatch)?,
+            control_group: String::try_from(group).map_err(|_| Mismatch)?,
+            exit_type: String::try_from(exit_type).map_err(|_| Mismatch)?,
+            remain: bool::try_from(remain).map_err(|_| Mismatch)?,
+            delegated: bool::try_from(delegated).map_err(|_| Mismatch)?,
+            stop_timeout: Duration::from_micros(u64::try_from(stop_timeout).map_err(|_| Mismatch)?),
+        },
+        std::process::id(),
+        cgroup,
+    )
+}
+
+/// The unit properties that startup confirms through the service manager.
+#[derive(Clone)]
+struct UnitProperties {
+    main_pid: u32,
+    kill_mode: String,
+    send_kill: bool,
+    control_group: String,
+    exit_type: String,
+    remain: bool,
+    delegated: bool,
+    stop_timeout: Duration,
+}
+
+/// Whether the unit that runs the coordinator, as process `pid` in `cgroup`,
+/// keeps its crash cleanup and stop contract (ADR 0137, ADR 0141).
+/// `KillMode=mixed` sends SIGTERM to the coordinator alone and SIGKILL to
+/// every process left once it exits, so the coordinator can drain, and its
+/// exit stops every managed job.
+fn unit_contract(unit: &UnitProperties, pid: u32, cgroup: &Path) -> Result<(), UnitFault> {
+    if unit.main_pid != pid
+        || unit.kill_mode != "mixed"
+        || !unit.send_kill
+        || unit.exit_type != "main"
+        || unit.remain
+        || unit.delegated
+        || unit.stop_timeout < STOP_BUDGET
+        || Path::new("/sys/fs/cgroup").join(unit.control_group.trim_start_matches('/')) != cgroup
     {
-        return Err(Mismatch);
+        return Err(UnitFault::Mismatch);
     }
     Ok(())
 }
@@ -4126,16 +4407,34 @@ mod tests {
                 "{input}: nothing new is admitted under the old trust, even after a clean look"
             );
             assert_eq!(
-                state.phase.drained(1),
+                state.phase.drained(1, 0, true, Duration::ZERO),
                 None,
                 "{input}: waits for its running job"
             );
             assert_eq!(
-                state.phase.drained(0),
-                Some(input),
+                state.phase.drained(0, 0, false, Duration::ZERO),
+                None,
+                "{input}: and for its connections"
+            );
+            assert_eq!(
+                state.phase.drained(0, 0, true, Duration::ZERO),
+                Some(Exit::Changed(input)),
                 "{input}: exits for a restart once no job runs"
             );
+            assert_eq!(
+                state.phase.drained(0, 1, true, Duration::ZERO),
+                (input == Input::Policy).then_some(Exit::Changed(input)),
+                "{input}: a grant approved under the old policy ends at the exit, and one that keeps its use across a sudo-program change is waited for"
+            );
         }
+        let mut state = routing_state(&[(1, user_scope(1000))]);
+        watch_trust(&mut state, Ok(Some(Input::SudoProgram)));
+        watch_trust(&mut state, Ok(Some(Input::Policy)));
+        assert_eq!(
+            state.phase.drained(0, 1, true, Duration::ZERO),
+            Some(Exit::Changed(Input::Policy)),
+            "a later policy change ends the use that grants kept"
+        );
     }
 
     #[test]
@@ -4235,7 +4534,7 @@ mod tests {
             Ok(()),
             "and the next is not"
         );
-        assert_eq!(state.phase.drained(0), None);
+        assert_eq!(state.phase.drained(0, 0, true, Duration::ZERO), None);
     }
 
     #[test]
@@ -4494,6 +4793,291 @@ mod tests {
             covering(&ended, &run, Some(GrantScope::Command), scope_of),
             Err(Failure::NoGrant),
             "an ended grant covers nothing"
+        );
+    }
+
+    fn at(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn an_orderly_stop_closes_admission_and_lets_running_jobs_finish_within_its_drain() {
+        let phase = Phase::Serving.stop_requested(at(100));
+        assert!(
+            admission(phase, Ok(None)).is_err(),
+            "nothing new is admitted"
+        );
+        assert_eq!(
+            phase.drained(1, 0, true, at(159)),
+            None,
+            "a running job keeps the drain open"
+        );
+        assert_eq!(
+            phase.drained(0, 1, false, at(101)),
+            Some(Exit::Stopped),
+            "the drain ends once no job runs, and connections finish afterwards"
+        );
+        assert_eq!(
+            phase.drained(1, 1, true, at(160)),
+            Some(Exit::Stopped),
+            "the drain is bounded"
+        );
+        assert_eq!(
+            phase.stop_requested(at(130)),
+            phase,
+            "a repeated request keeps the first bound"
+        );
+    }
+
+    #[test]
+    fn a_stop_during_a_trust_change_drain_becomes_the_bounded_stop_drain() {
+        let phase = Phase::Draining(Drain::Changed(Input::SudoProgram)).stop_requested(at(100));
+        assert_eq!(phase.drained(1, 0, true, at(159)), None);
+        assert_eq!(phase.drained(1, 1, false, at(160)), Some(Exit::Stopped));
+        assert_eq!(
+            phase.drained(0, 1, false, at(101)),
+            Some(Exit::Stopped),
+            "a stopped coordinator exits with success, not for a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopping_coordinator_lets_finishing_connections_deliver_their_results() {
+        use std::os::unix::net::UnixStream;
+        let (coordinator, client) = UnixStream::pair().unwrap();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            (&coordinator).write_all(b"exec result").unwrap();
+        });
+        connections.spawn(std::future::pending());
+        let started = std::time::Instant::now();
+        finish_connections(&mut connections, Duration::from_millis(500)).await;
+        assert!(connections.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a connection that never finishes is cancelled at the bound"
+        );
+        let mut received = Vec::new();
+        (&client).read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"exec result");
+    }
+
+    fn drainable_unit() -> UnitProperties {
+        UnitProperties {
+            main_pid: 7,
+            kill_mode: "mixed".into(),
+            send_kill: true,
+            control_group: "/system.slice/dev-auth-grants.service".into(),
+            exit_type: "main".into(),
+            remain: false,
+            delegated: false,
+            stop_timeout: at(90),
+        }
+    }
+
+    const UNIT_CGROUP: &str = "/sys/fs/cgroup/system.slice/dev-auth-grants.service";
+
+    #[test]
+    fn startup_requires_a_unit_that_lets_the_coordinator_drain_before_anything_is_killed() {
+        let cgroup = Path::new(UNIT_CGROUP);
+        assert_eq!(unit_contract(&drainable_unit(), 7, cgroup), Ok(()));
+        for (unit, why) in [
+            (
+                UnitProperties {
+                    kill_mode: "control-group".into(),
+                    ..drainable_unit()
+                },
+                "the service manager would send SIGTERM to every job at a stop",
+            ),
+            (
+                UnitProperties {
+                    stop_timeout: at(5),
+                    ..drainable_unit()
+                },
+                "the stop timeout would cut the drain short",
+            ),
+            (
+                UnitProperties {
+                    send_kill: false,
+                    ..drainable_unit()
+                },
+                "jobs would outlive the coordinator",
+            ),
+            (
+                UnitProperties {
+                    delegated: true,
+                    ..drainable_unit()
+                },
+                "a delegated unit gives up the boundaries",
+            ),
+        ] {
+            assert_eq!(
+                unit_contract(&unit, 7, cgroup),
+                Err(UnitFault::Mismatch),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_unit_satisfies_the_startup_contract() {
+        let setting = |key: &str| {
+            super::super::assets::SERVICE
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("{key} is unset"))
+                .to_owned()
+        };
+        let seconds = setting("TimeoutStopSec");
+        let unit = UnitProperties {
+            main_pid: 7,
+            kill_mode: setting("KillMode"),
+            send_kill: setting("SendSIGKILL") == "yes",
+            control_group: "/system.slice/dev-auth-grants.service".into(),
+            exit_type: setting("ExitType"),
+            remain: setting("RemainAfterExit") == "yes",
+            delegated: setting("Delegate") == "yes",
+            stop_timeout: at(seconds.strip_suffix('s').unwrap().parse().unwrap()),
+        };
+        assert_eq!(unit_contract(&unit, 7, Path::new(UNIT_CGROUP)), Ok(()));
+    }
+
+    #[test]
+    fn a_replaced_sudo_program_is_selected_only_through_the_startup_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let bound = directory.path().join("bound");
+        let replaced = directory.path().join("replaced");
+        std::fs::write(&bound, b"bound").unwrap();
+        std::fs::write(&replaced, b"replaced").unwrap();
+        let held = File::open(&bound).unwrap();
+        let unchanged = current_sudo(Ok(true), &held, || -> Result<File, Failure> {
+            panic!("an unchanged program is not validated again")
+        })
+        .unwrap();
+        assert!(native::same_file(&unchanged, &held).unwrap());
+        let selected = current_sudo(Ok(false), &held, || Ok(File::open(&replaced).unwrap()))
+            .expect("a replaced program that passes the startup validation is selected");
+        assert!(native::same_file(&selected, &File::open(&replaced).unwrap()).unwrap());
+        assert_eq!(
+            current_sudo(Ok(false), &held, || Err(Failure::AuthorityDenied)).err(),
+            Some(Failure::AuthorityDenied),
+            "a replacement that fails the validation refuses the connection"
+        );
+        assert!(
+            current_sudo(Err(UNREADABLE), &held, || -> Result<File, Failure> {
+                panic!("a look that could not be taken selects nothing")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn admitted_grants_keep_managed_sudo_across_a_sudo_program_change_only() {
+        let sudo_drain = Phase::Draining(Drain::Changed(Input::SudoProgram));
+        let policy_drain = Phase::Draining(Drain::Changed(Input::Policy));
+        let stop = Phase::Draining(Drain::Stop { until: at(60) });
+        for (phase, policy, expected, why) in [
+            (Phase::Serving, Ok(true), GrantUse::Open, "serving"),
+            (
+                sudo_drain,
+                Ok(true),
+                GrantUse::Open,
+                "a replaced sudo program",
+            ),
+            (
+                sudo_drain,
+                Ok(false),
+                GrantUse::Draining,
+                "a policy change as well",
+            ),
+            (
+                Phase::Serving,
+                Ok(false),
+                GrantUse::Draining,
+                "a policy change not yet reaped",
+            ),
+            (
+                policy_drain,
+                Ok(true),
+                GrantUse::Draining,
+                "grants approved under the old policy",
+            ),
+            (stop, Ok(true), GrantUse::Draining, "an orderly stop"),
+            (Phase::Stopping, Ok(true), GrantUse::Draining, "shutdown"),
+            (
+                Phase::Serving,
+                Err(UNREADABLE),
+                GrantUse::Unobserved,
+                "an unreadable policy",
+            ),
+            (
+                sudo_drain,
+                Err(UNREADABLE),
+                GrantUse::Unobserved,
+                "an unreadable policy in a drain",
+            ),
+        ] {
+            assert_eq!(grant_use(phase, policy), expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn only_work_under_an_existing_grant_continues_through_a_sudo_program_drain() {
+        let grant = "0123456789abcdef0123456789abcdef".to_owned();
+        let execution = || super::super::Execution {
+            program: "/usr/bin/true".into(),
+            arguments: vec![],
+            working_directory: "/".into(),
+            environment: vec![],
+            terminal: false,
+        };
+        for request in [
+            ControlRequest::Exec {
+                grant: None,
+                execution: execution(),
+            },
+            ControlRequest::SudoRelay {
+                grant: grant.clone(),
+                execution: execution(),
+            },
+        ] {
+            assert!(uses_existing_grant(&request), "{}", request.operation());
+        }
+        for request in [
+            ControlRequest::Request {
+                request: GrantRequest::command(Authority::Administrator, 60),
+            },
+            ControlRequest::Delegate {
+                grant,
+                request: GrantRequest::command(Authority::Administrator, 60),
+            },
+        ] {
+            assert!(
+                !uses_existing_grant(&request),
+                "{}: a new grant waits for the coordinator that binds the new state",
+                request.operation()
+            );
+        }
+    }
+
+    #[test]
+    fn a_routed_sudo_during_a_drain_is_told_to_rerun_and_an_unrouted_one_has_native_sudo() {
+        assert_eq!(
+            preflight_answer(Ok(7), GrantUse::Draining),
+            Ok(Preflight::Draining)
+        );
+        assert_eq!(
+            preflight_answer(Err(Failure::NoGrant), GrantUse::Draining),
+            Ok(Preflight::Native)
+        );
+        assert_eq!(
+            preflight_answer(Ok(7), GrantUse::Open),
+            Ok(Preflight::Admit(7))
+        );
+        assert_eq!(
+            preflight_answer(Ok(7), GrantUse::Unobserved),
+            Err(Failure::NativeUnavailable)
         );
     }
 }

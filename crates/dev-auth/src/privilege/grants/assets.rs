@@ -17,9 +17,11 @@ mod tests {
         assert_eq!(POLKIT.matches(">auth_admin<").count(), 3);
         assert!(!POLKIT.contains("auth_admin_keep"));
         for required in [
-            "KillMode=control-group",
+            "KillMode=mixed",
             "SendSIGKILL=yes",
-            "TimeoutStopSec=5s",
+            "TimeoutStopSec=90s",
+            "OOMPolicy=continue",
+            "OOMScoreAdjust=-900",
             "RuntimeDirectoryPreserve=yes",
             "Delegate=no",
             "ExitType=main",

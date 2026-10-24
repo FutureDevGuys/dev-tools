@@ -82,7 +82,8 @@ fn control_inner(
         } else if execution.is_some() {
             10
         } else {
-            15
+            // Revocation and `leave` wait for the stopped work (ADR 0141).
+            super::STOP_SETTLE.as_secs() as u32 + 10
         };
         let endpoint = std::env::var_os("DEV_AUTH_GRANT_SOCKET")
             .map(std::path::PathBuf::from)
