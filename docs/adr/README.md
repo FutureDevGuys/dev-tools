@@ -11,6 +11,7 @@ SyncConfigs also maintains product-local records, including [durable overlay pub
 
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0141](0141-graceful-ends-and-drained-stops-for-managed-work.md) | Dev Auth ends managed work with SIGTERM and a fixed 10-second grace before SIGKILL, drains an orderly coordinator stop, refuses setup over running jobs, never idles a grant with attached work, contains OOM kills and job process groups, and keeps admitted grants working across a sudo-program change | proposed | hermetic source tests passed; native acceptance pending |
 | [0140](0140-candidate-rendered-setup-plans.md) | Dev Auth renders a setup plan only in the release it installs, and every release hands a plan to that release before judging it | proposed | hermetic source tests passed; signed upgrade acceptance pending |
 | [0139](0139-command-scoped-grants-and-remaining-time-checks.md) | Dev Auth runs one program as the caller under a freshly approved grant that only its process tree can use, and checks a covering grant's remaining time | proposed | hermetic source tests passed; native acceptance pending |
 | [0138](0138-trust-change-drain-and-observed-supervision.md) | Dev Auth drains the grant coordinator when its policy or sudo program changes, acts only on observed native state, and gives native sudo to an unanswered invocation that the coordinator does not own | proposed | hermetic source tests passed; native acceptance pending |
