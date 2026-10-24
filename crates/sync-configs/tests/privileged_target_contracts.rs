@@ -1,6 +1,7 @@
 #![cfg(all(unix, any(debug_assertions, feature = "test-support")))]
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -241,12 +242,18 @@ fn invoked_commands(history: &[Vec<String>]) -> Vec<String> {
 
 /// Authentication runs a harmless system `true` through `sudo -n --` before it
 /// prompts, so a password-requiring sudo records that refused attempt first.
-fn authorization_probe() -> Vec<String> {
+fn pathless_authorization_probe() -> Vec<String> {
     vec![
         "-n".to_owned(),
         "--".to_owned(),
         system_command("true").display().to_string(),
     ]
+}
+
+fn environment_without_path() -> BTreeMap<OsString, OsString> {
+    std::env::vars_os()
+        .filter(|(name, _)| name != "PATH")
+        .collect()
 }
 
 fn temporary_candidates(target: &Path) -> Vec<PathBuf> {
@@ -342,6 +349,7 @@ fn first_pass_is_atomic_and_second_pass_invokes_no_sudo() {
     let sudo = fake_sudo(root.path(), FakeBehavior::default());
     let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
         .expect("session")
+        .with_environment_for_test(environment_without_path())
         .with_foreground_terminal_for_test(true);
     let plans = plan_selected_privileged_entries(&selected, false, &identities).expect("plan");
 
@@ -368,7 +376,7 @@ fn first_pass_is_atomic_and_second_pass_invokes_no_sudo() {
     );
     let first_history = history(root.path());
     assert_eq!(first_history[0], ["-n", "-v"]);
-    assert_eq!(first_history[1], authorization_probe());
+    assert_eq!(first_history[1], pathless_authorization_probe());
     assert_eq!(first_history[2], ["-v"]);
     assert_eq!(invoked_commands(&first_history), ["true", "install", "mv"]);
     let temporary = first_history[3].last().expect("temporary target");
@@ -451,6 +459,7 @@ fn authentication_drift_is_detected_before_any_privileged_mutation() {
     );
     let mut session = PrivilegeSession::new_injected_sudo_for_test(sudo)
         .expect("session")
+        .with_environment_for_test(environment_without_path())
         .with_foreground_terminal_for_test(true);
 
     let error = apply_privileged_plans(
@@ -467,7 +476,7 @@ fn authentication_drift_is_detected_before_any_privileged_mutation() {
         history(root.path()),
         [
             vec!["-n".to_owned(), "-v".to_owned()],
-            authorization_probe(),
+            pathless_authorization_probe(),
             vec!["-v".to_owned()]
         ]
     );
