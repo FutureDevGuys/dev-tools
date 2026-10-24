@@ -1,7 +1,7 @@
 use super::*;
 use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use serde::{Deserialize, Serialize};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Type, Value};
 
@@ -207,6 +207,7 @@ impl Prompt {
 
 struct Bus {
     child: Child,
+    _address: Option<ChildStdout>,
     root: tempfile::TempDir,
 }
 
@@ -223,25 +224,37 @@ impl Bus {
         let child = Command::new("/usr/bin/dbus-daemon")
             .arg("--nofork")
             .arg("--nopidfile")
+            .arg("--print-address")
             .arg(format!("--config-file={}", config.display()))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("native store test requires /usr/bin/dbus-daemon");
-        let mut bus = Self { child, root };
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !bus.path().exists() {
-            assert!(
-                bus.child.try_wait().unwrap().is_none(),
-                "fixture bus exited"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture bus did not start"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let mut bus = Self {
+            child,
+            _address: None,
+            root,
+        };
+        // The socket path exists from bind(), before listen() accepts
+        // connections; the daemon prints its address once it is listening.
+        let stdout = bus.child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            let read = std::io::BufRead::read_line(&mut reader, &mut line);
+            let _ = sender.send((read.map(|_| line), reader.into_inner()));
+        });
+        let (line, stdout) = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("fixture bus did not start listening");
+        let line = line.unwrap();
+        assert!(
+            line.starts_with(&format!("{address},")),
+            "fixture bus did not report its listening address: {line:?}"
+        );
+        bus._address = Some(stdout);
         bus
     }
 
