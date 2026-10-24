@@ -20,6 +20,13 @@ use thiserror::Error;
 
 const DEFAULT_PRIVILEGED_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_PRIVILEGED_COMMAND_OUTPUT_LIMIT: usize = 16 << 20;
+#[cfg(unix)]
+const AUTHORIZATION_PROBE_LIMITS: PrivilegedExecutionLimits = PrivilegedExecutionLimits {
+    timeout: Duration::from_secs(30),
+    output_limit: 64 << 10,
+};
+#[cfg(unix)]
+const AUTHORIZATION_PROBE_CANDIDATES: [&str; 2] = ["/usr/bin/true", "/bin/true"];
 
 #[derive(Debug, Error)]
 pub enum PrivilegeError {
@@ -36,6 +43,12 @@ pub enum PrivilegeError {
     UnsafeCommand,
     #[error("privileged command requires an authenticated sudo session")]
     NotAuthenticated,
+    #[error(
+        "sudo requires interactive authentication, but no foreground terminal is available to \
+         request it, so no credential was collected; run sync-configs directly in a terminal, \
+         or authenticate first in a user-visible terminal and verify with `sudo -n -v`"
+    )]
+    PromptUnavailable,
     #[error("privileged command failed to start")]
     Start,
     #[error("privileged command exceeded its execution timeout")]
@@ -105,6 +118,8 @@ pub struct PrivilegeSession {
     limits: PrivilegedExecutionLimits,
     #[cfg(any(debug_assertions, feature = "test-support"))]
     cancellation_for_test: Option<Arc<AtomicBool>>,
+    #[cfg(all(unix, any(debug_assertions, feature = "test-support")))]
+    foreground_terminal_for_test: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -142,6 +157,8 @@ impl PrivilegeSession {
             limits: PrivilegedExecutionLimits::default(),
             #[cfg(any(debug_assertions, feature = "test-support"))]
             cancellation_for_test: None,
+            #[cfg(all(unix, any(debug_assertions, feature = "test-support")))]
+            foreground_terminal_for_test: None,
         })
     }
 
@@ -162,6 +179,8 @@ impl PrivilegeSession {
             environment: env::vars_os().collect(),
             limits: PrivilegedExecutionLimits::default(),
             cancellation_for_test: None,
+            #[cfg(unix)]
+            foreground_terminal_for_test: None,
         })
     }
 
@@ -180,6 +199,8 @@ impl PrivilegeSession {
             environment: env::vars_os().collect(),
             limits: PrivilegedExecutionLimits::default(),
             cancellation_for_test: None,
+            #[cfg(unix)]
+            foreground_terminal_for_test: None,
         })
     }
 
@@ -197,6 +218,8 @@ impl PrivilegeSession {
             environment: env::vars_os().collect(),
             limits: PrivilegedExecutionLimits::default(),
             cancellation_for_test: None,
+            #[cfg(unix)]
+            foreground_terminal_for_test: None,
         })
     }
 
@@ -217,6 +240,8 @@ impl PrivilegeSession {
             environment: env::vars_os().collect(),
             limits: PrivilegedExecutionLimits::default(),
             cancellation_for_test: None,
+            #[cfg(unix)]
+            foreground_terminal_for_test: None,
         })
     }
 
@@ -255,14 +280,29 @@ impl PrivilegeSession {
         self
     }
 
+    /// Replace foreground-terminal detection for tests whose contract is the
+    /// prompt decision rather than the test runner's own terminal.
+    #[cfg(all(unix, any(debug_assertions, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn with_foreground_terminal_for_test(mut self, owns_foreground: bool) -> Self {
+        self.foreground_terminal_for_test = Some(owns_foreground);
+        self
+    }
+
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
     }
 
-    /// Acquire one native sudo timestamp, reusing an existing timestamp when present.
+    /// Authorize one shared sudo session, reusing existing authorization first.
     ///
-    /// The interactive `sudo -v` inherits the caller's terminal. This function never
-    /// reads or proxies credential input itself.
+    /// A cached timestamp (`sudo -n -v`) authorizes the session. Otherwise a
+    /// harmless command in the exact `sudo -n --` form of later privileged work
+    /// detects policy that admits commands without a timestamp, such as a
+    /// NOPASSWD rule or a policy plugin grant. Only then does an interactive
+    /// `sudo -v` run, inheriting the caller's terminal, and only when this
+    /// process group owns that terminal's foreground: a background group would
+    /// be stopped by the prompt's terminal read. This function never reads or
+    /// proxies credential input itself.
     pub fn ensure_authenticated(&mut self) -> Result<(), PrivilegeError> {
         #[cfg(not(unix))]
         {
@@ -270,48 +310,97 @@ impl PrivilegeSession {
         }
         #[cfg(unix)]
         {
-            if crate::interrupt::check().is_err() {
-                return Err(PrivilegeError::Interrupted);
-            }
+            interruption_point()?;
             if self.authenticated {
                 return Ok(());
             }
-            let cached = Command::new(&self.sudo)
-                .args(["-n", "-v"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|error| {
-                    authentication_process_error(AuthenticationStage::CachedCheck, error)
-                })?;
-            if crate::interrupt::check().is_err() {
-                return Err(PrivilegeError::Interrupted);
-            }
-            if !cached.success() {
-                let prompted = Command::new(&self.sudo)
-                    .arg("-v")
-                    .status()
-                    .map_err(|error| {
-                        authentication_process_error(AuthenticationStage::Prompt, error)
-                    })?;
-                if crate::interrupt::check().is_err() {
-                    return Err(PrivilegeError::Interrupted);
-                }
-                if !prompted.success() {
-                    use std::os::unix::process::ExitStatusExt;
-                    return Err(PrivilegeError::Authentication {
-                        stage: AuthenticationStage::Prompt,
-                        failure: AuthenticationFailure::Exit {
-                            code: prompted.code(),
-                            signal: prompted.signal(),
-                        },
-                    });
-                }
-            }
+            self.authorize()?;
             self.authenticated = true;
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    fn authorize(&self) -> Result<(), PrivilegeError> {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cached = Command::new(&self.sudo)
+            .args(["-n", "-v"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| {
+                authentication_process_error(AuthenticationStage::CachedCheck, error)
+            })?;
+        interruption_point()?;
+        if cached.success() {
+            return Ok(());
+        }
+        let policy_admits_commands = self.noninteractive_command_authorized()?;
+        interruption_point()?;
+        if policy_admits_commands {
+            return Ok(());
+        }
+        if !self.owns_foreground_terminal() {
+            return Err(PrivilegeError::PromptUnavailable);
+        }
+        let prompted = Command::new(&self.sudo)
+            .arg("-v")
+            .status()
+            .map_err(|error| authentication_process_error(AuthenticationStage::Prompt, error))?;
+        interruption_point()?;
+        if prompted.success() {
+            Ok(())
+        } else {
+            Err(PrivilegeError::Authentication {
+                stage: AuthenticationStage::Prompt,
+                failure: AuthenticationFailure::Exit {
+                    code: prompted.code(),
+                    signal: prompted.signal(),
+                },
+            })
+        }
+    }
+
+    /// `sudo -v` validates only the timestamp, so policy that authorizes
+    /// commands without one is visible only by running a command.
+    #[cfg(unix)]
+    fn noninteractive_command_authorized(&self) -> Result<bool, PrivilegeError> {
+        let Some(probe) = AUTHORIZATION_PROBE_CANDIDATES
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| validate_trusted_executable(candidate).is_ok())
+        else {
+            return Ok(false);
+        };
+        match self.run_noninteractive(probe, &[], AUTHORIZATION_PROBE_LIMITS, true) {
+            Ok(output) => Ok(output.status.success()),
+            Err(PrivilegeError::Interrupted) => Err(PrivilegeError::Interrupted),
+            Err(_) => Ok(false),
+        }
+    }
+
+    #[cfg(unix)]
+    fn owns_foreground_terminal(&self) -> bool {
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        if let Some(owns_foreground) = self.foreground_terminal_for_test {
+            return owns_foreground;
+        }
+        use std::io::IsTerminal;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        let Ok(terminal) = fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open("/dev/tty")
+        else {
+            return false;
+        };
+        rustix::termios::tcgetpgrp(&terminal).is_ok_and(|group| group == rustix::process::getpgrp())
     }
 
     pub fn run(&self, command: &[OsString]) -> Result<Output, PrivilegeError> {
@@ -340,27 +429,39 @@ impl PrivilegeSession {
         if observe_cancellation && self.cancellation_flag().load(Ordering::Acquire) {
             return Err(PrivilegeError::Interrupted);
         }
-        let executable = command
-            .first()
-            .map(PathBuf::from)
-            .ok_or(PrivilegeError::UnsafeCommand)?;
-        let executable = self.elevated_executable(&executable)?;
+        let (executable, arguments) = command.split_first().ok_or(PrivilegeError::UnsafeCommand)?;
+        let executable = self.elevated_executable(Path::new(executable))?;
         if !self.authenticated {
             return Err(PrivilegeError::NotAuthenticated);
         }
-        let mut trusted_command = command.to_vec();
-        trusted_command[0] = executable.into_os_string();
-        let mut arguments = Vec::with_capacity(trusted_command.len() + 2);
-        arguments.push(OsString::from("-n"));
-        arguments.push(OsString::from("--"));
-        arguments.extend(trusted_command);
+        let output =
+            self.run_noninteractive(executable, arguments, self.limits, observe_cancellation)?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(PrivilegeError::Failed)
+        }
+    }
+
+    fn run_noninteractive(
+        &self,
+        executable: PathBuf,
+        arguments: &[OsString],
+        limits: PrivilegedExecutionLimits,
+        observe_cancellation: bool,
+    ) -> Result<Output, PrivilegeError> {
+        let mut sudo_arguments = Vec::with_capacity(arguments.len() + 3);
+        sudo_arguments.push(OsString::from("-n"));
+        sudo_arguments.push(OsString::from("--"));
+        sudo_arguments.push(executable.into_os_string());
+        sudo_arguments.extend_from_slice(arguments);
         let request = BoundedCommand {
             executable: &self.sudo,
-            arguments: &arguments,
+            arguments: &sudo_arguments,
             environment: &self.environment,
             cwd: None,
-            timeout: self.limits.timeout,
-            output_limit: self.limits.output_limit,
+            timeout: limits.timeout,
+            output_limit: limits.output_limit,
         };
         let output = if observe_cancellation {
             run_bounded_command_with_cancellation(&request, self.cancellation_flag())
@@ -368,16 +469,11 @@ impl PrivilegeSession {
             run_bounded_command(&request)
         }
         .map_err(classify_bounded_error)?;
-        let output = Output {
+        Ok(Output {
             status: output.status,
             stdout: output.stdout,
             stderr: output.stderr,
-        };
-        if output.status.success() {
-            Ok(output)
-        } else {
-            Err(PrivilegeError::Failed)
-        }
+        })
     }
 
     pub fn sudo_path(&self) -> &Path {
@@ -410,6 +506,11 @@ impl PrivilegeSession {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn interruption_point() -> Result<(), PrivilegeError> {
+    crate::interrupt::check().map_err(|_| PrivilegeError::Interrupted)
 }
 
 fn classify_bounded_error(error: BoundedCommandError) -> PrivilegeError {

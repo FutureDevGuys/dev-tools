@@ -130,6 +130,9 @@ impl EngineError {
             | Self::PrivilegedTarget(PrivilegedTargetError::PrivilegedCommand { source, .. }) => {
                 match source {
                     PrivilegeError::TimedOut => FailureDiagnostic::PrivilegedCommandTimedOut,
+                    PrivilegeError::PromptUnavailable => {
+                        FailureDiagnostic::AuthenticationPromptUnavailable
+                    }
                     PrivilegeError::Authentication { stage, failure } => match failure {
                         AuthenticationFailure::Process { os_code, .. } => {
                             FailureDiagnostic::AuthenticationProcess {
