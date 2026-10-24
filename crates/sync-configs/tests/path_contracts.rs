@@ -53,8 +53,8 @@ fn synthetic_windows_home_environment_lookup_is_case_insensitive() {
         ),
         (
             "drive and home path",
-            &[("homeDrive", "D:"), ("homePath", r"\Operators\rashino")],
-            r"D:\Operators\rashino",
+            &[("homeDrive", "D:"), ("homePath", r"\Operators\operator")],
+            r"D:\Operators\operator",
         ),
     ];
     for &(name, environment, expected) in cases {
