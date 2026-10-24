@@ -4719,6 +4719,17 @@ fn configured_git_resolves_literal_origin_without_caller_path_fallback() {
         .status()
         .unwrap()
         .success());
+    // An unprivileged Bubblewrap user namespace shows root-owned host files
+    // as the overflow user, which program custody rejects. Configure an
+    // account-owned copy of the native Git executable instead. A child process
+    // writes it, so no writer of it can outlive the copy in this harness.
+    let configured_git = directory.join("configured-git");
+    assert!(Command::new("/usr/bin/install")
+        .args(["-m", "0700", "/usr/bin/git"])
+        .arg(&configured_git)
+        .status()
+        .unwrap()
+        .success());
     let home = &sandbox.home;
     let config_dir = home.join(".config/dev-auth");
     fs::create_dir_all(&config_dir).unwrap();
@@ -4726,11 +4737,12 @@ fn configured_git_resolves_literal_origin_without_caller_path_fallback() {
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        r#"version = 1
+        format!(
+            r#"version = 1
 [programs]
 op = "/usr/bin/false"
 gh = "/usr/bin/false"
-git = "/usr/bin/git"
+git = "{}"
 ssh_add = "/usr/bin/false"
 ssh_keygen = "/usr/bin/false"
 [github]
@@ -4738,8 +4750,10 @@ app_id = 42
 private_key_ref = "op://Automation/app/private key"
 repository_selection = "all"
 discover_installations = true
-permissions = { actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }
+permissions = {{ actions = "read", checks = "read", contents = "write", metadata = "read", pull_requests = "write", statuses = "read" }}
 "#,
+            configured_git.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(
