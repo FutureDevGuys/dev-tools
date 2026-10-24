@@ -563,136 +563,56 @@ fn setup_cli_never_treats_a_binary_install_plan_as_full_desired_state() {
 #[cfg(target_os = "linux")]
 const FIXTURE_OPERATOR: &str = "fixture-operator";
 
-/// One strong account's current-state inventory as a planner older than 0.5.0
-/// records it: everything a strong installation owns except the maintenance helper.
+/// A user-only plan for the effective native account that a newer release
+/// rendered for `candidate`: it carries a component and an action that this
+/// release does not know.
 #[cfg(target_os = "linux")]
-fn pre_maintenance_strong_inventory() -> Vec<(String, String, std::path::PathBuf)> {
-    use std::path::{Path, PathBuf};
-
-    let data = Path::new("/usr/local/lib/dev-auth");
-    let bin = Path::new("/usr/local/bin");
-    let home = Path::new("/home").join(FIXTURE_OPERATOR);
-    let system = |kind: &str, path: PathBuf| (kind.to_owned(), "system".to_owned(), path);
-    let mut inventory = vec![
-        system("installation_receipt", data.join("install-v2.json")),
-        system(
-            "shared_installation_receipt",
-            data.join("installation-receipt-v1.json"),
-        ),
-        system("active_release_pointer", data.join("active")),
-        system("previous_release_pointer", data.join("previous")),
-        system(
-            "privileged_workload_launcher",
-            data.join("dev-auth-workload-launcher"),
-        ),
-        system(
-            "privileged_setup_helper",
-            data.join("dev-auth-setup-helper"),
-        ),
-        system("setup_helper_receipt", data.join("setup-helper-v1.json")),
-        system(
-            "credential_actions",
-            data.join("credential-actions-v2.json"),
-        ),
-        system("setup_transition", data.join("setup-transition-v1.json")),
-        system("administrator_policy", "/etc/dev-auth/policy.toml".into()),
-    ];
-    for alias in [
-        "dev-auth",
-        "git-credential-dev-auth",
-        "git-dev-auth",
-        "gh-dev-auth",
-        "ssh-keygen-dev-auth",
-    ] {
-        inventory.push(("product_launcher".into(), alias.into(), bin.join(alias)));
-    }
-    for alias in ["git", "gh"] {
-        inventory.push(("transparent_launcher".into(), alias.into(), bin.join(alias)));
-    }
-    for (path, _, _) in dev_auth::setup::linux_system_assets() {
-        inventory.push((
-            "system_integration".into(),
-            path.display().to_string(),
-            path.into(),
-        ));
-    }
-    for (kind, relative) in [
-        (
-            "workload_launcher_receipt",
-            ".local/share/dev-auth/workload-aliases-v1.json",
-        ),
-        (
-            "desktop_entry_receipt",
-            ".local/share/dev-auth/desktop-entries-v1.json",
-        ),
-        ("user_configuration", ".config/dev-auth/config-v2.toml"),
-        (
-            "retained_user_configuration",
-            ".config/dev-auth/config-v3.toml",
-        ),
-    ] {
-        inventory.push((kind.into(), FIXTURE_OPERATOR.into(), home.join(relative)));
-    }
-    inventory
-}
-
-#[cfg(target_os = "linux")]
-fn strong_credential_plan(
-    candidate_version: &str,
-    mut inventory: Vec<(String, String, std::path::PathBuf)>,
-) -> dev_auth::setup_v3::SetupPlanV3 {
+fn newer_candidate_plan(root: &std::path::Path, candidate: &std::path::Path) -> Vec<u8> {
     use dev_auth::deployment::{
         canonical_deployment_intent, Activation, Channel, DeploymentIntent, DeploymentMode,
         DeploymentUser,
     };
     use dev_auth::setup::SetupPlan;
     use dev_auth::setup_v3::{
-        planned_action_contract, CurrentPathIdentity, DocumentIdentity, NativeAccountIdentity,
-        SetupPlanV3,
+        planned_action_contract, DocumentIdentity, NativeAccountIdentity, SetupPlanV3,
     };
     use sha2::{Digest, Sha256};
 
     let sha256 = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let home = std::path::Path::new("/home").join(FIXTURE_OPERATOR);
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let home = root.join("home");
     let intent = DeploymentIntent {
         purpose: Default::default(),
         schema: "dev-auth-deployment-intent-v1".into(),
-        mode: DeploymentMode::Strong,
+        mode: DeploymentMode::UserOnly,
         channel: Channel::Stable,
         offline: true,
         activation: Activation::Inactive,
-        administrator_policy: "/etc/dev-auth/candidate-policy.toml".into(),
+        administrator_policy: root.join("policy.toml"),
         grant_policy: None,
         users: vec![DeploymentUser {
-            name: FIXTURE_OPERATOR.into(),
-            config: home.join("candidate-config.toml"),
+            name: user.name.clone(),
+            config: root.join("config.toml"),
             policy: None,
         }],
         credentials: Vec::new(),
         bindings: Vec::new(),
     };
-    inventory.sort();
-    let current_paths = inventory
-        .into_iter()
-        .map(|(kind, subject, path)| CurrentPathIdentity {
-            kind,
-            subject,
-            path,
-            identity: None,
-        })
-        .collect::<Vec<_>>();
-    let current_credential_ready = std::collections::BTreeSet::new();
-    let current_broker_state = "inactive".to_owned();
-    // Every planner binds its recorded inventory to the plan with this digest.
-    let current_state_sha256 = sha256(
-        &serde_jcs::to_vec(&serde_json::json!({
-            "files": current_paths,
-            "credential_ready": current_credential_ready,
-            "broker": current_broker_state,
-        }))
-        .unwrap(),
-    );
-    SetupPlanV3 {
+    let candidate_bytes = fs::read(candidate).unwrap();
+    let mut actions = planned_action_contract(&intent);
+    let verify = actions.pop().unwrap();
+    actions.push(dev_auth::setup_v3::SetupActionV3 {
+        order: actions.len() as u32,
+        kind: "install_future_component".into(),
+        subject: None,
+    });
+    actions.push(dev_auth::setup_v3::SetupActionV3 {
+        order: actions.len() as u32,
+        ..verify
+    });
+    let plan = SetupPlanV3 {
         credential_preservation: None,
         grant_previous_block: None,
         grant_current_state: None,
@@ -700,21 +620,20 @@ fn strong_credential_plan(
         authority_schema: None,
         schema: "dev-auth-setup-plan-v3".into(),
         intent_sha256: sha256(&canonical_deployment_intent(&intent).unwrap()),
-        actions: planned_action_contract(&intent),
         installation: SetupPlan {
             schema: "dev-auth-setup-plan-v2".into(),
-            paths: SetupPaths::strong(),
+            paths: SetupPaths::user_only(&home),
             request: InstallRequest {
                 purpose: Default::default(),
-                mode: InstallMode::Strong,
-                version: candidate_version.into(),
-                source_executable: "/var/cache/dev-auth/candidate/dev-auth".into(),
-                native_git: "/usr/bin/git".into(),
-                native_gh: "/usr/bin/gh".into(),
+                mode: InstallMode::UserOnly,
+                version: "99.0.0".into(),
+                source_executable: candidate.into(),
+                native_git: root.join("git"),
+                native_gh: root.join("gh"),
                 activate_transparent_launchers: false,
             },
-            source_length: 1,
-            source_sha256: "a".repeat(64),
+            source_length: candidate_bytes.len() as u64,
+            source_sha256: sha256(&candidate_bytes),
             verified_release: None,
         },
         source_documents: vec![DocumentIdentity {
@@ -725,91 +644,246 @@ fn strong_credential_plan(
             sha256: "b".repeat(64),
         }],
         accounts: vec![NativeAccountIdentity {
-            name: FIXTURE_OPERATOR.into(),
-            uid: 60_001,
-            gid: 60_001,
+            name: user.name,
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
             home,
         }],
         retiring_accounts: Vec::new(),
         intent,
-        current_paths,
-        current_credential_ready,
-        current_broker_state,
-        current_state_sha256,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn rejected_plan_diagnostic(operation: &str, plan: &dev_auth::setup_v3::SetupPlanV3) -> String {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("setup-plan.json");
-    fs::write(&path, serde_json::to_vec(plan).unwrap()).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
-        .args([
-            "setup",
-            operation,
-            "--plan",
-            path.to_str().unwrap(),
-            "--sha256",
-            &"0".repeat(64),
-            "--format",
-            "json",
-        ])
-        .env_clear()
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "setup {operation} accepted the plan"
-    );
-    assert!(output.stdout.is_empty());
-    String::from_utf8(output.stderr).unwrap()
+        current_paths: Vec::new(),
+        current_credential_ready: Default::default(),
+        current_broker_state: "inactive".into(),
+        current_state_sha256: "c".repeat(64),
+        actions,
+    };
+    let mut plan = serde_json::to_value(plan).unwrap();
+    plan["future_component"] = serde_json::json!({"schema": "dev-auth-future-component-v1"});
+    serde_jcs::to_vec(&plan).unwrap()
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn older_planner_strong_plan_names_its_version_skew_and_remedy() {
-    const SKEW: &str = "setup plan omits only the current-state paths that Dev Auth 0.5.0 added for strong installations (maintenance_helper_receipt, maintenance_policy, maintenance_polkit_action, privileged_maintenance_helper), so a planner older than 0.5.0 produced it for the 0.5.2 candidate; regenerate the plan with the 0.5.2 candidate's `dev-auth setup plan` and approve its new digest";
-    let older = strong_credential_plan("0.5.2", pre_maintenance_strong_inventory());
+fn installed_release_hands_a_newer_candidates_plan_to_it_without_judging_its_contract() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let record = root.path().join("handoff.log");
+    let candidate = root.path().join("candidate");
+    executable(
+        &candidate,
+        &format!(
+            "#!/bin/sh\n{{ printf 'arg=%s\\n' \"$@\"; printf 'cwd=%s\\n' \"$(pwd)\"; printf 'sentinel=%s\\n' \"${{DEV_AUTH_HANDOFF_SENTINEL-unset}}\"; }} > '{}'\n",
+            record.display()
+        ),
+    );
+    let plan = root.path().join("setup-plan.json");
+    let bytes = newer_candidate_plan(root.path(), &candidate);
+    fs::write(&plan, &bytes).unwrap();
+    fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+
     for operation in ["apply", "verify"] {
-        let diagnostic = rejected_plan_diagnostic(operation, &older);
+        let _ = fs::remove_file(&record);
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["setup", operation, "--plan"])
+            .arg(&plan)
+            .args(["--sha256", &digest, "--format", "json"])
+            .env("DEV_AUTH_HANDOFF_SENTINEL", "inherited")
+            .output()
+            .unwrap();
         assert!(
-            diagnostic.contains(&format!(
-                "setup {operation} accepts only a full setup plan: {SKEW}"
-            )),
-            "{diagnostic}"
+            output.status.success(),
+            "setup {operation} did not reach its candidate: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            format!(
+                "arg=setup\narg={operation}\narg=--plan\narg={}\narg=--sha256\narg={digest}\narg=--format\narg=json\ncwd=/\nsentinel=unset\n",
+                plan.display()
+            ),
+            "setup {operation} handed off with different arguments or environment"
         );
     }
+}
 
-    let mut current = pre_maintenance_strong_inventory();
-    current.extend(
-        [
-            (
-                "privileged_maintenance_helper",
-                "/usr/local/lib/dev-auth/dev-auth-maintenance-helper",
-            ),
-            (
-                "maintenance_helper_receipt",
-                "/usr/local/lib/dev-auth/maintenance-helper-v1.json",
-            ),
-            (
-                "maintenance_polkit_action",
-                "/usr/share/polkit-1/actions/com.futuredevguys.dev-auth.maintenance.policy",
-            ),
-            (
-                "maintenance_policy",
-                "/etc/dev-auth/privilege-policy-v1.json",
-            ),
-        ]
-        .map(|(kind, path)| (kind.into(), "system".into(), path.into())),
+#[cfg(target_os = "linux")]
+#[test]
+fn a_plan_is_never_handed_to_a_candidate_it_does_not_authenticate() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let record = root.path().join("handoff.log");
+    let candidate = root.path().join("candidate");
+    executable(
+        &candidate,
+        &format!("#!/bin/sh\ntouch '{}'\n", record.display()),
     );
-    let matching = strong_credential_plan("0.5.2", current);
+    let newer: serde_json::Value =
+        serde_json::from_slice(&newer_candidate_plan(root.path(), &candidate)).unwrap();
+    let mut changed_candidate = newer.clone();
+    changed_candidate["installation"]["source_sha256"] = "0".repeat(64).into();
+    let mut strong_without_release = newer.clone();
+    strong_without_release["intent"]["mode"] = "strong".into();
+    strong_without_release["installation"]["request"]["mode"] = "strong".into();
+    let mut mismatched_modes = newer.clone();
+    mismatched_modes["installation"]["request"]["mode"] = "strong".into();
+    let plan = root.path().join("setup-plan.json");
+    for (case, document, approve_other_bytes) in [
+        ("another digest", &newer, true),
+        ("changed candidate", &changed_candidate, false),
+        (
+            "strong plan without a release",
+            &strong_without_release,
+            false,
+        ),
+        ("mismatched modes", &mismatched_modes, false),
+    ] {
+        let bytes = serde_jcs::to_vec(document).unwrap();
+        fs::write(&plan, &bytes).unwrap();
+        fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+        let approved = if approve_other_bytes {
+            [bytes.as_slice(), b" "].concat()
+        } else {
+            bytes
+        };
+        let digest = format!("{:x}", Sha256::digest(&approved));
+        for operation in ["apply", "verify"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .args(["setup", operation, "--plan"])
+                .arg(&plan)
+                .args(["--sha256", &digest, "--format", "json"])
+                .env_clear()
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "setup {operation} accepted the {case} plan"
+            );
+            assert!(
+                !record.exists(),
+                "setup {operation} handed the {case} plan to its candidate"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn this_release_names_itself_as_the_release_to_plan_with_for_an_older_planners_plan() {
+    use dev_auth::setup_v3::planned_action_contract;
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let this_release = std::path::Path::new(env!("CARGO_BIN_EXE_dev-auth"));
+    let mut plan: serde_json::Value =
+        serde_json::from_slice(&newer_candidate_plan(root.path(), this_release)).unwrap();
+    plan.as_object_mut().unwrap().remove("future_component");
+    let version = env!("CARGO_PKG_VERSION");
+    plan["installation"]["request"]["version"] = version.into();
+    let intent = serde_json::from_value(plan["intent"].clone()).unwrap();
+    let mut older_actions = planned_action_contract(&intent);
+    older_actions.remove(0);
+    for (order, action) in older_actions.iter_mut().enumerate() {
+        action.order = order as u32;
+    }
+    plan["actions"] = serde_json::to_value(older_actions).unwrap();
+    plan["current_state_sha256"] = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_jcs::to_vec(&serde_json::json!({
+                "files": plan["current_paths"],
+                "credential_ready": plan["current_credential_ready"],
+                "broker": plan["current_broker_state"],
+            }))
+            .unwrap()
+        )
+    )
+    .into();
+    let bytes = serde_jcs::to_vec(&plan).unwrap();
+    let path = root.path().join("setup-plan.json");
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+
     for operation in ["apply", "verify"] {
-        let diagnostic = rejected_plan_diagnostic(operation, &matching);
+        let output = Command::new(this_release)
+            .args(["setup", operation, "--plan"])
+            .arg(&path)
+            .args(["--sha256", &digest, "--format", "json"])
+            .env_clear()
+            .output()
+            .unwrap();
         assert!(
-            !diagnostic.contains("current-state paths") && !diagnostic.contains("planner older"),
-            "a 0.5.0 inventory passes the current-state check: {diagnostic}"
+            !output.status.success(),
+            "setup {operation} accepted the plan"
+        );
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8(output.stderr).unwrap();
+        for expected in [
+            format!("setup {operation} accepts only a full setup plan: setup plan was not rendered by Dev Auth {version}, the release it installs: its action contract differs"),
+            format!("regenerate it with the Dev Auth {version} candidate's `dev-auth setup plan`"),
+        ] {
+            assert!(diagnostic.contains(&expected), "{expected:?} is absent from {diagnostic:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_release_never_renders_a_setup_plan_for_another_release() {
+    use dev_auth::deployment::{
+        Activation, Channel, DeploymentIntent, DeploymentMode, DeploymentUser,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let intent = DeploymentIntent {
+        purpose: Default::default(),
+        schema: "dev-auth-deployment-intent-v1".into(),
+        mode: DeploymentMode::UserOnly,
+        channel: Channel::Stable,
+        offline: true,
+        activation: Activation::Inactive,
+        administrator_policy: root.path().join("policy.toml"),
+        grant_policy: None,
+        users: vec![DeploymentUser {
+            name: FIXTURE_OPERATOR.into(),
+            config: root.path().join("config.toml"),
+            policy: None,
+        }],
+        credentials: Vec::new(),
+        bindings: Vec::new(),
+    };
+    let release = dev_auth::release_manifest::VerifiedDevAuthRelease {
+        schema: "dev-auth-verified-release-v1".into(),
+        root_path: root.path().join("root.json"),
+        manifest_path: root.path().join("manifest.json"),
+        root_generation: 1,
+        manifest_generation: 1,
+        version: "0.5.7".into(),
+        source_commit: "d".repeat(40),
+        target: "linux-x86_64".into(),
+        artifact_path: root.path().join("artifact"),
+        artifact_url: "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.5.7/dev-auth-0.5.7-linux-x86_64".into(),
+        artifact_length: 1,
+        artifact_sha256: "e".repeat(64),
+        root_sha256: "f".repeat(64),
+        manifest_sha256: "0".repeat(64),
+    };
+    let error =
+        dev_auth::setup_v3::build_setup_plan_v3_for_verified_release(intent, release).unwrap_err();
+    let error = format!("{error:#}");
+    for expected in [
+        format!(
+            "Dev Auth {} cannot render the setup plan for Dev Auth 0.5.7",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "run `dev-auth setup plan` from the Dev Auth 0.5.7 candidate".to_owned(),
+    ] {
+        assert!(
+            error.contains(&expected),
+            "{expected:?} is absent from {error:?}"
         );
     }
 }

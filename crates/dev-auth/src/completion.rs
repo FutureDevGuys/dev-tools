@@ -147,6 +147,7 @@ fn setup() -> Command {
             path("grant-policy"),
             choice("channel", ["stable"]),
             flag("offline"),
+            flag("accepted-release"),
             path("release-root"),
             path("release-manifest"),
             path("release-artifact"),

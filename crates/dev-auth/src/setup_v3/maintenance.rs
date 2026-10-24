@@ -284,7 +284,6 @@ fn inner(
         bail!("maintenance native account identity changed");
     }
     validate_candidate_inventory(plan, &generation.candidate_documents)?;
-    validate_setup_plan_v3_with_installation_check(plan, &|_| Ok(()))?;
     *retry = Some(paths.versioned_binary(&plan.installation.request.version));
     if crate::setup::setup_executable_identity(&std::env::current_exe()?)?
         != (
@@ -295,6 +294,7 @@ fn inner(
         progress.blocked("run_retained_candidate_for_maintenance");
         bail!("maintenance requires the exact retained candidate");
     }
+    validate_setup_plan_v3_with_installation_check(plan, &|_| Ok(()))?;
     if deployment_mode == DeploymentMode::UserOnly {
         crate::setup::require_user_sessions_absent()?;
     }
