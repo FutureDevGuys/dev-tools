@@ -400,7 +400,7 @@ fn stalled_lookup_or_read_is_bounded_and_disconnects_without_retry() {
         let bus = Bus::new();
         run_test(async {
             let (connection, store) = bus.store(mode, b"synthetic".to_vec()).await;
-            let error = read_at(&bus.path(), &stores(), Duration::from_millis(300))
+            let error = read_at(&bus.path(), &stores(), READ_BUDGET)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -526,7 +526,7 @@ fn slot_read_does_not_receive_a_new_budget_after_slow_lookup() {
             while store.0.lock().unwrap().searches.is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             {
                 let mut state = store.0.lock().unwrap();
                 state.search_released = true;
@@ -536,12 +536,12 @@ fn slot_read_does_not_receive_a_new_budget_after_slow_lookup() {
             }
             std::future::pending::<()>().await;
         };
-        // Per-call two-second timeouts would allow the second call to survive
+        // Per-call four-second timeouts would allow the second call to survive
         // this deadline. The actual whole-read budget must already be exhausted.
         let result = tokio::time::timeout(
-            Duration::from_millis(2700),
+            Duration::from_millis(5500),
             select(
-                Box::pin(read_at(&path, &stores, Duration::from_secs(2))),
+                Box::pin(read_at(&path, &stores, Duration::from_secs(4))),
                 Box::pin(release_search),
             ),
         )

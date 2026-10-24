@@ -3541,8 +3541,10 @@ fn await_startup_proof(reader: &OwnedFd) -> Result<()> {
             reader.as_fd(),
             PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
         )];
-        poll(&mut descriptors, PollTimeout::from(20_u16))
-            .context("wait for configured workload startup proof")?;
+        match poll(&mut descriptors, PollTimeout::from(20_u16)) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            result => result.context("wait for configured workload startup proof")?,
+        };
         let events = descriptors[0].revents().unwrap_or(PollFlags::empty());
         if events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
             bail!("configured workload startup proof pipe failed");
