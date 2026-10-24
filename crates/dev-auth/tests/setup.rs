@@ -814,6 +814,209 @@ fn older_planner_strong_plan_names_its_version_skew_and_remedy() {
     }
 }
 
+/// A user-only plan for the effective native account that a newer release
+/// rendered for `candidate`: it carries a component and an action that this
+/// release does not know.
+#[cfg(target_os = "linux")]
+fn newer_candidate_plan(root: &std::path::Path, candidate: &std::path::Path) -> Vec<u8> {
+    use dev_auth::deployment::{
+        canonical_deployment_intent, Activation, Channel, DeploymentIntent, DeploymentMode,
+        DeploymentUser,
+    };
+    use dev_auth::setup::SetupPlan;
+    use dev_auth::setup_v3::{
+        planned_action_contract, DocumentIdentity, NativeAccountIdentity, SetupPlanV3,
+    };
+    use sha2::{Digest, Sha256};
+
+    let sha256 = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .unwrap()
+        .unwrap();
+    let home = root.join("home");
+    let intent = DeploymentIntent {
+        purpose: Default::default(),
+        schema: "dev-auth-deployment-intent-v1".into(),
+        mode: DeploymentMode::UserOnly,
+        channel: Channel::Stable,
+        offline: true,
+        activation: Activation::Inactive,
+        administrator_policy: root.join("policy.toml"),
+        grant_policy: None,
+        users: vec![DeploymentUser {
+            name: user.name.clone(),
+            config: root.join("config.toml"),
+            policy: None,
+        }],
+        credentials: Vec::new(),
+        bindings: Vec::new(),
+    };
+    let candidate_bytes = fs::read(candidate).unwrap();
+    let mut actions = planned_action_contract(&intent);
+    let verify = actions.pop().unwrap();
+    actions.push(dev_auth::setup_v3::SetupActionV3 {
+        order: actions.len() as u32,
+        kind: "install_future_component".into(),
+        subject: None,
+    });
+    actions.push(dev_auth::setup_v3::SetupActionV3 {
+        order: actions.len() as u32,
+        ..verify
+    });
+    let plan = SetupPlanV3 {
+        credential_preservation: None,
+        grant_previous_block: None,
+        grant_current_state: None,
+        grant_payload: Default::default(),
+        authority_schema: None,
+        schema: "dev-auth-setup-plan-v3".into(),
+        intent_sha256: sha256(&canonical_deployment_intent(&intent).unwrap()),
+        installation: SetupPlan {
+            schema: "dev-auth-setup-plan-v2".into(),
+            paths: SetupPaths::user_only(&home),
+            request: InstallRequest {
+                purpose: Default::default(),
+                mode: InstallMode::UserOnly,
+                version: "99.0.0".into(),
+                source_executable: candidate.into(),
+                native_git: root.join("git"),
+                native_gh: root.join("gh"),
+                activate_transparent_launchers: false,
+            },
+            source_length: candidate_bytes.len() as u64,
+            source_sha256: sha256(&candidate_bytes),
+            verified_release: None,
+        },
+        source_documents: vec![DocumentIdentity {
+            kind: "administrator_policy".into(),
+            subject: "system".into(),
+            path: intent.administrator_policy.clone(),
+            length: 1,
+            sha256: "b".repeat(64),
+        }],
+        accounts: vec![NativeAccountIdentity {
+            name: user.name,
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            home,
+        }],
+        retiring_accounts: Vec::new(),
+        intent,
+        current_paths: Vec::new(),
+        current_credential_ready: Default::default(),
+        current_broker_state: "inactive".into(),
+        current_state_sha256: "c".repeat(64),
+        actions,
+    };
+    let mut plan = serde_json::to_value(plan).unwrap();
+    plan["future_component"] = serde_json::json!({"schema": "dev-auth-future-component-v1"});
+    serde_jcs::to_vec(&plan).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_release_hands_a_newer_candidates_plan_to_it_without_judging_its_contract() {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let record = root.path().join("handoff.log");
+    let candidate = root.path().join("candidate");
+    executable(
+        &candidate,
+        &format!(
+            "#!/bin/sh\n{{ printf 'arg=%s\\n' \"$@\"; printf 'cwd=%s\\n' \"$(pwd)\"; printf 'sentinel=%s\\n' \"${{DEV_AUTH_HANDOFF_SENTINEL-unset}}\"; }} > '{}'\n",
+            record.display()
+        ),
+    );
+    let plan = root.path().join("setup-plan.json");
+    let bytes = newer_candidate_plan(root.path(), &candidate);
+    fs::write(&plan, &bytes).unwrap();
+    fs::set_permissions(&plan, fs::Permissions::from_mode(0o600)).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+
+    for operation in ["apply", "verify"] {
+        let _ = fs::remove_file(&record);
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+            .args(["setup", operation, "--plan"])
+            .arg(&plan)
+            .args(["--sha256", &digest, "--format", "json"])
+            .env("DEV_AUTH_HANDOFF_SENTINEL", "inherited")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "setup {operation} did not reach its candidate: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            format!(
+                "arg=setup\narg={operation}\narg=--plan\narg={}\narg=--sha256\narg={digest}\narg=--format\narg=json\ncwd=/\nsentinel=unset\n",
+                plan.display()
+            ),
+            "setup {operation} handed off with different arguments or environment"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_release_never_renders_a_setup_plan_for_another_release() {
+    use dev_auth::deployment::{
+        Activation, Channel, DeploymentIntent, DeploymentMode, DeploymentUser,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let intent = DeploymentIntent {
+        purpose: Default::default(),
+        schema: "dev-auth-deployment-intent-v1".into(),
+        mode: DeploymentMode::UserOnly,
+        channel: Channel::Stable,
+        offline: true,
+        activation: Activation::Inactive,
+        administrator_policy: root.path().join("policy.toml"),
+        grant_policy: None,
+        users: vec![DeploymentUser {
+            name: FIXTURE_OPERATOR.into(),
+            config: root.path().join("config.toml"),
+            policy: None,
+        }],
+        credentials: Vec::new(),
+        bindings: Vec::new(),
+    };
+    let release = dev_auth::release_manifest::VerifiedDevAuthRelease {
+        schema: "dev-auth-verified-release-v1".into(),
+        root_path: root.path().join("root.json"),
+        manifest_path: root.path().join("manifest.json"),
+        root_generation: 1,
+        manifest_generation: 1,
+        version: "0.5.7".into(),
+        source_commit: "d".repeat(40),
+        target: "linux-x86_64".into(),
+        artifact_path: root.path().join("artifact"),
+        artifact_url: "https://github.com/FutureDevGuys/dev-tools/releases/download/dev-auth%2Fv0.5.7/dev-auth-0.5.7-linux-x86_64".into(),
+        artifact_length: 1,
+        artifact_sha256: "e".repeat(64),
+        root_sha256: "f".repeat(64),
+        manifest_sha256: "0".repeat(64),
+    };
+    let error =
+        dev_auth::setup_v3::build_setup_plan_v3_for_verified_release(intent, release).unwrap_err();
+    let error = format!("{error:#}");
+    for expected in [
+        format!(
+            "Dev Auth {} cannot render the setup plan for Dev Auth 0.5.7",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "run `dev-auth setup plan` from the Dev Auth 0.5.7 candidate".to_owned(),
+    ] {
+        assert!(
+            error.contains(&expected),
+            "{expected:?} is absent from {error:?}"
+        );
+    }
+}
+
 #[test]
 fn strong_setup_owns_hardened_socket_activated_service_assets() {
     let assets = dev_auth::setup::linux_system_assets();

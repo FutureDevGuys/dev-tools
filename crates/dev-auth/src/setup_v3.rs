@@ -5855,12 +5855,28 @@ mod tests {
         candidate_version: &str,
         edit_inventory: impl FnOnce(&mut Vec<(String, String, PathBuf)>),
     ) -> SetupPlanV3 {
+        strong_plan(candidate_version, false, edit_inventory)
+    }
+
+    /// The plan this release renders for one strong account, optionally with
+    /// the grant component, before any edit that stands in for another planner.
+    #[cfg(target_os = "linux")]
+    fn strong_plan(
+        candidate_version: &str,
+        grants: bool,
+        edit_inventory: impl FnOnce(&mut Vec<(String, String, PathBuf)>),
+    ) -> SetupPlanV3 {
         use crate::setup::{InstallMode, InstallRequest, SetupPaths};
         let intent = DeploymentIntent {
             bindings: Vec::new(),
             purpose: Default::default(),
-            grant_policy: None,
-            schema: "dev-auth-deployment-intent-v1".into(),
+            grant_policy: grants.then(|| "/etc/dev-auth/candidate-grant-policy.json".into()),
+            schema: if grants {
+                "dev-auth-deployment-intent-v2"
+            } else {
+                "dev-auth-deployment-intent-v1"
+            }
+            .into(),
             mode: DeploymentMode::Strong,
             channel: crate::deployment::Channel::Stable,
             offline: true,
@@ -5907,24 +5923,45 @@ mod tests {
                 identity: None,
             })
             .collect::<Vec<_>>();
-        let current_state_sha256 =
-            stored_current_state_digest(&current_paths, &BTreeSet::new(), "inactive").unwrap();
+        let grant_current_state =
+            grants.then(|| r#"{"enabled":false,"loaded":false,"stopped":true}"#.to_owned());
+        let current_state_sha256 = stored_current_state_digest_with_grants(
+            &current_paths,
+            &BTreeSet::new(),
+            "inactive",
+            grant_current_state.as_deref(),
+        )
+        .unwrap();
+        let mut source_documents = vec![DocumentIdentity {
+            kind: "administrator_policy".into(),
+            subject: "system".into(),
+            path: intent.administrator_policy.clone(),
+            length: 1,
+            sha256: "b".repeat(64),
+        }];
+        if let Some(path) = &intent.grant_policy {
+            source_documents.push(DocumentIdentity {
+                kind: "grant_policy".into(),
+                subject: "system".into(),
+                path: path.clone(),
+                length: 1,
+                sha256: "c".repeat(64),
+            });
+        }
         SetupPlanV3 {
             credential_preservation: None,
             grant_previous_block: None,
-            grant_current_state: None,
-            grant_payload: BTreeMap::new(),
+            grant_payload: if grants {
+                grants::payload(&installation).unwrap()
+            } else {
+                BTreeMap::new()
+            },
+            grant_current_state,
             authority_schema: None,
-            schema: "dev-auth-setup-plan-v3".into(),
+            schema: setup_plan_schema(&intent).into(),
             intent_sha256: sha256_hex(&canonical_deployment_intent(&intent).unwrap()),
             actions: planned_action_contract(&intent),
-            source_documents: vec![DocumentIdentity {
-                kind: "administrator_policy".into(),
-                subject: "system".into(),
-                path: intent.administrator_policy.clone(),
-                length: 1,
-                sha256: "b".repeat(64),
-            }],
+            source_documents,
             intent,
             installation,
             accounts,
@@ -6035,5 +6072,72 @@ mod tests {
             rejection(&unverified),
             format!("{unsupported}its actions do not end with verify")
         );
+    }
+
+    /// The release under test, standing in for the candidate that validates
+    /// a plan it installs.
+    #[cfg(target_os = "linux")]
+    const THIS_RELEASE: &str = env!("CARGO_PKG_VERSION");
+
+    /// The identity a planner records for bytes that only it embeds.
+    #[cfg(target_os = "linux")]
+    fn embedded_identity(bytes: &[u8]) -> dev_tools_installation::ArtifactIdentity {
+        dev_tools_installation::ArtifactIdentity {
+            length: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn names_the_release_to_plan_with(rejection: &str, candidate: &str, component: &str) {
+        for expected in [
+            format!("setup plan was not rendered by Dev Auth {candidate}, the release it installs"),
+            component.to_owned(),
+            format!(
+                "regenerate it with the Dev Auth {candidate} candidate's `dev-auth setup plan`"
+            ),
+        ] {
+            assert!(
+                rejection.contains(&expected),
+                "{expected:?} is absent from {rejection:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs the embedded native sudo payload; `just test` runs it"]
+    fn older_planner_grant_payload_names_the_release_to_plan_with() {
+        assert!(
+            !crate::privilege::grants::assets::SUDO_LIBRARY.is_empty(),
+            "the grant component needs the embedded native sudo payload; run `just test`"
+        );
+        let current = strong_plan(THIS_RELEASE, true, |_| {});
+        validate_setup_plan_v3_with_installation_check(&current, &|_| Ok(())).unwrap();
+
+        let mut older = current;
+        older.grant_payload.insert(
+            "library".into(),
+            embedded_identity(b"dev-auth-sudo-build-v1:0.5.2:planner:end"),
+        );
+        older.grant_payload.insert(
+            "service".into(),
+            embedded_identity(b"[Service]\nExitType=main\n"),
+        );
+        names_the_release_to_plan_with(&rejection(&older), THIS_RELEASE, "grant payload");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn older_planner_action_contract_names_the_release_to_plan_with() {
+        let current = strong_plan_for(THIS_RELEASE, |_| {});
+        validate_setup_plan_v3_with_installation_check(&current, &|_| Ok(())).unwrap();
+
+        let mut older = current;
+        older.actions.remove(0);
+        for (order, action) in older.actions.iter_mut().enumerate() {
+            action.order = order as u32;
+        }
+        names_the_release_to_plan_with(&rejection(&older), THIS_RELEASE, "action contract");
     }
 }

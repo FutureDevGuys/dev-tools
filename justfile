@@ -35,7 +35,9 @@ test:
     # libtest reads the thread limit from the environment; custom-harness targets accept no flags.
     RUST_TEST_THREADS=2 cargo test -p dev-auth -p dev-auth-sudo -p sync-configs -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --locked -j 2 --config 'profile.test.package.sha2.opt-level=3'
     if [[ "$(uname -s)" == Linux ]]; then
-        cargo test -p dev-auth --lib --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' setup_v3::grants::native_acceptance::native_fixture_embedded_sudo_payload_available -- --ignored --exact --test-threads=1
+        cargo test -p dev-auth --lib --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' -- --ignored --exact --test-threads=1 \
+            setup_v3::grants::native_acceptance::native_fixture_embedded_sudo_payload_available \
+            setup_v3::tests::older_planner_grant_payload_names_the_release_to_plan_with
     fi
 
 # Compile Dev Auth and embed its version/target/source-matched Linux sudo helper
