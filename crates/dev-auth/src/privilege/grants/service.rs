@@ -1105,8 +1105,8 @@ async fn activate_launch(
         None
     };
     {
-        let observed = now()?;
         let mut state = service.state.lock().await;
+        let observed = now()?;
         state.registry.poll(observed);
         require_launch_state(service, &state, id, caller, LaunchPhase::Pending)?;
         if let Some(bootstrap) = &bootstrap {
@@ -1502,9 +1502,9 @@ async fn delegate(
         .policy
         .approve_limits(&caller.scope.account, &request)?;
     request.idle_seconds = effective_idle(&service.policy, &scope.account, &request)?;
-    let now = now()?;
     let id = new_id()?;
     let mut state = service.state.lock().await;
+    let now = now()?;
     if state.phase != Phase::Serving {
         return Err(Failure::NativeUnavailable);
     }
@@ -1613,7 +1613,6 @@ async fn execute(
     let relay_sudo = sudo_relay.then(|| service.sudo_program()).transpose()?;
     let terminal = execution.terminal;
     caller.verify_directory(&execution.working_directory)?;
-    let now = now()?;
     let job_id = new_id()?;
     let (
         grant_id,
@@ -1627,6 +1626,7 @@ async fn execute(
         captured_relay,
     ) = {
         let mut state = service.state.lock().await;
+        let now = now()?;
         if service.grant_use(state.phase) != GrantUse::Open || state.jobs.len() >= MAX_EXECUTIONS {
             return Err(Failure::Busy);
         }
@@ -2456,9 +2456,14 @@ fn integrity_lost(integrity: Integrity) -> Failure {
     integrity.into()
 }
 
+/// Every look at the clock that reaches the registry is taken while the
+/// state lock is held, so the registry sees observations in lock order. An
+/// observation taken before waiting for the lock can be older than one that
+/// another task recorded meanwhile, and the registry would stop every active
+/// grant as a regressed clock.
 async fn reap(service: &Service) -> Result<(), Integrity> {
-    let now = now().map_err(|_| Integrity::Clock)?;
     let mut state = service.state.lock().await;
+    let now = now().map_err(|_| Integrity::Clock)?;
     state.pending_relays.retain(|_, pending| {
         now < pending.expires && native::alive(pending.caller.peer.peer_pidfd())
     });
