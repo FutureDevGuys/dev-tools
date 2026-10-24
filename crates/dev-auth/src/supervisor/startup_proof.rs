@@ -571,4 +571,46 @@ mod tests {
         let mut byte = [0_u8];
         assert_eq!(nix::unistd::read(&pipe_reader, &mut byte).unwrap(), 0);
     }
+
+    #[test]
+    fn handled_signals_do_not_end_a_commit_receipt_wait() {
+        use std::os::unix::thread::JoinHandleExt;
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::handled_signals_do_not_end_a_commit_receipt_wait"
+        )) {
+            return;
+        }
+        extern "C" fn handled(_: nix::libc::c_int) {}
+        // SAFETY: installs an empty handler in this isolated test process.
+        // poll is not restarted after a handler even with SA_RESTART.
+        unsafe {
+            nix::sys::signal::sigaction(
+                nix::sys::signal::Signal::SIGUSR1,
+                &nix::sys::signal::SigAction::new(
+                    nix::sys::signal::SigHandler::Handler(handled),
+                    nix::sys::signal::SaFlags::SA_RESTART,
+                    nix::sys::signal::SigSet::empty(),
+                ),
+            )
+        }
+        .unwrap();
+        let (receiver, sender) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let waiter = std::thread::spawn(move || await_commit_receipt(&File::from(receiver)));
+        for _ in 0..50 {
+            // SAFETY: the joinable waiter's thread handle stays valid until join.
+            unsafe { nix::libc::pthread_kill(waiter.as_pthread_t(), nix::libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sent = send_commit_receipt(&sender);
+        let result = waiter.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        sent.unwrap();
+    }
 }
