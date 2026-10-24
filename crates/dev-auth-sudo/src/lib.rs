@@ -1,6 +1,7 @@
 //! A product-owned native sudo plugin, loaded only through root-owned sudo
-//! configuration. It never converses with the user, handles a password, parses
+//! configuration. It never reads user input, handles a password, parses
 //! command options, executes a shell, or makes a cached timestamp authoritative.
+//! Its only terminal output is one line that explains a refusal.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

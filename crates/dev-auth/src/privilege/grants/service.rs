@@ -386,7 +386,7 @@ async fn run(
                 let mut readiness = readiness.map_err(|_| Failure::NativeUnavailable)?;
                 let mut bytes = [0_u8; 8];
                 let _ = readiness.try_io(|fd| nix::unistd::read(fd.get_ref(), &mut bytes).map_err(io::Error::from));
-                reap(&service).await?;
+                reap(&service).await.map_err(integrity_lost)?;
                 login_tick += 1;
                 if login_tick >= 10 {
                     login_tick = 0;
@@ -433,7 +433,7 @@ async fn run(
         state.registry.stop_all(StopReason::BrokerShutdown, now()?);
     }
     for _ in 0..50 {
-        reap(&service).await?;
+        reap(&service).await.map_err(integrity_lost)?;
         if service
             .state
             .lock()
@@ -1048,6 +1048,14 @@ fn stop_uncommitted_launch(
         .registry
         .stop(id, StopReason::WorkloadEnded, now)
         .map_err(session_failure)?;
+    withdraw_uncommitted_launch(service, state, id)
+}
+
+fn withdraw_uncommitted_launch(
+    service: &Service,
+    state: &mut State,
+    id: GrantId,
+) -> Result<(), Failure> {
     let metadata = state.metadata.get_mut(&id).ok_or(Failure::NoGrant)?;
     let stopped = metadata.boundary.stop().map_err(|_| Failure::CleanupFailed);
     if state.selected.get(&metadata.scope) == Some(&id) {
@@ -1070,7 +1078,7 @@ fn sweep_abandoned_launches_locked(
     service: &Service,
     state: &mut State,
     now: Duration,
-) -> Result<(), Failure> {
+) -> Result<(), Integrity> {
     state.registry.poll(now);
     let abandoned: Vec<_> = state
         .metadata
@@ -1090,14 +1098,24 @@ fn sweep_abandoned_launches_locked(
         })
         .collect();
     for id in abandoned {
-        stop_uncommitted_launch(service, state, id, now)?;
+        state
+            .registry
+            .stop(id, StopReason::WorkloadEnded, now)
+            .map_err(|_| Integrity::RecordsDisagree(id))?;
+        // The stopped grant admits nothing. A failed withdrawal keeps the
+        // launch owner, so the next sweep retries it.
+        if let Err(failure) = withdraw_uncommitted_launch(service, state, id) {
+            eprintln!(
+                "dev-auth abandoned launch withdrawal failed: grant={id:032x} failure={failure:?}; retrying"
+            );
+        }
     }
     Ok(())
 }
 
 async fn sweep_abandoned_launches(service: &Service) -> Result<(), Failure> {
     let mut state = service.state.lock().await;
-    sweep_abandoned_launches_locked(service, &mut state, now()?)
+    sweep_abandoned_launches_locked(service, &mut state, now()?).map_err(Failure::from)
 }
 
 async fn observe(
@@ -2126,8 +2144,38 @@ fn execution_authority(
     Err(Failure::AuthorityDenied)
 }
 
-async fn reap(service: &Service) -> Result<(), Failure> {
-    let now = now()?;
+/// The only faults that end a reaping pass, and with it the coordinator
+/// (ADR 0137). A failure that belongs to one grant stays with that grant.
+#[derive(Clone, Copy)]
+enum Integrity {
+    Clock,
+    RecordsDisagree(GrantId),
+}
+
+impl std::fmt::Display for Integrity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Clock => formatter.write_str("the boot clock is unreadable"),
+            Self::RecordsDisagree(id) => {
+                write!(formatter, "the records of grant={id:032x} disagree")
+            }
+        }
+    }
+}
+
+impl From<Integrity> for Failure {
+    fn from(_: Integrity) -> Self {
+        Self::RuntimeFailure
+    }
+}
+
+fn integrity_lost(integrity: Integrity) -> Failure {
+    eprintln!("dev-auth grant coordinator exiting: {integrity}");
+    integrity.into()
+}
+
+async fn reap(service: &Service) -> Result<(), Integrity> {
+    let now = now().map_err(|_| Integrity::Clock)?;
     let mut state = service.state.lock().await;
     state.pending_relays.retain(|_, pending| {
         now < pending.expires && native::alive(pending.caller.peer.peer_pidfd())
@@ -2153,7 +2201,7 @@ async fn reap(service: &Service) -> Result<(), Failure> {
         state
             .registry
             .stop(id, reason, now)
-            .map_err(session_failure)?;
+            .map_err(|_| Integrity::RecordsDisagree(id))?;
     }
     sweep_abandoned_launches_locked(service, &mut state, now)?;
     state.registry.poll(now);
@@ -2236,7 +2284,10 @@ async fn reap(service: &Service) -> Result<(), Failure> {
         if has_live_child {
             continue;
         }
-        let metadata = state.metadata.get_mut(&id).ok_or(Failure::RuntimeFailure)?;
+        let metadata = state
+            .metadata
+            .get_mut(&id)
+            .ok_or(Integrity::RecordsDisagree(id))?;
         match metadata.boundary.is_empty() {
             Ok(true) => {
                 let result = metadata.boundary.remove();
@@ -2262,7 +2313,10 @@ async fn reap(service: &Service) -> Result<(), Failure> {
         .map(|grant| (grant.id, grant.lifetime.state()))
         .collect();
     for (id, lease) in terminal {
-        let metadata = state.metadata.get_mut(&id).ok_or(Failure::RuntimeFailure)?;
+        let metadata = state
+            .metadata
+            .get_mut(&id)
+            .ok_or(Integrity::RecordsDisagree(id))?;
         if metadata.terminal_since.is_none() {
             eprintln!("dev-auth grant ended: grant={id:032x} lease={lease:?}");
             metadata.terminal_since = Some(now);
@@ -2633,16 +2687,42 @@ fn own_service_cgroup() -> Result<PathBuf, Failure> {
     Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
-/// Why the service manager did not confirm this unit's crash-cleanup contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnitFault {
-    /// No answer arrived from the system bus or the service manager.
     Unreachable,
-    /// The service manager answered, and the unit breaks the contract.
     Mismatch,
 }
 
-/// Bounds for confirming the unit before the coordinator admits anything.
+/// A failed call means the service manager has not answered yet only when
+/// the bus could not deliver it. Any other reply is the manager's answer.
+fn bus_fault(error: &zbus::Error) -> UnitFault {
+    match error {
+        zbus::Error::InputOutput(_) | zbus::Error::Connection(..) | zbus::Error::Handshake(_) => {
+            UnitFault::Unreachable
+        }
+        zbus::Error::MethodError(name, _, _) => reply_fault(name.as_str()),
+        zbus::Error::FDO(error) => fdo_fault(error),
+        _ => UnitFault::Mismatch,
+    }
+}
+
+fn fdo_fault(error: &zbus::fdo::Error) -> UnitFault {
+    match error {
+        zbus::fdo::Error::ZBus(error) => bus_fault(error),
+        error => reply_fault(zbus::DBusError::name(error).as_str()),
+    }
+}
+
+fn reply_fault(name: &str) -> UnitFault {
+    match name.strip_prefix("org.freedesktop.DBus.Error.") {
+        Some(
+            "ServiceUnknown" | "NameHasNoOwner" | "NoReply" | "Timeout" | "TimedOut"
+            | "Disconnected" | "NoServer" | "IOError",
+        ) => UnitFault::Unreachable,
+        _ => UnitFault::Mismatch,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Backoff {
     attempt: Duration,
@@ -2658,21 +2738,43 @@ const UNIT_VERIFICATION: Backoff = Backoff {
     total: Duration::from_secs(60),
 };
 
-/// Confirm the unit's crash-cleanup contract before any listener exists.
-async fn verify_unit<F, Answer>(mut verify: F, backoff: Backoff) -> Result<(), Failure>
+async fn verify_unit<F, Attempt>(mut verify: F, backoff: Backoff) -> Result<(), Failure>
 where
-    F: FnMut() -> Answer,
-    Answer: std::future::Future<Output = Result<(), UnitFault>>,
+    F: FnMut() -> Attempt,
+    Attempt: std::future::Future<Output = Result<(), UnitFault>>,
 {
-    match tokio::time::timeout(backoff.attempt, verify()).await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(Failure::NativeUnavailable),
+    let give_up = tokio::time::Instant::now() + backoff.total;
+    let mut delay = backoff.first_delay;
+    loop {
+        let fault = match tokio::time::timeout(backoff.attempt, verify()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(fault)) => fault,
+            Err(_) => UnitFault::Unreachable,
+        };
+        if fault == UnitFault::Mismatch {
+            eprintln!("dev-auth grant service unit is not confirmed by the service manager");
+            return Err(Failure::NativeUnavailable);
+        }
+        if tokio::time::Instant::now() + delay >= give_up {
+            eprintln!(
+                "dev-auth grant service unit unverified: the service manager did not answer within {:?}",
+                backoff.total
+            );
+            return Err(Failure::NativeUnavailable);
+        }
+        eprintln!(
+            "dev-auth grant service unit verification: the service manager did not answer; retrying in {delay:?}"
+        );
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(backoff.longest_delay);
     }
 }
 
 async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
-    use UnitFault::{Mismatch, Unreachable};
-    let connection = zbus::Connection::system().await.map_err(|_| Unreachable)?;
+    use UnitFault::Mismatch;
+    let connection = zbus::Connection::system()
+        .await
+        .map_err(|error| bus_fault(&error))?;
     let unit = connection
         .call_method(
             Some("org.freedesktop.systemd1"),
@@ -2682,7 +2784,7 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
             &(std::process::id(),),
         )
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| bus_fault(&error))?;
     let unit: zbus::zvariant::OwnedObjectPath = unit.body().deserialize().map_err(|_| Mismatch)?;
     let properties = zbus::fdo::PropertiesProxy::builder(&connection)
         .destination("org.freedesktop.systemd1")
@@ -2691,42 +2793,42 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
         .map_err(|_| Mismatch)?
         .build()
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| bus_fault(&error))?;
     let service_interface =
         zbus::names::InterfaceName::try_from("org.freedesktop.systemd1.Service")
             .map_err(|_| Mismatch)?;
     let main_pid = properties
         .get(service_interface.clone(), "MainPID")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let kill_mode = properties
         .get(service_interface.clone(), "KillMode")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let send_kill = properties
         .get(service_interface.clone(), "SendSIGKILL")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let group = properties
         .get(service_interface.clone(), "ControlGroup")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let exit_type = properties
         .get(service_interface.clone(), "ExitType")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let remain = properties
         .get(service_interface.clone(), "RemainAfterExit")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let delegated = properties
         .get(service_interface.clone(), "Delegate")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let stop_timeout = properties
         .get(service_interface, "TimeoutStopUSec")
         .await
-        .map_err(|_| Unreachable)?;
+        .map_err(|error| fdo_fault(&error))?;
     let main_pid = u32::try_from(main_pid).map_err(|_| Mismatch)?;
     let kill_mode = String::try_from(kill_mode).map_err(|_| Mismatch)?;
     let send_kill = bool::try_from(send_kill).map_err(|_| Mismatch)?;
@@ -3466,17 +3568,15 @@ mod tests {
         assert_eq!(select(&state, &user, None), Ok(1));
     }
 
-    /// One scripted answer from a fake service manager.
     #[derive(Clone, Copy)]
     enum Answer {
+        Confirmed,
         Fault(UnitFault),
-        /// Never completes, like a service manager that is re-executing itself.
         Silent,
     }
 
     type Verification = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), UnitFault>>>>;
 
-    /// A verifier that gives `answers` in order, then confirms the unit.
     fn scripted(
         answers: &[Answer],
     ) -> (
@@ -3492,9 +3592,10 @@ mod tests {
             let answer = answers.get(call).copied();
             Box::pin(async move {
                 match answer {
-                    None => Ok(()),
+                    Some(Answer::Confirmed) => Ok(()),
                     Some(Answer::Silent) => std::future::pending().await,
                     Some(Answer::Fault(fault)) => Err(fault),
+                    None => panic!("verified after the scripted answers ran out"),
                 }
             })
         };
@@ -3508,13 +3609,12 @@ mod tests {
         total: Duration::from_secs(10),
     };
 
-    // A start failure during a service manager upgrade leaves the grant
-    // service down: verification gives up after one three-second attempt.
     #[tokio::test]
     async fn unit_verification_retries_while_the_service_manager_is_unreachable() {
         let (calls, verify) = scripted(&[
             Answer::Fault(UnitFault::Unreachable),
             Answer::Fault(UnitFault::Unreachable),
+            Answer::Confirmed,
         ]);
         assert_eq!(verify_unit(verify, QUICK).await, Ok(()));
         assert_eq!(calls.get(), 3);
@@ -3522,7 +3622,7 @@ mod tests {
 
     #[tokio::test]
     async fn unit_verification_retries_a_service_manager_that_does_not_answer() {
-        let (calls, verify) = scripted(&[Answer::Silent]);
+        let (calls, verify) = scripted(&[Answer::Silent, Answer::Confirmed]);
         assert_eq!(verify_unit(verify, QUICK).await, Ok(()));
         assert_eq!(calls.get(), 2);
     }
@@ -3535,6 +3635,40 @@ mod tests {
             Err(Failure::NativeUnavailable)
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn only_an_undelivered_call_leaves_the_service_manager_unanswered() {
+        use zbus::fdo::Error as Reply;
+        let undelivered = [
+            zbus::Error::InputOutput(Arc::new(io::ErrorKind::ConnectionRefused.into())),
+            zbus::Error::FDO(Box::new(Reply::NameHasNoOwner("systemd".into()))),
+            zbus::Error::FDO(Box::new(Reply::ServiceUnknown("systemd".into()))),
+            zbus::Error::FDO(Box::new(Reply::NoReply("timeout".into()))),
+        ];
+        for error in &undelivered {
+            assert_eq!(bus_fault(error), UnitFault::Unreachable, "{error}");
+        }
+        assert_eq!(
+            fdo_fault(&Reply::Disconnected("bus".into())),
+            UnitFault::Unreachable
+        );
+        let answered = [
+            zbus::Error::FDO(Box::new(Reply::AccessDenied("policy".into()))),
+            zbus::Error::FDO(Box::new(Reply::UnknownProperty("KillMode".into()))),
+            zbus::Error::InvalidReply,
+        ];
+        for error in &answered {
+            assert_eq!(bus_fault(error), UnitFault::Mismatch, "{error}");
+        }
+        assert_eq!(
+            reply_fault("org.freedesktop.systemd1.NoUnitForPID"),
+            UnitFault::Mismatch
+        );
+        assert_eq!(
+            reply_fault("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            UnitFault::Unreachable
+        );
     }
 
     #[tokio::test]

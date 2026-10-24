@@ -31,21 +31,14 @@ pub(crate) struct Client {
     grant: String,
 }
 
-/// Why this plugin refuses an invocation. Sudo reports only that its audit
-/// plugin failed to initialize, so the plugin shows `message` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// Routing selects a grant, but no coordinator accepts connections.
     Unreachable,
-    /// The coordinator accepted the connection but gave no usable answer.
     Unanswered,
-    /// Every other refusal, including an answer that denies admission.
     Denied,
 }
 
 impl Refusal {
-    /// One short line for the user's terminal. It names no grant, account,
-    /// path or credential.
     pub(crate) fn message(self) -> &'static CStr {
         match self {
             Self::Unreachable => c"dev-auth: managed sudo routing is selected, but the grant coordinator is unreachable; start dev-auth-grants.service to restore native sudo\n",
@@ -117,7 +110,7 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> Result
     match protected(&path, false) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            unreachable(routing, error.kind())?;
+            coordinator_unreachable(routing, error.kind())?;
             return Ok(state);
         }
         Err(error) => return Err(error.into()),
@@ -129,7 +122,7 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> Result
         None,
     )?;
     if let Err(error) = socket::connect(socket.as_raw_fd(), &UnixAddr::new(&path)?) {
-        unreachable(routing, io::Error::from(error).kind())?;
+        coordinator_unreachable(routing, io::Error::from(error).kind())?;
         return Ok(state);
     }
     let peer = socket::getsockopt(&socket, socket::sockopt::PeerCredentials)?;
@@ -169,9 +162,9 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> Result
 /// How this invocation proceeds when no coordinator accepts its connection.
 /// An installed but unavailable service cannot revoke ordinary native
 /// behavior for an unselected account. Selected routing always denies.
-fn unreachable(routing: bool, error: io::ErrorKind) -> Result<(), Refusal> {
+fn coordinator_unreachable(routing: bool, error: io::ErrorKind) -> Result<(), Refusal> {
     if routing {
-        Err(Refusal::Denied)
+        Err(Refusal::Unreachable)
     } else if matches!(
         error,
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -182,15 +175,18 @@ fn unreachable(routing: bool, error: io::ErrorKind) -> Result<(), Refusal> {
     }
 }
 
-/// The coordinator's greeting and its preflight answer for `uid`.
 fn preflight(client: &mut Client, uid: u32) -> Result<Response, Refusal> {
-    let hello = client.receive(Instant::now() + Duration::from_secs(3))?;
+    let hello = client
+        .receive(Instant::now() + Duration::from_secs(3))
+        .map_err(|_| Refusal::Unanswered)?;
     if hello.bytes != SUDO_HELLO || !hello.descriptors.is_empty() {
-        return Err(Refusal::Denied);
+        return Err(Refusal::Unanswered);
     }
-    let (response, descriptors) = client.exchange(Request::Preflight { uid })?;
+    let (response, descriptors) = client
+        .exchange(Request::Preflight { uid })
+        .map_err(|_| Refusal::Unanswered)?;
     if !descriptors.is_empty() {
-        return Err(Refusal::Denied);
+        return Err(Refusal::Unanswered);
     }
     Ok(response)
 }
@@ -602,24 +598,22 @@ mod tests {
         }
     }
 
-    // Sudo shows the user nothing but "error initializing audit plugin", so
-    // each refusal must name what failed and the step that recovers native sudo.
     #[test]
     fn selected_routing_reports_an_unreachable_coordinator() {
         for absent in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
             assert_eq!(
-                unreachable(true, absent),
+                coordinator_unreachable(true, absent),
                 Err(Refusal::Unreachable),
                 "{absent:?}"
             );
-            assert_eq!(unreachable(false, absent), Ok(()), "{absent:?}");
+            assert_eq!(coordinator_unreachable(false, absent), Ok(()), "{absent:?}");
         }
         assert_eq!(
-            unreachable(true, io::ErrorKind::PermissionDenied),
+            coordinator_unreachable(true, io::ErrorKind::PermissionDenied),
             Err(Refusal::Unreachable)
         );
         assert_eq!(
-            unreachable(false, io::ErrorKind::PermissionDenied),
+            coordinator_unreachable(false, io::ErrorKind::PermissionDenied),
             Err(Refusal::Denied)
         );
     }

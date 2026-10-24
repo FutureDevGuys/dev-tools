@@ -9,6 +9,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::os::unix::ffi::OsStringExt;
 
 const API: c_uint = crate::SUDO_PLUGIN_API_VERSION;
+const SUDO_CONV_ERROR_MSG: c_int = 0x0003;
 const DENIAL: &[u8] = b"Dev Auth managed administrator admission denied; inspect the grant or explicitly leave managed routing.\0";
 type Strings = *const *mut c_char;
 type ErrorText = *mut *const c_char;
@@ -31,6 +32,18 @@ type Hook = Option<unsafe extern "C" fn(c_int, *mut c_void)>;
 type Event = Option<unsafe extern "C" fn() -> *mut c_void>;
 type AuditEvent =
     unsafe extern "C" fn(*const c_char, c_uint, *const c_char, Strings, ErrorText) -> c_int;
+
+#[repr(C)]
+struct ConversationMessage {
+    kind: c_int,
+    timeout: c_int,
+    text: *const c_char,
+}
+
+#[repr(C)]
+struct ConversationReply {
+    text: *mut c_char,
+}
 
 #[repr(C)]
 pub struct AuditPlugin {
@@ -160,9 +173,38 @@ unsafe fn copy_strings(values: Strings) -> io::Result<Vec<OsString>> {
     Err(native::invalid())
 }
 
+/// Sudo reports a failed audit open with its own generic error, and the
+/// plugin's error string never reaches the terminal.
+///
+/// # Safety
+/// `conversation` is null or sudo's conversation function for this callback.
+unsafe fn tell(conversation: Conversation, refusal: native::Refusal) {
+    let Some(conversation) = conversation else {
+        return;
+    };
+    let messages = [ConversationMessage {
+        kind: SUDO_CONV_ERROR_MSG,
+        timeout: 0,
+        text: refusal.message().as_ptr(),
+    }];
+    let mut replies = [ConversationReply {
+        text: std::ptr::null_mut(),
+    }];
+    // SAFETY: sudo_plugin(5) requires one null-initialized reply per message.
+    // An error message reads no input, so no suspend callback is needed.
+    unsafe {
+        conversation(
+            1,
+            messages.as_ptr().cast(),
+            replies.as_mut_ptr().cast(),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
 unsafe extern "C" fn audit_open(
     version: c_uint,
-    _conversation: Conversation,
+    conversation: Conversation,
     _print: Print,
     _settings: Strings,
     user_info: Strings,
@@ -172,14 +214,18 @@ unsafe extern "C" fn audit_open(
     options: Strings,
     error: ErrorText,
 ) -> c_int {
-    guarded(error, || {
+    let mut refusal = native::Refusal::Denied;
+    let result = guarded(error, || {
         if (version >> 16) != (API >> 16) || (version & 0xffff) < (API & 0xffff) {
             return Err(native::invalid());
         }
         // SAFETY: these arrays have the native callback's borrowed lifetime.
         let user_info = unsafe { copy_strings(user_info)? };
         let options = unsafe { copy_strings(options)? };
-        let state = native::initialize(&user_info, &options).map_err(|_| native::invalid())?;
+        let state = native::initialize(&user_info, &options).map_err(|denial| {
+            refusal = denial;
+            native::invalid()
+        })?;
         if state.relay {
             // SAFETY: sudo retains its original unparsed argv/environment for
             // the callback. The replacement frontend has no retained privilege.
@@ -196,7 +242,12 @@ unsafe extern "C" fn audit_open(
         }
         *current = Some(state);
         Ok(1)
-    })
+    });
+    if result != 1 {
+        // SAFETY: sudo supplies its conversation function for this callback.
+        unsafe { tell(conversation, refusal) };
+    }
+    result
 }
 
 unsafe extern "C" fn audit_close(_kind: c_int, _status: c_int) {
@@ -371,21 +422,14 @@ mod tests {
             -1
         );
     }
-    /// The sudo_plugin(5) conversation records, as native sudo lays them out.
-    #[repr(C)]
-    struct NativeMessage {
+    #[derive(Clone, Debug)]
+    struct Told {
         kind: c_int,
-        timeout: c_int,
-        text: *const c_char,
-    }
-    #[repr(C)]
-    struct NativeReply {
-        text: *mut c_char,
+        text: Vec<u8>,
+        replies_null: bool,
     }
 
-    /// Messages a fake sudo front end received: type, text, and whether the
-    /// plugin supplied one null-initialized reply per message.
-    static TOLD: std::sync::Mutex<Vec<(c_int, Vec<u8>, bool)>> = std::sync::Mutex::new(Vec::new());
+    static TOLD: std::sync::Mutex<Vec<Told>> = std::sync::Mutex::new(Vec::new());
 
     unsafe extern "C" fn fake_conversation(
         count: c_int,
@@ -394,11 +438,12 @@ mod tests {
         _callback: *mut c_void,
     ) -> c_int {
         let count = usize::try_from(count).unwrap_or(0);
-        // SAFETY: the plugin passes `count` messages and `count` replies.
+        // SAFETY: the plugin passes `count` messages for this call.
         let messages =
-            unsafe { std::slice::from_raw_parts(messages.cast::<NativeMessage>(), count) };
-        let replies_ready = !replies.is_null()
-            && unsafe { std::slice::from_raw_parts(replies.cast::<NativeReply>(), count) }
+            unsafe { std::slice::from_raw_parts(messages.cast::<ConversationMessage>(), count) };
+        // SAFETY: a non-null reply array holds `count` replies for this call.
+        let replies_null = !replies.is_null()
+            && unsafe { std::slice::from_raw_parts(replies.cast::<ConversationReply>(), count) }
                 .iter()
                 .all(|reply| reply.text.is_null());
         let Ok(mut told) = TOLD.lock() else {
@@ -407,13 +452,15 @@ mod tests {
         for message in messages {
             // SAFETY: each message text is a NUL-terminated string for this call.
             let text = unsafe { CStr::from_ptr(message.text) }.to_bytes().to_vec();
-            told.push((message.kind, text, replies_ready));
+            told.push(Told {
+                kind: message.kind,
+                text,
+                replies_null,
+            });
         }
         0
     }
 
-    // Sudo answers a failed audit open with only "error initializing audit
-    // plugin", so the user never learns why sudo refused or how to recover.
     #[test]
     fn a_refused_audit_open_tells_the_user_why_on_the_terminal() {
         const ERROR_MESSAGE: c_int = 0x0003;
@@ -454,13 +501,12 @@ mod tests {
             1,
             "exactly one message reaches the user: {told:?}"
         );
-        let (kind, text, replies_ready) = &told[0];
-        assert_eq!(*kind, ERROR_MESSAGE);
+        assert_eq!(told[0].kind, ERROR_MESSAGE);
         assert!(
-            replies_ready,
+            told[0].replies_null,
             "sudo_plugin(5) requires one null reply per message"
         );
-        let text = std::str::from_utf8(text).unwrap();
+        let text = std::str::from_utf8(&told[0].text).unwrap();
         assert!(text.starts_with("dev-auth: "), "{text}");
         assert!(
             text.ends_with('\n') && text.matches('\n').count() == 1,
@@ -515,6 +561,9 @@ mod tests {
             std::mem::size_of::<GroupPlugin>(),
             std::mem::offset_of!(GroupPlugin, query),
             std::mem::size_of::<Conversation>(),
+            std::mem::size_of::<ConversationMessage>(),
+            std::mem::offset_of!(ConversationMessage, text),
+            std::mem::size_of::<ConversationReply>(),
         ];
         let actual: Vec<usize> = std::str::from_utf8(&output.stdout)
             .unwrap()
