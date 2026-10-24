@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use dev_auth::privilege::grants::policy::{
     Account, ExecutionPlan, ExitPolicy, PlanCommand, PlanPipe, Policy, SubjectPolicy,
 };

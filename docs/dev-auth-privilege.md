@@ -4,7 +4,7 @@ The 0.5.2 release provides direct `privilege inspect|exec|delegate|leave` aliase
 
 Ordinary strong workload launch can explicitly request fresh administrator approval with `--privilege-scope user|workload --privilege-duration DURATION`. Noninteractive use returns approval-required before starting anything. A pending grant is unusable until native target exec is proved and activation succeeds; the target remains kernel-stopped until release. Workload authority and hard deadlines remain independent. See [ADR 0119](adr/0119-bounded-grant-output-and-native-launch-activation.md); source integration does not qualify installed support.
 
-The separate administrator source family is `dev-auth privilege grant request|status|inspect|exec|delegate|revoke|leave`. Its policy is `dev-auth-administrator-grant-policy-v1` at `/etc/dev-auth/administrator-grants-v1.json`; its runtime is `/run/dev-auth-grants`. These inputs preserve the maintenance policy and runtime described below. Generate the default deny-all input with `dev-auth setup template administrator-grant-policy`, then select privilege-only or combined full setup explicitly. An absent embedded source-matched sudo bridge blocks component activation. See [ADR 0115](adr/0115-native-administrator-grants-with-maintenance-compatibility.md) and [ADR 0116](adr/0116-retained-grant-setup-and-explicit-empty-native-files.md) for scope, approval, migration and pending native gates.
+The separate administrator source family is `dev-auth privilege grant request|status|inspect|exec|delegate|revoke|leave`. Its policy is `dev-auth-administrator-grant-policy-v1` at `/etc/dev-auth/administrator-grants-v1.json`; its runtime is `/run/dev-auth-grants`. These inputs preserve the maintenance policy and runtime described below. Generate the default deny-all input with `dev-auth setup template administrator-grant-policy`, or authorize one account as in [authorizing an account for administrator grants](#authorizing-an-account-for-administrator-grants), then select privilege-only or combined full setup explicitly. An absent embedded source-matched sudo bridge blocks component activation. See [ADR 0115](adr/0115-native-administrator-grants-with-maintenance-compatibility.md) and [ADR 0116](adr/0116-retained-grant-setup-and-explicit-empty-native-files.md) for scope, approval, migration and pending native gates.
 
 Administrator plans in the 0.5.2 release also define optional per-command `run_as`, `stdin`, `stdout` and `stderr` fields. `run_as` contains numeric `uid`, `gid` and required `supplementary_groups`; an empty group list clears inherited groups. Streams select `"inherit"` or `"null"`. Omission or JSON null preserves the existing canonical plan and defaults, while every explicit selection changes the approval digest and requires graph execution. A pipe producer's stdout and consumer's stdin must be omitted so approved stream choices cannot be overwritten. Null streams use a retained host null-device descriptor. Direct argv and native Sudo cannot reinterpret selected plan effects. See [ADR 0122](adr/0122-exact-plan-node-identity-and-streams.md).
 
@@ -39,6 +39,49 @@ This preserves the host's existing crash collector. No sysctl or ordinary creden
 The privileged execution profile is deliberately bounded. It uses approved held filesystem resources, private namespaces, restricted capabilities and syscall rules. It does not provide an unrestricted host-root shell, service manager, container manager or network client. Exact argv alone is not effect containment. Verify the real helper's resource and execution requirements before adopting it, and never disguise an incompatible broad command as a reviewed operation.
 
 Expiry and revocation cannot undo completed effects. Successful cleanup requires positive kernel evidence for all retained domains; an incomplete/failed observation remains unsuccessful. Terminal observation files contain no reusable grant. Restart never restores a lease.
+
+## Authorizing an account for administrator grants
+
+`dev-auth setup template administrator-grant-policy --user NAME --maximum-duration DURATION` prints the deny-all policy with exactly one subject: the named existing non-root account, resolved to its numeric uid through the native account database. By default that account may request `user` and `workload` scopes with `administrator` authority for at most the maximum duration, and cannot delegate. Repeat `--scope` to choose scopes explicitly and add `--allow-delegation` to permit narrowed delegation. The command prints nothing and fails for a missing or root account, a zero or malformed duration, or any subject that the policy's own validation refuses. The document keeps the schema's `/usr/bin/sudo`, the only sudo program setup accepts. Outside Linux the options are unsupported. The 0.5.2 release prints only the deny-all template; these options are in its successor source. The policy document itself does not depend on the binary that wrote it.
+
+Review the document, then install it where only root can change it. Setup reads only a regular, singly linked source that is not group- or world-writable.
+
+```text
+dev-auth setup template administrator-grant-policy --user account-name --maximum-duration 12h > /absolute/private/administrator-grants-v1.json
+sudo install -d -m 0755 /etc/dev-auth/source
+sudo install -m 0644 /absolute/private/administrator-grants-v1.json /etc/dev-auth/source/administrator-grants-v1.json
+```
+
+Privilege-only planning runs as root from the exact signed release executable it selects. The [standalone setup guide](dev-auth-v0.3.md) shows how to plan with a downloaded release, including the offline bundle form. Apply the `sha256` digest that planning prints. The grant coordinator runs only with `--activation transparent`; `inactive` installs the component stopped. A first strong installation applies as root, which also installs the receipt-owned setup helper.
+
+```text
+sudo dev-auth setup plan --purpose privilege-only --mode strong --channel stable --activation transparent --grant-policy /etc/dev-auth/source/administrator-grants-v1.json --output /run/dev-auth-setup-plan.json --format json
+sudo dev-auth setup apply --plan /run/dev-auth-setup-plan.json --sha256 APPROVED_DIGEST --format json
+```
+
+To add grants to an existing credential installation, plan from its deployment document with `--grant-policy`. Writing `grant_policy` into the document instead also requires the `dev-auth-deployment-v2` schema, as `dev-auth setup template credential-grant-deployment` shows. Setup preserves the credential purpose, accounts and credential actions. The document's `activation` controls the grant coordinator and the credential `git` and `gh` launchers together, so the coordinator runs only when it is `transparent`.
+
+```text
+sudo dev-auth setup plan --deployment /absolute/source/deployment.toml --grant-policy /etc/dev-auth/source/administrator-grants-v1.json --output /run/dev-auth-setup-plan.json --format json
+sudo dev-auth setup apply --plan /run/dev-auth-setup-plan.json --sha256 APPROVED_DIGEST --format json
+```
+
+Once the installed setup helper comes from the 0.5.2 release or later, the native account can apply either plan without running as root by replacing `sudo` with `--authorize polkit` or `--authorize sudo`. An older helper cannot read these plans, so apply as root. PolicyKit authorization also needs a root-owned `/usr/bin/pkexec` and accepts credential files but not `--credential-stdin`.
+
+```text
+dev-auth setup apply --plan /run/dev-auth-setup-plan.json --sha256 APPROVED_DIGEST --authorize polkit
+```
+
+The authorized account then requests a grant. Each request needs fresh native administrator approval, and its duration cannot exceed the policy maximum.
+
+```text
+dev-auth privilege grant request --scope user --authority administrator --duration 12h
+dev-auth privilege grant status
+dev-auth privilege grant revoke GRANT_ID
+dev-auth privilege grant leave
+```
+
+`status` observes only the caller's grants. `revoke` ends one grant and terminates its privileged descendants. `leave` ends the selected grant and removes managed sudo routing. Native grant, sudo, guardian and signed setup acceptance remain pending under ADR 0115 and ADR 0116, so this path is not an installed-support claim.
 
 ## Native acceptance harness
 

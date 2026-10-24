@@ -43,6 +43,42 @@ pub(super) fn setup_recovery_command() -> Command {
         ])
 }
 
+pub(super) fn setup_template_command() -> Command {
+    command("template")
+        .bin_name("dev-auth setup template")
+        .disable_help_flag(false)
+        .about("Print a version-matched setup source document")
+        .long_about("Print a version-matched setup source document. administrator-grant-policy alone prints the deny-all grant policy; with --user and --maximum-duration it authorizes exactly one native account. The other templates accept no options.")
+        .arg(
+            positional("template")
+                .required(true)
+                .value_parser(dev_auth::SETUP_TEMPLATE_NAMES),
+        )
+        .args([
+            value("user")
+                .value_name("NAME")
+                .value_hint(ValueHint::Username)
+                .requires("maximum-duration")
+                .help("Authorize this existing non-root account, resolved by name from the native account database (Linux)"),
+            value("maximum-duration")
+                .value_name("DURATION")
+                .requires("user")
+                .help("Longest grant the account may request, such as 30m, 12h or 2d"),
+            choice("scope", ["user", "workload"])
+                .action(ArgAction::Append)
+                .default_values(["user", "workload"])
+                .requires("user")
+                .help("Grant scope the account may request; repeat for each allowed scope"),
+            choice("authority", ["administrator"])
+                .default_value("administrator")
+                .requires("user")
+                .help("Authority the account may request"),
+            flag("allow-delegation")
+                .requires("user")
+                .help("Allow the account to delegate narrowed grants [default: no delegation]"),
+        ])
+}
+
 pub(super) fn setup_restoration_command() -> Command {
     command("restore")
         .bin_name("dev-auth setup restore")
@@ -85,10 +121,7 @@ fn positional(name: &'static str) -> Arg {
 
 fn setup() -> Command {
     let mut setup = command("setup")
-        .subcommand(
-            command("template")
-                .arg(positional("template").value_parser(dev_auth::SETUP_TEMPLATE_NAMES)),
-        )
+        .subcommand(setup_template_command())
         .subcommand(
             command("discover")
                 .arg(mode())

@@ -86,6 +86,9 @@ pub(super) fn run(arguments: Vec<OsString>) -> anyhow::Result<i32> {
         eprintln!("dev-auth: invalid workload name");
         return Ok(2);
     }
+    #[cfg(not(target_os = "linux"))]
+    let privilege: Option<()> = None;
+    #[cfg(target_os = "linux")]
     let privilege = match parsed.get_one::<String>("privilege-scope") {
         Some(scope) => {
             let duration = parsed
@@ -240,7 +243,7 @@ fn execute(
     _arguments: &[OsString],
     _noninteractive: bool,
     sink: Option<ResultDestination>,
-    _privilege: Option<&dev_auth::privilege::grants::GrantRequest>,
+    _privilege: Option<&()>,
 ) -> anyhow::Result<i32> {
     finish(
         ExecutionResult::launch("unsupported", Some(false), 3).error("unsupported"),

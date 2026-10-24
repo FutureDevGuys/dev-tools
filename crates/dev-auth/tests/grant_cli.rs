@@ -352,6 +352,7 @@ fn invalid_duration_returns_value_free_json_before_any_approval() {
     assert_eq!(result["changed"], false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn grant_policy_template_is_standalone_readable_and_non_authorizing() {
     let output = invoke(&["setup", "template", "administrator-grant-policy"]);
@@ -364,6 +365,238 @@ fn grant_policy_template_is_standalone_readable_and_non_authorizing() {
         serde_json::from_value(value).unwrap();
     policy.validate().unwrap();
     assert!(dev_auth::privilege::policy::parse_policy(&output.stdout).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn grant_policy_template_without_options_is_the_embedded_deny_all_document() {
+    let output = invoke(&["setup", "template", "administrator-grant-policy"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        include_bytes!("../administrator-grant-policy.example.json")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn template_help_publishes_the_subject_options_for_every_template() {
+    for arguments in [
+        ["setup", "template", "--help"].as_slice(),
+        &["setup", "template", "administrator-grant-policy", "--help"],
+        &["setup", "template", "deployment", "--help"],
+        &["--help"],
+    ] {
+        let output = invoke(arguments);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        let help = String::from_utf8(output.stdout).unwrap();
+        for option in [
+            "--user",
+            "--maximum-duration",
+            "--scope",
+            "--allow-delegation",
+        ] {
+            assert!(help.contains(option), "{arguments:?}: missing {option}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod grant_policy_subjects {
+    use super::bounded_output;
+    use dev_auth::privilege::grants::policy::{Account, Policy};
+    use dev_auth::privilege::grants::{Authority, GrantScope};
+    use nix::unistd::{getuid, User};
+    use std::process::{Command, Output, Stdio};
+
+    const DENY_ALL: &[u8] = include_bytes!("../administrator-grant-policy.example.json");
+
+    // A root or unnamed process has no account it may authorize. Those hosts
+    // still run the rejection cases that need no valid subject, and the unit
+    // tests cover policy construction for any uid.
+    fn current_account() -> Option<String> {
+        let account = User::from_uid(getuid())
+            .unwrap()
+            .filter(|user| !user.uid.is_root())
+            .map(|user| user.name);
+        if account.is_none() {
+            eprintln!("skipped: this process has no named non-root account to authorize");
+        }
+        account
+    }
+
+    fn absent_account() -> String {
+        (0..)
+            .map(|index| format!("dev-auth-absent-{}-{index}", std::process::id()))
+            .find(|name| User::from_name(name).unwrap().is_none())
+            .unwrap()
+    }
+
+    fn subject_template(arguments: &[&str]) -> Output {
+        let decoy = absent_account();
+        bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .args(["setup", "template", "administrator-grant-policy"])
+                .args(arguments)
+                .env_clear()
+                .env("PATH", "")
+                .env("USER", &decoy)
+                .env("LOGNAME", &decoy)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+    }
+
+    fn accepted(arguments: &[&str]) -> Policy {
+        let output = subject_template(arguments);
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let policy: Policy = serde_json::from_slice(&output.stdout).unwrap();
+        policy.validate().unwrap();
+        assert!(dev_auth::privilege::policy::parse_policy(&output.stdout).is_err());
+        let mut document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut deny_all: serde_json::Value = serde_json::from_slice(DENY_ALL).unwrap();
+        document["subjects"] = serde_json::Value::Null;
+        deny_all["subjects"] = serde_json::Value::Null;
+        assert_eq!(document, deny_all, "only the subject differs from deny-all");
+        assert_eq!(policy.subjects.len(), 1);
+        policy
+    }
+
+    fn rejected(arguments: &[&str]) {
+        let output = subject_template(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+    }
+
+    #[test]
+    fn named_account_becomes_the_only_subject_with_documented_defaults() {
+        let Some(user) = current_account() else {
+            return;
+        };
+        let policy = accepted(&["--user", &user, "--maximum-duration", "12h"]);
+        let subject = &policy.subjects[0];
+        assert_eq!(
+            subject.account,
+            Account::Unix {
+                uid: getuid().as_raw()
+            }
+        );
+        assert_eq!(subject.scopes, [GrantScope::User, GrantScope::Workload]);
+        assert_eq!(subject.authorities, [Authority::Administrator]);
+        assert_eq!(subject.maximum_duration_seconds, 12 * 60 * 60);
+        assert_eq!(subject.idle_timeout_seconds, None);
+        assert_eq!(subject.maximum_uses, None);
+        assert!(!subject.allow_delegation);
+    }
+
+    #[test]
+    fn explicit_options_narrow_scope_allow_delegation_and_reach_the_deadline_bound() {
+        let Some(user) = current_account() else {
+            return;
+        };
+        // 106751 days is the largest whole-day duration within i64::MAX
+        // nanoseconds, the native boot-clock deadline range.
+        let policy = accepted(&[
+            "--user",
+            &user,
+            "--maximum-duration",
+            "106751d",
+            "--scope",
+            "workload",
+            "--authority",
+            "administrator",
+            "--allow-delegation",
+        ]);
+        let subject = &policy.subjects[0];
+        assert_eq!(
+            subject.account,
+            Account::Unix {
+                uid: getuid().as_raw()
+            }
+        );
+        assert_eq!(subject.scopes, [GrantScope::Workload]);
+        assert_eq!(subject.authorities, [Authority::Administrator]);
+        assert_eq!(subject.maximum_duration_seconds, 9_223_286_400);
+        assert!(subject.allow_delegation);
+    }
+
+    #[test]
+    fn subjects_that_cannot_be_resolved_or_authorized_produce_no_policy() {
+        let absent = absent_account();
+        rejected(&["--user", &absent, "--maximum-duration", "12h"]);
+        rejected(&["--maximum-duration", "12h"]);
+        rejected(&["--scope", "user"]);
+        rejected(&["--authority", "administrator"]);
+        rejected(&["--allow-delegation"]);
+    }
+
+    #[test]
+    fn invalid_subject_limits_produce_no_policy() {
+        let Some(user) = current_account() else {
+            return;
+        };
+        rejected(&["--user", &user]);
+        for duration in [
+            "0h",
+            "0s",
+            "12",
+            "h",
+            "1.5h",
+            "twelve",
+            "106752d",
+            "18446744073709552s",
+        ] {
+            rejected(&["--user", &user, "--maximum-duration", duration]);
+        }
+        for options in [
+            ["--scope", "user", "--scope", "user"].as_slice(),
+            &["--scope", "host"],
+            &["--authority", "root"],
+            &["--authority", "exact-plan"],
+            &["--user", &user],
+        ] {
+            let mut arguments = vec!["--user", &user, "--maximum-duration", "12h"];
+            arguments.extend_from_slice(options);
+            rejected(&arguments);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn options_never_change_the_other_templates() {
+    for arguments in [
+        ["setup", "template", "deployment", "--user", "account-name"].as_slice(),
+        &[
+            "setup",
+            "template",
+            "privilege-deployment",
+            "--allow-delegation",
+        ],
+        &["setup", "template", "credential-grant-deployment", "extra"],
+    ] {
+        let output = invoke(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn grant_policy_subjects_are_unsupported_without_the_linux_grant_backend() {
+    let output = invoke(&[
+        "setup",
+        "template",
+        "administrator-grant-policy",
+        "--user",
+        "account-name",
+        "--maximum-duration",
+        "12h",
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty());
 }
 
 #[cfg(unix)]
