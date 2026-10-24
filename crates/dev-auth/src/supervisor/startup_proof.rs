@@ -326,11 +326,7 @@ pub(crate) fn await_ready(reader: &OwnedFd, owner: &RootSpawnOwner) -> Result<Pr
         if Instant::now() >= deadline {
             bail!("kernel-authenticated startup proof timed out");
         }
-        let mut poller = [PollFd::new(
-            reader.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
+        wait_interval(reader)?;
         let Some(message) = receive(reader)? else {
             continue;
         };
@@ -338,6 +334,19 @@ pub(crate) fn await_ready(reader: &OwnedFd, owner: &RootSpawnOwner) -> Result<Pr
             bail!("configured workload did not prove its final exec");
         }
         return owner.verify(message);
+    }
+}
+
+/// Waits at most one 20 ms interval for input. A handled signal interrupts
+/// poll without restart; callers recheck their deadline and poll again.
+fn wait_interval(fd: &impl AsFd) -> Result<()> {
+    let mut poller = [PollFd::new(
+        fd.as_fd(),
+        PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+    )];
+    match poll(&mut poller, PollTimeout::from(20_u16)) {
+        Ok(_) | Err(nix::errno::Errno::EINTR) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -384,11 +393,7 @@ pub(crate) fn await_release_witness(
         if Instant::now() >= deadline {
             bail!("native release witness timed out");
         }
-        let mut poller = [PollFd::new(
-            socket.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
+        wait_interval(socket)?;
         let Some(message) = receive(socket)? else {
             continue;
         };
@@ -416,11 +421,7 @@ pub(crate) fn await_commit_receipt(socket: &File) -> Result<()> {
         if Instant::now() >= deadline {
             bail!("release commit receipt timed out");
         }
-        let mut poller = [PollFd::new(
-            socket.as_fd(),
-            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-        )];
-        poll(&mut poller, PollTimeout::from(20_u16))?;
+        wait_interval(socket)?;
         let mut bytes = [0_u8; 2];
         match nix::sys::socket::recv(
             socket.as_raw_fd(),
