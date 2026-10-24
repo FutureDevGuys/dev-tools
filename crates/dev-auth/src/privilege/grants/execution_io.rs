@@ -562,12 +562,13 @@ mod tests {
         )
         .unwrap();
         let saved = nix::sys::termios::tcgetattr(&outer.slave).unwrap();
+        let fixture = concat!(module_path!(), "::terminal_client_fixture");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
                 "--ignored",
                 "--exact",
-                "privilege::execution_io::tests::terminal_client_fixture",
+                fixture.split_once("::").unwrap().1,
                 "--nocapture",
             ])
             .env("DEV_AUTH_GRANT_PTY_FIXTURE", "client")
