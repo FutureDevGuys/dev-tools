@@ -1620,6 +1620,12 @@ impl NativeUserSandbox {
         self.install_binary_from(Path::new(env!("CARGO_BIN_EXE_dev-auth")), destination);
     }
 
+    /// User-only setup observes enrollment metadata on the account session bus
+    /// and fails closed without one; serve a Secret Service with no items.
+    fn unenrolled_secret_service(&self) -> enrolled_store::EnrolledStore {
+        enrolled_store::EnrolledStore::start(&self.runtime, Default::default())
+    }
+
     fn install_binary_from(&self, source: &Path, destination: &Path) {
         fs::copy(source, destination).unwrap();
         assert!(Command::new("/usr/bin/strip")
@@ -3808,6 +3814,7 @@ fn missing_credential_stages_no_workload_launchers() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     let current = std::env::current_exe().unwrap();
@@ -4246,6 +4253,7 @@ fn logical_setup_stages_versioned_authority_and_resumes_without_activation() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4336,6 +4344,7 @@ fn run_binary_receipt_recovery_test(recovery: SetupRecoveryFixture, test_name: &
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     // Native CLI behavior does not require debug or static symbol tables. Keep
@@ -4383,6 +4392,7 @@ fn native_user_setup_restores_retained_generation_inactive() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4427,6 +4437,7 @@ fn native_user_setup_restores_initial_installation_absence() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
@@ -4469,6 +4480,7 @@ fn native_user_setup_restoration_resumes_after_process_death() {
         return;
     }
     let sandbox = NativeUserSandbox::new();
+    let _secret_service = sandbox.unenrolled_secret_service();
     let product = sandbox.root.join("product");
     sandbox.install_binary(&product);
     assert!(Command::new("/usr/bin/strip")
