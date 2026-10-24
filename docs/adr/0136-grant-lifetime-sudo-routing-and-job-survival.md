@@ -55,6 +55,8 @@ ADR0115 says that denied managed Sudo never falls back to a cached native author
 
 After a grant ends, sudo for the account has its native behavior. A native ticket that was valid when the grant started, and has not expired when the grant ends, can therefore authorize sudo again. Managed routing does not refresh native tickets while a grant is active. To deny native sudo after every grant, configure native sudo without cached credentials, for example with `timestamp_timeout=0`.
 
+[ADR 0137](0137-coordinator-fault-containment-and-sudo-refusal-reasons.md) keeps a reaping failure that belongs to one grant from ending the coordinator, and it records that a coordinator exit stops every managed job. It also makes the sudo plugin print the reason for each refusal.
+
 ### Diagnostics
 
 The coordinator writes one journal line for each of these events:

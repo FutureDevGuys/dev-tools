@@ -24,6 +24,7 @@ mod tests {
             "Delegate=no",
             "ExitType=main",
             "RemainAfterExit=no",
+            "Restart=on-failure",
         ] {
             assert!(SERVICE.lines().any(|line| line == required));
         }
