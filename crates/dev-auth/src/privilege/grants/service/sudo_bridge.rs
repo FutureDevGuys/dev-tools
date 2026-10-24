@@ -14,8 +14,8 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
     if peer.uid != 0
         || !native::alive(peer.peer_pidfd())
-        || !native::same_file(&executable, &service.sudo_file)?
-        || !policy_unchanged(&service)
+        || !native::same_file(&executable, &service.sudo.file)?
+        || admission(service.state.lock().await.phase, service.trust()).is_err()
     {
         return Err(Failure::AuthorityDenied);
     }
@@ -81,7 +81,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
             Err(failure) => return Err(failure),
         };
         let grant = state.registry.get(id).ok_or(Failure::NoGrant)?;
-        if state.stopping
+        if state.phase != Phase::Serving
             || grant.lifetime.state() != LeaseState::Active
             || !grant.scope.contains(&caller.scope)
         {
@@ -133,7 +133,7 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
         return Err(Failure::InvalidRequest);
     };
     if !caller.still_present()
-        || !policy_unchanged(&service)
+        || admission(service.state.lock().await.phase, service.trust()).is_err()
         || !native::same_file(
             &File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?,
             &executable,
@@ -148,7 +148,9 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
     };
     let descriptors = {
         let mut state = service.state.lock().await;
-        if state.stopping || (relay_job.is_none() && state.jobs.len() >= MAX_EXECUTIONS) {
+        if state.phase != Phase::Serving
+            || (relay_job.is_none() && state.jobs.len() >= MAX_EXECUTIONS)
+        {
             return Err(Failure::Busy);
         }
         let grant = state.registry.get(id).ok_or(Failure::NoGrant)?;
@@ -295,7 +297,7 @@ async fn admitted(
             .registry
             .get(grant_id)
             .is_none_or(|grant| grant.lifetime.state() != LeaseState::Active)
-            || !policy_unchanged(service)
+            || super::admission(state.phase, service.trust()).is_err()
         {
             return Err(Failure::GrantRevoked);
         }
@@ -322,6 +324,13 @@ async fn admitted(
     let remaining = deadline.saturating_sub(now()?);
     match receive_with_completion(descriptor, peer, remaining, true).await {
         Ok(Received::Request(Request::Complete)) => {}
+        Ok(Received::Unverified(unobserved)) => {
+            eprintln!(
+                "dev-auth native sudo completion unverified: grant={grant_id:032x} job={job_id:032x} sudo_pid={} error={unobserved:?}; the job continues under its grant",
+                peer.pid
+            );
+            return Ok(());
+        }
         Ok(Received::Closed(error)) => {
             // ADR 0136: the command sudo started keeps running under its
             // grant's deadline, revocation and policy; reaping retires the
@@ -353,18 +362,20 @@ async fn admitted(
             return Err(failure);
         }
     }
-    {
+    let verified = {
         let state = service.state.lock().await;
         let job = state.jobs.get(&job_id).ok_or(Failure::NoGrant)?;
-        let executable =
-            File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
-        let group = crate::linux_admission::read_unified_cgroup(peer.pid)
-            .map_err(|_| Failure::AuthorityDenied)?;
-        if !native::same_file(&executable, &service.sudo_file)?
-            || !native::same_file(&root_file(&group, true)?, job.boundary.directory())?
-            || !native::alive(peer.peer_pidfd())
-        {
-            return Err(Failure::AuthorityDenied);
+        completed_by_sudo(peer, &service.sudo.file, job.boundary.directory())
+    };
+    match verified {
+        Ok(true) => {}
+        Ok(false) => return Err(Failure::AuthorityDenied),
+        Err(unobserved) => {
+            eprintln!(
+                "dev-auth native sudo completion unverified: grant={grant_id:032x} job={job_id:032x} sudo_pid={} error={unobserved:?}; the job continues under its grant",
+                peer.pid
+            );
+            return Ok(());
         }
     }
     reply(
@@ -375,6 +386,28 @@ async fn admitted(
         Some(grant_id),
     )
     .await
+}
+
+/// One look at whether completion came from the admitted sudo: alive, still
+/// running the bound sudo image, inside the job's boundary.
+fn completed_by_sudo(
+    peer: &crate::linux_admission::LinuxPeerEvidence,
+    sudo: &File,
+    boundary: &File,
+) -> Look<bool> {
+    let Some(executable) = native::process_look(File::open(format!("/proc/{}/exe", peer.pid)))?
+    else {
+        return Ok(false);
+    };
+    let Some(group) = native::cgroup_look(peer.pid)? else {
+        return Ok(false);
+    };
+    let Some(group) = protected_file(&group, true)? else {
+        return Ok(false);
+    };
+    Ok(native::identical(&executable, sudo)?
+        && native::identical(&group, boundary)?
+        && !native::readable(peer.peer_pidfd())?)
 }
 
 fn admit_authority(
@@ -474,6 +507,8 @@ enum Received {
     /// The peer's end closed, or reset with our frames unread.
     Closed(io::Error),
     Malformed(io::Error),
+    /// A completion frame whose sender's liveness could not be observed.
+    Unverified(Unobserved),
 }
 
 async fn receive(
@@ -484,6 +519,7 @@ async fn receive(
     match receive_with_completion(descriptor, peer, timeout, false).await? {
         Received::Request(request) => Ok(request),
         Received::Closed(_) | Received::Malformed(_) => Err(Failure::ProtocolViolation),
+        Received::Unverified(_) => Err(Failure::AuthorityDenied),
     }
 }
 
@@ -513,22 +549,25 @@ async fn receive_with_completion(
                     }
                     Ok(Err(error)) => return Ok(Received::Malformed(error)),
                 };
+            let exited = native::readable(peer.peer_pidfd());
             if !packet.descriptors.is_empty()
                 || !packet.credentials.is_some_and(|credentials| {
                     sender_identity_matches(peer.pid, peer.uid, peer.gid, credentials, completion_only)
                 })
-                || !native::alive(peer.peer_pidfd())
+                || exited == Ok(true)
             {
                 let credentials = packet.credentials;
                 eprintln!(
-                    "dev-auth native sudo message identity rejected: pid_match={} uid_match={} gid_match={} alive={} unexpected_fds={}",
+                    "dev-auth native sudo message identity rejected: pid_match={} uid_match={} gid_match={} exited={exited:?} unexpected_fds={}",
                     credentials.is_some_and(|value| value.pid() as u32 == peer.pid),
                     credentials.is_some_and(|value| value.uid() == peer.uid),
                     credentials.is_some_and(|value| value.gid() == peer.gid),
-                    native::alive(peer.peer_pidfd()),
                     !packet.descriptors.is_empty(),
                 );
                 return Err(Failure::AuthorityDenied);
+            }
+            if let Err(unobserved) = exited {
+                return Ok(Received::Unverified(unobserved));
             }
             let message: Message =
                 serde_json::from_slice(&packet.bytes).map_err(|_| Failure::InvalidRequest)?;

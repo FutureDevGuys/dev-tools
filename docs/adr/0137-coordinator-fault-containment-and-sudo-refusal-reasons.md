@@ -27,12 +27,12 @@ A failure that belongs to one grant stays with that grant, and the next pass ret
 - a failed withdrawal of an abandoned pending launch, whose grant has already stopped and admits nothing;
 - a failed removal of an ended grant's routing marker (ADR 0136);
 - a failed stop or population read of a stopped grant's boundary, which keeps that grant's cleanup pending or failed;
-- an unreadable workload population, which ends only that workload's grant;
+- an unreadable workload population, which [ADR 0138](0138-trust-change-drain-and-observed-supervision.md) retries without ending the grant;
 - a dead or failed job leader, which affects only that job.
 
 A control request sweeps abandoned launches too, and it no longer fails because one launch could not be withdrawn.
 
-A panic in a connection task or in the login observer is a defect in the coordinator. It stops every grant through the ordinary shutdown. A changed or unobservable grant policy or sudo program still ends every grant without ending the coordinator (ADR 0115).
+A panic in a connection task or in the login observer is a defect in the coordinator. It stops every grant through the ordinary shutdown. [ADR 0138](0138-trust-change-drain-and-observed-supervision.md) replaces the rule that a changed or unobservable grant policy or sudo program ends every grant. A change drains the coordinator, and a look that could not be taken is retried.
 
 ### A coordinator exit stops every managed job
 
@@ -60,7 +60,7 @@ When the plugin refuses an audit open, it sends one error message through sudo's
 | Unanswered | The coordinator accepted the connection, then closed, exited, stalled or garbled its greeting or preflight answer. | Retry, or restart `dev-auth-grants.service`, which ends every grant. |
 | Denied | Every other refusal. | Inspect the grant with `dev-auth privilege grant status`, or run `dev-auth privilege leave`. |
 
-`leave` needs a running coordinator, so the unreachable message names the service instead. Which invocations the plugin refuses is unchanged from ADR 0136. A refusal at final admission gets no conversation function from sudo, so it still reports only the error string.
+`leave` needs a running coordinator, so the unreachable message names the service instead. [ADR 0138](0138-trust-change-drain-and-observed-supervision.md) gives native sudo to an unanswered invocation that the coordinator does not own. Every other refusal is unchanged from ADR 0136. A refusal at final admission gets no conversation function from sudo, so it still reports only the error string.
 
 ## Verification
 

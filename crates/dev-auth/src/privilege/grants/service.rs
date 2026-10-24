@@ -1,5 +1,5 @@
 use super::model::{Envelope, FRAME_LIMIT, WIRE_SCHEMA};
-use super::native::{self, Caller};
+use super::native::{self, Caller, Look, Unobserved};
 use super::policy::{Account, NativeScope, Policy};
 use super::{
     Authority, ControlRequest, ControlResult, Failure, Grant, GrantRequest, GrantScope, GrantState,
@@ -90,11 +90,7 @@ impl LaunchOwner {
     }
 
     fn present(&self) -> bool {
-        native::alive(&self.pidfd)
-            && crate::linux_admission::read_unified_cgroup(self.pid)
-                .is_ok_and(|path| path == self.native_cgroup)
-            && File::open(format!("/proc/{}/exe", self.pid))
-                .is_ok_and(|image| native::same_file(&image, &self.image).unwrap_or(false))
+        self.presence() == Ok(true)
     }
 
     fn available(&self) -> bool {
@@ -105,12 +101,25 @@ impl LaunchOwner {
                 .is_some_and(|deadline| now().is_ok_and(|observed| observed < deadline))
     }
 
-    fn revocation_reason(&self) -> Option<StopReason> {
-        (!self.present()
-            || self
-                .release_deadline
-                .is_some_and(|deadline| !now().is_ok_and(|observed| observed < deadline)))
-        .then_some(StopReason::WorkloadEnded)
+    /// One look at whether the retained native owner is still the same live
+    /// process, in its registered cgroup, running the installed image.
+    fn presence(&self) -> Look<bool> {
+        if native::readable(&self.pidfd)? {
+            return Ok(false);
+        }
+        let Some(cgroup) = native::cgroup_look(self.pid)? else {
+            return Ok(false);
+        };
+        let Some(image) = native::process_look(File::open(format!("/proc/{}/exe", self.pid)))?
+        else {
+            return Ok(false);
+        };
+        Ok(cgroup == self.native_cgroup && native::identical(&image, &self.image)?)
+    }
+
+    fn release_expired(&self) -> bool {
+        self.release_deadline
+            .is_some_and(|deadline| !now().is_ok_and(|observed| observed < deadline))
     }
 
     fn matches(&self, caller: &Caller) -> bool {
@@ -182,7 +191,70 @@ struct State {
     selected: BTreeMap<NativeScope, GrantId>,
     jobs: BTreeMap<GrantId, Job>,
     pending_relays: BTreeMap<u32, PendingRelay>,
-    stopping: bool,
+    phase: Phase,
+    unseen: Unseen,
+}
+
+/// Whether the coordinator admits new managed work (ADR 0138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Serving,
+    /// A watched trust input changed. Nothing new is admitted under the old
+    /// trust, running jobs finish under their grants, and the coordinator then
+    /// exits so the service manager starts one that binds the new state.
+    Draining(Input),
+    /// Shutdown stopped every grant.
+    Stopping,
+}
+
+impl Phase {
+    /// The changed trust input to exit for once a draining coordinator runs
+    /// no managed job.
+    fn drained(self, running_jobs: usize) -> Option<Input> {
+        match self {
+            Self::Draining(input) if running_jobs == 0 => Some(input),
+            _ => None,
+        }
+    }
+}
+
+/// What a supervision look was about, for its journal lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Subject {
+    Trust,
+    Workload(GrantId),
+    LaunchOwner(GrantId),
+    Cleanup(GrantId),
+    Client(GrantId),
+}
+
+impl std::fmt::Display for Subject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trust => formatter.write_str("the watched trust inputs"),
+            Self::Workload(id) => write!(formatter, "the workload of grant={id:032x}"),
+            Self::LaunchOwner(id) => write!(formatter, "the launch owner of grant={id:032x}"),
+            Self::Cleanup(id) => write!(formatter, "the boundary of stopping grant={id:032x}"),
+            Self::Client(id) => write!(formatter, "the client of job={id:032x}"),
+        }
+    }
+}
+
+/// Subjects whose last look could not be taken, so a lasting fault writes one
+/// journal line when it starts and one when it clears.
+#[derive(Default)]
+struct Unseen(BTreeSet<Subject>);
+
+impl Unseen {
+    fn note<T>(&mut self, subject: Subject, look: &Look<T>) {
+        match look {
+            Err(Unobserved(kind)) if self.0.insert(subject) => {
+                eprintln!("dev-auth could not observe {subject}: {kind:?}; retrying");
+            }
+            Ok(_) if self.0.remove(&subject) => eprintln!("dev-auth observes {subject} again"),
+            _ => {}
+        }
+    }
 }
 
 struct PendingRelay {
@@ -193,14 +265,11 @@ struct PendingRelay {
 
 struct Service {
     policy: Policy,
-    policy_file: File,
-    policy_stamp: FileStamp,
-    policy_path: PathBuf,
+    policy_source: Bound,
     parent: File,
     runtime: PathBuf,
     coordinator: OwnedFd,
-    sudo_file: File,
-    sudo_stamp: FileStamp,
+    sudo: Bound,
     product_file: File,
     state: Mutex<State>,
     pending: std::sync::Mutex<BTreeSet<Account>>,
@@ -248,10 +317,10 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
         .map_err(|_| Failure::AuthorityDenied)?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Failure::Busy)?;
     clear_markers(&configuration.runtime)?;
-    let policy_file = root_file(&configuration.policy, false)?;
-    let policy_stamp = FileStamp::of(&policy_file)?;
+    let policy_source = Bound::open(Input::Policy, &configuration.policy)?;
     let mut bytes = Vec::new();
-    policy_file
+    policy_source
+        .file
         .try_clone()
         .map_err(|_| Failure::NativeUnavailable)?
         .take(1024 * 1024 + 1)
@@ -262,9 +331,8 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
     }
     let policy: Policy = serde_json::from_slice(&bytes).map_err(|_| Failure::InvalidRequest)?;
     policy.validate()?;
-    let sudo_file = root_file(Path::new(&policy.sudo_program), false)?;
-    let sudo_stamp = FileStamp::of(&sudo_file)?;
-    if FileStamp::of(&policy_file)? != policy_stamp {
+    let sudo = Bound::open(Input::SudoProgram, Path::new(&policy.sudo_program))?;
+    if FileStamp::of(&policy_source.file)? != policy_source.stamp {
         return Err(Failure::AuthorityDenied);
     }
     let parent_path = own_service_cgroup()?;
@@ -293,14 +361,11 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
     let sudo_listener = create_listener(&configuration.runtime.join("sudo.sock"))?;
     let service = Arc::new(Service {
         policy,
-        policy_file,
-        policy_stamp,
-        policy_path: configuration.policy,
+        policy_source,
         parent,
         runtime: configuration.runtime,
         coordinator,
-        sudo_file,
-        sudo_stamp,
+        sudo,
         product_file,
         state: Mutex::new(State {
             registry: GrantRegistry::new(MAX_GRANTS).map_err(|_| Failure::RuntimeFailure)?,
@@ -308,7 +373,8 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
             selected: BTreeMap::new(),
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
-            stopping: false,
+            phase: Phase::Serving,
+            unseen: Unseen::default(),
         }),
         pending: std::sync::Mutex::new(BTreeSet::new()),
     });
@@ -377,6 +443,7 @@ async fn run(
     let mut connections = tokio::task::JoinSet::new();
     let mut login_tick = 0_u32;
     let mut login_check: Option<tokio::task::JoinHandle<()>> = None;
+    let mut drained = None;
     loop {
         tokio::select! {
             biased;
@@ -387,6 +454,13 @@ async fn run(
                 let mut bytes = [0_u8; 8];
                 let _ = readiness.try_io(|fd| nix::unistd::read(fd.get_ref(), &mut bytes).map_err(io::Error::from));
                 reap(&service).await.map_err(integrity_lost)?;
+                if connections.is_empty() {
+                    let state = service.state.lock().await;
+                    drained = state.phase.drained(state.jobs.len());
+                    if drained.is_some() {
+                        break;
+                    }
+                }
                 login_tick += 1;
                 if login_tick >= 10 {
                     login_tick = 0;
@@ -427,9 +501,14 @@ async fn run(
             }
         }
     }
+    if let Some(input) = drained {
+        eprintln!(
+            "dev-auth grant coordinator exiting: the {input} changed and no managed job remains; the service manager starts a coordinator that binds the new state"
+        );
+    }
     {
         let mut state = service.state.lock().await;
-        state.stopping = true;
+        state.phase = Phase::Stopping;
         state.registry.stop_all(StopReason::BrokerShutdown, now()?);
     }
     for _ in 0..50 {
@@ -462,7 +541,10 @@ async fn run(
     {
         return Err(Failure::CleanupFailed);
     }
-    Ok(())
+    match drained {
+        Some(_) => Err(Failure::AuthorityDenied),
+        None => Ok(()),
+    }
 }
 
 async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Result<(), Failure> {
@@ -527,15 +609,11 @@ async fn dispatch(
     if let Err(failure) = sweep_abandoned_launches(service).await {
         return ControlResult::failure(operation, failure, Some(false));
     }
-    if !policy_unchanged(service) {
-        let mut state = service.state.lock().await;
-        if let Ok(now) = now() {
-            state.registry.stop_all(StopReason::AuthorityChanged, now);
+    if admits_new_work(&request) {
+        let phase = service.state.lock().await.phase;
+        if let Err(failure) = admission(phase, service.trust()) {
+            return ControlResult::failure(operation, failure, Some(false));
         }
-        for metadata in state.metadata.values_mut() {
-            let _ = metadata.boundary.stop();
-        }
-        return ControlResult::failure(operation, Failure::AuthorityDenied, Some(false));
     }
     let mut progress = Progress::default();
     let result = match request {
@@ -695,7 +773,7 @@ async fn issue(
             .pending
             .lock()
             .map_err(|_| Failure::RuntimeFailure)?;
-        if state.stopping
+        if state.phase != Phase::Serving
             || pending.len() >= 4
             || state.registry.iter().count() + pending.len() >= MAX_GRANTS
             || !pending.insert(scope.account.clone())
@@ -712,9 +790,8 @@ async fn issue(
     drop(pending);
     approval?;
     let _setup = setup_admission(service)?;
-    if state.stopping
+    if admission(state.phase, service.trust()).is_err()
         || !caller.still_present()
-        || !policy_unchanged(service)
         || launch_owner
             .as_ref()
             .is_some_and(|owner| !owner.matches(caller))
@@ -914,8 +991,7 @@ fn require_launch_state(
     caller: &Caller,
     phase: LaunchPhase,
 ) -> Result<(), Failure> {
-    if state.stopping
-        || !policy_unchanged(service)
+    if admission(state.phase, service.trust()).is_err()
         || state
             .registry
             .get(id)
@@ -1080,23 +1156,26 @@ fn sweep_abandoned_launches_locked(
     now: Duration,
 ) -> Result<(), Integrity> {
     state.registry.poll(now);
-    let abandoned: Vec<_> = state
-        .metadata
-        .iter()
-        .filter_map(|(id, metadata)| {
-            metadata
-                .launch_owner
-                .as_ref()
-                .filter(|owner| {
-                    owner.revocation_reason().is_some()
-                        || state
-                            .registry
-                            .get(*id)
-                            .is_none_or(|grant| grant.lifetime.state() != LeaseState::Active)
-                })
-                .map(|_| *id)
-        })
-        .collect();
+    let mut abandoned = Vec::new();
+    let mut looks = Vec::new();
+    for (id, metadata) in &state.metadata {
+        let Some(owner) = &metadata.launch_owner else {
+            continue;
+        };
+        let presence = owner.presence();
+        if launch_revocation(presence, owner.release_expired()).is_some()
+            || state
+                .registry
+                .get(*id)
+                .is_none_or(|grant| grant.lifetime.state() != LeaseState::Active)
+        {
+            abandoned.push(*id);
+        }
+        looks.push((Subject::LaunchOwner(*id), presence));
+    }
+    for (subject, presence) in looks {
+        state.unseen.note(subject, &presence);
+    }
     for id in abandoned {
         state
             .registry
@@ -1228,7 +1307,7 @@ async fn delegate(
     let now = now()?;
     let id = new_id()?;
     let mut state = service.state.lock().await;
-    if state.stopping {
+    if state.phase != Phase::Serving {
         return Err(Failure::NativeUnavailable);
     }
     if depth(&state, parent) >= 16 {
@@ -1349,7 +1428,7 @@ async fn execute(
         captured_relay,
     ) = {
         let mut state = service.state.lock().await;
-        if state.stopping || state.jobs.len() >= MAX_EXECUTIONS {
+        if state.phase != Phase::Serving || state.jobs.len() >= MAX_EXECUTIONS {
             return Err(Failure::Busy);
         }
         let grant_id = select(&state, &caller.scope, selected)?;
@@ -1630,7 +1709,8 @@ async fn execute(
     } else if sudo_relay {
         Some(
             service
-                .sudo_file
+                .sudo
+                .file
                 .try_clone()
                 .map_err(|_| Failure::NativeUnavailable)?,
         )
@@ -1677,6 +1757,7 @@ async fn execute(
         }
     };
     drop(setup_lease);
+    let mut unseen = Unseen::default();
     let status = loop {
         if self::now()? >= hard_deadline {
             let mut state = service.state.lock().await;
@@ -1688,7 +1769,9 @@ async fn execute(
                 let _ = metadata.boundary.stop();
             }
         }
-        if !caller.still_present() || connection_closed(connection) {
+        let presence = caller.presence();
+        unseen.note(Subject::Client(job_id), &presence);
+        if client_left(presence, native::readable(connection)) {
             let mut state = service.state.lock().await;
             if let Some(job) = state.jobs.get_mut(&job_id) {
                 let _ = job.boundary.stop();
@@ -1762,10 +1845,8 @@ async fn execute(
                 state
                     .jobs
                     .get(&job_id)
-                    .map(|job| job.boundary.is_empty())
-                    .transpose()
-                    .map_err(|_| Failure::CleanupFailed)?
-                    .unwrap_or(true)
+                    .map_or(Ok(true), |job| job.boundary.is_empty())
+                    .unwrap_or(false)
             };
             if empty {
                 break;
@@ -1848,9 +1929,12 @@ async fn execute_captured(
         Some(Failure::RuntimeFailure)
     };
     let mut cleanup_deadline = failure.map(|_| std::time::Instant::now() + Duration::from_secs(5));
+    let mut unseen = Unseen::default();
     loop {
         let expired = !self::now().is_ok_and(|now| now < hard_deadline);
-        let disconnected = !caller.still_present() || connection_closed(connection);
+        let presence = caller.presence();
+        unseen.note(Subject::Client(job_id), &presence);
+        let disconnected = client_left(presence, native::readable(connection));
         let signal = super::execution_io::receive_signal(&events);
         let mut state = service.state.lock().await;
         let job = state.jobs.get_mut(&job_id).ok_or(Failure::CleanupFailed)?;
@@ -1909,17 +1993,7 @@ async fn execute_captured(
                 .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
         }
         let joined = job.leader_done;
-        let empty = if joined {
-            match job.boundary.is_empty() {
-                Ok(empty) => empty,
-                Err(_) => {
-                    captured.cleanup_failed = true;
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        let empty = joined && job.boundary.is_empty().unwrap_or(false);
         let timed_out =
             cleanup_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
         if joined && !empty {
@@ -1979,7 +2053,7 @@ fn poll_captured(job: &mut Job) {
     if !captured.spawn_finished {
         return;
     }
-    if connection_closed(&captured.connection) {
+    if native::readable(&captured.connection) == Ok(true) {
         // No response reader remains; retain sole Child wait custody until
         // terminal cleanup, then allow the reaper to release this job record.
         captured.published = true;
@@ -2075,18 +2149,6 @@ impl Drop for PendingApproval<'_> {
     }
 }
 
-fn connection_closed(connection: &OwnedFd) -> bool {
-    use std::os::fd::AsFd;
-    let mut descriptors = [nix::poll::PollFd::new(
-        connection.as_fd(),
-        nix::poll::PollFlags::POLLIN,
-    )];
-    !matches!(
-        nix::poll::poll(&mut descriptors, nix::poll::PollTimeout::ZERO),
-        Ok(0)
-    )
-}
-
 fn execution_authority(
     policy: &Policy,
     authority: &Authority,
@@ -2180,28 +2242,28 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
     state.pending_relays.retain(|_, pending| {
         now < pending.expires && native::alive(pending.caller.peer.peer_pidfd())
     });
-    if !policy_unchanged(service) {
-        state.registry.stop_all(StopReason::AuthorityChanged, now);
+    if state.phase == Phase::Serving {
+        let look = service.trust();
+        watch_trust(&mut state, look);
     }
-    let ended: Vec<_> = state
+    let workloads: Vec<_> = state
         .metadata
         .iter()
         .filter_map(|(id, metadata)| {
             metadata
                 .workload
                 .as_ref()
-                .and_then(|workload| match cgroup_empty(workload) {
-                    Ok(false) => None,
-                    Ok(true) => Some((*id, StopReason::WorkloadEnded)),
-                    Err(_) => Some((*id, StopReason::AuthorityChanged)),
-                })
+                .map(|workload| (*id, population(workload)))
         })
         .collect();
-    for (id, reason) in ended {
-        state
-            .registry
-            .stop(id, reason, now)
-            .map_err(|_| Integrity::RecordsDisagree(id))?;
+    for (id, population) in workloads {
+        state.unseen.note(Subject::Workload(id), &population);
+        if let Some(reason) = workload_end(population) {
+            state
+                .registry
+                .stop(id, reason, now)
+                .map_err(|_| Integrity::RecordsDisagree(id))?;
+        }
     }
     sweep_abandoned_launches_locked(service, &mut state, now)?;
     state.registry.poll(now);
@@ -2223,7 +2285,7 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
         if job
             .external_leader
             .as_ref()
-            .is_some_and(|leader| !native::alive(leader))
+            .is_some_and(|leader| native::readable(leader) == Ok(true))
         {
             // ADR 0136: a command that native sudo started outlives sudo
             // within its grant. Only an invocation that never attached, and so
@@ -2288,23 +2350,22 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
             .metadata
             .get_mut(&id)
             .ok_or(Integrity::RecordsDisagree(id))?;
-        match metadata.boundary.is_empty() {
-            Ok(true) => {
-                let result = metadata.boundary.remove();
-                let _ = state.registry.report_cleanup(
-                    id,
-                    if result.is_ok() {
-                        Cleanup::Complete
-                    } else {
-                        Cleanup::Failed
-                    },
-                );
-            }
-            Ok(false) => {}
-            Err(_) => {
-                let _ = state.registry.report_cleanup(id, Cleanup::Failed);
-            }
+        let population = metadata
+            .boundary
+            .is_empty()
+            .map_err(|error| Unobserved(error.kind()));
+        if population == Ok(true) {
+            let result = metadata.boundary.remove();
+            let _ = state.registry.report_cleanup(
+                id,
+                if result.is_ok() {
+                    Cleanup::Complete
+                } else {
+                    Cleanup::Failed
+                },
+            );
         }
+        state.unseen.note(Subject::Cleanup(id), &population);
     }
     let terminal: Vec<_> = state
         .registry
@@ -2341,6 +2402,15 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
             state.metadata.remove(&id);
         }
     }
+    let State {
+        metadata, unseen, ..
+    } = &mut *state;
+    unseen.0.retain(|subject| match subject {
+        Subject::Workload(id) | Subject::LaunchOwner(id) | Subject::Cleanup(id) => {
+            metadata.contains_key(id)
+        }
+        Subject::Trust | Subject::Client(_) => true,
+    });
     Ok(())
 }
 
@@ -2591,21 +2661,133 @@ fn session_failure(error: SessionError) -> Failure {
     }
 }
 
-fn policy_unchanged(service: &Service) -> bool {
-    let Ok(current) = root_file(&service.policy_path, false) else {
-        return false;
-    };
-    FileStamp::of(&current).ok() == Some(service.policy_stamp)
-        && FileStamp::of(&service.policy_file).ok() == Some(service.policy_stamp)
-        && FileStamp::of(&service.sudo_file).ok() == Some(service.sudo_stamp)
-        && root_file(Path::new(&service.policy.sudo_program), false)
-            .ok()
-            .as_ref()
-            .and_then(|file| FileStamp::of(file).ok())
-            == Some(service.sudo_stamp)
+/// A trust input the coordinator binds at startup (ADR 0115). Admission needs
+/// each one unchanged, and a change drains the coordinator (ADR 0138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Input {
+    Policy,
+    SudoProgram,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+impl std::fmt::Display for Input {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Policy => "grant policy",
+            Self::SudoProgram => "sudo program",
+        })
+    }
+}
+
+/// A trust input bound at startup: its path, the file that path named then,
+/// held open, and that file's stamp.
+struct Bound {
+    input: Input,
+    path: PathBuf,
+    file: File,
+    stamp: FileStamp,
+}
+
+impl Bound {
+    fn open(input: Input, path: &Path) -> Result<Self, Failure> {
+        let file = root_file(path, false)?;
+        Ok(Self {
+            input,
+            path: path.to_owned(),
+            stamp: FileStamp::of(&file)?,
+            file,
+        })
+    }
+
+    /// Whether the file the path names now is still the one bound at startup.
+    fn look(&self) -> Look<bool> {
+        let named = protected_file(&self.path, false)
+            .and_then(|file| file.as_ref().map(FileStamp::look).transpose());
+        unchanged(self.stamp, FileStamp::look(&self.file), named)
+    }
+}
+
+impl Service {
+    /// The first watched trust input a look finds changed. A look that could
+    /// not be taken is not a change.
+    fn trust(&self) -> Look<Option<Input>> {
+        changed_input([&self.policy_source, &self.sudo].map(|bound| (bound.input, bound.look())))
+    }
+}
+
+/// Whether a bound input still names the file the coordinator trusted, from
+/// the stamp of the descriptor held since startup and the stamp of the file
+/// its path names now, which is `None` when the path names no protected file.
+fn unchanged(
+    bound: FileStamp,
+    held: Look<FileStamp>,
+    named: Look<Option<FileStamp>>,
+) -> Look<bool> {
+    let observed_change =
+        held.is_ok_and(|held| held != bound) || named.is_ok_and(|named| named != Some(bound));
+    if observed_change {
+        return Ok(false);
+    }
+    held.and(named).map(|_| true)
+}
+
+fn changed_input<const N: usize>(looks: [(Input, Look<bool>); N]) -> Look<Option<Input>> {
+    let mut unobserved = None;
+    for (input, look) in looks {
+        match look {
+            Ok(true) => {}
+            Ok(false) => return Ok(Some(input)),
+            Err(failure) => unobserved = unobserved.or(Some(failure)),
+        }
+    }
+    unobserved.map_or(Ok(None), Err)
+}
+
+/// Admission needs a serving coordinator and a fresh look that finds every
+/// watched trust input unchanged. A look that could not be taken refuses only
+/// this admission.
+fn admission(phase: Phase, trust: Look<Option<Input>>) -> Result<(), Failure> {
+    match (phase, trust) {
+        (Phase::Serving, Ok(None)) => Ok(()),
+        (Phase::Serving, Err(_)) => Err(Failure::NativeUnavailable),
+        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_), _) => Err(Failure::AuthorityDenied),
+        (Phase::Stopping, _) => Err(Failure::Busy),
+    }
+}
+
+/// Apply one look at the watched trust inputs. A change closes admission for
+/// good and leaves every grant and job running; a look that could not be
+/// taken changes nothing.
+fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
+    state.unseen.note(Subject::Trust, &look);
+    if let (Phase::Serving, Ok(Some(input))) = (state.phase, look) {
+        state.phase = Phase::Draining(input);
+        eprintln!(
+            "dev-auth grant trust changed: the {input} is not the one bound at startup; admission is closed and {} running job(s) continue under their grants",
+            state.jobs.len()
+        );
+    }
+}
+
+/// Whether a control request admits new managed work, and so needs the trust
+/// the coordinator bound at startup. Observing and ending grants never does.
+fn admits_new_work(request: &ControlRequest) -> bool {
+    match request {
+        ControlRequest::Status
+        | ControlRequest::Inspect { .. }
+        | ControlRequest::Revoke { .. }
+        | ControlRequest::Leave => false,
+        ControlRequest::Request { .. }
+        | ControlRequest::LaunchRequest { .. }
+        | ControlRequest::ActivateLaunch { .. }
+        | ControlRequest::CommitLaunch { .. }
+        | ControlRequest::Exec { .. }
+        | ControlRequest::RunPlan { .. }
+        | ControlRequest::SudoRelay { .. }
+        | ControlRequest::Delegate { .. } => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     device: u64,
     inode: u64,
@@ -2618,7 +2800,11 @@ struct FileStamp {
 
 impl FileStamp {
     fn of(file: &File) -> Result<Self, Failure> {
-        let metadata = file.metadata().map_err(|_| Failure::AuthorityDenied)?;
+        Self::look(file).map_err(|_| Failure::AuthorityDenied)
+    }
+
+    fn look(file: &File) -> Look<Self> {
+        let metadata = file.metadata().map_err(|error| Unobserved(error.kind()))?;
         Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -2632,6 +2818,16 @@ impl FileStamp {
 }
 
 fn root_file(path: &Path, directory: bool) -> Result<File, Failure> {
+    protected_file(path, directory)
+        .ok()
+        .flatten()
+        .ok_or(Failure::AuthorityDenied)
+}
+
+/// One look at the root-owned file a path names. `None` when the path or an
+/// ancestor observably breaks root custody: a symlink, a wrong file type, or
+/// a group- or world-writable or non-root owner.
+fn protected_file(path: &Path, directory: bool) -> Look<Option<File>> {
     if !path.is_absolute()
         || path.components().any(|component| {
             !matches!(
@@ -2640,24 +2836,31 @@ fn root_file(path: &Path, directory: bool) -> Result<File, Failure> {
             )
         })
     {
-        return Err(Failure::AuthorityDenied);
+        return Ok(None);
     }
-    for ancestor in path.parent().ok_or(Failure::AuthorityDenied)?.ancestors() {
-        let metadata = std::fs::symlink_metadata(ancestor).map_err(|_| Failure::AuthorityDenied)?;
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    for ancestor in parent.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|error| opening(&error))?;
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(Failure::AuthorityDenied);
+            return Ok(None);
         }
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(
-            nix::libc::O_CLOEXEC
-                | nix::libc::O_NOFOLLOW
-                | if directory { nix::libc::O_DIRECTORY } else { 0 },
-        )
-        .open(path)
-        .map_err(|_| Failure::AuthorityDenied)?;
-    let metadata = file.metadata().map_err(|_| Failure::AuthorityDenied)?;
+    let Some(file) = opened(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                nix::libc::O_CLOEXEC
+                    | nix::libc::O_NOFOLLOW
+                    | if directory { nix::libc::O_DIRECTORY } else { 0 },
+            )
+            .open(path),
+    )?
+    else {
+        return Ok(None);
+    };
+    let metadata = file.metadata().map_err(|error| opening(&error))?;
     if metadata.uid() != 0
         || metadata.mode() & 0o022 != 0
         || if directory {
@@ -2666,9 +2869,32 @@ fn root_file(path: &Path, directory: bool) -> Result<File, Failure> {
             !metadata.is_file()
         }
     {
-        return Err(Failure::AuthorityDenied);
+        return Ok(None);
     }
-    Ok(file)
+    Ok(Some(file))
+}
+
+/// One no-follow open of a protected path: `None` when its final component
+/// is a symlink or the wrong file type.
+fn opened(open: io::Result<File>) -> Look<Option<File>> {
+    match open {
+        Ok(file) => Ok(Some(file)),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(nix::libc::ELOOP | nix::libc::ENOTDIR)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(opening(&error)),
+    }
+}
+
+/// A path that could not be opened or inspected now, including one absent
+/// while it is replaced, has not been observed.
+fn opening(error: &io::Error) -> Unobserved {
+    Unobserved(error.kind())
 }
 
 fn own_service_cgroup() -> Result<PathBuf, Failure> {
@@ -2851,24 +3077,45 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
     Ok(())
 }
 
-fn cgroup_empty(directory: &File) -> Result<bool, Failure> {
+/// One look at a held cgroup's population: `true` when it has no member.
+/// A cgroup directory that was removed reports its control files absent, and
+/// a cgroup is removable only once it is empty.
+fn population(directory: &File) -> Look<bool> {
     use std::os::unix::fs::FileExt;
-    let fd = rustix::fs::openat(
+    let fd = match rustix::fs::openat(
         directory,
         "cgroup.events",
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
-    )
-    .map_err(|_| Failure::NativeUnavailable)?;
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NODEV) => return Ok(true),
+        Err(error) => return Err(Unobserved(io::Error::from(error).kind())),
+    };
     let file = File::from(fd);
     let mut bytes = [0; 4096];
-    let length = file
-        .read_at(&mut bytes, 0)
-        .map_err(|_| Failure::NativeUnavailable)?;
-    if length == bytes.len() {
-        return Err(Failure::NativeUnavailable);
-    }
-    parse_population(&bytes[..length])
+    let length = match file.read_at(&mut bytes, 0) {
+        Ok(length) if length < bytes.len() => length,
+        Ok(_) => return Err(Unobserved(io::ErrorKind::InvalidData)),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ENODEV) => return Ok(true),
+        Err(error) => return Err(Unobserved(error.kind())),
+    };
+    parse_population(&bytes[..length]).map_err(|_| Unobserved(io::ErrorKind::InvalidData))
+}
+
+/// How one look at a workload's population ends its grant.
+fn workload_end(population: Look<bool>) -> Option<StopReason> {
+    (population == Ok(true)).then_some(StopReason::WorkloadEnded)
+}
+
+/// How one look at a pending launch's native owner revokes its grant.
+fn launch_revocation(presence: Look<bool>, release_expired: bool) -> Option<StopReason> {
+    (presence == Ok(false) || release_expired).then_some(StopReason::WorkloadEnded)
+}
+
+/// Whether an execution's client has left, which stops its job.
+fn client_left(presence: Look<bool>, hung_up: Look<bool>) -> bool {
+    presence == Ok(false) || hung_up == Ok(true)
 }
 
 fn parse_population(bytes: &[u8]) -> Result<bool, Failure> {
@@ -3002,7 +3249,7 @@ fn recover_cgroups(parent: &File) -> Result<(), Failure> {
                 .map_err(|_| Failure::CleanupFailed)?,
             );
             kill.write_all(b"1").map_err(|_| Failure::CleanupFailed)?;
-            while !cgroup_empty(&child)? {
+            while !population(&child).map_err(|_| Failure::NativeUnavailable)? {
                 if std::time::Instant::now() >= deadline {
                     return Err(Failure::CleanupFailed);
                 }
@@ -3184,7 +3431,7 @@ mod tests {
                 owner.available(),
                 "first privileged instruction must see available release phase"
             );
-            assert!(owner.revocation_reason().is_none());
+            assert!(launch_revocation(owner.presence(), owner.release_expired()).is_none());
             assert!(marker.exists());
             controller.0.kill().unwrap();
             controller.0.wait().unwrap();
@@ -3192,7 +3439,7 @@ mod tests {
                 !owner.available(),
                 "native controller death must immediately deny admission"
             );
-            lease.stop(owner.revocation_reason().unwrap());
+            lease.stop(launch_revocation(owner.presence(), owner.release_expired()).unwrap());
             remove_marker_at(runtime.path(), &scope).unwrap();
             assert_ne!(lease.state(), LeaseState::Active);
             assert!(
@@ -3340,7 +3587,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_ambiguous_or_unreadable_population_is_authority_loss() {
+    fn missing_ambiguous_or_unreadable_population_is_not_an_answer() {
         assert_eq!(parse_population(b"populated 0\nfrozen 0\n"), Ok(true));
         assert_eq!(parse_population(b"populated 1\n"), Ok(false));
         for bytes in [
@@ -3419,7 +3666,8 @@ mod tests {
             selected,
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
-            stopping: false,
+            phase: Phase::Serving,
+            unseen: Unseen::default(),
         }
     }
 
@@ -3689,6 +3937,210 @@ mod tests {
             calls.get()
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    fn active(state: &State, id: GrantId) -> bool {
+        state
+            .registry
+            .get(id)
+            .is_some_and(|grant| grant.lifetime.state() == LeaseState::Active)
+    }
+
+    const UNREADABLE: Unobserved = Unobserved(io::ErrorKind::Interrupted);
+
+    #[test]
+    fn a_changed_trust_input_closes_admission_and_keeps_running_grants() {
+        for input in [Input::SudoProgram, Input::Policy] {
+            let scope = user_scope(1000);
+            let mut state = routing_state(&[(1, scope.clone())]);
+            watch_trust(&mut state, Ok(Some(input)));
+            assert!(
+                active(&state, 1),
+                "{input}: the grant and its job keep running"
+            );
+            assert_eq!(
+                select(&state, &scope, None),
+                Ok(1),
+                "{input}: routing stays"
+            );
+            assert!(
+                admission(state.phase, Ok(None)).is_err(),
+                "{input}: nothing new is admitted under the old trust, even after a clean look"
+            );
+            assert_eq!(
+                state.phase.drained(1),
+                None,
+                "{input}: waits for its running job"
+            );
+            assert_eq!(
+                state.phase.drained(0),
+                Some(input),
+                "{input}: exits for a restart once no job runs"
+            );
+        }
+    }
+
+    #[test]
+    fn ending_and_observing_grants_never_wait_for_trust() {
+        let grant = "0123456789abcdef0123456789abcdef".to_owned();
+        for request in [
+            ControlRequest::Status,
+            ControlRequest::Inspect {
+                grant: grant.clone(),
+            },
+            ControlRequest::Revoke {
+                grant: grant.clone(),
+            },
+            ControlRequest::Leave,
+        ] {
+            assert!(!admits_new_work(&request), "{}", request.operation());
+        }
+        for request in [
+            ControlRequest::CommitLaunch {
+                grant: grant.clone(),
+            },
+            ControlRequest::ActivateLaunch {
+                grant,
+                bootstrap: false,
+            },
+        ] {
+            assert!(admits_new_work(&request), "{}", request.operation());
+        }
+    }
+
+    #[test]
+    fn a_trust_input_that_cannot_be_read_is_not_a_change() {
+        let bound = FileStamp {
+            device: 1,
+            inode: 2,
+            length: 3,
+            mtime: 4,
+            mtime_ns: 5,
+            ctime: 6,
+            ctime_ns: 7,
+        };
+        let replaced = FileStamp { inode: 9, ..bound };
+        assert_eq!(unchanged(bound, Ok(bound), Ok(Some(bound))), Ok(true));
+        assert_eq!(
+            unchanged(bound, Ok(bound), Err(UNREADABLE)),
+            Err(UNREADABLE),
+            "a path that cannot be opened now"
+        );
+        assert_eq!(
+            unchanged(bound, Err(UNREADABLE), Ok(Some(bound))),
+            Err(UNREADABLE),
+            "a held descriptor that cannot be stamped now"
+        );
+        assert_eq!(unchanged(bound, Ok(bound), Ok(Some(replaced))), Ok(false));
+        assert_eq!(unchanged(bound, Ok(replaced), Ok(Some(bound))), Ok(false));
+        assert_eq!(unchanged(bound, Ok(bound), Ok(None)), Ok(false));
+        assert_eq!(
+            unchanged(bound, Ok(replaced), Err(UNREADABLE)),
+            Ok(false),
+            "an observed change wins over a look that failed"
+        );
+        assert_eq!(
+            changed_input([
+                (Input::Policy, Err(UNREADABLE)),
+                (Input::SudoProgram, Ok(true))
+            ]),
+            Err(UNREADABLE)
+        );
+        let scope = user_scope(1000);
+        let mut state = routing_state(&[(1, scope.clone())]);
+        watch_trust(&mut state, Err(UNREADABLE));
+        assert!(active(&state, 1), "the grant and its job keep running");
+        assert!(
+            admission(state.phase, Err(UNREADABLE)).is_err(),
+            "only this admission is refused"
+        );
+        assert_eq!(
+            admission(state.phase, Ok(None)),
+            Ok(()),
+            "and the next is not"
+        );
+        assert_eq!(state.phase.drained(0), None);
+    }
+
+    #[test]
+    fn a_workload_population_that_cannot_be_read_does_not_end_its_grant() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let held = File::open(cgroup.path()).unwrap();
+        let events = cgroup.path().join("cgroup.events");
+        std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+        assert_eq!(population(&held), Ok(false));
+        assert_eq!(workload_end(population(&held)), None);
+        std::fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
+        assert_eq!(
+            workload_end(population(&held)),
+            Some(StopReason::WorkloadEnded)
+        );
+        std::fs::remove_file(&events).unwrap();
+        assert_eq!(
+            population(&held),
+            Ok(true),
+            "a removed cgroup has no member"
+        );
+        let unreadable: [fn(&Path); 2] = [
+            |events| std::fs::create_dir(events).unwrap(),
+            |events| std::fs::write(events, "populated 2\n").unwrap(),
+        ];
+        for unreadable in unreadable {
+            let _ = std::fs::remove_dir(&events);
+            let _ = std::fs::remove_file(&events);
+            unreadable(&events);
+            assert!(population(&held).is_err());
+            assert_eq!(workload_end(population(&held)), None);
+        }
+    }
+
+    #[test]
+    fn only_a_symlink_or_wrong_type_is_an_observed_unprotected_path() {
+        for observed in [nix::libc::ELOOP, nix::libc::ENOTDIR] {
+            assert!(matches!(
+                opened(Err(io::Error::from_raw_os_error(observed))),
+                Ok(None)
+            ));
+        }
+        for unobserved in [
+            nix::libc::ENOENT,
+            nix::libc::EACCES,
+            nix::libc::EMFILE,
+            nix::libc::ENFILE,
+            nix::libc::ENOMEM,
+            nix::libc::EIO,
+            nix::libc::EINTR,
+        ] {
+            assert!(
+                opened(Err(io::Error::from_raw_os_error(unobserved))).is_err(),
+                "errno {unobserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_owner_that_cannot_be_observed_is_not_revoked() {
+        assert_eq!(launch_revocation(Ok(true), false), None);
+        assert_eq!(launch_revocation(Err(UNREADABLE), false), None);
+        for (presence, expired) in [
+            (Ok(false), false),
+            (Ok(true), true),
+            (Err(UNREADABLE), true),
+        ] {
+            assert_eq!(
+                launch_revocation(presence, expired),
+                Some(StopReason::WorkloadEnded)
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_observed_has_not_left() {
+        assert!(!client_left(Ok(true), Ok(false)));
+        assert!(!client_left(Err(UNREADABLE), Ok(false)));
+        assert!(!client_left(Ok(true), Err(UNREADABLE)));
+        assert!(client_left(Ok(false), Err(UNREADABLE)));
+        assert!(client_left(Err(UNREADABLE), Ok(true)));
     }
 
     // check_logins stops every user grant of the account, and with it all of

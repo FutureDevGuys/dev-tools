@@ -22,7 +22,7 @@ Routing markers also outlived their grants. A marker stayed after expiry, revoca
 
 ### An attached job runs until its grant stops it
 
-Completion is accounting, not authority. After native sudo attaches an invocation, its command keeps running until it exits or its grant stops it. The grant stops it at the hard deadline, on revocation, on an observed logout, on a policy change and at coordinator shutdown.
+Completion is accounting, not authority. After native sudo attaches an invocation, its command keeps running until it exits or its grant stops it. The grant stops it at the hard deadline, on revocation, on an observed logout and at coordinator shutdown. A changed grant policy or sudo program no longer stops it ([ADR 0138](0138-trust-change-drain-and-observed-supervision.md)).
 
 If sudo's end of the completion channel closes, or resets with a coordinator frame unread, the bridge logs the invocation as abandoned and stops reading. The bridge does not stop the job's domain. If the sudo process exits before completion, reaping leaves the job's domain running. Reaping retires an abandoned job once its cgroup is empty, and grant cleanup still waits for that job. An abandoned invocation admits nothing, extends nothing and refunds no use.
 
@@ -43,7 +43,7 @@ A user-scope grant ends at final interactive logout when logind answers that the
 
 ### Routing lives exactly as long as its grant
 
-A routing marker routes sudo only while its grant is active. Selection ignores a marker whose grant has stopped or retired, so the bridge answers native for that scope at once. Every reaping pass removes the marker file of each ended grant and retries a failed removal. This holds for every way a grant ends, including expiry, revocation, logout, policy change, shutdown and retirement. A starting coordinator removes every marker after it takes the daemon lock and before it reads policy, because no grant survives a restart. `leave` with no selected grant succeeds and reports no change.
+A routing marker routes sudo only while its grant is active. Selection ignores a marker whose grant has stopped or retired, so the bridge answers native for that scope at once. Every reaping pass removes the marker file of each ended grant and retries a failed removal. This holds for every way a grant ends, including expiry, revocation, logout, shutdown and retirement. A starting coordinator removes every marker after it takes the daemon lock and before it reads policy, because no grant survives a restart. `leave` with no selected grant succeeds and reports no change.
 
 A workload whose own grant ended routes through its account's selected user-scope grant while that grant is active. The workload had that routing before its own grant existed.
 
@@ -55,7 +55,7 @@ ADR0115 says that denied managed Sudo never falls back to a cached native author
 
 After a grant ends, sudo for the account has its native behavior. A native ticket that was valid when the grant started, and has not expired when the grant ends, can therefore authorize sudo again. Managed routing does not refresh native tickets while a grant is active. To deny native sudo after every grant, configure native sudo without cached credentials, for example with `timestamp_timeout=0`.
 
-[ADR 0137](0137-coordinator-fault-containment-and-sudo-refusal-reasons.md) keeps a reaping failure that belongs to one grant from ending the coordinator, and it records that a coordinator exit stops every managed job. It also makes the sudo plugin print the reason for each refusal.
+[ADR 0137](0137-coordinator-fault-containment-and-sudo-refusal-reasons.md) keeps a reaping failure that belongs to one grant from ending the coordinator, and it records that a coordinator exit stops every managed job. It also makes the sudo plugin print the reason for each refusal. [ADR 0138](0138-trust-change-drain-and-observed-supervision.md) drains the coordinator when the grant policy or sudo program changes instead of stopping every grant, acts only on observed state, and gives native sudo to an unanswered invocation that the coordinator does not own.
 
 ### Diagnostics
 
