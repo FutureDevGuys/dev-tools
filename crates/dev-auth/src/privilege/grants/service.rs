@@ -2318,13 +2318,13 @@ async fn check_logins(service: &Service) {
         let Account::Unix { uid } = account else {
             continue;
         };
-        if tokio::time::timeout(
+        let observation = tokio::time::timeout(
             Duration::from_secs(2),
             super::approval::account_has_login(uid),
         )
         .await
-            != Ok(Ok(true))
-        {
+        .unwrap_or(Err(Failure::NativeUnavailable));
+        if login_ended(observation) {
             let mut state = service.state.lock().await;
             let ids: Vec<_> = state
                 .metadata
@@ -2341,6 +2341,11 @@ async fn check_logins(service: &Service) {
             }
         }
     }
+}
+
+/// Whether one native login observation ends the account's user-scope grants.
+fn login_ended(observation: Result<bool, Failure>) -> bool {
+    observation != Ok(true)
 }
 
 fn requested_scope(caller: &Caller, scope: GrantScope) -> Result<NativeScope, Failure> {
@@ -3229,6 +3234,136 @@ mod tests {
             "admin-1000",
         ] {
             assert!(parse_marker_name(name).is_err(), "{name}");
+        }
+    }
+
+    fn user_scope(uid: u32) -> NativeScope {
+        NativeScope {
+            account: Account::Unix { uid },
+            workload: None,
+        }
+    }
+
+    /// Coordinator state holding only registry and routing records. These
+    /// grants own no native boundary, which `select` never consults.
+    fn routing_state(grants: &[(GrantId, NativeScope)]) -> State {
+        let mut registry = GrantRegistry::new(MAX_GRANTS).unwrap();
+        let limits = dev_tools_privilege_session::GrantLimits::from_administrator_policy(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut selected = BTreeMap::new();
+        for (id, scope) in grants {
+            registry
+                .issue(
+                    *id,
+                    scope.clone(),
+                    Authority::Administrator,
+                    limits,
+                    None,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            selected.insert(scope.clone(), *id);
+        }
+        State {
+            registry,
+            metadata: BTreeMap::new(),
+            selected,
+            jobs: BTreeMap::new(),
+            pending_relays: BTreeMap::new(),
+            stopping: false,
+        }
+    }
+
+    type GrantEnd = (&'static str, fn(&mut State));
+
+    // A selection that still names an ended grant makes the sudo bridge deny
+    // every invocation for the scope until someone knows to run `leave`.
+    #[test]
+    fn a_grant_ended_by_any_path_no_longer_routes_its_scope() {
+        let scope = user_scope(1000);
+        let later = Duration::from_secs(1);
+        let ends: [GrantEnd; 7] = [
+            ("hard expiry", |state| {
+                state.registry.poll(Duration::from_secs(61));
+            }),
+            ("revocation", |state| {
+                state
+                    .registry
+                    .stop(1, StopReason::Revoked, Duration::from_secs(1))
+                    .unwrap();
+            }),
+            ("logout", |state| {
+                state
+                    .registry
+                    .stop(1, StopReason::Logout, Duration::from_secs(1))
+                    .unwrap();
+            }),
+            ("authority change", |state| {
+                state
+                    .registry
+                    .stop_all(StopReason::AuthorityChanged, Duration::from_secs(1));
+            }),
+            ("coordinator shutdown", |state| {
+                state
+                    .registry
+                    .stop_all(StopReason::BrokerShutdown, Duration::from_secs(1));
+            }),
+            ("retirement after cleanup", |state| {
+                state
+                    .registry
+                    .stop(1, StopReason::Revoked, Duration::from_secs(1))
+                    .unwrap();
+                state.registry.report_cleanup(1, Cleanup::Complete).unwrap();
+                state.registry.retire(1).unwrap();
+            }),
+            ("coordinator restart", |state| {
+                state.registry = GrantRegistry::new(MAX_GRANTS).unwrap();
+            }),
+        ];
+        for (path, end) in ends {
+            let mut state = routing_state(&[(1, scope.clone())]);
+            state.registry.poll(later);
+            assert_eq!(select(&state, &scope, None), Ok(1), "{path}");
+            end(&mut state);
+            assert_eq!(
+                select(&state, &scope, None),
+                Err(Failure::NoGrant),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workload_whose_grant_ended_returns_to_its_accounts_selected_grant() {
+        let user = user_scope(1000);
+        let workload = NativeScope {
+            account: Account::Unix { uid: 1000 },
+            workload: Some(7),
+        };
+        let mut state = routing_state(&[(1, user.clone()), (2, workload.clone())]);
+        assert_eq!(select(&state, &workload, None), Ok(2));
+        state
+            .registry
+            .stop(2, StopReason::WorkloadEnded, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(select(&state, &workload, None), Ok(1));
+        assert_eq!(select(&state, &user, None), Ok(1));
+    }
+
+    // check_logins stops every user grant of the account, and with it all of
+    // their running jobs, whenever this returns true.
+    #[test]
+    fn only_an_observed_logout_ends_user_grants() {
+        assert!(!login_ended(Ok(true)));
+        assert!(login_ended(Ok(false)));
+        for failure in [Failure::NativeUnavailable, Failure::ProtocolViolation] {
+            assert!(
+                !login_ended(Err(failure)),
+                "an unanswered login query ended user grants: {failure:?}"
+            );
         }
     }
 }

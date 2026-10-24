@@ -652,4 +652,169 @@ mod tests {
         assert!(!sender_identity_matches(123, 0, 984, completed, false));
         assert!(sender_identity_matches(123, 0, 984, completed, true));
     }
+
+    struct BridgePair {
+        coordinator: AsyncFd<OwnedFd>,
+        sudo: Option<OwnedFd>,
+        peer: crate::linux_admission::LinuxPeerEvidence,
+    }
+
+    /// A connected coordinator end with the production receive options. The
+    /// test process is its own peer, so its pid, uid and gid are the evidence.
+    fn bridge_pair() -> BridgePair {
+        let (coordinator, sudo) = socket::socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )
+        .unwrap();
+        socket::setsockopt(&coordinator, socket::sockopt::PassCred, &true).unwrap();
+        let peer = crate::linux_admission::peer_evidence_fd(&coordinator).unwrap();
+        BridgePair {
+            coordinator: AsyncFd::new(coordinator).unwrap(),
+            sudo: Some(sudo),
+            peer,
+        }
+    }
+
+    fn send_as_sudo(sudo: &OwnedFd, request: Request) {
+        let bytes = serde_json::to_vec(&Message {
+            schema: SUDO_SCHEMA.into(),
+            request,
+        })
+        .unwrap();
+        let credentials = socket::UnixCredentials::from(nix::libc::ucred {
+            pid: nix::unistd::getpid().as_raw(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+        });
+        socket::sendmsg::<UnixAddr>(
+            sudo.as_raw_fd(),
+            &[io::IoSlice::new(&bytes)],
+            &[socket::ControlMessage::ScmCredentials(&credentials)],
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    // The connection stops the job's execution domain whenever the completion
+    // wait fails, so a failure here kills the still-running privileged command.
+    #[test]
+    fn attached_sudo_that_disconnects_does_not_fail_its_running_job() {
+        block_on(async {
+            let mut pair = bridge_pair();
+            drop(pair.sudo.take());
+            let outcome = receive_with_completion(
+                &pair.coordinator,
+                &pair.peer,
+                Duration::from_secs(3),
+                true,
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "closed completion channel failed the job: {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn attached_sudo_that_dies_before_reading_its_reply_does_not_fail_its_running_job() {
+        block_on(async {
+            let mut pair = bridge_pair();
+            socket::send(
+                pair.coordinator.get_ref().as_raw_fd(),
+                b"unread attachment reply",
+                MsgFlags::MSG_NOSIGNAL,
+            )
+            .unwrap();
+            drop(pair.sudo.take());
+            let outcome = receive_with_completion(
+                &pair.coordinator,
+                &pair.peer,
+                Duration::from_secs(3),
+                true,
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "reset completion channel failed the job: {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn completion_from_a_process_other_than_the_admitted_sudo_is_denied() {
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::completion_from_a_process_other_than_the_admitted_sudo_is_denied"
+        )) {
+            return;
+        }
+        block_on(async {
+            let mut pair = bridge_pair();
+            let sudo = pair.sudo.take().unwrap();
+            let bytes = serde_json::to_vec(&Message {
+                schema: SUDO_SCHEMA.into(),
+                request: Request::Complete,
+            })
+            .unwrap();
+            // SAFETY: the child performs only send(2) on a descriptor and a
+            // buffer prepared before fork, then _exit(2); it touches no lock,
+            // allocator or runtime state inherited from this process.
+            match unsafe { nix::unistd::fork() }.unwrap() {
+                nix::unistd::ForkResult::Child => unsafe {
+                    // PassCred makes the kernel attach this child's own pid.
+                    let sent = nix::libc::send(
+                        sudo.as_raw_fd(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        nix::libc::MSG_NOSIGNAL,
+                    );
+                    nix::libc::_exit(i32::from(sent != bytes.len() as isize));
+                },
+                nix::unistd::ForkResult::Parent { child } => {
+                    assert_eq!(
+                        nix::sys::wait::waitpid(child, None).unwrap(),
+                        nix::sys::wait::WaitStatus::Exited(child, 0)
+                    );
+                }
+            }
+            let outcome = receive_with_completion(
+                &pair.coordinator,
+                &pair.peer,
+                Duration::from_secs(3),
+                true,
+            )
+            .await;
+            assert_eq!(outcome.err(), Some(Failure::AuthorityDenied));
+            drop(sudo);
+        });
+    }
+
+    #[test]
+    fn completion_from_the_admitted_sudo_is_accepted() {
+        block_on(async {
+            let pair = bridge_pair();
+            send_as_sudo(pair.sudo.as_ref().unwrap(), Request::Complete);
+            let outcome = receive_with_completion(
+                &pair.coordinator,
+                &pair.peer,
+                Duration::from_secs(3),
+                true,
+            )
+            .await;
+            assert!(matches!(outcome, Ok(Request::Complete)), "{outcome:?}");
+        });
+    }
 }
