@@ -369,7 +369,7 @@ pub(super) async fn run(
             launch_owner: None,
         },
     );
-    state.jobs.insert(
+    state.attach_job(
         job_id,
         Job {
             grant: id,
@@ -381,7 +381,7 @@ pub(super) async fn run(
             relay: RelayAdmission::Ordinary,
             captured: None,
         },
-    );
+    )?;
     // Control requests from inside the tree select this grant. Sudo routes
     // through the job boundary itself, so no marker is published.
     state.selected.insert(scope, id);
@@ -460,23 +460,7 @@ pub(super) async fn run(
 /// Reap until the stopped grant reaches its terminal state, within the bound
 /// that `revoke` uses. Whatever its program left running is stopped with it.
 async fn ended(service: &Service, id: GrantId) -> bool {
-    for _ in 0..50 {
-        if reap(service).await.is_err() {
-            return false;
-        }
-        let terminal = service
-            .state
-            .lock()
-            .await
-            .registry
-            .get(id)
-            .is_none_or(|grant| grant.lifetime.state().is_terminal());
-        if terminal {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    false
+    settle(service, Some(id)).await.unwrap_or(false)
 }
 
 #[cfg(test)]

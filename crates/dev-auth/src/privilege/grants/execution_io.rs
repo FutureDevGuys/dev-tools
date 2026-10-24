@@ -234,9 +234,15 @@ fn nonblocking(fd: &OwnedFd) -> Result<(), Failure> {
 
 /// Pump a descriptor-owned PTY without mixing protocol/result bytes into child
 /// output. Non-TTY execution uses the same signal channel and hard wait bound.
-/// Whether a client stops waiting for its result at boot time `now`.
+/// Whether a client stops waiting for its result at boot time `now`. Work
+/// that outlives the hard deadline receives SIGTERM, is killed once the grace
+/// passes, and the coordinator then waits up to `STOP_SETTLE` for its
+/// cleanup before it answers (ADR 0141), so the client waits for all of it.
 fn abandoned(now: Duration, hard_deadline: Duration) -> bool {
-    now > hard_deadline.saturating_add(Duration::from_secs(5))
+    now > hard_deadline
+        .saturating_add(dev_tools_privilege_session::linux::TERMINATION_GRACE)
+        .saturating_add(super::STOP_SETTLE)
+        .saturating_add(Duration::from_secs(5))
 }
 
 pub(super) fn wait_execution(

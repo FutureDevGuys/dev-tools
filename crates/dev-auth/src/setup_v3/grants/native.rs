@@ -4,6 +4,11 @@ use std::time::{Duration, Instant};
 
 const PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,FragmentPath,DropInPaths,ControlGroup,MainPID,ControlPID,Job,UnitFileState,KillMode,SendSIGKILL,Delegate,ExitType,RemainAfterExit,TimeoutStopUSec";
 
+/// The kill mode and stop timeout of the unit that setup publishes, and of
+/// the unit it replaces, which setup still observes so that it can stop that
+/// coordinator (ADR 0141).
+const TEARDOWN: [(&str, &str); 2] = [("mixed", "1min 30s"), ("control-group", "5s")];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct State {
@@ -12,8 +17,9 @@ pub(super) struct State {
     pub enabled: bool,
 }
 
-/// How long setup waits for `systemctl stop` of the coordinator.
-const STOP_WAIT: Duration = Duration::from_secs(10);
+/// How long setup waits for `systemctl stop` of the coordinator, which can
+/// take the unit's whole `TimeoutStopSec=90s` while it drains (ADR 0141).
+const STOP_WAIT: Duration = Duration::from_secs(100);
 
 pub(super) fn run(program: &Path, arguments: &[std::ffi::OsString]) -> Result<Vec<u8>> {
     run_within(program, arguments, Duration::from_secs(10))
@@ -98,12 +104,11 @@ fn parse(bytes: &[u8]) -> Result<State> {
     }
     if fields["LoadState"] != "loaded"
         || fields["FragmentPath"] != SERVICE
-        || fields["KillMode"] != "control-group"
+        || !TEARDOWN.contains(&(fields["KillMode"], fields["TimeoutStopUSec"]))
         || fields["SendSIGKILL"] != "yes"
         || fields["Delegate"] != "no"
         || fields["ExitType"] != "main"
         || fields["RemainAfterExit"] != "no"
-        || fields["TimeoutStopUSec"] != "5s"
         || !fields["Job"].is_empty()
     {
         bail!("privilege service lacks its owned teardown contract");

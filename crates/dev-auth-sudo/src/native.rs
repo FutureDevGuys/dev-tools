@@ -262,6 +262,7 @@ fn route(decision: Decision) -> Result<Route, Refusal> {
         Decision::Native => Ok(Route::Native),
         Decision::Managed => Ok(Route::Managed),
         Decision::Relay => Ok(Route::Relay),
+        Decision::Draining => Err(Refusal::Draining),
         _ => Err(Refusal::Denied),
     }
 }

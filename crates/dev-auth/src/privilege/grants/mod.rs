@@ -47,6 +47,14 @@ pub use output::run_worker as run_output_relay;
 #[cfg(target_os = "linux")]
 pub(crate) use tty_agent::TtyAgent;
 
+/// How long stopped managed work has to end: the fixed grace before SIGKILL
+/// and five seconds of cleanup (ADR 0141). The coordinator waits this long
+/// before it reports a cleanup failure, so its clients wait longer.
+#[cfg(target_os = "linux")]
+pub(crate) const STOP_SETTLE: std::time::Duration =
+    dev_tools_privilege_session::linux::TERMINATION_GRACE
+        .saturating_add(std::time::Duration::from_secs(5));
+
 pub const SYSTEM_SOCKET: &str = "/run/dev-auth-grants/control.sock";
 pub const SYSTEM_POLICY: &str = "/etc/dev-auth/administrator-grants-v1.json";
 

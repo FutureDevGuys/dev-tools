@@ -69,7 +69,7 @@ case ${1:-} in
         chmod 0644 "$fixture/native-setid.log"
         install -d -m 0700 -o "$owner" -g "$group" "$fixture/user"
         "$fixture/dev-auth" setup template administrator-grant-policy >"$fixture/policy.json"
-        if systemd-run --unit="$coordinator" --property=KillMode=control-group --property=SendSIGKILL=yes --property=ExitType=main --property=TimeoutStopSec=5s --property=RuntimeMaxSec=120s --property=Delegate=no "$fixture/dev-auth" grant-daemon --policy "$fixture/policy.json" --runtime "$fixture"; then
+        if systemd-run --unit="$coordinator" --property=KillMode=mixed --property=SendSIGKILL=yes --property=ExitType=main --property=TimeoutStopSec=90s --property=OOMPolicy=continue --property=OOMScoreAdjust=-900 --property=RuntimeMaxSec=120s --property=Delegate=no "$fixture/dev-auth" grant-daemon --policy "$fixture/policy.json" --runtime "$fixture"; then
             for ((attempt=0; attempt<100; attempt++)); do [[ -S "$fixture/control.sock" && -S "$fixture/sudo.sock" ]] && break; sleep 0.1; done
             if [[ -S "$fixture/control.sock" && -S "$fixture/sudo.sock" ]]; then
                 if /usr/bin/setpriv --reuid="$owner" --regid="$group" --init-groups --reset-env /usr/bin/env DEV_AUTH_GRANT_SOCKET="$fixture/control.sock" "$fixture/dev-auth" privilege grant status --format json >"$fixture/status.json" && jq -e '.error_kind == null and .changed == false' "$fixture/status.json"; then coordinator_passed=true; else all_passed=false; fi

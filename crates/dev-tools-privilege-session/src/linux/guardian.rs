@@ -1,5 +1,10 @@
 //! A separately owned kernel-timer process; stopping the coordinator does not
 //! stop this process. The product's service manager owns whole-unit crash cleanup.
+//!
+//! The guardian waits for its boundary's admission gate to close or its hard
+//! deadline to pass. At the deadline it closes the gate itself. It then writes
+//! `cgroup.kill` once the grace has passed since the first of the two, or exits
+//! as soon as the boundary is empty (ADR 0141).
 
 use nix::sys::timerfd::{ClockId, TimerFd, TimerFlags, TimerSetTimeFlags};
 use std::fs::File;
@@ -65,14 +70,18 @@ impl DeadlineGuard {
         deadline: Duration,
         grace: Duration,
     ) -> io::Result<Self> {
-        let _ = (events, grace);
-        if deadline > super::MAX_BOOT_DEADLINE
-            || !cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
-        {
+        let after_deadline = deadline
+            .checked_add(grace)
+            .filter(|kill_at| *kill_at <= super::MAX_BOOT_DEADLINE);
+        let Some(after_deadline) = after_deadline.filter(|_| {
+            !grace.is_zero() && cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        }) else {
             return Err(io::Error::other(
                 "deadline guardian clock or target is unsupported",
             ));
-        }
+        };
+        let after_deadline = timespec(after_deadline);
+        let grace = timespec(grace);
         // SAFETY: sigaction writes one initialized local structure; this is a
         // query only. Automatic reaping cannot provide the required join proof.
         let mut disposition: nix::libc::sigaction = unsafe { std::mem::zeroed() };
@@ -102,6 +111,7 @@ impl DeadlineGuard {
             kill.as_raw_fd() as u32,
             gate.as_raw_fd() as u32,
             timer.as_fd().as_raw_fd() as u32,
+            events.as_raw_fd() as u32,
             ready_write.as_raw_fd() as u32,
         ];
         keep.sort_unstable();
@@ -133,15 +143,20 @@ impl DeadlineGuard {
             )
         };
         if result == 0 {
-            // SAFETY: all four distinct descriptors and the sorted keep list
+            // SAFETY: all five distinct descriptors and the sorted keep list
             // were prepared before clone and remain open in this child's table.
             unsafe {
                 run_child(
-                    kill.as_raw_fd(),
-                    gate.as_raw_fd(),
-                    timer.as_fd().as_raw_fd(),
-                    ready_write.as_raw_fd(),
+                    Held {
+                        kill: kill.as_raw_fd(),
+                        gate: gate.as_raw_fd(),
+                        timer: timer.as_fd().as_raw_fd(),
+                        events: events.as_raw_fd(),
+                        ready: ready_write.as_raw_fd(),
+                    },
                     keep,
+                    after_deadline,
+                    grace,
                 )
             }
         }
@@ -178,6 +193,15 @@ impl DeadlineGuard {
             return Err(error);
         }
         Ok(guard)
+    }
+
+    /// Reap this guardian if it has exited, without waiting for it. A reaped
+    /// guardian reports its outcome as `join` does.
+    pub(super) fn try_join(&mut self) -> io::Result<bool> {
+        if !self.reaped && !self.wait_until(Instant::now())? {
+            return Ok(false);
+        }
+        self.outcome().map(|()| true)
     }
 
     /// Join is bounded and remembers a forced stop, failed status or lost reap.
@@ -337,10 +361,39 @@ impl Drop for SignalMask {
     }
 }
 
+fn timespec(time: Duration) -> nix::libc::timespec {
+    nix::libc::timespec {
+        tv_sec: time.as_secs() as nix::libc::time_t,
+        tv_nsec: time.subsec_nanos() as nix::libc::c_long,
+    }
+}
+
+/// The descriptors a guardian child holds.
+#[derive(Clone, Copy)]
+struct Held {
+    kill: i32,
+    gate: i32,
+    timer: i32,
+    events: i32,
+    ready: i32,
+}
+
 /// Run only in the fork-like clone child while every catchable signal is blocked.
-/// `keep` is sorted, distinct and contains the four live, owned descriptor numbers.
+/// `keep` is sorted, distinct and contains the five live, owned descriptor numbers.
 /// No Rust allocation, locks, destructors, panic path or foreign callback may run.
-unsafe fn run_child(kill: i32, gate: i32, timer: i32, ready: i32, keep: [u32; 4]) -> ! {
+unsafe fn run_child(
+    held: Held,
+    keep: [u32; 5],
+    after_deadline: nix::libc::timespec,
+    grace: nix::libc::timespec,
+) -> ! {
+    let Held {
+        kill,
+        gate,
+        timer,
+        events,
+        ready,
+    } = held;
     let mut first = 0_u32;
     for retained in keep {
         if first < retained {
@@ -383,7 +436,71 @@ unsafe fn run_child(kill: i32, gate: i32, timer: i32, ready: i32, keep: [u32; 4]
     // SAFETY: the initialized native pollfd array stays local; only held gate
     // and absolute CLOCK_BOOTTIME timer descriptors are polled. Signals stay
     // blocked, so inherited process handlers never run in this guardian.
-    let result = unsafe {
+    if unsafe { wait(&mut descriptors) } <= 0 {
+        unsafe { finish_child(kill, gate, false) }
+    }
+    let expired = descriptors[1].revents != 0;
+    if expired && !unsafe { close_gate(gate) } {
+        unsafe { finish_child(kill, gate, false) }
+    }
+    let schedule = nix::libc::itimerspec {
+        it_interval: nix::libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: if expired { after_deadline } else { grace },
+    };
+    // SAFETY: the held timer is re-armed from one initialized local value; a
+    // relative grace starts now, and the deadline's grace is absolute.
+    if unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_timerfd_settime,
+            timer,
+            if expired {
+                nix::libc::TFD_TIMER_ABSTIME
+            } else {
+                0
+            },
+            &schedule as *const nix::libc::itimerspec,
+            std::ptr::null_mut::<nix::libc::itimerspec>(),
+        )
+    } != 0
+    {
+        unsafe { finish_child(kill, gate, false) }
+    }
+    loop {
+        // SAFETY: events is this guardian's own held cgroup.events description.
+        if unsafe { populated(events) } == Some(false) {
+            break;
+        }
+        let mut descriptors = [
+            nix::libc::pollfd {
+                fd: timer,
+                events: nix::libc::POLLIN,
+                revents: 0,
+            },
+            nix::libc::pollfd {
+                fd: events,
+                events: nix::libc::POLLPRI,
+                revents: 0,
+            },
+        ];
+        // SAFETY: as above; a population change notifies cgroup.events with
+        // POLLPRI, so each wake reads the population again.
+        if unsafe { wait(&mut descriptors) } <= 0 {
+            unsafe { finish_child(kill, gate, false) }
+        }
+        if descriptors[0].revents != 0 {
+            break;
+        }
+    }
+    unsafe { finish_child(kill, gate, true) }
+}
+
+/// Wait without a timeout until a polled descriptor is ready.
+unsafe fn wait(descriptors: &mut [nix::libc::pollfd; 2]) -> nix::libc::c_long {
+    // SAFETY: the caller's initialized array stays borrowed for the call.
+    unsafe {
         nix::libc::syscall(
             nix::libc::SYS_ppoll,
             descriptors.as_mut_ptr(),
@@ -392,20 +509,52 @@ unsafe fn run_child(kill: i32, gate: i32, timer: i32, ready: i32, keep: [u32; 4]
             std::ptr::null::<u64>(),
             std::mem::size_of::<u64>(),
         )
+    }
+}
+
+/// Close the admission gate. A saturated eventfd is already closed.
+unsafe fn close_gate(gate: i32) -> bool {
+    let value = 1_u64;
+    // SAFETY: eventfd consumes one initialized native u64 synchronously.
+    let written =
+        unsafe { nix::libc::syscall(nix::libc::SYS_write, gate, &value as *const u64, 8_usize) };
+    written == 8 || (written < 0 && unsafe { *nix::libc::__errno_location() } == nix::libc::EAGAIN)
+}
+
+/// One read of the boundary's population: `Some(false)` once it has no
+/// member, and `None` when the read or its content cannot be used.
+unsafe fn populated(events: i32) -> Option<bool> {
+    let mut bytes = [0_u8; 256];
+    // SAFETY: pread fills only the initialized local buffer.
+    let length = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pread64,
+            events,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            0_i64,
+        )
     };
-    unsafe { finish_child(kill, gate, result > 0) }
+    let text = bytes.get(..usize::try_from(length).ok()?)?;
+    if text.len() == bytes.len() {
+        return None;
+    }
+    let mut population = None;
+    for line in text.split(|byte| *byte == b'\n') {
+        match line {
+            b"populated 0" => population = Some(false),
+            b"populated 1" => population = Some(true),
+            _ => {}
+        }
+    }
+    population
 }
 
 /// Held gate and cgroup.kill belong to exactly one freshly prepared boundary.
 /// This child has no other execution path and must terminate through _exit.
 unsafe fn finish_child(kill: i32, gate: i32, observed: bool) -> ! {
-    let value = 1_u64;
-    // SAFETY: eventfd consumes one initialized native u64 synchronously.
-    let written =
-        unsafe { nix::libc::syscall(nix::libc::SYS_write, gate, &value as *const u64, 8_usize) };
-    // A saturated eventfd is already permanently readable; no holder reads it.
-    let revoked = written == 8
-        || (written < 0 && unsafe { *nix::libc::__errno_location() } == nix::libc::EAGAIN);
+    // SAFETY: the held gate descriptor stays open until _exit.
+    let revoked = unsafe { close_gate(gate) };
     let byte = b'1';
     // SAFETY: pwrite uses the retained cgroup.kill descriptor and one initialized
     // byte, without pathname lookup or access to another grant's kernel domain.

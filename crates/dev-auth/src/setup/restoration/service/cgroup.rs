@@ -44,6 +44,7 @@ pub(super) fn require_maintenance_absence() -> Result<()> {
 }
 
 fn require_maintenance_absence_in(root: &KernelDirectory) -> Result<()> {
+    refuse_running_grant_work(grant_boundary_populations(root)?)?;
     let mut entries = rustix::fs::Dir::read_from(&root.directory)?;
     for (index, entry) in (&mut entries).enumerate() {
         if index >= MAX_ENTRIES {
@@ -65,8 +66,57 @@ fn require_maintenance_absence_in(root: &KernelDirectory) -> Result<()> {
 /// refuses while one runs (ADR 0141). `populations` holds one look at each
 /// boundary inside the coordinator's unit.
 fn refuse_running_grant_work(populations: impl IntoIterator<Item = Result<bool>>) -> Result<()> {
-    let _ = populations;
+    let mut running = 0_usize;
+    for population in populations {
+        if population.context("observe a grant boundary before setup mutation")? {
+            running += 1;
+        }
+    }
+    if running > 0 {
+        bail!(
+            "{running} dev-auth administrator grant(s) run managed work, and setup would end it by restarting dev-auth-grants.service; let the work finish or end it with `dev-auth privilege grant revoke`, then run setup again outside any grant"
+        );
+    }
     Ok(())
+}
+
+/// One look at each boundary inside the grant coordinator's unit, which
+/// holds only grant boundaries. A unit that is absent runs nothing.
+fn grant_boundary_populations(root: &KernelDirectory) -> Result<Vec<Result<bool>>> {
+    const UNIT: &str = "dev-auth-grants.service";
+    let unit = match rustix::fs::openat(
+        &root.directory,
+        UNIT,
+        directory_flags(),
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(unit) => KernelDirectory {
+            directory: unit,
+            path: root.path.join(UNIT),
+        },
+        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("open the grant coordinator's cgroup"),
+    };
+    unit.validate()?;
+    let mut populations = Vec::new();
+    for (index, entry) in rustix::fs::Dir::read_from(&unit.directory)?.enumerate() {
+        if index >= MAX_ENTRIES {
+            bail!("native grant domain inventory exceeds its bound");
+        }
+        let entry = entry?;
+        if entry.file_type() != rustix::fs::FileType::Directory
+            || matches!(entry.file_name().to_bytes(), b"." | b"..")
+        {
+            continue;
+        }
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        populations.push(
+            unit.population(name)
+                .map(|population| population == Some(true)),
+        );
+    }
+    unit.validate()?;
+    Ok(populations)
 }
 
 fn maintenance_unit_name(name: &[u8]) -> Result<bool> {
@@ -127,6 +177,15 @@ impl KernelDirectory {
     }
 
     fn require_empty(&self, name: &OsStr) -> Result<()> {
+        if self.population(name)? == Some(true) {
+            bail!("native product execution domain remains populated");
+        }
+        Ok(())
+    }
+
+    /// One look at whether the child cgroup `name` has any member, including
+    /// its descendants' members. `None` when it is absent.
+    fn population(&self, name: &OsStr) -> Result<Option<bool>> {
         if !matches!(
             Path::new(name).components().collect::<Vec<_>>().as_slice(),
             [std::path::Component::Normal(_)]
@@ -143,14 +202,12 @@ impl KernelDirectory {
             Ok(directory) => directory,
             Err(rustix::io::Errno::NOENT) => {
                 self.validate()?;
-                return Ok(());
+                return Ok(None);
             }
             Err(error) => return Err(error).context("open native unit cgroup"),
         };
         require_kernel_directory(&directory)?;
-        if read_population(&directory)? {
-            bail!("native product execution domain remains populated");
-        }
+        let populated = read_population(&directory)?;
         let held = rustix::fs::fstat(&directory)?;
         let named =
             rustix::fs::statat(&self.directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
@@ -161,7 +218,8 @@ impl KernelDirectory {
         {
             bail!("native unit cgroup changed during observation");
         }
-        self.validate()
+        self.validate()?;
+        Ok(Some(populated))
     }
 }
 

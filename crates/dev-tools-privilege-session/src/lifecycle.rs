@@ -54,7 +54,13 @@ impl LifecycleCore {
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Duration> {
-        (self.state == LeaseState::Active).then(|| self.hard_deadline.min(self.idle_deadline))
+        (self.state == LeaseState::Active).then(|| {
+            if self.attached == 0 {
+                self.hard_deadline.min(self.idle_deadline)
+            } else {
+                self.hard_deadline
+            }
+        })
     }
 
     pub(crate) fn poll(&mut self, now: Duration) -> LeaseState {
@@ -65,7 +71,8 @@ impl LifecycleCore {
                 self.last_observed = now;
                 if now >= self.hard_deadline {
                     self.stop(StopReason::HardExpired);
-                } else if now >= self.idle_deadline {
+                } else if self.attached == 0 && now >= self.idle_deadline {
+                    // A grant with a running job is not idle (ADR 0141).
                     self.stop(StopReason::IdleExpired);
                 }
             }
@@ -128,11 +135,16 @@ impl LifecycleCore {
     }
 
     /// One job under this grant ended at `now`.
-    pub(crate) fn detach(&mut self, _now: Duration) -> Result<(), SessionError> {
+    /// One job under this grant ended at `now`. Once none remains, the idle
+    /// cutoff counts from `now`.
+    pub(crate) fn detach(&mut self, now: Duration) -> Result<(), SessionError> {
         self.attached = self
             .attached
             .checked_sub(1)
             .ok_or(SessionError::InvalidTransition)?;
+        if self.attached == 0 && self.state == LeaseState::Active && now >= self.last_observed {
+            self.touch(now);
+        }
         Ok(())
     }
 

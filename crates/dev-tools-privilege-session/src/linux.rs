@@ -55,7 +55,9 @@ pub struct ExecutionBoundary {
 
 impl ExecutionBoundary {
     pub fn create(parent: &File, name: &str, deadline: Duration) -> io::Result<Self> {
-        if deadline > MAX_BOOT_DEADLINE
+        if deadline
+            .checked_add(TERMINATION_GRACE)
+            .is_none_or(|kill_at| kill_at > MAX_BOOT_DEADLINE)
             || name.is_empty()
             || name.len() > 96
             || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -170,9 +172,23 @@ impl ExecutionBoundary {
         ))
     }
 
-    /// End this boundary's work: close its admission gate, then end its
-    /// members as `Ending` directs. Call again to advance the ending.
+    /// End this boundary's work: close its admission gate, send SIGTERM to
+    /// every member, and write `cgroup.kill` once `TERMINATION_GRACE` has
+    /// passed (ADR 0141). It never waits; call it again to advance the end.
+    /// The deadline guardian kills at the same time if this owner cannot.
     pub fn stop(&mut self) -> io::Result<()> {
+        self.end(true)
+    }
+
+    /// End a boundary whose members all live in nested boundaries that its
+    /// owner stops with it: close the gate and kill what remains once the
+    /// grace passes, but send no signal, so that each member receives one
+    /// SIGTERM, from its own boundary.
+    pub fn stop_enclosing(&mut self) -> io::Result<()> {
+        self.end(false)
+    }
+
+    fn end(&mut self, ask: bool) -> io::Result<()> {
         let gate = self.gate.revoke();
         let step = match boot_time() {
             Ok(now) => self.ending.advance(now, self.deadline, TERMINATION_GRACE),
@@ -182,10 +198,14 @@ impl ExecutionBoundary {
             }
         };
         let ended = match step {
-            Step::Terminate => self.terminate().or_else(|_| {
-                self.ending = Ending::Killed;
-                self.kill()
-            }),
+            // SIGTERM is a request; the kill at the end of the grace is the
+            // guarantee, so a member that the walk misses is still ended.
+            Step::Terminate => {
+                if ask {
+                    let _ = self.terminate();
+                }
+                Ok(())
+            }
             Step::Kill => self.kill(),
             Step::Wait => Ok(()),
         };
@@ -197,26 +217,19 @@ impl ExecutionBoundary {
         gate.and(ended).and(guard)
     }
 
-    /// End a boundary whose members all live in nested boundaries that its
-    /// owner stops with it.
-    pub fn stop_enclosing(&mut self) -> io::Result<()> {
-        self.stop()
-    }
-
     /// Whether this boundary's work has begun to end.
     pub fn stopping(&self) -> bool {
         self.ending != Ending::Running
     }
 
+    /// Reap the deadline guardian once it has exited, without waiting.
     fn settle_guardian(&mut self) -> io::Result<()> {
-        match self.deadline_guard.as_mut() {
-            Some(guard) => {
-                guard.join()?;
+        if let Some(guard) = self.deadline_guard.as_mut() {
+            if guard.try_join()? {
                 self.deadline_guard.take();
-                Ok(())
             }
-            None => Ok(()),
         }
+        Ok(())
     }
 
     /// Ask every member to exit: SIGTERM, then SIGCONT so that a stopped
@@ -280,9 +293,12 @@ impl ExecutionBoundary {
             }
             validate_directory(&directory)?;
             let mut text = String::new();
-            open_control(&directory, "cgroup.procs", OFlags::RDONLY)?
-                .take(65_537)
-                .read_to_string(&mut text)?;
+            match open_control(&directory, "cgroup.procs", OFlags::RDONLY) {
+                Ok(procs) => procs.take(65_537).read_to_string(&mut text)?,
+                // A nested cgroup removed during the walk has no member left.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if text.len() > 65_536 {
                 return Err(invalid());
             }
@@ -296,12 +312,16 @@ impl ExecutionBoundary {
             for entry in std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
-                    directories.push(File::from(rustix::fs::openat(
+                    match rustix::fs::openat(
                         &directory,
                         entry.file_name(),
                         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
-                    )?));
+                    ) {
+                        Ok(nested) => directories.push(File::from(nested)),
+                        Err(rustix::io::Errno::NOENT) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
         }
@@ -319,7 +339,12 @@ impl ExecutionBoundary {
             let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
             let membership = match std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
                 Ok(membership) => membership,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(nix::libc::ESRCH) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(error),
             };
             let within = membership
@@ -348,12 +373,14 @@ impl ExecutionBoundary {
         if self.removed {
             return Ok(());
         }
-        if self.ending == Ending::Running
-            || !self.gate.revoked
-            || self.deadline_guard.is_some()
-            || !self.is_empty()?
-        {
+        if self.ending == Ending::Running || !self.gate.revoked || !self.is_empty()? {
             return Err(denied());
+        }
+        // The guardian of an empty boundary whose gate is closed exits at
+        // once, so this bounded join only proves that it did.
+        if let Some(guard) = self.deadline_guard.as_mut() {
+            guard.join()?;
+            self.deadline_guard.take();
         }
         let current = File::from(rustix::fs::openat(
             &self.parent,
@@ -376,7 +403,13 @@ impl Drop for ExecutionBoundary {
     fn drop(&mut self) {
         // Drop is fail-closed best effort, never the proof used for a successful
         // revocation result. The product also retains service-manager cleanup.
-        let _ = self.stop();
+        // A boundary dropped without a stop gets no grace.
+        let _ = self.gate.revoke();
+        let _ = self.kill();
+        self.ending = Ending::Killed;
+        if let Some(mut guard) = self.deadline_guard.take() {
+            let _ = guard.join();
+        }
         if self.is_empty().unwrap_or(false) {
             let _ = self.remove();
         }
@@ -404,10 +437,26 @@ enum Step {
 
 impl Ending {
     /// The next step at boot time `now` for a boundary whose hard deadline is
-    /// `deadline`.
-    fn advance(&mut self, _now: Duration, _deadline: Duration, _grace: Duration) -> Step {
-        *self = Self::Killed;
-        Step::Kill
+    /// `deadline`. The members are asked to exit when the stop starts, and
+    /// killed once `grace` has passed since the stop or the deadline,
+    /// whichever came first.
+    fn advance(&mut self, now: Duration, deadline: Duration, grace: Duration) -> Step {
+        let kill_at = match *self {
+            Self::Running => now.min(deadline).saturating_add(grace),
+            Self::Terminating { kill_at } => kill_at,
+            Self::Killed => return Step::Kill,
+        };
+        if now >= kill_at {
+            *self = Self::Killed;
+            return Step::Kill;
+        }
+        let started = *self == Self::Running;
+        *self = Self::Terminating { kill_at };
+        if started {
+            Step::Terminate
+        } else {
+            Step::Wait
+        }
     }
 }
 
@@ -495,7 +544,7 @@ fn enter_user_session(session: UserSession) -> io::Result<()> {
     // keyring or descriptor flags, and passes no pointer except a null name.
     unsafe {
         nix::libc::umask(session.umask as nix::libc::mode_t);
-        // A terminal job already leads the session it created for its terminal.
+        // A job already leads the session it created in `enter_job`.
         if nix::libc::getsid(0) != nix::libc::getpid() && nix::libc::setsid() < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -526,18 +575,52 @@ fn enter_user_session(session: UserSession) -> io::Result<()> {
 /// of running a handler inherited from its owner. It uses only
 /// async-signal-safe system calls and allocates nothing.
 fn default_termination_signals() -> io::Result<()> {
+    for signal in [
+        nix::libc::SIGTERM,
+        nix::libc::SIGINT,
+        nix::libc::SIGHUP,
+        nix::libc::SIGQUIT,
+    ] {
+        // SAFETY: the zeroed action is SIG_DFL with an empty mask and no
+        // flags; sigaction only reads it and writes no old action.
+        unsafe {
+            let action: nix::libc::sigaction = std::mem::zeroed();
+            if nix::libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
     Ok(())
 }
 
 /// Give a forked child about to exec a job the process state every job
-/// starts with: a terminal job leads a session that its relayed terminal
-/// controls. It uses only async-signal-safe system calls and allocates nothing.
-fn enter_job(controlling_terminal: bool, _oom_score_adj: &std::ffi::CStr) -> io::Result<()> {
-    // SAFETY: each call changes only this process's own session or terminal
-    // and passes no pointer.
+/// starts with (ADR 0141): `oom_score_adj` as its OOM score adjustment, so it
+/// never inherits the coordinator's protection, and a session and process
+/// group of its own, so a signal to its group never reaches the coordinator.
+/// A terminal job's session is controlled by its relayed terminal. Call it
+/// before entering a caller's mount namespace, whose `/proc` the caller may
+/// have mounted. It uses only async-signal-safe system calls and allocates
+/// nothing.
+fn enter_job(controlling_terminal: bool, oom_score_adj: &std::ffi::CStr) -> io::Result<()> {
+    let value = oom_score_adj.to_bytes();
+    // SAFETY: each call changes only this process's own OOM score, session or
+    // terminal, and passes only the static path and the borrowed value.
     unsafe {
-        if controlling_terminal
-            && (nix::libc::setsid() < 0 || nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) != 0)
+        let descriptor = nix::libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            nix::libc::O_WRONLY | nix::libc::O_CLOEXEC,
+        );
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let written = nix::libc::write(descriptor, value.as_ptr().cast(), value.len());
+        let error = io::Error::last_os_error();
+        nix::libc::close(descriptor);
+        if written != value.len() as isize {
+            return Err(error);
+        }
+        if nix::libc::setsid() < 0
+            || (controlling_terminal && nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) != 0)
         {
             return Err(io::Error::last_os_error());
         }
@@ -667,12 +750,12 @@ impl SpawnPermit {
                 {
                     return Err(denied());
                 }
+                enter_job(context.controlling_terminal, JOB_OOM_SCORE_ADJ)?;
                 if let Some(namespace) = &context.mount_namespace {
                     if nix::libc::setns(namespace.as_raw_fd(), nix::libc::CLONE_NEWNS) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }
-                enter_job(context.controlling_terminal, JOB_OOM_SCORE_ADJ)?;
                 if nix::libc::fchdir(context.working_directory.as_raw_fd()) != 0
                     || nix::libc::setgroups(
                         context.supplementary_groups.len(),

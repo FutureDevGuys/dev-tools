@@ -2,7 +2,9 @@
 //! Explicit root-only acceptance of the shared native mechanism. This harness
 //! grants no caller authority and is not a substitute for product/approval tests.
 
-use dev_tools_privilege_session::linux::{boot_time, ExecutionBoundary, NativeContext};
+use dev_tools_privilege_session::linux::{
+    boot_time, ExecutionBoundary, NativeContext, TERMINATION_GRACE,
+};
 use nix::fcntl::OFlag;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::fs::File;
@@ -288,8 +290,9 @@ fn cgroup_enforcement() {
         .unwrap();
     let expiring_fd = pidfd(expiring.id());
     // No product tick, registry poll, stop call or request actor participates.
-    // The independent native guard must enforce this live process's deadline.
-    let observed_by = Instant::now() + Duration::from_secs(3);
+    // The independent native guard must enforce this live process's deadline,
+    // which it does once the grace after the deadline has passed.
+    let observed_by = Instant::now() + Duration::from_secs(3) + TERMINATION_GRACE;
     while alive(&expiring_fd) {
         assert!(
             Instant::now() < observed_by,
@@ -414,7 +417,7 @@ fn guardian_expires_only_its_domain_while_the_controller_is_stopped() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let expires_by = Instant::now() + Duration::from_secs(10);
+    let expires_by = Instant::now() + Duration::from_secs(10) + TERMINATION_GRACE;
     while alive(&expiring_fd) {
         assert!(
             Instant::now() < expires_by,
@@ -526,7 +529,7 @@ fn native_stopped_controller_child() {
         .unwrap();
     println!("\nREADY {} {}", payload.id(), sentinel.id());
     std::io::stdout().flush().unwrap();
-    let joined_by = Instant::now() + Duration::from_secs(20);
+    let joined_by = Instant::now() + Duration::from_secs(20) + TERMINATION_GRACE;
     loop {
         if let Some(status) = payload.try_wait().unwrap() {
             assert!(!status.success());
