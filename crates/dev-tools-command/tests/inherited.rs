@@ -1032,9 +1032,8 @@ mod linux {
                         // PTY master; querying its slave here fails with ENOTTY.
                         // SAFETY: the driver retains this live PTY master until
                         // the exclusively owned, unreaped case child settles.
-                        let foreground = unsafe {
-                            libc::tcgetpgrp(terminal.as_ref().unwrap().0.as_raw_fd())
-                        };
+                        let foreground =
+                            unsafe { libc::tcgetpgrp(terminal.as_ref().unwrap().0.as_raw_fd()) };
                         assert!(
                             foreground >= 0,
                             "query owned PTY master foreground: {}",
