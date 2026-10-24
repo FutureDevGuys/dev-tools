@@ -1,6 +1,6 @@
 # Standalone receipt-install protocol v1
 
-This optional, finite maintenance adapter is implemented in the unreleased Dev Auth 0.5 candidate. It does not require a sibling product, source checkout, interpreter, Git, registry, network or user-home installation. An independently approved native artifact implements the interface. Dev Auth validates the public protocol and independently admitted executor evidence; it does not select a downstream implementation or execute the installed payload. An optional consumer integration must not become a prerequisite for building, testing, releasing, installing or operating Dev Auth.
+This optional, finite maintenance adapter ships in Dev Auth 0.5.2. It does not require a sibling product, source checkout, interpreter, Git, registry, network or user-home installation. An independently approved native artifact implements the interface. Dev Auth validates the public protocol and independently admitted executor evidence; it does not select a downstream implementation or execute the installed payload. An optional consumer integration must not become a prerequisite for building, testing, releasing, installing or operating Dev Auth.
 
 ## Authority and bootstrap
 
