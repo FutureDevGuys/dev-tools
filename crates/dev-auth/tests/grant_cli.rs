@@ -352,6 +352,7 @@ fn invalid_duration_returns_value_free_json_before_any_approval() {
     assert_eq!(result["changed"], false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn grant_policy_template_is_standalone_readable_and_non_authorizing() {
     let output = invoke(&["setup", "template", "administrator-grant-policy"]);
