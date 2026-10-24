@@ -8,10 +8,11 @@ mod native_text;
 pub mod policy;
 
 pub use cli_spec::{direct_specification, specification, DirectGrantCommand};
-pub use client::control;
+pub use client::{control, run_program};
 pub use model::{
     parse_duration, Authority, ControlRequest, ControlResult, Execution, Failure, Grant,
-    GrantRequest, GrantScope, GrantState, OutputCounts, OutputObservation, RESULT_SCHEMA,
+    GrantRequest, GrantRequirement, GrantScope, GrantState, OutputCounts, OutputObservation,
+    RESULT_SCHEMA,
 };
 
 #[cfg(target_os = "linux")]

@@ -40,7 +40,7 @@ fn nested_grant_help_exposes_the_lifecycle_and_hides_private_entrypoints() {
     assert!(output.status.success(), "{:?}", output);
     let help = String::from_utf8(output.stdout).unwrap();
     for command in [
-        "request", "status", "inspect", "exec", "delegate", "revoke", "leave",
+        "request", "status", "inspect", "exec", "delegate", "revoke", "leave", "run",
     ] {
         assert!(help.contains(command), "missing {command}: {help}");
         let output = invoke(&["privilege", "grant", command, "--help"]);
@@ -73,6 +73,7 @@ fn finite_privilege_help_keeps_its_commands_and_adds_the_grant_namespace() {
         "exec",
         "delegate",
         "leave",
+        "run",
     ] {
         assert!(
             help.lines()
@@ -85,7 +86,7 @@ fn finite_privilege_help_keeps_its_commands_and_adds_the_grant_namespace() {
 #[cfg(target_os = "linux")]
 #[test]
 fn direct_grant_alias_help_uses_the_direct_public_invocation() {
-    for command in ["inspect", "exec", "delegate", "leave"] {
+    for command in ["inspect", "exec", "delegate", "leave", "run"] {
         let output = invoke(&["privilege", command, "--help"]);
         assert!(output.status.success(), "{command}: {output:?}");
         let help = String::from_utf8(output.stdout).unwrap();
@@ -177,6 +178,32 @@ mod alias_grammar {
                 "--format",
                 "json",
             ],
+            vec!["run", "--duration", "2h", "--", "/usr/bin/id", "-u"],
+            vec![
+                "run",
+                "--duration",
+                "2h",
+                "--preserve-env",
+                "SSH_AUTH_SOCK",
+                "--preserve-env",
+                "LANGUAGE",
+                "--",
+                "converge",
+            ],
+            vec![
+                "run",
+                "--duration",
+                "30m",
+                "--authority",
+                "administrator",
+                "--format",
+                "json",
+                "--result-file",
+                "/tmp/result",
+                "--non-interactive",
+                "--",
+                "converge",
+            ],
         ] {
             let nested = specification()
                 .try_get_matches_from(std::iter::once("grant").chain(arguments.iter().copied()))
@@ -243,6 +270,17 @@ mod alias_grammar {
                 "--authority",
                 "administrator",
             ],
+            vec!["run", "--", "/usr/bin/id"],
+            vec!["run", "--duration", "2h"],
+            vec![
+                "run",
+                "--duration",
+                "2h",
+                "--authority",
+                "typed",
+                "--",
+                "/usr/bin/id",
+            ],
         ] {
             let nested = specification()
                 .try_get_matches_from(std::iter::once("grant").chain(arguments.iter().copied()))
@@ -261,6 +299,7 @@ mod alias_grammar {
             ("exec", DirectGrantCommand::Exec),
             ("delegate", DirectGrantCommand::Delegate),
             ("leave", DirectGrantCommand::Leave),
+            ("run", DirectGrantCommand::Run),
         ] {
             assert_eq!(DirectGrantCommand::from_name(OsStr::new(name)), Some(kind));
             assert_eq!(kind.name(), name);
@@ -520,6 +559,44 @@ mod grant_policy_subjects {
         assert_eq!(subject.authorities, [Authority::Administrator]);
         assert_eq!(subject.maximum_duration_seconds, 9_223_286_400);
         assert!(subject.allow_delegation);
+    }
+
+    #[test]
+    fn the_command_scope_is_emitted_only_when_asked_for() {
+        let Some(user) = current_account() else {
+            return;
+        };
+        let scopes = |arguments: &[&str]| {
+            let mut options = vec!["--user", &user, "--maximum-duration", "4h"];
+            options.extend_from_slice(arguments);
+            let output = subject_template(&options);
+            assert!(output.status.success(), "{arguments:?}: {output:?}");
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            serde_json::from_slice::<Policy>(&output.stdout)
+                .unwrap()
+                .validate()
+                .unwrap();
+            document["subjects"][0]["scopes"].clone()
+        };
+        assert_eq!(scopes(&[]), serde_json::json!(["user", "workload"]));
+        assert_eq!(
+            scopes(&["--scope", "command"]),
+            serde_json::json!(["command"])
+        );
+        assert_eq!(
+            scopes(&["--scope", "user", "--scope", "workload", "--scope", "command"]),
+            serde_json::json!(["user", "workload", "command"])
+        );
+        rejected(&[
+            "--user",
+            &user,
+            "--maximum-duration",
+            "4h",
+            "--scope",
+            "command",
+            "--scope",
+            "command",
+        ]);
     }
 
     #[test]
@@ -788,4 +865,221 @@ fn a_private_sudo_relay_never_invokes_native_sudo_when_coordination_is_absent() 
         "native sudo version output would reveal fallback"
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Sudo version"));
+}
+
+#[cfg(target_os = "linux")]
+mod privilege_run {
+    use super::bounded_output;
+    use std::path::Path;
+    use std::process::{Command, Output, Stdio};
+
+    fn run_with_path(path: &Path, arguments: &[&str]) -> Output {
+        let directory = tempfile::tempdir().unwrap();
+        bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_dev-auth"))
+                .args(["privilege", "run"])
+                .args(arguments)
+                .env_clear()
+                .env("PATH", path)
+                .env(
+                    "DEV_AUTH_GRANT_SOCKET",
+                    directory.path().join("missing.sock"),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+    }
+
+    fn json(output: &Output) -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    /// A native ELF program on a private PATH, reached through a symlink as
+    /// many installed commands are.
+    fn native_program_on_path() -> tempfile::TempDir {
+        let bin = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_dev-auth"),
+            bin.path().join("fixture-program"),
+        )
+        .unwrap();
+        bin
+    }
+
+    #[test]
+    fn a_noninteractive_run_needs_approval_and_starts_nothing() {
+        let bin = native_program_on_path();
+        let output = run_with_path(
+            bin.path(),
+            &[
+                "--duration",
+                "2h",
+                "--non-interactive",
+                "--format",
+                "json",
+                "--result-file",
+                "/nonexistent/result.json",
+                "--",
+                "fixture-program",
+                "setup",
+                "template",
+                "administrator-grant-policy",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let result = json(&output);
+        assert_eq!(result["schema"], "dev-auth-administrator-grant-result-v1");
+        assert_eq!(result["operation"], "run");
+        assert_eq!(result["error_kind"], "approval_required");
+        assert_eq!(result["changed"], false);
+        assert!(result.get("grant").is_none_or(serde_json::Value::is_null));
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("subjects"),
+            "the program printed its output, so it ran"
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_coordinator_requires_setup_and_starts_nothing() {
+        let bin = native_program_on_path();
+        let results = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(results.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = results.path().join("result.json");
+        let output = run_with_path(
+            bin.path(),
+            &[
+                "--duration",
+                "2h",
+                "--format",
+                "json",
+                "--result-file",
+                destination.to_str().unwrap(),
+                "--",
+                "fixture-program",
+                "setup",
+                "template",
+                "administrator-grant-policy",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        assert!(output.stdout.is_empty(), "the program ran: {output:?}");
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(destination).unwrap()).unwrap();
+        assert_eq!(result["operation"], "run");
+        assert_eq!(result["error_kind"], "requires_setup");
+        assert_eq!(result["changed"], false);
+    }
+
+    #[test]
+    fn a_script_or_missing_program_is_refused_before_any_connection() {
+        let scripts = tempfile::tempdir().unwrap();
+        let script = scripts.path().join("converge.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = run_with_path(
+            scripts.path(),
+            &[
+                "--duration",
+                "1h",
+                "--format",
+                "json",
+                "--result-file",
+                "/tmp/r",
+                "--",
+                "converge.sh",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(json(&output)["error_kind"], "invalid_request");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("interpreter"),
+            "the refusal names the remedy: {output:?}"
+        );
+        let output = run_with_path(
+            scripts.path(),
+            &[
+                "--duration",
+                "1h",
+                "--non-interactive",
+                "--",
+                "absent-program",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+
+    #[test]
+    fn json_run_results_need_a_separate_destination() {
+        let bin = native_program_on_path();
+        let output = run_with_path(
+            bin.path(),
+            &[
+                "--duration",
+                "1h",
+                "--format",
+                "json",
+                "--",
+                "fixture-program",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(json(&output)["error_kind"], "invalid_request");
+    }
+
+    #[test]
+    fn only_administrator_authority_and_a_valid_duration_are_accepted() {
+        let bin = native_program_on_path();
+        for arguments in [
+            ["--duration", "1h", "--authority", "typed"].as_slice(),
+            &["--duration", "0m"],
+            &["--duration", "forever"],
+            &["--duration", "1h", "--preserve-env", "NAME=value"],
+            &["--duration", "1h", "--preserve-env", ""],
+        ] {
+            let mut arguments = arguments.to_vec();
+            arguments.extend(["--non-interactive", "--", "fixture-program"]);
+            let output = run_with_path(bin.path(), &arguments);
+            assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        }
+    }
+}
+
+#[test]
+fn a_remaining_time_check_without_a_coordinator_reports_value_free_json() {
+    let output = invoke(&[
+        "privilege",
+        "grant",
+        "status",
+        "--require-remaining",
+        "10m",
+        "--scope",
+        "workload",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "status");
+    assert_eq!(result["error_kind"], "requires_setup");
+    assert_eq!(result["changed"], false);
+}
+
+#[test]
+fn a_remaining_time_check_needs_a_positive_duration_before_its_scope() {
+    for arguments in [
+        ["--scope", "user"].as_slice(),
+        &["--require-remaining", "0m"],
+        &["--require-remaining", "10m", "--scope", "host"],
+    ] {
+        let mut command = vec!["privilege", "grant", "status"];
+        command.extend_from_slice(arguments);
+        command.extend(["--format", "json"]);
+        let output = invoke(&command);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error_kind"], "invalid_request");
+    }
 }

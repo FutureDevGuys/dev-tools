@@ -3,7 +3,8 @@ use dev_auth::privilege::grants::policy::{
     Account, ExecutionPlan, ExitPolicy, PlanCommand, PlanPipe, Policy, SubjectPolicy,
 };
 use dev_auth::privilege::grants::{
-    Authority, ControlRequest, Execution, Failure, GrantRequest, GrantScope,
+    Authority, ControlRequest, Execution, Failure, Grant, GrantRequest, GrantRequirement,
+    GrantScope, GrantState,
 };
 use std::time::Duration;
 
@@ -45,7 +46,7 @@ fn every_grant_control_request_rejects_undeclared_authority_fields() {
     };
     for request in [
         ControlRequest::Request { request: request() },
-        ControlRequest::Status,
+        ControlRequest::Status { requirement: None },
         ControlRequest::Inspect { grant: id.clone() },
         ControlRequest::Exec {
             grant: None,
@@ -68,6 +69,13 @@ fn every_grant_control_request_rejects_undeclared_authority_fields() {
         },
         ControlRequest::Revoke { grant: id },
         ControlRequest::Leave,
+        run(execution_fixture()),
+        ControlRequest::Status {
+            requirement: Some(GrantRequirement {
+                remaining_seconds: 600,
+                scope: Some(GrantScope::Command),
+            }),
+        },
     ] {
         let mut value = serde_json::to_value(&request).unwrap();
         let decoded: ControlRequest = serde_json::from_value(value.clone()).unwrap();
@@ -596,4 +604,285 @@ fn ordinary_execution_environments_do_not_expand_to_byte_arrays_on_the_wire() {
     assert_eq!(value["program"], "/usr/bin/true");
     let decoded: dev_auth::privilege::grants::Execution = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded.environment, execution.environment);
+}
+
+fn execution_fixture() -> Execution {
+    Execution {
+        program: "converge".into(),
+        arguments: vec!["--apply".into()],
+        working_directory: "/".into(),
+        environment: vec![],
+        terminal: false,
+    }
+}
+
+fn run(execution: Execution) -> ControlRequest {
+    ControlRequest::Run {
+        authority: Authority::Administrator,
+        duration_seconds: 7200,
+        executable: "/usr/bin/converge".into(),
+        execution,
+    }
+}
+
+fn command_policy(scopes: Vec<GrantScope>) -> Policy {
+    let mut policy = policy();
+    policy.subjects[0].scopes = scopes;
+    policy.subjects[0].maximum_duration_seconds = 4 * 3600;
+    policy
+}
+
+#[test]
+fn policies_without_the_command_scope_deny_privilege_run() {
+    let request = GrantRequest::command(Authority::Administrator, 3600);
+    let template = Policy::template();
+    template.validate().unwrap();
+    assert_eq!(
+        template.approve_limits(&Account::Unix { uid: 1000 }, &request),
+        Err(Failure::AuthorityDenied)
+    );
+    let existing = policy();
+    existing.validate().unwrap();
+    assert_eq!(
+        existing.approve_limits(&Account::Unix { uid: 1000 }, &request),
+        Err(Failure::AuthorityDenied),
+        "a policy written before the command scope grants nothing new"
+    );
+}
+
+#[test]
+fn listing_the_command_scope_permits_privilege_run_within_the_maximum() {
+    let policy = command_policy(vec![GrantScope::User, GrantScope::Command]);
+    policy.validate().unwrap();
+    let limits = policy
+        .approve_limits(
+            &Account::Unix { uid: 1000 },
+            &GrantRequest::command(Authority::Administrator, 3 * 3600),
+        )
+        .unwrap();
+    assert_eq!(limits.hard_timeout(), Duration::from_secs(3 * 3600));
+    assert_eq!(
+        policy.approve_limits(
+            &Account::Unix { uid: 1000 },
+            &GrantRequest::command(Authority::Administrator, 4 * 3600 + 1),
+        ),
+        Err(Failure::AuthorityDenied),
+        "a duration above the maximum is refused before any prompt"
+    );
+    assert_eq!(
+        policy.approve_limits(
+            &Account::Unix { uid: 1001 },
+            &GrantRequest::command(Authority::Administrator, 60),
+        ),
+        Err(Failure::AuthorityDenied)
+    );
+}
+
+#[test]
+fn a_subject_lists_each_of_up_to_three_scopes_once() {
+    command_policy(vec![
+        GrantScope::User,
+        GrantScope::Workload,
+        GrantScope::Command,
+    ])
+    .validate()
+    .unwrap();
+    for scopes in [
+        vec![GrantScope::Command, GrantScope::Command],
+        vec![GrantScope::User, GrantScope::Command, GrantScope::User],
+        vec![],
+    ] {
+        assert_eq!(
+            command_policy(scopes.clone()).validate(),
+            Err(Failure::InvalidRequest),
+            "{scopes:?}"
+        );
+    }
+    let mut value = serde_json::to_value(command_policy(vec![GrantScope::Command])).unwrap();
+    assert_eq!(
+        value["subjects"][0]["scopes"],
+        serde_json::json!(["command"])
+    );
+    value["subjects"][0]["scopes"] = serde_json::json!(["process"]);
+    assert!(serde_json::from_value::<Policy>(value).is_err());
+}
+
+#[test]
+fn a_command_scope_takes_no_idle_cutoff_or_use_budget() {
+    let mut idle = command_policy(vec![GrantScope::User, GrantScope::Command]);
+    idle.subjects[0].idle_timeout_seconds = Some(900);
+    assert_eq!(idle.validate(), Err(Failure::InvalidRequest));
+    let mut uses = command_policy(vec![GrantScope::Command]);
+    uses.subjects[0].maximum_uses = Some(10);
+    assert_eq!(uses.validate(), Err(Failure::InvalidRequest));
+    let mut user_only = command_policy(vec![GrantScope::User]);
+    user_only.subjects[0].idle_timeout_seconds = Some(900);
+    user_only.subjects[0].maximum_uses = Some(10);
+    user_only.validate().unwrap();
+}
+
+#[test]
+fn only_run_can_ask_for_a_command_scope() {
+    let command = GrantRequest {
+        scope: GrantScope::Command,
+        ..request()
+    };
+    for request in [
+        ControlRequest::Request {
+            request: command.clone(),
+        },
+        ControlRequest::Delegate {
+            grant: "0".repeat(32),
+            request: command,
+        },
+    ] {
+        assert_eq!(
+            request.validate(),
+            Err(Failure::InvalidRequest),
+            "{}",
+            request.operation()
+        );
+    }
+    run(execution_fixture()).validate().unwrap();
+}
+
+#[test]
+fn a_run_request_names_an_absolute_program_and_administrator_authority_only() {
+    let ControlRequest::Run {
+        authority,
+        duration_seconds,
+        executable,
+        execution,
+    } = run(execution_fixture())
+    else {
+        unreachable!();
+    };
+    for (authority, duration_seconds, executable, execution) in [
+        (
+            Authority::Typed {
+                operations: vec!["inspect".into()],
+            },
+            duration_seconds,
+            executable.clone(),
+            execution.clone(),
+        ),
+        (authority.clone(), 0, executable.clone(), execution.clone()),
+        (
+            authority.clone(),
+            duration_seconds,
+            "usr/bin/converge".into(),
+            execution.clone(),
+        ),
+        (
+            authority.clone(),
+            duration_seconds,
+            executable.clone(),
+            Execution {
+                working_directory: "relative".into(),
+                ..execution.clone()
+            },
+        ),
+        (
+            authority,
+            duration_seconds,
+            executable,
+            Execution {
+                program: "".into(),
+                ..execution
+            },
+        ),
+    ] {
+        let request = ControlRequest::Run {
+            authority,
+            duration_seconds,
+            executable,
+            execution,
+        };
+        assert_eq!(
+            request.validate(),
+            Err(Failure::InvalidRequest),
+            "{request:?}"
+        );
+    }
+}
+
+fn grant(scope: GrantScope, state: GrantState, remaining_milliseconds: u64) -> Grant {
+    Grant {
+        id: "0123456789abcdef0123456789abcdef".into(),
+        scope,
+        authority: Authority::Administrator,
+        state,
+        duration_seconds: 7200,
+        remaining_milliseconds,
+        idle_seconds: None,
+        remaining_uses: None,
+        stop_reason: None,
+        cleanup_failed: false,
+    }
+}
+
+#[test]
+fn a_requirement_is_met_only_by_an_active_grant_with_enough_time_left() {
+    let requirement = GrantRequirement {
+        remaining_seconds: 600,
+        scope: None,
+    };
+    requirement.validate().unwrap();
+    assert!(requirement.met_by(&grant(GrantScope::User, GrantState::Active, 600_000)));
+    assert!(requirement.met_by(&grant(GrantScope::Command, GrantState::Active, 3_600_000)));
+    assert!(!requirement.met_by(&grant(GrantScope::User, GrantState::Active, 599_999)));
+    for state in [
+        GrantState::Pending,
+        GrantState::Stopping,
+        GrantState::Terminated,
+    ] {
+        assert!(
+            !requirement.met_by(&grant(GrantScope::User, state, 3_600_000)),
+            "{state:?}"
+        );
+    }
+    for invalid in [0, u64::MAX] {
+        assert_eq!(
+            GrantRequirement {
+                remaining_seconds: invalid,
+                scope: None,
+            }
+            .validate(),
+            Err(Failure::InvalidRequest)
+        );
+    }
+}
+
+#[test]
+fn status_documents_name_each_grants_scope_state_and_remaining_time() {
+    let mut result = dev_auth::privilege::grants::ControlResult::success("status", false);
+    result.grants = vec![
+        grant(GrantScope::Command, GrantState::Active, 4_200_000),
+        grant(GrantScope::User, GrantState::Terminated, 0),
+    ];
+    let document = serde_json::to_value(&result).unwrap();
+    assert_eq!(document["schema"], "dev-auth-administrator-grant-result-v1");
+    assert_eq!(document["grants"][0]["scope"], "command");
+    assert_eq!(document["grants"][0]["state"], "active");
+    assert_eq!(document["grants"][0]["remaining_milliseconds"], 4_200_000);
+    assert_eq!(document["grants"][1]["scope"], "user");
+    assert_eq!(document["grants"][1]["state"], "terminated");
+    assert_eq!(document["grants"][1]["remaining_milliseconds"], 0);
+    let mut short = dev_auth::privilege::grants::ControlResult::failure(
+        "status",
+        Failure::InsufficientRemaining,
+        Some(false),
+    );
+    short.grant = Some(grant(GrantScope::Workload, GrantState::Active, 1_000));
+    assert_eq!(short.exit_code(), 3);
+    let document = serde_json::to_value(&short).unwrap();
+    assert_eq!(document["error_kind"], "insufficient_remaining");
+    assert_eq!(document["grant"]["scope"], "workload");
+}
+
+#[test]
+fn logout_ends_user_and_command_grants_but_not_workload_grants() {
+    assert!(GrantScope::User.ends_at_logout());
+    assert!(GrantScope::Command.ends_at_logout());
+    assert!(!GrantScope::Workload.ends_at_logout());
 }

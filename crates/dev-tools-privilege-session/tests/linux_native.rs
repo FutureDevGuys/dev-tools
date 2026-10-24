@@ -51,6 +51,7 @@ fn context(uid: u32) -> NativeContext {
         effective_uid: uid,
         gid: uid,
         supplementary_groups: vec![],
+        user_session: None,
         controlling_terminal: false,
         inherited_files: vec![],
     }

@@ -53,6 +53,42 @@ pub(super) struct Caller {
 }
 
 impl Caller {
+    /// The caller's file-creation mask, from its `/proc` status.
+    pub fn umask(&self) -> Result<u32, Failure> {
+        let status = read_bounded(
+            Path::new(&format!("/proc/{}/status", self.peer.pid)),
+            1024 * 1024,
+        )?;
+        let mask = parse_umask(&status).ok_or(Failure::AuthorityDenied)?;
+        if !self.still_present() {
+            return Err(Failure::AuthorityDenied);
+        }
+        Ok(mask)
+    }
+
+    /// Whether the caller runs under a confinement that a process started for
+    /// it in the host namespaces would leave: no-new-privileges, a seccomp
+    /// filter, or a namespace other than the coordinator's, except the mount
+    /// namespace, which that process joins.
+    pub fn confined(&self) -> Result<bool, Failure> {
+        let status = read_bounded(
+            Path::new(&format!("/proc/{}/status", self.peer.pid)),
+            1024 * 1024,
+        )?;
+        let mut confined = parse_confinement(&status).ok_or(Failure::AuthorityDenied)?;
+        for namespace in ["user", "net", "pid", "ipc", "uts", "cgroup", "time"] {
+            let theirs = File::open(format!("/proc/{}/ns/{namespace}", self.peer.pid))
+                .map_err(|_| Failure::AuthorityDenied)?;
+            let ours = File::open(format!("/proc/self/ns/{namespace}"))
+                .map_err(|_| Failure::NativeUnavailable)?;
+            confined |= !same_file(&theirs, &ours)?;
+        }
+        if !self.still_present() {
+            return Err(Failure::AuthorityDenied);
+        }
+        Ok(confined)
+    }
+
     pub fn groups(&self) -> Result<Vec<u32>, Failure> {
         let status = read_bounded(
             Path::new(&format!("/proc/{}/status", self.peer.pid)),
@@ -250,6 +286,39 @@ impl Caller {
     }
 }
 
+/// `NoNewPrivs` and `Seccomp` from a `/proc` status: `Some(true)` when either
+/// confines the process, `None` when either is missing or repeated.
+fn parse_confinement(status: &[u8]) -> Option<bool> {
+    let field = |name: &[u8]| {
+        let mut values = status
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(name));
+        let value = std::str::from_utf8(values.next()?)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        values.next().is_none().then_some(value)
+    };
+    Some(field(b"NoNewPrivs:")? != 0 || field(b"Seccomp:")? != 0)
+}
+
+fn parse_umask(status: &[u8]) -> Option<u32> {
+    let mut masks = status
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"Umask:"));
+    let mask = std::str::from_utf8(masks.next()?).ok()?.trim();
+    if masks.next().is_some()
+        || mask.is_empty()
+        || !mask.bytes().all(|byte| (b'0'..=b'7').contains(&byte))
+    {
+        return None;
+    }
+    u32::from_str_radix(mask, 8)
+        .ok()
+        .filter(|mask| *mask <= 0o777)
+}
+
 /// Admission needs a positive look that the process is alive.
 pub(super) fn alive(fd: impl AsFd) -> bool {
     readable(fd) == Ok(false)
@@ -307,6 +376,24 @@ fn read_limited(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_new_privileges_or_a_seccomp_filter_confines_a_caller() {
+        let status = |no_new_privs: &str, seccomp: &str| {
+            format!(
+                "Name:\tshell\nUmask:\t0022\nNoNewPrivs:\t{no_new_privs}\nSeccomp:\t{seccomp}\n"
+            )
+        };
+        assert_eq!(parse_confinement(status("0", "0").as_bytes()), Some(false));
+        assert_eq!(parse_confinement(status("1", "0").as_bytes()), Some(true));
+        assert_eq!(parse_confinement(status("0", "2").as_bytes()), Some(true));
+        assert_eq!(parse_confinement(b"Name:\tshell\nSeccomp:\t0\n"), None);
+        assert_eq!(
+            parse_confinement(b"NoNewPrivs:\t0\nNoNewPrivs:\t1\nSeccomp:\t0\n"),
+            None
+        );
+        assert_eq!(parse_umask(status("0", "0").as_bytes()), Some(0o022));
+    }
 
     #[test]
     fn only_an_exited_process_is_gone_from_proc() {

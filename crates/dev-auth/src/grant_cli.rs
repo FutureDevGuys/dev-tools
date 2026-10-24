@@ -1,7 +1,7 @@
 use clap::{Arg, Command};
 use dev_auth::privilege::grants::{
     parse_duration, Authority, ControlRequest, ControlResult, Execution, Failure, GrantRequest,
-    GrantScope,
+    GrantRequirement, GrantScope,
 };
 use std::ffi::OsString;
 use std::io::Write;
@@ -88,8 +88,9 @@ fn subject_policy_template(uid: u32, arguments: &clap::ArgMatches) -> anyhow::Re
         .map(|scope| match scope.as_str() {
             "user" => Ok(GrantScope::User),
             "workload" => Ok(GrantScope::Workload),
+            "command" => Ok(GrantScope::Command),
             _ => Err(anyhow!(
-                "administrator grant scope must be user or workload"
+                "administrator grant scope must be user, workload or command"
             )),
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -126,7 +127,25 @@ fn request(name: &str, arguments: &clap::ArgMatches) -> Result<ControlRequest, F
         "request" => ControlRequest::Request {
             request: grant_request(arguments)?,
         },
-        "status" => ControlRequest::Status,
+        "status" => ControlRequest::Status {
+            requirement: arguments
+                .get_one::<String>("require-remaining")
+                .map(|value| {
+                    Ok::<_, Failure>(GrantRequirement {
+                        remaining_seconds: parse_duration(value)?.as_secs(),
+                        scope: arguments
+                            .get_one::<String>("scope")
+                            .map(|scope| match scope.as_str() {
+                                "user" => Ok(GrantScope::User),
+                                "workload" => Ok(GrantScope::Workload),
+                                "command" => Ok(GrantScope::Command),
+                                _ => Err(Failure::InvalidRequest),
+                            })
+                            .transpose()?,
+                    })
+                })
+                .transpose()?,
+        },
         "inspect" => ControlRequest::Inspect { grant: grant()? },
         "revoke" => ControlRequest::Revoke { grant: grant()? },
         "delegate" => ControlRequest::Delegate {
@@ -180,6 +199,118 @@ fn request(name: &str, arguments: &clap::ArgMatches) -> Result<ControlRequest, F
     Ok(request)
 }
 
+/// The variables a login gives a user's first process. A program that `run`
+/// starts gets these and the ones named with `--preserve-env`, so that its
+/// approval can show every variable it receives.
+const LOGIN_ENVIRONMENT: [&str; 7] = ["PATH", "HOME", "SHELL", "USER", "LOGNAME", "TERM", "LANG"];
+
+fn run_environment<'a>(
+    preserved: impl IntoIterator<Item = &'a str>,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<Vec<(OsString, OsString)>, Failure> {
+    let kept = LOGIN_ENVIRONMENT
+        .into_iter()
+        .chain(preserved)
+        .map(|name| {
+            if name.is_empty() || name.contains('=') {
+                Err(Failure::InvalidRequest)
+            } else {
+                Ok(name)
+            }
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    Ok(environment
+        .into_iter()
+        .filter(|(name, _)| name.to_str().is_some_and(|name| kept.contains(name)))
+        .collect())
+}
+
+/// One `run` request and the program's descriptor, opened as the caller.
+fn run_request(arguments: &clap::ArgMatches) -> Result<(ControlRequest, std::fs::File), Failure> {
+    let duration = parse_duration(
+        arguments
+            .get_one::<String>("duration")
+            .ok_or(Failure::InvalidRequest)?,
+    )?;
+    let authority = match arguments.get_one::<String>("authority").map(String::as_str) {
+        Some("administrator") => Authority::Administrator,
+        _ => return Err(Failure::InvalidRequest),
+    };
+    let mut command = arguments
+        .get_many::<OsString>("command")
+        .ok_or(Failure::InvalidRequest)?
+        .cloned();
+    let program = command.next().ok_or(Failure::InvalidRequest)?;
+    let (executable, file) = native_program(&program)?;
+    let request = ControlRequest::Run {
+        authority,
+        duration_seconds: duration.as_secs(),
+        executable: executable.into_os_string(),
+        execution: Execution {
+            program,
+            arguments: command.collect(),
+            working_directory: std::env::current_dir()
+                .map_err(|_| Failure::InvalidRequest)?
+                .into_os_string(),
+            environment: run_environment(
+                arguments
+                    .get_many::<String>("preserve-env")
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+                std::env::vars_os(),
+            )?,
+            terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        },
+    };
+    request.validate()?;
+    Ok((request, file))
+}
+
+/// Resolve a program as a shell does and open it as the caller. Only a native
+/// ELF program can be approved by its digest and run from its descriptor.
+fn native_program(
+    program: &std::ffi::OsStr,
+) -> Result<(std::path::PathBuf, std::fs::File), Failure> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let candidate = if program.as_bytes().contains(&b'/') {
+        Some(std::path::PathBuf::from(program))
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| {
+                    if directory.as_os_str().is_empty() {
+                        std::path::PathBuf::from(".")
+                    } else {
+                        directory
+                    }
+                    .join(program)
+                })
+                .find(|candidate| {
+                    std::fs::metadata(candidate).is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                })
+        })
+    };
+    let Some(path) = candidate.and_then(|candidate| std::fs::canonicalize(candidate).ok()) else {
+        eprintln!("dev-auth: privilege run could not find the program in PATH");
+        return Err(Failure::InvalidRequest);
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        eprintln!("dev-auth: privilege run needs read access to the program");
+        return Err(Failure::InvalidRequest);
+    };
+    let mut magic = [0_u8; 4];
+    if file.read_exact(&mut magic).is_err() || &magic != b"\x7fELF" {
+        eprintln!("dev-auth: privilege run starts a native program; run a script through its interpreter, such as -- /usr/bin/bash SCRIPT");
+        return Err(Failure::InvalidRequest);
+    }
+    Ok((path, file))
+}
+
 pub(super) fn run(arguments: Vec<OsString>) -> i32 {
     run_with_specification(arguments, specification(), "grant")
 }
@@ -222,11 +353,20 @@ fn run_with_specification(arguments: Vec<OsString>, grammar: Command, name: &str
         );
     };
     let json = arguments.get_one::<String>("format").map(String::as_str) == Some("json");
-    let request = match request(name, arguments) {
-        Ok(request) => request,
+    let prepared = if name == "run" {
+        run_request(arguments).map(|(request, program)| (request, Some(program)))
+    } else {
+        request(name, arguments).map(|request| (request, None))
+    };
+    let (request, program) = match prepared {
+        Ok(prepared) => prepared,
         Err(failure) => return output(ControlResult::failure(name, failure, Some(false)), json),
     };
-    if matches!(request, ControlRequest::Request { .. }) && arguments.get_flag("non-interactive") {
+    if matches!(
+        request,
+        ControlRequest::Request { .. } | ControlRequest::Run { .. }
+    ) && arguments.get_flag("non-interactive")
+    {
         return output(
             ControlResult::failure(name, Failure::ApprovalRequired, Some(false)),
             json,
@@ -234,7 +374,7 @@ fn run_with_specification(arguments: Vec<OsString>, grammar: Command, name: &str
     }
     if matches!(
         request,
-        ControlRequest::Exec { .. } | ControlRequest::RunPlan { .. }
+        ControlRequest::Exec { .. } | ControlRequest::RunPlan { .. } | ControlRequest::Run { .. }
     ) {
         let destination = arguments.get_one::<OsString>("result-file");
         if json && destination.is_none() {
@@ -257,7 +397,10 @@ fn run_with_specification(arguments: Vec<OsString>, grammar: Command, name: &str
                 )
             }
         };
-        let result = dev_auth::privilege::grants::control(request);
+        let result = match &program {
+            Some(program) => dev_auth::privilege::grants::run_program(request, program),
+            None => dev_auth::privilege::grants::control(request),
+        };
         let code = result.exit_code();
         if let Some(destination) = destination {
             if destination.finish_grant(&result).is_err() {
@@ -414,7 +557,11 @@ fn output(result: ControlResult, json: bool) -> i32 {
     } else {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
-        for grant in result.grants.iter().chain(result.grant.iter()) {
+        let covering = result
+            .grant
+            .iter()
+            .filter(|grant| result.grants.iter().all(|listed| listed.id != grant.id));
+        for grant in result.grants.iter().chain(covering) {
             if writeln!(
                 stdout,
                 "{}  {:?}  {:?}  {}s remaining",
@@ -456,6 +603,36 @@ mod tests {
         let policy: Policy = serde_json::from_str(&document).unwrap();
         policy.validate().unwrap();
         Ok(policy)
+    }
+
+    #[test]
+    fn a_run_passes_only_the_login_environment_and_named_variables() {
+        let environment = || {
+            [
+                ("PATH", "/usr/bin"),
+                ("HOME", "/home/account"),
+                ("LD_PRELOAD", "/tmp/x.so"),
+                ("SSH_AUTH_SOCK", "/run/agent"),
+                ("TERM", "xterm"),
+            ]
+            .map(|(name, value)| (name.into(), value.into()))
+        };
+        let names = |kept: Vec<(std::ffi::OsString, std::ffi::OsString)>| {
+            kept.into_iter()
+                .map(|(name, _)| name.into_string().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(super::run_environment([], environment()).unwrap()),
+            ["PATH", "HOME", "TERM"]
+        );
+        assert_eq!(
+            names(super::run_environment(["SSH_AUTH_SOCK"], environment()).unwrap()),
+            ["PATH", "HOME", "SSH_AUTH_SOCK", "TERM"]
+        );
+        for invalid in ["", "A=B"] {
+            assert!(super::run_environment([invalid], environment()).is_err());
+        }
     }
 
     #[test]

@@ -169,6 +169,50 @@ impl Signals {
     }
 }
 
+impl Signals {
+    /// Wait for the coordinator's first answer to an execution that needs
+    /// approval. A signal that would end the caller cancels the request, so
+    /// it never reaches a program that starts after the caller gave up.
+    pub(super) fn wait_for_answer(
+        &self,
+        connection: &impl AsFd,
+        seconds: u32,
+    ) -> Result<(), Failure> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(seconds.into());
+        while std::time::Instant::now() < deadline {
+            let mut descriptors = [
+                PollFd::new(connection.as_fd(), PollFlags::POLLIN),
+                PollFd::new(self.descriptor.as_fd(), PollFlags::POLLIN),
+            ];
+            match poll(&mut descriptors, 100_u16) {
+                Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                Err(_) => return Err(Failure::NativeUnavailable),
+            }
+            let [answer, signal] = descriptors.map(|descriptor| descriptor.revents());
+            if answer.is_some_and(|flags| {
+                flags.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR)
+            }) {
+                return Ok(());
+            }
+            if signal.is_some_and(|flags| flags.contains(PollFlags::POLLIN)) {
+                while let Some(info) = self
+                    .descriptor
+                    .read_signal()
+                    .map_err(|_| Failure::NativeUnavailable)?
+                {
+                    if !matches!(
+                        Signal::try_from(info.ssi_signo as i32),
+                        Ok(Signal::SIGWINCH | Signal::SIGCONT | Signal::SIGTSTP)
+                    ) {
+                        return Err(Failure::Interrupted);
+                    }
+                }
+            }
+        }
+        Err(Failure::NativeUnavailable)
+    }
+}
+
 impl Drop for Signals {
     fn drop(&mut self) {
         let _ = self.previous.thread_set_mask();

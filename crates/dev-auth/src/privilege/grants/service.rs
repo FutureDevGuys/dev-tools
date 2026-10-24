@@ -2,7 +2,8 @@ use super::model::{Envelope, FRAME_LIMIT, WIRE_SCHEMA};
 use super::native::{self, Caller, Look, Unobserved};
 use super::policy::{Account, NativeScope, Policy};
 use super::{
-    Authority, ControlRequest, ControlResult, Failure, Grant, GrantRequest, GrantScope, GrantState,
+    Authority, ControlRequest, ControlResult, Failure, Grant, GrantRequest, GrantRequirement,
+    GrantScope, GrantState,
 };
 use dev_tools_privilege_session::linux::{boot_time, ExecutionBoundary};
 use dev_tools_privilege_session::Constraint;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 
+mod command;
 mod sudo_bridge;
 
 const MAX_GRANTS: usize = 128;
@@ -191,6 +193,9 @@ struct State {
     selected: BTreeMap<NativeScope, GrantId>,
     jobs: BTreeMap<GrantId, Job>,
     pending_relays: BTreeMap<u32, PendingRelay>,
+    /// The pidfd of each command-scoped grant's program, whose exit ends that
+    /// grant (ADR 0139).
+    commands: BTreeMap<GrantId, OwnedFd>,
     phase: Phase,
     unseen: Unseen,
 }
@@ -373,6 +378,7 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
             selected: BTreeMap::new(),
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
+            commands: BTreeMap::new(),
             phase: Phase::Serving,
             unseen: Unseen::default(),
         }),
@@ -587,6 +593,7 @@ fn request_descriptors_valid(request: &ControlRequest, count: usize) -> bool {
         ControlRequest::ActivateLaunch {
             bootstrap: false, ..
         } => count == 0,
+        ControlRequest::Run { .. } => count == 5,
         _ if request.execution_terminal().is_some() => count == 4,
         _ => count == 0,
     }
@@ -636,8 +643,30 @@ async fn dispatch(
         ControlRequest::CommitLaunch { grant } => {
             commit_launch(service, &caller, &grant, &mut progress).await
         }
-        ControlRequest::Status => observe(service, &caller, None).await,
-        ControlRequest::Inspect { grant } => observe(service, &caller, Some(&grant)).await,
+        ControlRequest::Run {
+            authority,
+            duration_seconds,
+            executable,
+            execution,
+        } => {
+            command::run(
+                service,
+                &caller,
+                command::Requested {
+                    request: GrantRequest::command(authority, duration_seconds),
+                    executable,
+                    execution,
+                },
+                streams,
+                connection,
+                &mut progress,
+            )
+            .await
+        }
+        ControlRequest::Status { requirement } => {
+            observe(service, &caller, None, requirement).await
+        }
+        ControlRequest::Inspect { grant } => observe(service, &caller, Some(&grant), None).await,
         ControlRequest::Revoke { grant } => {
             revoke(service, &caller, Some(&grant), false, &mut progress).await
         }
@@ -696,25 +725,41 @@ async fn normalize_execution_scope(service: &Service, caller: &mut Caller) -> Re
     let state = service.state.lock().await;
     let directory =
         File::open(&caller.peer.unified_cgroup).map_err(|_| Failure::AuthorityDenied)?;
-    for job in state.jobs.values() {
-        if native::same_file(&directory, job.boundary.directory())? {
-            if job.origin.account != caller.scope.account {
-                return Err(Failure::AuthorityDenied);
-            }
-            caller.scope = job.origin.clone();
-            caller.workload = state
-                .metadata
-                .get(&job.grant)
-                .ok_or(Failure::NoGrant)?
-                .workload
-                .as_ref()
-                .map(File::try_clone)
-                .transpose()
-                .map_err(|_| Failure::NativeUnavailable)?;
-            break;
+    let boundaries = state
+        .jobs
+        .iter()
+        .map(|(id, job)| (*id, job.boundary.directory()));
+    if let Some(job) = job_in_cgroup(boundaries, &directory)?.and_then(|id| state.jobs.get(&id)) {
+        if job.origin.account != caller.scope.account {
+            return Err(Failure::AuthorityDenied);
         }
+        caller.scope = job.origin.clone();
+        caller.workload = state
+            .metadata
+            .get(&job.grant)
+            .ok_or(Failure::NoGrant)?
+            .workload
+            .as_ref()
+            .map(File::try_clone)
+            .transpose()
+            .map_err(|_| Failure::NativeUnavailable)?;
     }
     Ok(())
+}
+
+/// The job whose boundary is exactly the caller's cgroup. The kernel identity
+/// of the cgroup directory is the only selector; a path, PID or grant ID that
+/// a caller names never selects a job.
+fn job_in_cgroup<'a>(
+    boundaries: impl IntoIterator<Item = (GrantId, &'a File)>,
+    cgroup: &File,
+) -> Result<Option<GrantId>, Failure> {
+    for (id, boundary) in boundaries {
+        if native::same_file(cgroup, boundary)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// Observation failure cannot erase an already established grant, use charge,
@@ -785,7 +830,8 @@ async fn issue(
             account: scope.account.clone(),
         }
     };
-    let approval = super::approval::approve(caller, &request, &format!("{id:032x}"), control).await;
+    let approval =
+        super::approval::approve(caller, &request, &format!("{id:032x}"), control, None).await;
     let mut state = service.state.lock().await;
     drop(pending);
     approval?;
@@ -1201,6 +1247,7 @@ async fn observe(
     service: &Service,
     caller: &Caller,
     selected: Option<&str>,
+    requirement: Option<GrantRequirement>,
 ) -> Result<ControlResult, Failure> {
     let mut state = service.state.lock().await;
     let now = now()?;
@@ -1224,6 +1271,24 @@ async fn observe(
             .filter(|grant| grant.scope.account == caller.scope.account)
         {
             response.grants.push(snapshot(&state, grant.id, now)?);
+        }
+    }
+    if let Some(requirement) = requirement {
+        let scope_of = |id: GrantId| {
+            state
+                .metadata
+                .get(&id)
+                .map(|metadata| metadata.request.scope)
+        };
+        match covering(&state, &caller.scope, requirement.scope, scope_of) {
+            Ok(id) => {
+                let grant = snapshot(&state, id, now)?;
+                if !requirement.met_by(&grant) {
+                    response.error_kind = Some(Failure::InsufficientRemaining);
+                }
+                response.grant = Some(grant);
+            }
+            Err(failure) => response.error_kind = Some(failure),
         }
     }
     Ok(response)
@@ -1563,6 +1628,7 @@ async fn execute(
                     .map(nix::unistd::Gid::as_raw)
                     .collect()
             },
+            user_session: None,
             controlling_terminal: terminal,
             inherited_files,
         };
@@ -1637,34 +1703,7 @@ async fn execute(
             captured_relay,
         )
     };
-    let started = super::execution_io::Started {
-        schema: super::execution_io::START_SCHEMA.to_owned(),
-        hard_deadline_milliseconds: u64::try_from(hard_deadline.as_millis())
-            .map_err(|_| Failure::InvalidRequest)?,
-        terminal,
-    };
-    let sent = (|| {
-        let bytes = serde_json::to_vec(&started).map_err(|_| Failure::RuntimeFailure)?;
-        let descriptors: Vec<_> = master.iter().map(AsRawFd::as_raw_fd).collect();
-        let controls = if descriptors.is_empty() {
-            Vec::new()
-        } else {
-            vec![socket::ControlMessage::ScmRights(&descriptors)]
-        };
-        let count = socket::sendmsg::<UnixAddr>(
-            connection.as_raw_fd(),
-            &[std::io::IoSlice::new(&bytes)],
-            &controls,
-            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
-            None,
-        )
-        .map_err(|_| Failure::RuntimeFailure)?;
-        if count != bytes.len() {
-            return Err(Failure::ProtocolViolation);
-        }
-        Ok(())
-    })();
-    drop(master);
+    let sent = send_started(connection, hard_deadline, terminal, master);
     if let Err(failure) = sent {
         let mut state = service.state.lock().await;
         if let Some(job) = state.jobs.get_mut(&job_id) {
@@ -1757,77 +1796,16 @@ async fn execute(
         }
     };
     drop(setup_lease);
-    let mut unseen = Unseen::default();
-    let status = loop {
-        if self::now()? >= hard_deadline {
-            let mut state = service.state.lock().await;
-            state
-                .registry
-                .stop(grant_id, StopReason::HardExpired, self::now()?)
-                .map_err(session_failure)?;
-            if let Some(metadata) = state.metadata.get_mut(&grant_id) {
-                let _ = metadata.boundary.stop();
-            }
-        }
-        let presence = caller.presence();
-        unseen.note(Subject::Client(job_id), &presence);
-        if client_left(presence, native::readable(connection)) {
-            let mut state = service.state.lock().await;
-            if let Some(job) = state.jobs.get_mut(&job_id) {
-                let _ = job.boundary.stop();
-            }
-        }
-        match super::execution_io::receive_signal(&events) {
-            Ok(Some(signal)) => {
-                let mut state = service.state.lock().await;
-                if let Some(job) = state.jobs.get_mut(&job_id) {
-                    if job.boundary.signal(signal).is_err() {
-                        let _ = job.boundary.stop();
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(_) => {
-                let mut state = service.state.lock().await;
-                if let Some(job) = state.jobs.get_mut(&job_id) {
-                    let _ = job.boundary.stop();
-                }
-            }
-        }
-        // This task is the sole waiter for its directly spawned child. An
-        // unreaped child PID cannot be reused; stop/continue notifications are
-        // consumed here and final waitpid status is the join witness.
-        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-        match waitpid(
-            nix::unistd::Pid::from_raw(child.id() as i32),
-            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
-        ) {
-            Ok(WaitStatus::Exited(_, code)) => break std::process::ExitStatus::from_raw(code << 8),
-            Ok(WaitStatus::Signaled(_, signal, core)) => {
-                break std::process::ExitStatus::from_raw(
-                    signal as i32 | if core { 0x80 } else { 0 },
-                )
-            }
-            Ok(WaitStatus::Stopped(_, signal)) => {
-                if super::execution_io::report_stopped(&events, signal).is_err() {
-                    let mut state = service.state.lock().await;
-                    if let Some(job) = state.jobs.get_mut(&job_id) {
-                        let _ = job.boundary.stop();
-                    }
-                }
-            }
-            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
-            Err(_) => {
-                let mut state = service.state.lock().await;
-                if let Some(job) = state.jobs.get_mut(&job_id) {
-                    job.leader_done = true;
-                    let _ = job.boundary.stop();
-                }
-                return Err(Failure::RuntimeFailure);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let status = wait_leader(
+        service,
+        caller,
+        connection,
+        &events,
+        (job_id, grant_id),
+        hard_deadline,
+        &child,
+    )
+    .await?;
     {
         let mut state = service.state.lock().await;
         if let Some(job) = state.jobs.get_mut(&job_id) {
@@ -1868,6 +1846,127 @@ async fn execute(
         .map(|_| snapshot(&state, grant_id, self::now()?))
         .transpose()?;
     Ok(response)
+}
+
+/// Tell the client that its execution starts, handing it the terminal relay's
+/// master end when there is one.
+fn send_started(
+    connection: &OwnedFd,
+    hard_deadline: Duration,
+    terminal: bool,
+    master: Option<OwnedFd>,
+) -> Result<(), Failure> {
+    let started = super::execution_io::Started {
+        schema: super::execution_io::START_SCHEMA.to_owned(),
+        hard_deadline_milliseconds: u64::try_from(hard_deadline.as_millis())
+            .map_err(|_| Failure::InvalidRequest)?,
+        terminal,
+    };
+    let bytes = serde_json::to_vec(&started).map_err(|_| Failure::RuntimeFailure)?;
+    let descriptors: Vec<_> = master.iter().map(AsRawFd::as_raw_fd).collect();
+    let controls = if descriptors.is_empty() {
+        Vec::new()
+    } else {
+        vec![socket::ControlMessage::ScmRights(&descriptors)]
+    };
+    let count = socket::sendmsg::<UnixAddr>(
+        connection.as_raw_fd(),
+        &[std::io::IoSlice::new(&bytes)],
+        &controls,
+        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+        None,
+    )
+    .map_err(|_| Failure::RuntimeFailure)?;
+    if count != bytes.len() {
+        return Err(Failure::ProtocolViolation);
+    }
+    Ok(())
+}
+
+/// Wait for one directly spawned job leader to exit while relaying the
+/// client's signals and the leader's job-control stops.
+async fn wait_leader(
+    service: &Service,
+    caller: &Caller,
+    connection: &OwnedFd,
+    events: &OwnedFd,
+    (job_id, grant_id): (GrantId, GrantId),
+    hard_deadline: Duration,
+    child: &std::process::Child,
+) -> Result<std::process::ExitStatus, Failure> {
+    let mut unseen = Unseen::default();
+    loop {
+        if self::now()? >= hard_deadline {
+            let mut state = service.state.lock().await;
+            state
+                .registry
+                .stop(grant_id, StopReason::HardExpired, self::now()?)
+                .map_err(session_failure)?;
+            if let Some(metadata) = state.metadata.get_mut(&grant_id) {
+                let _ = metadata.boundary.stop();
+            }
+        }
+        let presence = caller.presence();
+        unseen.note(Subject::Client(job_id), &presence);
+        if client_left(presence, native::readable(connection)) {
+            let mut state = service.state.lock().await;
+            if let Some(job) = state.jobs.get_mut(&job_id) {
+                let _ = job.boundary.stop();
+            }
+        }
+        match super::execution_io::receive_signal(events) {
+            Ok(Some(signal)) => {
+                let mut state = service.state.lock().await;
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    if job.boundary.signal(signal).is_err() {
+                        let _ = job.boundary.stop();
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let mut state = service.state.lock().await;
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    let _ = job.boundary.stop();
+                }
+            }
+        }
+        // This task is the sole waiter for its directly spawned child. An
+        // unreaped child PID cannot be reused; stop/continue notifications are
+        // consumed here and final waitpid status is the join witness.
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        match waitpid(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
+        ) {
+            Ok(WaitStatus::Exited(_, code)) => {
+                return Ok(std::process::ExitStatus::from_raw(code << 8))
+            }
+            Ok(WaitStatus::Signaled(_, signal, core)) => {
+                return Ok(std::process::ExitStatus::from_raw(
+                    signal as i32 | if core { 0x80 } else { 0 },
+                ))
+            }
+            Ok(WaitStatus::Stopped(_, signal)) => {
+                if super::execution_io::report_stopped(events, signal).is_err() {
+                    let mut state = service.state.lock().await;
+                    if let Some(job) = state.jobs.get_mut(&job_id) {
+                        let _ = job.boundary.stop();
+                    }
+                }
+            }
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(_) => {
+                let mut state = service.state.lock().await;
+                if let Some(job) = state.jobs.get_mut(&job_id) {
+                    job.leader_done = true;
+                    let _ = job.boundary.stop();
+                }
+                return Err(Failure::RuntimeFailure);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2265,6 +2364,7 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
                 .map_err(|_| Integrity::RecordsDisagree(id))?;
         }
     }
+    command::end_exited(&mut state, now)?;
     sweep_abandoned_launches_locked(service, &mut state, now)?;
     state.registry.poll(now);
     withdraw_ended_routing(&service.runtime, &mut state);
@@ -2400,6 +2500,7 @@ async fn reap(service: &Service) -> Result<(), Integrity> {
     for (_, id) in retired {
         if !state.jobs.values().any(|job| job.grant == id) && state.registry.retire(id).is_ok() {
             state.metadata.remove(&id);
+            state.commands.remove(&id);
         }
     }
     let State {
@@ -2421,7 +2522,7 @@ async fn check_logins(service: &Service) {
         .await
         .metadata
         .values()
-        .filter(|metadata| metadata.scope.workload.is_none())
+        .filter(|metadata| metadata.request.scope.ends_at_logout())
         .map(|metadata| metadata.scope.account.clone())
         .collect();
     for account in accounts {
@@ -2445,7 +2546,7 @@ async fn check_logins(service: &Service) {
                 .metadata
                 .iter()
                 .filter(|(_, metadata)| {
-                    metadata.scope.account == account && metadata.scope.workload.is_none()
+                    metadata.scope.account == account && metadata.request.scope.ends_at_logout()
                 })
                 .map(|(id, _)| *id)
                 .collect();
@@ -2471,7 +2572,9 @@ fn requested_scope(caller: &Caller, scope: GrantScope) -> Result<NativeScope, Fa
             account: caller.scope.account.clone(),
             workload: None,
         }),
-        GrantScope::Workload if caller.scope.workload.is_some() => Ok(caller.scope.clone()),
+        // A caller in a command grant's boundary has a keyed scope but no
+        // workload; a workload grant cannot relabel that boundary.
+        GrantScope::Workload if caller.workload.is_some() => Ok(caller.scope.clone()),
         _ => Err(Failure::AuthorityDenied),
     }
 }
@@ -2494,23 +2597,54 @@ fn select(state: &State, scope: &NativeScope, requested: Option<&str>) -> Result
     let id = if let Some(requested) = requested {
         parse_id(requested)?
     } else {
-        [
-            scope.clone(),
-            NativeScope {
-                account: scope.account.clone(),
-                workload: None,
-            },
-        ]
-        .iter()
-        .find_map(|candidate| {
-            state
-                .selected
-                .get(candidate)
-                .copied()
-                .filter(|id| routes(&state.registry, *id))
-        })
-        .ok_or(Failure::NoGrant)?
+        routing_candidates(scope)
+            .iter()
+            .find_map(|candidate| routed(state, candidate))
+            .ok_or(Failure::NoGrant)?
     };
+    usable(state, id)
+}
+
+/// The grant a remaining-time requirement checks: the one `select` routes for
+/// this caller now, or with a scope, the caller's routable grant of that
+/// scope (ADR 0139).
+fn covering(
+    state: &State,
+    scope: &NativeScope,
+    kind: Option<GrantScope>,
+    scope_of: impl Fn(GrantId) -> Option<GrantScope>,
+) -> Result<GrantId, Failure> {
+    let id = routing_candidates(scope)
+        .iter()
+        .filter_map(|candidate| routed(state, candidate))
+        .find(|id| kind.is_none_or(|kind| scope_of(*id) == Some(kind)))
+        .ok_or(Failure::NoGrant)?;
+    usable(state, id)
+}
+
+/// The scopes whose selected grant routes a caller, in order: the caller's
+/// own boundary, then its account (ADR 0136).
+fn routing_candidates(scope: &NativeScope) -> [NativeScope; 2] {
+    [
+        scope.clone(),
+        NativeScope {
+            account: scope.account.clone(),
+            workload: None,
+        },
+    ]
+}
+
+fn routed(state: &State, candidate: &NativeScope) -> Option<GrantId> {
+    state
+        .selected
+        .get(candidate)
+        .copied()
+        .filter(|id| routes(&state.registry, *id))
+}
+
+/// A grant whose own or an ancestor's pending launch owner is unavailable
+/// admits nothing.
+fn usable(state: &State, id: GrantId) -> Result<GrantId, Failure> {
     let mut ancestor = Some(id);
     for _ in 0..=16 {
         let Some(current) = ancestor else {
@@ -2772,11 +2906,12 @@ fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
 /// the coordinator bound at startup. Observing and ending grants never does.
 fn admits_new_work(request: &ControlRequest) -> bool {
     match request {
-        ControlRequest::Status
+        ControlRequest::Status { .. }
         | ControlRequest::Inspect { .. }
         | ControlRequest::Revoke { .. }
         | ControlRequest::Leave => false,
         ControlRequest::Request { .. }
+        | ControlRequest::Run { .. }
         | ControlRequest::LaunchRequest { .. }
         | ControlRequest::ActivateLaunch { .. }
         | ControlRequest::CommitLaunch { .. }
@@ -3464,7 +3599,29 @@ mod tests {
                 );
             }
         }
-        assert!(!request_descriptors_valid(&ControlRequest::Status, 2));
+        assert!(!request_descriptors_valid(
+            &ControlRequest::Status { requirement: None },
+            2
+        ));
+        let run = ControlRequest::Run {
+            authority: Authority::Administrator,
+            duration_seconds: 60,
+            executable: "/program".into(),
+            execution: super::super::Execution {
+                program: "program".into(),
+                arguments: vec![],
+                working_directory: "/".into(),
+                environment: vec![],
+                terminal: false,
+            },
+        };
+        for count in 0..=6 {
+            assert_eq!(
+                request_descriptors_valid(&run, count),
+                count == 5,
+                "a run carries its streams, its signal channel and its program"
+            );
+        }
     }
 
     #[test]
@@ -3666,6 +3823,7 @@ mod tests {
             selected,
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
+            commands: BTreeMap::new(),
             phase: Phase::Serving,
             unseen: Unseen::default(),
         }
@@ -3984,7 +4142,7 @@ mod tests {
     fn ending_and_observing_grants_never_wait_for_trust() {
         let grant = "0123456789abcdef0123456789abcdef".to_owned();
         for request in [
-            ControlRequest::Status,
+            ControlRequest::Status { requirement: None },
             ControlRequest::Inspect {
                 grant: grant.clone(),
             },
@@ -3995,7 +4153,25 @@ mod tests {
         ] {
             assert!(!admits_new_work(&request), "{}", request.operation());
         }
+        assert!(!admits_new_work(&ControlRequest::Status {
+            requirement: Some(GrantRequirement {
+                remaining_seconds: 60,
+                scope: None,
+            }),
+        }));
         for request in [
+            ControlRequest::Run {
+                authority: Authority::Administrator,
+                duration_seconds: 60,
+                executable: "/program".into(),
+                execution: super::super::Execution {
+                    program: "program".into(),
+                    arguments: vec![],
+                    working_directory: "/".into(),
+                    environment: vec![],
+                    terminal: false,
+                },
+            },
             ControlRequest::CommitLaunch {
                 grant: grant.clone(),
             },
@@ -4155,5 +4331,169 @@ mod tests {
                 "an unanswered login query ended user grants: {failure:?}"
             );
         }
+    }
+
+    /// A forked child whose exit the test controls. It runs no program.
+    struct Leader {
+        pid: nix::unistd::Pid,
+        reaped: bool,
+    }
+
+    impl Leader {
+        fn start() -> Self {
+            // SAFETY: the child calls only async-signal-safe pause and never
+            // returns into the test harness.
+            match unsafe { nix::unistd::fork() }.unwrap() {
+                nix::unistd::ForkResult::Child => loop {
+                    unsafe { nix::libc::pause() };
+                },
+                nix::unistd::ForkResult::Parent { child } => Self {
+                    pid: child,
+                    reaped: false,
+                },
+            }
+        }
+
+        fn pidfd(&self) -> OwnedFd {
+            rustix::process::pidfd_open(
+                rustix::process::Pid::from_raw(self.pid.as_raw()).unwrap(),
+                rustix::process::PidfdFlags::empty(),
+            )
+            .unwrap()
+        }
+
+        fn exit(&mut self) {
+            nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+            nix::sys::wait::waitpid(self.pid, None).unwrap();
+            self.reaped = true;
+        }
+    }
+
+    impl Drop for Leader {
+        fn drop(&mut self) {
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(self.pid, None);
+            }
+        }
+    }
+
+    fn command_scope(uid: u32, boundary: &File) -> NativeScope {
+        NativeScope {
+            account: Account::Unix { uid },
+            workload: Some(command::cgroup_key(boundary).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_command_grant_ends_when_its_program_exits() {
+        let boundary = tempfile::tempdir().unwrap();
+        let scope = command_scope(1000, &File::open(boundary.path()).unwrap());
+        let mut state = routing_state(&[(1, scope.clone())]);
+        let mut leader = Leader::start();
+        state.commands.insert(1, leader.pidfd());
+        assert!(command::end_exited(&mut state, Duration::from_secs(1)).is_ok());
+        assert!(active(&state, 1), "the grant lasts while its program runs");
+        assert_eq!(select(&state, &scope, None), Ok(1));
+        leader.exit();
+        assert!(command::end_exited(&mut state, Duration::from_secs(2)).is_ok());
+        assert_eq!(
+            state.registry.get(1).unwrap().lifetime.state(),
+            LeaseState::Stopping {
+                reason: StopReason::WorkloadEnded,
+                cleanup_failed: false
+            }
+        );
+        assert_eq!(select(&state, &scope, None), Err(Failure::NoGrant));
+        assert!(command::end_exited(&mut state, Duration::from_secs(3)).is_ok());
+    }
+
+    #[test]
+    fn only_the_programs_own_boundary_routes_through_its_grant() {
+        // Directory identity stands in for the kernel cgroup identity that the
+        // coordinator reads from a sudo process's peer evidence.
+        let program_boundary = tempfile::tempdir().unwrap();
+        let sibling_cgroup = tempfile::tempdir().unwrap();
+        let boundary = File::open(program_boundary.path()).unwrap();
+        let run = command_scope(1000, &boundary);
+        let account = user_scope(1000);
+        let mut state = routing_state(&[(1, run.clone())]);
+        let jobs = || [(7, &boundary)];
+
+        let member = File::open(program_boundary.path()).unwrap();
+        assert_eq!(job_in_cgroup(jobs(), &member), Ok(Some(7)));
+        assert_eq!(
+            select(&state, &run, None),
+            Ok(1),
+            "the tree routes through its grant"
+        );
+
+        let sibling = File::open(sibling_cgroup.path()).unwrap();
+        assert_eq!(
+            job_in_cgroup(jobs(), &sibling),
+            Ok(None),
+            "a sibling keeps its own scope"
+        );
+        assert_eq!(
+            select(&state, &account, None),
+            Err(Failure::NoGrant),
+            "a sibling process of the same account is not routed"
+        );
+        assert!(
+            state
+                .registry
+                .admit(
+                    1,
+                    &account,
+                    &Authority::Administrator,
+                    Duration::from_secs(1)
+                )
+                .is_err(),
+            "naming the grant does not widen it to a sibling"
+        );
+        assert!(state
+            .registry
+            .admit(1, &run, &Authority::Administrator, Duration::from_secs(1))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_remaining_time_requirement_checks_the_grant_that_covers_the_caller() {
+        let boundary = tempfile::tempdir().unwrap();
+        let run = command_scope(1000, &File::open(boundary.path()).unwrap());
+        let account = user_scope(1000);
+        let state = routing_state(&[(1, account.clone()), (2, run.clone())]);
+        let scopes = BTreeMap::from([(1, GrantScope::User), (2, GrantScope::Command)]);
+        let scope_of = |id| scopes.get(&id).copied();
+        assert_eq!(
+            covering(&state, &run, None, scope_of),
+            Ok(2),
+            "inside the tree, sudo routes through the command grant"
+        );
+        assert_eq!(covering(&state, &account, None, scope_of), Ok(1));
+        assert_eq!(
+            covering(&state, &run, Some(GrantScope::User), scope_of),
+            Ok(1),
+            "a scope selects the caller's routable grant of that scope"
+        );
+        assert_eq!(
+            covering(&state, &account, Some(GrantScope::Command), scope_of),
+            Err(Failure::NoGrant),
+            "outside the tree no command grant covers the caller"
+        );
+        assert_eq!(
+            covering(&state, &user_scope(1001), None, scope_of),
+            Err(Failure::NoGrant)
+        );
+        let mut ended = state;
+        ended
+            .registry
+            .stop(2, StopReason::WorkloadEnded, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            covering(&ended, &run, Some(GrantScope::Command), scope_of),
+            Err(Failure::NoGrant),
+            "an ended grant covers nothing"
+        );
     }
 }

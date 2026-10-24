@@ -212,10 +212,18 @@ impl Policy {
             subject.account.validate()?;
             if !accounts.insert(&subject.account)
                 || subject.scopes.is_empty()
-                || subject.scopes.len() > 2
-                || (subject.scopes.len() == 2 && subject.scopes[0] == subject.scopes[1])
+                || subject.scopes.len() > 3
+                || subject
+                    .scopes
+                    .iter()
+                    .enumerate()
+                    .any(|(index, scope)| subject.scopes[..index].contains(scope))
                 || subject.authorities.is_empty()
                 || subject.authorities.len() > 128
+                // A command grant lasts while its program runs. An idle cutoff
+                // or a use budget would stop or starve that program partway.
+                || subject.scopes.contains(&GrantScope::Command)
+                    && (subject.idle_timeout_seconds.is_some() || subject.maximum_uses.is_some())
             {
                 return Err(Failure::InvalidRequest);
             }
