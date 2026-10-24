@@ -121,7 +121,7 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
     if !descriptors.is_empty() {
         return Err(invalid());
     }
-    match route(response.decision, routing)? {
+    match route(response.decision)? {
         Route::Native => return Ok(state),
         Route::Managed => {}
         Route::Relay => state.relay = true,
@@ -150,10 +150,12 @@ enum Route {
     Relay,
 }
 
-/// How this invocation proceeds after the coordinator's preflight answer.
-fn route(decision: Decision, routing: bool) -> io::Result<Route> {
+/// How this invocation proceeds after the coordinator's preflight answer. The
+/// authenticated coordinator owns routing: its native answer means no grant is
+/// selected, including when it withdrew a marker this invocation saw above.
+fn route(decision: Decision) -> io::Result<Route> {
     match decision {
-        Decision::Native if !routing => Ok(Route::Native),
+        Decision::Native => Ok(Route::Native),
         Decision::Managed => Ok(Route::Managed),
         Decision::Relay => Ok(Route::Relay),
         _ => Err(denied()),
@@ -537,16 +539,14 @@ mod tests {
     // the invocation once the coordinator answers that no grant is selected.
     #[test]
     fn coordinator_reported_native_routing_is_honored_after_a_marker_was_seen() {
-        for routing in [false, true] {
-            assert_eq!(route(Decision::Native, routing).unwrap(), Route::Native);
-            assert_eq!(route(Decision::Managed, routing).unwrap(), Route::Managed);
-            assert_eq!(route(Decision::Relay, routing).unwrap(), Route::Relay);
-            for denial in [Decision::Denied, Decision::Unavailable, Decision::Attached] {
-                assert_eq!(
-                    route(denial, routing).unwrap_err().kind(),
-                    io::ErrorKind::PermissionDenied
-                );
-            }
+        assert_eq!(route(Decision::Native).unwrap(), Route::Native);
+        assert_eq!(route(Decision::Managed).unwrap(), Route::Managed);
+        assert_eq!(route(Decision::Relay).unwrap(), Route::Relay);
+        for denial in [Decision::Denied, Decision::Unavailable, Decision::Attached] {
+            assert_eq!(
+                route(denial).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
         }
     }
 

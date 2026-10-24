@@ -222,7 +222,6 @@ pub(super) async fn connection(service: Arc<Service>, descriptor: OwnedFd) -> Re
                     preparing: true,
                     leader_done: false,
                     external_leader: Some(native::clone_fd(peer.peer_pidfd())?),
-                    external_complete: false,
                     origin: caller.scope.clone(),
                     relay: RelayAdmission::Ordinary,
                     captured: None,
@@ -321,19 +320,42 @@ async fn admitted(
     .await?;
     drop(setup_lease);
     let remaining = deadline.saturating_sub(now()?);
-    if !matches!(
-        receive_with_completion(descriptor, peer, remaining, true)
-            .await
-            .inspect_err(|failure| {
-                eprintln!("dev-auth native sudo completion failed: {failure:?}");
-            })?,
-        Request::Complete
-    ) {
-        return Err(Failure::ProtocolViolation);
+    match receive_with_completion(descriptor, peer, remaining, true).await {
+        Ok(Received::Request(Request::Complete)) => {}
+        Ok(Received::Closed(error)) => {
+            // ADR 0136: the command sudo started keeps running under its
+            // grant's deadline, revocation and policy; reaping retires the
+            // job once its cgroup is empty. A stopping grant also closes
+            // this channel when its cleanup kills sudo, so log the lease.
+            let lease = service
+                .state
+                .lock()
+                .await
+                .registry
+                .get(grant_id)
+                .map(|grant| grant.lifetime.state());
+            eprintln!(
+                "dev-auth native sudo completion abandoned: grant={grant_id:032x} job={job_id:032x} sudo_pid={} error={error:?} lease={lease:?}",
+                peer.pid
+            );
+            return Ok(());
+        }
+        outcome => {
+            let (failure, error) = match outcome {
+                Ok(Received::Malformed(error)) => (Failure::ProtocolViolation, Some(error)),
+                Ok(_) => (Failure::ProtocolViolation, None),
+                Err(failure) => (failure, None),
+            };
+            eprintln!(
+                "dev-auth native sudo completion failed: grant={grant_id:032x} job={job_id:032x} sudo_pid={} failure={failure:?} error={error:?}; stopping job",
+                peer.pid
+            );
+            return Err(failure);
+        }
     }
     {
-        let mut state = service.state.lock().await;
-        let job = state.jobs.get_mut(&job_id).ok_or(Failure::NoGrant)?;
+        let state = service.state.lock().await;
+        let job = state.jobs.get(&job_id).ok_or(Failure::NoGrant)?;
         let executable =
             File::open(format!("/proc/{}/exe", peer.pid)).map_err(|_| Failure::AuthorityDenied)?;
         let group = crate::linux_admission::read_unified_cgroup(peer.pid)
@@ -344,7 +366,6 @@ async fn admitted(
         {
             return Err(Failure::AuthorityDenied);
         }
-        job.external_complete = true;
     }
     reply(
         descriptor,
@@ -445,12 +466,25 @@ fn field<'a>(values: &'a [OsString], name: &[u8]) -> Result<&'a OsStr, Failure> 
     result.ok_or(Failure::InvalidRequest)
 }
 
+/// One receive from the native sudo peer. A closed or malformed channel keeps
+/// the kernel's error so the completion wait can report it.
+#[derive(Debug)]
+enum Received {
+    Request(Request),
+    /// The peer's end closed, or reset with our frames unread.
+    Closed(io::Error),
+    Malformed(io::Error),
+}
+
 async fn receive(
     descriptor: &AsyncFd<OwnedFd>,
     peer: &crate::linux_admission::LinuxPeerEvidence,
     timeout: Duration,
 ) -> Result<Request, Failure> {
-    receive_with_completion(descriptor, peer, timeout, false).await
+    match receive_with_completion(descriptor, peer, timeout, false).await? {
+        Received::Request(request) => Ok(request),
+        Received::Closed(_) | Received::Malformed(_) => Err(Failure::ProtocolViolation),
+    }
 }
 
 async fn receive_with_completion(
@@ -458,7 +492,7 @@ async fn receive_with_completion(
     peer: &crate::linux_admission::LinuxPeerEvidence,
     timeout: Duration,
     completion_only: bool,
-) -> Result<Request, Failure> {
+) -> Result<Received, Failure> {
     tokio::time::timeout(timeout, async {
         loop {
             let mut ready = descriptor
@@ -469,7 +503,15 @@ async fn receive_with_completion(
                 match ready.try_io(|fd| crate::privilege::grants::packet::receive_owned(fd.get_ref())) {
                     Ok(Ok(packet)) => packet,
                     Err(_) => continue,
-                    _ => return Err(Failure::ProtocolViolation),
+                    Ok(Err(error))
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        return Ok(Received::Closed(error))
+                    }
+                    Ok(Err(error)) => return Ok(Received::Malformed(error)),
                 };
             if !packet.descriptors.is_empty()
                 || !packet.credentials.is_some_and(|credentials| {
@@ -495,7 +537,7 @@ async fn receive_with_completion(
             {
                 return Err(Failure::InvalidRequest);
             }
-            return Ok(message.request);
+            return Ok(Received::Request(message.request));
         }
     })
     .await
@@ -722,7 +764,10 @@ mod tests {
             )
             .await;
             assert!(
-                outcome.is_ok(),
+                matches!(
+                    outcome,
+                    Ok(Received::Closed(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+                ),
                 "closed completion channel failed the job: {outcome:?}"
             );
         });
@@ -747,7 +792,10 @@ mod tests {
             )
             .await;
             assert!(
-                outcome.is_ok(),
+                matches!(
+                    outcome,
+                    Ok(Received::Closed(ref error)) if error.kind() == io::ErrorKind::ConnectionReset
+                ),
                 "reset completion channel failed the job: {outcome:?}"
             );
         });
@@ -814,7 +862,39 @@ mod tests {
                 true,
             )
             .await;
-            assert!(matches!(outcome, Ok(Request::Complete)), "{outcome:?}");
+            assert!(
+                matches!(outcome, Ok(Received::Request(Request::Complete))),
+                "{outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn malformed_frame_from_a_connected_sudo_is_not_a_departure() {
+        block_on(async {
+            let pair = bridge_pair();
+            socket::sendmsg::<UnixAddr>(
+                pair.sudo.as_ref().unwrap().as_raw_fd(),
+                &[io::IoSlice::new(&[])],
+                &[],
+                MsgFlags::MSG_NOSIGNAL,
+                None,
+            )
+            .unwrap();
+            let outcome = receive_with_completion(
+                &pair.coordinator,
+                &pair.peer,
+                Duration::from_secs(3),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(Received::Malformed(ref error)) if error.kind() == io::ErrorKind::InvalidData
+                ),
+                "{outcome:?}"
+            );
         });
     }
 }

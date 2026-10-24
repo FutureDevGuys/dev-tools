@@ -53,6 +53,12 @@ pub(crate) fn receive_owned(fd: &impl AsRawFd) -> std::io::Result<Packet> {
     let control_length = message
         .msg_controllen
         .min(std::mem::size_of_val(&ancillary));
+    // A seqpacket frame, even an empty one, carries the kernel's sender
+    // credentials once the receiver passes them. Only end of stream has
+    // neither bytes nor control data.
+    if length == 0 && control_length == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
     let base = ancillary.as_ptr().cast::<u8>();
     let mut offset = 0;
     let header_size = std::mem::size_of::<nix::libc::cmsghdr>();

@@ -129,7 +129,6 @@ struct Job {
     preparing: bool,
     leader_done: bool,
     external_leader: Option<OwnedFd>,
-    external_complete: bool,
     origin: NativeScope,
     relay: RelayAdmission,
     captured: Option<CapturedJob>,
@@ -248,6 +247,7 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
         .open(configuration.runtime.join("daemon.lock"))
         .map_err(|_| Failure::AuthorityDenied)?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| Failure::Busy)?;
+    clear_markers(&configuration.runtime)?;
     let policy_file = root_file(&configuration.policy, false)?;
     let policy_stamp = FileStamp::of(&policy_file)?;
     let mut bytes = Vec::new();
@@ -287,11 +287,9 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
             tokio::time::timeout(Duration::from_secs(3), verify_service_unit(&parent_path)).await
         })
         .map_err(|_| Failure::NativeUnavailable)??;
-    // Systemd owns crash cleanup of the entire unit. Stale routing records are
-    // denial state only; they never restore a memory-only grant. Do not accept
-    // requests until all owned remnants are gone and their cleanup is proven.
+    // Systemd owns crash cleanup of the entire unit. Do not accept requests
+    // until all owned remnants are gone and their cleanup is proven.
     recover_cgroups(&parent)?;
-    let selected = load_markers(&configuration.runtime)?;
     let listener = create_listener(&configuration.runtime.join("control.sock"))?;
     let sudo_listener = create_listener(&configuration.runtime.join("sudo.sock"))?;
     let service = Arc::new(Service {
@@ -308,7 +306,7 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
         state: Mutex::new(State {
             registry: GrantRegistry::new(MAX_GRANTS).map_err(|_| Failure::RuntimeFailure)?,
             metadata: BTreeMap::new(),
-            selected,
+            selected: BTreeMap::new(),
             jobs: BTreeMap::new(),
             pending_relays: BTreeMap::new(),
             stopping: false,
@@ -1147,26 +1145,13 @@ async fn revoke(
         let id = if let Some(id) = selected {
             parse_id(id)?
         } else {
-            select(&state, &caller.scope, None)?
+            match select(&state, &caller.scope, None) {
+                Err(Failure::NoGrant) if leave => {
+                    return Ok(ControlResult::success("leave", false));
+                }
+                selected => selected?,
+            }
         };
-        if leave && state.registry.get(id).is_none() {
-            let scope = state
-                .selected
-                .iter()
-                .find_map(|(scope, selected)| {
-                    (*selected == id && scope.account == caller.scope.account)
-                        .then(|| scope.clone())
-                })
-                .ok_or(Failure::NoGrant)?;
-            // Startup proved all old process boundaries empty. A retired
-            // record is also removed only after confirmed cleanup. Leaving
-            // stale routing is safe but never issues replacement authority.
-            progress.entered();
-            remove_marker(service, &scope)?;
-            state.selected.remove(&scope);
-            progress.changed();
-            return Ok(ControlResult::success("leave", true));
-        }
         require_owner(&state, id, &caller.scope.account)?;
         let scope = state
             .metadata
@@ -1535,7 +1520,6 @@ async fn execute(
                 preparing: true,
                 leader_done: false,
                 external_leader: None,
-                external_complete: false,
                 origin: caller.scope.clone(),
                 relay: if sudo_relay {
                     RelayAdmission::Preparing
@@ -2174,6 +2158,7 @@ async fn reap(service: &Service) -> Result<(), Failure> {
     }
     sweep_abandoned_launches_locked(service, &mut state, now)?;
     state.registry.poll(now);
+    withdraw_ended_routing(&service.runtime, &mut state);
     let stopped: BTreeSet<_> = state
         .registry
         .iter()
@@ -2193,11 +2178,14 @@ async fn reap(service: &Service) -> Result<(), Failure> {
             .as_ref()
             .is_some_and(|leader| !native::alive(leader))
         {
-            job.leader_done = true;
-            job.preparing = false;
-            if !job.external_complete {
+            // ADR 0136: a command that native sudo started outlives sudo
+            // within its grant. Only an invocation that never attached, and so
+            // never started its command, is stopped when sudo exits.
+            if job.preparing {
                 let _ = job.boundary.stop();
             }
+            job.leader_done = true;
+            job.preparing = false;
         }
         if stopped.contains(&job.grant) && job.boundary.stop().is_err() {
             if let Some(captured) = &mut job.captured {
@@ -2272,15 +2260,14 @@ async fn reap(service: &Service) -> Result<(), Failure> {
         .registry
         .iter()
         .filter(|grant| grant.lifetime.state().is_terminal())
-        .map(|grant| grant.id)
+        .map(|grant| (grant.id, grant.lifetime.state()))
         .collect();
-    for id in terminal {
-        state
-            .metadata
-            .get_mut(&id)
-            .ok_or(Failure::RuntimeFailure)?
-            .terminal_since
-            .get_or_insert(now);
+    for (id, lease) in terminal {
+        let metadata = state.metadata.get_mut(&id).ok_or(Failure::RuntimeFailure)?;
+        if metadata.terminal_since.is_none() {
+            eprintln!("dev-auth grant ended: grant={id:032x} lease={lease:?}");
+            metadata.terminal_since = Some(now);
+        }
     }
     // Keep recent terminal observations long enough for concurrent result
     // publication, but do not impose a lifetime cap of MAX_GRANTS per daemon.
@@ -2324,6 +2311,11 @@ async fn check_logins(service: &Service) {
         )
         .await
         .unwrap_or(Err(Failure::NativeUnavailable));
+        if let Err(failure) = observation {
+            eprintln!(
+                "dev-auth login observation failed: uid={uid} failure={failure:?}; user grants continue"
+            );
+        }
         if login_ended(observation) {
             let mut state = service.state.lock().await;
             let ids: Vec<_> = state
@@ -2344,8 +2336,10 @@ async fn check_logins(service: &Service) {
 }
 
 /// Whether one native login observation ends the account's user-scope grants.
+/// Only logind's positive answer that no interactive session remains is a
+/// logout; an unavailable or failing query is retried on the next pass.
 fn login_ended(observation: Result<bool, Failure>) -> bool {
-    observation != Ok(true)
+    observation == Ok(false)
 }
 
 fn requested_scope(caller: &Caller, scope: GrantScope) -> Result<NativeScope, Failure> {
@@ -2377,17 +2371,22 @@ fn select(state: &State, scope: &NativeScope, requested: Option<&str>) -> Result
     let id = if let Some(requested) = requested {
         parse_id(requested)?
     } else {
-        state
-            .selected
-            .get(scope)
-            .or_else(|| {
-                state.selected.get(&NativeScope {
-                    account: scope.account.clone(),
-                    workload: None,
-                })
-            })
-            .copied()
-            .ok_or(Failure::NoGrant)?
+        [
+            scope.clone(),
+            NativeScope {
+                account: scope.account.clone(),
+                workload: None,
+            },
+        ]
+        .iter()
+        .find_map(|candidate| {
+            state
+                .selected
+                .get(candidate)
+                .copied()
+                .filter(|id| routes(&state.registry, *id))
+        })
+        .ok_or(Failure::NoGrant)?
     };
     let mut ancestor = Some(id);
     for _ in 0..=16 {
@@ -2408,6 +2407,39 @@ fn select(state: &State, scope: &NativeScope, requested: Option<&str>) -> Result
         return Err(Failure::AuthorityDenied);
     }
     Ok(id)
+}
+
+/// Sudo routing lives exactly as long as its grant is active (ADR 0136).
+fn routes(registry: &GrantRegistry<NativeScope, Authority>, id: GrantId) -> bool {
+    registry
+        .get(id)
+        .is_some_and(|grant| grant.lifetime.state() == LeaseState::Active)
+}
+
+/// Withdraw every published marker whose grant no longer routes sudo. A
+/// failed removal keeps its selection, which `select` already ignores, so the
+/// next pass retries it.
+fn withdraw_ended_routing(runtime: &Path, state: &mut State) {
+    let ended: Vec<_> = state
+        .selected
+        .iter()
+        .filter(|(_, id)| !routes(&state.registry, **id))
+        .map(|(scope, id)| (scope.clone(), *id))
+        .collect();
+    for (scope, id) in ended {
+        let lease = state.registry.get(id).map(|grant| grant.lifetime.state());
+        match remove_marker_at(runtime, &scope) {
+            Ok(()) => {
+                state.selected.remove(&scope);
+                eprintln!("dev-auth grant routing withdrawn: grant={id:032x} lease={lease:?}");
+            }
+            Err(failure) => {
+                eprintln!(
+                    "dev-auth grant routing withdrawal failed: grant={id:032x} failure={failure:?}"
+                );
+            }
+        }
+    }
 }
 
 fn require_owner(state: &State, id: GrantId, account: &Account) -> Result<(), Failure> {
@@ -2757,40 +2789,20 @@ fn parse_marker_name(name: &str) -> Result<NativeScope, Failure> {
     })
 }
 
-fn load_markers(runtime: &Path) -> Result<BTreeMap<NativeScope, GrantId>, Failure> {
-    let mut selected = BTreeMap::new();
+/// No grant survives a coordinator restart, so neither does its routing. The
+/// held daemon lock proves that no live instance still owns these markers.
+fn clear_markers(runtime: &Path) -> Result<(), Failure> {
     for entry in std::fs::read_dir(runtime).map_err(|_| Failure::NativeUnavailable)? {
         let entry = entry.map_err(|_| Failure::NativeUnavailable)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             return Err(Failure::AuthorityDenied);
         };
-        if !name.starts_with("user-") && !name.starts_with("workload-") {
-            continue;
+        if name.starts_with("user-") || name.starts_with("workload-") {
+            remove_marker_at(runtime, &parse_marker_name(name)?)?;
         }
-        if selected.len() >= 16_384 {
-            return Err(Failure::Busy);
-        }
-        let scope = parse_marker_name(name)?;
-        let mut file = root_file(&entry.path(), false)?;
-        let mut contents = String::new();
-        Read::by_ref(&mut file)
-            .take(34)
-            .read_to_string(&mut contents)
-            .map_err(|_| Failure::AuthorityDenied)?;
-        if contents.len() != 33 || !contents.ends_with('\n') {
-            return Err(Failure::AuthorityDenied);
-        }
-        let text = &contents[..32];
-        if !text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(Failure::AuthorityDenied);
-        }
-        selected.insert(scope, parse_id(text)?);
     }
-    Ok(selected)
+    Ok(())
 }
 
 fn recover_cgroups(parent: &File) -> Result<(), Failure> {
@@ -3279,6 +3291,26 @@ mod tests {
 
     type GrantEnd = (&'static str, fn(&mut State));
 
+    /// Publish the state's selections as `write_marker` names and contents.
+    fn publish(runtime: &Path, state: &State) {
+        for (scope, id) in &state.selected {
+            std::fs::write(
+                runtime.join(marker_name(scope).unwrap()),
+                format!("{id:032x}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn entries(runtime: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
     // A selection that still names an ended grant makes the sudo bridge deny
     // every invocation for the scope until someone knows to run `leave`.
     #[test]
@@ -3324,16 +3356,65 @@ mod tests {
             }),
         ];
         for (path, end) in ends {
+            let runtime = tempfile::tempdir().unwrap();
             let mut state = routing_state(&[(1, scope.clone())]);
+            publish(runtime.path(), &state);
             state.registry.poll(later);
+            withdraw_ended_routing(runtime.path(), &mut state);
             assert_eq!(select(&state, &scope, None), Ok(1), "{path}");
+            assert_eq!(entries(runtime.path()), ["user-1000"], "{path}");
             end(&mut state);
             assert_eq!(
                 select(&state, &scope, None),
                 Err(Failure::NoGrant),
                 "{path}"
             );
+            withdraw_ended_routing(runtime.path(), &mut state);
+            assert!(entries(runtime.path()).is_empty(), "{path}");
+            assert!(state.selected.is_empty(), "{path}");
         }
+    }
+
+    #[test]
+    fn ending_one_grant_withdraws_only_its_own_routing() {
+        let runtime = tempfile::tempdir().unwrap();
+        let ended = user_scope(1000);
+        let active = user_scope(1001);
+        let mut state = routing_state(&[(1, ended.clone()), (2, active.clone())]);
+        publish(runtime.path(), &state);
+        state
+            .registry
+            .stop(1, StopReason::Revoked, Duration::from_secs(1))
+            .unwrap();
+        withdraw_ended_routing(runtime.path(), &mut state);
+        assert_eq!(entries(runtime.path()), ["user-1001"]);
+        assert_eq!(select(&state, &active, None), Ok(2));
+        assert_eq!(select(&state, &ended, None), Err(Failure::NoGrant));
+    }
+
+    #[test]
+    fn a_starting_coordinator_withdraws_every_previous_routing_marker() {
+        let runtime = tempfile::tempdir().unwrap();
+        let state = routing_state(&[
+            (1, user_scope(1000)),
+            (
+                2,
+                NativeScope {
+                    account: Account::Unix { uid: 1000 },
+                    workload: Some(7),
+                },
+            ),
+        ]);
+        publish(runtime.path(), &state);
+        for kept in ["control.sock", "daemon.lock", "sudo.sock"] {
+            std::fs::write(runtime.path().join(kept), b"").unwrap();
+        }
+        assert_eq!(entries(runtime.path()).len(), 5);
+        clear_markers(runtime.path()).unwrap();
+        assert_eq!(
+            entries(runtime.path()),
+            ["control.sock", "daemon.lock", "sudo.sock"]
+        );
     }
 
     #[test]

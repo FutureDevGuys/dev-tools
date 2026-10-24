@@ -11,6 +11,7 @@ SyncConfigs also maintains product-local records, including [durable overlay pub
 
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0136](0136-grant-lifetime-sudo-routing-and-job-survival.md) | Dev Auth ends sudo routing with its grant and keeps an attached managed job running when sudo or its completion channel is lost | proposed | hermetic source tests passed; native acceptance pending |
 | [0135](0135-admission-bound-workload-environment-projections.md) | Dev Auth binds generic environment projection destinations to its configured workload consumer | proposed | synthetic Linux user-only acceptance passed; Strong and signed delivery pending |
 | [0130](0130-mode-bound-setup-transition-root.md) | Dev Auth prepares the exact installation root mode before transition retention | proposed | pending native acceptance |
 | [0125](0125-descriptor-relative-ordinary-files-and-locks.md) | Descriptor-relative ordinary files and resource locks | proposed | pending |
