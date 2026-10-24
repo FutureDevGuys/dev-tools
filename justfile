@@ -32,7 +32,8 @@ test:
         helper=$(cargo build -p dev-auth-sudo --locked -j 2 --message-format=json | jq -sr '[.[] | select(.reason == "compiler-artifact" and .target.name == "dev_auth_sudo") | .filenames[] | select(endswith(".so"))] | unique | if length == 1 then .[0] else error("expected one native sudo helper") end')
         export DEV_AUTH_SUDO_ARTIFACT="$helper"
     fi
-    cargo test -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' -- --test-threads=2
+    # libtest reads the thread limit from the environment; custom-harness targets accept no flags.
+    RUST_TEST_THREADS=2 cargo test -p dev-auth -p dev-auth-sudo -p dev-tools-command -p dev-tools-privilege-session -p dev-tools-privilege -p dev-tools-installation --locked -j 2 --config 'profile.test.package.sha2.opt-level=3'
     if [[ "$(uname -s)" == Linux ]]; then
         cargo test -p dev-auth --lib --locked -j 2 --config 'profile.test.package.sha2.opt-level=3' setup_v3::grants::native_acceptance::native_fixture_embedded_sudo_payload_available -- --ignored --exact --test-threads=1
     fi
