@@ -179,7 +179,7 @@ unsafe extern "C" fn audit_open(
         // SAFETY: these arrays have the native callback's borrowed lifetime.
         let user_info = unsafe { copy_strings(user_info)? };
         let options = unsafe { copy_strings(options)? };
-        let state = native::initialize(&user_info, &options)?;
+        let state = native::initialize(&user_info, &options).map_err(|_| native::invalid())?;
         if state.relay {
             // SAFETY: sudo retains its original unparsed argv/environment for
             // the callback. The replacement frontend has no retained privilege.
@@ -371,6 +371,107 @@ mod tests {
             -1
         );
     }
+    /// The sudo_plugin(5) conversation records, as native sudo lays them out.
+    #[repr(C)]
+    struct NativeMessage {
+        kind: c_int,
+        timeout: c_int,
+        text: *const c_char,
+    }
+    #[repr(C)]
+    struct NativeReply {
+        text: *mut c_char,
+    }
+
+    /// Messages a fake sudo front end received: type, text, and whether the
+    /// plugin supplied one null-initialized reply per message.
+    static TOLD: std::sync::Mutex<Vec<(c_int, Vec<u8>, bool)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn fake_conversation(
+        count: c_int,
+        messages: *const c_void,
+        replies: *mut c_void,
+        _callback: *mut c_void,
+    ) -> c_int {
+        let count = usize::try_from(count).unwrap_or(0);
+        // SAFETY: the plugin passes `count` messages and `count` replies.
+        let messages =
+            unsafe { std::slice::from_raw_parts(messages.cast::<NativeMessage>(), count) };
+        let replies_ready = !replies.is_null()
+            && unsafe { std::slice::from_raw_parts(replies.cast::<NativeReply>(), count) }
+                .iter()
+                .all(|reply| reply.text.is_null());
+        let Ok(mut told) = TOLD.lock() else {
+            return -1;
+        };
+        for message in messages {
+            // SAFETY: each message text is a NUL-terminated string for this call.
+            let text = unsafe { CStr::from_ptr(message.text) }.to_bytes().to_vec();
+            told.push((message.kind, text, replies_ready));
+        }
+        0
+    }
+
+    // Sudo answers a failed audit open with only "error initializing audit
+    // plugin", so the user never learns why sudo refused or how to recover.
+    #[test]
+    fn a_refused_audit_open_tells_the_user_why_on_the_terminal() {
+        const ERROR_MESSAGE: c_int = 0x0003;
+        let runtime = tempfile::tempdir().unwrap();
+        let fields = [
+            std::ffi::CString::new("uid=1000").unwrap(),
+            std::ffi::CString::new("user=example").unwrap(),
+        ];
+        let user_info = [
+            fields[0].as_ptr().cast_mut(),
+            fields[1].as_ptr().cast_mut(),
+            std::ptr::null_mut(),
+        ];
+        let option =
+            std::ffi::CString::new(format!("runtime={}", runtime.path().display())).unwrap();
+        let options = [option.as_ptr().cast_mut(), std::ptr::null_mut()];
+        let mut error = std::ptr::null();
+        TOLD.lock().unwrap().clear();
+        // SAFETY: every array is NUL-terminated and outlives the callback.
+        let result = unsafe {
+            audit_open(
+                API,
+                Some(fake_conversation),
+                None,
+                std::ptr::null(),
+                user_info.as_ptr(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                options.as_ptr(),
+                &mut error,
+            )
+        };
+        assert_eq!(result, -1, "an unprivileged test process is never admitted");
+        let told = TOLD.lock().unwrap().clone();
+        assert_eq!(
+            told.len(),
+            1,
+            "exactly one message reaches the user: {told:?}"
+        );
+        let (kind, text, replies_ready) = &told[0];
+        assert_eq!(*kind, ERROR_MESSAGE);
+        assert!(
+            replies_ready,
+            "sudo_plugin(5) requires one null reply per message"
+        );
+        let text = std::str::from_utf8(text).unwrap();
+        assert!(text.starts_with("dev-auth: "), "{text}");
+        assert!(
+            text.ends_with('\n') && text.matches('\n').count() == 1,
+            "{text}"
+        );
+        assert!(
+            text.contains("dev-auth privilege"),
+            "names a remedy: {text}"
+        );
+    }
+
     #[test]
     fn copying_native_arrays_preserves_non_unicode_values_and_has_a_bound() {
         let value = std::ffi::CString::new([b'a', 255]).unwrap();

@@ -2,7 +2,7 @@ use crate::packet::{receive_owned, Packet, FRAME_LIMIT};
 use crate::sudo_wire::{Decision, Message, Request, Response, SUDO_HELLO, SUDO_SCHEMA};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::socket::{self, MsgFlags, SockFlag, SockType, UnixAddr};
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -31,7 +31,43 @@ pub(crate) struct Client {
     grant: String,
 }
 
-pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Result<State> {
+/// Why this plugin refuses an invocation. Sudo reports only that its audit
+/// plugin failed to initialize, so the plugin shows `message` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Routing selects a grant, but no coordinator accepts connections.
+    Unreachable,
+    /// The coordinator accepted the connection but gave no usable answer.
+    Unanswered,
+    /// Every other refusal, including an answer that denies admission.
+    Denied,
+}
+
+impl Refusal {
+    /// One short line for the user's terminal. It names no grant, account,
+    /// path or credential.
+    pub(crate) fn message(self) -> &'static CStr {
+        match self {
+            Self::Unreachable => c"dev-auth: managed sudo routing is selected, but the grant coordinator is unreachable; start dev-auth-grants.service to restore native sudo\n",
+            Self::Unanswered => c"dev-auth: the grant coordinator did not answer; retry, or restart dev-auth-grants.service to end every grant and restore native sudo\n",
+            Self::Denied => c"dev-auth: managed sudo admission denied; see `dev-auth privilege grant status`, or run `dev-auth privilege leave` to restore native sudo\n",
+        }
+    }
+}
+
+impl From<io::Error> for Refusal {
+    fn from(_: io::Error) -> Self {
+        Self::Denied
+    }
+}
+
+impl From<nix::errno::Errno> for Refusal {
+    fn from(_: nix::errno::Errno) -> Self {
+        Self::Denied
+    }
+}
+
+pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> Result<State, Refusal> {
     let uid = field(user_info, b"uid")?
         .to_str()
         .ok_or_else(invalid)?
@@ -39,7 +75,7 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
         .map_err(|_| invalid())?;
     let user = field(user_info, b"user")?.as_bytes().to_vec();
     if user.is_empty() || user.len() > 256 || !nix::unistd::Uid::effective().is_root() {
-        return Err(denied());
+        return Err(Refusal::Denied);
     }
     let mut runtime = PathBuf::from("/run/dev-auth-grants");
     let mut frontend = PathBuf::from("/usr/local/bin/dev-auth");
@@ -52,17 +88,17 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
             .ok_or_else(invalid)?;
         let (key, tail) = bytes.split_at(position);
         if !keys.insert(key) {
-            return Err(invalid());
+            return Err(Refusal::Denied);
         }
         let value = PathBuf::from(OsStr::from_bytes(&tail[1..]));
         match key {
             b"runtime" => runtime = value,
             b"frontend" => frontend = value,
-            _ => return Err(invalid()),
+            _ => return Err(Refusal::Denied),
         }
     }
     if !runtime.is_absolute() || !frontend.is_absolute() {
-        return Err(invalid());
+        return Err(Refusal::Denied);
     }
     let mut state = State {
         uid,
@@ -80,8 +116,11 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
     let path = runtime.join("sudo.sock");
     match protected(&path, false) {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !routing => return Ok(state),
-        Err(error) => return Err(error),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            unreachable(routing, error.kind())?;
+            return Ok(state);
+        }
+        Err(error) => return Err(error.into()),
     }
     let socket = socket::socket(
         socket::AddressFamily::Unix,
@@ -90,22 +129,13 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
         None,
     )?;
     if let Err(error) = socket::connect(socket.as_raw_fd(), &UnixAddr::new(&path)?) {
-        // An installed but unavailable service cannot revoke ordinary native
-        // behavior for an unselected account. Selected routing always denies.
-        if !routing
-            && matches!(
-                error,
-                nix::errno::Errno::ECONNREFUSED | nix::errno::Errno::ENOENT
-            )
-        {
-            return Ok(state);
-        }
-        return Err(error.into());
+        unreachable(routing, io::Error::from(error).kind())?;
+        return Ok(state);
     }
     let peer = socket::getsockopt(&socket, socket::sockopt::PeerCredentials)?;
     let coordinator = socket::getsockopt(&socket, socket::sockopt::PeerPidfd)?;
     if peer.uid() != 0 || !quiet(&coordinator)? {
-        return Err(denied());
+        return Err(Refusal::Denied);
     }
     let mut client = Client {
         socket,
@@ -113,14 +143,7 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
         deadline: Duration::ZERO,
         grant: String::new(),
     };
-    let hello = client.receive(Instant::now() + Duration::from_secs(3))?;
-    if hello.bytes != SUDO_HELLO || !hello.descriptors.is_empty() {
-        return Err(invalid());
-    }
-    let (response, descriptors) = client.exchange(Request::Preflight { uid })?;
-    if !descriptors.is_empty() {
-        return Err(invalid());
-    }
+    let response = preflight(&mut client, uid)?;
     match route(response.decision)? {
         Route::Native => return Ok(state),
         Route::Managed => {}
@@ -134,13 +157,42 @@ pub(crate) fn initialize(user_info: &[OsString], options: &[OsString]) -> io::Re
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(invalid());
+        return Err(Refusal::Denied);
     }
     if boot_time()? >= client.deadline {
-        return Err(denied());
+        return Err(Refusal::Denied);
     }
     state.client = Some(client);
     Ok(state)
+}
+
+/// How this invocation proceeds when no coordinator accepts its connection.
+/// An installed but unavailable service cannot revoke ordinary native
+/// behavior for an unselected account. Selected routing always denies.
+fn unreachable(routing: bool, error: io::ErrorKind) -> Result<(), Refusal> {
+    if routing {
+        Err(Refusal::Denied)
+    } else if matches!(
+        error,
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) {
+        Ok(())
+    } else {
+        Err(Refusal::Denied)
+    }
+}
+
+/// The coordinator's greeting and its preflight answer for `uid`.
+fn preflight(client: &mut Client, uid: u32) -> Result<Response, Refusal> {
+    let hello = client.receive(Instant::now() + Duration::from_secs(3))?;
+    if hello.bytes != SUDO_HELLO || !hello.descriptors.is_empty() {
+        return Err(Refusal::Denied);
+    }
+    let (response, descriptors) = client.exchange(Request::Preflight { uid })?;
+    if !descriptors.is_empty() {
+        return Err(Refusal::Denied);
+    }
+    Ok(response)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -547,6 +599,108 @@ mod tests {
                 route(denial).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
             );
+        }
+    }
+
+    // Sudo shows the user nothing but "error initializing audit plugin", so
+    // each refusal must name what failed and the step that recovers native sudo.
+    #[test]
+    fn selected_routing_reports_an_unreachable_coordinator() {
+        for absent in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            assert_eq!(
+                unreachable(true, absent),
+                Err(Refusal::Unreachable),
+                "{absent:?}"
+            );
+            assert_eq!(unreachable(false, absent), Ok(()), "{absent:?}");
+        }
+        assert_eq!(
+            unreachable(true, io::ErrorKind::PermissionDenied),
+            Err(Refusal::Unreachable)
+        );
+        assert_eq!(
+            unreachable(false, io::ErrorKind::PermissionDenied),
+            Err(Refusal::Denied)
+        );
+    }
+
+    fn fake_coordinator(serve: impl FnOnce(OwnedFd) + Send + 'static) -> Option<Response> {
+        let (client, coordinator) = socket::socketpair(
+            socket::AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        )
+        .unwrap();
+        let identity = socket::getsockopt(&client, socket::sockopt::PeerPidfd).unwrap();
+        let server = std::thread::spawn(move || serve(coordinator));
+        let mut client = Client {
+            socket: client,
+            coordinator: identity,
+            deadline: Duration::ZERO,
+            grant: String::new(),
+        };
+        let answer = preflight(&mut client, 1000);
+        server.join().unwrap();
+        match answer {
+            Ok(response) => Some(response),
+            Err(refusal) => {
+                assert_eq!(refusal, Refusal::Unanswered);
+                None
+            }
+        }
+    }
+
+    fn wait_readable(fd: &OwnedFd) {
+        let mut ready = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+        assert_eq!(poll(&mut ready, 3000_u16).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_coordinator_that_closes_before_answering_has_not_answered() {
+        assert!(
+            fake_coordinator(drop).is_none(),
+            "closed before its greeting"
+        );
+        assert!(
+            fake_coordinator(|coordinator| {
+                socket::send(coordinator.as_raw_fd(), SUDO_HELLO, MsgFlags::MSG_NOSIGNAL).unwrap();
+                wait_readable(&coordinator);
+            })
+            .is_none(),
+            "closed after reading the preflight request"
+        );
+        let answered = fake_coordinator(|coordinator| {
+            socket::send(coordinator.as_raw_fd(), SUDO_HELLO, MsgFlags::MSG_NOSIGNAL).unwrap();
+            wait_readable(&coordinator);
+            receive_owned(&coordinator).unwrap();
+            let response = serde_json::to_vec(&Response {
+                schema: SUDO_SCHEMA.into(),
+                decision: Decision::Native,
+                hard_deadline_milliseconds: 0,
+                grant: None,
+            })
+            .unwrap();
+            socket::send(coordinator.as_raw_fd(), &response, MsgFlags::MSG_NOSIGNAL).unwrap();
+        });
+        assert_eq!(answered.unwrap().decision, Decision::Native);
+    }
+
+    #[test]
+    fn every_refusal_is_one_short_line_with_a_remedy() {
+        for (refusal, remedy) in [
+            (Refusal::Unreachable, "start dev-auth-grants.service"),
+            (Refusal::Unanswered, "restart dev-auth-grants.service"),
+            (Refusal::Denied, "dev-auth privilege leave"),
+        ] {
+            let text = refusal.message().to_str().unwrap();
+            assert!(text.starts_with("dev-auth: "), "{text}");
+            assert!(text.contains(remedy), "{text}");
+            assert!(
+                text.ends_with('\n') && text.matches('\n').count() == 1,
+                "{text}"
+            );
+            assert!(text.len() <= 160, "{} bytes: {text}", text.len());
         }
     }
 

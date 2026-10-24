@@ -282,11 +282,10 @@ pub fn serve(configuration: Configuration) -> Result<(), Failure> {
         .max_blocking_threads(8)
         .build()
         .map_err(|_| Failure::NativeUnavailable)?;
-    runtime
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(3), verify_service_unit(&parent_path)).await
-        })
-        .map_err(|_| Failure::NativeUnavailable)??;
+    runtime.block_on(verify_unit(
+        || verify_service_unit(&parent_path),
+        UNIT_VERIFICATION,
+    ))?;
     // Systemd owns crash cleanup of the entire unit. Do not accept requests
     // until all owned remnants are gone and their cleanup is proven.
     recover_cgroups(&parent)?;
@@ -2634,10 +2633,46 @@ fn own_service_cgroup() -> Result<PathBuf, Failure> {
     Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
-async fn verify_service_unit(cgroup: &Path) -> Result<(), Failure> {
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+/// Why the service manager did not confirm this unit's crash-cleanup contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitFault {
+    /// No answer arrived from the system bus or the service manager.
+    Unreachable,
+    /// The service manager answered, and the unit breaks the contract.
+    Mismatch,
+}
+
+/// Bounds for confirming the unit before the coordinator admits anything.
+#[derive(Clone, Copy)]
+struct Backoff {
+    attempt: Duration,
+    first_delay: Duration,
+    longest_delay: Duration,
+    total: Duration,
+}
+
+const UNIT_VERIFICATION: Backoff = Backoff {
+    attempt: Duration::from_secs(3),
+    first_delay: Duration::from_millis(250),
+    longest_delay: Duration::from_secs(5),
+    total: Duration::from_secs(60),
+};
+
+/// Confirm the unit's crash-cleanup contract before any listener exists.
+async fn verify_unit<F, Answer>(mut verify: F, backoff: Backoff) -> Result<(), Failure>
+where
+    F: FnMut() -> Answer,
+    Answer: std::future::Future<Output = Result<(), UnitFault>>,
+{
+    match tokio::time::timeout(backoff.attempt, verify()).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(Failure::NativeUnavailable),
+    }
+}
+
+async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
+    use UnitFault::{Mismatch, Unreachable};
+    let connection = zbus::Connection::system().await.map_err(|_| Unreachable)?;
     let unit = connection
         .call_method(
             Some("org.freedesktop.systemd1"),
@@ -2647,62 +2682,59 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), Failure> {
             &(std::process::id(),),
         )
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
-    let unit: zbus::zvariant::OwnedObjectPath = unit
-        .body()
-        .deserialize()
-        .map_err(|_| Failure::ProtocolViolation)?;
+        .map_err(|_| Unreachable)?;
+    let unit: zbus::zvariant::OwnedObjectPath = unit.body().deserialize().map_err(|_| Mismatch)?;
     let properties = zbus::fdo::PropertiesProxy::builder(&connection)
         .destination("org.freedesktop.systemd1")
-        .map_err(|_| Failure::NativeUnavailable)?
+        .map_err(|_| Mismatch)?
         .path(unit)
-        .map_err(|_| Failure::NativeUnavailable)?
+        .map_err(|_| Mismatch)?
         .build()
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let service_interface =
         zbus::names::InterfaceName::try_from("org.freedesktop.systemd1.Service")
-            .map_err(|_| Failure::NativeUnavailable)?;
+            .map_err(|_| Mismatch)?;
     let main_pid = properties
         .get(service_interface.clone(), "MainPID")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let kill_mode = properties
         .get(service_interface.clone(), "KillMode")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let send_kill = properties
         .get(service_interface.clone(), "SendSIGKILL")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let group = properties
         .get(service_interface.clone(), "ControlGroup")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let exit_type = properties
         .get(service_interface.clone(), "ExitType")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let remain = properties
         .get(service_interface.clone(), "RemainAfterExit")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let delegated = properties
         .get(service_interface.clone(), "Delegate")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
+        .map_err(|_| Unreachable)?;
     let stop_timeout = properties
         .get(service_interface, "TimeoutStopUSec")
         .await
-        .map_err(|_| Failure::NativeUnavailable)?;
-    let main_pid = u32::try_from(main_pid).map_err(|_| Failure::ProtocolViolation)?;
-    let kill_mode = String::try_from(kill_mode).map_err(|_| Failure::ProtocolViolation)?;
-    let send_kill = bool::try_from(send_kill).map_err(|_| Failure::ProtocolViolation)?;
-    let group = String::try_from(group).map_err(|_| Failure::ProtocolViolation)?;
-    let exit_type = String::try_from(exit_type).map_err(|_| Failure::ProtocolViolation)?;
-    let remain = bool::try_from(remain).map_err(|_| Failure::ProtocolViolation)?;
-    let delegated = bool::try_from(delegated).map_err(|_| Failure::ProtocolViolation)?;
-    let stop_timeout = u64::try_from(stop_timeout).map_err(|_| Failure::ProtocolViolation)?;
+        .map_err(|_| Unreachable)?;
+    let main_pid = u32::try_from(main_pid).map_err(|_| Mismatch)?;
+    let kill_mode = String::try_from(kill_mode).map_err(|_| Mismatch)?;
+    let send_kill = bool::try_from(send_kill).map_err(|_| Mismatch)?;
+    let group = String::try_from(group).map_err(|_| Mismatch)?;
+    let exit_type = String::try_from(exit_type).map_err(|_| Mismatch)?;
+    let remain = bool::try_from(remain).map_err(|_| Mismatch)?;
+    let delegated = bool::try_from(delegated).map_err(|_| Mismatch)?;
+    let stop_timeout = u64::try_from(stop_timeout).map_err(|_| Mismatch)?;
     if main_pid != std::process::id()
         || kill_mode != "control-group"
         || !send_kill
@@ -2712,7 +2744,7 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), Failure> {
         || stop_timeout > 5_000_000
         || Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')) != cgroup
     {
-        return Err(Failure::NativeUnavailable);
+        return Err(Mismatch);
     }
     Ok(())
 }
@@ -3432,6 +3464,97 @@ mod tests {
             .unwrap();
         assert_eq!(select(&state, &workload, None), Ok(1));
         assert_eq!(select(&state, &user, None), Ok(1));
+    }
+
+    /// One scripted answer from a fake service manager.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        Fault(UnitFault),
+        /// Never completes, like a service manager that is re-executing itself.
+        Silent,
+    }
+
+    type Verification = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), UnitFault>>>>;
+
+    /// A verifier that gives `answers` in order, then confirms the unit.
+    fn scripted(
+        answers: &[Answer],
+    ) -> (
+        std::rc::Rc<std::cell::Cell<usize>>,
+        impl FnMut() -> Verification,
+    ) {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let answers = answers.to_vec();
+        let counter = std::rc::Rc::clone(&calls);
+        let verify = move || -> Verification {
+            let call = counter.get();
+            counter.set(call + 1);
+            let answer = answers.get(call).copied();
+            Box::pin(async move {
+                match answer {
+                    None => Ok(()),
+                    Some(Answer::Silent) => std::future::pending().await,
+                    Some(Answer::Fault(fault)) => Err(fault),
+                }
+            })
+        };
+        (calls, verify)
+    }
+
+    const QUICK: Backoff = Backoff {
+        attempt: Duration::from_millis(20),
+        first_delay: Duration::from_millis(1),
+        longest_delay: Duration::from_millis(4),
+        total: Duration::from_secs(10),
+    };
+
+    // A start failure during a service manager upgrade leaves the grant
+    // service down: verification gives up after one three-second attempt.
+    #[tokio::test]
+    async fn unit_verification_retries_while_the_service_manager_is_unreachable() {
+        let (calls, verify) = scripted(&[
+            Answer::Fault(UnitFault::Unreachable),
+            Answer::Fault(UnitFault::Unreachable),
+        ]);
+        assert_eq!(verify_unit(verify, QUICK).await, Ok(()));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn unit_verification_retries_a_service_manager_that_does_not_answer() {
+        let (calls, verify) = scripted(&[Answer::Silent]);
+        assert_eq!(verify_unit(verify, QUICK).await, Ok(()));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_unit_that_breaks_the_cleanup_contract_fails_without_retrying() {
+        let (calls, verify) = scripted(&[Answer::Fault(UnitFault::Mismatch)]);
+        assert_eq!(
+            verify_unit(verify, QUICK).await,
+            Err(Failure::NativeUnavailable)
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn unit_verification_gives_up_when_its_budget_ends() {
+        let (calls, verify) = scripted(&[Answer::Fault(UnitFault::Unreachable); 10_000]);
+        let budget = Backoff {
+            total: Duration::from_millis(50),
+            ..QUICK
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(
+            verify_unit(verify, budget).await,
+            Err(Failure::NativeUnavailable)
+        );
+        assert!(
+            calls.get() >= 2,
+            "retried before giving up: {}",
+            calls.get()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     // check_logins stops every user grant of the account, and with it all of
