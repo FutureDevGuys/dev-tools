@@ -25,8 +25,7 @@ const AUTHORIZATION_PROBE_LIMITS: PrivilegedExecutionLimits = PrivilegedExecutio
     timeout: Duration::from_secs(30),
     output_limit: 64 << 10,
 };
-#[cfg(unix)]
-const AUTHORIZATION_PROBE_CANDIDATES: [&str; 2] = ["/usr/bin/true", "/bin/true"];
+const PATH_FALLBACK_DIRECTORIES: [&str; 3] = ["/usr/bin", "/bin", "/usr/local/bin"];
 
 #[derive(Debug, Error)]
 pub enum PrivilegeError {
@@ -367,11 +366,10 @@ impl PrivilegeSession {
     /// commands without one is visible only by running a command.
     #[cfg(unix)]
     fn noninteractive_command_authorized(&self) -> Result<bool, PrivilegeError> {
-        let Some(probe) = AUTHORIZATION_PROBE_CANDIDATES
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|candidate| validate_trusted_executable(candidate).is_ok())
-        else {
+        let path = self.environment.get(OsStr::new("PATH"));
+        let Some(probe) = find_executable(path.map(OsString::as_os_str), "true", |candidate| {
+            self.elevated_executable(&candidate).ok()
+        }) else {
             return Ok(false);
         };
         match self.run_noninteractive(probe, &[], AUTHORIZATION_PROBE_LIMITS, true) {
@@ -570,25 +568,29 @@ pub(crate) fn resolve_trusted_sudo(path: &Path) -> Result<PathBuf, ()> {
 /// complete trusted-executable and root-owned ancestor validation before it is
 /// returned; user-writable or relative PATH entries cannot become authority.
 pub(crate) fn discover_trusted_sudo(path: Option<&OsStr>) -> Option<PathBuf> {
-    sudo_candidates(path)
-        .into_iter()
-        .find_map(|candidate| resolve_trusted_sudo(&candidate).ok())
+    find_executable(path, "sudo", |candidate| {
+        resolve_trusted_sudo(&candidate).ok()
+    })
 }
 
-fn sudo_candidates(path: Option<&OsStr>) -> Vec<PathBuf> {
+fn find_executable<T>(
+    path: Option<&OsStr>,
+    name: &str,
+    accept: impl FnMut(PathBuf) -> Option<T>,
+) -> Option<T> {
     let mut candidates = path
         .into_iter()
         .flat_map(env::split_paths)
         .filter(|directory| directory.is_absolute())
-        .map(|directory| directory.join("sudo"))
+        .map(|directory| directory.join(name))
         .collect::<Vec<_>>();
-    for fallback in ["/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"] {
-        let fallback = PathBuf::from(fallback);
+    for directory in PATH_FALLBACK_DIRECTORIES {
+        let fallback = Path::new(directory).join(name);
         if !candidates.contains(&fallback) {
             candidates.push(fallback);
         }
     }
-    candidates
+    candidates.into_iter().find_map(accept)
 }
 
 /// Validate an executable and every path element that selects it while
@@ -658,12 +660,23 @@ fn validate_trusted_spelling(path: &Path) -> Result<(), ()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::sudo_candidates;
+    use super::find_executable;
     use std::env;
-    use std::path::PathBuf;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    fn searched(path: Option<&OsStr>, name: &str) -> Vec<PathBuf> {
+        let mut searched = Vec::new();
+        let found = find_executable(path, name, |candidate| {
+            searched.push(candidate);
+            None::<PathBuf>
+        });
+        assert_eq!(found, None);
+        searched
+    }
 
     #[test]
-    fn sudo_discovery_includes_absolute_path_entries_before_fixed_fallbacks() {
+    fn executable_discovery_includes_absolute_path_entries_before_fixed_fallbacks() {
         let path = env::join_paths([
             PathBuf::from("relative-bin"),
             PathBuf::from("/opt/vendor/sbin"),
@@ -671,13 +684,44 @@ mod tests {
         ])
         .expect("representable PATH");
 
-        let candidates = sudo_candidates(Some(&path));
+        for name in ["sudo", "true"] {
+            assert_eq!(
+                searched(Some(&path), name),
+                [
+                    PathBuf::from("/opt/vendor/sbin").join(name),
+                    PathBuf::from("/usr/bin").join(name),
+                    PathBuf::from("/bin").join(name),
+                    PathBuf::from("/usr/local/bin").join(name),
+                ]
+            );
+        }
+    }
 
-        assert_eq!(candidates[0], PathBuf::from("/opt/vendor/sbin/sudo"));
-        assert_eq!(candidates[1], PathBuf::from("/usr/bin/sudo"));
-        assert!(!candidates.contains(&PathBuf::from("relative-bin/sudo")));
-        assert!(candidates.contains(&PathBuf::from("/bin/sudo")));
-        assert!(candidates.contains(&PathBuf::from("/usr/local/bin/sudo")));
+    #[test]
+    fn executable_discovery_without_path_uses_only_fixed_fallbacks() {
+        assert_eq!(
+            searched(None, "true"),
+            [
+                PathBuf::from("/usr/bin/true"),
+                PathBuf::from("/bin/true"),
+                PathBuf::from("/usr/local/bin/true"),
+            ]
+        );
+    }
+
+    #[test]
+    fn executable_discovery_returns_the_first_accepted_candidate() {
+        let mut searched = Vec::new();
+        let found = find_executable(None, "true", |candidate| {
+            searched.push(candidate.clone());
+            (candidate == Path::new("/bin/true")).then_some(candidate)
+        });
+
+        assert_eq!(found, Some(PathBuf::from("/bin/true")));
+        assert_eq!(
+            searched,
+            [PathBuf::from("/usr/bin/true"), PathBuf::from("/bin/true")]
+        );
     }
 }
 
