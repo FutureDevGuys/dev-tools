@@ -1,10 +1,23 @@
 # Active work
 
-- Dev Auth 0.5.2 is the newest published Dev Auth release (2026-10-16, source `42e2bbc`). Main carries the 0.5.4 source candidate. Its additions since 0.5.2 are source-only: setup-owned updates (ADR 0120), setup-owned mutable binding activation (ADR 0117), captured native workload streams (ADR 0131), the mode-bound setup transition root (ADR 0130), native-account workstation configuration (ADR 0133), operation-only SSH signing (ADRs 0132 and 0134) and admission-bound environment projections (ADR 0135). Their native, signed and installed acceptance remains open. Do not attribute them to the 0.5.2 artifact or reuse its identity for different bytes.
-- Native qualification of the maintenance sessions, receipt-install adapter and administrator grants that 0.5.2 ships remains open (ADRs 0094, 0095, 0115, 0116 and 0119). A container under a shifted 65,536-ID mapping cannot qualify strong admission: an account-free `PrivateUsers=full` probe fails with 217/USER. Run signed fresh, upgrade, interruption and restoration acceptance in a native environment with full identity-map support, and do not weaken map, admission or service-hardening checks to pass elsewhere.
-- Released Dev Auth through 0.5.5 renders a setup plan in whichever executable plans it and validates the whole plan before handing it to its candidate, so a cross-release upgrade fails on the grant payload, action list or current-state inventory. Main renders and validates a plan only in the release it installs (ADR 0140). Until a release ships that, and for the first upgrade from 0.5.5 or older, plan and apply with the new release's own executable, and apply a strong installation directly as root rather than through `--authorize`.
-- Some `cargo test -p dev-auth` cases depend on host state (native tool ownership, enrollment metadata, shell completion and PTY behavior) and fail on some hosts. Make them hermetic without relaxing their checks.
-- Update All 0.1.17 and Skills Sync 0.2.1 are prepared in source and unpublished; the newest releases are Update All 0.1.16 and Skills Sync 0.2.0.
-- Dev Cache's native container cache stays off by default. Native Docker acceptance and installed-release qualification have not run (issue 41).
-- Sync Configs issue 84: a sudo prompt can stall unreadably when the command is not in the terminal foreground.
-- Windows, WSL and macOS qualification and broader release-distribution outcomes remain separate. Keep remaining product and registry outcomes in the accepted completion plan, and do not reopen completed work without a reproduced regression or unmet acceptance condition.
+- **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
+  - a PolicyKit restart must not end grants;
+  - an abnormal coordinator exit restarts the coordinator;
+  - a rollback keeps the binary and its unit in step;
+  - per-job task limits and a systemd-oomd preference;
+  - the flaky packet test;
+  - a rerun message for `exec` while the coordinator drains.
+
+  Remaining: the approval-classification test and the issue's unfinished items, then a merge-commit pull request.
+- **Dev Auth 0.5.6**, after #105 merges.
+  - Advance `crates/dev-auth` and `crates/dev-auth-sudo` to 0.5.6 with `Cargo.lock`.
+  - Then build twice, compare, verify and publish through the approved release-builder workload; that step waits on the owner's approval. The newest published release is 0.5.5.
+  - Releases through 0.5.5 judge a setup plan in the release that plans it (ADR 0140), so an upgrade from 0.5.5 or older must plan with the 0.5.6 executable itself.
+- **Agent Plugins as a Dev Tools product**, after Dev Auth 0.5.6. The owner: "Do this task here: 'dev-tools: agent-plugins as an encapsulated, modular product'". Their wider direction: "it needs to be able to just work when given a config or just given arguments or flags. However, I think that there should be commands to generate default configurations too", "I think update all also does something similar, so that would need to change too", and "the finished tools themselves are encapsulated and hermetic". Not started. The work:
+  - port the agent-tooling projector to Rust on shared crates;
+  - add a command that writes the default configuration;
+  - use the shared update and release crates, then release the product;
+  - move Update All's similar logic onto the same shared crate.
+- Update All 0.1.17 and Skills Sync 0.2.1 are prepared in source and unpublished. The newest releases are Update All 0.1.16 and Skills Sync 0.2.0.
+- Dev Cache's native container cache stays off by default, and native Docker acceptance has not run (#41).
+- Native Windows, WSL and macOS acceptance has not run, so supported platforms are Linux only.
