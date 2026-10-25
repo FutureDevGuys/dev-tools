@@ -22,6 +22,10 @@ Public CLI, protocol, release, installation, or privilege contract changes SHALL
 
 # Verification
 
-Keep each integration slice independently buildable and testable. A target build does not establish runtime support; claim support only after the native acceptance required by the product standard and applicable ADR passes.
+Verify a change by running the product the way its users will, then the tests that cover it. A target build does not establish platform support; advertise a platform only after the product standard's native acceptance passes on it.
 
 Tests SHALL create the files, environment, and fake providers they need in private temporary locations, and SHALL pass unchanged on any supported host, independent of the developer's home directory, accounts, installed tools, credentials, network, and root access.
+
+# Work State
+
+Keep the work state in `context/state.md`: each unfinished item or active risk in a line or two, naming what remains, where its work lives (branch, pull request), and what it waits on. Remove resolved items.
