@@ -21,3 +21,4 @@
 - Update All 0.1.17 and Skills Sync 0.2.1 are prepared in source and unpublished. The newest releases are Update All 0.1.16 and Skills Sync 0.2.0.
 - Dev Cache's native container cache stays off by default, and native Docker acceptance has not run (#41).
 - Native Windows, WSL and macOS acceptance has not run, so supported platforms are Linux only.
+- Branches `auric/generic-secret-projection-policy-20261022` (1,220 changed lines) and `feat/generic-workload-acceptance-20261022` (599) hold unmerged Dev Auth projection and acceptance work with no pull request. #75 may supersede them; compare before reusing or deleting them.
