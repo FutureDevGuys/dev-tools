@@ -170,14 +170,8 @@ pub(super) async fn approve(
     let response = match response {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
-            match &error {
-                zbus::Error::MethodError(name, _, _) => {
-                    eprintln!("dev-auth native approval transport rejected: {name}");
-                }
-                _ => eprintln!("dev-auth native approval transport unavailable"),
-            }
             cancel(&connection, &cancellation).await;
-            return Err(Failure::ApprovalDenied);
+            return Err(transport_failure(&error));
         }
         Err(_) => {
             eprintln!("dev-auth native approval timed out");
@@ -197,6 +191,17 @@ pub(super) async fn approve(
         return Err(Failure::ApprovalDenied);
     }
     Ok(())
+}
+
+/// The outcome of a request whose approval call failed with `error`.
+fn transport_failure(error: &zbus::Error) -> Failure {
+    match error {
+        zbus::Error::MethodError(name, _, _) => {
+            eprintln!("dev-auth native approval transport rejected: {name}");
+        }
+        _ => eprintln!("dev-auth native approval transport unavailable"),
+    }
+    Failure::ApprovalDenied
 }
 
 fn subject_properties(
@@ -465,6 +470,55 @@ mod tests {
         assert!(!shown.message.contains("Program:"));
         assert!(disclosure(1000, 4242, &user, Some(&converge(&[]))).is_err());
         assert!(disclosure(1000, 4242, &command_request(), None).is_err());
+    }
+
+    #[test]
+    fn a_polkit_that_cannot_answer_makes_approval_unavailable_and_the_request_retryable() {
+        use zbus::fdo::Error as Reply;
+        let polkit = || "org.freedesktop.PolicyKit1".to_owned();
+        for (error, why) in [
+            (
+                zbus::Error::InputOutput(std::sync::Arc::new(
+                    std::io::ErrorKind::ConnectionReset.into(),
+                )),
+                "the bus connection broke",
+            ),
+            (
+                zbus::Error::FDO(Box::new(Reply::NameHasNoOwner(polkit()))),
+                "PolicyKit is stopped",
+            ),
+            (
+                zbus::Error::FDO(Box::new(Reply::ServiceUnknown(polkit()))),
+                "PolicyKit is not activatable",
+            ),
+            (
+                zbus::Error::FDO(Box::new(Reply::SpawnChildExited(polkit()))),
+                "PolicyKit failed to start",
+            ),
+            (
+                zbus::Error::FDO(Box::new(Reply::NoReply(polkit()))),
+                "PolicyKit restarted during the approval",
+            ),
+            (
+                zbus::Error::FDO(Box::new(Reply::Disconnected(polkit()))),
+                "the bus disconnected",
+            ),
+        ] {
+            let failure = transport_failure(&error);
+            assert_eq!(
+                serde_json::to_value(failure).unwrap(),
+                "approval_unavailable",
+                "{why}"
+            );
+            assert_eq!(failure.exit_code(), 3, "{why}: retryable, like busy");
+        }
+        for error in [
+            zbus::Error::FDO(Box::new(Reply::AccessDenied(polkit()))),
+            zbus::Error::FDO(Box::new(Reply::Failed(polkit()))),
+            zbus::Error::InvalidReply,
+        ] {
+            assert_eq!(transport_failure(&error), Failure::ApprovalDenied, "{error}");
+        }
     }
 
     #[test]

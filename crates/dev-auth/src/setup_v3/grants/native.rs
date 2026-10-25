@@ -4,10 +4,6 @@ use std::time::{Duration, Instant};
 
 const PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,FragmentPath,DropInPaths,ControlGroup,MainPID,ControlPID,Job,UnitFileState,KillMode,SendSIGKILL,Delegate,ExitType,RemainAfterExit,TimeoutStopUSec";
 
-/// The kill mode and stop timeout of the unit that setup publishes, and of
-/// the unit it replaces, which setup still observes so that it can stop that
-/// coordinator (ADR 0141).
-const TEARDOWN: [(&str, &str); 2] = [("mixed", "1min 30s"), ("control-group", "5s")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,7 +100,7 @@ fn parse(bytes: &[u8]) -> Result<State> {
     }
     if fields["LoadState"] != "loaded"
         || fields["FragmentPath"] != SERVICE
-        || !TEARDOWN.contains(&(fields["KillMode"], fields["TimeoutStopUSec"]))
+        || !assets::TEARDOWNS.contains(&(fields["KillMode"], fields["TimeoutStopUSec"]))
         || fields["SendSIGKILL"] != "yes"
         || fields["Delegate"] != "no"
         || fields["ExitType"] != "main"
