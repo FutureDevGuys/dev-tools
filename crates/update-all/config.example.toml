@@ -161,7 +161,8 @@ catalogs = []
 #   predecessors. Direct `after` entries are still honored when selected.
 # - requires_elevation: command needs elevated privileges.
 # - needs_sudo_session: command should reuse update-all's managed sudo session.
-# - interactive: command may prompt and should stay dashboard-aware.
+# - interactive: command may prompt. On Linux, declared sudo-session tasks use
+#   native input on the startup terminal; stdout and stderr remain captured.
 # - shell: run a raw platform shell fragment rather than exec-ing the command directly.
 #   When true, command + args are joined as shell text; quote/escape them yourself.
 # - command_candidates: alternate direct commands for the same updater. Candidates

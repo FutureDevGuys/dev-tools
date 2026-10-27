@@ -4,9 +4,165 @@ use crate::ProcessDomain;
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{self, Read};
+use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
+use std::rc::Rc;
 use std::time::Duration;
+
+/// Exclusive, calling-thread custody of the inherited controlling terminal.
+///
+/// The caller serializes terminal users and suspends its own terminal reads and
+/// rendering before opening this guard. The guard changes only this thread's
+/// SIGTTOU mask and no process-wide disposition. It neither authorizes nor reaps
+/// commands, forwards signals, enforces deadlines, or contains descendants.
+/// The caller owns the child until terminal custody has been restored.
+///
+/// This guard is deliberately neither Send nor Sync because its saved signal
+/// mask belongs to the opening thread. `restore` reports restoration errors;
+/// dropping the guard performs the same restoration as a best-effort fallback.
+pub struct ForegroundTerminal {
+    terminal: Option<Terminal>,
+    attributes: libc::termios,
+    previous_mask: libc::sigset_t,
+    mask_active: bool,
+    unblock_child_sigttou: bool,
+    _calling_thread: PhantomData<Rc<()>>,
+}
+
+impl ForegroundTerminal {
+    /// Retain the current terminal and require the caller's foreground group.
+    /// Returns None only when the caller has no controlling terminal.
+    pub fn open() -> Result<Option<Self>> {
+        let Some(terminal) = Terminal::open()? else {
+            return Ok(None);
+        };
+        terminal.require_foreground()?;
+        // SAFETY: termios and sigset_t are initialized POD output objects.
+        let (mut attributes, mut mask, mut previous_mask) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed()) };
+        // SAFETY: the retained file names this thread's controlling terminal.
+        if unsafe { libc::tcgetattr(terminal.file.as_raw_fd(), &mut attributes) } != 0 {
+            return Err(io::Error::last_os_error()).context("save terminal attributes");
+        }
+        // SAFETY: initialized native masks are borrowed only during these calls.
+        let error = unsafe {
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGTTOU);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous_mask)
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error))
+                .context("block terminal handoff signal");
+        }
+        // SAFETY: the successful native exchange initialized previous_mask.
+        let unblock_child_sigttou =
+            unsafe { libc::sigismember(&previous_mask, libc::SIGTTOU) } == 0;
+        Ok(Some(Self {
+            terminal: Some(terminal),
+            attributes,
+            previous_mask,
+            mask_active: true,
+            unblock_child_sigttou,
+            _calling_thread: PhantomData,
+        }))
+    }
+
+    /// Prepare a dedicated child group without inheriting the guard's SIGTTOU
+    /// block. Invoke once before spawn; other prepared callbacks stay intact.
+    pub fn prepare_child(&self, command: &mut Command) {
+        command.process_group(0);
+        if self.unblock_child_sigttou {
+            // SAFETY: the child callback uses only async-signal-safe native mask
+            // operations and captures no parent references or allocation.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGTTOU);
+                    if libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()) == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+    }
+
+    /// Transfer foreground ownership to this unreaped direct child's group.
+    /// The caller must retain exclusive child reaping and signal ownership.
+    pub fn give_to(&mut self, child: &Child) -> Result<()> {
+        let group = i32::try_from(child.id()).context("terminal child group is out of range")?;
+        let domain = ProcessDomain::for_child(child);
+        crate::process_exit_observed(domain).context("terminal child wait custody unavailable")?;
+        // SAFETY: the caller retains this direct child's wait identity. These
+        // query-only calls cannot affect the process or its group.
+        if unsafe { libc::getpgid(group) } != group
+            || unsafe { libc::getsid(group) } != unsafe { libc::getsid(0) }
+        {
+            bail!("terminal child must lead a group in the caller's session");
+        }
+        self.terminal
+            .as_mut()
+            .context("terminal custody already restored")?
+            .give_to_required(group)
+    }
+
+    /// Restore terminal ownership, terminal attributes and the opening thread's
+    /// signal mask. All restorations are attempted even if one reports failure.
+    pub fn restore(mut self) -> Result<()> {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        if let Some(mut terminal) = self.terminal.take() {
+            if let Err(error) = terminal.restore() {
+                errors.push(error.to_string());
+            }
+            // SAFETY: retained original termios and the same live terminal file;
+            // SIGTTOU stays blocked through this and Terminal's Drop fallback.
+            if unsafe {
+                libc::tcsetattr(terminal.file.as_raw_fd(), libc::TCSANOW, &self.attributes)
+            } != 0
+            {
+                errors.push(format!(
+                    "restore terminal attributes: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            drop(terminal);
+        }
+        if self.mask_active {
+            // SAFETY: !Send/!Sync retain this initialized mask's opening thread.
+            let error = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut())
+            };
+            if error == 0 {
+                self.mask_active = false;
+            } else {
+                errors.push(format!(
+                    "restore terminal signal mask: {}",
+                    io::Error::from_raw_os_error(error)
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "));
+        }
+    }
+}
+
+impl Drop for ForegroundTerminal {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
 
 pub(crate) struct Signals {
     pub(crate) previous: libc::sigset_t,

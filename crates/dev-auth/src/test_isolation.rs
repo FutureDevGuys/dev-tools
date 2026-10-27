@@ -5,6 +5,8 @@
 //! pipe writer or executable writer closed here can therefore stay open for an
 //! unbounded time. The isolated process has no concurrent test threads.
 
+#![cfg(test)]
+
 const MARKER: &str = "DEV_AUTH_ISOLATED_UNIT_TEST";
 
 /// Returns `false` inside the isolated process, where the caller runs its body.

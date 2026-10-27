@@ -18,5 +18,8 @@ fn main() {
         .open(root.join("calls.tsv"))
         .unwrap();
     writeln!(calls, "{}", arguments.join("\t")).unwrap();
-    println!("{{\"fixture\":true,\"updated\":false}}");
+    println!(
+        "{{\"schema\":\"dev-tools-operation-result-v2\",\"product\":\"{}\",\"operation\":\"update_apply\",\"outcome\":\"completed\",\"changed\":false,\"exit_code\":0}}",
+        arguments[2]
+    );
 }

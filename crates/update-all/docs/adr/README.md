@@ -57,6 +57,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0044](0044-preserving-run-artifact-replacement.md) | Preserving run artifact replacement | proposed | pending |
 | [0045](0045-truthful-operation-observations.md) | Truthful operation observations | proposed | pending |
 | [0046](0046-completion-sync-result-observations.md) | Completion sync result observations | proposed | pending |
+| [0047](0047-startup-terminal-sudo-reuse.md) | Original-terminal sudo reuse with captured custom-task results | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

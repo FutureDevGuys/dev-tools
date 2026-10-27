@@ -660,6 +660,7 @@ fn pipe_records(
             collected.lock().unwrap().push((kind, line));
         })),
         guard,
+        None,
     )
     .join()
     .unwrap();

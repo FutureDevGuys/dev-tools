@@ -8,6 +8,8 @@ owner: dev-tools/update-all
 status: proposed
 verification: pending
 
+[ADR 0047](0047-startup-terminal-sudo-reuse.md) supersedes Linux interactive task-terminal execution for prompt_tty and required. Admission meanings, auto deferrals, and no-replay rules remain.
+
 ## Context
 
 Some hosts cannot provide sudo or interactive authentication. Aborting every

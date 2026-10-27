@@ -668,7 +668,7 @@ fn windows_manager_gates_machine_winget_after_user_scope() {
 }
 
 #[test]
-fn arch_update_services_builtin_uses_dashboard_input_with_sudo_preflight() {
+fn arch_update_services_builtin_declares_interactive_sudo_session() {
     let tasks = builtin_catalog().expect("builtin catalog");
     let yay = tasks
         .iter()

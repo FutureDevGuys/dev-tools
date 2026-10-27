@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::result::CompletionObservation;
 use super::CompletionSnapshotPublishOutcome;
 use serde_json::Value;

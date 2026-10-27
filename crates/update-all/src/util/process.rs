@@ -528,8 +528,6 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    // Foreground interactive commands must stay in the caller's process group so
-    // terminal input (e.g., password prompts) behaves like normal shell execution.
     run_capture_with_options(
         program,
         args,
@@ -541,7 +539,7 @@ where
         Some(cancel_check),
         Some(on_spawn),
         Some(on_exit),
-        false,
+        cfg!(target_os = "linux"),
         None,
         None,
     )
@@ -936,6 +934,18 @@ where
         .collect::<Vec<OsString>>();
     let mut cmd = command_for_executable(&resolved_program);
     cmd.args(&args);
+    #[cfg(target_os = "linux")]
+    let mut terminal = if stdin_inherit && stdin_rx.is_none() {
+        dev_tools_command::ForegroundTerminal::open()?
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(terminal) = &terminal {
+        terminal.prepare_child(&mut cmd);
+    }
+    #[cfg(target_os = "linux")]
+    let managed_process_group = managed_process_group || terminal.is_some();
     if stdin_rx.is_some() {
         cmd.stdin(Stdio::piped());
     } else if stdin_inherit {
@@ -952,6 +962,22 @@ where
         cmd.stderr(Stdio::piped());
     }
 
+    #[cfg(target_os = "linux")]
+    let terminal_mirror = if terminal.is_some() && !stdout_stderr_inherit {
+        use std::os::unix::fs::OpenOptionsExt;
+        Some(Arc::new(
+            File::options()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK)
+                .open("/dev/tty")
+                .context("open nonblocking terminal output")?,
+        ))
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let terminal_mirror: Option<Arc<std::fs::File>> = None;
+
     #[cfg(unix)]
     if managed_process_group {
         // Create a dedicated process group so cancellation can terminate descendants too.
@@ -962,6 +988,20 @@ where
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", resolved_program.display()))?;
+    #[cfg(target_os = "linux")]
+    if let Some(terminal) = terminal.as_mut() {
+        if let Err(error) = terminal.give_to(&child) {
+            terminate_child(&mut child, true);
+            let _ = child.wait();
+            return Err(error);
+        }
+        // The child can reach a terminal read before its parent's handoff.
+        // SAFETY: the unreaped direct child owns this admitted process group.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGCONT);
+        }
+    }
     let stdin_writer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stdin_writer = if let Some(rx) = stdin_rx {
         let stop = stdin_writer_stop.clone();
@@ -999,6 +1039,7 @@ where
             reader,
             line_cb.clone(),
             guard_state.clone(),
+            terminal_mirror.clone(),
         ))
     } else {
         None
@@ -1009,6 +1050,7 @@ where
             reader,
             line_cb.clone(),
             guard_state.clone(),
+            terminal_mirror.clone(),
         ))
     } else {
         None
@@ -1050,6 +1092,10 @@ where
     }
     let out_bytes = stdout_reader.map(join_pipe_reader).unwrap_or_default();
     let err_bytes = stderr_reader.map(join_pipe_reader).unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    if let Some(terminal) = terminal {
+        terminal.restore()?;
+    }
     let output = CapturedOutput {
         stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
@@ -1077,6 +1123,14 @@ where
         }
         Err(WaitOutcome::Other(error)) => return Err(error),
     };
+    #[cfg(unix)]
+    if stdin_inherit {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGINT) {
+            cancel::request_cancel();
+            return Err(anyhow!(Cancelled));
+        }
+    }
     if let Some(reason) = guard_state.as_ref().and_then(|state| state.reason()) {
         return Err(anyhow!(CaptureGuardError {
             reason,
@@ -1413,6 +1467,7 @@ fn read_pipe_thread<R: Read + Send + 'static>(
     mut reader: R,
     line_cb: Option<std::sync::Arc<dyn Fn(StreamKind, String) + Send + Sync>>,
     guard_state: Option<Arc<CaptureGuardState>>,
+    terminal_mirror: Option<Arc<std::fs::File>>,
 ) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut acc = Vec::new();
@@ -1425,6 +1480,11 @@ fn read_pipe_thread<R: Read + Send + 'static>(
             let read: usize = reader.read(&mut chunk).unwrap_or_default();
             if read == 0 {
                 break;
+            }
+            if let Some(output) = &terminal_mirror {
+                let mut output = output.as_ref();
+                // Backpressure affects display only; captured evidence keeps every byte.
+                let _ = output.write_all(&chunk[..read]);
             }
 
             if let Some(state) = &guard_state {
@@ -1772,6 +1832,26 @@ fn wait_with_cancel_timeout(
                 Ok(None) => Err(WaitOutcome::Cancelled),
                 Err(error) => Err(WaitOutcome::Other(anyhow!(error))),
             };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Observe job-control stops without consuming the child's exit.
+            #[allow(unsafe_code)]
+            let stopped = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                ) == 0
+                    && info.si_pid() != 0
+            };
+            if stopped {
+                return Err(WaitOutcome::Other(anyhow!(
+                    "command stopped by terminal job control; review the task before retrying"
+                )));
+            }
         }
         if let Some(state) = &guard_state {
             state.mark_stall_if_needed();
