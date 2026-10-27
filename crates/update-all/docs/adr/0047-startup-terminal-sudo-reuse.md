@@ -5,8 +5,8 @@ owner: dev-tools/update-all
 
 # ADR 0047: Reuse startup sudo authority on the original terminal
 
-status: proposed
-verification: pending
+status: accepted
+verification: verified
 
 ## Context
 
@@ -53,6 +53,10 @@ Typical terminal-scoped policy reuses the single startup authentication, includi
 Disposable native PTYs exercise the public executable in plain and dashboard modes with sync and async scheduling, concurrent custom tasks, controlled sudo, native terminal input, exact argv and parent/session/terminal identity, captured results, failure, cancellation, and job-control stop. These controlled sudo fixtures do not establish host sudo policy support. The shared terminal mechanism separately checks foreground and terminal restoration through explicit completion, Drop, panic, spawn failure, background refusal, and absent terminals.
 
 Before accepting this decision or activating a release, run the exact candidate with real sudo through a user-visible terminal and a harmless isolated catalog. The user enters any credential directly into native sudo. Verify one startup authentication, subsequent direct and nested launches, exact argv, captured result agreement, no protected replay, and cancellation cleanup. Native non-Linux acceptance remains unrun. Signed publication and receipt-owned installation are separate milestones.
+
+## Linux qualification evidence
+
+The signed Linux x86-64 0.1.17 artifact from source `74ce7f9a157b88297952073f4ff0e38ab2e8eada` passed native direct and nested sudo launches under the host's current configuration. The intentional exit-7 task emitted its protected effect once and remained failed despite a configured retry budget. Cancellation returned exit 3 with a saved canceled task. The two independently constructed release sets were byte-identical, authenticated publication verified the public downloads, and managed activation retained 0.1.16 for rollback. The installed executable matches the native-qualified artifact SHA-256 `76e84de6b03110b9fe2c7c426b82bef6b6d5d0edc907fb2ff1fddc03c28f1b1f`. The published manifest generation is 18. Native policy-matrix and non-Linux lanes remain unrun.
 
 ## Supersession conditions
 

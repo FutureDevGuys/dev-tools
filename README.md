@@ -30,7 +30,7 @@ A native Linux x86-64 host can download `update-all-0.1.8-linux-x86_64` from the
 
 The current stable `dev-auth` is distributed through the same signed release format and provisioned through its product-owned setup workflow. It remains deliberately outside unattended `update-all` product installation because setup includes administrator policy and explicit credential enrollment.
 
-After that, `update-all` checks its authenticated stable manifest automatically no more than once every six hours and the public `builtin/dev-tools-*` tasks update only products already installed. Fresh and steady-state `sync-configs` installations use a target-specific native executable and need no Python runtime. A managed upgrade from the retained Python `sync-configs 0.1.13` artifact keeps that interpreter available only through adoption and the rollback window, as described in the [sync-configs guide](docs/sync-configs.md).
+Ordinary `update-all` runs update already-installed managed products through the visible `builtin/dev-tools-*` tasks when those tasks are selected. Startup performs no hidden release check or activation; the legacy `install.auto_update` field is inert. Use `update-all self update` for an explicit authenticated update of the installed updater. Fresh and steady-state `sync-configs` installations use a target-specific native executable and need no Python runtime. A managed upgrade from the retained Python `sync-configs 0.1.13` artifact keeps that interpreter available only through adoption and the rollback window, as described in the [sync-configs guide](docs/sync-configs.md).
 
 | Platform | Status | Notes |
 |---|---|---|

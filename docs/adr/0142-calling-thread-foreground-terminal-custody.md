@@ -5,8 +5,8 @@ owner: dev-tools
 
 # ADR 0142: Calling-thread foreground terminal custody
 
-status: proposed
-verification: pending
+status: accepted
+verification: verified
 
 ## Context
 
@@ -21,3 +21,7 @@ Explicit restoration and Drop restore the original foreground group, terminal at
 ## Verification
 
 The shared native inherited fixture tests explicit restoration, Drop, panic, spawn failure, background refusal, absent controlling terminals, foreground /dev/tty input, child signal masks, and terminal-attribute restoration through disposable PTYs. The shared crate's library, integration, documentation, formatting, and strict lint checks pass. Update All's consuming executable separately checks terminal handoff and captured custom-task results. These checks establish Linux terminal mechanics; they do not establish real sudo policy support, signed publication, installed acceptance, or non-Linux qualification.
+
+## Linux consumer qualification
+
+Update All 0.1.17 compiled this mechanism from source `74ce7f9a157b88297952073f4ff0e38ab2e8eada`. Its signed Linux x86-64 artifact passed direct and nested native sudo launches, an intentional protected failure without replay, and cancellation with matching saved outcomes. Managed installation activated those same verified bytes and retained the prior version for rollback. This accepts the Linux mechanism and exercised consumer path; it adds no non-Linux support or arbitrary-descendant containment claim.

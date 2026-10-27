@@ -1,6 +1,5 @@
 # Active work
 
-- **Update All 0.1.17 native qualification and delivery**, source correction in PR #107 (`codex/update-all-startup-sudo`). The owner: "Fix foundational update all in dev tools then you can work in each task as needed as part of syscfg separately since dev tools is meant to be many people using it with their own custom tasks". Generic original-terminal sudo execution, captured custom-task results, the existing NPM range correction, and automated validation are complete. The real-sudo attempt failed startup authentication before protected tasks began. Native acceptance, two authenticated release builds, publication, and managed activation remain pending; the local driver and evidence live in `.local/acceptance/update-all-startup-sudo-20261027/`. Private consumer task repairs live separately in Syscfg.
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
   - a PolicyKit restart must not end grants;
   - an abnormal coordinator exit restarts the coordinator;
@@ -19,7 +18,7 @@
   - add a command that writes the default configuration;
   - use the shared update and release crates, then release the product;
   - move Update All's similar logic onto the same shared crate.
-- Update All 0.1.17 and Skills Sync 0.2.1 are prepared in source and unpublished. The newest releases are Update All 0.1.16 and Skills Sync 0.2.0.
+- Skills Sync 0.2.1 is prepared in source and unpublished. The newest Skills Sync release is 0.2.0.
 - Dev Cache's native container cache stays off by default, and native Docker acceptance has not run (#41).
 - Native Windows, WSL and macOS acceptance has not run, so supported platforms are Linux only.
 - Branches `auric/generic-secret-projection-policy-20261022` (1,220 changed lines) and `feat/generic-workload-acceptance-20261022` (599) hold unmerged Dev Auth projection and acceptance work with no pull request. #75 may supersede them; compare before reusing or deleting them.
