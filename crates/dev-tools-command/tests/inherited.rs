@@ -91,6 +91,66 @@ mod linux {
         );
     }
 
+    fn terminal_attributes() -> libc::termios {
+        let mut attributes = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(0, &mut attributes) }, 0);
+        attributes
+    }
+
+    fn foreground_custody_case(name: &str) {
+        use dev_tools_command::ForegroundTerminal;
+        if name == "foreground-no-tty" {
+            assert!(ForegroundTerminal::open().unwrap().is_none());
+            return;
+        }
+        if name == "foreground-background-refuse" {
+            assert!(ForegroundTerminal::open().is_err());
+            return;
+        }
+        if name == "foreground-background" {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["case", "foreground-background-refuse"])
+                .process_group(0)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let original = unsafe { libc::tcgetpgrp(0) };
+        let attributes = terminal_attributes();
+        let mut terminal = ForegroundTerminal::open().unwrap().unwrap();
+        assert!(mask()[5], "handoff thread blocks SIGTTOU");
+        let mut command = child("foreground-probe");
+        terminal.prepare_child(&mut command);
+        if name == "foreground-spawn-failure" {
+            let mut missing = Command::new(fixture_root().join("absent-foreground-command"));
+            terminal.prepare_child(&mut missing);
+            assert!(missing.spawn().is_err());
+            terminal.restore().unwrap();
+        } else {
+            let mut child = command.spawn().unwrap();
+            terminal.give_to(&child).unwrap();
+            assert_eq!(
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGCONT) },
+                0
+            );
+            assert_eq!(child.wait().unwrap().code(), Some(23));
+            if name == "foreground-explicit" {
+                terminal.restore().unwrap();
+            } else if name == "foreground-panic" {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _terminal = terminal;
+                    panic!("intentional foreground custody panic");
+                }));
+                assert!(result.is_err());
+            } else {
+                drop(terminal);
+            }
+        }
+        assert_eq!(unsafe { libc::tcgetpgrp(0) }, original);
+        assert_eq!(terminal_attributes().c_lflag, attributes.c_lflag);
+    }
+
     fn terminal_graph_case(name: &str) {
         use dev_tools_command::{
             CommandGraphNode, GraphDependencies, GraphExitPolicy, TerminalGraphSignalMask,
@@ -737,6 +797,7 @@ mod linux {
                 assert!(!output.cancelled);
             }
             value if value.starts_with("terminal-graph-") => terminal_graph_case(value),
+            value if value.starts_with("foreground-") => foreground_custody_case(value),
             _ => panic!("unknown fixture"),
         }
         assert_eq!(mask(), before, "calling thread mask must be restored");
@@ -750,6 +811,20 @@ mod linux {
     pub fn run() {
         let args: Vec<_> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("child") {
+            if args.get(2).map(String::as_str) == Some("foreground-probe") {
+                use std::io::Read;
+                assert!(
+                    !mask()[5],
+                    "payload must not inherit the guard's SIGTTOU block"
+                );
+                let mut tty = std::fs::File::open("/dev/tty").unwrap();
+                tty.read_exact(&mut [0u8]).unwrap();
+                assert_eq!(unsafe { libc::tcgetpgrp(0) }, unsafe { libc::getpgrp() });
+                let mut attributes = terminal_attributes();
+                attributes.c_lflag ^= libc::ECHO;
+                assert_eq!(unsafe { libc::tcsetattr(0, libc::TCSANOW, &attributes) }, 0);
+                std::process::exit(23);
+            }
             if args.get(2).map(String::as_str) == Some("signal-without-core") {
                 // Only this synthetic helper opts out of host core collection.
                 // Its ready receipt follows the kernel-confirmed setting, so the
@@ -832,6 +907,12 @@ mod linux {
             return;
         }
         const FIXTURES: &[&str] = &[
+            "foreground-explicit",
+            "foreground-drop",
+            "foreground-panic",
+            "foreground-spawn-failure",
+            "foreground-background",
+            "foreground-no-tty",
             "startup-observer-failure",
             "failed-spawn-no-observer",
             "exit",
@@ -896,6 +977,7 @@ mod linux {
             let mut terminal = None;
             if matches!(name, "terminal" | "jobcontrol")
                 || (name.starts_with("terminal-graph-") && name != "terminal-graph-no-tty")
+                || (name.starts_with("foreground-") && name != "foreground-no-tty")
             {
                 use std::os::fd::{AsRawFd, FromRawFd};
                 let (mut master, mut slave) = (-1, -1);
@@ -929,7 +1011,7 @@ mod linux {
                     });
                 }
                 terminal = Some((master, slave));
-            } else if name == "terminal-graph-no-tty" {
+            } else if matches!(name, "terminal-graph-no-tty" | "foreground-no-tty") {
                 unsafe {
                     command.pre_exec(|| {
                         if libc::setsid() < 0 {
@@ -946,7 +1028,10 @@ mod linux {
             let mut process = command.spawn().unwrap();
             if matches!(
                 name,
-                "terminal-graph-pipe"
+                "foreground-explicit"
+                    | "foreground-drop"
+                    | "foreground-panic"
+                    | "terminal-graph-pipe"
                     | "terminal-graph-jobcontrol"
                     | "terminal-graph-stop-expiry"
                     | "terminal-graph-interrupt"

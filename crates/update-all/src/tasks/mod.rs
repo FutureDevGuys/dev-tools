@@ -973,6 +973,15 @@ pub(crate) struct PrivilegeSession {
     sudo_runtime_error: Mutex<Option<String>>,
     sudo_refresh_gate: Mutex<()>,
     auto_unavailable: Mutex<Option<PrivilegeUnavailable>>,
+    terminal_gate: Mutex<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandIo {
+    Captured,
+    Dashboard,
+    Terminal,
+    DirectTerminal,
 }
 
 #[cfg(unix)]
@@ -1352,15 +1361,15 @@ impl SyncContext {
     ) -> Result<String> {
         // Interactive tasks should use foreground TTY to avoid dashboard/raw-mode
         // contention with tools that may prompt or manipulate terminal state.
-        let (foreground_tty, capture_foreground_output) = if interactive {
+        let io = if interactive {
             match self.interactive_runtime.mode {
-                InteractiveExecutionMode::DirectTty => (true, false),
+                InteractiveExecutionMode::DirectTty => CommandIo::DirectTerminal,
                 InteractiveExecutionMode::Capture | InteractiveExecutionMode::AutoFallback => {
-                    (true, true)
+                    CommandIo::Dashboard
                 }
             }
         } else {
-            (false, false)
+            CommandIo::Captured
         };
         self.run_command_with_policy_mode(
             task_id,
@@ -1368,8 +1377,7 @@ impl SyncContext {
             args,
             policy,
             interactive,
-            foreground_tty,
-            capture_foreground_output,
+            io,
             replay_policy,
         )
     }
@@ -1388,8 +1396,7 @@ impl SyncContext {
             args,
             policy,
             interactive,
-            true,
-            false,
+            CommandIo::DirectTerminal,
             CommandReplayPolicy::Configured,
         )
     }
@@ -1408,8 +1415,7 @@ impl SyncContext {
             args,
             policy,
             true,
-            true,
-            false,
+            CommandIo::DirectTerminal,
             CommandReplayPolicy::for_allowed_replay(allow_replay),
         )
     }
@@ -1468,10 +1474,35 @@ impl SyncContext {
         args: Vec<String>,
         policy: &TaskPolicy,
         interactive: bool,
-        foreground_tty: bool,
-        capture_foreground_output: bool,
+        io: CommandIo,
         replay_policy: CommandReplayPolicy,
     ) -> Result<String> {
+        let native_terminal = matches!(io, CommandIo::Terminal | CommandIo::DirectTerminal);
+        let _terminal_lease = if native_terminal {
+            loop {
+                if cancel::is_cancel_requested()
+                    || self
+                        .runtime_control
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.should_cancel(task_id))
+                {
+                    return Err(anyhow::anyhow!(crate::Cancelled));
+                }
+                match self.privilege_session.terminal_gate.try_lock() {
+                    Ok(lease) => break Some(lease),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        thread::sleep(Duration::from_millis(25))
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        bail!("foreground terminal lease is unavailable")
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let foreground_tty = io != CommandIo::Captured;
+        let capture_foreground_output = matches!(io, CommandIo::Dashboard | CommandIo::Terminal);
         let mut attempt = 0u32;
         let mut fallback_consumed = false;
         let mut capture_this_run = capture_foreground_output;
@@ -1489,16 +1520,25 @@ impl SyncContext {
             }
             let args_for_run = args.clone();
             let task = task_id.to_string();
-            let cb = self.build_stream_callback(task_id, interactive && capture_this_run);
+            let cb = self.build_stream_callback(
+                task_id,
+                interactive && capture_this_run && !native_terminal,
+            );
             let capture_enabled_for_run = capture_this_run;
-            let suspend_ui_for_command =
-                interactive && self.runtime_control.is_some() && !capture_enabled_for_run;
+            let suspend_ui_for_command = interactive
+                && self.runtime_control.is_some()
+                && self.event_tx.is_some()
+                && (native_terminal || !capture_enabled_for_run);
             if suspend_ui_for_command {
                 let suspended = self.request_ui_suspend_and_wait(
                     format!("suspending dashboard for interactive command: {}", program),
                     Duration::from_secs(2),
                 );
                 if !suspended {
+                    if native_terminal {
+                        let _ = self.request_ui_resume_and_wait(Duration::from_secs(2));
+                        bail!("dashboard did not release the foreground terminal; command was not started");
+                    }
                     self.log_line(
                         task_id,
                         LogLevel::Warn,
@@ -1511,7 +1551,7 @@ impl SyncContext {
                 }
             }
             let entering_interactive_foreground =
-                interactive && foreground_tty && !capture_enabled_for_run;
+                interactive && foreground_tty && (native_terminal || !capture_enabled_for_run);
             if entering_interactive_foreground {
                 self.log_line(
                     task_id,
@@ -1532,13 +1572,14 @@ impl SyncContext {
             let dashboard_managed_input = interactive
                 && capture_enabled_for_run
                 && foreground_tty
+                && !native_terminal
                 && self.runtime_control.is_some();
             let auto_fallback_enabled = interactive
                 && !dashboard_managed_input
                 && self.interactive_runtime.mode == InteractiveExecutionMode::AutoFallback
                 && self.interactive_runtime.retry_once;
             let capture_guard = if interactive && capture_enabled_for_run {
-                let stall_timeout = if dashboard_managed_input {
+                let stall_timeout = if dashboard_managed_input || native_terminal {
                     Duration::ZERO
                 } else {
                     Duration::from_secs(self.interactive_runtime.stall_seconds.max(1))
@@ -1563,7 +1604,8 @@ impl SyncContext {
 
                     let runtime_for_spawn = runtime.clone();
                     let task_for_spawn = task.clone();
-                    let managed_process_group = capture_enabled_for_run;
+                    let managed_process_group =
+                        capture_enabled_for_run || cfg!(target_os = "linux");
                     let on_spawn: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |pid| {
                         runtime_for_spawn.register_spawn(
                             &task_for_spawn,
@@ -1578,7 +1620,7 @@ impl SyncContext {
                         Arc::new(move || runtime_for_exit.clear_spawn(&task_for_exit));
 
                     let mut stdin_rx = None;
-                    if interactive && capture_enabled_for_run {
+                    if interactive && capture_enabled_for_run && !native_terminal {
                         let (stdin_tx, rx) = mpsc::channel::<String>();
                         runtime.register_stdin_sender(&task, stdin_tx);
                         self.set_task_input_state(task_id, true);
@@ -2778,6 +2820,7 @@ fn interactive_sudo_invocation(program: &str, interactive: bool) -> bool {
 fn command_supports_dashboard_input(cmd: &CommandTask, runtime: &InteractiveRuntimeConfig) -> bool {
     cmd.interactive
         && !cmd.external_window
+        && !(cfg!(target_os = "linux") && command_needs_sudo_session(cmd))
         && !matches!(runtime.mode, InteractiveExecutionMode::DirectTty)
 }
 
@@ -3343,6 +3386,7 @@ fn completion_report_sections(sync: &CompletionSyncResult) -> Vec<TaskReportSect
 enum InteractiveExecutionPath {
     Standard,
     DashboardManaged,
+    AuthenticatedForeground,
     ImmediateForeground,
     ForegroundReplay,
     ExternalWindow,
@@ -3386,7 +3430,11 @@ fn interactive_execution_path(host_os: HostOs, cmd: &CommandTask) -> Interactive
         return InteractiveExecutionPath::ExternalWindow;
     }
     if command_needs_sudo_session(cmd) {
-        return InteractiveExecutionPath::DashboardManaged;
+        return if cfg!(target_os = "linux") && host_os == HostOs::Linux {
+            InteractiveExecutionPath::AuthenticatedForeground
+        } else {
+            InteractiveExecutionPath::DashboardManaged
+        };
     }
     InteractiveExecutionPath::DashboardManaged
 }
@@ -3607,9 +3655,10 @@ fn run_command_with_transcript(
     args: &[String],
     execution_path: InteractiveExecutionPath,
 ) -> Result<String> {
-    let transcript = write_interactive_transcript_wrapper(ctx, task_id, program, args)?;
+    let transcript = || write_interactive_transcript_wrapper(ctx, task_id, program, args);
     match execution_path {
         InteractiveExecutionPath::DashboardManaged => {
+            let _transcript = transcript()?;
             ctx.log_line(
                 task_id,
                 LogLevel::Info,
@@ -3619,6 +3668,7 @@ fn run_command_with_transcript(
             ctx.run_command_with_policy(task_id, program, args.to_vec(), policy, true)
         }
         InteractiveExecutionPath::ImmediateForeground => {
+            let transcript = transcript()?;
             ctx.log_line(
                 task_id,
                 LogLevel::Info,
@@ -3638,6 +3688,7 @@ fn run_command_with_transcript(
             run_result.map(|_| transcript_out)
         }
         InteractiveExecutionPath::ExternalWindow => {
+            let transcript = transcript()?;
             if let Some(launcher) = detect_external_terminal_launcher() {
                 ctx.log_line(
                     task_id,
@@ -3700,6 +3751,7 @@ fn run_command_with_transcript(
             )
         }
         InteractiveExecutionPath::ForegroundReplay => {
+            let transcript = transcript()?;
             ctx.log_line(
                 task_id,
                 LogLevel::Info,
@@ -3723,6 +3775,32 @@ fn run_command_with_transcript(
         }
         InteractiveExecutionPath::Standard => {
             ctx.run_command_with_policy(task_id, program, args.to_vec(), policy, false)
+        }
+        InteractiveExecutionPath::AuthenticatedForeground => {
+            ctx.log_line(
+                task_id,
+                LogLevel::Info,
+                LogStream::Meta,
+                if ctx.interactive_runtime.mode == InteractiveExecutionMode::DirectTty {
+                    "interactive execution on the startup terminal with inherited output"
+                } else {
+                    "interactive execution on the startup terminal; output remains captured"
+                }
+                .to_string(),
+            );
+            ctx.run_command_with_policy_mode(
+                task_id,
+                program,
+                args.to_vec(),
+                policy,
+                true,
+                if ctx.interactive_runtime.mode == InteractiveExecutionMode::DirectTty {
+                    CommandIo::DirectTerminal
+                } else {
+                    CommandIo::Terminal
+                },
+                CommandReplayPolicy::Never,
+            )
         }
     }
 }
@@ -4269,7 +4347,7 @@ fn run_command_task_inner(
         }
     };
 
-    if ctx.emit_plain {
+    if ctx.emit_plain && execution_path != InteractiveExecutionPath::AuthenticatedForeground {
         crate::ua_out!("{out}");
     }
 
@@ -6113,6 +6191,11 @@ fn build_command_failure_detail(
 ) -> String {
     let class = classify_runtime_failure(err_text, cmd.requires_elevation);
     if cmd.requires_elevation && class == RuntimeFailureClass::SudoSessionUnavailable {
+        if cfg!(target_os = "linux") && !cmd.external_window {
+            return format!(
+                "the startup sudo authority was unavailable at launch: {err_text}; no password fallback or automatic replay was attempted; review the task log and rerun update-all to authenticate again"
+            );
+        }
         if cmd.interactive {
             return format!(
                 "sudo authentication failed in the task terminal: {err_text}; review the task log before retrying explicitly and answer its sudo prompt; authentication in another terminal may not apply here"
@@ -8683,7 +8766,8 @@ fn build_command_invocation_with_privilege(
         {
             if matches!(host_os, HostOs::Linux | HostOs::Macos) {
                 let mut args = Vec::new();
-                if !cmd.interactive
+                if (host_os == HostOs::Linux && !cmd.external_window)
+                    || !cmd.interactive
                     || mode == PrivilegeMode::Auto
                     || (mode == PrivilegeMode::Required
                         && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
@@ -8692,9 +8776,8 @@ fn build_command_invocation_with_privilege(
                     // does not apply at command launch.
                     args.push("-n".to_string());
                 }
-                // One sudo process authenticates and launches in the same task
-                // terminal, without relying on credential reuse between separate
-                // invocations. The old shell/exec wrapper changed parent identity.
+                // Linux uses the startup terminal and direct parent identity.
+                // A launch cannot request another password or replay effects.
                 args.extend(["--".to_string(), base_program]);
                 args.extend(base_args);
                 return ("sudo".to_string(), args);

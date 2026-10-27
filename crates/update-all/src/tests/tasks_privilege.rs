@@ -337,7 +337,17 @@ fn auto_privilege_interactive_task_invocation_still_forbids_password_prompts() {
     assert_eq!(&auto[..2], ["-n", "--"]);
     let (_, prompt) =
         build_command_invocation_with_privilege(HostOs::Linux, cmd, PrivilegeMode::PromptTty);
-    assert_eq!(prompt[0], "--");
+    assert_eq!(&prompt[..2], ["-n", "--"]);
+    let (_, macos) =
+        build_command_invocation_with_privilege(HostOs::Macos, cmd, PrivilegeMode::PromptTty);
+    assert_eq!(macos[0], "--");
+    cmd.external_window = true;
+    let (_, external) =
+        build_command_invocation_with_privilege(HostOs::Linux, cmd, PrivilegeMode::PromptTty);
+    assert_eq!(external[0], "--");
+    let (_, external_auto) =
+        build_command_invocation_with_privilege(HostOs::Linux, cmd, PrivilegeMode::Auto);
+    assert_eq!(&external_auto[..2], ["-n", "--"]);
 }
 
 #[test]
@@ -568,5 +578,9 @@ fn required_privilege_interactive_catalog_task_cannot_create_password_permission
     assert_eq!(&required[..2], ["-n", "--"]);
     let (_, prompt) =
         build_command_invocation_with_privilege(HostOs::Linux, cmd, PrivilegeMode::PromptTty);
-    assert_eq!(prompt[0], "--", "legacy prompt_tty invocation is unchanged");
+    assert_eq!(
+        &prompt[..2],
+        ["-n", "--"],
+        "Linux native task launch reuses startup authority without another prompt"
+    );
 }

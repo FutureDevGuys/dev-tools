@@ -2,6 +2,7 @@
 
 ## 0.1.17
 
+- On Linux, interactive tasks declaring sudo use share the startup terminal and authentication. Native input stays with the foreground command while stdout, stderr, custom result footers, and reports remain captured. Direct sudo launches cannot request another password or replay protected effects. Explicit external windows keep separate authentication.
 - Open logs at the end in browse mode. In Less, `q` returns and `F` follows new output.
 - On Linux, give the viewer its own foreground process group. Viewer interrupts do not cancel updates; a signal sent to UpdateAll still cancels the run and cleans up the viewer.
 - Show deferred and unconfirmed observations separately from process completion in the dashboard, final summary, and run history.

@@ -6,6 +6,8 @@ mod public_file_stdout;
 pub use owned_prepared::OwnedPreparedCommand;
 #[cfg(target_os = "linux")]
 mod terminal_custody;
+#[cfg(target_os = "linux")]
+pub use terminal_custody::ForegroundTerminal;
 mod terminal_graph;
 pub use terminal_graph::{run_prepared_terminal_command_graph, TerminalGraphSignalMask};
 mod inherited;

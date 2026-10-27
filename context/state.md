@@ -1,5 +1,6 @@
 # Active work
 
+- **Update All startup sudo reuse**, on `codex/update-all-startup-sudo`. The owner: "Fix foundational update all in dev tools then you can work in each task as needed as part of syscfg separately since dev tools is meant to be many people using it with their own custom tasks". Implement and verify generic terminal/session execution, validate the existing NPM tilde-range correction, and deliver through the normal release path; native sudo acceptance and authenticated publication remain pending. Private consumer tasks stay outside this product change.
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
   - a PolicyKit restart must not end grants;
   - an abnormal coordinator exit restarts the coordinator;

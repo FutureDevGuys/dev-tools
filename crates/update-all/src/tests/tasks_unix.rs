@@ -2316,7 +2316,7 @@ exit 0
 }
 
 #[test]
-fn interactive_sudo_session_stays_dashboard_managed() {
+fn interactive_sudo_session_uses_startup_terminal_on_linux() {
     let cmd = CommandTask {
         program: "arch-update".to_string(),
         args: vec!["-s".to_string()],
@@ -2343,7 +2343,11 @@ fn interactive_sudo_session_stays_dashboard_managed() {
 
     assert_eq!(
         interactive_execution_path(HostOs::Linux, &cmd),
-        InteractiveExecutionPath::DashboardManaged
+        if cfg!(target_os = "linux") {
+            InteractiveExecutionPath::AuthenticatedForeground
+        } else {
+            InteractiveExecutionPath::DashboardManaged
+        }
     );
 }
 
@@ -2542,7 +2546,7 @@ exit 1
 }
 
 #[test]
-fn interactive_sudo_session_supports_dashboard_input_when_capture_enabled() {
+fn interactive_sudo_session_reserves_native_input_on_linux() {
     let cmd = CommandTask {
         program: "arch-update".to_string(),
         args: vec!["-s".to_string()],
@@ -2567,16 +2571,53 @@ fn interactive_sudo_session_supports_dashboard_input_when_capture_enabled() {
         result_protocol: None,
     };
 
-    assert!(command_supports_dashboard_input(
-        &cmd,
-        &InteractiveRuntimeConfig {
-            mode: InteractiveExecutionMode::AutoFallback,
-            stall_seconds: 20,
-            max_line_bytes: 262_144,
-            max_capture_bytes: 16_777_216,
-            retry_once: true,
-        }
-    ));
+    assert_eq!(
+        command_supports_dashboard_input(
+            &cmd,
+            &InteractiveRuntimeConfig {
+                mode: InteractiveExecutionMode::AutoFallback,
+                stall_seconds: 20,
+                max_line_bytes: 262_144,
+                max_capture_bytes: 16_777_216,
+                retry_once: true,
+            }
+        ),
+        !cfg!(target_os = "linux")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn foreground_sudo_refuses_launch_without_dashboard_terminal_release() {
+    let temp = TempDir::new().unwrap();
+    let effect = temp.path().join("effect");
+    let (tx, _unacknowledged_ui) = mpsc::channel();
+    let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
+    ctx.event_tx = Some(DashboardSender::new(tx, None));
+    ctx.runtime_control = Some(Arc::new(RuntimeControl::default()));
+
+    let error = run_command_with_transcript(
+        &ctx,
+        "local/foreground-fixture",
+        &TaskPolicy::new(5, 3, 0),
+        "/bin/sh",
+        &[
+            "-c".into(),
+            "printf effect > \"$1\"".into(),
+            "fixture".into(),
+            effect.to_string_lossy().into_owned(),
+        ],
+        InteractiveExecutionPath::AuthenticatedForeground,
+    )
+    .expect_err("a dashboard that retains the terminal must prevent launch");
+
+    assert!(
+        error
+            .to_string()
+            .contains("dashboard did not release the foreground terminal"),
+        "{error:#}"
+    );
+    assert!(!effect.exists(), "command ran without terminal release");
 }
 
 #[test]
@@ -2837,6 +2878,9 @@ printf 'sudo %s\n' "$*" >> "${SUDO_STUB_LOG:?}"
 if [ "${1:-}" = "-n" ] && [ "${2:-}" = "-v" ]; then
   exit 0
 fi
+if [ "${1:-}" = "-n" ]; then
+  shift
+fi
 if [ "${1:-}" != "--" ]; then
   echo "unexpected separate sudo authentication or launch" >&2
   exit 2
@@ -2935,14 +2979,24 @@ fi
         assert_eq!(
             sudo_lines
                 .iter()
-                .filter(|line| line.starts_with("sudo --"))
+                .filter(|line| line.starts_with(if cfg!(target_os = "linux") {
+                    "sudo -n --"
+                } else {
+                    "sudo --"
+                }))
                 .count(),
             1,
             "authentication or side effects were replayed: {sudo_log_after_run}"
         );
         assert!(!sudo_lines.contains(&"sudo -v"), "{sudo_log_after_run}");
         assert!(
-            !sudo_lines.iter().any(|line| line.starts_with("sudo -n --")),
+            !sudo_lines
+                .iter()
+                .any(|line| line.starts_with(if cfg!(target_os = "linux") {
+                    "sudo --"
+                } else {
+                    "sudo -n --"
+                })),
             "{sudo_log_after_run}"
         );
         if scenario == "password_timeout" {
@@ -2961,7 +3015,11 @@ fi
                 result
                     .details
                     .iter()
-                    .any(|detail| detail.contains("task terminal")),
+                    .any(|detail| detail.contains(if cfg!(target_os = "linux") {
+                        "startup sudo authority was unavailable at launch"
+                    } else {
+                        "task terminal"
+                    })),
                 "{result:#?}"
             );
         }

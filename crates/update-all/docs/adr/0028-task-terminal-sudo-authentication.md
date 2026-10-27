@@ -9,6 +9,8 @@ status: superseded
 verification: verified
 replacement: 0034-compatible-privilege-fallback-modes.md
 
+Linux original-terminal execution is superseded by [ADR 0047](0047-startup-terminal-sudo-reuse.md). Historical task-PTY acceptance below describes the earlier implementation.
+
 ## Context
 
 An interactive elevated task authenticated with a separate `sudo -v` inside a
