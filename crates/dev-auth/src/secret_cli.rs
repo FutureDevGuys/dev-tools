@@ -214,12 +214,17 @@ fn render_metadata(report: dev_auth::resource_metadata::MetadataReport, json: bo
 fn run_sign_ssh(parsed: &clap::ArgMatches) -> anyhow::Result<i32> {
     let purpose = parsed.get_one::<String>("purpose").map(String::as_str);
     let fingerprint = parsed.get_one::<String>("fingerprint");
-    if !matches!(purpose, Some("authentication" | "git-signing"))
-        || !fingerprint.is_some_and(|value| valid_ssh_fingerprint(value))
-    {
-        eprintln!("dev-auth: invalid SSH signing selection");
-        return Ok(2);
-    }
+    let (purpose, fingerprint) = match (purpose, fingerprint) {
+        (Some(purpose @ ("authentication" | "git-signing")), Some(fingerprint))
+            if valid_ssh_fingerprint(fingerprint) =>
+        {
+            (purpose, fingerprint)
+        }
+        _ => {
+            eprintln!("dev-auth: invalid SSH signing selection");
+            return Ok(2);
+        }
+    };
     let sink = match parsed
         .get_one::<OsString>("result-file")
         .map(|path| ResultDestination::reserve(Path::new(path)))
@@ -231,7 +236,7 @@ fn run_sign_ssh(parsed: &clap::ArgMatches) -> anyhow::Result<i32> {
             return Ok(1);
         }
     };
-    sign_ssh(purpose.unwrap(), fingerprint.unwrap(), sink)
+    sign_ssh(purpose, fingerprint, sink)
 }
 
 fn valid_ssh_fingerprint(value: &str) -> bool {
