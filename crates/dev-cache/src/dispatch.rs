@@ -13,9 +13,7 @@ pub fn classify_invocation(command: &str, args: &[OsString]) -> Dispatch {
     // Static completion generation needs no cache routing or maintenance. Match
     // only the native root command, never a tool/script argument with that name.
     let completion = match spec.map(|spec| spec.command) {
-        Some("uv") => args
-            .first()
-            .is_some_and(|arg| arg == "generate-shell-completion"),
+        Some("uv") => uv_completion(args),
         Some("uvx") => args
             .first()
             .is_some_and(|arg| arg == "--generate-shell-completion"),
@@ -32,6 +30,55 @@ pub fn classify_invocation(command: &str, args: &[OsString]) -> Dispatch {
         Some(EntrypointMode::Cargo | EntrypointMode::Rustup) | None => None,
     };
     adapter.map_or(Dispatch::Delegate, Dispatch::Adapter)
+}
+
+fn uv_completion(args: &[OsString]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_encoded_bytes();
+        if arg == b"generate-shell-completion" {
+            return true;
+        }
+        // Only skip known root options. Never search a workload's arguments or
+        // mistake a value (including a non-Unicode path) for the root command.
+        let (option, attached_value) = arg
+            .iter()
+            .position(|byte| *byte == b'=')
+            .map_or((arg, false), |index| (&arg[..index], true));
+        match option {
+            b"--cache-dir"
+            | b"--color"
+            | b"--allow-insecure-host"
+            | b"--directory"
+            | b"--project"
+            | b"--config-file" => {
+                if !attached_value && args.next().is_none() {
+                    return false;
+                }
+            }
+            b"--no-cache"
+            | b"--managed-python"
+            | b"--no-managed-python"
+            | b"--no-python-downloads"
+            | b"--quiet"
+            | b"--verbose"
+            | b"--system-certs"
+            | b"--native-tls"
+            | b"--offline"
+            | b"--no-progress"
+            | b"--no-config"
+            | b"--help"
+            | b"--version"
+                if !attached_value => {}
+            _ if arg.starts_with(b"-")
+                && arg.len() > 1
+                && arg[1..]
+                    .iter()
+                    .all(|byte| matches!(byte, b'n' | b'q' | b'v' | b'h' | b'V')) => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 pub fn is_intercept_name(command: &str) -> bool {
