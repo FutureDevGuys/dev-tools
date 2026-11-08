@@ -33,12 +33,7 @@ keeping a requested target in notes rather than presenting it as installed.
 
 ## Restart after updates
 
-Run `update-all --restart-after` (alias `--reboot`) to request a non-forced restart
-only after a clean task run, dashboard dismissal, and durable run-log finalization.
-Save your work first. Failure, cancellation, reported task issues, empty/all-skipped
-plans, and evidence-write failures prevent the restart. Help/version and maintenance
-subcommands never restart the host. Restart is off by default and has no persistent
-configuration setting.
+Run `update-all --restart-after` (alias `--reboot`) to request a non-forced restart after all selected tasks settle and their run logs are durably finalized. Save your work first. Failed, deferred, skipped, and warning-bearing task results still permit restart. The dashboard closes automatically when tasks finish, even when its normal configuration keeps it open for review. The task-run exit code and saved results still report update failures or deferrals after an accepted restart request. Explicit cancellation, an empty task selection, startup failure, or evidence-write failure prevents restart. Help/version and maintenance subcommands never restart the host. Restart is off by default and has no persistent configuration setting.
 
 Linux requires a native systemd host with inhibitor checking (systemd 248+); WSL,
 containers and other init systems are unsupported. Windows requests an immediate

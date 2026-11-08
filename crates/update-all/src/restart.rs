@@ -27,13 +27,12 @@ impl RestartRequest {
         if crate::util::cancel::is_cancel_requested() {
             return Err(crate::Cancelled.into());
         }
-        // Tasks deliberately release admission before a persistent dashboard
-        // closes. Another run may have started since our tasks completed.
-        // Fail closed if so, and prevent admission through the OS request.
+        // Another run may start between task completion and terminal teardown.
+        // Retain exclusive admission through the OS request.
         let _restart_admission = crate::tasks::acquire_restart_admission_lock(log)
             .context("restart withheld: cannot establish exclusive Update All task admission")?;
         if !log.restart_eligible()? {
-            bail!("Restart not requested: a clean run with at least one completed task and no canceled tasks or issues is required; restart manually if appropriate");
+            bail!("Restart not requested: finalized task results with no cancellation are required; empty selections and startup failures do not request a restart");
         }
         // Evidence is committed before the one irreversible request. A pending
         // record after power loss/termination is deliberately not replay authority.
@@ -211,6 +210,22 @@ fn request_backend(run_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_refuses_when_another_task_run_owns_admission() {
+        let root = tempfile::TempDir::new().unwrap();
+        let log = RunLogSink::new(root.path(), false).unwrap();
+        let _active_run = crate::tasks::acquire_restart_admission_lock(&log).unwrap();
+        let lock = root.path().join(".update-all-task-run.lock");
+        let before = std::fs::read(&lock).unwrap();
+        let error = RestartRequest.request(&log).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot establish exclusive Update All task admission"));
+        assert_eq!(std::fs::read(lock).unwrap(), before);
+        assert!(!log.run_dir().join("restart.json").exists());
+    }
+
     #[test]
     fn restart_adapters_never_force_or_prompt_for_elevation() {
         assert_eq!(

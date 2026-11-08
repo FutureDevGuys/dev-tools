@@ -57,7 +57,7 @@ impl Fixture {
         let config = home.path().join("config/update-all");
         fs::create_dir_all(config.join("catalog.d/local")).unwrap();
         fs::write(config.join("config.toml"), format!(
-            "[install]\nauto_update=false\n[engine]\nmode={engine:?}\njobs=\"2\"\n[tasks.tool_update]\nretries=0\ntimeout_secs=15\n"
+            "[install]\nauto_update=false\n[engine]\nmode={engine:?}\njobs=\"2\"\n[ui]\npersist_until_exit=true\n[tasks.tool_update]\nretries=0\ntimeout_secs=15\n"
         )).unwrap();
         let catalog = format!(
             r#"
@@ -212,17 +212,66 @@ fn restart_after_is_opt_in_and_read_only_surfaces_never_request_it() {
 }
 
 #[test]
-fn restart_after_suppresses_failed_and_invalid_task_runs() {
+fn restart_after_preserves_failed_deferred_and_warning_task_outcomes() {
     for engine in ["sync", "async"] {
-        let fixture = Fixture::new(engine, "exit 7");
-        let output = fixture.run().arg("--restart-after").output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        assert_eq!(
-            json(fixture.only_run().join("run.json"))["status"],
-            "failed"
-        );
-        fixture.assert_no_restart();
+        for (script, protocol, exit_code, status) in [
+            ("exit 7", false, 1, "failed"),
+            (
+                r#"printf '%s\n' 'UPDATE_ALL_RESULT {"outcome":"deferred","detail":"fixture deferred"}'"#,
+                true,
+                2,
+                "failed",
+            ),
+            (
+                "printf 'warning: harmless fixture warning\\n'",
+                false,
+                0,
+                "completed",
+            ),
+        ] {
+            let fixture = Fixture::new(engine, script);
+            if protocol {
+                use std::io::Write;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(
+                        fixture
+                            .home
+                            .path()
+                            .join("config/update-all/catalog.d/local/restart.toml"),
+                    )
+                    .unwrap()
+                    .write_all(b"result_protocol=1\n")
+                    .unwrap();
+            }
+            let output = fixture.run().arg("--restart-after").output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(exit_code),
+                "{engine}: {output:?}"
+            );
+            let requests = fs::read_to_string(&fixture.marker).unwrap();
+            assert_eq!(requests.lines().count(), 1);
+            let request: Value = serde_json::from_str(requests.trim()).unwrap();
+            assert_eq!(request["run"]["status"], status);
+            assert_eq!(request["run"]["exit_code"], exit_code);
+            assert_eq!(request["metadata"]["status"], status);
+            assert!(request["run"]["issue_count"].as_u64().unwrap() > 0);
+            assert_eq!(request["run_completed_count"], 1);
+            assert_eq!(request["terminal_raw_mode"], false);
+            assert_eq!(request["task_admission_owned"], true);
+            assert_eq!(request["run"], json(fixture.only_run().join("run.json")));
+            assert_eq!(
+                json(fixture.only_run().join("restart.json"))["status"],
+                "request_accepted"
+            );
+        }
+    }
+}
 
+#[test]
+fn restart_after_suppresses_invalid_task_runs() {
+    for engine in ["sync", "async"] {
         let fixture = Fixture::new(engine, "exit 0");
         let output = fixture
             .process()
@@ -238,6 +287,164 @@ fn restart_after_suppresses_failed_and_invalid_task_runs() {
             .unwrap();
         assert!(!output.status.success());
         fixture.assert_no_restart();
+    }
+}
+
+#[test]
+fn restart_after_suppresses_failed_startup_authentication() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    for engine in ["sync", "async"] {
+        let fixture = Fixture::new(engine, "touch \"$HOME/unexpected-effect\"");
+        let bin = fixture.home.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("sudo"), "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(bin.join("sudo"), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = fixture.home.path().join("config/update-all");
+        for (path, content) in [
+            (
+                config.join("config.toml"),
+                "\n[updaters]\nprivilege_mode=\"required\"\n",
+            ),
+            (
+                config.join("catalog.d/local/restart.toml"),
+                "requires_elevation=true\n",
+            ),
+        ] {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(content.as_bytes())
+                .unwrap();
+        }
+        let output = fixture
+            .run()
+            .arg("--restart-after")
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        fixture.assert_no_restart();
+        assert!(!fixture.home.path().join("unexpected-effect").exists());
+        let run = json(fixture.only_run().join("run.json"));
+        assert!(run["tasks"].as_array().unwrap().is_empty());
+        assert!(run["reason"]
+            .as_str()
+            .unwrap()
+            .contains("sudo preflight failed"));
+    }
+}
+
+#[test]
+fn restart_after_waits_for_running_siblings_after_failure() {
+    for engine in ["sync", "async"] {
+        let fixture = Fixture::new(engine, "exit 7");
+        let script = r#"touch "$HOME/sibling-started"; while [ ! -e "$HOME/release-sibling" ]; do sleep 0.02; done"#;
+        fs::write(
+            fixture
+                .home
+                .path()
+                .join("config/update-all/catalog.d/local/sibling.toml"),
+            format!(
+                r#"
+[tasks."local/restart-sibling"]
+label="Harmless sibling fixture"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c", {}]
+policy_key="tool_update"
+"#,
+                serde_json::to_string(script).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut child = TestChild(
+            fixture
+                .process()
+                .args([
+                    "--plain",
+                    "--only",
+                    "local/restart-fixture,local/restart-sibling",
+                    "--restart-after",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        wait_for(&fixture.home.path().join("sibling-started"), &mut child);
+        fixture.assert_no_restart();
+        assert!(child.try_wait().unwrap().is_none());
+        fs::write(fixture.home.path().join("release-sibling"), "continue").unwrap();
+        assert_eq!(wait_child(&mut child).code(), Some(1));
+        let requests = fs::read_to_string(&fixture.marker).unwrap();
+        assert_eq!(requests.lines().count(), 1);
+        let request: Value = serde_json::from_str(requests.trim()).unwrap();
+        assert_eq!(request["run"]["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(request["run"]["failed_task_count"], 1);
+        assert_eq!(request["run_completed_count"], 1);
+    }
+}
+
+#[test]
+fn restart_after_requests_after_dependency_and_fail_fast_cancellations() {
+    for engine in ["sync", "async"] {
+        for fail_fast in [false, true] {
+            let fixture = Fixture::new(engine, "exit 7");
+            let dependency = if fail_fast {
+                ""
+            } else {
+                "depends_on=[\"local/restart-fixture\"]\n"
+            };
+            fs::write(
+                fixture
+                    .home
+                    .path()
+                    .join("config/update-all/catalog.d/local/pending.toml"),
+                format!(
+                    r#"
+[tasks."local/restart-pending"]
+label="Unstarted fixture"
+category="maintenance"
+os=["linux","macos"]
+detect_mode="command_available"
+command="/bin/sh"
+args=["-c", "touch \"$HOME/unexpected-effect\""]
+policy_key="tool_update"
+{dependency}"#
+                ),
+            )
+            .unwrap();
+            let mut command = fixture.process();
+            command.args([
+                "--plain",
+                "--jobs",
+                "1",
+                "--only",
+                "local/restart-fixture,local/restart-pending",
+                "--restart-after",
+            ]);
+            if fail_fast {
+                command.arg("--fail-fast");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{engine}, fail_fast={fail_fast}: {output:?}"
+            );
+            assert!(!fixture.home.path().join("unexpected-effect").exists());
+            let requests = fs::read_to_string(&fixture.marker).unwrap();
+            assert_eq!(requests.lines().count(), 1);
+            let request: Value = serde_json::from_str(requests.trim()).unwrap();
+            assert_eq!(request["run"]["failed_task_count"], 1);
+            assert_eq!(request["run"]["canceled_task_count"], 1);
+            assert_eq!(request["run"]["exit_code"], 1);
+            assert_eq!(request["run_completed_count"], 1);
+        }
     }
 }
 
@@ -344,337 +551,137 @@ fn restart_request_failure_preserves_completed_task_evidence_and_fails_invocatio
 
 #[cfg(all(target_os = "linux", feature = "tui"))]
 #[test]
-fn restart_after_waits_for_dashboard_exit_and_restores_terminal() {
-    use std::io::{Read, Write};
+fn restart_after_closes_dashboard_without_input_and_restores_terminal() {
+    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
-    let fixture = Fixture::new("async", "printf 'dashboard harmless task\\n'");
-    let mut master_fd = -1;
-    let mut slave_fd = -1;
-    let size = libc::winsize {
-        ws_row: 40,
-        ws_col: 120,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: openpty initializes two owned descriptors; all pointer arguments are valid.
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
-            )
-        },
-        0
-    );
-    // SAFETY: these distinct successful openpty descriptors are transferred exactly once.
-    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
-    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
-    let mut reader = master.try_clone().unwrap();
-    let capture = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => panic!("read dashboard PTY: {error}"),
-            }
-        }
-        bytes
-    });
-    let mut command = fixture.process();
-    command
-        .args([
-            "--dashboard",
-            "--completions",
-            "off",
-            "--only",
-            "local/restart-fixture",
-            "--restart-after",
-        ])
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave.try_clone().unwrap());
-    // SAFETY: only async-signal-safe native calls occur in this pre-exec closure.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = TestChild(command.spawn().unwrap());
-    drop(command);
-    drop(slave);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let run = loop {
-        let root = fixture.home.path().join("state/update-all/runs");
-        let ready = fs::read_dir(root)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                fs::read_to_string(path.join("events.jsonl"))
-                    .is_ok_and(|events| events.contains("\"kind\":\"tasks_completed\""))
+    for engine in ["sync", "async"] {
+        for task_exit in [0, 7] {
+            let fixture = Fixture::new(
+                engine,
+                &format!(
+                    r#"touch "$HOME/task-started"; while [ ! -e "$HOME/release" ]; do sleep 0.02; done; exit {task_exit}"#
+                ),
+            );
+            let original_config =
+                fs::read(fixture.home.path().join("config/update-all/config.toml")).unwrap();
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            let size = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: openpty initializes two owned descriptors; all pointer arguments are valid.
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master_fd,
+                        &mut slave_fd,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        &size,
+                    )
+                },
+                0
+            );
+            // SAFETY: these distinct successful openpty descriptors are transferred exactly once.
+            let master = unsafe { fs::File::from_raw_fd(master_fd) };
+            let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+            let mut reader = master.try_clone().unwrap();
+            let capture = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 8192];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => panic!("read dashboard PTY: {error}"),
+                    }
+                }
+                bytes
             });
-        if let Some(run) = ready {
-            break run;
-        }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "dashboard exited before tasks completed"
-        );
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("dashboard tasks did not complete");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let metadata = json(run.join("run-meta.json"));
-    assert!(
-        matches!(metadata["status"].as_str(), Some("running" | "finalizing")),
-        "dashboard still owns the nonterminal run: {metadata}"
-    );
-    fixture.assert_no_restart();
-    master.write_all(b"q").unwrap();
-    assert!(wait_child(&mut child).success());
-    drop(master);
-    let bytes = capture.join().unwrap();
-    let screen = String::from_utf8_lossy(&bytes);
-    assert!(
-        screen.contains("\x1b[?1049h"),
-        "dashboard did not enter alternate screen"
-    );
-    assert!(
-        screen.contains("\x1b[?1049l"),
-        "dashboard did not leave alternate screen"
-    );
-    let requests = fs::read_to_string(&fixture.marker).unwrap();
-    assert_eq!(requests.lines().count(), 1);
-    let request: Value = serde_json::from_str(requests.trim()).unwrap();
-    assert_eq!(request["terminal_raw_mode"], false);
-    assert_eq!(request["run"]["ui_mode"], "dashboard");
-    assert_eq!(request["metadata"]["status"], "completed");
-    assert_eq!(request["run_completed_count"], 1);
-}
-
-#[cfg(all(target_os = "linux", feature = "tui"))]
-#[test]
-fn restart_after_refuses_when_second_run_started_during_dashboard_review() {
-    use std::io::{Read, Write};
-    use std::os::fd::FromRawFd;
-    use std::os::unix::process::CommandExt;
-    let fixture = Fixture::new("async", "printf 'dashboard harmless task\\n'");
-    let mut master_fd = -1;
-    let mut slave_fd = -1;
-    let size = libc::winsize {
-        ws_row: 40,
-        ws_col: 120,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: openpty initializes two owned descriptors; all pointer arguments are valid.
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
-            )
-        },
-        0
-    );
-    // SAFETY: these distinct successful openpty descriptors are transferred exactly once.
-    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
-    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
-    let mut reader = master.try_clone().unwrap();
-    let capture = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => panic!("read dashboard PTY: {error}"),
+            let mut command = fixture.process();
+            command
+                .args([
+                    "--dashboard",
+                    "--completions",
+                    "off",
+                    "--only",
+                    "local/restart-fixture",
+                    "--restart-after",
+                ])
+                .stdin(slave.try_clone().unwrap())
+                .stdout(slave.try_clone().unwrap())
+                .stderr(slave.try_clone().unwrap());
+            // SAFETY: only async-signal-safe native calls occur in this pre-exec closure.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
             }
+            let mut child = TestChild(command.spawn().unwrap());
+            drop(command);
+            drop(slave);
+            wait_for(&fixture.home.path().join("task-started"), &mut child);
+            fixture.assert_no_restart();
+            fs::write(fixture.home.path().join("release"), "continue").unwrap();
+            assert_eq!(
+                wait_child(&mut child).code(),
+                Some(if task_exit == 0 { 0 } else { 1 })
+            );
+            drop(master);
+            let bytes = capture.join().unwrap();
+            let screen = String::from_utf8_lossy(&bytes);
+            assert!(
+                screen.contains("\x1b[?1049h"),
+                "dashboard did not enter alternate screen"
+            );
+            assert!(
+                screen.contains("\x1b[?1049l"),
+                "dashboard did not leave alternate screen"
+            );
+            let requests = fs::read_to_string(&fixture.marker).unwrap();
+            assert_eq!(requests.lines().count(), 1);
+            let request: Value = serde_json::from_str(requests.trim()).unwrap();
+            assert_eq!(request["terminal_raw_mode"], false);
+            assert_eq!(request["run"]["ui_mode"], "dashboard");
+            assert_eq!(
+                request["metadata"]["status"],
+                if task_exit == 0 {
+                    "completed"
+                } else {
+                    "failed"
+                }
+            );
+            assert_eq!(request["run_completed_count"], 1);
+            assert_eq!(request["task_admission_owned"], true);
+            // UI choice persistence may add mode, but must not disable normal review persistence.
+            let config_path = fixture.home.path().join("config/update-all/config.toml");
+            let current: toml::Value =
+                toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let original: toml::Value =
+                toml::from_str(std::str::from_utf8(&original_config).unwrap()).unwrap();
+            assert_eq!(
+                current
+                    .get("ui")
+                    .and_then(|ui| ui.get("persist_until_exit")),
+                original
+                    .get("ui")
+                    .and_then(|ui| ui.get("persist_until_exit"))
+            );
         }
-        bytes
-    });
-    let mut command = fixture.process();
-    command
-        .args([
-            "--dashboard",
-            "--completions",
-            "off",
-            "--only",
-            "local/restart-fixture",
-            "--restart-after",
-        ])
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave.try_clone().unwrap());
-    // SAFETY: only async-signal-safe native calls occur in this pre-exec closure.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
     }
-    let mut child = TestChild(command.spawn().unwrap());
-    drop(command);
-    drop(slave);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let run = loop {
-        let root = fixture.home.path().join("state/update-all/runs");
-        let ready = fs::read_dir(root)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                fs::read_to_string(path.join("events.jsonl"))
-                    .is_ok_and(|events| events.contains("\"kind\":\"tasks_completed\""))
-            });
-        if let Some(run) = ready {
-            break run;
-        }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "dashboard exited before tasks completed"
-        );
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("dashboard tasks did not complete");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let metadata = json(run.join("run-meta.json"));
-    assert!(
-        matches!(metadata["status"].as_str(), Some("running" | "finalizing")),
-        "dashboard still owns the nonterminal run: {metadata}"
-    );
-    fixture.assert_no_restart();
-    // The task-completed journal event precedes lock release. Wait for the
-    // actual admission boundary rather than racing the first run's final writes.
-    let task_lock = fixture
-        .home
-        .path()
-        .join("state/update-all/runs/.update-all-task-run.lock");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while task_lock.exists() {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "first dashboard exited unexpectedly"
-        );
-        assert!(
-            Instant::now() < deadline,
-            "first run did not release task admission"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // The first run released task admission but its dashboard is still open.
-    // Start a harmless second writer under the exact same admission root.
-    let second_ready = fixture.home.path().join("second-run.ready");
-    let release_second = fixture.home.path().join("release-second");
-    let script = r#"printf ready > "$HOME/second-run.ready"; while [ ! -f "$HOME/release-second" ]; do sleep 0.01; done"#;
-    fs::write(
-        fixture
-            .home
-            .path()
-            .join("config/update-all/catalog.d/local/blocker.toml"),
-        format!(
-            r#"
-[tasks."local/restart-blocker"]
-label="Harmless second-run writer fixture"
-category="maintenance"
-os=["linux","macos"]
-detect_mode="command_available"
-command="/bin/sh"
-args=["-c", {}]
-policy_key="tool_update"
-"#,
-            serde_json::to_string(script).unwrap()
-        ),
-    )
-    .unwrap();
-    let mut second_command = fixture.process();
-    second_command.args([
-        "--plain",
-        "--completions",
-        "off",
-        "--only",
-        "local/restart-blocker",
-    ]);
-    let mut second = TestChild(second_command.spawn().unwrap());
-    wait_for(&second_ready, &mut second);
-    assert!(second.try_wait().unwrap().is_none());
-    master.write_all(b"q").unwrap();
-    assert_eq!(wait_child(&mut child).code(), Some(1));
-    fixture.assert_no_restart();
-    assert!(
-        second.try_wait().unwrap().is_none(),
-        "restart guard must not kill the active updater"
-    );
-    let lock_payload = fs::read_to_string(&task_lock).unwrap();
-    assert!(
-        lock_payload
-            .lines()
-            .any(|line| line == format!("pid={}", second.id())),
-        "the second updater must retain admission after restart refusal: {lock_payload}"
-    );
-    assert_eq!(
-        json(run.join("run.json"))["status"],
-        "completed",
-        "completed first-run task evidence is preserved"
-    );
-    assert!(
-        !run.join("restart.json").exists(),
-        "no request is made while another run owns admission"
-    );
-    fs::write(release_second, "release").unwrap();
-    assert!(wait_child(&mut second).success());
-    assert!(
-        !task_lock.exists(),
-        "second updater did not release admission"
-    );
-    drop(master);
-    let bytes = capture.join().unwrap();
-    let screen = String::from_utf8_lossy(&bytes);
-    assert!(
-        screen.contains("\x1b[?1049h"),
-        "dashboard did not enter alternate screen"
-    );
-    assert!(
-        screen.contains("\x1b[?1049l"),
-        "dashboard did not leave alternate screen"
-    );
-    assert!(
-        screen.contains("restart withheld: cannot establish exclusive Update All task admission"),
-        "expected restart admission refusal, not unrelated cancellation: {screen}"
-    );
-    fixture.assert_no_restart();
 }
 
 #[test]
-fn restart_after_suppresses_all_skipped_tasks() {
+fn restart_after_requests_after_all_skipped_tasks() {
     use std::io::Write;
     for engine in ["sync", "async"] {
         let fixture = Fixture::new(engine, "touch \"$HOME/unexpected-effect\"");
@@ -692,8 +699,9 @@ fn restart_after_suppresses_all_skipped_tasks() {
             .write_all(b"requires_elevation=true\n")
             .unwrap();
         let output = fixture.run().arg("--restart-after").output().unwrap();
-        assert!(!output.status.success());
-        fixture.assert_no_restart();
+        assert!(output.status.success(), "{output:?}");
+        let requests = fs::read_to_string(&fixture.marker).unwrap();
+        assert_eq!(requests.lines().count(), 1);
         assert!(!fixture.home.path().join("unexpected-effect").exists());
         let run = json(fixture.only_run().join("run.json"));
         assert_eq!(run["tasks"][0]["status"], "skipped");

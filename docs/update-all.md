@@ -68,6 +68,8 @@ Each new run records the executing image's common build-info document in its fir
 
 `update-all build-info --json` emits the common checkout-independent `dev-tools-build-info-v1` document without loading configuration, release state, task catalogs, or network machinery. The hidden `--build-info` form remains for rollback to the pre-standard 0.1 line and is removed in the next minor release after one accepted release has shipped the standard subcommand.
 
+`update-all --restart-after` (alias `--reboot`) requests one non-forced OS restart when all tasks settle, including failed, deferred, warning-bearing, and all-skipped results. Save work before invoking it. The dashboard closes automatically; the original update exit category and saved results remain visible after an accepted request. Explicit cancellation, an empty selection, startup failure, or evidence-persistence failure prevents restart. Existing OS authority and inhibitors apply; the command does not prompt for new restart privileges, force applications closed, or retry uncertain requests. See [ADR 0048](../crates/update-all/docs/adr/0048-unattended-post-run-restart.md) and the [restart guide](../crates/update-all/README.md#restart-after-updates).
+
 Catalog relationships distinguish capability health from ordering. `depends_on`
 and `depends_on_selected` require healthy predecessors. `after` and
 `after_selected` wait only for terminal outcomes, so a final reconciliation task

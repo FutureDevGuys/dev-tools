@@ -45,7 +45,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0033](0033-mandatory-task-run-evidence-and-shared-scheduling.md) | Mandatory task-run evidence and shared scheduling | proposed | pending |
 | [0034](0034-compatible-privilege-fallback-modes.md) | Compatible privilege fallback modes | proposed | pending |
 | [0035](0035-owned-dashboard-input-and-bounded-display.md) | Owned dashboard input and bounded display | proposed | pending |
-| [0036](0036-opt-in-post-run-restart.md) | Opt-in post-run restart requests | proposed | pending |
+| [0036](0036-opt-in-post-run-restart.md) | Opt-in post-run restart requests | superseded | pending |
 | [0037](0037-read-only-damaged-run-inspection.md) | Read-only damaged run inspection | proposed | pending |
 | [0038](0038-terminal-reported-storage-exhaustion.md) | Terminal reported storage exhaustion | proposed | pending |
 | [0039](0039-preserve-unclassified-npm-directories.md) | Preserve unclassified NPM directories | proposed | pending |
@@ -58,6 +58,7 @@ scheduling, package-manager reconciliation, or run artifacts.
 | [0045](0045-truthful-operation-observations.md) | Truthful operation observations | proposed | pending |
 | [0046](0046-completion-sync-result-observations.md) | Completion sync result observations | proposed | pending |
 | [0047](0047-startup-terminal-sudo-reuse.md) | Original-terminal sudo reuse with captured custom-task results | accepted | verified |
+| [0048](0048-unattended-post-run-restart.md) | Unattended restart after finalized task outcomes | proposed | pending |
 
 `proposed` plus `verification: pending` means code and automated gates exist,
 but the record's runtime acceptance has not passed. `accepted` requires

@@ -5,8 +5,9 @@ owner: dev-tools/update-all
 
 # ADR 0036: Opt-in post-run restart requests
 
-status: proposed
+status: superseded
 verification: pending
+replacement: 0048-unattended-post-run-restart.md
 
 ## Context
 
@@ -90,11 +91,11 @@ after the asynchronous OS request is accepted and the guard is released.
 ## Verification
 
 - `restart_adapters_never_force_or_prompt_for_elevation`
-- `restart_eligibility_requires_clean_completed_task_evidence`
+- `restart_eligibility_requires_finalized_uncanceled_task_evidence`
 - `restart_after_requests_once_only_after_successful_persisted_terminalization`
 - `restart_after_is_opt_in_and_read_only_surfaces_never_request_it`
-- `restart_after_waits_for_dashboard_exit_and_restores_terminal`
-- `restart_after_refuses_when_second_run_started_during_dashboard_review`
+- `restart_after_closes_dashboard_without_input_and_restores_terminal`
+- `restart_refuses_when_another_task_run_owns_admission`
 - `restart_after_suppresses_failed_pre_request_evidence_sync`
 
 ## Runtime acceptance
