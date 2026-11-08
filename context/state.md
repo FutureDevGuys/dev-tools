@@ -1,5 +1,6 @@
 # Active work
 
+- **Unattended Update All restart**, branch `codex/update-all-unattended-restart`. The user: "I was thinking it should restart regardless of outcome after all things are done right? The whole point is unattended restarting." and "continue. We aren't restarting now though". Implement task-outcome-independent restart and automatic dashboard exit; verify with the harmless compiled backend, then deliver without restarting this host.
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
   - a PolicyKit restart must not end grants;
   - an abnormal coordinator exit restarts the coordinator;

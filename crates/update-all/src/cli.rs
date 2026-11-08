@@ -53,7 +53,7 @@ pub struct RunCli {
     #[arg(long = "config")]
     config: Option<PathBuf>,
 
-    /// Request a non-forced OS restart only after a clean, fully finalized task run.
+    /// Request a non-forced OS restart after tasks finish, even when updates fail.
     #[arg(
         long = "restart-after",
         visible_alias = "reboot",
@@ -258,7 +258,7 @@ impl RunCli {
         let restart = if self.restart_after {
             let request = crate::restart::RestartRequest::prepare()?;
             crate::ua_errln!(
-                "WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart after a clean update run and dashboard exit. No forced restart or automatic elevation will be used."
+                "WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart when tasks finish, even if updates fail or are deferred. The dashboard will close automatically. Cancellation prevents restart. No forced restart or automatic elevation will be used."
             );
             Some(request)
         } else {
@@ -367,7 +367,7 @@ impl RunCli {
                 engine_mode: engine_label,
                 ui,
                 fail_fast,
-                ui_persist_until_exit: runtime_cfg.ui.persist_until_exit,
+                ui_persist_until_exit: runtime_cfg.ui.persist_until_exit && !self.restart_after,
                 completions_mode,
                 completion_providers,
                 completion_discover,
@@ -430,11 +430,12 @@ impl RunCli {
                 "failed to persist terminal run evidence (observed task-run outcome: {status}, exit {exit_code})"
             )));
         }
-        run_result?;
         if let Some(restart) = restart {
-            restart.request(&run_log)?;
+            if run_result.is_ok() || run_log.restart_eligible()? {
+                restart.request(&run_log)?;
+            }
         }
-        Ok(())
+        run_result
     }
 }
 

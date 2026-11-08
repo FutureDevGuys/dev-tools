@@ -8,7 +8,6 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +26,7 @@ pub struct RunLogSink {
     event_file_path: PathBuf,
     event_sequence: Mutex<u64>,
     journal_failure: Mutex<Option<String>>,
+    cancellation_requested: AtomicBool,
     run_snapshot: Mutex<Option<Value>>,
     selected_tasks: Mutex<Vec<String>>,
     started_tasks: Mutex<BTreeSet<String>>,
@@ -67,6 +67,7 @@ impl RunLogSink {
             event_file_path,
             event_sequence: Mutex::new(0),
             journal_failure: Mutex::new(None),
+            cancellation_requested: AtomicBool::new(false),
             run_snapshot: Mutex::new(None),
             selected_tasks: Mutex::new(Vec::new()),
             started_tasks: Mutex::new(BTreeSet::new()),
@@ -202,7 +203,12 @@ impl RunLogSink {
 
     pub fn write_event(&self, kind: &str, task_id: Option<&str>, payload: Value) -> Result<()> {
         let starts_task = kind == "task_state_changed" && payload["state"] == "running";
+        let requests_cancellation =
+            matches!(kind, "task_cancel_requested" | "run_cancel_requested");
         let result = self.write_event_inner(kind, task_id, payload);
+        if result.is_ok() && requests_cancellation {
+            self.cancellation_requested.store(true, Ordering::SeqCst);
+        }
         if result.is_ok() && starts_task {
             if let (Some(task_id), Ok(mut started)) = (task_id, self.started_tasks.lock()) {
                 started.insert(task_id.to_string());
@@ -337,19 +343,30 @@ impl RunLogSink {
         Ok(())
     }
 
-    /// A zero exit can include cancel-one or all-skipped plans; neither permits restart.
+    /// Task outcomes do not veto restart, but cancellation and incomplete runs do.
     pub(crate) fn restart_eligible(&self) -> Result<bool> {
+        if self.journal_failure().is_some() || self.cancellation_requested.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         let snapshot = self
             .run_snapshot
             .lock()
             .map_err(|_| anyhow::anyhow!("run snapshot lock poisoned"))?;
         Ok(snapshot.as_ref().is_some_and(|run| {
-            run["failed_task_count"].as_u64() == Some(0)
-                && run["canceled_task_count"].as_u64() == Some(0)
-                && run["issue_count"].as_u64() == Some(0)
-                && run["tasks"]
-                    .as_array()
-                    .is_some_and(|tasks| tasks.iter().any(|task| task["status"] == "completed"))
+            matches!(run["status"].as_str(), Some("completed" | "failed"))
+                && run["tasks"].as_array().is_some_and(|tasks| {
+                    !tasks.is_empty()
+                        && tasks.iter().all(|task| {
+                            matches!(
+                                task["status"].as_str(),
+                                Some("completed" | "failed" | "skipped" | "canceled")
+                            ) && !task["advisories"].as_array().is_some_and(|advisories| {
+                                advisories
+                                    .iter()
+                                    .any(|advisory| advisory["code"] == "elevation-canceled")
+                            })
+                        })
+                })
         }))
     }
 
@@ -1326,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_eligibility_requires_clean_completed_task_evidence() {
+    fn restart_eligibility_requires_finalized_uncanceled_task_evidence() {
         let root = TempDir::new().unwrap();
         let sink = RunLogSink::new(root.path(), false).unwrap();
         assert!(!sink.restart_eligible().unwrap(), "missing snapshot");
@@ -1344,17 +1361,15 @@ mod tests {
 
         for tasks in [
             serde_json::json!([]),
-            serde_json::json!([{"status": "skipped"}]),
+            serde_json::json!([{"status": "running"}]),
+            serde_json::json!([{"status": "pending"}]),
         ] {
             let mut snapshot = clean.clone();
             snapshot["tasks"] = tasks;
             sink.write_json_file("run.json", &snapshot).unwrap();
             assert!(!sink.restart_eligible().unwrap(), "{snapshot}");
         }
-        // Cancel-one can retain a zero invocation exit alongside a completed
-        // sibling. Explicit task evidence must still suppress the restart.
         for (counter, task_status) in [
-            ("canceled_task_count", "canceled"),
             ("failed_task_count", "failed"),
             ("issue_count", "completed"),
         ] {
@@ -1365,7 +1380,61 @@ mod tests {
                 .unwrap()
                 .push(serde_json::json!({"status": task_status}));
             sink.write_json_file("run.json", &snapshot).unwrap();
-            assert!(!sink.restart_eligible().unwrap(), "{counter}: {snapshot}");
+            assert!(sink.restart_eligible().unwrap(), "{counter}: {snapshot}");
+        }
+        let mut failed = clean.clone();
+        failed["status"] = "failed".into();
+        failed["exit_code"] = 1.into();
+        failed["failed_task_count"] = 1.into();
+        failed["tasks"] = serde_json::json!([{"status": "failed"}]);
+        sink.write_json_file("run.json", &failed).unwrap();
+        assert!(sink.restart_eligible().unwrap());
+
+        let mut skipped = clean.clone();
+        skipped["tasks"] = serde_json::json!([{"status": "skipped"}]);
+        sink.write_json_file("run.json", &skipped).unwrap();
+        assert!(sink.restart_eligible().unwrap());
+
+        // Fail-fast and blocked dependencies produce canceled task results without user cancellation.
+        let mut canceled = clean.clone();
+        canceled["canceled_task_count"] = 1.into();
+        canceled["tasks"] = serde_json::json!([{"status": "completed"}, {"status": "canceled"}]);
+        sink.write_json_file("run.json", &canceled).unwrap();
+        assert!(sink.restart_eligible().unwrap());
+        canceled["tasks"][1]["advisories"] = serde_json::json!([{"code": "elevation-canceled"}]);
+        sink.write_json_file("run.json", &canceled).unwrap();
+        assert!(!sink.restart_eligible().unwrap());
+        for status in ["running", "finalizing", "canceled"] {
+            let mut snapshot = clean.clone();
+            snapshot["status"] = status.into();
+            sink.write_json_file("run.json", &snapshot).unwrap();
+            assert!(!sink.restart_eligible().unwrap(), "{snapshot}");
+        }
+        sink.write_json_file("run.json", &clean).unwrap();
+        sink.inject_journal_fault_for_test();
+        assert!(sink
+            .write_event("fixture", None, serde_json::json!({}))
+            .is_err());
+        assert!(!sink.restart_eligible().unwrap());
+    }
+
+    #[test]
+    fn restart_eligibility_preserves_explicit_operator_cancellation() {
+        for kind in ["task_cancel_requested", "run_cancel_requested"] {
+            let root = TempDir::new().unwrap();
+            let sink = RunLogSink::new(root.path(), false).unwrap();
+            sink.write_json_file(
+                "run.json",
+                &serde_json::json!({
+                    "status": "completed",
+                    "tasks": [{"status": "completed"}, {"status": "canceled"}],
+                }),
+            )
+            .unwrap();
+            assert!(sink.restart_eligible().unwrap());
+            sink.write_event(kind, Some("local/fixture"), serde_json::json!({}))
+                .unwrap();
+            assert!(!sink.restart_eligible().unwrap(), "{kind}");
         }
     }
 }
