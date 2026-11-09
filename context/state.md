@@ -1,5 +1,6 @@
 # Active work
 
+- **Update All restart review timeout**, branch `codex/update-all-restart-idle`. The user: "lets make it close after a set amount of time (reset when there's user activity) instead of auto close please. Maybe 3min? or something else?" and "ignore claude stuff for now". The configurable 180-second review window is implemented and passed the full product suite (972 tests), 25 lifecycle checks, and a full-length three-minute harmless PTY run. Delivery waits on native Dev Auth authorization: launch failed with environment_handoff_timed_out before the delivery script ran; HEAD/index remain unchanged. Next: authorize the prepared release-builder workflow, commit/push/merge, build twice, publish/install 0.1.19, and clean state. Installed 0.1.18 is unchanged; native reboot is not authorized.
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
   - a PolicyKit restart must not end grants;
   - an abnormal coordinator exit restarts the coordinator;

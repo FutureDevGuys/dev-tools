@@ -393,6 +393,7 @@ fn native_e2e_plain_frontend_acknowledges_foreground_handoffs() {
             2,
             2,
             false,
+            None,
         )
         .unwrap()
         .unwrap();

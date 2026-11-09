@@ -1,6 +1,9 @@
 [ui]
 mode = "dashboard"
 persist_until_exit = true
+# Completed-dashboard inactivity window when --restart-after is selected.
+# Keyboard, paste, and mouse input in the dashboard reset this timer.
+restart_idle_secs = 180
 show_global_log = true
 max_events_per_frame = 120
 

@@ -50,6 +50,7 @@ pub struct LoggingConfig {
 pub struct UiConfig {
     pub mode: UiMode,
     pub persist_until_exit: bool,
+    pub restart_idle_secs: u64,
     pub show_global_log: bool,
     pub max_events_per_frame: usize,
     pub dashboard_quit_behavior: DashboardQuitBehavior,
@@ -366,6 +367,7 @@ struct FileConfig {
 struct FileUiConfig {
     mode: Option<String>,
     persist_until_exit: Option<bool>,
+    restart_idle_secs: Option<u64>,
     show_global_log: Option<bool>,
     max_events_per_frame: Option<usize>,
     dashboard: Option<FileUiDashboardConfig>,
@@ -1639,6 +1641,10 @@ fn parse_core_config_values(parsed: &FileConfig) -> Result<ParsedCoreConfig> {
     let install = parsed.install.as_ref();
     let updaters = parsed.updaters.as_ref();
 
+    if parsed.ui.as_ref().and_then(|ui| ui.restart_idle_secs) == Some(0) {
+        bail!("invalid ui.restart_idle_secs '0'; expected >= 1");
+    }
+
     if let Some(grace) = dashboard.and_then(|d| d.quit_cancel_grace_ms) {
         if grace < 500 {
             bail!("invalid ui.dashboard.quit_cancel_grace_ms '{grace}'; expected >= 500");
@@ -1772,6 +1778,11 @@ pub fn load_runtime_config(config_path_cli: Option<PathBuf>) -> Result<RuntimeCo
                 .as_ref()
                 .and_then(|u| u.persist_until_exit)
                 .unwrap_or(true),
+            restart_idle_secs: parsed
+                .ui
+                .as_ref()
+                .and_then(|ui| ui.restart_idle_secs)
+                .unwrap_or(180),
             show_global_log: parsed
                 .ui
                 .as_ref()

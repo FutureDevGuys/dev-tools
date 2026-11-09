@@ -747,6 +747,7 @@ pub struct AsyncContext {
     pub ui: UiModeResolved,
     pub fail_fast: bool,
     pub ui_persist_until_exit: bool,
+    pub restart_idle_timeout: Option<Duration>,
     pub completions_mode: String,
     pub completion_providers: String,
     pub completion_discover: String,
@@ -2008,6 +2009,7 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         ctx.max_in_memory_lines,
         ctx.max_events_per_frame,
         ctx.task_colors,
+        ctx.restart_idle_timeout,
     )?;
     if let Some(run_log) = ctx.run_log.as_ref() {
         let _ = event_tx.send(DashboardEvent::RunIdentity {
@@ -2616,6 +2618,10 @@ pub fn run_async(ctx: AsyncContext) -> Result<()> {
         }
     }
 
+    // A final review key can close the frontend before the wait loop observes it.
+    // Consume its cancellation control before deciding whether to restart.
+    drain_completed_run_ui_controls(&ui_control_rx, &event_tx, ctx.run_log.as_ref());
+
     if ctx.ui == UiModeResolved::Plain || dashboard_unavailable {
         crate::ua_outln!(
             "\n{} Task Summary",
@@ -2699,11 +2705,13 @@ fn handle_completed_run_ui_control(
             );
         }
         UiControlEvent::CancelAll => {
+            journal_ui_control(event_tx, &UiControlEvent::CancelAll);
+            cancel::request_cancel();
             emit_runtime_log(
                 event_tx,
                 run_log,
                 "runtime",
-                "cancel-all ignored: run already complete",
+                "restart canceled after task completion",
             );
         }
         UiControlEvent::SendStdin { id, .. } => {
