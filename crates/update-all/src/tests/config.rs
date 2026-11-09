@@ -2,6 +2,34 @@ use super::{load_runtime_config, merge_user_completion_catalog, validate_config}
 use crate::completions::registry::Registry;
 use tempfile::TempDir;
 
+#[test]
+fn restart_review_timeout_defaults_to_three_minutes_and_rejects_zero() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("config.toml");
+    std::fs::write(&path, "").unwrap();
+    assert_eq!(
+        load_runtime_config(Some(path.clone()))
+            .unwrap()
+            .ui
+            .restart_idle_secs,
+        180
+    );
+    let template: toml::Value = toml::from_str(super::default_config_template()).unwrap();
+    assert_eq!(template["ui"]["restart_idle_secs"].as_integer(), Some(180));
+    std::fs::write(&path, "[ui]\nrestart_idle_secs=12\n").unwrap();
+    assert_eq!(
+        load_runtime_config(Some(path.clone()))
+            .unwrap()
+            .ui
+            .restart_idle_secs,
+        12
+    );
+    validate_config(Some(path.clone()), true).unwrap();
+    std::fs::write(&path, "[ui]\nrestart_idle_secs=0\n").unwrap();
+    assert!(load_runtime_config(Some(path.clone())).is_err());
+    assert!(validate_config(Some(path), true).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn configuration_writer_preserves_legacy_destination_selection_in_isolated_processes() {

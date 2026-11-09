@@ -550,11 +550,174 @@ fn restart_request_failure_preserves_completed_task_evidence_and_fails_invocatio
 }
 
 #[cfg(all(target_os = "linux", feature = "tui"))]
+struct DashboardSession {
+    child: Option<TestChild>,
+    master: fs::File,
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+impl DashboardSession {
+    fn start(fixture: &Fixture, args: &[&str]) -> Self {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let size = libc::winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty initializes two distinct owned descriptors and valid output pointers.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &size,
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty descriptors are each transferred exactly once.
+        let master = unsafe { fs::File::from_raw_fd(master_fd) };
+        let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+        let mut input = master.try_clone().unwrap();
+        let mut responder = master.try_clone().unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = [0; 8192];
+            let mut query_tail = Vec::new();
+            loop {
+                match input.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        captured.lock().unwrap().extend_from_slice(&bytes[..count]);
+                        query_tail.extend_from_slice(&bytes[..count]);
+                        let queries = query_tail
+                            .windows(4)
+                            .filter(|part| *part == b"\x1b[6n")
+                            .count();
+                        for _ in 0..queries {
+                            let _ = responder.write_all(b"\x1b[1;1R");
+                        }
+                        let keep = query_tail.len().saturating_sub(3);
+                        query_tail.drain(..keep);
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read fixture terminal: {error}"),
+                }
+            }
+        });
+        let mut command = fixture.process();
+        command
+            .args(["--dashboard", "--only", "local/restart-fixture"])
+            .args(args)
+            .env(
+                "PATH",
+                format!(
+                    "{}:/usr/bin:/bin",
+                    fixture.home.path().join("bin").display()
+                ),
+            )
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        // SAFETY: only async-signal-safe native calls run between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = TestChild(command.spawn().unwrap());
+        drop(command);
+        drop(slave);
+        Self {
+            child: Some(child),
+            master,
+            output,
+            reader: Some(reader),
+        }
+    }
+
+    fn wait_for_review(&mut self) {
+        self.wait_for_output(b"\x1b[?2004h", 1);
+    }
+
+    fn wait_for_output(&mut self, needle: &[u8], count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self
+                .output
+                .lock()
+                .unwrap()
+                .windows(needle.len())
+                .filter(|part| *part == needle)
+                .count()
+                >= count
+            {
+                return;
+            }
+            assert!(
+                self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "dashboard exited before review: {}",
+                String::from_utf8_lossy(&self.output.lock().unwrap())
+            );
+            assert!(Instant::now() < deadline, "review window did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn input(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+        self.master.write_all(bytes).unwrap();
+    }
+
+    fn assert_open_for(&mut self, duration: Duration) {
+        let until = Instant::now() + duration;
+        while Instant::now() < until {
+            assert!(
+                self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "dashboard closed during active review"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn finish(mut self, expected: i32) -> Vec<u8> {
+        assert_eq!(
+            wait_child(self.child.as_mut().unwrap()).code(),
+            Some(expected)
+        );
+        drop(self.child.take());
+        self.reader.take().unwrap().join().unwrap();
+        self.output.lock().unwrap().clone()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+impl Drop for DashboardSession {
+    fn drop(&mut self) {
+        drop(self.child.take());
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
 #[test]
 fn restart_after_closes_dashboard_without_input_and_restores_terminal() {
-    use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::process::CommandExt;
     for engine in ["sync", "async"] {
         for task_exit in [0, 7] {
             let fixture = Fixture::new(
@@ -563,95 +726,34 @@ fn restart_after_closes_dashboard_without_input_and_restores_terminal() {
                     r#"touch "$HOME/task-started"; while [ ! -e "$HOME/release" ]; do sleep 0.02; done; exit {task_exit}"#
                 ),
             );
-            let original_config =
-                fs::read(fixture.home.path().join("config/update-all/config.toml")).unwrap();
-            let mut master_fd = -1;
-            let mut slave_fd = -1;
-            let size = libc::winsize {
-                ws_row: 40,
-                ws_col: 120,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            // SAFETY: openpty initializes two owned descriptors; all pointer arguments are valid.
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master_fd,
-                        &mut slave_fd,
-                        std::ptr::null_mut(),
-                        std::ptr::null(),
-                        &size,
-                    )
-                },
-                0
+            let mut session =
+                DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "1"]);
+            wait_for(
+                &fixture.home.path().join("task-started"),
+                session.child.as_mut().unwrap(),
             );
-            // SAFETY: these distinct successful openpty descriptors are transferred exactly once.
-            let master = unsafe { fs::File::from_raw_fd(master_fd) };
-            let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
-            let mut reader = master.try_clone().unwrap();
-            let capture = std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let mut buffer = [0; 8192];
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(count) => bytes.extend_from_slice(&buffer[..count]),
-                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => panic!("read dashboard PTY: {error}"),
-                    }
-                }
-                bytes
-            });
-            let mut command = fixture.process();
-            command
-                .args([
-                    "--dashboard",
-                    "--completions",
-                    "off",
-                    "--only",
-                    "local/restart-fixture",
-                    "--restart-after",
-                ])
-                .stdin(slave.try_clone().unwrap())
-                .stdout(slave.try_clone().unwrap())
-                .stderr(slave.try_clone().unwrap());
-            // SAFETY: only async-signal-safe native calls occur in this pre-exec closure.
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let mut child = TestChild(command.spawn().unwrap());
-            drop(command);
-            drop(slave);
-            wait_for(&fixture.home.path().join("task-started"), &mut child);
+            session.assert_open_for(Duration::from_millis(1100));
             fixture.assert_no_restart();
             fs::write(fixture.home.path().join("release"), "continue").unwrap();
-            assert_eq!(
-                wait_child(&mut child).code(),
-                Some(if task_exit == 0 { 0 } else { 1 })
-            );
-            drop(master);
-            let bytes = capture.join().unwrap();
-            let screen = String::from_utf8_lossy(&bytes);
+            session.wait_for_review();
+            let review_started = Instant::now();
+            session.assert_open_for(Duration::from_millis(300));
+            let bytes = session.finish(if task_exit == 0 { 0 } else { 1 });
+            assert!(review_started.elapsed() >= Duration::from_millis(900));
             assert!(
-                screen.contains("\x1b[?1049h"),
-                "dashboard did not enter alternate screen"
+                bytes.windows(8).any(|part| part == b"\x1b[?2004l"),
+                "paste mode was not restored"
             );
             assert!(
-                screen.contains("\x1b[?1049l"),
-                "dashboard did not leave alternate screen"
+                bytes.windows(8).any(|part| part == b"\x1b[?1049l"),
+                "alternate screen was not restored"
             );
             let requests = fs::read_to_string(&fixture.marker).unwrap();
             assert_eq!(requests.lines().count(), 1);
             let request: Value = serde_json::from_str(requests.trim()).unwrap();
             assert_eq!(request["terminal_raw_mode"], false);
-            assert_eq!(request["run"]["ui_mode"], "dashboard");
+            assert_eq!(request["task_admission_owned"], true);
+            assert_eq!(request["run_completed_count"], 1);
             assert_eq!(
                 request["metadata"]["status"],
                 if task_exit == 0 {
@@ -660,24 +762,276 @@ fn restart_after_closes_dashboard_without_input_and_restores_terminal() {
                     "failed"
                 }
             );
-            assert_eq!(request["run_completed_count"], 1);
-            assert_eq!(request["task_admission_owned"], true);
-            // UI choice persistence may add mode, but must not disable normal review persistence.
-            let config_path = fixture.home.path().join("config/update-all/config.toml");
-            let current: toml::Value =
-                toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-            let original: toml::Value =
-                toml::from_str(std::str::from_utf8(&original_config).unwrap()).unwrap();
-            assert_eq!(
-                current
-                    .get("ui")
-                    .and_then(|ui| ui.get("persist_until_exit")),
-                original
-                    .get("ui")
-                    .and_then(|ui| ui.get("persist_until_exit"))
+            let config: toml::Value = toml::from_str(
+                &fs::read_to_string(fixture.home.path().join("config/update-all/config.toml"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(config["ui"]["persist_until_exit"].as_bool(), Some(true));
+            assert!(
+                config["ui"].get("restart_idle_secs").is_none(),
+                "CLI override must not persist"
             );
         }
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_idle_window_resets_for_keyboard_mouse_and_literal_paste() {
+    for input in [
+        b"\x1b[B".as_slice(),
+        b"\x1b[<64;5;6M",
+        b"\x1b[200~q\x03\n\x1b[201~",
+    ] {
+        let fixture = Fixture::new("async", "exit 0");
+        let mut session =
+            DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "2"]);
+        session.wait_for_review();
+        session.assert_open_for(Duration::from_millis(1100));
+        session.input(input);
+        session.assert_open_for(Duration::from_millis(1100));
+        fixture.assert_no_restart();
+        session.finish(0);
+        assert_eq!(
+            fs::read_to_string(&fixture.marker).unwrap().lines().count(),
+            1
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_idle_review_honors_early_quit_and_cancellation() {
+    for (input, code) in [(b"q".as_slice(), 0), (b"\x03".as_slice(), 3)] {
+        let fixture = Fixture::new("async", "exit 0");
+        let mut session =
+            DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "30"]);
+        session.wait_for_review();
+        session.input(input);
+        session.finish(code);
+        if code == 3 {
+            fixture.assert_no_restart();
+        } else {
+            assert_eq!(
+                fs::read_to_string(&fixture.marker).unwrap().lines().count(),
+                1
+            );
+        }
+        assert_eq!(
+            json(fixture.only_run().join("run.json"))["status"],
+            "completed",
+            "review cancellation must preserve completed task evidence"
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_review_config_and_cli_override_preserve_user_preferences() {
+    for override_cli in [false, true] {
+        let fixture = Fixture::new("async", "exit 0");
+        let path = fixture.home.path().join("config/update-all/config.toml");
+        let configured = if override_cli { 30 } else { 1 };
+        fs::write(
+            &path,
+            fs::read_to_string(&path).unwrap().replace(
+                "persist_until_exit=true",
+                &format!("persist_until_exit=false\nrestart_idle_secs={configured}"),
+            ),
+        )
+        .unwrap();
+        let args = if override_cli {
+            vec!["--restart-after", "--restart-idle-secs", "1"]
+        } else {
+            vec!["--restart-after"]
+        };
+        let mut session = DashboardSession::start(&fixture, &args);
+        session.wait_for_review();
+        let start = Instant::now();
+        session.assert_open_for(Duration::from_millis(300));
+        session.finish(0);
+        assert!(start.elapsed() >= Duration::from_millis(900));
+        let config: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(config["ui"]["persist_until_exit"].as_bool(), Some(false));
+        assert_eq!(
+            config["ui"]["restart_idle_secs"].as_integer(),
+            Some(configured)
+        );
+        assert!(
+            json(fixture.only_run().join("run.json"))["ui_wait_ms"]
+                .as_u64()
+                .unwrap()
+                >= 900
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_review_does_not_reset_for_resize() {
+    use std::os::fd::AsRawFd;
+    let fixture = Fixture::new("async", "exit 0");
+    let mut session =
+        DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "2"]);
+    session.wait_for_review();
+    let start = Instant::now();
+    session.assert_open_for(Duration::from_millis(1100));
+    let size = libc::winsize {
+        ws_row: 41,
+        ws_col: 121,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: the PTY descriptor is live and size points to a valid winsize.
+    assert_eq!(
+        unsafe { libc::ioctl(session.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(session.child.as_ref().unwrap().id() as i32),
+        nix::sys::signal::Signal::SIGWINCH,
+    )
+    .unwrap();
+    session.wait_for_output(b"\x1b[?2004l", 1);
+    assert!(
+        start.elapsed() < Duration::from_millis(2900),
+        "resize postponed the original deadline: {:?}",
+        start.elapsed()
+    );
+    session.finish(0);
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_review_canceled_task_exits_without_misleading_countdown() {
+    let fixture = Fixture::new("async", "touch \"$HOME/task-started\"; sleep 12");
+    let mut session =
+        DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "30"]);
+    wait_for(
+        &fixture.home.path().join("task-started"),
+        session.child.as_mut().unwrap(),
+    );
+    session.wait_for_output(b"Harmless", 1);
+    session.input(b"k");
+    let output = session.finish(1);
+    fixture.assert_no_restart();
+    assert!(!output.windows(8).any(|part| part == b"\x1b[?2004h"));
+    assert_eq!(
+        json(fixture.only_run().join("run.json"))["canceled_task_count"],
+        1
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_review_pauses_for_log_viewer_and_resumes_with_full_interval() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("async", "printf 'reviewable task output\\n'");
+    fs::create_dir(fixture.home.path().join("bin")).unwrap();
+    let pager = fixture.home.path().join("bin/less");
+    fs::write(&pager, "#!/bin/sh\ntouch \"$HOME/pager-started\"\nwhile [ ! -e \"$HOME/release-pager\" ]; do sleep 0.02; done\n").unwrap();
+    fs::set_permissions(&pager, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut session =
+        DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "1"]);
+    session.wait_for_review();
+    session.input(b"m");
+    wait_for(
+        &fixture.home.path().join("pager-started"),
+        session.child.as_mut().unwrap(),
+    );
+    session.assert_open_for(Duration::from_millis(1200));
+    fixture.assert_no_restart();
+    fs::write(fixture.home.path().join("release-pager"), "continue").unwrap();
+    session.wait_for_output(b"\x1b[?2004h", 2);
+    let resumed = Instant::now();
+    session.assert_open_for(Duration::from_millis(300));
+    session.finish(0);
+    assert!(resumed.elapsed() >= Duration::from_millis(900));
+    assert_eq!(
+        fs::read_to_string(&fixture.marker).unwrap().lines().count(),
+        1
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn restart_review_preserves_deferred_task_outcome() {
+    use std::io::Write;
+    let fixture = Fixture::new(
+        "async",
+        r#"printf '%s\n' 'UPDATE_ALL_RESULT {"outcome":"deferred","detail":"fixture deferred"}'"#,
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(
+            fixture
+                .home
+                .path()
+                .join("config/update-all/catalog.d/local/restart.toml"),
+        )
+        .unwrap()
+        .write_all(b"result_protocol=1\n")
+        .unwrap();
+    let mut session =
+        DashboardSession::start(&fixture, &["--restart-after", "--restart-idle-secs", "1"]);
+    session.wait_for_review();
+    session.finish(2);
+    let run = json(fixture.only_run().join("run.json"));
+    assert_eq!(run["exit_code"], 2);
+    assert_eq!(
+        fs::read_to_string(&fixture.marker).unwrap().lines().count(),
+        1
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "tui"))]
+#[test]
+fn ordinary_dashboard_ignores_restart_timeout_configuration() {
+    let fixture = Fixture::new("async", "exit 0");
+    let path = fixture.home.path().join("config/update-all/config.toml");
+    let content = fs::read_to_string(&path).unwrap().replace(
+        "persist_until_exit=true",
+        "persist_until_exit=true\nrestart_idle_secs=1",
+    );
+    fs::write(path, content).unwrap();
+    let mut session = DashboardSession::start(&fixture, &[]);
+    session.assert_open_for(Duration::from_millis(1600));
+    session.input(b"q");
+    session.finish(0);
+    fixture.assert_no_restart();
+}
+
+#[test]
+fn restart_idle_cli_and_config_validate_before_task_effects() {
+    for args in [
+        vec!["--restart-idle-secs", "1"],
+        vec!["--restart-after", "--restart-idle-secs", "0"],
+    ] {
+        let fixture = Fixture::new("async", "touch \"$HOME/unexpected-effect\"");
+        let output = fixture.run().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(!fixture.home.path().join("unexpected-effect").exists());
+        fixture.assert_no_restart();
+    }
+    let fixture = Fixture::new("async", "touch \"$HOME/unexpected-effect\"");
+    let path = fixture.home.path().join("config/update-all/config.toml");
+    fs::write(
+        &path,
+        fs::read_to_string(&path).unwrap().replace(
+            "persist_until_exit=true",
+            "persist_until_exit=true\nrestart_idle_secs=0",
+        ),
+    )
+    .unwrap();
+    let output = fixture
+        .process()
+        .args(["config", "validate", "--strict"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ui.restart_idle_secs"));
+    fixture.assert_no_restart();
 }
 
 #[test]

@@ -3,10 +3,11 @@ use crate::ui::{
     DashboardQuitBehavior, DashboardReceiver, LogLevel, LogRecord, LogStream, LogViewTarget,
     MouseRowStride, TaskPresentation, TaskState, UiControlEvent, RUN_LOG_SCOPE,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyEventState, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -143,6 +144,26 @@ enum SearchRestore {
     },
 }
 
+struct RestartReview {
+    timeout: Duration,
+    last_activity: Instant,
+}
+
+impl RestartReview {
+    fn remaining(&self, now: Instant) -> Duration {
+        self.timeout
+            .saturating_sub(now.saturating_duration_since(self.last_activity))
+    }
+
+    fn observe_input(&mut self, event: &Event, now: Instant) {
+        if matches!(event, Event::Key(key) if key.kind != KeyEventKind::Release)
+            || matches!(event, Event::Mouse(_) | Event::Paste(_))
+        {
+            self.last_activity = now;
+        }
+    }
+}
+
 struct Model {
     started_at: Instant,
     run_id: Option<String>,
@@ -152,6 +173,8 @@ struct Model {
     run_canceled: bool,
     run_had_failures: bool,
     cancel_requested: bool,
+    task_cancel_requested: bool,
+    restart_review: Option<RestartReview>,
     task_order: Vec<String>,
     tasks: BTreeMap<String, TaskRow>,
     pending_task_logs: BTreeMap<String, PendingTaskLogs>,
@@ -213,6 +236,8 @@ impl Model {
             run_canceled: false,
             run_had_failures: false,
             cancel_requested: false,
+            task_cancel_requested: false,
+            restart_review: None,
             task_order: Vec::new(),
             tasks: BTreeMap::new(),
             pending_task_logs: BTreeMap::new(),
@@ -621,6 +646,7 @@ pub fn run_dashboard(
     max_in_memory_lines: usize,
     max_events_per_frame: usize,
     task_colors: bool,
+    restart_idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let mut terminal = Some(setup_terminal()?);
     if let Some(t) = terminal.as_mut() {
@@ -712,13 +738,29 @@ pub fn run_dashboard(
                         canceled,
                         had_failures,
                         completed_at,
-                    } => apply_run_complete_event(
-                        &mut model,
-                        success,
-                        canceled,
-                        had_failures,
-                        completed_at,
-                    ),
+                    } => {
+                        let first_completion = model.run_complete.is_none();
+                        apply_run_complete_event(
+                            &mut model,
+                            success,
+                            canceled,
+                            had_failures,
+                            completed_at,
+                        );
+                        if first_completion {
+                            if let Some(timeout) = restart_idle_timeout {
+                                if canceled || model.cancel_requested || model.task_cancel_requested
+                                {
+                                    done = true;
+                                } else {
+                                    model.restart_review = Some(RestartReview {
+                                        timeout,
+                                        last_activity: Instant::now(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     DashboardEvent::UiSuspendRequested { reason, ack } => {
                         if !suspended {
                             if let Some(mut t) = terminal.take() {
@@ -738,6 +780,9 @@ pub fn run_dashboard(
                                 t.clear()?;
                             }
                             suspended = false;
+                            if let Some(review) = model.restart_review.as_mut() {
+                                review.last_activity = Instant::now();
+                            }
                         }
                         if let Some(ack) = ack {
                             let _ = ack.send(());
@@ -747,8 +792,28 @@ pub fn run_dashboard(
                 }
             }
 
+            if restart_idle_timeout.is_some()
+                && model.run_complete.is_some()
+                && crate::util::cancel::is_cancel_requested()
+            {
+                done = true;
+            }
+            if !suspended
+                && model
+                    .restart_review
+                    .as_ref()
+                    .is_some_and(|review| review.remaining(Instant::now()).is_zero())
+            {
+                done = true;
+            }
             normalize_active_pane(&mut model);
             if !suspended {
+                if model.restart_review.is_some() {
+                    terminal
+                        .as_mut()
+                        .context("terminal unavailable")?
+                        .enable_review_paste()?;
+                }
                 layout = layout_for(
                     terminal_rect(
                         terminal
@@ -799,13 +864,18 @@ fn drain_terminal_input(
             break;
         }
         let owner = model.modal_owner();
-        match event::read()? {
+        let event = event::read()?;
+        if let Some(review) = model.restart_review.as_mut() {
+            review.observe_input(&event, Instant::now());
+        }
+        match event {
             Event::Key(key) => {
                 if handle_key_event(model, key, layout, control_tx, quit_behavior) {
                     return Ok(true);
                 }
             }
             Event::Mouse(mouse) => handle_mouse_event(model, mouse, layout),
+            Event::Paste(text) => handle_review_paste(model, &text),
             Event::Resize(_, _) => model.reset_task_mouse_stride_calibration(),
             _ => {}
         }
@@ -816,6 +886,17 @@ fn drain_terminal_input(
         }
     }
     Ok(false)
+}
+
+fn handle_review_paste(model: &mut Model, text: &str) {
+    let buffer = match model.modal_owner() {
+        ModalOwner::Search => model.search_edit.as_mut().map(|edit| &mut edit.buffer),
+        ModalOwner::Rename => model.rename_edit.as_mut().map(|edit| &mut edit.buffer),
+        _ => None,
+    };
+    if let Some(buffer) = buffer {
+        buffer.extend(text.chars().filter(|character| !character.is_control()));
+    }
 }
 
 fn visible_panes(show_global: bool, right_mode: RightPaneMode) -> Vec<ActivePane> {
@@ -894,11 +975,13 @@ fn handle_key_event(
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
-        if model.run_complete.is_none() && !model.cancel_requested {
+        if (model.run_complete.is_none() || model.restart_review.is_some())
+            && !model.cancel_requested
+        {
             let _ = control_tx.send(UiControlEvent::CancelAll);
             model.cancel_requested = true;
         }
-        return false;
+        return model.restart_review.is_some();
     }
     if key
         .modifiers
@@ -1097,6 +1180,7 @@ fn handle_key_event(
                 .flatten()
             {
                 let _ = control_tx.send(UiControlEvent::CancelTask { id: task_id });
+                model.task_cancel_requested = true;
             }
         }
         KeyCode::Char('K') => {
@@ -2112,7 +2196,14 @@ fn render_footer_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
         ("m", "open log"),
     ];
     if model.run_complete.is_some() {
-        hints.push(("q", "close dashboard"));
+        hints.push((
+            "q",
+            if model.restart_review.is_some() {
+                "restart now"
+            } else {
+                "close dashboard"
+            },
+        ));
     } else {
         hints.extend([("k/K", "kill one/all"), ("q", "exit")]);
     }
@@ -2156,6 +2247,20 @@ fn render_footer_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
         }
     }
 
+    if let Some(review) = &model.restart_review {
+        let remaining = review.remaining(Instant::now());
+        let seconds = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Restart in {}:{:02} | input resets | q: now | Ctrl+C: cancel",
+                seconds / 60,
+                seconds % 60
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     lines.extend(shortcut_lines);
     lines
 }
@@ -4645,6 +4750,7 @@ struct TerminalModes {
     raw: bool,
     alternate: bool,
     mouse: bool,
+    paste: bool,
 }
 
 impl TerminalModes {
@@ -4659,6 +4765,14 @@ impl TerminalModes {
             }
         }
         let mut stdout = io::stdout();
+        if self.paste {
+            match execute!(stdout, DisableBracketedPaste) {
+                Ok(()) => self.paste = false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
         if self.mouse {
             match execute!(stdout, DisableMouseCapture) {
                 Ok(()) => self.mouse = false,
@@ -4684,7 +4798,7 @@ impl TerminalModes {
 
 impl Drop for TerminalModes {
     fn drop(&mut self) {
-        if self.raw || self.alternate || self.mouse {
+        if self.raw || self.alternate || self.mouse || self.paste {
             let _ = self.restore();
         }
     }
@@ -4693,6 +4807,16 @@ impl Drop for TerminalModes {
 struct DashboardTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     modes: TerminalModes,
+}
+
+impl DashboardTerminal {
+    fn enable_review_paste(&mut self) -> io::Result<()> {
+        if !self.modes.paste {
+            self.modes.paste = true;
+            execute!(io::stdout(), EnableBracketedPaste)?;
+        }
+        Ok(())
+    }
 }
 
 impl std::ops::Deref for DashboardTerminal {

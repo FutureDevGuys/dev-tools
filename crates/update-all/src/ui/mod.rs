@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, RecvError, SendError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Bound the entire producer-to-frontend log backlog, including unusually long
 // records. Complete evidence is journaled before entering this display channel.
@@ -442,6 +442,7 @@ impl UiModeResolved {
         max_in_memory_lines: usize,
         max_events_per_frame: usize,
         task_colors: bool,
+        restart_idle_timeout: Option<Duration>,
     ) -> Result<Option<thread::JoinHandle<Result<()>>>> {
         match self {
             UiModeResolved::Plain => {
@@ -483,6 +484,7 @@ impl UiModeResolved {
                             max_in_memory_lines,
                             max_events_per_frame,
                             task_colors,
+                            restart_idle_timeout,
                         )
                     })))
                 }

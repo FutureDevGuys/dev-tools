@@ -61,6 +61,14 @@ pub struct RunCli {
     )]
     restart_after: bool,
 
+    /// Seconds of dashboard inactivity before closing for --restart-after (default: 180).
+    #[arg(
+        long = "restart-idle-secs",
+        requires = "restart_after",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    restart_idle_secs: Option<u64>,
+
     #[arg(long = "fail-fast", default_value_t = false)]
     fail_fast: bool,
 
@@ -258,7 +266,7 @@ impl RunCli {
         let restart = if self.restart_after {
             let request = crate::restart::RestartRequest::prepare()?;
             crate::ua_errln!(
-                "WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart when tasks finish, even if updates fail or are deferred. The dashboard will close automatically. Cancellation prevents restart. No forced restart or automatic elevation will be used."
+                "WARNING: --restart-after is enabled. Save your work: this computer will be asked to restart after tasks finish, even if updates fail or are deferred. The completed dashboard closes after its inactivity timeout; dashboard input resets the timer. Cancellation prevents restart. No forced restart or automatic elevation will be used."
             );
             Some(request)
         } else {
@@ -367,7 +375,13 @@ impl RunCli {
                 engine_mode: engine_label,
                 ui,
                 fail_fast,
-                ui_persist_until_exit: runtime_cfg.ui.persist_until_exit && !self.restart_after,
+                ui_persist_until_exit: runtime_cfg.ui.persist_until_exit || self.restart_after,
+                restart_idle_timeout: self.restart_after.then(|| {
+                    std::time::Duration::from_secs(
+                        self.restart_idle_secs
+                            .unwrap_or(runtime_cfg.ui.restart_idle_secs),
+                    )
+                }),
                 completions_mode,
                 completion_providers,
                 completion_discover,

@@ -5,8 +5,9 @@ owner: dev-tools/update-all
 
 # ADR 0048: Unattended restart after finalized task outcomes
 
-status: proposed
+status: superseded
 verification: pending
+replacement: 0049-restart-dashboard-inactivity-window.md
 
 ## Context
 

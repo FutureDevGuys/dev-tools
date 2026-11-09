@@ -1,6 +1,147 @@
 use super::*;
 
 #[test]
+fn restart_review_resets_only_for_dashboard_activity() {
+    let start = Instant::now();
+    let later = start + Duration::from_secs(30);
+    for event in [
+        Event::Resize(80, 24),
+        Event::FocusGained,
+        Event::FocusLost,
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )),
+    ] {
+        let mut review = RestartReview {
+            timeout: Duration::from_secs(180),
+            last_activity: start,
+        };
+        review.observe_input(&event, later);
+        assert_eq!(review.remaining(later), Duration::from_secs(150));
+        assert!(review.remaining(start + Duration::from_secs(180)).is_zero());
+    }
+    for event in [
+        Event::Key(KeyEvent::from(KeyCode::Down)),
+        Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )),
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Paste("q\n\x03".into()),
+    ] {
+        let mut review = RestartReview {
+            timeout: Duration::from_secs(180),
+            last_activity: start,
+        };
+        review.observe_input(&event, later);
+        assert_eq!(review.remaining(later), Duration::from_secs(180));
+        assert_eq!(
+            review.remaining(start + Duration::from_secs(180)),
+            Duration::from_secs(30)
+        );
+    }
+}
+
+#[test]
+fn restart_review_paste_preserves_editors_without_submitting_controls() {
+    let mut model = Model::new(200, true, true);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let layout = layout_for(
+        Rect::new(0, 0, 120, 40),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    model.restart_review = Some(RestartReview {
+        timeout: Duration::from_secs(180),
+        last_activity: Instant::now(),
+    });
+    model.run_complete = Some(true);
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Char('/')),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::CancelAll,
+    );
+    handle_review_paste(&mut model, "needle q\n\x03");
+    assert_eq!(model.search_edit.as_ref().unwrap().buffer, "needle q");
+    assert!(rx.try_recv().is_err());
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Esc),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::CancelAll,
+    );
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Char('r')),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::CancelAll,
+    );
+    handle_review_paste(&mut model, "review q\n\x03");
+    assert_eq!(model.rename_edit.as_ref().unwrap().buffer, "review q");
+    assert!(rx.try_recv().is_err());
+    assert!(!model.cancel_requested);
+    assert!(handle_key_event(
+        &mut model,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::CancelAll
+    ));
+    assert!(matches!(rx.try_recv().unwrap(), UiControlEvent::CancelAll));
+}
+
+#[test]
+fn restart_review_footer_explains_countdown_and_task_cancel_is_latched() {
+    let mut model = Model::new(200, true, true);
+    model.register_task("fixture".into(), "Fixture".into(), Vec::new(), false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let layout = layout_for(
+        Rect::new(0, 0, 120, 40),
+        true,
+        RightPaneMode::Split,
+        ActivePane::Tasks,
+    );
+    handle_key_event(
+        &mut model,
+        KeyEvent::from(KeyCode::Char('k')),
+        &layout,
+        &tx,
+        DashboardQuitBehavior::CancelAll,
+    );
+    assert!(model.task_cancel_requested);
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        UiControlEvent::CancelTask { .. }
+    ));
+    let mut model = Model::new(200, true, true);
+    model.run_complete = Some(false);
+    model.restart_review = Some(RestartReview {
+        timeout: Duration::from_secs(180),
+        last_activity: Instant::now(),
+    });
+    let text = render_footer_lines(&model, 120)
+        .into_iter()
+        .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+        .collect::<String>();
+    assert!(text.contains("Restart in"));
+    assert!(text.contains("input resets"));
+    assert!(text.contains("Ctrl+C: cancel"));
+}
+
+#[test]
 fn functional_categories_collapse_to_six_dashboard_groups() {
     assert_eq!(functional_group_label("system"), "System Packages");
     assert_eq!(functional_group_label("language"), "Developer Tools");
