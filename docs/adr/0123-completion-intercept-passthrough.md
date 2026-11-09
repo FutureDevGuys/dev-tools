@@ -16,12 +16,14 @@ The existing product-owned invocation dispatcher classifies the documented leadi
 
 Classification uses the existing normalized entrypoint inventory and the first native argument only. It does not search later arguments for completion-like words: `uv run generate-shell-completion`, `uvx generate-shell-completion`, and arguments after a tool name or `--` retain their existing dispatch. Other option placements and completion grammars are not claimed. Explicit `dev-cache exec` continues to request its selected adapter environment. This is a command-specific cache classification, not privilege authorization or an exemption from native tool safeguards.
 
+[ADR 0143](0143-uv-completion-global-options.md) extends the UV root-command classification to recognized leading global options. It supersedes the first-argument-only restriction for `uv`, not the retained `uvx` grammar or any other boundary above.
+
 Other workloads retain the existing pre/post automatic maintenance, activity and resource protections; explicit GC and compiler-intercept boundaries remain unchanged. No shell plugin, user configuration, private consumer, background supervisor, dependency or on-disk schema is introduced or changed. The common `dev-cache completion` renderer remains governed by ADR 0012.
 
 The upstream native forms are documented in [UV's shell autocompletion instructions](https://docs.astral.sh/uv/getting-started/installation/#shell-autocompletion).
 
 ## Verification and acceptance
 
-The existing dispatch conformance case is extended in source with both native forms, normalized executable spelling and adjacent workload arguments that must continue routing. It has not been executed for this source-only change. No build, test, lint, CI or installed-binary acceptance has run.
+The original source-only change added both native forms, normalized executable spelling and adjacent workload arguments to the dispatch conformance case, without executing build, test, lint, CI or installed-binary acceptance at that time. Subsequent Linux build, test and native intercept evidence, including the original leading forms, is recorded in [ADR 0143](0143-uv-completion-global-options.md).
 
-Native acceptance remains outstanding: confirm unchanged completion bytes and failure status through an intercept while configuration is invalid or root coordination is exclusively held, with no cache state or maintenance effect, then confirm ordinary UV work retains routing and maintenance. No signed release or managed installation is performed by this source change; the installed binary retains its previous behavior until qualified delivery.
+No signed release or managed installation is performed by this source change; the installed binary retains its previous behavior until qualified delivery. Native non-Linux qualification remains outstanding.

@@ -11,6 +11,7 @@ SyncConfigs also maintains product-local records, including [durable overlay pub
 
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0143](0143-uv-completion-global-options.md) | UV completion passthrough after recognized global options | proposed | Linux completion acceptance passed; three unrelated environment-dependent tests blocked |
 | [0142](0142-calling-thread-foreground-terminal-custody.md) | Linux calling-thread foreground terminal custody shared by native command consumers | accepted | native mechanism and signed Linux consumer qualification passed |
 | [0141](0141-graceful-ends-and-drained-stops-for-managed-work.md) | Dev Auth ends managed work with SIGTERM and a fixed 10-second grace before SIGKILL, drains an orderly coordinator stop, refuses setup over running jobs, never idles a grant with attached work, contains OOM kills and job process groups, and keeps admitted grants working across a sudo-program change | proposed | hermetic source tests passed; native acceptance pending |
 | [0140](0140-candidate-rendered-setup-plans.md) | Dev Auth renders a setup plan only in the release it installs, and every release hands a plan to that release before judging it | proposed | hermetic source tests passed; signed upgrade acceptance pending |
