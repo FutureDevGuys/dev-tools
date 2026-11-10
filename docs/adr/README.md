@@ -159,5 +159,3 @@ Product-scoped records remain with their product. The existing [Update All ADR s
 | [0132](0132-admission-before-public-signing-input.md) | Admission before public signing input | proposed | pending |
 | [0133](0133-native-account-workstation-config-authority.md) | Native-account workstation configuration authority | proposed | pending |
 | [0134](0134-provider-neutral-operation-only-ssh-signing.md) | Provider-neutral operation-only signing | proposed | pending |
-
-| [0144](0144-explicit-gc-protected-paths.md) | Explicit GC protected paths | proposed | pending |
