@@ -31,6 +31,8 @@ pub struct GcOverrides {
     pub target_free_bytes: Option<u64>,
     pub stale_after_days: Option<u64>,
     pub max_actions: Option<usize>,
+    /// Absolute managed paths excluded, including overlapping compound actions.
+    pub protect_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -205,7 +207,40 @@ fn collect_with_lease(
     progress: &mut dyn FnMut(u64),
 ) -> Result<GcReport> {
     progress(0);
+    for path in &overrides.protect_paths {
+        if !path.is_absolute()
+            || path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            bail!("protected paths must be absolute without dot components");
+        }
+        validate_action_path(root, path)?;
+        if ![
+            root.shared(),
+            root.repos(),
+            root.platform_root.join("artifacts"),
+        ]
+        .iter()
+        .any(|payload| path.starts_with(payload))
+        {
+            bail!("protected paths must be cache, workspace, or artifact payload paths; control metadata is not a payload");
+        }
+    }
     if apply {
+        // Recovery predates planning and may delete committed trash or restore
+        // protected originals. Do not let a restricted run enter that boundary.
+        if !overrides.protect_paths.is_empty()
+            && (trash_backlog(root)? != 0
+                || fs::read_dir(root.control().join("gc-journal"))?
+                    .next()
+                    .is_some())
+        {
+            bail!("protected GC requires an empty trash and journal; recovery was not attempted");
+        }
         recover_trash(root)?;
     }
     let free_before = fs2::available_space(&root.root)?;
@@ -258,6 +293,17 @@ fn collect_with_lease(
         &mut actions,
         &mut abstentions,
     );
+    actions.retain(|action| {
+        let protected = action_overlaps_protection(action, &overrides.protect_paths);
+        if protected {
+            abstentions.push(GcAbstention {
+                resource_id: action.resource_id.clone(),
+                path: action.path.clone(),
+                reason: "action overlaps an explicitly protected managed path".to_owned(),
+            });
+        }
+        !protected
+    });
     remove_nested_actions(&mut actions);
     let bytes_before = measure_action_sizes(root, &mut actions, progress)?;
     let pressure = free_before < min_free || max_bytes.is_some_and(|limit| bytes_before > limit);
@@ -361,6 +407,17 @@ fn collect_with_lease(
         failures,
         trash_backlog,
     })
+}
+
+fn action_overlaps_protection(action: &GcAction, protected: &[PathBuf]) -> bool {
+    std::iter::once(&action.path)
+        .chain(action.companion_paths.iter())
+        .chain(action.destination.iter())
+        .any(|path| {
+            protected
+                .iter()
+                .any(|p| path.starts_with(p) || p.starts_with(path))
+        })
 }
 
 fn measured_action(action: &GcAction) -> bool {
@@ -1504,6 +1561,22 @@ mod planning_tests {
         actions.retain(|action| {
             action.kind == "repository" || !roots.iter().any(|root| action.path.starts_with(root))
         });
+    }
+
+    #[test]
+    fn protected_reconciliation_destination_and_ancestors_are_excluded() {
+        let mut candidate = action("repository-identity", "/cache/old", 0);
+        candidate.destination = Some(PathBuf::from("/cache/new"));
+        for path in ["/cache/new", "/cache/new/payload", "/cache"] {
+            assert!(action_overlaps_protection(
+                &candidate,
+                &[PathBuf::from(path)]
+            ));
+        }
+        assert!(!action_overlaps_protection(
+            &candidate,
+            &[PathBuf::from("/cache/newer")]
+        ));
     }
 
     #[test]

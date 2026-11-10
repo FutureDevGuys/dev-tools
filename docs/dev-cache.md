@@ -130,3 +130,7 @@ When the canonical intercept directory is missing from the current PATH, doctor 
 ## Workspace discovery
 
 Workspace grouping uses local filesystem markers and never launches Git or its credential wrappers. The nearest `.git` file/directory takes precedence over nested language manifests; without one, the nearest supported language manifest or requested directory supplies the scope. Markers are cache grouping hints only. Git environment and configuration overrides do not change this scope. See [ADR 0086](adr/0086-local-cache-workspace-discovery.md).
+
+### Protecting managed payloads during one manual GC
+
+Repeat `gc --protect-path /absolute/managed/payload` to exclude any action whose primary path, companion or destination overlaps the protected path, including ancestor actions. Use the same paths for preview and `--apply`; applied collection still replans. The paths must belong to the current runtime domain's cache, workspace or artifact payload trees, not control metadata, symlinks or source checkouts. Identify every cache resource to retain, including shared resources if ownership is uncertain. Excluded actions are reported as abstentions. Pending trash or journals block protected apply before recovery. This invocation-only restriction does not change later automatic GC or configuration, and cannot be combined with `--automatic`. See ADR 0144.

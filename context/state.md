@@ -22,3 +22,9 @@
 - Dev Cache's native container cache stays off by default, and native Docker acceptance has not run (#41).
 - Native Windows, WSL and macOS acceptance has not run, so supported platforms are Linux only.
 - Branches `auric/generic-secret-projection-policy-20261022` (1,220 changed lines) and `feat/generic-workload-acceptance-20261022` (599) hold unmerged Dev Auth projection and acceptance work with no pull request. #75 may supersede them; compare before reusing or deleting them.
+
+## Dev Cache explicit protected GC paths (2026-11-10)
+
+- Branch `auric/dev-cache-protected-paths`: generic invocation-local exclusion, compound/destination overlap and fail-closed pending recovery. ADR 0144.
+- Native live cleanup and signed delivery remain unqualified; no production GC performed.
+- Cloud evidence: 222 passed; 2 existing ignored; 3 capability-dependent tests not qualified (ptrace/socket denied). Independent control-path finding corrected and public-CLI regression added. No live GC or installed changes.
