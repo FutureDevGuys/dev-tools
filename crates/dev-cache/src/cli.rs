@@ -174,6 +174,9 @@ enum ConfigCommand {
 
 #[derive(Args, Debug)]
 struct GcArgs {
+    /// Exclude actions overlapping an absolute managed cache path (repeatable).
+    #[arg(long = "protect-path", conflicts_with = "automatic")]
+    protect_paths: Vec<PathBuf>,
     #[arg(long)]
     apply: bool,
     #[arg(long, hide = true)]
@@ -1523,6 +1526,7 @@ fn gc_command(config: &Config, args: GcArgs, json: bool) -> Result<i32> {
         target_free_bytes: args.target_free_bytes,
         stale_after_days: args.stale_after_days,
         max_actions: None,
+        protect_paths: args.protect_paths,
     };
     let started = std::time::Instant::now();
     let mut progress = crate::space::Progress::default();
