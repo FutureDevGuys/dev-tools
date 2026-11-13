@@ -329,8 +329,7 @@ fn classify_conservative_linux(kind: PackageManagerKind, lower: &str) -> Option<
 }
 
 fn classify_unknown(lower: &str) -> Option<RecoveryPlan> {
-    if has_explicit_lock_or_busy_evidence(lower)
-        || lower.contains("blocking waiting for file lock")
+    if has_explicit_lock_or_busy_evidence(lower) || lower.contains("blocking waiting for file lock")
     {
         return Some(RecoveryPlan::diagnose(
             PackageManagerKind::Unknown,
