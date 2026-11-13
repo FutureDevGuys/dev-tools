@@ -1104,6 +1104,7 @@ fn sync_cancellation_settles_tasks_finalizes_evidence_and_releases_lock() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn custom_task_lock_diagnostics_never_add_implicit_replay() {
     for mode in ["sync", "async"] {
