@@ -1,5 +1,7 @@
 # Active work
 
+- Update All generic lock diagnostics: `fix/unknown-task-lock-diagnostics` removes false contention reports from ordinary locked-dependency progress. Regression and isolated native runtime validation pending; no installed product changed.
+
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
   - a PolicyKit restart must not end grants;
   - an abnormal coordinator exit restarts the coordinator;
