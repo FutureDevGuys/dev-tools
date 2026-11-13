@@ -8305,12 +8305,13 @@ fn unknown_task_recovery_requires_lock_contention_evidence() {
         "Blocking waiting for file lock on package cache",
         "Blocking waiting for file lock on build directory",
     ] {
-        let plan = recovery::classify_package_recovery(
-            recovery::PackageManagerKind::Unknown,
-            output,
-        )
-        .expect("explicit contention retains a diagnostic");
-        assert!(matches!(plan.causes[0], recovery::RecoveryCause::LockOrBusy { .. }));
+        let plan =
+            recovery::classify_package_recovery(recovery::PackageManagerKind::Unknown, output)
+                .expect("explicit contention retains a diagnostic");
+        assert!(matches!(
+            plan.causes[0],
+            recovery::RecoveryCause::LockOrBusy { .. }
+        ));
         assert_eq!(plan.actions, vec![recovery::RecoveryAction::DiagnoseOnly]);
     }
 }
