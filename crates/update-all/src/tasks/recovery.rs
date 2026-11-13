@@ -329,7 +329,9 @@ fn classify_conservative_linux(kind: PackageManagerKind, lower: &str) -> Option<
 }
 
 fn classify_unknown(lower: &str) -> Option<RecoveryPlan> {
-    if has_lock_or_busy_evidence(lower) || lower.contains("blocking waiting for file lock") {
+    if has_explicit_lock_or_busy_evidence(lower)
+        || lower.contains("blocking waiting for file lock")
+    {
         return Some(RecoveryPlan::diagnose(
             PackageManagerKind::Unknown,
             vec![RecoveryCause::LockOrBusy {
@@ -340,19 +342,20 @@ fn classify_unknown(lower: &str) -> Option<RecoveryPlan> {
     None
 }
 
-fn has_lock_or_busy_evidence(lower: &str) -> bool {
+fn has_explicit_lock_or_busy_evidence(lower: &str) -> bool {
     lower.contains("resource busy")
         || lower.contains("ebusy")
         || lower.contains("file in use")
         || lower.contains("used by another process")
         || lower.contains("could not get lock")
         || lower.contains("unable to lock database")
-        || lower.contains("db.lck")
-        || lower.contains("database lock")
 }
 
 fn classify_lock_or_busy(kind: PackageManagerKind, lower: &str) -> Option<RecoveryPlan> {
-    if has_lock_or_busy_evidence(lower) {
+    if has_explicit_lock_or_busy_evidence(lower)
+        || lower.contains("db.lck")
+        || lower.contains("database lock")
+    {
         return Some(RecoveryPlan::retry_whole(
             kind,
             vec![RecoveryCause::LockOrBusy {
