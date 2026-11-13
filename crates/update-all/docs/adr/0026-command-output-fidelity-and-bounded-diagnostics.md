@@ -29,6 +29,10 @@ error syntax retains precedence. When it is absent, the compact failure summary
 uses the final non-progress record instead of an earlier startup/progress line.
 That record is terminal context, not proof of the underlying cause; it does not
 reclassify a successful command, change diagnostic severity, or authorize replay.
+Generic custom-task lock diagnostics require explicit lock-contention or busy-file
+evidence, not a substring in ordinary progress such as locked dependency fetching.
+Unclassified command failures keep their original failure context; explicit
+contention in an unknown task remains diagnostic-only and never authorizes replay.
 
 The command deadline uses one monotonic start through the direct-child wait and
 owned capture/input settlement. A direct child exiting does not grant an
@@ -72,6 +76,9 @@ Ordinary command tasks preserve the execution owner's typed cancellation error t
 The foreground log viewer uses `less +G -K -R -S`. Active and completed logs open at the end in normal browsing mode, where `q` returns to the dashboard. `F` explicitly enters follow mode; Ctrl-C returns from that mode or ordinary browsing. The `tail -f` fallback still requires Ctrl-C, not `q`. Less's documented interrupt exit status 2 means the user dismissed that viewer with Ctrl-C, so it resumes the dashboard without a failure advisory. This numeric status convention applies only to Less. On Unix, the native tail fallback terminates on SIGINT when dismissed with Ctrl-C; that signal is accepted only for tail. Launch errors, other nonzero statuses and other signal termination remain failures. On Linux, the shared inherited-command owner gives the viewer its own foreground process group and restores dashboard ownership after it exits. Terminal Ctrl-C therefore reaches the viewer, not the updater. A process-directed SIGINT to the updater remains genuine cancellation: the existing signal handler requests cancellation and the inherited-command owner settles the viewer before returning. Non-Linux platforms retain the previous launch and signal-suppression behavior; this change does not qualify their interrupt isolation.
 
 ## Verification
+
+- `unknown_task_recovery_requires_lock_contention_evidence`
+- `custom_task_lock_diagnostics_never_add_implicit_replay`
 
 - `output_diagnostic_levels_agree_across_streams_and_reports`
 - `command_diagnostics_preserve_late_errors_and_explain_omissions`

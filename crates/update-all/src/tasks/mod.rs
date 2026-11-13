@@ -4288,7 +4288,10 @@ fn run_command_task_inner(
                         Some(&before_report_output),
                     ));
                 }
-                if class == RuntimeFailureClass::TransientLockOrBusy {
+                if class == RuntimeFailureClass::TransientLockOrBusy
+                    && package_manager_kind_for_command(spec, &cmd, &program)
+                        != recovery::PackageManagerKind::Unknown
+                {
                     let retry_delay = transient_retry_backoff(policy.retry_backoff, 0);
                     ctx.log_line(
                         &spec.id,

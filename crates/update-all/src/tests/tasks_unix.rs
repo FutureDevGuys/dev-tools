@@ -1799,10 +1799,11 @@ fn command_task_preserves_typed_cancellation_from_transient_retry() {
     let _lock = env_guard();
     let temp = TempDir::new().unwrap();
     let count = temp.path().join("attempts");
-    let (spec, command) = cancellation_command_fixture(&format!(
+    let (mut spec, command) = cancellation_command_fixture(&format!(
         "if [ ! -f '{}' ]; then touch '{}'; printf 'EBUSY\\n' >&2; exit 1; fi; printf 'RETRY_READY\\n'; while :; do sleep 0.1; done",
         count.display(), count.display(),
     ));
+    spec.id = "pacman".to_string();
     let runtime = Arc::new(RuntimeControl::default());
     let mut ctx = test_context(Arc::new(PrivilegeSession::default()));
     ctx.runtime_control = Some(runtime.clone());
