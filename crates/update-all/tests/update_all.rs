@@ -1103,3 +1103,67 @@ fn sync_cancellation_settles_tasks_finalizes_evidence_and_releases_lock() {
         1
     );
 }
+
+#[test]
+fn custom_task_lock_diagnostics_never_add_implicit_replay() {
+    for mode in ["sync", "async"] {
+        for stream in ["stdout", "stderr"] {
+            for (output, diagnose) in [
+                ("fetching locked dependencies", false),
+                ("error: cannot read /tmp/db.lck: permission denied", false),
+                ("error: failed to parse database lock configuration", false),
+                ("Blocking waiting for file lock on package cache", true),
+                ("error: resource busy", true),
+            ] {
+                let home = TempDir::new().unwrap();
+                let config_dir = home.path().join("config/update-all");
+                let catalog_dir = config_dir.join("catalog.d/local");
+                fs::create_dir_all(&catalog_dir).unwrap();
+                fs::write(
+                    config_dir.join("config.toml"),
+                    format!(
+                        "[install]\nauto_update=false\n[engine]\nmode=\"{mode}\"\njobs=\"1\"\n"
+                    ),
+                )
+                .unwrap();
+                let redirect = if stream == "stderr" { " >&2" } else { "" };
+                let script = format!(
+                    "printf 'call\\n' >> \"$HOME/calls\"; printf '%s\\n' '{output}'{redirect}; exit 101"
+                );
+                fs::write(
+                    catalog_dir.join("failure.toml"),
+                    format!(
+                        "[tasks.\"local/failure\"]\nlabel=\"Lock evidence fixture\"\ncategory=\"maintenance\"\nos=[\"linux\",\"macos\"]\ndetect_mode=\"command_available\"\ncommand=\"sh\"\nargs=[\"-c\",{}]\npolicy_key=\"tool_update\"\n",
+                        serde_json::to_string(&script).unwrap()
+                    ),
+                ).unwrap();
+                command(&home)
+                    .args(["--plain", "--completions", "off", "--only", "local/failure"])
+                    .assert()
+                    .code(1);
+                assert_eq!(
+                    fs::read_to_string(home.path().join("calls")).unwrap(),
+                    "call\n",
+                    "{mode}/{stream}: {output}"
+                );
+                let run = fs::read_dir(home.path().join("state/update-all/runs"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| path.join("run.json").is_file())
+                    .unwrap();
+                let artifact: serde_json::Value =
+                    serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+                assert_eq!(artifact["exit_code"], 1);
+                assert_eq!(artifact["tasks"][0]["status"], "failed");
+                let detail = artifact["tasks"][0]["detail"].as_str().unwrap();
+                assert_eq!(
+                    detail.contains("busy file or held lock"),
+                    diagnose,
+                    "{mode}/{stream}: {detail}"
+                );
+                let raw = fs::read_to_string(run.join("task-local%2Ffailure.raw.log")).unwrap();
+                assert!(raw.contains(output));
+            }
+        }
+    }
+}
