@@ -78,6 +78,7 @@ The foreground log viewer uses `less +G -K -R -S`. Active and completed logs ope
 ## Verification
 
 - `unknown_task_recovery_requires_lock_contention_evidence`
+- `custom_task_lock_diagnostics_never_add_implicit_replay`
 
 - `output_diagnostic_levels_agree_across_streams_and_reports`
 - `command_diagnostics_preserve_late_errors_and_explain_omissions`
