@@ -8288,6 +8288,8 @@ fn unknown_task_recovery_requires_lock_contention_evidence() {
         "error: Cargo.lock needs to be updated but --locked was passed",
         "error: failed to read /tmp/lockfile",
         "error: blocked by dependency",
+        "error: cannot read /tmp/db.lck: permission denied",
+        "error: failed to parse database lock configuration",
     ] {
         assert_eq!(
             recovery::classify_package_recovery(recovery::PackageManagerKind::Unknown, output),
