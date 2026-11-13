@@ -1115,6 +1115,7 @@ fn custom_task_lock_diagnostics_never_add_implicit_replay() {
                 ("error: failed to parse database lock configuration", false),
                 ("Blocking waiting for file lock on package cache", true),
                 ("error: resource busy", true),
+                ("error: EBUSY", true),
             ] {
                 let home = TempDir::new().unwrap();
                 let config_dir = home.path().join("config/update-all");
