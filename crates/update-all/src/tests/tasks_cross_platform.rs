@@ -8280,3 +8280,35 @@ fn skipped_issue_counts_follow_bounded_persisted_evidence() {
         );
     }
 }
+
+#[test]
+fn unknown_task_recovery_requires_lock_contention_evidence() {
+    for output in [
+        "observing toolchain\nfetching locked dependencies\npreparation command failed: exit status 101",
+        "error: Cargo.lock needs to be updated but --locked was passed",
+        "error: failed to read /tmp/lockfile",
+        "error: blocked by dependency",
+    ] {
+        assert_eq!(
+            recovery::classify_package_recovery(recovery::PackageManagerKind::Unknown, output),
+            None,
+            "ordinary lock-related words are not contention evidence: {output}"
+        );
+    }
+    for output in [
+        "error: resource busy",
+        "error: file in use",
+        "error: could not get lock",
+        "error: unable to lock database",
+        "Blocking waiting for file lock on package cache",
+        "Blocking waiting for file lock on build directory",
+    ] {
+        let plan = recovery::classify_package_recovery(
+            recovery::PackageManagerKind::Unknown,
+            output,
+        )
+        .expect("explicit contention retains a diagnostic");
+        assert!(matches!(plan.causes[0], recovery::RecoveryCause::LockOrBusy { .. }));
+        assert_eq!(plan.actions, vec![recovery::RecoveryAction::DiagnoseOnly]);
+    }
+}
