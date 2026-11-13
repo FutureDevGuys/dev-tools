@@ -1,6 +1,6 @@
 # Active work
 
-- Update All generic lock diagnostics: `fix/unknown-task-lock-diagnostics` removes false contention reports from ordinary locked-dependency progress. Regression and isolated native runtime validation pending; no installed product changed.
+- Update All generic lock diagnostics, PR #116: source and controlled Linux CLI validation pass. One socket fixture remains blocked by the cloud sandbox and fails identically on baseline. Release and desktop installation remain pending; no installed product changed.
 
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
   - a PolicyKit restart must not end grants;
