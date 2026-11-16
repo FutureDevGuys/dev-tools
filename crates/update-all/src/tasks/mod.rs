@@ -5870,6 +5870,7 @@ fn recovery_diagnostic_status(cause: &RecoveryCause) -> TaskReportStatus {
     match cause {
         RecoveryCause::StorageExhausted
         | RecoveryCause::PackageConflict { .. }
+        | RecoveryCause::DependencyConstraint { .. }
         | RecoveryCause::LockOrBusy { .. }
         | RecoveryCause::BuildFailure { .. }
         | RecoveryCause::RunningProcess { .. } => TaskReportStatus::Blocked,
@@ -5896,6 +5897,25 @@ fn describe_recovery_cause(cause: &RecoveryCause) -> String {
             format!(
                 "package dependency conflict involving {}",
                 packages.join(", ")
+            )
+        }
+        RecoveryCause::DependencyConstraint { requirements } => {
+            let detail = if requirements.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    requirements
+                        .iter()
+                        .map(|(package, requirement)| {
+                            format!("{package} requires {requirement}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            };
+            format!(
+                "unsatisfied dependency constraint{detail}; a compatible package-manager transaction is required before retrying the full upgrade; no automatic removal, ignore, downgrade, or dependency bypass"
             )
         }
         RecoveryCause::LockOrBusy { summary } => summary.clone(),

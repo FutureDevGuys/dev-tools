@@ -43,6 +43,9 @@ pub(crate) enum RecoveryCause {
         packages: Vec<String>,
         pairs: Vec<PackageConflictPair>,
     },
+    DependencyConstraint {
+        requirements: Vec<(String, String)>,
+    },
     LockOrBusy {
         summary: String,
     },
@@ -151,6 +154,37 @@ pub(crate) fn classify_package_recovery(
     }
 }
 
+// Keep only attributable single-token package constraints, not arbitrary log text.
+// A malformed/unrecognized detail still leaves the transaction blocked by its header.
+fn collect_dependency_requirements(output: &str) -> Vec<(String, String)> {
+    let token = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 256
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"@._+:-<>=~".contains(&c))
+    };
+    let mut requirements = BTreeSet::new();
+    for line in output.lines() {
+        let line = line.trim().trim_start_matches(":: ");
+        let detail = line
+            .split_once("breaks dependency '")
+            .map(|(_, rest)| rest)
+            .or_else(|| line.strip_prefix("unable to satisfy dependency '"));
+        if let Some((requirement, required_by)) =
+            detail.and_then(|s| s.split_once("' required by "))
+        {
+            if token(requirement) && token(required_by) {
+                requirements.insert((required_by.to_string(), requirement.to_string()));
+                if requirements.len() == 64 {
+                    break;
+                }
+            }
+        }
+    }
+    requirements.into_iter().collect()
+}
+
 fn classify_pacman_like(output: &str, lower: &str) -> Option<RecoveryPlan> {
     if lower.contains("failed to commit transaction (conflicting files)") {
         let owners = collect_owned_by_packages(output);
@@ -166,6 +200,14 @@ fn classify_pacman_like(output: &str, lower: &str) -> Option<RecoveryPlan> {
         causes.push(RecoveryCause::PackageConflict {
             packages: collect_conflicting_packages(output),
             pairs: collect_conflict_removal_pairs(output),
+        });
+    }
+    if lower.contains("could not satisfy dependencies")
+        || lower.contains("breaks dependency ")
+        || lower.contains("unable to satisfy dependency ")
+    {
+        causes.push(RecoveryCause::DependencyConstraint {
+            requirements: collect_dependency_requirements(output),
         });
     }
     let source_packages = if lower.contains("one or more files did not pass the validity check")

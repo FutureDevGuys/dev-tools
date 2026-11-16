@@ -31,6 +31,15 @@ alone stays a clean skip; a selected health dependent without its capability doe
 not. NPM reports an unknown after-version when installation was not observed,
 keeping a requested target in notes rather than presenting it as installed.
 
+Pacman/yay version-constraint failures remain failed transactions. Recovery reports
+which dependent requires which constraint when the provider output identifies it,
+and does not retry a mixed AUR source failure, clear its cache, remove the dependent,
+ignore packages, downgrade, or bypass dependency checks to force progress. Resolve
+compatible provider and dependent versions through the package manager, then rerun
+the full upgrade. A rebuild alone does not establish compatibility when the package
+recipe still requires an older version; a combined-upgrade flag is not an atomic
+compatibility repair.
+
 ## Restart after updates
 
 Run `update-all --restart-after` (alias `--reboot`) to request a non-forced restart after all selected tasks settle and their run logs are durably finalized. Save your work first. Failed, deferred, skipped, and warning-bearing task results still permit restart. The completed dashboard shows a countdown and closes after three minutes without input. Keyboard, paste, and mouse input in that dashboard reset the countdown; resize events and new log output do not. Use `q` to close early and proceed with restart, or `Ctrl+C` to cancel restart. Set `[ui].restart_idle_secs` to a positive number of seconds, or override it for one run with `--restart-idle-secs SECONDS`. The timer starts after task completion and applies only to dashboard runs selected with `--restart-after`; plain output does not wait for input. The task-run exit code and saved results still report update failures or deferrals after an accepted restart request. Explicit cancellation, an empty task selection, startup failure, or evidence-write failure prevents restart. Help/version and maintenance subcommands never restart the host. Restart is off by default and has no persistent activation setting.

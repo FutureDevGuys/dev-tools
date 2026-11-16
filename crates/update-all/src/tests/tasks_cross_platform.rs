@@ -8315,3 +8315,47 @@ fn unknown_task_recovery_requires_lock_contention_evidence() {
         assert_eq!(plan.actions, vec![recovery::RecoveryAction::DiagnoseOnly]);
     }
 }
+
+#[test]
+fn pacman_dependency_constraints_block_automatic_recovery() {
+    use recovery::{PackageManagerKind, RecoveryAction, RecoveryCause};
+    for detail in [
+        ":: installing engine (2.0-1) breaks dependency 'engine=1.0' required by bridge",
+        ":: removing engine breaks dependency 'engine=1.0' required by bridge",
+        ":: unable to satisfy dependency 'engine=1.0' required by bridge",
+    ] {
+        let output = format!(
+            "error: failed to prepare transaction (could not satisfy dependencies)\n{detail}\n{detail}"
+        );
+        let plan =
+            recovery::classify_package_recovery(PackageManagerKind::PacmanLike, &output).unwrap();
+        assert_eq!(plan.actions, vec![RecoveryAction::DiagnoseOnly]);
+        assert_eq!(
+            plan.causes,
+            vec![RecoveryCause::DependencyConstraint {
+                requirements: vec![("bridge".into(), "engine=1.0".into())],
+            }]
+        );
+    }
+    for detail in [
+        "",
+        ":: installing engine breaks dependency 'bad constraint' required by bridge",
+        ":: unable to satisfy dependency 'engine=1.0' required by bridge extra",
+    ] {
+        let output = format!(
+            "error: failed to prepare transaction (could not satisfy dependencies)\n{detail}"
+        );
+        let plan =
+            recovery::classify_package_recovery(PackageManagerKind::PacmanLike, &output).unwrap();
+        assert_eq!(plan.actions, vec![RecoveryAction::DiagnoseOnly]);
+        assert_eq!(
+            plan.causes,
+            vec![RecoveryCause::DependencyConstraint {
+                requirements: vec![]
+            }]
+        );
+    }
+    let mixed = ":: installing engine (2.0-1) breaks dependency 'engine=1.0' required by bridge\nerror: unresolvable package conflicts detected\n:: replacement and retired are in conflict. Remove retired? [y/N]";
+    let plan = recovery::classify_package_recovery(PackageManagerKind::PacmanLike, mixed).unwrap();
+    assert_eq!(plan.actions, vec![RecoveryAction::DiagnoseOnly]);
+}
