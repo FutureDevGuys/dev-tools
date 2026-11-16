@@ -5405,3 +5405,153 @@ fn truthful_declared_operation_result_rejects_missing_and_retains_failed_effects
     assert!(row.before.is_none());
     assert!(row.note.as_deref().unwrap().contains("change reported"));
 }
+
+#[test]
+fn yay_dependency_constraint_blocks_checksum_recovery_without_mutating_cache() {
+    let _lock = env_guard();
+
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let log_file = temp.path().join("recovery-dependency-constraint.log");
+    let log_file_str = log_file.display().to_string();
+    let home_dir = temp.path().join("home");
+    let source_dir = home_dir.join(".cache").join("yay").join("source-demo-bin");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::write(source_dir.join("artifact"), b"cached").unwrap();
+    let _home = EnvVarGuard::set("HOME", home_dir.as_os_str());
+
+    write_executable(
+        &bin_dir.join("yay"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+log_file="{}"
+printf 'yay %s\n' "$*" >> "$log_file"
+if [ "${{1:-}}" = "-Syu" ]; then
+  cat <<'EOF' >&2
+:: 3 packages to upgrade/install.
+3  core/engine             1.0-1          -> 2.0-1
+2  aur/source-demo-bin               3.0.16-2       -> 3.0.22-1
+1  aur/other-source-bin   26.429.61741-1 -> 26.513.20950-2
+==> ERROR: One or more files did not pass the validity check!
+ -> error downloading sources: HOME_PLACEHOLDER/.cache/yay/source-demo-bin
+error downloading sources: HOME_PLACEHOLDER/.cache/yay/other-source-bin
+error: failed to prepare transaction (could not satisfy dependencies)
+:: installing engine (2.0-1) breaks dependency 'engine=1.0' required by bridge
+ -> error making: source-demo-bin-exit status 1
+EOF
+  exit 1
+fi
+cat <<'EOF' >&2
+==> ERROR: One or more files did not pass the validity check!
+ -> error downloading sources: HOME_PLACEHOLDER/.cache/yay/source-demo-bin
+ -> error making: source-demo-bin-exit status 1
+EOF
+exit 1
+"#,
+            log_file_str
+        )
+        .replace("HOME_PLACEHOLDER", &home_dir.display().to_string()),
+    );
+
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    let spec = TaskSpec {
+        id: "yay".to_string(),
+        label: "Yay".to_string(),
+        depends_on: Vec::new(),
+        kind: TaskKind::Command(CommandTask {
+            program: bin_dir.join("yay").display().to_string(),
+            args: vec!["-Syu".to_string(), "--noconfirm".to_string()],
+            mode: None,
+            command_candidates: Vec::new(),
+            pre_commands: Vec::new(),
+            report_commands: Vec::new(),
+            report_patterns: Vec::new(),
+            report_scoped_deltas: Vec::new(),
+            policy_key: "system_update".to_string(),
+            requires_elevation: false,
+            needs_sudo_session: false,
+            interactive: false,
+            external_window: false,
+            shell: false,
+            windows_bridge: false,
+            report_parser: Some(BuiltinReportParser::Yay),
+            plain_header: None,
+            plain_start: None,
+            success_details: Vec::new(),
+            external_manager_skip: false,
+            result_protocol: None,
+        }),
+        category: "system".to_string(),
+        resource_locks: BTreeSet::new(),
+    };
+    let TaskKind::Command(cmd) = &spec.kind else {
+        panic!("expected command task");
+    };
+
+    let result = run_command_task(&ctx, &spec, cmd).expect("task result");
+
+    assert_eq!(result.status, TaskStatus::Failed);
+    assert!(result.details.iter().any(|detail| {
+        detail.contains("automatic mutation is not safe")
+            && detail.contains("unsatisfied dependency constraint: bridge requires engine=1.0")
+    }));
+    assert_eq!(fs::read(source_dir.join("artifact")).unwrap(), b"cached");
+    let command_log = fs::read_to_string(&log_file).unwrap();
+    assert_eq!(command_log.lines().count(), 1, "{command_log}");
+    assert!(
+        command_log.contains("yay -Syu --noconfirm"),
+        "{command_log}"
+    );
+
+    let yay_section = result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "yay_packages")
+        .expect("original yay package report should be preserved");
+    let names = yay_section
+        .rows
+        .iter()
+        .map(|row| row.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["core/engine", "aur/source-demo-bin", "aur/other-source-bin"]
+    );
+    for row in &yay_section.rows {
+        assert_eq!(row.status, TaskReportStatus::Blocked);
+        assert_eq!(
+            row.note.as_deref(),
+            Some("listed before failed transaction; update not confirmed")
+        );
+    }
+
+    let recovery_rows = result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "package_recovery")
+        .expect("package recovery section")
+        .rows
+        .iter()
+        .collect::<Vec<_>>();
+    assert!(
+        recovery_rows
+            .iter()
+            .any(|row| row.name == "other-source-bin"
+                && row.status == TaskReportStatus::Info
+                && row
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("source/checksum drift"))),
+        "{recovery_rows:?}"
+    );
+    assert!(
+        recovery_rows
+            .iter()
+            .any(|row| row.status == TaskReportStatus::Blocked
+                && row.note.as_deref().is_some_and(|note| note
+                    .contains("unsatisfied dependency constraint: bridge requires engine=1.0"))),
+        "{recovery_rows:?}"
+    );
+}
