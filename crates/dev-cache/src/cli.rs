@@ -410,9 +410,9 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
                     serde_json::json!({
                         "outcome": if result.changed { "updated" } else { "no_op" },
                         "detail": if result.changed {
-                            "Activated compiler and package-manager intercepts"
+                            "Reconciled compiler and package-manager intercept files"
                         } else {
-                            "Compiler and package-manager intercepts already active"
+                            "Intercept files already match this Dev Cache installation"
                         }
                     })
                 );
