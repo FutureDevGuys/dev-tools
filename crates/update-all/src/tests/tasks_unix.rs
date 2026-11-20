@@ -5407,6 +5407,58 @@ fn truthful_declared_operation_result_rejects_missing_and_retains_failed_effects
 }
 
 #[test]
+fn truthful_item_observations_survive_a_failed_command_or_output_validation() {
+    let _lock = env_guard();
+    let temp = TempDir::new().unwrap();
+    let task = crate::updaters::builtin_catalog()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == "builtin/dev-tools-update-all")
+        .unwrap();
+    let mut spec = builtin_to_task_spec(task, false);
+    let ctx = test_context(Arc::new(PrivilegeSession::default()));
+    for (program, diagnostic, exit) in [
+        ("winget", "Error processing package dependencies. Exiting...", 0),
+        ("provider", "deterministic provider exit", 7),
+    ] {
+        let program = temp.path().join(program);
+        write_executable(
+            &program,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' '{diagnostic}' 'UPDATE_ALL_ITEM {{"subject":"component","action":"update","outcome":"updated","before":"1","after":"2"}}' 'UPDATE_ALL_RESULT {{"outcome":"updated","detail":"component update completed"}}'
+exit {exit}
+"#
+            ),
+        );
+        let TaskKind::Command(command) = &mut spec.kind else {
+            panic!("expected command task");
+        };
+        command.program = program.display().to_string();
+        command.args.clear();
+        command.report_parser = None;
+        command.result_protocol = None;
+        let TaskKind::Command(command) = &spec.kind else {
+            unreachable!();
+        };
+        let result = run_command_task(&ctx, &spec, command).unwrap();
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_ne!(result.details[0], "component update completed");
+        assert!(!result.details[0].contains("UPDATE_ALL_RESULT"), "{result:?}");
+        let row = &result
+            .report_sections
+            .iter()
+            .find(|section| section.key == "operation_items_update")
+            .unwrap()
+            .rows[0];
+        assert_eq!(row.name, "component");
+        assert_eq!(row.status, TaskReportStatus::Updated);
+        assert_eq!(row.before.as_deref(), Some("1"));
+        assert_eq!(row.after.as_deref(), Some("2"));
+    }
+}
+
+#[test]
 fn yay_dependency_constraint_blocks_checksum_recovery_without_mutating_cache() {
     let _lock = env_guard();
 

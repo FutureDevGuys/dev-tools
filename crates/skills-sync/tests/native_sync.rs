@@ -36,7 +36,7 @@ impl Fixture {
         self.directory.path()
     }
     fn lock(&self, names: &[&str]) {
-        let skills: serde_json::Map<String, Value> = names.iter().map(|name| ((*name).into(), json!({"source":"example/skills", "sourceType":"github", "sourceUrl":"https://github.com/example/skills.git", "skillPath":format!("skills/{name}/SKILL.md"), "skillFolderHash":"fixture-hash"}))).collect();
+        let skills: serde_json::Map<String, Value> = names.iter().map(|name| ((*name).into(), json!({"source":"example/skills", "sourceType":"github", "sourceUrl":"https://github.com/example/skills.git", "skillPath":format!("skills/{name}/SKILL.md"), "skillFolderHash":"a".repeat(64)}))).collect();
         fs::write(
             self.home().join(".agents/skills-lock.json"),
             serde_json::to_vec(&json!({"version":3,"skills":skills})).unwrap(),
@@ -198,6 +198,28 @@ fn failed_update_stops_before_restore_or_link_mutation() {
             .contains("upstream tracked update failed")));
     assert!(!fixture.home().join(".agents/skills/missing").exists());
     assert!(!fixture.calls().contains("\"add\""));
+}
+
+#[test]
+fn sync_reports_changed_hashes_and_retains_applied_updates_on_inventory_failure() {
+    let fixture = Fixture::new();
+    fs::write(fixture.home().join("change-hash"), "").unwrap();
+    let changed = fixture.payload(&["sync"]);
+    assert_eq!(
+        changed["updated_skill_hashes"],
+        json!([{"scope":"global","name":"tracked","before":"a".repeat(64),"after":"b".repeat(64)}])
+    );
+    assert!(fixture.payload(&["sync"]).get("updated_skill_hashes").is_none());
+
+    let fixture = Fixture::new();
+    for flag in ["change-hash", "fail-list-after-update"] {
+        fs::write(fixture.home().join(flag), "").unwrap();
+    }
+    let output = fixture.run(&["sync"]);
+    assert!(!output.status.success());
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["applied"][0]["skills"], json!(["tracked"]));
+    assert!(payload.get("updated_skill_hashes").is_none());
 }
 
 #[test]

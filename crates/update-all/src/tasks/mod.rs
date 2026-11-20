@@ -4418,6 +4418,7 @@ fn run_command_task_inner(
         mark_unconfirmed_command_report_sections(&cmd, &mut report_sections, &primary_report_input);
         let mut result = TaskResult::failed(spec.label.clone(), detail);
         result.report_sections = report_sections;
+        apply_structured_command_result(&mut result, &out);
         attach_command_output_diagnostics(&mut result, &primary_report_input);
         return Ok(result);
     }
@@ -4456,6 +4457,7 @@ fn run_command_task_inner(
 }
 
 const STRUCTURED_RESULT_PREFIX: &str = "UPDATE_ALL_RESULT ";
+const STRUCTURED_ITEM_PREFIX: &str = "UPDATE_ALL_ITEM ";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4485,7 +4487,11 @@ fn apply_structured_command_result(result: &mut TaskResult, output: &str) -> boo
         .filter(|detail| !detail.trim().is_empty())
         .unwrap_or_else(|| protocol.outcome.replace('_', " "));
     if !result.details.iter().any(|existing| existing == &detail) {
-        result.details.insert(0, detail.clone());
+        if result.status == TaskStatus::Failed {
+            result.details.push(detail.clone());
+        } else {
+            result.details.insert(0, detail.clone());
+        }
     }
     match protocol.outcome.as_str() {
         "deferred" => result.advisories.push(TaskAdvisory {
@@ -4559,7 +4565,7 @@ struct StructuredCommandItem {
 fn append_structured_command_items(sections: &mut Vec<TaskReportSection>, output: &str) {
     for line in output
         .lines()
-        .filter_map(|line| line.strip_prefix("UPDATE_ALL_ITEM "))
+        .filter_map(|line| line.strip_prefix(STRUCTURED_ITEM_PREFIX))
         .take(256)
     {
         if line.len() > STRUCTURED_TEXT_LIMIT_BYTES {
@@ -4625,10 +4631,7 @@ fn failed_command_result_with_report_sections(
         attach_unconfirmed_before_report(&mut result, before_report);
     }
     attach_command_output_diagnostics(&mut result, output);
-    if cmd.result_protocol.is_some() {
-        apply_structured_command_result(&mut result, output);
-        result.status = TaskStatus::Failed;
-    }
+    apply_structured_command_result(&mut result, output);
     if result.report_sections.is_empty() {
         result.report_sections.push(TaskReportSection {
             key: "task_failures".to_string(),
@@ -6129,7 +6132,14 @@ fn concise_command_failure_text(output: &str) -> String {
     let cause = last_command_error_line(&clean)
         // Without explicit error syntax, retain terminal context instead of an
         // earlier startup/progress line. This does not classify prose as failure.
-        .or_else(|| clean.lines().rev().find(|line| !line.trim().is_empty()))
+        .or_else(|| {
+            clean.lines().rev().find(|line| {
+                let line = line.trim();
+                !line.is_empty()
+                    && !line.starts_with(STRUCTURED_RESULT_PREFIX)
+                    && !line.starts_with(STRUCTURED_ITEM_PREFIX)
+            })
+        })
         .unwrap_or("command failed");
     bounded_structured_text(cause)
 }

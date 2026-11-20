@@ -33,6 +33,9 @@ fn main() {
     let skills = root.join(".agents/skills");
     match args.first().map(String::as_str) {
         Some("list") => {
+            if home.join("fail-list-after-update").exists() && home.join("updated-hash").exists() {
+                std::process::exit(8);
+            }
             let mut items = Vec::new();
             for entry in fs::read_dir(&skills).into_iter().flatten().flatten() {
                 let path = entry.path();
@@ -60,6 +63,12 @@ fn main() {
             assert!(!names.is_empty(), "updates must select explicit tracked names");
             for name in names {
                 fs::write(skills.join(name).join("SKILL.md"), "updated payload\n").unwrap();
+            }
+            if home.join("change-hash").exists() {
+                let lock = root.join(".agents/.skill-lock.json");
+                let original = fs::read_to_string(&lock).unwrap();
+                fs::write(lock, original.replace(&"a".repeat(64), &"b".repeat(64))).unwrap();
+                fs::write(home.join("updated-hash"), "").unwrap();
             }
         }
         Some("add") => {

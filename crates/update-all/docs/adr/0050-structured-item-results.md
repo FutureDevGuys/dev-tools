@@ -34,6 +34,7 @@ The runner considers up to 256 item lines per command, each within the structure
 
 - `truthful_operation_final_rollup_pty_preserves_outcomes_and_observations`
 - `truthful_declared_operation_result_rejects_missing_and_retains_failed_effects`
+- `truthful_item_observations_survive_a_failed_command_or_output_validation`
 
 ## Runtime acceptance
 

@@ -197,15 +197,15 @@ impl App {
             if !result.status.success() {
                 return Err(self.fail(EXIT_USAGE, "upstream tracked update failed; later restore and link operations were not run"));
             }
-            self.refresh_updated_scope(&plan.scope, &plan.skills)?;
             self.payload.applied.push(AppliedPlan {
                 scope: plan.scope.clone(),
                 reason: plan.reason,
                 source: plan.source,
-                skills: plan.skills,
+                skills: plan.skills.clone(),
                 agents: plan.agents,
                 command: plan.command,
             });
+            self.refresh_updated_scope(&plan.scope, &plan.skills)?;
         }
         Ok(())
     }
