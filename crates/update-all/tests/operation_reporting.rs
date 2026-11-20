@@ -228,6 +228,22 @@ fn truthful_operation_final_rollup_pty_preserves_outcomes_and_observations() {
             .contains("available: 3.0"));
         assert_eq!(row("local/deferred")["status"], "deferred");
         assert!(row("local/deferred")["after"].is_null());
+        let items = tasks
+            .iter()
+            .find(|task| task["task_id"] == "local/deferred")
+            .unwrap()["report_sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["key"] == "operation_items_update")
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "updated component");
+        assert_eq!(items[0]["before"], "1.0");
+        assert_eq!(items[0]["after"], "2.0");
+        assert_eq!(items[0]["status"], "updated");
         assert_eq!(row("local/unknown")["status"], "unconfirmed");
         assert!(row("local/unknown")["after"].is_null());
         if std::env::var_os("UPDATE_ALL_REPORT_TEST_KEEP_DIR").is_some() {

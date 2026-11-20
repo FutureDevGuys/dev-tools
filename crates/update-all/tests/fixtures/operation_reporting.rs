@@ -12,9 +12,17 @@ fn main() {
         Some("updated") => println!(
             r#"{{"schema":"dev-tools-operation-result-v2","product":"example-tool","operation":"update_apply","outcome":"completed","changed":true,"installed_version":"2.0","available_version":"3.0","exit_code":0}}"#
         ),
-        Some("deferred") => println!(
-            r#"UPDATE_ALL_RESULT {{"outcome":"deferred","detail":"close the fixture application","current":"1.0","latest":"2.0"}}"#
-        ),
+        Some("deferred") => {
+            println!(
+                r#"UPDATE_ALL_ITEM {{"subject":"updated component","action":"update","outcome":"updated","before":"1.0","after":"2.0"}}"#
+            );
+            println!(
+                r#"UPDATE_ALL_ITEM {{"subject":"\u001b[31mspoof","action":"update","outcome":"passed"}}"#
+            );
+            println!(
+                r#"UPDATE_ALL_RESULT {{"outcome":"deferred","detail":"close the fixture application","current":"1.0","latest":"2.0"}}"#
+            );
+        }
         Some("unknown") => println!(
             r#"{{"schema":"dev-tools-operation-result-v2","product":"uncertain-tool","operation":"update_apply","outcome":"completed","changed":null,"installed_version":null,"available_version":"4.0","exit_code":0}}"#
         ),
