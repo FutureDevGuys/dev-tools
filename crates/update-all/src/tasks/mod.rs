@@ -4542,7 +4542,73 @@ fn apply_structured_command_result(result: &mut TaskResult, output: &str) -> boo
         };
         result.details.push(version_detail);
     }
+    append_structured_command_items(&mut result.report_sections, output);
     true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredCommandItem {
+    subject: String,
+    action: String,
+    outcome: String,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+fn append_structured_command_items(sections: &mut Vec<TaskReportSection>, output: &str) {
+    for line in output
+        .lines()
+        .filter_map(|line| line.strip_prefix("UPDATE_ALL_ITEM "))
+        .take(256)
+    {
+        if line.len() > STRUCTURED_TEXT_LIMIT_BYTES {
+            continue;
+        }
+        let Ok(item) = serde_json::from_str::<StructuredCommandItem>(line) else {
+            continue;
+        };
+        if item.action.is_empty()
+            || item.action.len() > 48
+            || !item
+                .action
+                .bytes()
+                .all(|ch| ch.is_ascii_lowercase() || ch == b'-')
+            || item.subject.trim().is_empty()
+            || std::iter::once(&item.subject)
+                .chain(item.before.iter())
+                .chain(item.after.iter())
+                .any(|value| value.chars().any(char::is_control))
+        {
+            continue;
+        }
+        let status = match item.outcome.as_str() {
+            "updated" => TaskReportStatus::Updated,
+            "unchanged" => TaskReportStatus::Unchanged,
+            "passed" => TaskReportStatus::Passed,
+            "failed" => TaskReportStatus::Failed,
+            _ => continue,
+        };
+        let title = format!(
+            "{}{} Results",
+            item.action[..1].to_ascii_uppercase(),
+            &item.action[1..]
+        );
+        merge_report_sections(
+            sections,
+            vec![TaskReportSection {
+                key: format!("operation_items_{}", item.action),
+                title,
+                rows: vec![TaskReportRow {
+                    name: item.subject,
+                    status,
+                    before: item.before,
+                    after: item.after,
+                    note: None,
+                }],
+            }],
+        );
+    }
 }
 
 fn failed_command_result_with_report_sections(
@@ -4559,6 +4625,10 @@ fn failed_command_result_with_report_sections(
         attach_unconfirmed_before_report(&mut result, before_report);
     }
     attach_command_output_diagnostics(&mut result, output);
+    if cmd.result_protocol.is_some() {
+        apply_structured_command_result(&mut result, output);
+        result.status = TaskStatus::Failed;
+    }
     if result.report_sections.is_empty() {
         result.report_sections.push(TaskReportSection {
             key: "task_failures".to_string(),
@@ -6029,6 +6099,13 @@ fn concise_command_text(output: &str) -> String {
 
 fn concise_command_failure_text(output: &str) -> String {
     let clean = strip_progress_output(output);
+    if let Some(result) = parse_structured_command_result(&clean) {
+        if matches!(result.outcome.as_str(), "failed" | "blocked") {
+            if let Some(detail) = result.detail.filter(|detail| !detail.trim().is_empty()) {
+                return bounded_structured_text(&detail);
+            }
+        }
+    }
     let cause = last_command_error_line(&clean)
         // Without explicit error syntax, retain terminal context instead of an
         // earlier startup/progress line. This does not classify prose as failure.
@@ -10627,7 +10704,15 @@ fn parse_operation_result_report(output: &str) -> Vec<TaskReportSection> {
         Some(false) => "no change reported",
         None => "change unknown",
     };
-    let mut note = format!("{}; {change}", observation.outcome.replace('_', " "));
+    let mut note = if observation.outcome == "no_op" && observation.changed == Some(false) {
+        if installed.is_some() {
+            "Installed version retained".to_string()
+        } else {
+            "No installation change reported".to_string()
+        }
+    } else {
+        format!("{}; {change}", observation.outcome.replace('_', " "))
+    };
     if let Some(available) = observation.available_version {
         note.push_str(&format!("; available: {available}"));
     }

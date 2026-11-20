@@ -5842,7 +5842,7 @@ fn truthful_operation_reports_preserve_observed_versions_and_change_uncertainty(
     assert_eq!(row.name, "skills-sync");
     assert!(row.before.is_none());
     assert_eq!(row.after.as_deref(), Some("0.2.0"));
-    assert!(row.note.as_deref().unwrap().contains("no change reported"));
+    assert!(row.note.as_deref().unwrap().contains("Installed version retained"));
     assert!(!row.note.as_deref().unwrap().contains("up to date"));
     let diagnostic = build_command_report_sections(parser, "{\"product\":\"example\",\"version\":\"2.0\",\"managed\":true,\"changed\":false,\"outcome\":\"no_op\"}\nwarning: fixture diagnostic\n");
     assert_eq!(diagnostic.len(), 1);
