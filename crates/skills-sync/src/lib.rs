@@ -446,6 +446,8 @@ struct Payload {
     planned_commands: Vec<AddPlan>,
     applied_agent_repairs: Vec<AgentLinkRepair>,
     applied: Vec<AppliedPlan>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    updated_skill_hashes: Vec<sync::SkillHashChange>,
     skipped: Vec<SkippedSkill>,
     warnings: Vec<String>,
     errors: Vec<String>,
@@ -836,6 +838,7 @@ impl App {
             planned_commands: Vec::new(),
             applied_agent_repairs: Vec::new(),
             applied: Vec::new(),
+            updated_skill_hashes: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
             errors: Vec::new(),
@@ -2560,6 +2563,13 @@ impl App {
                     style.warning("warning"),
                     warning
                 );
+            }
+            if code == 0
+                && self.options.mode == CommandMode::Sync
+                && self.options.apply
+                && !self.options.dry_run
+            {
+                self.print_sync_result();
             }
         }
         code

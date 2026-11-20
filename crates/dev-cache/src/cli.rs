@@ -404,6 +404,19 @@ fn run_cli(argv0: OsString, args: Vec<OsString>) -> Result<i32> {
                 cli.json,
                 &serde_json::json!({"activated":result.changed,"target":result.target}),
             )?;
+            if !cli.json {
+                println!(
+                    "UPDATE_ALL_RESULT {}",
+                    serde_json::json!({
+                        "outcome": if result.changed { "updated" } else { "no_op" },
+                        "detail": if result.changed {
+                            "Activated compiler and package-manager intercepts"
+                        } else {
+                            "Compiler and package-manager intercepts already active"
+                        }
+                    })
+                );
+            }
             return Ok(0);
         }
         CommandKind::Deactivate { intercept_dir } => {

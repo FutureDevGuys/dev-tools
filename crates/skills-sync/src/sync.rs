@@ -1,7 +1,65 @@
 //! Delegate tracked updates before observing the restore/link plan again.
 use super::*;
 
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct SkillHashChange {
+    scope: String,
+    name: String,
+    before: String,
+    after: String,
+}
+
+fn locked_content_hash<'a>(lock: &'a Value, name: &str) -> Option<&'a str> {
+    lock.get("skills")?
+        .get(name)?
+        .get("skillFolderHash")?
+        .as_str()
+        .filter(|hash| {
+            hash.len() <= 128 && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+}
+
 impl App {
+    pub(super) fn print_sync_result(&self) {
+        for skill in &self.payload.updated_skill_hashes {
+            println!(
+                "UPDATE_ALL_ITEM {}",
+                json!({
+                    "subject": format!("{} / {}", skill.scope, skill.name),
+                    "action": "update",
+                    "outcome": "updated",
+                    "before": skill.before,
+                    "after": skill.after
+                })
+            );
+        }
+        let checked = self
+            .payload
+            .applied
+            .iter()
+            .filter(|plan| plan.reason == "update")
+            .map(|plan| plan.skills.len())
+            .sum::<usize>();
+        let changes = self.payload.updated_skill_hashes.len();
+        let repairs = self.payload.applied_agent_repairs.len();
+        let other_commands = self
+            .payload
+            .applied
+            .iter()
+            .filter(|plan| plan.reason != "update")
+            .count();
+        let detail = format!(
+            "Checked {checked} tracked skills through the provider, observed {changes} content hash changes, applied {other_commands} restore/link/adoption commands and {repairs} agent-link repairs"
+        );
+        println!(
+            "UPDATE_ALL_RESULT {}",
+            json!({
+                "outcome": if changes + repairs + other_commands == 0 { "no_op" } else { "updated" },
+                "detail": detail
+            })
+        );
+    }
+
     pub(super) fn is_canonical_scope_skill(&self, scope: &str, skill: &InstalledSkill) -> bool {
         let root = if scope == "global" {
             home_dir()
@@ -139,6 +197,7 @@ impl App {
             if !result.status.success() {
                 return Err(self.fail(EXIT_USAGE, "upstream tracked update failed; later restore and link operations were not run"));
             }
+            self.refresh_updated_scope(&plan.scope, &plan.skills)?;
             self.payload.applied.push(AppliedPlan {
                 scope: plan.scope.clone(),
                 reason: plan.reason,
@@ -147,7 +206,6 @@ impl App {
                 agents: plan.agents,
                 command: plan.command,
             });
-            self.refresh_updated_scope(&plan.scope)?;
         }
         Ok(())
     }
@@ -188,7 +246,11 @@ impl App {
         Ok(())
     }
 
-    fn refresh_updated_scope(&mut self, scope: &str) -> std::result::Result<(), i32> {
+    fn refresh_updated_scope(
+        &mut self,
+        scope: &str,
+        requested: &[String],
+    ) -> std::result::Result<(), i32> {
         let (path, original) = if scope == "global" {
             (
                 PathBuf::from(&self.payload.global_lock_file),
@@ -218,6 +280,26 @@ impl App {
             .retain(|skill| selected.contains(&skill.name));
         self.payload.skipped.extend(normalized.skipped);
         let installed = self.list_installed(scope)?;
+        let previous = if scope == "global" {
+            &self.global_lock_selection.lock
+        } else {
+            &self.project_lock.lock
+        };
+        for name in requested {
+            if let (Some(before), Some(after)) = (
+                locked_content_hash(previous, name),
+                locked_content_hash(&observed.lock, name),
+            ) {
+                if before != after {
+                    self.payload.updated_skill_hashes.push(SkillHashChange {
+                        scope: scope.to_owned(),
+                        name: name.clone(),
+                        before: before.to_owned(),
+                        after: after.to_owned(),
+                    });
+                }
+            }
+        }
         if scope == "global" {
             self.global_lock_selection.lock = normalize_global_lock(&observed.lock);
             self.payload.global_desired = normalized.desired;
