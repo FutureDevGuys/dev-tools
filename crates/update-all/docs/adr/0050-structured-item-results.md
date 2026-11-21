@@ -16,6 +16,8 @@ A task footer describes the aggregate outcome but cannot say which operations co
 
 A command can emit one `UPDATE_ALL_ITEM` JSON record per observed item before its existing `UPDATE_ALL_RESULT` v1 footer. Each item supplies a subject, a lowercase action identifier, an outcome, and optional observed before and after identities. The runner groups rows by action using its existing report sections. The same report data reaches task logs, final rollups, and persisted run artifacts.
 
+Task logs and the final rollup show the action alongside each structured item. Color-capable displays use white for the subject, cyan for the action, and the existing outcome palette.
+
 ## Invariants
 
 - The command owns observation and attribution. The runner has no producer-specific dispatch.
@@ -33,6 +35,7 @@ The runner considers up to 256 item lines per command, each within the structure
 ## Verification
 
 - `truthful_operation_final_rollup_pty_preserves_outcomes_and_observations`
+- `stylize_operation_items_colors_subject_action_and_outcome`
 - `truthful_declared_operation_result_rejects_missing_and_retains_failed_effects`
 - `truthful_item_observations_survive_a_failed_command_or_output_validation`
 

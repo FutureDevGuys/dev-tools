@@ -4458,6 +4458,7 @@ fn run_command_task_inner(
 
 const STRUCTURED_RESULT_PREFIX: &str = "UPDATE_ALL_RESULT ";
 const STRUCTURED_ITEM_PREFIX: &str = "UPDATE_ALL_ITEM ";
+const OPERATION_ITEM_SECTION_PREFIX: &str = "operation_items_";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4574,12 +4575,7 @@ fn append_structured_command_items(sections: &mut Vec<TaskReportSection>, output
         let Ok(item) = serde_json::from_str::<StructuredCommandItem>(line) else {
             continue;
         };
-        if item.action.is_empty()
-            || item.action.len() > 48
-            || !item
-                .action
-                .bytes()
-                .all(|ch| ch.is_ascii_lowercase() || ch == b'-')
+        if !crate::ui::is_report_action(&item.action)
             || item.subject.trim().is_empty()
             || std::iter::once(&item.subject)
                 .chain(item.before.iter())
@@ -4603,7 +4599,7 @@ fn append_structured_command_items(sections: &mut Vec<TaskReportSection>, output
         merge_report_sections(
             sections,
             vec![TaskReportSection {
-                key: format!("operation_items_{}", item.action),
+                key: format!("{OPERATION_ITEM_SECTION_PREFIX}{}", item.action),
                 title,
                 rows: vec![TaskReportRow {
                     name: item.subject,
@@ -12387,6 +12383,7 @@ struct PackageChangeRow {
     category: String,
     task: String,
     item: String,
+    action: Option<String>,
     before: String,
     after: String,
     result: String,
@@ -12521,6 +12518,25 @@ impl ReportStatusCounts {
     }
 }
 
+fn operation_item_action(key: &str) -> Option<&str> {
+    key.strip_prefix(OPERATION_ITEM_SECTION_PREFIX)
+        .filter(|action| crate::ui::is_report_action(action))
+}
+
+fn report_item_cells(row: &TaskReportRow, action: Option<&str>) -> (String, String, String) {
+    let (mut before, mut after) = report_row_display_values(row);
+    let mut name = row.name.clone();
+    if action.is_some() {
+        for field in [&mut name, &mut before, &mut after] {
+            *field = field.split_whitespace().collect::<Vec<_>>().join(" ");
+            if field.is_empty() {
+                field.push('-');
+            }
+        }
+    }
+    (name, before, after)
+}
+
 fn render_npm_package_footer<'a>(
     summary: impl IntoIterator<Item = &'a TaskResult>,
     color: bool,
@@ -12564,6 +12580,8 @@ fn render_npm_package_footer<'a>(
                 level: LogLevel::Info,
             });
         }
+        let action = operation_item_action(&key);
+        let action_w = action.map_or(0, |action| visible_width(action).max(6));
         let (name_header, before_header, after_header, status_header) =
             report_headers_for_section(&key);
         let name_w = rows
@@ -12604,17 +12622,21 @@ fn render_npm_package_footer<'a>(
             text: title,
             level: LogLevel::Info,
         });
+        let mut header = vec![(name_header, None, name_w)];
+        if action.is_some() {
+            header.push(("Action", None, action_w));
+        }
+        header.extend([
+            (before_header, None, before_w),
+            (after_header, None, after_w),
+            (status_header, None, status_w),
+        ]);
         lines.push(RenderedReportLine {
-            text: format_report_row(&[
-                (name_header, None, name_w),
-                (before_header, None, before_w),
-                (after_header, None, after_w),
-                (status_header, None, status_w),
-            ]),
+            text: format_report_row(&header),
             level: LogLevel::Info,
         });
         for row in rows {
-            let (before, after) = report_row_display_values(row);
+            let (name, before, after) = report_item_cells(row, action);
             let outcome = report_status_cell_for_row(&key, row);
             let color_enabled = color_output_enabled(color);
             let value_change = report_row_has_value_change(row);
@@ -12633,13 +12655,26 @@ fn render_npm_package_footer<'a>(
             } else {
                 None
             };
-            let (row_text, overflow_notes) = format_table_row(&[
-                TableCell {
-                    text: &row.name,
-                    color: None,
-                    width: name_w,
-                    overflow_label: Some("package"),
+            let mut cells = vec![TableCell {
+                text: &name,
+                color: (color_enabled && action.is_some())
+                    .then_some(crossterm::style::Color::White),
+                width: name_w,
+                overflow_label: if action.is_some() {
+                    Some("item")
+                } else {
+                    Some("package")
                 },
+            }];
+            if let Some(action) = action {
+                cells.push(TableCell {
+                    text: action,
+                    color: color_enabled.then_some(crossterm::style::Color::Cyan),
+                    width: action_w,
+                    overflow_label: None,
+                });
+            }
+            cells.extend([
                 TableCell {
                     text: &before,
                     color: before_color,
@@ -12659,6 +12694,7 @@ fn render_npm_package_footer<'a>(
                     overflow_label: None,
                 },
             ]);
+            let (row_text, overflow_notes) = format_table_row(&cells);
             lines.push(RenderedReportLine {
                 text: row_text,
                 level: report_row_level(&key, row),
@@ -12822,11 +12858,13 @@ fn render_package_change_rollup_with_width<'a>(
                     let category = category.clone();
                     let task = task.clone();
                     section.rows.iter().map(move |row| {
-                        let (before, after) = report_row_display_values(row);
+                        let action = operation_item_action(&section.key);
+                        let (item, before, after) = report_item_cells(row, action);
                         PackageChangeRow {
                             category: category.clone(),
                             task: task.clone(),
-                            item: row.name.clone(),
+                            item,
+                            action: action.map(str::to_owned),
                             before,
                             after,
                             result: report_status_cell_for_row(&section.key, row).to_string(),
@@ -12896,45 +12934,66 @@ fn render_package_change_rollup_with_width<'a>(
             .max(visible_width("Notes"))
             .min(34),
     ];
-    let minimum_widths = [5, 6, 10, 8, 8, 7, 12];
-    let widths = allocate_box_table_widths(&preferred_widths, &minimum_widths, target_width);
-    let [group_w, task_w, item_w, before_w, after_w, result_w, notes_w] = widths;
+    let action_width = rows
+        .iter()
+        .filter_map(|row| row.action.as_deref().map(visible_width))
+        .max();
+    let [group, task, item, before, after, result, notes] = preferred_widths;
+    let [group_w, task_w, item_w, action_w, before_w, after_w, result_w, notes_w] =
+        if let Some(action_width) = action_width {
+            allocate_box_table_widths(
+                &[
+                    group,
+                    task,
+                    item,
+                    action_width.clamp(6, 24),
+                    before,
+                    after,
+                    result,
+                    notes,
+                ],
+                &[5, 6, 8, 6, 6, 6, result, 6],
+                target_width,
+            )
+        } else {
+            let [group, task, item, before, after, result, notes] = allocate_box_table_widths(
+                &preferred_widths,
+                &[5, 6, 10, 8, 8, 7, 12],
+                target_width,
+            );
+            [group, task, item, 0, before, after, result, notes]
+        };
+    let widths = [
+        group_w, task_w, item_w, action_w, before_w, after_w, result_w, notes_w,
+    ]
+    .into_iter()
+    .filter(|width| *width > 0)
+    .collect::<Vec<_>>();
+    let mut header = vec![
+        BoxCell::plain("Group", group_w),
+        BoxCell::plain("Task", task_w),
+        BoxCell::plain("Item", item_w),
+    ];
+    if action_w > 0 {
+        header.push(BoxCell::plain("Action", action_w));
+    }
+    header.extend([
+        BoxCell::plain("Before", before_w),
+        BoxCell::plain("After", after_w),
+        BoxCell::plain("Result", result_w),
+        BoxCell::plain("Notes", notes_w),
+    ]);
 
     lines.push(RenderedReportLine {
-        text: render_box_separator(
-            '┌',
-            '┬',
-            '┐',
-            &[
-                group_w, task_w, item_w, before_w, after_w, result_w, notes_w,
-            ],
-        ),
+        text: render_box_separator('┌', '┬', '┐', &widths),
         level: LogLevel::Info,
     });
     lines.push(RenderedReportLine {
-        text: render_box_row(
-            &[
-                BoxCell::plain("Group", group_w),
-                BoxCell::plain("Task", task_w),
-                BoxCell::plain("Item", item_w),
-                BoxCell::plain("Before", before_w),
-                BoxCell::plain("After", after_w),
-                BoxCell::plain("Result", result_w),
-                BoxCell::plain("Notes", notes_w),
-            ],
-            color,
-        ),
+        text: render_box_row(&header, color),
         level: LogLevel::Info,
     });
     lines.push(RenderedReportLine {
-        text: render_box_separator(
-            '├',
-            '┼',
-            '┤',
-            &[
-                group_w, task_w, item_w, before_w, after_w, result_w, notes_w,
-            ],
-        ),
+        text: render_box_separator('├', '┼', '┤', &widths),
         level: LogLevel::Info,
     });
 
@@ -12956,35 +13015,43 @@ fn render_package_change_rollup_with_width<'a>(
             (None, None)
         };
 
+        let mut cells = vec![
+            BoxCell::plain(&group_text, group_w),
+            BoxCell::plain(&task_text, task_w),
+            BoxCell {
+                text: item_text,
+                color: row.action.as_ref().map(|_| crossterm::style::Color::White),
+                width: item_w,
+            },
+        ];
+        let action = row.action.as_deref().unwrap_or_default();
+        if action_w > 0 {
+            cells.push(BoxCell {
+                text: action.to_owned(),
+                color: row.action.as_ref().map(|_| crossterm::style::Color::Cyan),
+                width: action_w,
+            });
+        }
+        cells.extend([
+            BoxCell {
+                text: before_text,
+                color: before_color,
+                width: before_w,
+            },
+            BoxCell {
+                text: after_text,
+                color: after_color,
+                width: after_w,
+            },
+            BoxCell {
+                text: row.result.clone(),
+                color: package_rollup_result_color(&row),
+                width: result_w,
+            },
+            BoxCell::plain(&note_text, notes_w),
+        ]);
         lines.push(RenderedReportLine {
-            text: render_box_row(
-                &[
-                    BoxCell::plain(&group_text, group_w),
-                    BoxCell::plain(&task_text, task_w),
-                    BoxCell::plain(&item_text, item_w),
-                    BoxCell {
-                        text: before_text,
-                        color: before_color,
-                        width: before_w,
-                    },
-                    BoxCell {
-                        text: after_text,
-                        color: after_color,
-                        width: after_w,
-                    },
-                    BoxCell {
-                        text: row.result.clone(),
-                        color: if color_enabled {
-                            package_rollup_result_color(&row)
-                        } else {
-                            None
-                        },
-                        width: result_w,
-                    },
-                    BoxCell::plain(&note_text, notes_w),
-                ],
-                color,
-            ),
+            text: render_box_row(&cells, color),
             level,
         });
 
@@ -13009,6 +13076,7 @@ fn render_package_change_rollup_with_width<'a>(
             ("group", group_overflow, row.category.as_str()),
             ("task", task_overflow, row.task.as_str()),
             ("item", item_overflow, row.item.as_str()),
+            ("action", visible_width(action) > action_w, action),
             ("before", before_overflow, row.before.as_str()),
             ("after", after_overflow, row.after.as_str()),
             ("notes", note_overflow, row.note.as_str()),
@@ -13034,14 +13102,7 @@ fn render_package_change_rollup_with_width<'a>(
     }
 
     lines.push(RenderedReportLine {
-        text: render_box_separator(
-            '└',
-            '┴',
-            '┘',
-            &[
-                group_w, task_w, item_w, before_w, after_w, result_w, notes_w,
-            ],
-        ),
+        text: render_box_separator('└', '┴', '┘', &widths),
         level: LogLevel::Info,
     });
 
@@ -13907,6 +13968,7 @@ fn report_headers_for_section(
     key: &str,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     match key {
+        key if operation_item_action(key).is_some() => ("Item", "Before", "After", "Outcome"),
         "arch_update_services" => ("Service", "Before", "After", "Result"),
         "package_recovery" | "yay_recovery" => ("Item", "Before", "After", "Result"),
         "task_failures" => ("Task", "Before", "After", "Outcome"),
@@ -14258,7 +14320,15 @@ fn render_box_row(cells: &[BoxCell], color: bool) -> String {
     let mut out = String::from("│");
     for cell in cells {
         out.push(' ');
-        let (plain, _) = fit_visible(&cell.text, cell.width);
+        let escaped;
+        let text = if cells.len() == crate::ui::ACTION_REPORT_BOX_COLUMNS && cell.text.contains('│')
+        {
+            escaped = cell.text.replace('│', "|");
+            &escaped
+        } else {
+            &cell.text
+        };
+        let (plain, _) = fit_visible(text, cell.width);
         let rendered = match (color_enabled, cell.color) {
             (true, Some(color)) => colorize_report_cell(&plain, color),
             _ => plain,
