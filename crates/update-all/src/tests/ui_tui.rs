@@ -707,6 +707,43 @@ fn stylize_report_row_highlights_version_columns() {
 }
 
 #[test]
+fn stylize_operation_items_colors_subject_action_and_outcome() {
+    for (line, kind, outcome, outcome_color) in [
+        (
+            "tmux-yank  update  -  -  Passed",
+            ReportHighlightState::Active(ReportStyleKind::OperationItems),
+            "Passed",
+            Color::LightGreen,
+        ),
+        (
+            "│ Maintenance │ Tmux Plugins │ tmux-yank │ update │ 1.0 │ 2.0 │ Error │ failed │",
+            ReportHighlightState::None,
+            "Error",
+            Color::Red,
+        ),
+    ] {
+        let spans = stylize_log_body(
+            line,
+            Style::default(),
+            LogStream::Meta,
+            kind,
+            LabeledVersionColorMode::Standalone,
+        );
+        for (cell, color) in [
+            ("tmux-yank", Color::White),
+            ("update", Color::Cyan),
+            (outcome, outcome_color),
+        ] {
+            let span = spans
+                .iter()
+                .find(|span| span.content.trim() == cell)
+                .unwrap_or_else(|| panic!("missing {cell} in {spans:?}"));
+            assert_eq!(span.style.fg, Some(color), "{line}");
+        }
+    }
+}
+
+#[test]
 fn stylize_report_row_leaves_unchanged_versions_uncolored() {
     let spans = stylize_log_body(
         "pkg      1.0.0             1.0.0             Unchanged",

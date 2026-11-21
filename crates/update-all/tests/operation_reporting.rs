@@ -170,6 +170,29 @@ fn truthful_operation_final_rollup_pty_preserves_outcomes_and_observations() {
         );
         let rollup = text.rsplit("Package Change Rollup").next().unwrap();
         let package_rows = rollup.split("Command Diagnostics").next().unwrap();
+        let cells = |line: &str| {
+            line.split('│')
+                .skip(1)
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let header = package_rows
+            .lines()
+            .find(|line| line.contains("│ Item") && line.contains("│ Action"))
+            .unwrap_or_else(|| panic!("{engine} missing action column: {package_rows}"));
+        assert_eq!(
+            &cells(header)[2..7],
+            ["Item", "Action", "Before", "After", "Result"]
+        );
+        let item = package_rows
+            .lines()
+            .find(|line| line.contains("│ updated component"))
+            .unwrap_or_else(|| panic!("{engine} missing structured item: {package_rows}"));
+        assert_eq!(
+            &cells(item)[2..7],
+            ["updated component", "update", "1.0", "2.0", "Updated"]
+        );
         assert!(
             !package_rows.contains("fixture operation diagnostic"),
             "{text}"

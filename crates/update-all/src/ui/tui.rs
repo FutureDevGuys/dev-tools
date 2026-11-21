@@ -3366,6 +3366,7 @@ enum ReportStyleKind {
     Recovery,
     UpdateDetails,
     StatusOnly,
+    OperationItems,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3738,6 +3739,13 @@ fn stylize_report_table_columns(
         };
         if end > start {
             let mut style = base_style;
+            if kind == ReportStyleKind::OperationItems && !header {
+                style = match idx {
+                    0 => Style::default().fg(Color::White).patch(base_style),
+                    1 => Style::default().fg(Color::Cyan).patch(base_style),
+                    _ => style,
+                };
+            }
             if let Some((before_col, after_col)) = layout.before_after_cols {
                 if value_change && idx == before_col {
                     style = Style::default().fg(Color::LightRed).patch(base_style);
@@ -3848,6 +3856,27 @@ fn report_table_layout(
                 status_col: Some(3),
             })
         }
+        ReportStyleKind::OperationItems => {
+            let columns = extract_report_columns(line, 5)?;
+            if header {
+                if columns
+                    .iter()
+                    .map(|column| column.trim())
+                    .ne(["Item", "Action", "Before", "After", "Outcome"])
+                {
+                    return None;
+                }
+            } else if !super::is_report_action(columns[1].trim())
+                || report_tail_style(kind, columns[4].trim()).is_none()
+            {
+                return None;
+            }
+            Some(ReportTableLayout {
+                column_count: 5,
+                before_after_cols: Some((2, 3)),
+                status_col: Some(4),
+            })
+        }
     }
 }
 
@@ -3875,8 +3904,18 @@ fn stylize_box_table_row(line: &str, base_style: Style) -> Option<Vec<Span<'stat
     if !line.trim_start().starts_with('│') {
         return None;
     }
-    let mut cell_styles = box_table_value_column_styles(line);
-    cell_styles.extend(box_table_status_column_styles(line));
+    let cells = box_table_cells(line)?;
+    let mut cell_styles = box_table_value_column_styles(&cells);
+    cell_styles.extend(box_table_status_column_styles(&cells));
+    if cells.len() == super::ACTION_REPORT_BOX_COLUMNS
+        && is_report_box_status_cell(cells[6].trim())
+        && !cells[3].trim().is_empty()
+    {
+        cell_styles.extend([
+            (2, Style::default().fg(Color::White)),
+            (3, Style::default().fg(Color::Cyan)),
+        ]);
+    }
     let mut cell_idx = 0usize;
     let mut spans = Vec::new();
     for segment in line.split_inclusive('│') {
@@ -3903,16 +3942,15 @@ fn stylize_box_table_row(line: &str, base_style: Style) -> Option<Vec<Span<'stat
     Some(spans)
 }
 
-fn box_table_value_column_styles(line: &str) -> Vec<(usize, Style)> {
-    let Some(cells) = box_table_cells(line) else {
-        return Vec::new();
+fn box_table_value_column_styles(cells: &[&str]) -> Vec<(usize, Style)> {
+    let before_idx = match cells.len() {
+        7 => 3,
+        super::ACTION_REPORT_BOX_COLUMNS => 4,
+        _ => return Vec::new(),
     };
-    if cells.len() != 7 {
-        return Vec::new();
-    }
-    let before = cells[3].trim();
-    let after = cells[4].trim();
-    let result = cells[5].trim();
+    let before = cells[before_idx].trim();
+    let after = cells[before_idx + 1].trim();
+    let result = cells[before_idx + 2].trim();
     if before == "Before" && after == "After" && result == "Result" {
         return Vec::new();
     }
@@ -3928,13 +3966,13 @@ fn box_table_value_column_styles(line: &str) -> Vec<(usize, Style)> {
     {
         return vec![
             (
-                3,
+                before_idx,
                 Style::default()
                     .fg(Color::LightRed)
                     .add_modifier(Modifier::BOLD),
             ),
             (
-                4,
+                before_idx + 1,
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
@@ -3944,11 +3982,9 @@ fn box_table_value_column_styles(line: &str) -> Vec<(usize, Style)> {
     Vec::new()
 }
 
-fn box_table_status_column_styles(line: &str) -> Vec<(usize, Style)> {
-    let Some(cells) = box_table_cells(line) else {
-        return Vec::new();
-    };
+fn box_table_status_column_styles(cells: &[&str]) -> Vec<(usize, Style)> {
     let Some(status_idx) = (match cells.len() {
+        super::ACTION_REPORT_BOX_COLUMNS => Some(6),
         7 => Some(5),
         5 => Some(2),
         4 => Some(3),
@@ -4006,7 +4042,7 @@ fn box_cell_style(cell: &str) -> Option<Style> {
 
 fn report_outcome_style(outcome: &str) -> Option<Style> {
     match outcome {
-        "Blocked/deferred" => Some(
+        "Blocked/deferred" | "Deferred" | "Unconfirmed" => Some(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -4099,6 +4135,9 @@ fn report_style_kind_for_title(line: &str) -> Option<ReportStyleKind> {
 }
 
 fn parse_report_header_kind(line: &str) -> Option<ReportStyleKind> {
+    if report_table_layout(line, ReportStyleKind::OperationItems, true).is_some() {
+        return Some(ReportStyleKind::OperationItems);
+    }
     if let Some(columns) = extract_report_columns(line, 4) {
         if let Some(kind) = match (
             columns[0].trim(),
@@ -4144,7 +4183,9 @@ fn report_tail_style(kind: ReportStyleKind, trimmed: &str) -> Option<Style> {
     match kind {
         ReportStyleKind::Standard if trimmed == "Outcome" => Some(Style::default()),
         ReportStyleKind::Recovery if trimmed == "Result" => Some(Style::default()),
-        ReportStyleKind::Standard | ReportStyleKind::Recovery => report_outcome_style(trimmed),
+        ReportStyleKind::Standard | ReportStyleKind::Recovery | ReportStyleKind::OperationItems => {
+            report_outcome_style(trimmed)
+        }
         ReportStyleKind::UpdateDetails => None,
         ReportStyleKind::StatusOnly => report_status_only_tail_style(trimmed),
     }

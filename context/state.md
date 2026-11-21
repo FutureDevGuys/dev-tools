@@ -1,5 +1,7 @@
 # Active work
 
+- Update All structured item reporting and dashboard colors need a signed release and managed installation. Source changes are in #119, #120, and the action-color change. The installed release is still 0.1.20.
+
 - Update All generic lock diagnostics, PR #116: source and controlled Linux CLI validation pass. One socket fixture remains blocked by the cloud sandbox and fails identically on baseline. Release and desktop installation remain pending; no installed product changed.
 
 - **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:

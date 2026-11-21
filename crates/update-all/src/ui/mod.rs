@@ -758,6 +758,16 @@ pub(crate) fn report_column_count(line: &str) -> usize {
     }
 }
 
+pub(crate) const ACTION_REPORT_BOX_COLUMNS: usize = 8;
+
+pub(crate) fn is_report_action(action: &str) -> bool {
+    !action.is_empty()
+        && action.len() <= 48
+        && action
+            .bytes()
+            .all(|ch| ch.is_ascii_lowercase() || ch == b'-')
+}
+
 pub(crate) fn report_values_are_version_change(before: &str, after: &str) -> bool {
     let before = before.trim();
     let after = after.trim();
