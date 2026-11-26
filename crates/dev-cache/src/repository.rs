@@ -46,8 +46,7 @@ pub(crate) enum IdentityDisposition {
 
 impl Repository {
     pub fn discover(cwd: &Path, root: &RootHandle) -> Result<Option<Self>> {
-        let requested = cwd
-            .canonicalize()
+        let requested = crate::util::canonicalize(cwd)
             .with_context(|| format!("resolve workspace start {}", cwd.display()))?;
         // Workspace discovery is local metadata observation. Invoking Git here
         // can enter a credential broker (or hang in a user wrapper) for every

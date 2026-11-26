@@ -20,8 +20,7 @@ pub struct ArtifactRecord {
 
 pub fn put(root: &RootHandle, source: &Path) -> Result<ArtifactRecord> {
     let _lease = RootLease::shared(root, "artifacts-put")?;
-    let source = source
-        .canonicalize()
+    let source = crate::util::canonicalize(source)
         .with_context(|| format!("resolve artifact {}", source.display()))?;
     if source.starts_with(&root.root) {
         bail!("artifact source must be outside the disposable cache root");

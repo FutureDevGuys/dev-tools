@@ -575,7 +575,7 @@ fn init_root(cli: &Cli, root_path: &Path, force_config: bool) -> Result<i32> {
             .root
             .as_deref()
             .map(crate::util::path_from_home)
-            .and_then(|configured| configured.canonicalize().ok());
+            .and_then(|configured| crate::util::canonicalize(&configured).ok());
         if existing_root.as_deref() == Some(root.root.as_path()) {
             print_value(
                 cli.json,
@@ -1282,10 +1282,11 @@ fn path_command(
         }
         let real = cargo_intercept::resolve_real_cargo(config, &env::current_exe()?)?;
         let args = [OsString::from("build")];
-        let cwd = repo_path
-            .map(Path::to_path_buf)
-            .unwrap_or(env::current_dir()?)
-            .canonicalize()?;
+        let cwd = crate::util::canonicalize(
+            &repo_path
+                .map(Path::to_path_buf)
+                .unwrap_or(env::current_dir()?),
+        )?;
         if !cargo_intercept::cargo_build_dir_capability(&real, &args, Some(&cwd))? {
             bail!("retained Cargo output routing requires Cargo 1.91 or newer");
         }

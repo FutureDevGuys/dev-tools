@@ -119,7 +119,7 @@ impl RootLease {
 
 // fs2 uses platform-specific contention codes (including Windows lock violation).
 // A broad ErrorKind is insufficient there and can misclassify unrelated errors.
-fn lock_is_contended(error: &std::io::Error) -> bool {
+pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
     matches!(
         (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
         (Some(actual), Some(expected)) if actual == expected
