@@ -251,7 +251,7 @@ impl HookShell {
         #[cfg(windows)]
         {
             let system_root = std::env::var_os("SystemRoot").ok_or(HookError::UnsafeShell)?;
-            Self::windows_cmd(PathBuf::from(system_root).join("System32/cmd.exe"))
+            Self::windows_cmd(PathBuf::from(system_root).join("System32").join("cmd.exe"))
         }
         #[cfg(not(any(unix, windows)))]
         {

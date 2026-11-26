@@ -174,7 +174,7 @@ impl InstallationLock {
             };
             match result {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if lock_is_contended(&error) => return Ok(None),
                 Err(error) => return Err(error).context("acquire installation lock"),
             }
         } else {
@@ -249,6 +249,13 @@ impl InstallationLock {
         lock.verify_named_identity(path)?;
         Ok(lock)
     }
+}
+
+// Windows reports a held byte-range lock as ERROR_LOCK_VIOLATION, which std
+// does not classify as WouldBlock.
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 impl Drop for InstallationLock {

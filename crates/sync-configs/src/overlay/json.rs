@@ -106,11 +106,11 @@ pub fn overlay_json_file(
     target_path: &Path,
     options: &JsonOverlayOptions,
 ) -> Result<OverlayResult> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if !options.dry_run {
         return overlay_json_file_transactional(source_path, target_path, options);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     super::transaction::ensure_no_pending(target_path)?;
     let source_text = fs::read_to_string(source_path)
         .with_context(|| format!("cannot read JSON overlay source {}", source_path.display()))?;
@@ -124,7 +124,7 @@ pub fn overlay_json_file(
             anyhow!("managed_overlay_id is required when reconcile_removed_keys is enabled")
         })?;
         let path = ownership::receipt_path(managed_id, options.state_root.as_deref())?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         super::transaction::ensure_no_receipt_pending(&path)?;
         prior_paths = ownership::load_paths(&path, managed_id)?;
         let source = load_json_object_text(&source_text, "source")?;
@@ -156,10 +156,10 @@ pub fn overlay_json_file(
         return Ok(result);
     }
 
-    bail!("durable overlay publication is currently available only on Linux")
+    bail!("durable overlay publication is unavailable on this platform; it is implemented for Linux and Windows")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn overlay_json_file_transactional(
     source_path: &Path,
     target_path: &Path,

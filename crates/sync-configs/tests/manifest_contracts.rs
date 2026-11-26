@@ -20,7 +20,7 @@ fn path_context(root: &Path) -> PathContext {
         root.join("from-env").into_os_string(),
     );
     PathContext::new(
-        PathPlatform::Posix,
+        PathPlatform::current(),
         root.to_path_buf(),
         Some(root.join("home")),
         root.join("temp"),
@@ -42,6 +42,7 @@ fn loads_complete_root_fragments_defaults_and_typed_preconditions() {
     let root = temp.path();
     fs::create_dir_all(root.join("entries/nested")).expect("entries directory");
     fs::write(root.join("desired.toml"), "enabled = true\n").expect("source");
+    let owner = root.join("bin").join("owner");
     fs::write(
         root.join("entries/nested/10-main.yaml"),
         r#"
@@ -71,7 +72,8 @@ entries:
     .expect("fragment");
     fs::write(
         root.join("manifest.yaml"),
-        r#"
+        format!(
+            r#"
 schema_version: 1
 required_capabilities: [manifest-schema-v1, entries-directory-v1]
 default_mode: copy
@@ -85,13 +87,15 @@ state_preconditions:
     remediation: Run the owner migration.
 reconcilers:
   - name: owner
-    executable: /usr/local/bin/owner
+    executable: '{}'
     source: ./desired.toml
     scope: user
     privilege: user
     protocol: dev-tools-reconcile-v1
     profiles: [desktop]
 "#,
+            owner.display()
+        ),
     )
     .expect("root manifest");
 
@@ -132,6 +136,7 @@ reconcilers:
     assert_eq!(entry.scope_label(), "CLI / Example");
     assert_eq!(loaded.reconcilers.len(), 1);
     assert_eq!(loaded.reconcilers[0].privilege, Privilege::User);
+    assert_eq!(loaded.reconcilers[0].executable, owner);
     assert_eq!(loaded.reconcilers[0].source, root.join("desired.toml"));
     assert!(matches!(
         loaded.state_preconditions.as_slice(),
@@ -379,7 +384,7 @@ entries:
 #[test]
 fn entry_dependencies_and_privileged_constraints_fail_closed() {
     let temp = TempDir::new().expect("temporary directory");
-    let cases = [
+    let mut cases = vec![
         (
             "removed-keys",
             "entries:\n  - source: ./a\n    target: ./b\n    mode: json_overlay\n    reconcile_removed_keys: true\n",
@@ -391,16 +396,22 @@ fn entry_dependencies_and_privileged_constraints_fail_closed() {
             "only supported for copy",
         ),
         (
-            "privileged-target",
-            "entries:\n  - source: ./a\n    target: /etc/example\n    mode: copy\n    target_privilege: sudo\n    target_owner: root\n    target_group: root\n    target_parent_mode: '0755'\n",
-            "permissions.file",
-        ),
-        (
             "comment-policy",
             "entries:\n  - source: ./a\n    target: ./b\n    mode: copy\n    commented_target_policy: respect\n",
             "toml_overlay",
         ),
     ];
+    // Privileged targets are POSIX-only; Windows rejects sudo outright.
+    let privileged_target = (
+        "privileged-target",
+        "entries:\n  - source: ./a\n    target: /etc/example\n    mode: copy\n    target_privilege: sudo\n    target_owner: root\n    target_group: root\n    target_parent_mode: '0755'\n",
+        if cfg!(windows) {
+            "unavailable on Windows"
+        } else {
+            "permissions.file"
+        },
+    );
+    cases.push(privileged_target);
 
     for (name, yaml, expected) in cases {
         let path = temp.path().join(format!("dependency-{name}.yaml"));
@@ -414,6 +425,7 @@ fn entry_dependencies_and_privileged_constraints_fail_closed() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn valid_privileged_copy_and_toml_policies_preserve_their_full_contract() {
     let temp = TempDir::new().expect("temporary directory");
@@ -503,6 +515,7 @@ fn source_and_manifest_overrides_are_resolved_without_double_selecting_sources()
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn source_overrides_skip_privileged_targets_but_still_apply_to_user_targets() {
     let temp = TempDir::new().expect("temporary directory");
@@ -572,9 +585,11 @@ fn profile_map_is_strict_at_root_and_preserves_first_seen_order() {
 fn profile_selection_matches_the_python_013_contract_for_entries_and_reconcilers() {
     let temp = TempDir::new().expect("temporary directory");
     let path = temp.path().join("manifest.yaml");
+    let executable = temp.path().join("owner-tool");
     fs::write(
         &path,
-        r#"
+        format!(
+            r#"
 entries:
   - name: default
     source: ./default
@@ -585,19 +600,21 @@ entries:
     target: ./desktop-target
 reconcilers:
   - name: default-owner
-    executable: /bin/true
+    executable: '{0}'
     source: ./default
     scope: user
     privilege: user
     protocol: dev-tools-reconcile-v1
   - name: desktop-owner
-    executable: /bin/true
+    executable: '{0}'
     source: ./desktop
     scope: user
     privilege: user
     protocol: dev-tools-reconcile-v1
     profiles: [desktop]
 "#,
+            executable.display()
+        ),
     )
     .expect("manifest");
     let loaded = load(temp.path(), &path);

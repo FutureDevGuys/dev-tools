@@ -337,10 +337,61 @@ pub fn is_absolute_for(path: &Path, platform: PathPlatform) -> bool {
     path.to_str().is_some_and(windows_text_is_absolute)
 }
 
+/// Whether an uppercased file-name stem is a reserved Windows device name,
+/// including COM/LPT 0-9 and their superscript forms.
+#[cfg(windows)]
+pub(crate) fn is_reserved_device_stem(stem: &str) -> bool {
+    matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix)
+                .is_some_and(|rest| matches!(rest.chars().collect::<Vec<_>>()[..], [c] if c.is_ascii_digit() || matches!(c, '\u{b9}' | '\u{b2}' | '\u{b3}')))
+        })
+}
+
+/// Drop the `\\?\` verbatim prefix that `fs::canonicalize` adds to a drive path
+/// on Windows, so reports and derived paths read as the user spelled them. UNC
+/// and volume paths, and any path with a component the ordinary spelling would
+/// reinterpret (trailing dot or space, reserved device name), keep it.
+pub(crate) fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(rest) = path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        let plain = matches!(rest.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+            && rest[3..].split('\\').all(|component| {
+                let stem = component.split('.').next().unwrap_or_default();
+                !component.ends_with(['.', ' '])
+                    && !is_reserved_device_stem(&stem.trim_end_matches(' ').to_uppercase())
+            });
+        if plain {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 #[cfg(all(test, windows))]
 mod windows_path_tests {
-    use super::windows_text_is_absolute;
-    use std::path::Path;
+    use super::{windows_text_is_absolute, without_verbatim_prefix};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn canonical_verbatim_prefixes_are_removed_only_when_equivalent() {
+        for (raw, expected) in [
+            (r"\\?\C:\config\a.yaml", r"C:\config\a.yaml"),
+            (r"\\?\UNC\server\share\a", r"\\?\UNC\server\share\a"),
+            (r"\\?\C:\dir\NUL.txt", r"\\?\C:\dir\NUL.txt"),
+            ("\\\\?\\C:\\dir\\com\u{b9}", "\\\\?\\C:\\dir\\com\u{b9}"),
+            (r"\\?\C:\dir.\a", r"\\?\C:\dir.\a"),
+            (r"\\?\C:\dir\com10", r"C:\dir\com10"),
+            (r"C:\config", r"C:\config"),
+            (r"\\?\Volume{1}\a", r"\\?\Volume{1}\a"),
+            (r"\\?\C:", r"\\?\C:"),
+        ] {
+            assert_eq!(
+                without_verbatim_prefix(PathBuf::from(raw)),
+                PathBuf::from(expected)
+            );
+        }
+    }
 
     #[test]
     fn synthetic_windows_absolute_classifier_matches_native_path_grammar() {
