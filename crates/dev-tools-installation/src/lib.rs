@@ -3198,8 +3198,24 @@ fn validate_existing_directory_chain(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Windows reports a held lock as ERROR_LOCK_VIOLATION, which is not WouldBlock.
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Windows opens a directory only with backup semantics, and flushing needs write access.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options
+        .open(path)
         .with_context(|| format!("open directory {}", path.display()))?
         .sync_all()
         .with_context(|| format!("sync directory {}", path.display()))

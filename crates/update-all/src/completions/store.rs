@@ -1099,7 +1099,9 @@ mod tests {
                     .join("managed-root")
                     .join("snapshots")
                     .join(snapshot)
-                    .join("views/zsh/_update-all")
+                    .join("views")
+                    .join("zsh")
+                    .join("_update-all")
             )
         );
 

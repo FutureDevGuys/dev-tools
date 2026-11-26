@@ -203,6 +203,11 @@ impl MutationAdapter {
         let owner_uid = state_document_authority(paths)
             .map_err(authority)?
             .owner_uid;
+        // Intermediate directories would otherwise take the umask mode.
+        if let Some(cache) = parent.parent() {
+            dev_tools_installation::ensure_owned_directory(cache, owner_uid, 0o700)
+                .map_err(authority)?;
+        }
         dev_tools_installation::ensure_owned_directory(parent, owner_uid, 0o700)
             .map_err(authority)?;
         dev_tools_installation::write_atomic_document(

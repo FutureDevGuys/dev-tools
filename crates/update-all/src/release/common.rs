@@ -224,6 +224,13 @@ impl CommonAdapter {
         let verified = acceptance
             .accept(&metadata, &candidate_authority())
             .map_err(authority_error)?;
+        // The writer would create `cache` with the umask mode.
+        dev_tools_installation::ensure_owned_directory(
+            &paths.product_root.join("cache"),
+            layout.owner_uid,
+            0o700,
+        )
+        .map_err(authority_error)?;
         dev_tools_installation::write_atomic_document(
             &cache_path,
             &bytes,
@@ -246,7 +253,8 @@ impl CommonAdapter {
             InstallClassification::Absent => {
                 // Admit legacy state without interpreting its observational active
                 // version or check time as receipt ownership or fresh evidence.
-                load_state(paths)?;
+                // Also admits the recorded retirement fence left by an interrupted cutover.
+                protocol::migration_history(paths)?;
                 return Ok(InstallationSnapshot::absent());
             }
             InstallClassification::Managed => {}
@@ -268,7 +276,7 @@ impl CommonAdapter {
         } else {
             // This is a strict v1 decoder, not a default on invalid v2 bytes.
             // Complete observation checks links and bytes without legacy recovery.
-            load_state(paths)?;
+            protocol::migration_history(paths)?;
             observe_versioned_installation(&layout, ARTIFACT_LIMIT)?
         };
         match receipt {
@@ -584,6 +592,68 @@ mod tests {
         assert!(!authority.exists());
         assert!(paths.state.is_dir());
         assert!(!retained.is_empty());
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn candidate_cache_directory_is_private_regardless_of_umask() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+        const CHILD: &str = "UPDATE_ALL_CACHE_MODE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "sh"])
+                .arg(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "release::common::tests::candidate_cache_directory_is_private_regardless_of_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .spawn()?;
+            let status = child.wait_timeout(Duration::from_secs(20))?;
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(status.is_some_and(|status| status.success()));
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        CommonAdapter::refresh_with(&paths, now_unix(), || Ok(signed_metadata()))?;
+        let cache = CandidateCache::path(&paths);
+        assert_eq!(fs::metadata(cache.parent().unwrap())?.mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn common_status_admits_a_recorded_retirement_fence_without_installation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        create_private_dir(&paths.product_root)?;
+        dev_tools_installation::retire_atomic_document(
+            &paths.state,
+            &state_document_authority(&paths)?,
+            true,
+        )?;
+        assert!(paths.state.is_dir());
+        let result = observe(super::super::tests::state_test_paths(root.path()));
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.installation_state, Some(InstallationState::Absent));
+        assert_eq!(result.changed, Some(false));
+        // An unrecorded directory remains hostile authority.
+        fs::remove_dir_all(root.path().join("product"))?;
+        create_private_dir(&paths.product_root)?;
+        fs::create_dir(&paths.state)?;
+        assert_eq!(
+            observe(super::super::tests::state_test_paths(root.path())).exit_code,
+            4
+        );
         Ok(())
     }
 
