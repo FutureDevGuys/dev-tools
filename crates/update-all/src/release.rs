@@ -1875,6 +1875,12 @@ fn load_state(paths: &Paths) -> Result<ReleaseState> {
 // lease precedes installation locks and spans bounded product-owned retrieval
 // and health verification. Nonblocking admission prevents reentrant waiting.
 fn acquire_release_writer(paths: &Paths) -> Result<dev_tools_installation::InstallationLock> {
+    // Create an absent root with the layout's mode; the lock's own parent creation
+    // would use the umask and later fail the exact-mode check. Existing roots are untouched.
+    if matches!(fs::symlink_metadata(&paths.product_root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        create_private_dir(&paths.product_root)?;
+    }
     state_document_authority(paths)?;
     dev_tools_installation::InstallationLock::try_acquire(
         &paths.product_root.join("release-writer-v1.lock"),
@@ -2589,6 +2595,32 @@ mod tests {
                 assert!(!journal.exists());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_product_root_is_created_private_regardless_of_umask() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        // SAFETY: umask is process-wide; restored immediately after the call.
+        #[allow(unsafe_code)]
+        let previous = unsafe { libc::umask(0o022) };
+        let result = update_managed_with_sources(
+            Product::UpdateAll,
+            &paths,
+            |_, _, _| bail!("fixture discovery reached"),
+            |_| bail!("fixture artifact fetch reached"),
+        );
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::umask(previous)
+        };
+        assert!(result.is_err());
+        let metadata = fs::metadata(&paths.product_root).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        dev_tools_installation::ensure_owned_directory(&paths.product_root, metadata.uid(), 0o700)
+            .unwrap();
     }
 
     #[test]
