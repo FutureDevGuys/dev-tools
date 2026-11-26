@@ -6,6 +6,8 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use dev_tools_installation::lock_is_contended;
+
 use crate::root::RootHandle;
 use crate::util::{now_unix, write_json_atomic};
 
@@ -115,15 +117,6 @@ impl RootLease {
         clean_stale_lease_records(root)?;
         Ok(Some(Self { file, record: None }))
     }
-}
-
-// fs2 uses platform-specific contention codes (including Windows lock violation).
-// A broad ErrorKind is insufficient there and can misclassify unrelated errors.
-pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
-    matches!(
-        (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
-        (Some(actual), Some(expected)) if actual == expected
-    )
 }
 
 impl Drop for RootLease {
@@ -259,19 +252,6 @@ fn process_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lock_contention_classification_uses_the_exact_native_code() {
-        let expected = fs2::lock_contended_error();
-        assert!(lock_is_contended(&expected));
-        assert!(!lock_is_contended(&std::io::Error::other("unrelated")));
-        assert!(!lock_is_contended(&std::io::Error::from(
-            std::io::ErrorKind::WouldBlock
-        )));
-        assert!(!lock_is_contended(&std::io::Error::from_raw_os_error(
-            expected.raw_os_error().unwrap() + 1
-        )));
-    }
 
     #[test]
     fn observation_and_routed_setup_share_coordination_without_unscoped_records() {

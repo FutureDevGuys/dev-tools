@@ -341,7 +341,7 @@ fn marker_lock(root: &Path) -> Result<fs::File> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error) if crate::lease::lock_is_contended(&error) => {
+            Err(error) if dev_tools_installation::lock_is_contended(&error) => {
                 if std::time::Instant::now() >= deadline {
                     bail!("cache-root marker is busy; retry the operation");
                 }

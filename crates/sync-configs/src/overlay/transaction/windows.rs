@@ -43,7 +43,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::{ParentIdentity, FILE_LIMIT, PREFIX};
-use crate::paths::is_reserved_device_stem;
+use dev_tools_command::windows_path::is_reserved_device_stem;
 
 pub(super) const MAX_NATIVE_PATH: usize = 32768;
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -68,11 +68,12 @@ impl FileId {
     /// The journal's 64-bit fingerprint. Live checks compare the full id; for
     /// NTFS (high half zero) this is the file index itself.
     fn fingerprint(self) -> ParentIdentity {
-        let (low, high) = self.id.split_at(8);
+        let (mut low, mut high) = ([0; 8], [0; 8]);
+        low.copy_from_slice(&self.id[..8]);
+        high.copy_from_slice(&self.id[8..]);
         ParentIdentity {
             device: self.volume,
-            inode: u64::from_le_bytes(low.try_into().unwrap())
-                ^ u64::from_le_bytes(high.try_into().unwrap()),
+            inode: u64::from_le_bytes(low) ^ u64::from_le_bytes(high),
         }
     }
 }

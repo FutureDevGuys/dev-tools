@@ -1886,23 +1886,86 @@ fn acquire_release_writer(paths: &Paths) -> Result<dev_tools_installation::Insta
 
 // An absent root is created private (the lock's own parent creation would use the
 // umask and fail the exact-mode check). A root from an earlier umask-mode creation
-// is tightened only when no group or other write bit is set; anything else is refused.
+// is tightened only in the recognised bootstrap state; anything else is refused.
 fn prepare_product_root(paths: &Paths, owner_uid: u32) -> Result<()> {
+    prepare_private_directory(&paths.product_root, owner_uid)
+}
+
+// The product cache directory was previously created with the umask mode. It is
+// admitted under the same rule as the product root and created private when absent.
+fn prepare_cache_directory(paths: &Paths, owner_uid: u32) -> Result<()> {
+    prepare_private_directory(&paths.product_root.join("cache"), owner_uid)
+}
+
+fn prepare_private_directory(path: &Path, owner_uid: u32) -> Result<()> {
     #[cfg(unix)]
+    tighten_bootstrap_directory(path, owner_uid)?;
+    dev_tools_installation::ensure_owned_directory(path, owner_uid, 0o700)
+}
+
+// Repair is limited to the recognised bootstrap state: a real directory owned by
+// the caller with owner rwx and no group/other write (for example 0755, 0750, 0711).
+// The chmod is applied to a descriptor obtained through a no-follow component walk,
+// so a concurrent substitution cannot redirect it. Everything else is left for the
+// exact check to refuse.
+#[cfg(unix)]
+fn tighten_bootstrap_directory(path: &Path, owner_uid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(directory) = open_directory_nofollow(path)? else {
+        return Ok(());
+    };
+    let metadata = directory.metadata().context("inspect private directory")?;
+    let mode = metadata.mode() & 0o777;
+    if metadata.is_dir()
+        && metadata.uid() == owner_uid
+        && mode & 0o700 == 0o700
+        && mode & 0o022 == 0
+        && mode != 0o700
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if let Ok(metadata) = fs::symlink_metadata(&paths.product_root) {
-            if metadata.is_dir()
-                && metadata.uid() == owner_uid
-                && metadata.mode() & 0o022 == 0
-                && metadata.mode() & 0o777 != 0o700
-            {
-                fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700))
-                    .context("tighten release product root")?;
-            }
-        }
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .context("tighten private directory")?;
     }
-    dev_tools_installation::ensure_owned_directory(&paths.product_root, owner_uid, 0o700)
+    Ok(())
+}
+
+// Walks every component with O_NOFOLLOW from the filesystem root. A missing
+// component yields None; a symlink or non-directory component is an error.
+#[cfg(unix)]
+#[allow(unsafe_code)] // Reason: openat has no std equivalent for a descriptor-relative walk.
+fn open_directory_nofollow(path: &Path) -> Result<Option<File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    if !path.is_absolute() {
+        bail!("private directory must be absolute");
+    }
+    let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY;
+    let root = CString::new("/").context("root path")?;
+    let fd = unsafe { libc::open(root.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open filesystem root");
+    }
+    let mut current = unsafe { File::from_raw_fd(fd) };
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => bail!("private directory path is not normalized"),
+        };
+        let name = CString::new(name.as_bytes()).context("directory component")?;
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error).context("open private directory component");
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(Some(current))
 }
 
 fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::DocumentAuthority> {
@@ -2681,6 +2744,24 @@ mod tests {
         let error = fail_discovery(&paths).unwrap_err();
         assert!(format!("{error:#}").contains("fixture discovery reached"));
         assert_private_product_root(&paths);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_product_root_is_refused_not_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::create_dir(&paths.product_root).unwrap();
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o500)).unwrap();
+        let error = fail_discovery(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("unsafe filesystem authority"));
+        let mode = fs::metadata(&paths.product_root)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o500);
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[cfg(unix)]

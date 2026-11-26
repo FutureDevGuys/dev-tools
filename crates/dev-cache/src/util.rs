@@ -58,82 +58,8 @@ pub fn join_slashed(base: &Path, relative: &str) -> PathBuf {
 
 /// Canonicalize, dropping the Windows verbatim prefix that other tools reject.
 pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
-    path.canonicalize().map(plain_path)
-}
-
-#[cfg(not(windows))]
-fn plain_path(path: PathBuf) -> PathBuf {
-    path
-}
-
-// `\\?\X:\...` becomes `X:\...` only where the plain form names the same
-// file: no reserved device-name or trailing-dot/space component. Long plain
-// paths stay equivalent because std re-adds the prefix when it needs one.
-#[cfg(windows)]
-fn plain_path(path: PathBuf) -> PathBuf {
-    use std::path::Prefix;
-
-    let mut components = path.components();
-    let Some(std::path::Component::Prefix(prefix)) = components.next() else {
-        return path;
-    };
-    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
-        return path;
-    };
-    let rest = components.as_path();
-    let plain = PathBuf::from(format!("{}:", letter as char)).join(rest);
-    if !rest.components().all(plain_component) {
-        return path;
-    }
-    plain
-}
-
-#[cfg(windows)]
-fn plain_component(component: std::path::Component<'_>) -> bool {
-    let std::path::Component::Normal(name) = component else {
-        return matches!(component, std::path::Component::RootDir);
-    };
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    if name.ends_with(['.', ' ']) {
-        return false;
-    }
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or(name)
-        .trim_end()
-        .to_ascii_uppercase();
-    let mut chars = stem.chars();
-    let numbered = matches!(
-        (
-            chars.next(),
-            chars.next(),
-            chars.next(),
-            chars.next(),
-            chars.next()
-        ),
-        (
-            Some('C'),
-            Some('O'),
-            Some('M'),
-            Some('0'..='9' | '¹' | '²' | '³'),
-            None
-        ) | (
-            Some('L'),
-            Some('P'),
-            Some('T'),
-            Some('0'..='9' | '¹' | '²' | '³'),
-            None
-        )
-    );
-    let reserved = numbered
-        || matches!(
-            stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-        );
-    !reserved
+    path.canonicalize()
+        .map(dev_tools_command::windows_path::without_verbatim_prefix)
 }
 
 pub fn path_from_home(raw: &Path) -> PathBuf {
@@ -145,38 +71,4 @@ pub fn path_from_home(raw: &Path) -> PathBuf {
         return crate::config::home_dir().join(rest);
     }
     raw.to_path_buf()
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    fn plain(text: &str) -> PathBuf {
-        plain_path(PathBuf::from(text))
-    }
-
-    #[test]
-    fn verbatim_disk_paths_are_simplified_only_when_the_plain_form_is_equivalent() {
-        assert_eq!(
-            plain(r"\\?\C:\Users\a b\cache"),
-            Path::new(r"C:\Users\a b\cache")
-        );
-        assert_eq!(plain(r"\\?\C:\"), Path::new(r"C:\"));
-        for kept in [
-            r"\\?\UNC\server\share\x",
-            r"\\?\C:\dir\NUL",
-            r"\\?\C:\dir\com1.txt",
-            r"\\?\C:\dir\name.",
-            r"\\?\C:\dir\name ",
-            r"C:\plain",
-        ] {
-            assert_eq!(plain(kept), Path::new(kept), "{kept}");
-        }
-        let long = format!(r"\\?\C:\{}", "a".repeat(260));
-        assert_eq!(plain(&long), Path::new(&long[4..]));
-        for kept in [r"\\?\C:\com0", r"\\?\C:\LPT²", r"\\?\C:\Lpt9.txt"] {
-            assert_eq!(plain(kept), Path::new(kept), "{kept}");
-        }
-        assert_eq!(plain(r"\\?\C:\com10"), Path::new(r"C:\com10"));
-    }
 }

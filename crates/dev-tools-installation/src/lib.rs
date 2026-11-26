@@ -251,11 +251,16 @@ impl InstallationLock {
     }
 }
 
-// Windows reports a held byte-range lock as ERROR_LOCK_VIOLATION, which std
-// does not classify as WouldBlock.
-fn lock_is_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+/// Whether a `fs2` try-lock failure means another holder has the lock.
+///
+/// `fs2` reports contention as `EWOULDBLOCK` on Unix and `ERROR_LOCK_VIOLATION`
+/// on Windows, which std does not classify as `WouldBlock`. Only that exact
+/// native code counts, so unrelated errors are never treated as contention.
+pub fn lock_is_contended(error: &std::io::Error) -> bool {
+    matches!(
+        (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+        (Some(actual), Some(expected)) if actual == expected
+    )
 }
 
 impl Drop for InstallationLock {
@@ -3622,6 +3627,19 @@ mod versioned_tests {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+
+    #[test]
+    fn lock_contention_classification_uses_the_exact_native_code() {
+        let expected = fs2::lock_contended_error();
+        assert!(lock_is_contended(&expected));
+        assert!(!lock_is_contended(&std::io::Error::other("unrelated")));
+        assert!(!lock_is_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!lock_is_contended(&std::io::Error::from_raw_os_error(
+            expected.raw_os_error().unwrap() + 1
+        )));
+    }
 
     #[test]
     fn publication_copy_never_stages_growth_beyond_approved_length() {

@@ -17,6 +17,7 @@ pub use inherited::{
 };
 
 mod graph;
+pub mod windows_path;
 pub use graph::{
     run_prepared_command_graph, validate_command_graph_dependencies, CommandGraphNode,
     CommandGraphOutput, GraphDependencies, GraphExitPolicy, MAX_GRAPH_NODES,

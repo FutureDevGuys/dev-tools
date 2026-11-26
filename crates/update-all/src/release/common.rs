@@ -158,12 +158,7 @@ impl CommonAdapter {
         let authority_error = |_| UpdateError::new(UpdateErrorKind::Authority);
         let layout =
             shared_installation_layout(Product::UpdateAll, paths).map_err(authority_error)?;
-        dev_tools_installation::ensure_owned_directory(
-            &layout.data_root,
-            layout.owner_uid,
-            layout.directory_mode,
-        )
-        .map_err(authority_error)?;
+        prepare_private_directory(&layout.data_root, layout.owner_uid).map_err(authority_error)?;
         let lease = acquire_release_writer(paths).map_err(|error| {
             UpdateError::new(if error.downcast_ref::<ReleaseMutationBusy>().is_some() {
                 UpdateErrorKind::Blocked
@@ -181,6 +176,8 @@ impl CommonAdapter {
                 .map_err(authority_error)?;
             return Err(UpdateError::new(UpdateErrorKind::Blocked));
         }
+        // Cache custody is validated before any metadata is accepted.
+        prepare_cache_directory(paths, layout.owner_uid).map_err(authority_error)?;
         let acceptance =
             protocol::MetadataAcceptance::begin(paths, &lease).map_err(authority_error)?;
         let cache_path = CandidateCache::path(paths);
@@ -224,13 +221,6 @@ impl CommonAdapter {
         let verified = acceptance
             .accept(&metadata, &candidate_authority())
             .map_err(authority_error)?;
-        // The writer would create `cache` with the umask mode.
-        dev_tools_installation::ensure_owned_directory(
-            &paths.product_root.join("cache"),
-            layout.owner_uid,
-            0o700,
-        )
-        .map_err(authority_error)?;
         dev_tools_installation::write_atomic_document(
             &cache_path,
             &bytes,
@@ -415,6 +405,60 @@ mod tests {
         CommonAdapter::refresh_with(&paths, checked_at, || Ok(signed_metadata()))?;
         assert_eq!(fs::read(&paths.state)?, history);
         assert_eq!(fs::read(CandidateCache::path(&paths))?, cache);
+        Ok(())
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn existing_umask_mode_cache_is_admitted_and_tightened() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        let cache_dir = paths.product_root.join("cache");
+        // The earlier writer left product root and cache at the umask mode.
+        fs::create_dir_all(cache_dir.join("offline-bundles"))?;
+        for dir in [&paths.product_root, &cache_dir] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+        }
+        let checked_at = now_unix();
+        let candidate = CommonAdapter::refresh_with(&paths, checked_at, || Ok(signed_metadata()))?;
+        assert_eq!(
+            fs::metadata(&cache_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(CandidateCache::load(&paths)?, Some(candidate.clone()));
+        // Payload storage admits a pre-existing 0755 cache the same way.
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o755))?;
+        let payload = b"authenticated payload";
+        let mut verified = candidate.verified().clone();
+        verified.artifact_length = payload.len() as u64;
+        verified.artifact_sha256 = format!("{:x}", Sha256::digest(payload));
+        mutation::MutationAdapter::store_payload(&paths, &verified, payload).unwrap();
+        assert_eq!(
+            fs::metadata(&cache_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn unsafe_cache_directory_is_refused_before_metadata_is_accepted() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        let cache_dir = paths.product_root.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o775))?;
+        let error =
+            CommonAdapter::refresh_with(&paths, now_unix(), || Ok(signed_metadata())).unwrap_err();
+        assert_eq!(error.kind(), UpdateErrorKind::Authority);
+        assert!(!paths.state.exists());
+        assert_eq!(
+            fs::metadata(&cache_dir)?.permissions().mode() & 0o777,
+            0o775
+        );
         Ok(())
     }
 
