@@ -39,15 +39,15 @@ fn external_catalog_runtime_tokens_expand_without_a_source_checkout() {
         Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
         None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
-    // The expansion simulates a Unix host, so build the expectation with Unix suffixes.
-    assert_eq!(
-        expanded,
-        format!(
-            "{}/syscfg/tool --config {}/syscfg/tool.toml",
-            temp.path().join(".local/libexec").display(),
-            temp.path().join(".config").display()
-        )
-    );
+    // The expansion simulates a Unix host; the fixed Windows rendering is explicit.
+    let home = temp.path().display();
+    #[cfg(unix)]
+    let expected =
+        format!("{home}/.local/libexec/syscfg/tool --config {home}/.config/syscfg/tool.toml");
+    #[cfg(windows)]
+    let expected =
+        format!("{home}\\.local/libexec/syscfg/tool --config {home}\\.config/syscfg/tool.toml");
+    assert_eq!(expanded, expected);
 }
 
 fn wait_for_file(path: &Path) {

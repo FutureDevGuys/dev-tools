@@ -14,6 +14,8 @@ fn fixture_process(home: &TempDir) -> std::process::Command {
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("APPDATA", home.path().join("config"))
+        .env("LOCALAPPDATA", home.path().join("local"))
+        .env("USERPROFILE", home.path().join("profile"))
         .env("PATH", fixture_path())
         .env_remove("UPDATE_ALL_ROOT_URL")
         .env_remove("UPDATE_ALL_MANIFEST_URL");

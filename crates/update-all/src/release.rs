@@ -1875,17 +1875,34 @@ fn load_state(paths: &Paths) -> Result<ReleaseState> {
 // lease precedes installation locks and spans bounded product-owned retrieval
 // and health verification. Nonblocking admission prevents reentrant waiting.
 fn acquire_release_writer(paths: &Paths) -> Result<dev_tools_installation::InstallationLock> {
-    // Create an absent root with the layout's mode; the lock's own parent creation
-    // would use the umask and later fail the exact-mode check. Existing roots are untouched.
-    if matches!(fs::symlink_metadata(&paths.product_root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
-        create_private_dir(&paths.product_root)?;
-    }
-    state_document_authority(paths)?;
+    // Authority is checked on the real nearest ancestor before anything is created.
+    let authority = state_document_authority(paths)?;
+    prepare_product_root(paths, authority.owner_uid)?;
     dev_tools_installation::InstallationLock::try_acquire(
         &paths.product_root.join("release-writer-v1.lock"),
     )?
     .ok_or_else(|| ReleaseMutationBusy.into())
+}
+
+// An absent root is created private (the lock's own parent creation would use the
+// umask and fail the exact-mode check). A root from an earlier umask-mode creation
+// is tightened only when no group or other write bit is set; anything else is refused.
+fn prepare_product_root(paths: &Paths, owner_uid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(metadata) = fs::symlink_metadata(&paths.product_root) {
+            if metadata.is_dir()
+                && metadata.uid() == owner_uid
+                && metadata.mode() & 0o022 == 0
+                && metadata.mode() & 0o777 != 0o700
+            {
+                fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700))
+                    .context("tighten release product root")?;
+            }
+        }
+    }
+    dev_tools_installation::ensure_owned_directory(&paths.product_root, owner_uid, 0o700)
 }
 
 fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::DocumentAuthority> {
@@ -2598,29 +2615,84 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn fresh_product_root_is_created_private_regardless_of_umask() {
-        use std::os::unix::fs::MetadataExt;
-        let temp = tempfile::tempdir().unwrap();
-        let paths = state_test_paths(temp.path());
-        // SAFETY: umask is process-wide; restored immediately after the call.
-        #[allow(unsafe_code)]
-        let previous = unsafe { libc::umask(0o022) };
-        let result = update_managed_with_sources(
+    fn fail_discovery(paths: &Paths) -> Result<Activation> {
+        update_managed_with_sources(
             Product::UpdateAll,
-            &paths,
+            paths,
             |_, _, _| bail!("fixture discovery reached"),
             |_| bail!("fixture artifact fetch reached"),
-        );
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::umask(previous)
-        };
-        assert!(result.is_err());
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_private_product_root(paths: &Paths) {
+        use std::os::unix::fs::MetadataExt;
         let metadata = fs::metadata(&paths.product_root).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o700);
         dev_tools_installation::ensure_owned_directory(&paths.product_root, metadata.uid(), 0o700)
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_product_root_is_created_private_regardless_of_umask() {
+        const CHILD: &str = "UPDATE_ALL_FRESH_ROOT_TEST_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "sh"])
+                .arg(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "release::tests::fresh_product_root_is_created_private_regardless_of_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+            let status = child.wait_timeout(Duration::from_secs(20)).unwrap();
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(status.is_some_and(|status| status.success()));
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        assert!(fail_discovery(&paths).is_err());
+        assert_private_product_root(&paths);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn umask_mode_product_root_with_only_the_lock_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::create_dir(&paths.product_root).unwrap();
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(paths.product_root.join("release-writer-v1.lock"), b"").unwrap();
+        fs::set_permissions(
+            paths.product_root.join("release-writer-v1.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let error = fail_discovery(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("fixture discovery reached"));
+        assert_private_product_root(&paths);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_parent_is_refused_before_the_root_is_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let error = fail_discovery(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("unsafe filesystem authority"));
+        assert!(!paths.product_root.exists());
     }
 
     #[test]
