@@ -164,11 +164,11 @@ pub(crate) fn target_dir(
         filesystem.as_bytes(),
     ]);
     let toolchain = fingerprint(&[sysroot.as_os_str().as_encoded_bytes(), &compiler, &cargo]);
-    Ok(root
-        .platform_root
-        .join("outputs/cargo")
-        .join(workspace)
-        .join(toolchain))
+    Ok(
+        crate::util::join_slashed(&root.platform_root, "outputs/cargo")
+            .join(workspace)
+            .join(toolchain),
+    )
 }
 
 fn fingerprint(parts: &[&[u8]]) -> String {

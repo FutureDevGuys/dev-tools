@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 dev-tools-completion = { version = "0.1.0", path = "../dev-tools-completion" }
 dev-tools-command = { path = "../dev-tools-command" }
+dev-tools-installation = { path = "../dev-tools-installation" }
 dev-tools-product = { path = "../dev-tools-product" }
 fs2 = "0.4"
 same-file = "1"

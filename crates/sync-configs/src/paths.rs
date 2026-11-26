@@ -337,6 +337,10 @@ pub fn is_absolute_for(path: &Path, platform: PathPlatform) -> bool {
     path.to_str().is_some_and(windows_text_is_absolute)
 }
 
+/// Drop the `\\?\` verbatim prefix `fs::canonicalize` adds to a drive path on
+/// Windows when the plain spelling names the same file.
+pub(crate) use dev_tools_command::windows_path::without_verbatim_prefix;
+
 #[cfg(all(test, windows))]
 mod windows_path_tests {
     use super::windows_text_is_absolute;

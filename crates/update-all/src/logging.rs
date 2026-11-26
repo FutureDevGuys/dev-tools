@@ -744,6 +744,10 @@ fn write_owner_only(path: &Path, payload: &[u8]) -> Result<()> {
         .as_file_mut()
         .flush()
         .with_context(|| format!("flush {} (staged)", path.display()))?;
+    // The write-check handle is not opened with delete sharing, so release it
+    // before replacing the leaf; publication still rechecks the leaf is unchanged.
+    #[cfg(windows)]
+    drop(_previous_write_access);
     publish_artifact(staged, path, previous.as_ref())
 }
 

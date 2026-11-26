@@ -3,7 +3,7 @@
 pub mod json;
 pub mod ownership;
 pub mod toml;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) mod transaction;
 
 /// A structured configuration path. Each component is an exact object/table key.

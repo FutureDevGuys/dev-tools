@@ -155,7 +155,7 @@ pub(super) fn observe_authenticated(paths: &Paths) -> Result<Option<VersionedRec
     Ok(receipt)
 }
 
-fn migration_history(paths: &Paths) -> Result<ReleaseState> {
+pub(super) fn migration_history(paths: &Paths) -> Result<ReleaseState> {
     match dev_tools_installation::observe_retired_atomic_document(
         &paths.state,
         &state_document_authority(paths)?,

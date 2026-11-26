@@ -199,7 +199,7 @@ pub(crate) fn decode_paths(bytes: &[u8], managed_id: &str) -> Result<BTreeSet<Pa
     Ok(paths)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn encode_paths(managed_id: &str, paths: &BTreeSet<PathKey>) -> Result<String> {
     validate_managed_id(managed_id)?;
     if paths

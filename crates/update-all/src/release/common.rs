@@ -158,12 +158,7 @@ impl CommonAdapter {
         let authority_error = |_| UpdateError::new(UpdateErrorKind::Authority);
         let layout =
             shared_installation_layout(Product::UpdateAll, paths).map_err(authority_error)?;
-        dev_tools_installation::ensure_owned_directory(
-            &layout.data_root,
-            layout.owner_uid,
-            layout.directory_mode,
-        )
-        .map_err(authority_error)?;
+        prepare_private_directory(&layout.data_root, layout.owner_uid).map_err(authority_error)?;
         let lease = acquire_release_writer(paths).map_err(|error| {
             UpdateError::new(if error.downcast_ref::<ReleaseMutationBusy>().is_some() {
                 UpdateErrorKind::Blocked
@@ -181,6 +176,8 @@ impl CommonAdapter {
                 .map_err(authority_error)?;
             return Err(UpdateError::new(UpdateErrorKind::Blocked));
         }
+        // Cache custody is validated before any metadata is accepted.
+        prepare_cache_directory(paths, layout.owner_uid).map_err(authority_error)?;
         let acceptance =
             protocol::MetadataAcceptance::begin(paths, &lease).map_err(authority_error)?;
         let cache_path = CandidateCache::path(paths);
@@ -246,7 +243,8 @@ impl CommonAdapter {
             InstallClassification::Absent => {
                 // Admit legacy state without interpreting its observational active
                 // version or check time as receipt ownership or fresh evidence.
-                load_state(paths)?;
+                // Also admits the recorded retirement fence left by an interrupted cutover.
+                protocol::migration_history(paths)?;
                 return Ok(InstallationSnapshot::absent());
             }
             InstallClassification::Managed => {}
@@ -268,7 +266,7 @@ impl CommonAdapter {
         } else {
             // This is a strict v1 decoder, not a default on invalid v2 bytes.
             // Complete observation checks links and bytes without legacy recovery.
-            load_state(paths)?;
+            protocol::migration_history(paths)?;
             observe_versioned_installation(&layout, ARTIFACT_LIMIT)?
         };
         match receipt {
@@ -407,6 +405,60 @@ mod tests {
         CommonAdapter::refresh_with(&paths, checked_at, || Ok(signed_metadata()))?;
         assert_eq!(fs::read(&paths.state)?, history);
         assert_eq!(fs::read(CandidateCache::path(&paths))?, cache);
+        Ok(())
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn existing_umask_mode_cache_is_admitted_and_tightened() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        let cache_dir = paths.product_root.join("cache");
+        // The earlier writer left product root and cache at the umask mode.
+        fs::create_dir_all(cache_dir.join("offline-bundles"))?;
+        for dir in [&paths.product_root, &cache_dir] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+        }
+        let checked_at = now_unix();
+        let candidate = CommonAdapter::refresh_with(&paths, checked_at, || Ok(signed_metadata()))?;
+        assert_eq!(
+            fs::metadata(&cache_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(CandidateCache::load(&paths)?, Some(candidate.clone()));
+        // Payload storage admits a pre-existing 0755 cache the same way.
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o755))?;
+        let payload = b"authenticated payload";
+        let mut verified = candidate.verified().clone();
+        verified.artifact_length = payload.len() as u64;
+        verified.artifact_sha256 = format!("{:x}", Sha256::digest(payload));
+        mutation::MutationAdapter::store_payload(&paths, &verified, payload).unwrap();
+        assert_eq!(
+            fs::metadata(&cache_dir)?.permissions().mode() & 0o777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn unsafe_cache_directory_is_refused_before_metadata_is_accepted() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        let cache_dir = paths.product_root.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o775))?;
+        let error =
+            CommonAdapter::refresh_with(&paths, now_unix(), || Ok(signed_metadata())).unwrap_err();
+        assert_eq!(error.kind(), UpdateErrorKind::Authority);
+        assert!(!paths.state.exists());
+        assert_eq!(
+            fs::metadata(&cache_dir)?.permissions().mode() & 0o777,
+            0o775
+        );
         Ok(())
     }
 
@@ -584,6 +636,68 @@ mod tests {
         assert!(!authority.exists());
         assert!(paths.state.is_dir());
         assert!(!retained.is_empty());
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn candidate_cache_directory_is_private_regardless_of_umask() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+        const CHILD: &str = "UPDATE_ALL_CACHE_MODE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "sh"])
+                .arg(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "release::common::tests::candidate_cache_directory_is_private_regardless_of_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .spawn()?;
+            let status = child.wait_timeout(Duration::from_secs(20))?;
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(status.is_some_and(|status| status.success()));
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        CommonAdapter::refresh_with(&paths, now_unix(), || Ok(signed_metadata()))?;
+        let cache = CandidateCache::path(&paths);
+        assert_eq!(fs::metadata(cache.parent().unwrap())?.mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn common_status_admits_a_recorded_retirement_fence_without_installation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = super::super::tests::state_test_paths(root.path());
+        create_private_dir(&paths.product_root)?;
+        dev_tools_installation::retire_atomic_document(
+            &paths.state,
+            &state_document_authority(&paths)?,
+            true,
+        )?;
+        assert!(paths.state.is_dir());
+        let result = observe(super::super::tests::state_test_paths(root.path()));
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.installation_state, Some(InstallationState::Absent));
+        assert_eq!(result.changed, Some(false));
+        // An unrecorded directory remains hostile authority.
+        fs::remove_dir_all(root.path().join("product"))?;
+        create_private_dir(&paths.product_root)?;
+        fs::create_dir(&paths.state)?;
+        assert_eq!(
+            observe(super::super::tests::state_test_paths(root.path())).exit_code,
+            4
+        );
         Ok(())
     }
 

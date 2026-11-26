@@ -51,6 +51,17 @@ pub fn directory_size(path: &Path) -> u64 {
         .sum()
 }
 
+/// Join a slash-separated relative path using the platform separator.
+pub fn join_slashed(base: &Path, relative: &str) -> PathBuf {
+    base.join(relative.split('/').collect::<PathBuf>())
+}
+
+/// Canonicalize, dropping the Windows verbatim prefix that other tools reject.
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize()
+        .map(dev_tools_command::windows_path::without_verbatim_prefix)
+}
+
 pub fn path_from_home(raw: &Path) -> PathBuf {
     let text = raw.to_string_lossy();
     if text == "~" {

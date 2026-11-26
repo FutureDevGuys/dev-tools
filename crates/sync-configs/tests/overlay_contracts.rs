@@ -12,6 +12,35 @@ use sync_configs::overlay::{self, PathKey};
 use sync_configs::paths::PathPlatform;
 use tempfile::tempdir;
 
+/// Reports whether a link was created; false (after saying why) when Windows
+/// withholds the symlink privilege, so the calling test can skip.
+fn linked(result: std::io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(1314) => {
+            eprintln!("skipping: symbolic-link privilege not held");
+            false
+        }
+        Err(error) => panic!("create link: {error}"),
+    }
+}
+
+fn link_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_file(target, link);
+    linked(result)
+}
+
+fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(target, link);
+    linked(result)
+}
+
 fn key(parts: &[&str]) -> PathKey {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -76,7 +105,11 @@ fn ownership_receipt_state_root_uses_only_absolute_platform_environment_roots() 
             environment: &[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\operator")],
             expected: r"C:\Users\operator\AppData\Local\sync-configs\state",
         },
-    ] {
+    ]
+    .into_iter()
+    // A Windows host classifies POSIX roots such as "/var/state" as relative.
+    .filter(|case| cfg!(not(windows)) || case.platform == PathPlatform::Windows)
+    {
         let environment: BTreeMap<OsString, OsString> = case
             .environment
             .iter()
@@ -249,11 +282,8 @@ fn ownership_receipts_fail_closed_without_disclosing_payload_values() {
     assert!(!message.contains("secret-value"));
 }
 
-#[cfg(unix)]
 #[test]
 fn ownership_receipt_symlink_is_rejected_without_following_it() {
-    use std::os::unix::fs::symlink;
-
     let directory = tempdir().expect("tempdir");
     let referent = directory.path().join("referent.json");
     let receipt = directory.path().join("receipt.json");
@@ -262,18 +292,17 @@ fn ownership_receipt_symlink_is_rejected_without_following_it() {
         r#"{"schema_version":1,"managed_overlay_id":"fixture","managed_paths":[["managed"]]}"#,
     )
     .unwrap();
-    symlink(&referent, &receipt).unwrap();
+    if !link_file(&referent, &receipt) {
+        return;
+    }
 
     let error = overlay::ownership::load_paths(&receipt, "fixture")
         .expect_err("receipt symlink must fail closed");
     assert!(format!("{error:#}").contains("must be a regular file"));
 }
 
-#[cfg(unix)]
 #[test]
 fn ownership_receipt_rejects_a_symlinked_parent_boundary() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
-
     let directory = tempdir().expect("tempdir");
     let external = directory.path().join("external");
     let state = directory.path().join("state");
@@ -285,19 +314,22 @@ fn ownership_receipt_rejects_a_symlinked_parent_boundary() {
         r#"{"schema_version":1,"managed_overlay_id":"fixture","managed_paths":[["managed"]]}"#,
     )
     .unwrap();
-    fs::set_permissions(&external_receipt, fs::Permissions::from_mode(0o600)).unwrap();
-    symlink(&external, state.join("overlays")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&external_receipt, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    if !link_dir(&external, &state.join("overlays")) {
+        return;
+    }
 
     let error = overlay::ownership::load_paths(&state.join("overlays/fixture.json"), "fixture")
         .expect_err("parent symlink must fail closed");
     assert!(format!("{error:#}").contains("real directory"));
 }
 
-#[cfg(unix)]
 #[test]
 fn json_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
-    use std::os::unix::fs::symlink;
-
     let directory = tempdir().expect("tempdir");
     let source = directory.path().join("source.json");
     let external = directory.path().join("external");
@@ -306,7 +338,9 @@ fn json_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
     fs::write(&source, "{\"managed\":true}\n").unwrap();
     fs::create_dir(&external).unwrap();
     fs::write(&external_target, "{\"private\":\"unchanged\"}\n").unwrap();
-    symlink(&external, &target_parent).unwrap();
+    if !link_dir(&external, &target_parent) {
+        return;
+    }
 
     let error = json::overlay_json_file(
         &source,
@@ -322,11 +356,8 @@ fn json_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn toml_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
-    use std::os::unix::fs::symlink;
-
     let directory = tempdir().expect("tempdir");
     let source = directory.path().join("source.toml");
     let external = directory.path().join("external");
@@ -335,7 +366,9 @@ fn toml_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
     fs::write(&source, "managed = true\n").unwrap();
     fs::create_dir(&external).unwrap();
     fs::write(&external_target, "private = \"unchanged\"\n").unwrap();
-    symlink(&external, &target_parent).unwrap();
+    if !link_dir(&external, &target_parent) {
+        return;
+    }
 
     let error = toml::overlay_toml_file(
         &source,
@@ -351,11 +384,8 @@ fn toml_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn managed_overlay_rejects_a_symlinked_receipt_parent_without_external_effects() {
-    use std::os::unix::fs::symlink;
-
     let directory = tempdir().expect("tempdir");
     let source = directory.path().join("source.json");
     let target = directory.path().join("target.json");
@@ -365,7 +395,9 @@ fn managed_overlay_rejects_a_symlinked_receipt_parent_without_external_effects()
     fs::write(&target, "{\"local\":true}\n").unwrap();
     fs::create_dir_all(&state).unwrap();
     fs::create_dir(&external).unwrap();
-    symlink(&external, state.join("overlays")).unwrap();
+    if !link_dir(&external, &state.join("overlays")) {
+        return;
+    }
 
     let error = json::overlay_json_file(
         &source,
@@ -386,18 +418,17 @@ fn managed_overlay_rejects_a_symlinked_receipt_parent_without_external_effects()
     assert_eq!(fs::read_to_string(&target).unwrap(), "{\"local\":true}\n");
 }
 
-#[cfg(unix)]
 #[test]
 fn toml_target_leaf_symlink_is_still_materialized_without_changing_its_referent() {
-    use std::os::unix::fs::symlink;
-
     let directory = tempdir().expect("tempdir");
     let source = directory.path().join("source.toml");
     let referent = directory.path().join("referent.toml");
     let target = directory.path().join("target.toml");
     fs::write(&source, "managed = true\n").unwrap();
     fs::write(&referent, "managed = false\n").unwrap();
-    symlink(&referent, &target).unwrap();
+    if !link_file(&referent, &target) {
+        return;
+    }
 
     let result = toml::overlay_toml_file(&source, &target, &TomlOverlayOptions::default())
         .expect("materialize a safe target leaf symlink");

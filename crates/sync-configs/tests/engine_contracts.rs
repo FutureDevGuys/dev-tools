@@ -13,7 +13,10 @@ fn command(root: &Path) -> Command {
         .arg("--log-style")
         .arg("off")
         .env("HOME", root.join("home"))
-        .env("XDG_STATE_HOME", root.join("state"));
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("USERPROFILE", root.join("home"))
+        .env("APPDATA", root.join("roaming"))
+        .env("LOCALAPPDATA", root.join("state"));
     command
 }
 
@@ -30,7 +33,11 @@ fn reconciler_timeout_matches_the_python_013_contract() {
 fn relative_xdg_roots_fall_back_to_the_absolute_home_conventions() {
     let root = TempDir::new().expect("tempdir");
     let home = root.path().join("home");
-    let config = home.join(".config/sync-configs/manifest.yaml");
+    let config = if cfg!(windows) {
+        home.join("AppData/Roaming/sync-configs/manifest.yaml")
+    } else {
+        home.join(".config/sync-configs/manifest.yaml")
+    };
     let source = root.path().join("source.txt");
     let target = root.path().join("target.txt");
     fs::create_dir_all(config.parent().expect("config parent")).expect("create config parent");
@@ -50,6 +57,9 @@ fn relative_xdg_roots_fall_back_to_the_absolute_home_conventions() {
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", "relative-config")
         .env("XDG_STATE_HOME", "relative-state")
+        .env("USERPROFILE", &home)
+        .env("APPDATA", "relative-config")
+        .env("LOCALAPPDATA", "relative-state")
         .output()
         .expect("convergence");
     assert!(
@@ -61,7 +71,12 @@ fn relative_xdg_roots_fall_back_to_the_absolute_home_conventions() {
     assert_eq!(fs::read_to_string(&target).expect("target"), "desired\n");
     assert!(!root.path().join("relative-config").exists());
     assert!(!root.path().join("relative-state").exists());
-    assert!(home.join(".local/state/sync-configs").exists());
+    let state = if cfg!(windows) {
+        home.join("AppData/Local/sync-configs")
+    } else {
+        home.join(".local/state/sync-configs")
+    };
+    assert!(state.exists());
 }
 
 #[test]
@@ -245,6 +260,7 @@ fn convergence_defers_potential_target_conflicts_until_after_pre_hooks() {
     let first_source = root.path().join("first.txt");
     let second_source = root.path().join("second.txt");
     let target = root.path().join("target.txt");
+    // Hooks run in the manifest directory through the platform shell.
     let marker = root.path().join("hook-marker");
     let manifest = root.path().join("manifest.yaml");
     fs::write(&first_source, "first\n").expect("first source");
@@ -252,10 +268,9 @@ fn convergence_defers_potential_target_conflicts_until_after_pre_hooks() {
     fs::write(
         &manifest,
         format!(
-            "entries:\n  - name: first\n    source: {}\n    target: {}\n    mode: copy\n    pre_script: '/usr/bin/touch {}'\n  - name: second\n    source: {}\n    target: {}\n    mode: copy\n",
+            "entries:\n  - name: first\n    source: {}\n    target: {}\n    mode: copy\n    pre_script: 'echo ran> hook-marker'\n  - name: second\n    source: {}\n    target: {}\n    mode: copy\n",
             first_source.display(),
             target.display(),
-            marker.display(),
             second_source.display(),
             target.display(),
         ),
@@ -289,7 +304,7 @@ fn failed_skip_pre_hook_removes_its_entry_before_target_deduplication() {
     fs::write(
         &manifest,
         format!(
-            "entries:\n  - name: skipped\n    source: {}\n    target: {}\n    mode: copy\n    pre_script: /usr/bin/false\n    pre_script_on_fail: skip\n  - name: active\n    source: {}\n    target: {}\n    mode: copy\n",
+            "entries:\n  - name: skipped\n    source: {}\n    target: {}\n    mode: copy\n    pre_script: exit 1\n    pre_script_on_fail: skip\n  - name: active\n    source: {}\n    target: {}\n    mode: copy\n",
             first_source.display(),
             target.display(),
             second_source.display(),
@@ -325,31 +340,14 @@ fn convergence_allows_pre_hooks_to_create_filtered_recursive_sources() {
     let source_dir = root.path().join("generated-tree");
     let target_dir = root.path().join("target");
     let manifest = root.path().join("manifest.yaml");
-    let hook = root.path().join("prepare.sh");
-    fs::write(
-        &hook,
-        format!(
-            "#!/bin/sh\nset -eu\nmkdir -p '{}'\nprintf 'keep\\n' > '{}/keep.txt'\nprintf 'drop\\n' > '{}/drop.log'\n",
-            source_dir.display(),
-            source_dir.display(),
-            source_dir.display()
-        ),
-    )
-    .expect("hook");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&hook).expect("hook metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).expect("hook permissions");
-    }
+    // The hook runs in the manifest directory through the platform shell.
+    let hook = "mkdir generated-tree && echo keep> generated-tree/keep.txt && echo drop> generated-tree/drop.log";
     fs::write(
         &manifest,
         format!(
-            "entries:\n  - name: generated\n    source: {}\n    target: {}\n    mode: copy\n    directory_strategy: recursive\n    include: ['*.txt']\n    discover_ignore_files: false\n    use_default_filters: false\n    pre_script: /usr/bin/sh {}\n",
+            "entries:\n  - name: generated\n    source: {}\n    target: {}\n    mode: copy\n    directory_strategy: recursive\n    include: ['*.txt']\n    discover_ignore_files: false\n    use_default_filters: false\n    pre_script: '{hook}'\n",
             source_dir.display(),
             target_dir.display(),
-            hook.display()
         ),
     )
     .expect("manifest");
@@ -366,9 +364,12 @@ fn convergence_allows_pre_hooks_to_create_filtered_recursive_sources() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // The target is a byte-exact copy of what the hook generated.
+    let generated = fs::read(source_dir.join("keep.txt")).expect("generated source");
+    assert!(generated.starts_with(b"keep"));
     assert_eq!(
-        fs::read_to_string(target_dir.join("keep.txt")).expect("kept target"),
-        "keep\n"
+        fs::read(target_dir.join("keep.txt")).expect("kept target"),
+        generated
     );
     assert!(!target_dir.join("drop.log").exists());
 }
@@ -412,9 +413,13 @@ fn list_profiles_json_reports_the_resolved_profile_selection() {
     let root = TempDir::new().expect("tempdir");
     let manifest = root.path().join("manifest.yaml");
     let profile_map = root.path().join("profiles.yaml");
+    let executable = root.path().join("owner-tool");
     fs::write(
         &manifest,
-        "entries:\n  - name: desktop\n    source: ./desktop\n    target: ./desktop-target\n    profiles: [desktop]\nreconcilers:\n  - name: linux-owner\n    executable: /bin/true\n    source: ./desktop\n    scope: user\n    privilege: user\n    protocol: dev-tools-reconcile-v1\n    profiles: [linux]\n",
+        format!(
+            "entries:\n  - name: desktop\n    source: ./desktop\n    target: ./desktop-target\n    profiles: [desktop]\nreconcilers:\n  - name: linux-owner\n    executable: '{}'\n    source: ./desktop\n    scope: user\n    privilege: user\n    protocol: dev-tools-reconcile-v1\n    profiles: [linux]\n",
+            executable.display()
+        ),
     )
     .unwrap();
     fs::write(

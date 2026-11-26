@@ -103,8 +103,23 @@ Arrays remain atomic source-owned values, as in the existing merge contract.
 
 ## Limits and verification
 
-The durable mutation implementation is Linux-only. Other runtimes retain
-read-only planning and reject a required write. The protocol excludes updated
+The durable mutation implementation is Linux-only on the descriptor-relative
+installation boundary, plus a Windows implementation of the same transaction
+that is source-implemented and Wine-tested only. Windows identifies the
+selected directory by volume serial and 128-bit file id (`FileIdInfo`; the
+journal stores a 64-bit fingerprint) and revalidates it by pathname around
+every leaf operation, because it cannot hold a directory handle without denying
+write sharing to renames. It never follows reparse points, refuses an existing
+leaf not spelled as its real long name (8.3 short name or other case), stages a
+private temporary beside the leaf, copies the replaced file's owner and DACL
+onto it, flushes it, replaces the leaf with a write-through `MoveFileExW`, and
+then flushes the directory. `MoveFileExW` and file removal retry a bounded
+number of times on access-denied or sharing-violation and return the last
+error. Replacement does not preserve file attributes or alternate data
+streams. Replacement is atomic on NTFS and ReFS only; FAT and exFAT volumes are
+not atomic and are not refused. A new file inherits its parent's ACL, which is
+not audited, and the journal's mode/group fields carry fixed values.
+Other runtimes retain read-only planning and reject a required write. The protocol excludes updated
 cooperating writers using these locks; it does not fence an older released
 writer, external editor or hostile same-owner process. Operators must quiesce
 older writers. Ancestor trust remains the caller's responsibility. Moving a

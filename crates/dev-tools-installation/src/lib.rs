@@ -174,7 +174,7 @@ impl InstallationLock {
             };
             match result {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if lock_is_contended(&error) => return Ok(None),
                 Err(error) => return Err(error).context("acquire installation lock"),
             }
         } else {
@@ -249,6 +249,18 @@ impl InstallationLock {
         lock.verify_named_identity(path)?;
         Ok(lock)
     }
+}
+
+/// Whether a `fs2` try-lock failure means another holder has the lock.
+///
+/// `fs2` reports contention as `EWOULDBLOCK` on Unix and `ERROR_LOCK_VIOLATION`
+/// on Windows, which std does not classify as `WouldBlock`. Only that exact
+/// native code counts, so unrelated errors are never treated as contention.
+pub fn lock_is_contended(error: &std::io::Error) -> bool {
+    matches!(
+        (error.raw_os_error(), fs2::lock_contended_error().raw_os_error()),
+        (Some(actual), Some(expected)) if actual == expected
+    )
 }
 
 impl Drop for InstallationLock {
@@ -1817,6 +1829,55 @@ pub fn ensure_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<
     }
 }
 
+/// Admit an owner-controlled directory, creating it private when absent.
+///
+/// A directory left by an earlier umask-mode creation (owner rwx, no group or
+/// other write, not already exact) is tightened to `mode` through the descriptor
+/// of a no-follow chain walk. Any other state, including a symlink, is refused
+/// by the same exact check as [`ensure_owned_directory`].
+pub fn admit_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<()> {
+    if mode & !0o777 != 0 {
+        bail!("installation directory mode is invalid");
+    }
+    #[cfg(target_os = "linux")]
+    match open_directory_chain(path, false) {
+        Ok((directory, _)) => {
+            let metadata =
+                rustix::fs::fstat(&directory).context("inspect installation directory")?;
+            let current = metadata.st_mode & 0o777;
+            if metadata.st_uid == owner_uid
+                && current & 0o700 == 0o700
+                && current & 0o022 == 0
+                && current != mode
+            {
+                rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(mode))
+                    .context("tighten installation directory")?;
+            }
+        }
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) => {}
+        Err(error) => return Err(error),
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let current = metadata.mode() & 0o777;
+        if metadata.file_type().is_dir()
+            && metadata.uid() == owner_uid
+            && current & 0o700 == 0o700
+            && current & 0o022 == 0
+            && current != mode
+        {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .with_context(|| format!("tighten installation directory {}", path.display()))?;
+        }
+    }
+    ensure_owned_directory(path, owner_uid, mode)
+}
+
 fn receipt_authority(layout: &VersionedLayout) -> DocumentAuthority {
     DocumentAuthority {
         owner_uid: layout.owner_uid,
@@ -3192,7 +3253,17 @@ fn validate_existing_directory_chain(path: &Path) -> Result<()> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Windows opens a directory only with backup semantics, and flushing needs write access.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options
+        .open(path)
         .with_context(|| format!("open directory {}", path.display()))?
         .sync_all()
         .with_context(|| format!("sync directory {}", path.display()))
@@ -3605,6 +3676,19 @@ mod versioned_tests {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+
+    #[test]
+    fn lock_contention_classification_uses_the_exact_native_code() {
+        let expected = fs2::lock_contended_error();
+        assert!(lock_is_contended(&expected));
+        assert!(!lock_is_contended(&std::io::Error::other("unrelated")));
+        assert!(!lock_is_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!lock_is_contended(&std::io::Error::from_raw_os_error(
+            expected.raw_os_error().unwrap() + 1
+        )));
+    }
 
     #[test]
     fn publication_copy_never_stages_growth_beyond_approved_length() {

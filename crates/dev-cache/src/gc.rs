@@ -679,7 +679,7 @@ fn artifact_actions(
 ) -> Result<(Vec<GcAction>, Vec<GcAbstention>)> {
     let mut actions = Vec::new();
     let mut abstentions = Vec::new();
-    let metadata = root.platform_root.join("artifacts/metadata");
+    let metadata = crate::util::join_slashed(&root.platform_root, "artifacts/metadata");
     if !metadata.is_dir() {
         return Ok((actions, abstentions));
     }

@@ -52,12 +52,7 @@ impl MutationAdapter {
             if layout.owner_uid != super::super::offline::current_uid() {
                 return Err(UpdateError::new(UpdateErrorKind::Authority).with_changed(false));
             }
-            dev_tools_installation::ensure_owned_directory(
-                &layout.data_root,
-                layout.owner_uid,
-                layout.directory_mode,
-            )
-            .map_err(authority)?;
+            prepare_private_directory(&layout.data_root, layout.owner_uid).map_err(authority)?;
             self.lease = Some(acquire_release_writer(paths).map_err(|error| {
                 UpdateError::new(if error.downcast_ref::<ReleaseMutationBusy>().is_some() {
                     UpdateErrorKind::Blocked
@@ -65,6 +60,7 @@ impl MutationAdapter {
                     UpdateErrorKind::Authority
                 })
             })?);
+            prepare_cache_directory(paths, layout.owner_uid).map_err(authority)?;
         }
         Ok(())
     }
@@ -189,7 +185,7 @@ impl MutationAdapter {
         )?))
     }
 
-    fn store_payload(
+    pub(super) fn store_payload(
         paths: &Paths,
         verified: &SharedVerifiedRelease,
         bytes: &[u8],
@@ -203,6 +199,8 @@ impl MutationAdapter {
         let owner_uid = state_document_authority(paths)
             .map_err(authority)?
             .owner_uid;
+        // The cache directory is admitted (or created private) before its child.
+        prepare_cache_directory(paths, owner_uid).map_err(authority)?;
         dev_tools_installation::ensure_owned_directory(parent, owner_uid, 0o700)
             .map_err(authority)?;
         dev_tools_installation::write_atomic_document(

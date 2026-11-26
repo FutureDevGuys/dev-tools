@@ -6,16 +6,12 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Take};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use dev_tools_installation::{
-    ArtifactIdentity, DocumentAuthority, DocumentDirectoryPreparation, ExistingDocumentDirectory,
-    FileAuthority, InstallationLock,
+    ArtifactIdentity, DocumentAuthority, FileAuthority, InstallationLock,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +19,14 @@ use sha2::{Digest, Sha256};
 use super::ownership::RECEIPT_LIMIT;
 use super::{ownership, OverlayResult, PathKey};
 use crate::paths::{lexical_normalize, PathPlatform};
+
+#[cfg(target_os = "linux")]
+#[path = "transaction/linux.rs"]
+mod sys;
+#[cfg(windows)]
+#[path = "transaction/windows.rs"]
+mod sys;
+use sys::{gid, has_reserved_prefix, name_key, native_len, read_text, uid, MAX_NATIVE_PATH};
 
 const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 // JSON escaping of two admitted UTF-8 targets and receipts remains bounded.
@@ -65,7 +69,7 @@ struct ParentIdentity {
 enum Leaf {
     Missing,
     SymbolicLink {
-        #[serde(with = "native_path")]
+        #[serde(with = "sys::native_path")]
         target: PathBuf,
     },
     Regular {
@@ -79,7 +83,7 @@ enum Leaf {
 #[serde(deny_unknown_fields)]
 struct ReceiptTransition {
     id: String,
-    #[serde(with = "native_path")]
+    #[serde(with = "sys::native_path")]
     path: PathBuf,
     parent: ParentIdentity,
     before: Leaf,
@@ -91,10 +95,10 @@ struct ReceiptTransition {
 struct ReceiptReservation {
     schema: String,
     id: String,
-    #[serde(with = "native_path")]
+    #[serde(with = "sys::native_path")]
     target: PathBuf,
     target_parent: ParentIdentity,
-    #[serde(with = "native_path")]
+    #[serde(with = "sys::native_path")]
     source: PathBuf,
     operation: Operation,
 }
@@ -104,10 +108,10 @@ struct ReceiptReservation {
 struct Journal {
     schema: String,
     operation: Operation,
-    #[serde(with = "native_path")]
+    #[serde(with = "sys::native_path")]
     source: PathBuf,
     source_sha256: String,
-    #[serde(with = "native_path")]
+    #[serde(with = "sys::native_path")]
     target: PathBuf,
     parent: ParentIdentity,
     before: Leaf,
@@ -117,7 +121,7 @@ struct Journal {
 
 struct SelectedLeaf {
     path: PathBuf,
-    directory: ExistingDocumentDirectory,
+    directory: sys::Directory,
     parent: ParentIdentity,
     name: OsString,
 }
@@ -126,9 +130,7 @@ impl SelectedLeaf {
     fn prepare(path: PathBuf, label: &str) -> Result<Self> {
         ownership::validate_real_parent_chain(&path, label)?;
         let parent_path = path.parent().context("overlay leaf has no parent")?;
-        let preparation = DocumentDirectoryPreparation::observe(parent_path, uid(), 0o700)?;
-        let (directory, _) = preparation.prepare()?;
-        let metadata = fs::symlink_metadata(parent_path)?;
+        let (directory, parent) = sys::prepare(parent_path)?;
         let name = path
             .file_name()
             .context("overlay leaf has no name")?
@@ -136,10 +138,7 @@ impl SelectedLeaf {
         // This descriptor-relative observation also revalidates the held parent.
         directory.metadata(&name)?;
         Ok(Self {
-            parent: ParentIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
+            parent,
             directory,
             name,
             path,
@@ -157,15 +156,8 @@ impl SelectedLeaf {
                 .context("selected overlay link disappeared")?;
             return Ok(Leaf::SymbolicLink { target });
         }
-        if !metadata.is_file() || metadata.uid() != uid() || metadata.mode() & 0o7022 != 0 {
-            bail!("overlay leaf has unsafe ordinary-file custody");
-        }
-        let authority = FileAuthority {
-            owner_uid: uid(),
-            group_gid: metadata.gid(),
-            mode: metadata.mode() & 0o777,
-            limit,
-        };
+        let authority = sys::file_authority_of(&metadata, limit)
+            .context("overlay leaf has unsafe ordinary-file custody")?;
         let document = self
             .directory
             .read_file_with_group(&self.name, &authority)?
@@ -254,7 +246,7 @@ impl Transaction {
         let target_path = absolute(target)?;
         if target_path
             .file_name()
-            .is_some_and(|name| name.as_bytes().starts_with(PREFIX.as_bytes()))
+            .is_some_and(|name| has_reserved_prefix(name, PREFIX))
         {
             bail!("overlay target uses the reserved transaction namespace");
         }
@@ -270,7 +262,7 @@ impl Transaction {
                 if spec
                     .path
                     .file_name()
-                    .is_some_and(|name| name.as_bytes().starts_with(PREFIX.as_bytes()))
+                    .is_some_and(|name| has_reserved_prefix(name, PREFIX))
                 {
                     bail!("overlay receipt uses the reserved transaction namespace");
                 }
@@ -725,7 +717,7 @@ fn validate_leaf(leaf: &Leaf, limit: u64, allow_link: bool) -> Result<()> {
         Leaf::SymbolicLink { target }
             if allow_link
                 && !target.as_os_str().is_empty()
-                && target.as_os_str().as_bytes().len() <= 4096 =>
+                && native_len(target.as_os_str()) <= MAX_NATIVE_PATH =>
         {
             Ok(())
         }
@@ -733,43 +725,10 @@ fn validate_leaf(leaf: &Leaf, limit: u64, allow_link: bool) -> Result<()> {
     }
 }
 
-fn read_text(path: &Path) -> Result<String> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
-    let file = options.open(path).context("open overlay text input")?;
-    let before = file.metadata()?;
-    if !before.is_file() || before.len() > FILE_LIMIT {
-        bail!("overlay input must be a bounded regular file");
-    }
-    let mut bounded: Take<File> = file.try_clone()?.take(FILE_LIMIT + 1);
-    let mut text = String::new();
-    bounded
-        .read_to_string(&mut text)
-        .map_err(|_| anyhow!("overlay input is not bounded UTF-8 text"))?;
-    let after = file.metadata()?;
-    let named = fs::metadata(path)?;
-    if text.len() as u64 != before.len()
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-        || after.dev() != named.dev()
-        || after.ino() != named.ino()
-    {
-        bail!("overlay text input changed while being read");
-    }
-    Ok(text)
-}
-
 fn sibling_name(name: &std::ffi::OsStr, suffix: &str) -> OsString {
     let mut digest = Sha256::new();
     digest.update(b"sync-configs-overlay-leaf-v1\0");
-    digest.update(name.as_bytes());
+    digest.update(name_key(name));
     OsString::from(format!("{PREFIX}{:x}{suffix}", digest.finalize()))
 }
 
@@ -789,12 +748,6 @@ fn identity(bytes: &[u8]) -> ArtifactIdentity {
         length: bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(bytes)),
     }
-}
-fn uid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-fn gid() -> u32 {
-    rustix::process::getegid().as_raw()
 }
 fn file_authority(mode: u32, group_gid: u32, limit: u64) -> FileAuthority {
     FileAuthority {
@@ -819,33 +772,58 @@ fn reservation_authority() -> DocumentAuthority {
     }
 }
 
-// Authority paths retain their native bytes; lossy UTF-8 conversion would make
-// distinct selected targets or raw link destinations share journal identity.
-mod native_path {
+#[cfg(test)]
+mod tests {
     use super::*;
+    use crate::overlay::json::{overlay_json_file, JsonOverlayOptions};
 
-    pub fn serialize<S: serde::Serializer>(
-        path: &Path,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
-            return Err(<S::Error as serde::ser::Error>::custom(
-                "native path exceeds transaction bounds",
-            ));
-        }
-        bytes.serialize(serializer)
-    }
+    #[test]
+    fn a_retained_journal_is_finished_by_the_next_mutating_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.json");
+        let target = directory.path().join("target.json");
+        fs::write(&source, "{\"a\":1}\n").unwrap();
+        fs::write(&target, "{\"b\":2}\n").unwrap();
+        let leaf = SelectedLeaf::prepare(absolute(&target).unwrap(), "test target").unwrap();
+        let before = leaf.observe(FILE_LIMIT, true).unwrap();
+        let Leaf::Regular { mode, group, .. } = before else {
+            panic!("target is a regular file");
+        };
+        let journal = Journal {
+            schema: SCHEMA.to_owned(),
+            operation: Operation::JsonOverlay,
+            source: absolute(&source).unwrap(),
+            source_sha256: identity(b"{\"a\":1}\n").sha256,
+            target: leaf.path.clone(),
+            parent: leaf.parent.clone(),
+            before,
+            candidate: Leaf::Regular {
+                // A merge of source and target could never produce this key.
+                text: "{\n  \"a\": 1,\n  \"b\": 2,\n  \"journal-only\": true\n}\n".to_owned(),
+                mode,
+                group,
+            },
+            receipt: None,
+        };
+        let name = sibling_name(&leaf.name, ".json");
+        leaf.directory
+            .write(
+                &name,
+                &serde_json::to_vec(&journal).unwrap(),
+                &journal_authority(),
+                None,
+            )
+            .unwrap();
 
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<PathBuf, D::Error> {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
-            return Err(<D::Error as serde::de::Error>::custom(
-                "native path exceeds transaction bounds",
-            ));
-        }
-        Ok(PathBuf::from(OsString::from_vec(bytes)))
+        let error = ensure_no_pending(&target).unwrap_err();
+        assert!(format!("{error:#}").contains("pending transaction"));
+        let result = overlay_json_file(&source, &target, &JsonOverlayOptions::default()).unwrap();
+
+        assert!(result.changed);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "{\n  \"a\": 1,\n  \"b\": 2,\n  \"journal-only\": true\n}\n"
+        );
+        assert!(ensure_no_pending(&target).is_ok());
     }
 }

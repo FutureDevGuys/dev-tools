@@ -358,6 +358,11 @@ fn replace_file(temp_path: &Path, path: &Path) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(err) if can_retry_replace(&err, path) => {
                 last_error = Some(err);
+                // Windows already replaces atomically; a denial means another writer
+                // briefly holds the destination, so wait rather than unlink it.
+                #[cfg(windows)]
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                #[cfg(not(windows))]
                 match fs::remove_file(path) {
                     Ok(()) => {}
                     Err(remove_err) if remove_err.kind() == io::ErrorKind::NotFound => {}
@@ -392,10 +397,11 @@ fn replace_file(temp_path: &Path, path: &Path) -> Result<()> {
 }
 
 fn can_retry_replace(err: &io::Error, path: &Path) -> bool {
+    // On Windows the destination can be momentarily absent between a racing writer's steps.
     matches!(
         err.kind(),
         io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
-    ) && path.exists()
+    ) && (cfg!(windows) || path.exists())
 }
 
 pub(crate) fn rename_metadata(

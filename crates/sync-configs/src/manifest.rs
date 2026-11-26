@@ -1484,11 +1484,13 @@ pub fn load_manifest(path: &Path, options: &LoadOptions) -> Result<Manifest, Man
 }
 
 fn canonical_manifest_path(path: &Path) -> Result<PathBuf, ManifestError> {
-    fs::canonicalize(path).map_err(|source| ManifestError::Read {
-        kind: "manifest",
-        path: path.to_path_buf(),
-        source,
-    })
+    fs::canonicalize(path)
+        .map(crate::paths::without_verbatim_prefix)
+        .map_err(|source| ManifestError::Read {
+            kind: "manifest",
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn profile_list(

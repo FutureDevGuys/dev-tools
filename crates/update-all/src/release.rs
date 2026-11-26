@@ -1094,7 +1094,17 @@ fn activate_link(product: Product, paths: &Paths, version: &str) -> Result<()> {
         );
     }
     create_private_dir(&paths.product_root)?;
-    create_private_dir(&paths.bin_dir)?;
+    // The public command directory keeps its own 0700 or 0755 mode, as in
+    // `install_managed`; it is shared with the account's other commands.
+    match fs::symlink_metadata(&paths.bin_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&paths.bin_dir)
+                .with_context(|| format!("create {}", paths.bin_dir.display()))?;
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => bail!("public command directory has unsafe filesystem authority"),
+        Err(error) => return Err(error).context("inspect public command directory"),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -1875,11 +1885,31 @@ fn load_state(paths: &Paths) -> Result<ReleaseState> {
 // lease precedes installation locks and spans bounded product-owned retrieval
 // and health verification. Nonblocking admission prevents reentrant waiting.
 fn acquire_release_writer(paths: &Paths) -> Result<dev_tools_installation::InstallationLock> {
-    state_document_authority(paths)?;
+    // Authority is checked on the real nearest ancestor before anything is created.
+    let authority = state_document_authority(paths)?;
+    prepare_product_root(paths, authority.owner_uid)?;
     dev_tools_installation::InstallationLock::try_acquire(
         &paths.product_root.join("release-writer-v1.lock"),
     )?
     .ok_or_else(|| ReleaseMutationBusy.into())
+}
+
+// An absent root is created private (the lock's own parent creation would use the
+// umask and fail the exact-mode check). A root from an earlier umask-mode creation
+// is tightened only in the recognised bootstrap state; anything else is refused.
+fn prepare_product_root(paths: &Paths, owner_uid: u32) -> Result<()> {
+    prepare_private_directory(&paths.product_root, owner_uid)
+}
+
+// The product cache directory was previously created with the umask mode. It is
+// admitted under the same rule as the product root (tightened only in the recognised
+// bootstrap state, through a no-follow descriptor) and created private when absent.
+fn prepare_cache_directory(paths: &Paths, owner_uid: u32) -> Result<()> {
+    prepare_private_directory(&paths.product_root.join("cache"), owner_uid)
+}
+
+fn prepare_private_directory(path: &Path, owner_uid: u32) -> Result<()> {
+    dev_tools_installation::admit_owned_directory(path, owner_uid, 0o700)
 }
 
 fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::DocumentAuthority> {
@@ -2062,11 +2092,9 @@ fn create_private_dir(path: &Path) -> Result<()> {
     builder
         .create(path)
         .with_context(|| format!("create {}", path.display()))?;
+    // An existing symlink or unexpected mode is refused here, not followed.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    prepare_private_directory(path, offline::current_uid())?;
     Ok(())
 }
 
@@ -2589,6 +2617,138 @@ mod tests {
                 assert!(!journal.exists());
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn fail_discovery(paths: &Paths) -> Result<Activation> {
+        update_managed_with_sources(
+            Product::UpdateAll,
+            paths,
+            |_, _, _| bail!("fixture discovery reached"),
+            |_| bail!("fixture artifact fetch reached"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_private_product_root(paths: &Paths) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(&paths.product_root).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        dev_tools_installation::ensure_owned_directory(&paths.product_root, metadata.uid(), 0o700)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_product_root_is_created_private_regardless_of_umask() {
+        const CHILD: &str = "UPDATE_ALL_FRESH_ROOT_TEST_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "sh"])
+                .arg(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "release::tests::fresh_product_root_is_created_private_regardless_of_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+            let status = child.wait_timeout(Duration::from_secs(20)).unwrap();
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(status.is_some_and(|status| status.success()));
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        assert!(fail_discovery(&paths).is_err());
+        assert_private_product_root(&paths);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn umask_mode_product_root_with_only_the_lock_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::create_dir(&paths.product_root).unwrap();
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(paths.product_root.join("release-writer-v1.lock"), b"").unwrap();
+        fs::set_permissions(
+            paths.product_root.join("release-writer-v1.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let error = fail_discovery(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("fixture discovery reached"));
+        assert_private_product_root(&paths);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_product_root_is_refused_not_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::create_dir(&paths.product_root).unwrap();
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o500)).unwrap();
+        let error = fail_discovery(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("unsafe filesystem authority"));
+        let mode = fs::metadata(&paths.product_root)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o500);
+        fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_product_root_is_refused_and_target_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, &paths.product_root).unwrap();
+        assert!(fail_discovery(&paths).is_err());
+        assert!(create_private_dir(&paths.product_root).is_err());
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_cache_is_refused_and_target_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&paths.product_root).unwrap();
+        std::os::unix::fs::symlink(&target, paths.product_root.join("cache")).unwrap();
+        assert!(prepare_cache_directory(&paths, offline::current_uid()).is_err());
+        assert!(create_private_dir(&paths.product_root.join("cache")).is_err());
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_parent_is_refused_before_the_root_is_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let error = fail_discovery(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("unsafe filesystem authority"));
+        assert!(!paths.product_root.exists());
     }
 
     #[test]
