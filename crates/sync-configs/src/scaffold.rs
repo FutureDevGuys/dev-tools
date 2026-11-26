@@ -124,7 +124,12 @@ fn persist(file: NamedTempFile, target: &Path) -> io::Result<()> {
         fs::remove_file(target)?;
     }
     file.persist(target).map_err(|error| error.error)?;
-    OpenOptions::new().read(true).open(target)?.sync_all()
+    // FlushFileBuffers on Windows requires write access to the handle.
+    OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(target)?
+        .sync_all()
 }
 
 fn snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {

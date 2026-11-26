@@ -337,10 +337,44 @@ pub fn is_absolute_for(path: &Path, platform: PathPlatform) -> bool {
     path.to_str().is_some_and(windows_text_is_absolute)
 }
 
+/// Drop the `\\?\` verbatim prefix that `fs::canonicalize` adds on Windows when
+/// the ordinary drive or UNC spelling names the same path, so reports and
+/// derived paths read as the user spelled them. Other paths are unchanged.
+pub(crate) fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str() {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            if matches!(rest.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()) {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
+}
+
 #[cfg(all(test, windows))]
 mod windows_path_tests {
-    use super::windows_text_is_absolute;
-    use std::path::Path;
+    use super::{windows_text_is_absolute, without_verbatim_prefix};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn canonical_verbatim_prefixes_are_removed_only_when_equivalent() {
+        for (raw, expected) in [
+            (r"\\?\C:\config\a.yaml", r"C:\config\a.yaml"),
+            (r"\\?\UNC\server\share\a", r"\\server\share\a"),
+            (r"C:\config", r"C:\config"),
+            (r"\\?\Volume{1}\a", r"\\?\Volume{1}\a"),
+            (r"\\?\C:", r"\\?\C:"),
+        ] {
+            assert_eq!(
+                without_verbatim_prefix(PathBuf::from(raw)),
+                PathBuf::from(expected)
+            );
+        }
+    }
 
     #[test]
     fn synthetic_windows_absolute_classifier_matches_native_path_grammar() {
