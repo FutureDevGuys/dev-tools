@@ -2105,6 +2105,127 @@ fn update_details_color_only_marks_version_changes() {
 }
 
 #[test]
+fn structured_item_colors_follow_the_shared_roles_and_never_leak_when_color_is_off() {
+    let _lock = env_guard();
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+        ["UPDATE_ALL_TEST_FORCE_COLOR", "NO_COLOR", "TERM"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+    std::env::set_var("UPDATE_ALL_TEST_FORCE_COLOR", "1");
+    std::env::remove_var("NO_COLOR");
+    std::env::set_var("TERM", "xterm-256color");
+
+    let result = TaskResult {
+        label: "Tmux Plugins".to_string(),
+        status: TaskStatus::Completed,
+        details: Vec::new(),
+        advisories: Vec::new(),
+        report_sections: vec![TaskReportSection {
+            key: "operation_items_update".to_string(),
+            title: "Update Items".to_string(),
+            rows: vec![
+                TaskReportRow {
+                    name: "tmux-yank".to_string(),
+                    status: TaskReportStatus::Updated,
+                    before: Some("1.0".to_string()),
+                    after: Some("2.0".to_string()),
+                    note: None,
+                },
+                TaskReportRow {
+                    name: "tmux-sensible".to_string(),
+                    status: TaskReportStatus::Failed,
+                    before: None,
+                    after: None,
+                    note: None,
+                },
+            ],
+        }],
+    };
+    let categories = BTreeMap::from([("tmux".to_string(), "maintenance".to_string())]);
+    let footer =
+        |color| render_npm_package_footer([&result], color, crate::config::NoteVerbosity::All);
+    let rollup = |color| {
+        render_package_change_rollup_with_width(
+            [("tmux", &result)],
+            &categories,
+            color,
+            crate::config::NoteVerbosity::All,
+            false,
+            160,
+        )
+    };
+    let subject = |name: &str| format!("\x1b[1;37m{name}");
+    let action = "\x1b[1;35mupdate";
+
+    for (view, colored, plain) in [
+        ("task log", footer(true), footer(false)),
+        ("rollup", rollup(true), rollup(false)),
+    ] {
+        let colored_text = colored
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        let joined = colored_text.join("\n");
+        for name in ["tmux-yank", "tmux-sensible"] {
+            assert!(
+                joined.contains(&subject(name)),
+                "{view} subject {name}: {joined}"
+            );
+        }
+        assert!(joined.contains(action), "{view} action: {joined}");
+        assert!(
+            joined.contains("\x1b[1;32mUpdated"),
+            "{view} updated: {joined}"
+        );
+        // A failed item reads "Error" in the task log and "Failed" in the rollup, in red.
+        assert!(
+            joined.contains("\x1b[1;31mError") || joined.contains("\x1b[1;31mFailed"),
+            "{view} failed: {joined}"
+        );
+        // Color is additive: stripping it yields the exact uncolored report.
+        let stripped = colored_text
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+        let plain_text = plain
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(stripped, plain_text, "{view}");
+        assert!(
+            plain_text.iter().all(|line| !line.contains('\x1b')),
+            "{view} leaked escapes with color off: {plain_text:?}"
+        );
+        assert!(
+            plain_text.join("\n").contains("Action"),
+            "{view} has an Action column"
+        );
+    }
+
+    // A requested color still yields none under NO_COLOR.
+    std::env::set_var("NO_COLOR", "1");
+    for lines in [footer(true), rollup(true)] {
+        assert!(lines.iter().all(|line| !line.text.contains('\x1b')));
+    }
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+#[test]
+fn empty_no_color_does_not_disable_color() {
+    use std::ffi::OsStr;
+    assert!(!no_color_requested(None));
+    assert!(!no_color_requested(Some(OsStr::new(""))));
+    assert!(no_color_requested(Some(OsStr::new("1"))));
+}
+
+#[test]
 fn report_row_value_change_is_version_only() {
     let version_row = TaskReportRow {
         name: "stable".to_string(),

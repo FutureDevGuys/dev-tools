@@ -12658,7 +12658,7 @@ fn render_npm_package_footer<'a>(
             let mut cells = vec![TableCell {
                 text: &name,
                 color: (color_enabled && action.is_some())
-                    .then_some(crossterm::style::Color::White),
+                    .then_some(crate::ui::ReportItemRole::Subject.color()),
                 width: name_w,
                 overflow_label: if action.is_some() {
                     Some("item")
@@ -12669,7 +12669,7 @@ fn render_npm_package_footer<'a>(
             if let Some(action) = action {
                 cells.push(TableCell {
                     text: action,
-                    color: color_enabled.then_some(crossterm::style::Color::Cyan),
+                    color: color_enabled.then_some(crate::ui::ReportItemRole::Action.color()),
                     width: action_w,
                     overflow_label: None,
                 });
@@ -13020,7 +13020,10 @@ fn render_package_change_rollup_with_width<'a>(
             BoxCell::plain(&task_text, task_w),
             BoxCell {
                 text: item_text,
-                color: row.action.as_ref().map(|_| crossterm::style::Color::White),
+                color: row
+                    .action
+                    .as_ref()
+                    .map(|_| crate::ui::ReportItemRole::Subject.color()),
                 width: item_w,
             },
         ];
@@ -13028,7 +13031,10 @@ fn render_package_change_rollup_with_width<'a>(
         if action_w > 0 {
             cells.push(BoxCell {
                 text: action.to_owned(),
-                color: row.action.as_ref().map(|_| crossterm::style::Color::Cyan),
+                color: row
+                    .action
+                    .as_ref()
+                    .map(|_| crate::ui::ReportItemRole::Action.color()),
                 width: action_w,
             });
         }
@@ -14179,6 +14185,8 @@ fn colorize_report_cell(input: &str, color: crossterm::style::Color) -> String {
         crossterm::style::Color::Green => "32",
         crossterm::style::Color::Yellow => "33",
         crossterm::style::Color::Cyan => "36",
+        crossterm::style::Color::DarkMagenta => "35",
+        crossterm::style::Color::White => "37",
         crossterm::style::Color::Rgb { r, g, b } => {
             return format!("\x1b[1;38;2;{r};{g};{b}m{input}\x1b[0m");
         }
@@ -14681,10 +14689,16 @@ fn stdout_supports_color() -> bool {
     let term = std::env::var("TERM").ok();
     terminal_supports_color(
         stdout_is_tty,
-        std::env::var_os("NO_COLOR").is_some(),
+        no_color_requested(std::env::var_os("NO_COLOR").as_deref()),
         term.as_deref(),
         windows_color_hint(),
     )
+}
+
+/// NO_COLOR disables color when it is set to a non-empty value (no-color.org); an empty
+/// value is treated as unset, as the dashboard's terminal backend does.
+fn no_color_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 fn terminal_supports_color(

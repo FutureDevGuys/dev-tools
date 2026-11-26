@@ -731,7 +731,7 @@ fn stylize_operation_items_colors_subject_action_and_outcome() {
         );
         for (cell, color) in [
             ("tmux-yank", Color::White),
-            ("update", Color::Cyan),
+            ("update", Color::Magenta),
             (outcome, outcome_color),
         ] {
             let span = spans
@@ -740,6 +740,34 @@ fn stylize_operation_items_colors_subject_action_and_outcome() {
                 .unwrap_or_else(|| panic!("missing {cell} in {spans:?}"));
             assert_eq!(span.style.fg, Some(color), "{line}");
         }
+    }
+}
+
+#[test]
+fn item_roles_keep_their_colors_distinct_from_each_other_and_from_outcomes() {
+    use crate::ui::ReportItemRole;
+    assert_eq!(
+        Color::from_crossterm(ReportItemRole::Subject.color()),
+        Color::White
+    );
+    let action = Color::from_crossterm(ReportItemRole::Action.color());
+    assert_eq!(action, Color::Magenta);
+    for outcome in [
+        "Updated",
+        "Passed",
+        "Refreshed",
+        "Unchanged",
+        "Info",
+        "Deferred",
+        "Unconfirmed",
+        "Skipped",
+        "Removed",
+        "Blocked",
+        "Failed",
+    ] {
+        let style = report_outcome_style(outcome).unwrap_or_else(|| panic!("{outcome}"));
+        assert_ne!(style.fg, Some(action), "{outcome}");
+        assert_ne!(style.fg, Some(Color::White), "{outcome}");
     }
 }
 

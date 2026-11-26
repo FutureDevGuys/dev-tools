@@ -768,6 +768,29 @@ pub(crate) fn is_report_action(action: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch == b'-')
 }
 
+/// The cells of a structured update item row that carry their own color.
+///
+/// Every renderer of such a row (the ANSI task log and rollup in `tasks`, and the
+/// dashboard's re-styling of that text in `ui::tui`) takes the color from here, so a
+/// subject or an action cannot be colored differently in two views. The outcome cell
+/// keeps the shared outcome palette. The action color is distinct from every outcome
+/// color (cyan is an outcome color for Refreshed and Info rows), and the action is
+/// always printed in its own column, so color is never the only signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReportItemRole {
+    Subject,
+    Action,
+}
+
+impl ReportItemRole {
+    pub(crate) const fn color(self) -> crossterm::style::Color {
+        match self {
+            Self::Subject => crossterm::style::Color::White,
+            Self::Action => crossterm::style::Color::DarkMagenta,
+        }
+    }
+}
+
 pub(crate) fn report_values_are_version_change(before: &str, after: &str) -> bool {
     let before = before.trim();
     let after = after.trim();
