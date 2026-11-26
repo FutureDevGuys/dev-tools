@@ -272,7 +272,7 @@ pub fn classify_managed_path(request: &ManagedPathRequest) -> ManagedPathClassif
 }
 
 fn remove_source_owned_toml(request: &TomlRequest) -> Result<OverlayResult> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if !request.dry_run && !request.check {
         use crate::overlay::transaction::{Operation, Transaction};
         // Remove is target-only, irrespective of inactive receipt flags.
@@ -295,7 +295,7 @@ fn remove_source_owned_toml(request: &TomlRequest) -> Result<OverlayResult> {
         transaction.publish(&mut result, true, None)?;
         return Ok(result);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     crate::overlay::transaction::ensure_no_pending(&request.target)?;
     ownership::validate_real_parent_chain(&request.target, "TOML removal target")?;
     let Some(metadata) = optional_metadata(&request.target)? else {

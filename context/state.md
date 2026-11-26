@@ -25,4 +25,5 @@
 - Skills Sync 0.2.1 is prepared in source and unpublished. The newest Skills Sync release is 0.2.0.
 - Dev Cache's native container cache stays off by default, and native Docker acceptance has not run (#41).
 - Native Windows, WSL and macOS acceptance has not run, so supported platforms are Linux only.
+- SyncConfigs Windows overlay publication is on branch `fix/windows-sync-configs` (not pushed). It passes under Wine only; it needs native Windows acceptance and an audited owner-only ACL for its transaction files before any Windows claim.
 - Branches `auric/generic-secret-projection-policy-20261022` (1,220 changed lines) and `feat/generic-workload-acceptance-20261022` (599) hold unmerged Dev Auth projection and acceptance work with no pull request. #75 may supersede them; compare before reusing or deleting them.
