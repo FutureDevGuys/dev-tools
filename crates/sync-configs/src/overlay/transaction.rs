@@ -26,7 +26,7 @@ mod sys;
 #[cfg(windows)]
 #[path = "transaction/windows.rs"]
 mod sys;
-use sys::{gid, name_key, native_len, read_text, uid, MAX_NATIVE_PATH};
+use sys::{gid, has_reserved_prefix, name_key, native_len, read_text, uid, MAX_NATIVE_PATH};
 
 const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 // JSON escaping of two admitted UTF-8 targets and receipts remains bounded.
@@ -246,7 +246,7 @@ impl Transaction {
         let target_path = absolute(target)?;
         if target_path
             .file_name()
-            .is_some_and(|name| name_key(name).starts_with(PREFIX.as_bytes()))
+            .is_some_and(|name| has_reserved_prefix(name, PREFIX))
         {
             bail!("overlay target uses the reserved transaction namespace");
         }
@@ -262,7 +262,7 @@ impl Transaction {
                 if spec
                     .path
                     .file_name()
-                    .is_some_and(|name| name_key(name).starts_with(PREFIX.as_bytes()))
+                    .is_some_and(|name| has_reserved_prefix(name, PREFIX))
                 {
                     bail!("overlay receipt uses the reserved transaction namespace");
                 }
@@ -798,7 +798,8 @@ mod tests {
             parent: leaf.parent.clone(),
             before,
             candidate: Leaf::Regular {
-                text: "{\n  \"a\": 1,\n  \"b\": 2\n}\n".to_owned(),
+                // A merge of source and target could never produce this key.
+                text: "{\n  \"a\": 1,\n  \"b\": 2,\n  \"journal-only\": true\n}\n".to_owned(),
                 mode,
                 group,
             },
@@ -821,7 +822,7 @@ mod tests {
         assert!(result.changed);
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
-            "{\n  \"a\": 1,\n  \"b\": 2\n}\n"
+            "{\n  \"a\": 1,\n  \"b\": 2,\n  \"journal-only\": true\n}\n"
         );
         assert!(ensure_no_pending(&target).is_ok());
     }

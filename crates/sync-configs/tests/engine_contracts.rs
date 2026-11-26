@@ -364,12 +364,12 @@ fn convergence_allows_pre_hooks_to_create_filtered_recursive_sources() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // `echo` appends its platform line ending and, under cmd, a trailing space.
+    // The target is a byte-exact copy of what the hook generated.
+    let generated = fs::read(source_dir.join("keep.txt")).expect("generated source");
+    assert!(generated.starts_with(b"keep"));
     assert_eq!(
-        fs::read_to_string(target_dir.join("keep.txt"))
-            .expect("kept target")
-            .trim_end(),
-        "keep"
+        fs::read(target_dir.join("keep.txt")).expect("kept target"),
+        generated
     );
     assert!(!target_dir.join("drop.log").exists());
 }

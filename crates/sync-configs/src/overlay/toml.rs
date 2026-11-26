@@ -210,7 +210,7 @@ pub fn overlay_toml_file(
         return Ok(result);
     }
 
-    bail!("durable overlay publication is currently available only on Linux")
+    bail!("durable overlay publication is unavailable on this platform; it is implemented for Linux and Windows")
 }
 
 #[cfg(any(target_os = "linux", windows))]

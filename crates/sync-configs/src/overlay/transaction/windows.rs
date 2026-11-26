@@ -22,15 +22,28 @@ use dev_tools_installation::{
     ArtifactIdentity, AtomicDocument, DocumentAuthority, FileAuthority, InstallationLock,
 };
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{
+    LocalFree, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::Authorization::{
+    GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH,
+    FileIdInfo, FindClose, FindFirstFileW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    READ_CONTROL, WIN32_FIND_DATAW, WRITE_DAC, WRITE_OWNER,
 };
 
 use super::{ParentIdentity, FILE_LIMIT, PREFIX};
+use crate::paths::is_reserved_device_stem;
 
 pub(super) const MAX_NATIVE_PATH: usize = 32768;
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -43,8 +56,29 @@ pub(super) fn gid() -> u32 {
     0
 }
 
+/// Volume serial plus the 128-bit file id; the 64-bit file index is not unique
+/// on ReFS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    volume: u64,
+    id: [u8; 16],
+}
+
+impl FileId {
+    /// The journal's 64-bit fingerprint. Live checks compare the full id; for
+    /// NTFS (high half zero) this is the file index itself.
+    fn fingerprint(self) -> ParentIdentity {
+        let (low, high) = self.id.split_at(8);
+        ParentIdentity {
+            device: self.volume,
+            inode: u64::from_le_bytes(low.try_into().unwrap())
+                ^ u64::from_le_bytes(high.try_into().unwrap()),
+        }
+    }
+}
+
 struct Observed {
-    identity: ParentIdentity,
+    id: FileId,
     attributes: u32,
     links: u32,
     size: u64,
@@ -58,10 +92,23 @@ fn observe_handle(file: &File) -> io::Result<Observed> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: as above; FILE_ID_INFO is plain data and its exact size is passed.
+    let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            std::ptr::addr_of_mut!(id).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(Observed {
-        identity: ParentIdentity {
-            device: u64::from(info.dwVolumeSerialNumber),
-            inode: u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+        id: FileId {
+            volume: id.VolumeSerialNumber,
+            id: id.FileId.Identifier,
         },
         attributes: info.dwFileAttributes,
         links: info.nNumberOfLinks,
@@ -92,29 +139,27 @@ fn is_reparse(metadata: &Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-fn directory_identity(path: &Path) -> Result<ParentIdentity> {
+fn directory_identity(path: &Path) -> Result<FileId> {
     let observed = observe_handle(&open_no_follow(path, true, false)?)?;
     if observed.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
         || observed.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
         bail!("selected document directory is not a real directory");
     }
-    Ok(observed.identity)
+    Ok(observed.id)
 }
 
 pub(super) fn prepare(parent_path: &Path) -> Result<(Directory, ParentIdentity)> {
     fs::create_dir_all(parent_path).context("prepare overlay directory")?;
-    let identity = directory_identity(parent_path)?;
+    let id = directory_identity(parent_path)?;
     Ok((
         Directory {
             path: parent_path.to_path_buf(),
-            identity: identity.clone(),
+            id,
         },
-        identity,
+        id.fingerprint(),
     ))
 }
-
-const DEVICE_NAMES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 
 fn validate_name(name: &OsStr) -> Result<()> {
     let text = name.to_string_lossy();
@@ -123,19 +168,13 @@ fn validate_name(name: &OsStr) -> Result<()> {
         .next()
         .unwrap_or_default()
         .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    let numbered = |prefix: &str| {
-        stem.strip_prefix(prefix)
-            .is_some_and(|digit| matches!(digit.as_bytes(), [b'0'..=b'9']))
-    };
+        .to_uppercase();
     if text.is_empty()
         || text == "."
         || text == ".."
         || text.ends_with(['.', ' '])
         || text.chars().any(|c| c < ' ' || "\\/:*?\"<>|".contains(c))
-        || DEVICE_NAMES.contains(&stem.as_str())
-        || numbered("COM")
-        || numbered("LPT")
+        || is_reserved_device_stem(&stem)
     {
         bail!("overlay leaf name is not a plain Windows file name");
     }
@@ -153,15 +192,117 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-/// A selected existing directory, identified by volume serial and file index.
+/// Retry a bounded number of times on the transient denials that antivirus and
+/// indexers cause, returning the last error.
+fn retry<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut delay = 10;
+    for _ in 0..4 {
+        match operation() {
+            Err(error)
+                if matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                delay *= 2;
+            }
+            other => return other,
+        }
+    }
+    operation()
+}
+
+/// Give the staged file the replaced file's owner and DACL, so a narrowed
+/// target never becomes readable by more principals.
+fn copy_security(from: &File, to: &File) -> io::Result<()> {
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the handle is live and every out-pointer is valid for the call.
+    let status = unsafe {
+        GetSecurityInfo(
+            from.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: `descriptor` was returned by GetSecurityInfo and is freed once.
+    let result =
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            let protection = if control & SE_DACL_PROTECTED != 0 {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+            // SAFETY: owner and dacl point into `descriptor`, which is still live.
+            let status = unsafe {
+                SetSecurityInfo(
+                    to.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | protection,
+                    owner,
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status as i32))
+            }
+        };
+    // SAFETY: allocated by GetSecurityInfo with LocalAlloc.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
+/// Refuse a spelling that is not the leaf's real long name (8.3 short name or
+/// another case): lock and journal identity are keyed on the exact name.
+/// `FindFirstFileW` reports the stored name without following the leaf.
+fn require_exact_name(path: &Path, name: &OsStr) -> Result<()> {
+    // SAFETY: all-zero is a valid out-parameter for this plain-data type.
+    let mut found: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is NUL-terminated and `found` is valid for the call.
+    let handle = unsafe { FindFirstFileW(wide(path).as_ptr(), &mut found) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error()).context("resolve the leaf's real name");
+    }
+    // SAFETY: the handle came from FindFirstFileW and is closed once.
+    unsafe { FindClose(handle) };
+    let length = found
+        .cFileName
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(found.cFileName.len());
+    if found.cFileName[..length] != name.encode_wide().collect::<Vec<_>>()[..] {
+        bail!("overlay leaf is not spelled as its real file name");
+    }
+    Ok(())
+}
+
+/// A selected existing directory, identified by volume serial and file id.
 pub(super) struct Directory {
     path: PathBuf,
-    identity: ParentIdentity,
+    id: FileId,
 }
 
 impl Directory {
     fn validate(&self) -> Result<()> {
-        if directory_identity(&self.path)? != self.identity {
+        if directory_identity(&self.path)? != self.id {
             bail!("selected document directory changed or has unsafe custody");
         }
         Ok(())
@@ -181,6 +322,9 @@ impl Directory {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("inspect selected entry"),
         };
+        if metadata.is_some() {
+            require_exact_name(&self.path.join(name), name)?;
+        }
         self.validate()?;
         Ok(metadata)
     }
@@ -199,6 +343,7 @@ impl Directory {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("open held document"),
         };
+        require_exact_name(&path, name)?;
         let before = observe_handle(&file)?;
         if before.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
             || before.links != 1
@@ -212,10 +357,10 @@ impl Directory {
         let after = observe_handle(&file)?;
         let named = observe_handle(&open_no_follow(&path, false, false)?)?;
         if bytes.len() as u64 != before.size
-            || before.identity != after.identity
+            || before.id != after.id
             || before.size != after.size
             || before.written != after.written
-            || named.identity != before.identity
+            || named.id != before.id
         {
             bail!("held document changed while being read");
         }
@@ -250,36 +395,46 @@ impl Directory {
             .path
             .join(format!("{PREFIX}tmp-{}", uuid::Uuid::new_v4().simple()));
         let mut file = OpenOptions::new()
-            .write(true)
+            .access_mode(FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .create_new(true)
             .share_mode(0)
             .open(&temporary)
             .context("create overlay staging file")?;
-        let staged = file.write_all(bytes).and_then(|()| file.sync_all());
+        let staged = (|| {
+            if expected.is_some() {
+                copy_security(&open_no_follow(&destination, false, false)?, &file)?;
+            }
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
         drop(file);
         let published = staged.and_then(|()| {
             let mut flags = MOVEFILE_WRITE_THROUGH;
             if expected.is_some() {
                 flags |= MOVEFILE_REPLACE_EXISTING;
             }
-            // SAFETY: both arguments are NUL-terminated and outlive the call.
-            let moved = unsafe {
-                MoveFileExW(
-                    wide(&temporary).as_ptr(),
-                    wide(&destination).as_ptr(),
-                    flags,
-                )
-            };
-            if moved == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+            retry(|| {
+                // SAFETY: both arguments are NUL-terminated and outlive the call.
+                let moved = unsafe {
+                    MoveFileExW(
+                        wide(&temporary).as_ptr(),
+                        wide(&destination).as_ptr(),
+                        flags,
+                    )
+                };
+                if moved == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
         });
         if let Err(error) = published {
             let _ = fs::remove_file(&temporary);
             return Err(error).context("publish overlay file");
         }
+        // WRITE_THROUGH does not flush a same-volume rename's directory entry.
+        self.sync()?;
         self.validate()?;
         Ok(true)
     }
@@ -299,7 +454,8 @@ impl Directory {
             if current.identity != *expected {
                 bail!("held document removal does not match expected content");
             }
-            fs::remove_file(self.path.join(name)).context("remove exact held document")?;
+            retry(|| fs::remove_file(self.path.join(name)))
+                .context("remove exact held document")?;
         }
         self.sync()?;
         self.validate()?;
@@ -457,26 +613,43 @@ pub(super) fn read_text(path: &Path) -> Result<String> {
     let after = observe_handle(&file)?;
     let named = observe_handle(&open()?)?;
     if text.len() as u64 != before.size
-        || before.identity != after.identity
+        || before.id != after.id
         || before.size != after.size
         || before.written != after.written
-        || named.identity != after.identity
+        || named.id != after.id
     {
         bail!("overlay text input changed while being read");
     }
     Ok(text)
 }
 
-/// Lock/journal key and reserved-prefix test. Windows leaf names compare
-/// case-insensitively, so the key folds case; names that are not Unicode keep
-/// their exact UTF-16 units behind a marker byte.
-pub(super) fn name_key(name: &OsStr) -> Vec<u8> {
-    match name.to_str() {
-        Some(text) => text.to_lowercase().into_bytes(),
-        None => std::iter::once(0xFF)
-            .chain(name.encode_wide().flat_map(u16::to_le_bytes))
-            .collect(),
+/// Simple uppercase of one UTF-16 unit, as Windows folds leaf names.
+fn fold_unit(unit: u16) -> u16 {
+    let mut upper = char::from_u32(u32::from(unit))
+        .map(char::to_uppercase)
+        .into_iter()
+        .flatten();
+    match (upper.next(), upper.next()) {
+        (Some(single), None) if single as u32 <= 0xFFFF => single as u16,
+        _ => unit,
     }
+}
+
+fn folded(name: &OsStr) -> Vec<u16> {
+    name.encode_wide().map(fold_unit).collect()
+}
+
+/// Lock/journal key for a leaf that does not exist yet: the name folded per
+/// UTF-16 unit. An existing leaf must already carry its exact real spelling.
+pub(super) fn name_key(name: &OsStr) -> Vec<u8> {
+    folded(name)
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+pub(super) fn has_reserved_prefix(name: &OsStr, prefix: &str) -> bool {
+    folded(name).starts_with(&folded(OsStr::new(prefix)))
 }
 
 pub(super) fn native_len(path: &OsStr) -> usize {
@@ -604,12 +777,35 @@ mod tests {
             "lpt9.log",
             "trailing.",
             "trailing ",
+            "COM\u{b9}",
+            "lpt\u{b3}.txt",
+            "COM0",
+            "conout$",
         ] {
             assert!(validate_name(OsStr::new(rejected)).is_err(), "{rejected}");
         }
         for accepted in ["config.json", "COM10", "console.log", ".hidden"] {
             assert!(validate_name(OsStr::new(accepted)).is_ok(), "{accepted}");
         }
+    }
+
+    #[test]
+    fn only_the_real_spelling_of_an_existing_leaf_is_admitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (directory, _) = prepare(temp.path()).unwrap();
+        fs::write(temp.path().join("Leaf.txt"), b"x").unwrap();
+
+        assert!(directory
+            .metadata(OsStr::new("Leaf.txt"))
+            .unwrap()
+            .is_some());
+        // Another case is refused on a case-folding volume; Wine's host
+        // filesystem does not fold case and reports the entry absent. Either
+        // way the other spelling never selects the existing leaf.
+        assert!(!matches!(
+            directory.metadata(OsStr::new("leaf.txt")),
+            Ok(Some(_))
+        ));
     }
 
     #[test]

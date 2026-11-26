@@ -314,7 +314,7 @@ fn remove_source_owned_toml(request: &TomlRequest) -> Result<OverlayResult> {
         return Ok(result);
     }
     Err(anyhow!(
-        "durable overlay publication is currently available only on Linux"
+        "durable overlay publication is unavailable on this platform; it is implemented for Linux and Windows"
     ))
 }
 

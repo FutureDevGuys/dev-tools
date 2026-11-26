@@ -12,18 +12,33 @@ use sync_configs::overlay::{self, PathKey};
 use sync_configs::paths::PathPlatform;
 use tempfile::tempdir;
 
-fn link_file(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(target, link).unwrap();
+/// Reports whether a link was created; false (after saying why) when Windows
+/// withholds the symlink privilege, so the calling test can skip.
+fn linked(result: std::io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(1314) => {
+            eprintln!("skipping: symbolic-link privilege not held");
+            false
+        }
+        Err(error) => panic!("create link: {error}"),
+    }
 }
 
-fn link_dir(target: &Path, link: &Path) {
+fn link_file(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
+    let result = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(target, link).unwrap();
+    let result = std::os::windows::fs::symlink_file(target, link);
+    linked(result)
+}
+
+fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(target, link);
+    linked(result)
 }
 
 fn key(parts: &[&str]) -> PathKey {
@@ -277,7 +292,9 @@ fn ownership_receipt_symlink_is_rejected_without_following_it() {
         r#"{"schema_version":1,"managed_overlay_id":"fixture","managed_paths":[["managed"]]}"#,
     )
     .unwrap();
-    link_file(&referent, &receipt);
+    if !link_file(&referent, &receipt) {
+        return;
+    }
 
     let error = overlay::ownership::load_paths(&receipt, "fixture")
         .expect_err("receipt symlink must fail closed");
@@ -302,7 +319,9 @@ fn ownership_receipt_rejects_a_symlinked_parent_boundary() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&external_receipt, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    link_dir(&external, &state.join("overlays"));
+    if !link_dir(&external, &state.join("overlays")) {
+        return;
+    }
 
     let error = overlay::ownership::load_paths(&state.join("overlays/fixture.json"), "fixture")
         .expect_err("parent symlink must fail closed");
@@ -319,7 +338,9 @@ fn json_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
     fs::write(&source, "{\"managed\":true}\n").unwrap();
     fs::create_dir(&external).unwrap();
     fs::write(&external_target, "{\"private\":\"unchanged\"}\n").unwrap();
-    link_dir(&external, &target_parent);
+    if !link_dir(&external, &target_parent) {
+        return;
+    }
 
     let error = json::overlay_json_file(
         &source,
@@ -345,7 +366,9 @@ fn toml_overlay_rejects_a_symlinked_target_parent_before_reading_or_writing() {
     fs::write(&source, "managed = true\n").unwrap();
     fs::create_dir(&external).unwrap();
     fs::write(&external_target, "private = \"unchanged\"\n").unwrap();
-    link_dir(&external, &target_parent);
+    if !link_dir(&external, &target_parent) {
+        return;
+    }
 
     let error = toml::overlay_toml_file(
         &source,
@@ -372,7 +395,9 @@ fn managed_overlay_rejects_a_symlinked_receipt_parent_without_external_effects()
     fs::write(&target, "{\"local\":true}\n").unwrap();
     fs::create_dir_all(&state).unwrap();
     fs::create_dir(&external).unwrap();
-    link_dir(&external, &state.join("overlays"));
+    if !link_dir(&external, &state.join("overlays")) {
+        return;
+    }
 
     let error = json::overlay_json_file(
         &source,
@@ -401,7 +426,9 @@ fn toml_target_leaf_symlink_is_still_materialized_without_changing_its_referent(
     let target = directory.path().join("target.toml");
     fs::write(&source, "managed = true\n").unwrap();
     fs::write(&referent, "managed = false\n").unwrap();
-    link_file(&referent, &target);
+    if !link_file(&referent, &target) {
+        return;
+    }
 
     let result = toml::overlay_toml_file(&source, &target, &TomlOverlayOptions::default())
         .expect("materialize a safe target leaf symlink");

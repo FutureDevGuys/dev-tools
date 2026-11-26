@@ -89,6 +89,10 @@ pub(super) fn name_key(name: &OsStr) -> Vec<u8> {
     name.as_bytes().to_vec()
 }
 
+pub(super) fn has_reserved_prefix(name: &OsStr, prefix: &str) -> bool {
+    name.as_bytes().starts_with(prefix.as_bytes())
+}
+
 pub(super) fn native_len(path: &OsStr) -> usize {
     path.as_bytes().len()
 }
