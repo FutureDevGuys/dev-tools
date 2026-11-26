@@ -124,7 +124,7 @@ pub fn remove(root: &RootHandle, digest: &str) -> Result<()> {
 }
 
 fn list_unlocked(root: &RootHandle) -> Result<Vec<ArtifactRecord>> {
-    let metadata = root.platform_root.join("artifacts/metadata");
+    let metadata = crate::util::join_slashed(&root.platform_root, "artifacts/metadata");
     if !metadata.is_dir() {
         return Ok(Vec::new());
     }
@@ -175,8 +175,8 @@ pub(crate) fn object_path(root: &RootHandle, digest: &str) -> Result<PathBuf> {
 
 pub(crate) fn metadata_path(root: &RootHandle, digest: &str) -> Result<PathBuf> {
     validate_digest(digest)?;
-    Ok(root
-        .platform_root
-        .join("artifacts/metadata")
-        .join(format!("{digest}.json")))
+    Ok(
+        crate::util::join_slashed(&root.platform_root, "artifacts/metadata")
+            .join(format!("{digest}.json")),
+    )
 }

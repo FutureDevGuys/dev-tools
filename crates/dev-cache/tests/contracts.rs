@@ -33,13 +33,9 @@ fn write_placeholder_command(directory: &Path, name: &str) {
     fs::write(directory.join(format!("{name}.exe")), b"").expect("placeholder command");
 }
 
-/// Expected routed value: `base` plus `relative`, joined with the platform separator.
-fn native_join(base: &str, relative: &str) -> String {
-    relative
-        .split('/')
-        .fold(PathBuf::from(base), |path, part| path.join(part))
-        .to_string_lossy()
-        .into_owned()
+/// Expected value spelled out for the platform under test.
+fn platform(unix: &str, windows: &str) -> String {
+    if cfg!(windows) { windows } else { unix }.to_owned()
 }
 
 #[cfg(unix)]
@@ -298,27 +294,33 @@ fn shared_entrypoint_inventory_drives_static_dynamic_and_mediated_dispatch() {
 #[test]
 fn bun_and_yarn_route_only_independently_disposable_caches() {
     let context = AdapterContext {
-        worktree_cache: PathBuf::from("/root/workspaces/id"),
-        shared_cache: PathBuf::from("/root/cache"),
+        worktree_cache: PathBuf::from(platform("/root/workspaces/id", r"C:\root\workspaces\id")),
+        shared_cache: PathBuf::from(platform("/root/cache", r"C:\root\cache")),
         domain_id: "test-domain".to_owned(),
         inherited: HashMap::new(),
     };
     let bun = Adapter::Bun.environment(&context);
     assert_eq!(
         bun.get("BUN_INSTALL_CACHE_DIR").map(String::as_str),
-        Some(native_join("/root/cache", "bun/install").as_str())
+        Some(platform("/root/cache/bun/install", r"C:\root\cache\bun\install").as_str())
     );
     assert_eq!(
         bun.get("BUN_RUNTIME_TRANSPILER_CACHE_PATH")
             .map(String::as_str),
-        Some(native_join("/root/cache", "bun/transpiler").as_str())
+        Some(
+            platform(
+                "/root/cache/bun/transpiler",
+                r"C:\root\cache\bun\transpiler"
+            )
+            .as_str()
+        )
     );
     assert!(!bun.keys().any(|key| key.contains("INSTALL_DIR")));
 
     let yarn = Adapter::Yarn.environment(&context);
     assert_eq!(
         yarn.get("YARN_CACHE_FOLDER").map(String::as_str),
-        Some(native_join("/root/cache", "yarn/classic").as_str())
+        Some(platform("/root/cache/yarn/classic", r"C:\root\cache\yarn\classic").as_str())
     );
     assert_eq!(yarn.len(), 1);
 }
@@ -355,8 +357,8 @@ fn default_intercept_directory_is_product_owned_xdg_data() {
 #[test]
 fn nested_routing_replaces_only_values_with_exact_managed_provenance() {
     let base = AdapterContext {
-        worktree_cache: PathBuf::from("/root/workspaces/old"),
-        shared_cache: PathBuf::from("/root/cache"),
+        worktree_cache: PathBuf::from(platform("/root/workspaces/old", r"C:\root\workspaces\old")),
+        shared_cache: PathBuf::from(platform("/root/cache", r"C:\root\cache")),
         domain_id: "test-domain".to_owned(),
         inherited: HashMap::new(),
     };
@@ -364,19 +366,25 @@ fn nested_routing_replaces_only_values_with_exact_managed_provenance() {
     provenance::attach(&base.inherited, &mut upstream, "go");
 
     let managed = Adapter::Go.environment(&AdapterContext {
-        worktree_cache: PathBuf::from("/root/workspaces/new"),
+        worktree_cache: PathBuf::from(platform("/root/workspaces/new", r"C:\root\workspaces\new")),
         inherited: upstream.clone(),
         ..base.clone()
     });
     assert_eq!(
         managed.get("GOTMPDIR").map(String::as_str),
-        Some(native_join("/root/workspaces/new", "temp/go").as_str())
+        Some(
+            platform(
+                "/root/workspaces/new/temp/go",
+                r"C:\root\workspaces\new\temp\go"
+            )
+            .as_str()
+        )
     );
 
     let mut changed = upstream;
     changed.insert("GOTMPDIR".to_owned(), "/user/chosen/temp".to_owned());
     let authoritative = Adapter::Go.environment(&AdapterContext {
-        worktree_cache: PathBuf::from("/root/workspaces/new"),
+        worktree_cache: PathBuf::from(platform("/root/workspaces/new", r"C:\root\workspaces\new")),
         inherited: changed,
         ..base
     });
@@ -386,8 +394,8 @@ fn nested_routing_replaces_only_values_with_exact_managed_provenance() {
 #[test]
 fn npm_cache_routing_preserves_native_case_insensitive_overrides_and_managed_provenance() {
     let mut context = AdapterContext {
-        worktree_cache: PathBuf::from("/root/workspaces/id"),
-        shared_cache: PathBuf::from("/root/cache"),
+        worktree_cache: PathBuf::from(platform("/root/workspaces/id", r"C:\root\workspaces\id")),
+        shared_cache: PathBuf::from(platform("/root/cache", r"C:\root\cache")),
         domain_id: "test-domain".to_owned(),
         inherited: HashMap::new(),
     };
@@ -396,17 +404,17 @@ fn npm_cache_routing_preserves_native_case_insensitive_overrides_and_managed_pro
         managed,
         HashMap::from([(
             "npm_config_cache".to_owned(),
-            native_join("/root/cache", "npm")
+            platform("/root/cache/npm", r"C:\root\cache\npm")
         )])
     );
     provenance::attach(&context.inherited, &mut managed, "npm");
-    context.shared_cache = PathBuf::from("/replacement/cache");
+    context.shared_cache = PathBuf::from(platform("/replacement/cache", r"C:\replacement\cache"));
     context.inherited = managed.clone();
     assert_eq!(
         Adapter::Npm.environment(&context),
         HashMap::from([(
             "npm_config_cache".to_owned(),
-            native_join("/replacement/cache", "npm")
+            platform("/replacement/cache/npm", r"C:\replacement\cache\npm")
         )])
     );
     for key in ["npm_config_cache", "NPM_CONFIG_CACHE", "Npm_Config_Cache"] {
@@ -514,8 +522,8 @@ fn adapters_preserve_explicit_native_environment() {
     let mut inherited = HashMap::new();
     inherited.insert("GOCACHE".to_owned(), "/explicit/go-cache".to_owned());
     let context = AdapterContext {
-        worktree_cache: PathBuf::from("/root/repos/id"),
-        shared_cache: PathBuf::from("/root/shared"),
+        worktree_cache: PathBuf::from(platform("/root/repos/id", r"C:\root\repos\id")),
+        shared_cache: PathBuf::from(platform("/root/shared", r"C:\root\shared")),
         domain_id: "test-domain".to_owned(),
         inherited,
     };
@@ -524,19 +532,20 @@ fn adapters_preserve_explicit_native_environment() {
     assert!(!routed.contains_key("GOCACHE"));
     assert_eq!(
         routed.get("GOMODCACHE").map(String::as_str),
-        Some(native_join("/root/shared", "go-mod").as_str())
+        Some(platform("/root/shared/go-mod", r"C:\root\shared\go-mod").as_str())
     );
     assert_eq!(
         routed.get("GOTMPDIR").map(String::as_str),
-        Some(native_join("/root/repos/id", "temp/go").as_str())
+        Some(platform("/root/repos/id/temp/go", r"C:\root\repos\id\temp\go").as_str())
     );
 }
 
 #[test]
 fn cargo_routes_only_intermediate_artifacts_with_native_workspace_hashing() {
     let context = AdapterContext {
-        worktree_cache: PathBuf::from("/root/repos").join("a".repeat(160)),
-        shared_cache: PathBuf::from("/root/shared"),
+        worktree_cache: PathBuf::from(platform("/root/repos", r"C:\root\repos"))
+            .join("a".repeat(160)),
+        shared_cache: PathBuf::from(platform("/root/shared", r"C:\root\shared")),
         domain_id: "test-domain".to_owned(),
         inherited: HashMap::new(),
     };
@@ -545,13 +554,13 @@ fn cargo_routes_only_intermediate_artifacts_with_native_workspace_hashing() {
     assert_eq!(
         routed.get("CARGO_BUILD_BUILD_DIR").map(String::as_str),
         Some(
-            native_join(
-                "/root/shared",
-                &format!(
-                    "cargo/intermediate/{}/{{workspace-path-hash}}",
-                    "a".repeat(160)
+            {
+                let hash = "a".repeat(160);
+                platform(
+                    &format!("/root/shared/cargo/intermediate/{hash}/{{workspace-path-hash}}"),
+                    &format!(r"C:\root\shared\cargo\intermediate\{hash}\{{workspace-path-hash}}"),
                 )
-            )
+            }
             .as_str()
         )
     );
@@ -4034,4 +4043,91 @@ fn malformed_git_markers_do_not_capture_unrelated_workspaces() {
             .worktree,
         dev_cache::util::canonicalize(&project).unwrap()
     );
+}
+
+#[test]
+fn workspace_identity_is_the_same_from_a_deep_directory_and_the_workspace_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache")).unwrap();
+    let project = temp.path().join("project");
+    let deep = project.join("a/b/c");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let from_root = Repository::discover(&project, &root).unwrap().unwrap();
+    let from_deep = Repository::discover(&deep, &root).unwrap().unwrap();
+    assert_eq!(from_deep.worktree, from_root.worktree);
+    assert_eq!(from_deep.identity, from_root.identity);
+    assert_eq!(from_deep.cache_dir, from_root.cache_dir);
+}
+
+#[test]
+fn sources_inside_the_cache_root_are_refused_by_artifact_and_migration_guards() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache")).unwrap();
+    let inside = root.shared().join("inside");
+    fs::create_dir_all(&inside).unwrap();
+    fs::write(inside.join("file"), b"cache").unwrap();
+    // A redundant spelling must not slip past the root comparison.
+    let spelled = inside.join("..").join("inside");
+
+    let artifact = artifacts::put(&root, &spelled.join("file")).unwrap_err();
+    assert!(
+        format!("{artifact:#}").contains("outside the disposable cache root"),
+        "{artifact:#}"
+    );
+    let migration =
+        migrate::migrate(&root, None, Adapter::Npm, &spelled, false, false).unwrap_err();
+    assert!(
+        format!("{migration:#}").contains("already inside the dev-cache root"),
+        "{migration:#}"
+    );
+}
+
+#[test]
+fn path_command_prints_the_routed_environment_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootHandle::initialize(&temp.path().join("cache")).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("go.mod"), b"module example.invalid/path\n").unwrap();
+    let config_path = temp.path().join("config.toml");
+    let config = Config {
+        root: Some(root.root.clone()),
+        ..Config::default()
+    };
+    fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let repository = Repository::discover(&workspace, &root).unwrap().unwrap();
+    let context = AdapterContext {
+        worktree_cache: repository.cache_dir.clone(),
+        shared_cache: root.shared(),
+        domain_id: root.domain_id.clone(),
+        inherited: HashMap::new(),
+    };
+    for (adapter, name, variable) in [
+        (Adapter::Cargo, "cargo", "CARGO_BUILD_BUILD_DIR"),
+        (Adapter::Temp, "temp", "TMPDIR"),
+        (Adapter::Meson, "meson", "MESON_PACKAGE_CACHE_DIR"),
+        (Adapter::Bun, "bun", "BUN_INSTALL_CACHE_DIR"),
+        (Adapter::Yarn, "yarn", "YARN_CACHE_FOLDER"),
+        (Adapter::Npm, "npm", "npm_config_cache"),
+        (Adapter::Go, "go", "GOCACHE"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-cache"))
+            .arg("--config")
+            .arg(&config_path)
+            .args(["path", name, "--repo"])
+            .arg(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim_end(),
+            adapter.environment(&context)[variable],
+            "{name}"
+        );
+    }
 }

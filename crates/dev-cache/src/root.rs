@@ -229,7 +229,7 @@ impl RootHandle {
         self.platform_root.join("trash")
     }
     pub fn artifacts(&self) -> PathBuf {
-        self.platform_root.join("artifacts/blake3")
+        crate::util::join_slashed(&self.platform_root, "artifacts/blake3")
     }
 }
 

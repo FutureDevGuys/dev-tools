@@ -67,7 +67,8 @@ fn plain_path(path: PathBuf) -> PathBuf {
 }
 
 // `\\?\X:\...` becomes `X:\...` only where the plain form names the same
-// file: within MAX_PATH and without reserved or trailing-dot/space components.
+// file: no reserved device-name or trailing-dot/space component. Long plain
+// paths stay equivalent because std re-adds the prefix when it needs one.
 #[cfg(windows)]
 fn plain_path(path: PathBuf) -> PathBuf {
     use std::path::Prefix;
@@ -81,7 +82,7 @@ fn plain_path(path: PathBuf) -> PathBuf {
     };
     let rest = components.as_path();
     let plain = PathBuf::from(format!("{}:", letter as char)).join(rest);
-    if plain.as_os_str().len() >= 260 || !rest.components().all(plain_component) {
+    if !rest.components().all(plain_component) {
         return path;
     }
     plain
@@ -104,13 +105,34 @@ fn plain_component(component: std::path::Component<'_>) -> bool {
         .unwrap_or(name)
         .trim_end()
         .to_ascii_uppercase();
-    let reserved = matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || (stem.len() == 4
-        && (stem.starts_with("COM") || stem.starts_with("LPT"))
-        && stem.as_bytes()[3].is_ascii_digit()
-        && stem.as_bytes()[3] != b'0');
+    let mut chars = stem.chars();
+    let numbered = matches!(
+        (
+            chars.next(),
+            chars.next(),
+            chars.next(),
+            chars.next(),
+            chars.next()
+        ),
+        (
+            Some('C'),
+            Some('O'),
+            Some('M'),
+            Some('0'..='9' | '¹' | '²' | '³'),
+            None
+        ) | (
+            Some('L'),
+            Some('P'),
+            Some('T'),
+            Some('0'..='9' | '¹' | '²' | '³'),
+            None
+        )
+    );
+    let reserved = numbered
+        || matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        );
     !reserved
 }
 
@@ -151,7 +173,10 @@ mod tests {
             assert_eq!(plain(kept), Path::new(kept), "{kept}");
         }
         let long = format!(r"\\?\C:\{}", "a".repeat(260));
-        assert_eq!(plain(&long), Path::new(&long));
-        assert_eq!(plain(r"\\?\C:\com0"), Path::new(r"C:\com0"));
+        assert_eq!(plain(&long), Path::new(&long[4..]));
+        for kept in [r"\\?\C:\com0", r"\\?\C:\LPT²", r"\\?\C:\Lpt9.txt"] {
+            assert_eq!(plain(kept), Path::new(kept), "{kept}");
+        }
+        assert_eq!(plain(r"\\?\C:\com10"), Path::new(r"C:\com10"));
     }
 }

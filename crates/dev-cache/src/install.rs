@@ -433,7 +433,8 @@ pub fn activate(bin_dir: &Path, intercept_dir: &Path) -> Result<ActivationResult
     activate_on_path(bin_dir, intercept_dir, env::var_os("PATH").as_deref())
 }
 
-/// Activate the intercepts for the real commands found in `path`.
+/// Activate the intercepts for the real commands found in `path`; a test hook.
+#[doc(hidden)]
 pub fn activate_on_path(
     bin_dir: &Path,
     intercept_dir: &Path,

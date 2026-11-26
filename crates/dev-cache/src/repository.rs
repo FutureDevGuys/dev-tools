@@ -51,7 +51,8 @@ impl Repository {
         // Workspace discovery is local metadata observation. Invoking Git here
         // can enter a credential broker (or hang in a user wrapper) for every
         // compiler invocation, and makes a cache product depend on Git.
-        let worktree = native_workspace_root(&requested);
+        let worktree = crate::util::canonicalize(&native_workspace_root(&requested))
+            .context("resolve workspace root")?;
         let filesystem_identity = filesystem_identity(&worktree)?;
         let seed = format!(
             "v2\0{}\0{}\0{}",
