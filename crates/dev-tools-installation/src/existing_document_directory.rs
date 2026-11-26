@@ -280,7 +280,7 @@ impl ExistingDocumentDirectory {
         }
         match file.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if lock_is_contended(&error) => return Ok(None),
             Err(error) => return Err(error).context("acquire held resource lock"),
         }
         let lock = InstallationLock {

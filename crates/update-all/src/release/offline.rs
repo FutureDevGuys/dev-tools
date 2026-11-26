@@ -43,7 +43,7 @@ pub(super) fn validate_paths(bundle: &OfflineBundlePaths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(super) fn current_uid() -> u32 {
     // SAFETY: geteuid has no arguments, borrowed memory or failure state.
     #[allow(unsafe_code)]
@@ -192,6 +192,11 @@ fn prepare<'a>(
             "{}-{}",
             verified.root_sha256, verified.manifest_sha256
         ));
+    // `cache` and `offline-bundles` are created private (or an earlier umask-mode
+    // `cache` is admitted) instead of taking the umask mode as intermediates.
+    prepare_cache_directory(paths, uid)?;
+    let bundles_root = paths.product_root.join("cache/offline-bundles");
+    prepare_private_directory(&bundles_root, uid)?;
     dev_tools_installation::ensure_owned_directory(&cache_root, uid, 0o700)?;
     let cached = dev_tools_release::cache_verified_release(
         &cache_root,

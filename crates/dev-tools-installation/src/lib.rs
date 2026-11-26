@@ -1829,6 +1829,55 @@ pub fn ensure_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<
     }
 }
 
+/// Admit an owner-controlled directory, creating it private when absent.
+///
+/// A directory left by an earlier umask-mode creation (owner rwx, no group or
+/// other write, not already exact) is tightened to `mode` through the descriptor
+/// of a no-follow chain walk. Any other state, including a symlink, is refused
+/// by the same exact check as [`ensure_owned_directory`].
+pub fn admit_owned_directory(path: &Path, owner_uid: u32, mode: u32) -> Result<()> {
+    if mode & !0o777 != 0 {
+        bail!("installation directory mode is invalid");
+    }
+    #[cfg(target_os = "linux")]
+    match open_directory_chain(path, false) {
+        Ok((directory, _)) => {
+            let metadata =
+                rustix::fs::fstat(&directory).context("inspect installation directory")?;
+            let current = metadata.st_mode & 0o777;
+            if metadata.st_uid == owner_uid
+                && current & 0o700 == 0o700
+                && current & 0o022 == 0
+                && current != mode
+            {
+                rustix::fs::fchmod(&directory, rustix::fs::Mode::from_raw_mode(mode))
+                    .context("tighten installation directory")?;
+            }
+        }
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) => {}
+        Err(error) => return Err(error),
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let current = metadata.mode() & 0o777;
+        if metadata.file_type().is_dir()
+            && metadata.uid() == owner_uid
+            && current & 0o700 == 0o700
+            && current & 0o022 == 0
+            && current != mode
+        {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .with_context(|| format!("tighten installation directory {}", path.display()))?;
+        }
+    }
+    ensure_owned_directory(path, owner_uid, mode)
+}
+
 fn receipt_authority(layout: &VersionedLayout) -> DocumentAuthority {
     DocumentAuthority {
         owner_uid: layout.owner_uid,

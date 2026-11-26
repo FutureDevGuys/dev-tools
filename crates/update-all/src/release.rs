@@ -1094,7 +1094,17 @@ fn activate_link(product: Product, paths: &Paths, version: &str) -> Result<()> {
         );
     }
     create_private_dir(&paths.product_root)?;
-    create_private_dir(&paths.bin_dir)?;
+    // The public command directory keeps its own 0700 or 0755 mode, as in
+    // `install_managed`; it is shared with the account's other commands.
+    match fs::symlink_metadata(&paths.bin_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&paths.bin_dir)
+                .with_context(|| format!("create {}", paths.bin_dir.display()))?;
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => bail!("public command directory has unsafe filesystem authority"),
+        Err(error) => return Err(error).context("inspect public command directory"),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -1892,80 +1902,14 @@ fn prepare_product_root(paths: &Paths, owner_uid: u32) -> Result<()> {
 }
 
 // The product cache directory was previously created with the umask mode. It is
-// admitted under the same rule as the product root and created private when absent.
+// admitted under the same rule as the product root (tightened only in the recognised
+// bootstrap state, through a no-follow descriptor) and created private when absent.
 fn prepare_cache_directory(paths: &Paths, owner_uid: u32) -> Result<()> {
     prepare_private_directory(&paths.product_root.join("cache"), owner_uid)
 }
 
 fn prepare_private_directory(path: &Path, owner_uid: u32) -> Result<()> {
-    #[cfg(unix)]
-    tighten_bootstrap_directory(path, owner_uid)?;
-    dev_tools_installation::ensure_owned_directory(path, owner_uid, 0o700)
-}
-
-// Repair is limited to the recognised bootstrap state: a real directory owned by
-// the caller with owner rwx and no group/other write (for example 0755, 0750, 0711).
-// The chmod is applied to a descriptor obtained through a no-follow component walk,
-// so a concurrent substitution cannot redirect it. Everything else is left for the
-// exact check to refuse.
-#[cfg(unix)]
-fn tighten_bootstrap_directory(path: &Path, owner_uid: u32) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Some(directory) = open_directory_nofollow(path)? else {
-        return Ok(());
-    };
-    let metadata = directory.metadata().context("inspect private directory")?;
-    let mode = metadata.mode() & 0o777;
-    if metadata.is_dir()
-        && metadata.uid() == owner_uid
-        && mode & 0o700 == 0o700
-        && mode & 0o022 == 0
-        && mode != 0o700
-    {
-        directory
-            .set_permissions(fs::Permissions::from_mode(0o700))
-            .context("tighten private directory")?;
-    }
-    Ok(())
-}
-
-// Walks every component with O_NOFOLLOW from the filesystem root. A missing
-// component yields None; a symlink or non-directory component is an error.
-#[cfg(unix)]
-#[allow(unsafe_code)] // Reason: openat has no std equivalent for a descriptor-relative walk.
-fn open_directory_nofollow(path: &Path) -> Result<Option<File>> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Component;
-    if !path.is_absolute() {
-        bail!("private directory must be absolute");
-    }
-    let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY;
-    let root = CString::new("/").context("root path")?;
-    let fd = unsafe { libc::open(root.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("open filesystem root");
-    }
-    let mut current = unsafe { File::from_raw_fd(fd) };
-    for component in path.components() {
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
-            _ => bail!("private directory path is not normalized"),
-        };
-        let name = CString::new(name.as_bytes()).context("directory component")?;
-        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(error).context("open private directory component");
-        }
-        current = unsafe { File::from_raw_fd(fd) };
-    }
-    Ok(Some(current))
+    dev_tools_installation::admit_owned_directory(path, owner_uid, 0o700)
 }
 
 fn state_document_authority(paths: &Paths) -> Result<dev_tools_installation::DocumentAuthority> {
@@ -2148,11 +2092,9 @@ fn create_private_dir(path: &Path) -> Result<()> {
     builder
         .create(path)
         .with_context(|| format!("create {}", path.display()))?;
+    // An existing symlink or unexpected mode is refused here, not followed.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    prepare_private_directory(path, offline::current_uid())?;
     Ok(())
 }
 
@@ -2762,6 +2704,39 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o500);
         fs::set_permissions(&paths.product_root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_product_root_is_refused_and_target_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, &paths.product_root).unwrap();
+        assert!(fail_discovery(&paths).is_err());
+        assert!(create_private_dir(&paths.product_root).is_err());
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_cache_is_refused_and_target_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = state_test_paths(temp.path());
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&paths.product_root).unwrap();
+        std::os::unix::fs::symlink(&target, paths.product_root.join("cache")).unwrap();
+        assert!(prepare_cache_directory(&paths, offline::current_uid()).is_err());
+        assert!(create_private_dir(&paths.product_root.join("cache")).is_err());
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[cfg(unix)]
