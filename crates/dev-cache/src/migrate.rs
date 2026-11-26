@@ -10,7 +10,7 @@ use crate::lease::RootLease;
 use crate::repository::Repository;
 use crate::resources;
 use crate::root::RootHandle;
-use crate::util::{hash_file, now_unix, write_json_atomic};
+use crate::util::{hash_file, join_slashed, now_unix, write_json_atomic};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MigrationReport {
@@ -62,8 +62,7 @@ pub fn migrate_resource(
             source.display()
         );
     }
-    let source = source
-        .canonicalize()
+    let source = crate::util::canonicalize(source)
         .with_context(|| format!("resolve migration source {}", source.display()))?;
     let owned_v1 = root.root.join("v1").join(&root.platform);
     if source.starts_with(&root.root) && !source.starts_with(&owned_v1) {
@@ -325,10 +324,12 @@ fn destination(
         Adapter::Cargo => anyhow::bail!(
             "Cargo target directories mix final outputs with intermediates; rebuild with Cargo 1.91+ build-dir routing instead of migrating them"
         ),
-        Adapter::Temp => repository
-            .context("temp migration requires repository context")?
-            .cache_dir
-            .join("temp/generic"),
+        Adapter::Temp => join_slashed(
+            &repository
+                .context("temp migration requires repository context")?
+                .cache_dir,
+            "temp/generic",
+        ),
         Adapter::Sccache if resource == "default" || resource == "cache" => {
             root.shared().join("sccache")
         }
@@ -354,17 +355,17 @@ fn destination(
             root.shared().join("ccache")
         }
         Adapter::Zig if resource == "default" || resource == "global" => {
-            root.shared().join("zig/global")
+            join_slashed(&root.shared(), "zig/global")
         }
         Adapter::Meson if resource == "default" || resource == "packages" => {
-            root.shared().join("meson/packages")
+            join_slashed(&root.shared(), "meson/packages")
         }
         Adapter::Bun if resource == "default" || resource == "install" => {
-            root.shared().join("bun/install")
+            join_slashed(&root.shared(), "bun/install")
         }
-        Adapter::Bun if resource == "transpiler" => root.shared().join("bun/transpiler"),
+        Adapter::Bun if resource == "transpiler" => join_slashed(&root.shared(), "bun/transpiler"),
         Adapter::Yarn if resource == "default" || resource == "classic" => {
-            root.shared().join("yarn/classic")
+            join_slashed(&root.shared(), "yarn/classic")
         }
         _ => bail!("unsupported migration resource '{resource}' for {adapter:?}"),
     })

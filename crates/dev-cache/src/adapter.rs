@@ -5,6 +5,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::provenance;
+use crate::util::join_slashed;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -45,8 +46,7 @@ impl Adapter {
                     .unwrap_or_else(|| std::ffi::OsStr::new("workspace"));
                 values.push((
                     "CARGO_BUILD_BUILD_DIR",
-                    shared
-                        .join("cargo/intermediate")
+                    join_slashed(shared, "cargo/intermediate")
                         .join(workspace)
                         .join("{workspace-path-hash}"),
                 ));
@@ -68,7 +68,7 @@ impl Adapter {
             Self::Go => {
                 values.push(("GOCACHE", shared.join("go-build")));
                 values.push(("GOMODCACHE", shared.join("go-mod")));
-                values.push(("GOTMPDIR", repo.join("temp/go")));
+                values.push(("GOTMPDIR", join_slashed(repo, "temp/go")));
             }
             Self::Npm => {
                 if !context.inherited.keys().any(|key| {
@@ -89,24 +89,27 @@ impl Adapter {
             Self::Pip => values.push(("PIP_CACHE_DIR", shared.join("pip"))),
             Self::Ccache => {
                 values.push(("CCACHE_DIR", shared.join("ccache")));
-                values.push(("CCACHE_TEMPDIR", repo.join("temp/ccache")));
+                values.push(("CCACHE_TEMPDIR", join_slashed(repo, "temp/ccache")));
             }
             Self::Zig => {
-                values.push(("ZIG_GLOBAL_CACHE_DIR", shared.join("zig/global")));
-                values.push(("ZIG_LOCAL_CACHE_DIR", repo.join("zig/local")));
+                values.push(("ZIG_GLOBAL_CACHE_DIR", join_slashed(shared, "zig/global")));
+                values.push(("ZIG_LOCAL_CACHE_DIR", join_slashed(repo, "zig/local")));
             }
             Self::Meson => {
-                values.push(("MESON_PACKAGE_CACHE_DIR", shared.join("meson/packages")));
-            }
-            Self::Bun => {
-                values.push(("BUN_INSTALL_CACHE_DIR", shared.join("bun/install")));
                 values.push((
-                    "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
-                    shared.join("bun/transpiler"),
+                    "MESON_PACKAGE_CACHE_DIR",
+                    join_slashed(shared, "meson/packages"),
                 ));
             }
-            Self::Yarn => values.push(("YARN_CACHE_FOLDER", shared.join("yarn/classic"))),
-            Self::Temp => values.extend(temp_values(repo.join("temp/generic"))),
+            Self::Bun => {
+                values.push(("BUN_INSTALL_CACHE_DIR", join_slashed(shared, "bun/install")));
+                values.push((
+                    "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+                    join_slashed(shared, "bun/transpiler"),
+                ));
+            }
+            Self::Yarn => values.push(("YARN_CACHE_FOLDER", join_slashed(shared, "yarn/classic"))),
+            Self::Temp => values.extend(temp_values(join_slashed(repo, "temp/generic"))),
         }
         values
             .into_iter()

@@ -45,8 +45,7 @@ impl RootHandle {
         let path = crate::util::path_from_home(path);
         fs::create_dir_all(&path)
             .with_context(|| format!("create cache root {}", path.display()))?;
-        let canonical = path
-            .canonicalize()
+        let canonical = crate::util::canonicalize(&path)
             .with_context(|| format!("resolve cache root {}", path.display()))?;
         let marker_path = canonical.join(MARKER_NAME);
         if marker_path.exists() {
@@ -100,8 +99,7 @@ impl RootHandle {
         if !requested.is_dir() {
             bail!("configured cache root is missing: {}", requested.display());
         }
-        let canonical = requested
-            .canonicalize()
+        let canonical = crate::util::canonicalize(&requested)
             .with_context(|| format!("resolve cache root {}", requested.display()))?;
         let marker_path = canonical.join(MARKER_NAME);
         let mut marker = read_marker(&marker_path, &canonical)?;
@@ -184,11 +182,12 @@ impl RootHandle {
                 requested.display()
             );
         }
-        let parent = requested
-            .parent()
-            .context("replacement cache root has no parent")?
-            .canonicalize()
-            .with_context(|| format!("resolve replacement parent for {}", requested.display()))?;
+        let parent = crate::util::canonicalize(
+            requested
+                .parent()
+                .context("replacement cache root has no parent")?,
+        )
+        .with_context(|| format!("resolve replacement parent for {}", requested.display()))?;
         let leaf = requested
             .file_name()
             .context("replacement cache root has no final component")?;
@@ -230,7 +229,7 @@ impl RootHandle {
         self.platform_root.join("trash")
     }
     pub fn artifacts(&self) -> PathBuf {
-        self.platform_root.join("artifacts/blake3")
+        crate::util::join_slashed(&self.platform_root, "artifacts/blake3")
     }
 }
 
@@ -342,7 +341,7 @@ fn marker_lock(root: &Path) -> Result<fs::File> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if crate::lease::lock_is_contended(&error) => {
                 if std::time::Instant::now() >= deadline {
                     bail!("cache-root marker is busy; retry the operation");
                 }

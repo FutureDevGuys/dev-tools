@@ -25,7 +25,7 @@ use crate::provenance;
 use crate::repository::Repository;
 use crate::resources::{self, NativeTool};
 use crate::root::RootHandle;
-use crate::util::{now_unix, write_json_atomic};
+use crate::util::{join_slashed, now_unix, write_json_atomic};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -575,7 +575,7 @@ fn init_root(cli: &Cli, root_path: &Path, force_config: bool) -> Result<i32> {
             .root
             .as_deref()
             .map(crate::util::path_from_home)
-            .and_then(|configured| configured.canonicalize().ok());
+            .and_then(|configured| crate::util::canonicalize(&configured).ok());
         if existing_root.as_deref() == Some(root.root.as_path()) {
             print_value(
                 cli.json,
@@ -1282,10 +1282,11 @@ fn path_command(
         }
         let real = cargo_intercept::resolve_real_cargo(config, &env::current_exe()?)?;
         let args = [OsString::from("build")];
-        let cwd = repo_path
-            .map(Path::to_path_buf)
-            .unwrap_or(env::current_dir()?)
-            .canonicalize()?;
+        let cwd = crate::util::canonicalize(
+            &repo_path
+                .map(Path::to_path_buf)
+                .unwrap_or(env::current_dir()?),
+        )?;
         if !cargo_intercept::cargo_build_dir_capability(&real, &args, Some(&cwd))? {
             bail!("retained Cargo output routing requires Cargo 1.91 or newer");
         }
@@ -1321,8 +1322,7 @@ fn adapter_path(root: &RootHandle, adapter: Adapter, repo_path: Option<&Path>) -
     Ok(match adapter {
         Adapter::Cargo => {
             let workspace = repository.context("Cargo adapter requires workspace context")?;
-            root.shared()
-                .join("cargo/intermediate")
+            join_slashed(&root.shared(), "cargo/intermediate")
                 .join(
                     workspace
                         .cache_dir
@@ -1331,10 +1331,12 @@ fn adapter_path(root: &RootHandle, adapter: Adapter, repo_path: Option<&Path>) -
                 )
                 .join("{workspace-path-hash}")
         }
-        Adapter::Temp => repository
-            .context("temp adapter requires repository context")?
-            .cache_dir
-            .join("temp/generic"),
+        Adapter::Temp => join_slashed(
+            &repository
+                .context("temp adapter requires repository context")?
+                .cache_dir,
+            "temp/generic",
+        ),
         Adapter::Sccache => root.shared().join("sccache"),
         Adapter::Go => root.shared().join("go-build"),
         Adapter::Npm => root.shared().join("npm"),
@@ -1343,9 +1345,9 @@ fn adapter_path(root: &RootHandle, adapter: Adapter, repo_path: Option<&Path>) -
         Adapter::Pip => root.shared().join("pip"),
         Adapter::Ccache => root.shared().join("ccache"),
         Adapter::Zig => root.shared().join("zig"),
-        Adapter::Meson => root.shared().join("meson/packages"),
-        Adapter::Bun => root.shared().join("bun/install"),
-        Adapter::Yarn => root.shared().join("yarn/classic"),
+        Adapter::Meson => join_slashed(&root.shared(), "meson/packages"),
+        Adapter::Bun => join_slashed(&root.shared(), "bun/install"),
+        Adapter::Yarn => join_slashed(&root.shared(), "yarn/classic"),
     })
 }
 
@@ -2565,9 +2567,7 @@ fn cargo_routing(
             status = format!(
                 "routing active; workspace={}; build-dir={}",
                 repository.worktree.display(),
-                root.shared()
-                    .join("cargo/intermediate/{workspace-path-hash}")
-                    .display()
+                join_slashed(&root.shared(), "cargo/intermediate/{workspace-path-hash}").display()
             );
             provenance::attach(&inherited, &mut environment, "cargo");
             routed.extend(environment);

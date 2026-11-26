@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -159,7 +160,10 @@ pub fn activation_audit(intercept_dir: &Path) -> ActivationAudit {
         .iter()
         .map(|spec| spec.command.to_owned())
         .collect();
-    commands.extend(discovered_versioned_commands(intercept_dir));
+    commands.extend(discovered_versioned_commands(
+        intercept_dir,
+        env::var_os("PATH").as_deref(),
+    ));
     commands.sort();
     commands.dedup();
     let entrypoints = commands
@@ -312,12 +316,12 @@ fn audit_entrypoint(
     }
 }
 
-fn discovered_versioned_commands(intercept_dir: &Path) -> Vec<String> {
+fn discovered_versioned_commands(intercept_dir: &Path, path: Option<&OsStr>) -> Vec<String> {
     let mut commands = Vec::new();
-    let Some(path) = env::var_os("PATH") else {
+    let Some(path) = path else {
         return commands;
     };
-    for directory in env::split_paths(&path) {
+    for directory in env::split_paths(path) {
         if fs::canonicalize(&directory).ok() == fs::canonicalize(intercept_dir).ok() {
             continue;
         }
@@ -426,6 +430,16 @@ fn write_install_ownership(target: &Path, digest: String) -> Result<()> {
 }
 
 pub fn activate(bin_dir: &Path, intercept_dir: &Path) -> Result<ActivationResult> {
+    activate_on_path(bin_dir, intercept_dir, env::var_os("PATH").as_deref())
+}
+
+/// Activate the intercepts for the real commands found in `path`; a test hook.
+#[doc(hidden)]
+pub fn activate_on_path(
+    bin_dir: &Path,
+    intercept_dir: &Path,
+    path: Option<&OsStr>,
+) -> Result<ActivationResult> {
     let installed = bin_dir.join(if cfg!(windows) {
         "dev-cache.exe"
     } else {
@@ -440,7 +454,7 @@ pub fn activate(bin_dir: &Path, intercept_dir: &Path) -> Result<ActivationResult
     fs::create_dir_all(intercept_dir)?;
     let target = intercept_dir.join(command_name("cargo"));
     let rustup_target = intercept_dir.join(command_name("rustup"));
-    let commands = installed_intercept_commands(intercept_dir);
+    let commands = installed_intercept_commands(intercept_dir, path);
     let targets: Vec<PathBuf> = commands
         .iter()
         .map(|command| intercept_dir.join(command_name(command)))
@@ -549,28 +563,28 @@ pub fn intercept_is_first_on_path(intercept_dir: &Path) -> bool {
         .is_some_and(|first| fs::canonicalize(first).ok() == fs::canonicalize(intercept_dir).ok())
 }
 
-fn installed_intercept_commands(intercept_dir: &Path) -> Vec<String> {
+fn installed_intercept_commands(intercept_dir: &Path, path: Option<&OsStr>) -> Vec<String> {
     let mut commands: Vec<String> = entrypoint::STATIC_ENTRYPOINTS
         .iter()
         .filter(|spec| {
-            real_command_exists(spec.command, intercept_dir)
+            real_command_exists(spec.command, intercept_dir, path)
                 && spec
                     .requires_command
-                    .is_none_or(|command| real_command_exists(command, intercept_dir))
+                    .is_none_or(|command| real_command_exists(command, intercept_dir, path))
         })
         .map(|spec| spec.command.to_owned())
         .collect();
-    commands.extend(discovered_versioned_commands(intercept_dir));
+    commands.extend(discovered_versioned_commands(intercept_dir, path));
     commands.sort();
     commands.dedup();
     commands
 }
 
-fn real_command_exists(command: &str, intercept_dir: &Path) -> bool {
-    let Some(path) = env::var_os("PATH") else {
+fn real_command_exists(command: &str, intercept_dir: &Path, path: Option<&OsStr>) -> bool {
+    let Some(path) = path else {
         return false;
     };
-    env::split_paths(&path).any(|directory| {
+    env::split_paths(path).any(|directory| {
         fs::canonicalize(&directory).ok() != fs::canonicalize(intercept_dir).ok()
             && real_command_candidates(&directory, command)
                 .into_iter()
