@@ -863,19 +863,17 @@ fn same_location_accepts_equivalent_parent_paths_but_not_other_names() {
 
 #[test]
 fn path_prepend_is_platform_encoded_and_rejects_non_absolute_directory() {
-    let inherited = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
-    let value = prepend_path(
-        Path::new("/opt/dev-auth/session-bin"),
-        Some(OsStr::new(&inherited)),
-    )
-    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (session, first, second) = (
+        root.path().join("session-bin"),
+        root.path().join("usr").join("bin"),
+        root.path().join("bin"),
+    );
+    let inherited = std::env::join_paths([&first, &second]).unwrap();
+    let value = prepend_path(&session, Some(OsStr::new(&inherited))).unwrap();
     assert_eq!(
         std::env::split_paths(&value).collect::<Vec<PathBuf>>(),
-        vec![
-            PathBuf::from("/opt/dev-auth/session-bin"),
-            PathBuf::from("/usr/bin"),
-            PathBuf::from("/bin")
-        ]
+        vec![session, first, second]
     );
     assert!(prepend_path(Path::new("relative/bin"), None).is_err());
 }

@@ -20,6 +20,28 @@ use dev_cache::repository::Repository;
 use dev_cache::resources::{self, NativeTool, ResourceKind};
 use dev_cache::root::RootHandle;
 
+/// Publish a command that `PATH` resolution finds; its behavior is irrelevant.
+fn write_placeholder_command(directory: &Path, name: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join(name);
+        fs::write(&path, "#!/bin/sh\n").expect("placeholder command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable mode");
+    }
+    #[cfg(windows)]
+    fs::write(directory.join(format!("{name}.exe")), b"").expect("placeholder command");
+}
+
+/// Expected routed value: `base` plus `relative`, joined with the platform separator.
+fn native_join(base: &str, relative: &str) -> String {
+    relative
+        .split('/')
+        .fold(PathBuf::from(base), |path, part| path.join(part))
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(unix)]
 fn create_executable_alias(path: &Path) {
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dev-cache"), path)
@@ -284,19 +306,19 @@ fn bun_and_yarn_route_only_independently_disposable_caches() {
     let bun = Adapter::Bun.environment(&context);
     assert_eq!(
         bun.get("BUN_INSTALL_CACHE_DIR").map(String::as_str),
-        Some("/root/cache/bun/install")
+        Some(native_join("/root/cache", "bun/install").as_str())
     );
     assert_eq!(
         bun.get("BUN_RUNTIME_TRANSPILER_CACHE_PATH")
             .map(String::as_str),
-        Some("/root/cache/bun/transpiler")
+        Some(native_join("/root/cache", "bun/transpiler").as_str())
     );
     assert!(!bun.keys().any(|key| key.contains("INSTALL_DIR")));
 
     let yarn = Adapter::Yarn.environment(&context);
     assert_eq!(
         yarn.get("YARN_CACHE_FOLDER").map(String::as_str),
-        Some("/root/cache/yarn/classic")
+        Some(native_join("/root/cache", "yarn/classic").as_str())
     );
     assert_eq!(yarn.len(), 1);
 }
@@ -348,7 +370,7 @@ fn nested_routing_replaces_only_values_with_exact_managed_provenance() {
     });
     assert_eq!(
         managed.get("GOTMPDIR").map(String::as_str),
-        Some("/root/workspaces/new/temp/go")
+        Some(native_join("/root/workspaces/new", "temp/go").as_str())
     );
 
     let mut changed = upstream;
@@ -372,7 +394,10 @@ fn npm_cache_routing_preserves_native_case_insensitive_overrides_and_managed_pro
     let mut managed = Adapter::Npm.environment(&context);
     assert_eq!(
         managed,
-        HashMap::from([("npm_config_cache".to_owned(), "/root/cache/npm".to_owned())])
+        HashMap::from([(
+            "npm_config_cache".to_owned(),
+            native_join("/root/cache", "npm")
+        )])
     );
     provenance::attach(&context.inherited, &mut managed, "npm");
     context.shared_cache = PathBuf::from("/replacement/cache");
@@ -381,7 +406,7 @@ fn npm_cache_routing_preserves_native_case_insensitive_overrides_and_managed_pro
         Adapter::Npm.environment(&context),
         HashMap::from([(
             "npm_config_cache".to_owned(),
-            "/replacement/cache/npm".to_owned()
+            native_join("/replacement/cache", "npm")
         )])
     );
     for key in ["npm_config_cache", "NPM_CONFIG_CACHE", "Npm_Config_Cache"] {
@@ -410,7 +435,7 @@ fn cache_root_relocation_is_atomic_and_preserves_domain_identity() {
     assert!(!original.exists());
     assert_eq!(
         relocated.root,
-        replacement.canonicalize().expect("canonical replacement")
+        dev_cache::util::canonicalize(&replacement).expect("canonical replacement")
     );
     assert_eq!(relocated.domain_id, domain_id);
     assert_eq!(
@@ -499,11 +524,11 @@ fn adapters_preserve_explicit_native_environment() {
     assert!(!routed.contains_key("GOCACHE"));
     assert_eq!(
         routed.get("GOMODCACHE").map(String::as_str),
-        Some("/root/shared/go-mod")
+        Some(native_join("/root/shared", "go-mod").as_str())
     );
     assert_eq!(
         routed.get("GOTMPDIR").map(String::as_str),
-        Some("/root/repos/id/temp/go")
+        Some(native_join("/root/repos/id", "temp/go").as_str())
     );
 }
 
@@ -520,9 +545,12 @@ fn cargo_routes_only_intermediate_artifacts_with_native_workspace_hashing() {
     assert_eq!(
         routed.get("CARGO_BUILD_BUILD_DIR").map(String::as_str),
         Some(
-            format!(
-                "/root/shared/cargo/intermediate/{}/{{workspace-path-hash}}",
-                "a".repeat(160)
+            native_join(
+                "/root/shared",
+                &format!(
+                    "cargo/intermediate/{}/{{workspace-path-hash}}",
+                    "a".repeat(160)
+                )
             )
             .as_str()
         )
@@ -635,7 +663,7 @@ fn workspace_scope_exists_outside_git_and_uses_an_opaque_directory_name() {
         .expect("non-Git workspace");
     assert_eq!(
         workspace.worktree,
-        project.canonicalize().expect("canonical project")
+        dev_cache::util::canonicalize(&project).expect("canonical project")
     );
     let leaf = workspace
         .cache_dir
@@ -907,13 +935,24 @@ fn migration_removes_read_only_build_directories_after_copying() {
     assert!(applied.destination.join("locked/cache.bin").is_file());
 }
 
+/// A `PATH` holding only placeholder Cargo and Rustup commands.
+fn real_cargo_path(temp: &tempfile::TempDir) -> std::ffi::OsString {
+    let upstream = temp.path().join("upstream");
+    fs::create_dir(&upstream).expect("upstream directory");
+    write_placeholder_command(&upstream, "cargo");
+    write_placeholder_command(&upstream, "rustup");
+    std::env::join_paths([upstream]).expect("test PATH")
+}
+
 #[test]
 fn install_activation_owns_only_its_alias() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let bin = temp.path().join("bin");
     let intercept = temp.path().join("intercepts");
+    let path = real_cargo_path(&temp);
     install::install(&bin).expect("install current test executable");
-    let activation = install::activate(&bin, &intercept).expect("activate Cargo alias");
+    let activation =
+        install::activate_on_path(&bin, &intercept, Some(&path)).expect("activate Cargo alias");
     assert!(activation.changed);
     let cargo = activation.target;
     assert!(cargo.is_file());
@@ -929,8 +968,10 @@ fn deactivation_preflights_every_alias_before_removing_any() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let bin = temp.path().join("bin");
     let intercept = temp.path().join("intercepts");
+    let path = real_cargo_path(&temp);
     install::install(&bin).expect("install current test executable");
-    let activation = install::activate(&bin, &intercept).expect("activate aliases");
+    let activation =
+        install::activate_on_path(&bin, &intercept, Some(&path)).expect("activate aliases");
     fs::remove_file(&activation.rustup_target).expect("replace Rustup alias");
     fs::write(&activation.rustup_target, b"unknown rustup").expect("unknown Rustup");
 
@@ -1012,8 +1053,10 @@ fn activation_refreshes_an_owned_alias_after_binary_upgrade() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let bin = temp.path().join("bin");
     let intercept = temp.path().join("intercepts");
+    let path = real_cargo_path(&temp);
     let installed = install::install(&bin).expect("install current test executable");
-    let first = install::activate(&bin, &intercept).expect("initial activation");
+    let first =
+        install::activate_on_path(&bin, &intercept, Some(&path)).expect("initial activation");
     assert!(first.changed);
     let canonical_marker = intercept.join(if cfg!(windows) {
         "cargo.exe.dev-cache-intercept.json"
@@ -1026,7 +1069,8 @@ fn activation_refreshes_an_owned_alias_after_binary_upgrade() {
     fs::remove_file(&installed).expect("replace installed binary inode");
     fs::write(&installed, &upgraded).expect("simulate installer upgrade");
 
-    let refreshed = install::activate(&bin, &intercept).expect("refresh activation");
+    let refreshed =
+        install::activate_on_path(&bin, &intercept, Some(&path)).expect("refresh activation");
     assert!(refreshed.changed);
     assert_eq!(
         fs::read(refreshed.target).expect("read refreshed alias"),
@@ -2831,12 +2875,16 @@ fn status_reports_an_intentionally_empty_native_override() {
         toml::to_string(&config).expect("serialize config"),
     )
     .expect("write config");
+    let upstream = temp.path().join("upstream");
+    fs::create_dir(&upstream).expect("upstream directory");
+    write_placeholder_command(&upstream, "go");
 
     let output = Command::new(env!("CARGO_BIN_EXE_dev-cache"))
         .args(["--json", "--config"])
         .arg(&config_path)
         .arg("status")
         .env("GOCACHE", "")
+        .env("PATH", &upstream)
         .output()
         .expect("inspect status overrides");
     assert!(
@@ -2858,7 +2906,7 @@ fn status_reports_an_intentionally_empty_native_override() {
         .iter()
         .any(|path| path
             .as_str()
-            .is_some_and(|path| path.ends_with("/go-build"))));
+            .is_some_and(|path| Path::new(path).ends_with("go-build"))));
 }
 
 #[cfg(unix)]
@@ -2916,13 +2964,8 @@ fn garbage_collection_is_dry_run_first_and_honors_active_leases() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = RootHandle::initialize(&temp.path().join("cache-root")).expect("cache root");
     let repo = temp.path().join("repo");
-    fs::create_dir(&repo).expect("repository directory");
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo)
-        .status()
-        .expect("git init")
-        .success());
+    fs::create_dir_all(repo.join(".git/objects")).expect("Git worktree marker");
+    fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").expect("Git HEAD");
     let repository = Repository::discover(&repo, &root)
         .expect("discover repository")
         .expect("Git worktree");
@@ -3947,7 +3990,10 @@ fn workspace_discovery_preserves_git_boundaries_without_a_git_process() {
             fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         }
         let discovered = Repository::discover(&nested, &root).unwrap().unwrap();
-        assert_eq!(discovered.worktree, project.canonicalize().unwrap());
+        assert_eq!(
+            discovered.worktree,
+            dev_cache::util::canonicalize(&project).unwrap()
+        );
         // A submodule/nested worktree has its own scope.
         let module = temp.path().join("metadata/modules/crate");
         fs::create_dir_all(module.join("objects")).unwrap();
@@ -3960,7 +4006,7 @@ fn workspace_discovery_preserves_git_boundaries_without_a_git_process() {
         let nested_scope = Repository::discover(&nested, &root).unwrap().unwrap();
         assert_eq!(
             nested_scope.worktree,
-            project.join("crate").canonicalize().unwrap()
+            dev_cache::util::canonicalize(&project.join("crate")).unwrap()
         );
     }
 }
@@ -3978,7 +4024,7 @@ fn malformed_git_markers_do_not_capture_unrelated_workspaces() {
             .unwrap()
             .unwrap()
             .worktree,
-        project.canonicalize().unwrap()
+        dev_cache::util::canonicalize(&project).unwrap()
     );
     fs::write(project.join("src/.git"), "gitdir: missing\n").unwrap();
     assert_eq!(
@@ -3986,6 +4032,6 @@ fn malformed_git_markers_do_not_capture_unrelated_workspaces() {
             .unwrap()
             .unwrap()
             .worktree,
-        project.canonicalize().unwrap()
+        dev_cache::util::canonicalize(&project).unwrap()
     );
 }
