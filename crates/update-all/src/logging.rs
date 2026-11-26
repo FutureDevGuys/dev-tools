@@ -744,6 +744,10 @@ fn write_owner_only(path: &Path, payload: &[u8]) -> Result<()> {
         .as_file_mut()
         .flush()
         .with_context(|| format!("flush {} (staged)", path.display()))?;
+    // Windows cannot replace a leaf while any handle to it is open; publication
+    // below still rechecks that the leaf is unchanged.
+    #[cfg(windows)]
+    drop(_previous_write_access);
     publish_artifact(staged, path, previous.as_ref())
 }
 

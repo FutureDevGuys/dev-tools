@@ -13,10 +13,21 @@ fn fixture_process(home: &TempDir) -> std::process::Command {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_STATE_HOME", home.path().join("state"))
-        .env("PATH", "/usr/bin:/bin")
+        .env("APPDATA", home.path().join("config"))
+        .env("PATH", fixture_path())
         .env_remove("UPDATE_ALL_ROOT_URL")
         .env_remove("UPDATE_ALL_MANIFEST_URL");
     command
+}
+
+fn fixture_path() -> std::ffi::OsString {
+    if cfg!(windows) {
+        std::path::Path::new(&std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .into_os_string()
+    } else {
+        "/usr/bin:/bin".into()
+    }
 }
 
 #[test]
@@ -129,13 +140,22 @@ fn external_catalog_namespace_is_loaded_without_a_checkout() {
         r#"
 [tasks."local/demo"]
 label = "Local Demo"
-os = ["linux"]
+os = ["linux", "macos", "windows"]
 detect_mode = "command_available"
 category = "maintenance"
-command = "sh"
-args = ["-c", "printf 'demo complete\\n'"]
+command = "{command}"
+args = {args}
 policy_key = "tool_update"
-"#,
+"#
+        .replace("{command}", if cfg!(windows) { "cmd" } else { "sh" })
+        .replace(
+            "{args}",
+            if cfg!(windows) {
+                r#"["/c", "echo demo complete"]"#
+            } else {
+                r#"["-c", "printf 'demo complete\\n'"]"#
+            },
+        ),
     )
     .unwrap();
     command(&home)

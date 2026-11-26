@@ -39,12 +39,13 @@ fn external_catalog_runtime_tokens_expand_without_a_source_checkout() {
         Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
         None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
+    // The expansion simulates a Unix host, so build the expectation with Unix suffixes.
     assert_eq!(
         expanded,
         format!(
-            "{}/.local/libexec/syscfg/tool --config {}/.config/syscfg/tool.toml",
-            temp.path().display(),
-            temp.path().display()
+            "{}/syscfg/tool --config {}/syscfg/tool.toml",
+            temp.path().join(".local/libexec").display(),
+            temp.path().join(".config").display()
         )
     );
 }
@@ -5844,7 +5845,11 @@ fn truthful_operation_reports_preserve_observed_versions_and_change_uncertainty(
     assert_eq!(row.name, "skills-sync");
     assert!(row.before.is_none());
     assert_eq!(row.after.as_deref(), Some("0.2.0"));
-    assert!(row.note.as_deref().unwrap().contains("Installed version retained"));
+    assert!(row
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("Installed version retained"));
     assert!(!row.note.as_deref().unwrap().contains("up to date"));
     let diagnostic = build_command_report_sections(parser, "{\"product\":\"example\",\"version\":\"2.0\",\"managed\":true,\"changed\":false,\"outcome\":\"no_op\"}\nwarning: fixture diagnostic\n");
     assert_eq!(diagnostic.len(), 1);
