@@ -3198,12 +3198,6 @@ fn validate_existing_directory_chain(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// Windows reports a held lock as ERROR_LOCK_VIOLATION, which is not WouldBlock.
-fn lock_is_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-}
-
 fn sync_directory(path: &Path) -> Result<()> {
     let mut options = OpenOptions::new();
     options.read(true);
