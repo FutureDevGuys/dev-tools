@@ -2134,7 +2134,7 @@ fn structured_item_colors_follow_the_shared_roles_and_never_leak_when_color_is_o
                 },
                 TaskReportRow {
                     name: "tmux-sensible".to_string(),
-                    status: TaskReportStatus::Refreshed,
+                    status: TaskReportStatus::Failed,
                     before: None,
                     after: None,
                     note: None,
@@ -2174,6 +2174,15 @@ fn structured_item_colors_follow_the_shared_roles_and_never_leak_when_color_is_o
             );
         }
         assert!(joined.contains(action), "{view} action: {joined}");
+        assert!(
+            joined.contains("\x1b[1;32mUpdated"),
+            "{view} updated: {joined}"
+        );
+        // A failed item reads "Error" in the task log and "Failed" in the rollup, in red.
+        assert!(
+            joined.contains("\x1b[1;31mError") || joined.contains("\x1b[1;31mFailed"),
+            "{view} failed: {joined}"
+        );
         // Color is additive: stripping it yields the exact uncolored report.
         let stripped = colored_text
             .iter()
@@ -2206,6 +2215,14 @@ fn structured_item_colors_follow_the_shared_roles_and_never_leak_when_color_is_o
             None => std::env::remove_var(name),
         }
     }
+}
+
+#[test]
+fn empty_no_color_does_not_disable_color() {
+    use std::ffi::OsStr;
+    assert!(!no_color_requested(None));
+    assert!(!no_color_requested(Some(OsStr::new(""))));
+    assert!(no_color_requested(Some(OsStr::new("1"))));
 }
 
 #[test]

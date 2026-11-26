@@ -14689,10 +14689,16 @@ fn stdout_supports_color() -> bool {
     let term = std::env::var("TERM").ok();
     terminal_supports_color(
         stdout_is_tty,
-        std::env::var_os("NO_COLOR").is_some(),
+        no_color_requested(std::env::var_os("NO_COLOR").as_deref()),
         term.as_deref(),
         windows_color_hint(),
     )
+}
+
+/// NO_COLOR disables color when it is set to a non-empty value (no-color.org); an empty
+/// value is treated as unset, as the dashboard's terminal backend does.
+fn no_color_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 fn terminal_supports_color(

@@ -3901,7 +3901,10 @@ fn stylize_report_note_line(line: &str, base_style: Style) -> Option<Vec<Span<'s
 }
 
 fn report_item_style(role: super::ReportItemRole) -> Style {
-    Style::default().fg(Color::from_crossterm(role.color()))
+    // Bold, like the outcome cells and the ANSI task log and rollup.
+    Style::default()
+        .fg(Color::from_crossterm(role.color()))
+        .add_modifier(Modifier::BOLD)
 }
 
 fn stylize_box_table_row(line: &str, base_style: Style) -> Option<Vec<Span<'static>>> {

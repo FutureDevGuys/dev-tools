@@ -1,6 +1,6 @@
 # Active work
 
-- Update All structured item reporting and dashboard colors need a signed release and managed installation. Source changes are in #119, #120, and the action-color change. The installed release is still 0.1.20.
+- Update All structured item reporting and dashboard colors need a signed release and managed installation. Source changes are in #119, #120, #121 (colors) and the Claude review pass that follows it (shared item-role colors, magenta action, empty NO_COLOR). The installed release is still 0.1.20.
 
 - Update All generic lock diagnostics, PR #116: source and controlled Linux CLI validation pass. One socket fixture remains blocked by the cloud sandbox and fails identically on baseline. Release and desktop installation remain pending; no installed product changed.
 
