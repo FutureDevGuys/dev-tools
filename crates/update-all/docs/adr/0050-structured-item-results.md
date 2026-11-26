@@ -16,7 +16,7 @@ A task footer describes the aggregate outcome but cannot say which operations co
 
 A command can emit one `UPDATE_ALL_ITEM` JSON record per observed item before its existing `UPDATE_ALL_RESULT` v1 footer. Each item supplies a subject, a lowercase action identifier, an outcome, and optional observed before and after identities. The runner groups rows by action using its existing report sections. The same report data reaches task logs, final rollups, and persisted run artifacts.
 
-Task logs and the final rollup show the action alongside each structured item. Color-capable displays use white for the subject, cyan for the action, and the existing outcome palette.
+Task logs and the final rollup show the action alongside each structured item. Color-capable displays use white for the subject, magenta for the action (a color no outcome uses, so the two cells never look alike), and the existing outcome palette. One shared role mapping supplies these colors to the task log, the rollup, and the dashboard.
 
 ## Invariants
 

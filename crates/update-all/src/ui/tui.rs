@@ -13,7 +13,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{CrosstermBackend, FromCrossterm};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -3741,8 +3741,8 @@ fn stylize_report_table_columns(
             let mut style = base_style;
             if kind == ReportStyleKind::OperationItems && !header {
                 style = match idx {
-                    0 => Style::default().fg(Color::White).patch(base_style),
-                    1 => Style::default().fg(Color::Cyan).patch(base_style),
+                    0 => report_item_style(super::ReportItemRole::Subject).patch(base_style),
+                    1 => report_item_style(super::ReportItemRole::Action).patch(base_style),
                     _ => style,
                 };
             }
@@ -3900,6 +3900,10 @@ fn stylize_report_note_line(line: &str, base_style: Style) -> Option<Vec<Span<'s
     Some(spans)
 }
 
+fn report_item_style(role: super::ReportItemRole) -> Style {
+    Style::default().fg(Color::from_crossterm(role.color()))
+}
+
 fn stylize_box_table_row(line: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
     if !line.trim_start().starts_with('│') {
         return None;
@@ -3912,8 +3916,8 @@ fn stylize_box_table_row(line: &str, base_style: Style) -> Option<Vec<Span<'stat
         && !cells[3].trim().is_empty()
     {
         cell_styles.extend([
-            (2, Style::default().fg(Color::White)),
-            (3, Style::default().fg(Color::Cyan)),
+            (2, report_item_style(super::ReportItemRole::Subject)),
+            (3, report_item_style(super::ReportItemRole::Action)),
         ]);
     }
     let mut cell_idx = 0usize;
