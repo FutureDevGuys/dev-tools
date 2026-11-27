@@ -976,6 +976,7 @@ dependencies = [
 name = "dev-auth-sudo"
 version = "0.5.5"
 dependencies = [
+ "dev-tools-command",
  "nix 0.31.3",
  "serde",
  "serde_json",

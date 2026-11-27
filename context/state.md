@@ -4,15 +4,7 @@
 
 - Update All generic lock diagnostics, PR #116: source and controlled Linux CLI validation pass. One socket fixture remains blocked by the cloud sandbox and fails identically on baseline. Release and desktop installation remain pending; no installed product changed.
 
-- **Dev Auth lifecycle gaps (#105)** on branch `fix/dev-auth-lifecycle-edges-20261024`. The branch is one work-in-progress commit; rewrite it into reviewed commits before its pull request. It covers six items:
-  - a PolicyKit restart must not end grants;
-  - an abnormal coordinator exit restarts the coordinator;
-  - a rollback keeps the binary and its unit in step;
-  - per-job task limits and a systemd-oomd preference;
-  - the flaky packet test;
-  - a rerun message for `exec` while the coordinator drains.
-
-  Remaining: the approval-classification test and the issue's unfinished items, then a merge-commit pull request.
+- **Dev Auth lifecycle gaps (#105)**, pull request #124 on branch `fix/dev-auth-lifecycle-105`, closes #105 and waits for review and a merge commit. Its six items and ADR 0144 are in the pull request. Native acceptance of the lifecycle edges is pending, and two tests fail identically on `main` on the development host: the managed Git clone credential test and the `grant_cli` template help test. Release 0.5.6 and installation wait on the owner.
 - **Dev Auth 0.5.6**, after #105 merges.
   - Advance `crates/dev-auth` and `crates/dev-auth-sudo` to 0.5.6 with `Cargo.lock`.
   - Then build twice, compare, verify and publish through the approved release-builder workload; that step waits on the owner's approval. The newest published release is 0.5.5.

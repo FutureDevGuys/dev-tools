@@ -41,3 +41,8 @@ mod sudo_wire;
 #[cfg(target_os = "linux")]
 #[path = "../../dev-auth/src/strict_serde.rs"]
 mod strict_serde;
+
+// Tests that observe a descriptor's release run in a process of their own.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../dev-auth/src/test_isolation.rs"]
+mod test_isolation;

@@ -1,7 +1,7 @@
 [Unit]
 Description=Dev Auth explicitly approved administrator grants
 After=polkit.service systemd-logind.service
-Requires=polkit.service
+Wants=polkit.service
 
 [Service]
 Type=simple
@@ -19,7 +19,8 @@ SendSIGKILL=yes
 TimeoutStopSec=90s
 OOMPolicy=continue
 OOMScoreAdjust=-900
-Restart=on-failure
+ManagedOOMPreference=omit
+Restart=always
 RestartSec=2s
 Delegate=no
 TasksMax=4096

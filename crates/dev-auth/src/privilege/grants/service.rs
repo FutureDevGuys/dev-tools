@@ -227,6 +227,27 @@ enum Drain {
 enum Exit {
     Stopped,
     Changed(Input),
+    /// A task of the coordinator panicked or was cancelled, which no orderly
+    /// path does. Every grant stops and the process exits with a failure
+    /// status, so the exit is visible as one (#105).
+    Faulted,
+}
+
+impl Exit {
+    /// How the coordinator process ends once every grant has ended.
+    fn result(self) -> Result<(), Failure> {
+        match self {
+            Self::Stopped => Ok(()),
+            Self::Changed(_) => Err(Failure::AuthorityDenied),
+            Self::Faulted => Err(Failure::RuntimeFailure),
+        }
+    }
+}
+
+/// Why the coordinator stops serving once one of its tasks ended with
+/// `joined`.
+fn task_ended(joined: &Result<(), tokio::task::JoinError>) -> Option<Exit> {
+    joined.is_err().then_some(Exit::Faulted)
 }
 
 impl Phase {
@@ -531,7 +552,7 @@ async fn run(
                     login_tick = 0;
                     if login_check.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
                         if let Some(finished) = login_check.take() {
-                            if finished.await.is_err() { break Exit::Stopped; }
+                            if let Some(exit) = task_ended(&finished.await) { break exit; }
                         }
                         let service = Arc::clone(&service);
                         login_check = Some(tokio::spawn(async move { check_logins(&service).await; }));
@@ -539,7 +560,7 @@ async fn run(
                 }
             }
             completed = connections.join_next(), if !connections.is_empty() => {
-                if completed.is_some_and(|result| result.is_err()) { break Exit::Stopped; }
+                if let Some(exit) = completed.as_ref().and_then(task_ended) { break exit; }
             }
             readiness = listener.readable(), if connections.len() < MAX_CONNECTIONS => {
                 let mut readiness = readiness.map_err(|_| Failure::NativeUnavailable)?;
@@ -571,6 +592,11 @@ async fn run(
             "dev-auth grant coordinator exiting: the {input} changed and no managed job remains; the service manager starts a coordinator that binds the new state"
         );
     }
+    if exit == Exit::Faulted {
+        eprintln!(
+            "dev-auth grant coordinator exiting: one of its tasks failed; every grant stops and the service manager restarts the coordinator"
+        );
+    }
     {
         let mut state = service.state.lock().await;
         if matches!(state.phase, Phase::Draining(Drain::Stop { .. })) {
@@ -593,10 +619,7 @@ async fn run(
     if !ended {
         return Err(Failure::CleanupFailed);
     }
-    match exit {
-        Exit::Changed(_) => Err(Failure::AuthorityDenied),
-        Exit::Stopped => Ok(()),
-    }
+    exit.result()
 }
 
 /// How long an orderly stop waits for running jobs to finish (ADR 0141).
@@ -748,12 +771,12 @@ async fn dispatch(
     }
     if admits_new_work(&request) {
         let phase = service.state.lock().await.phase;
-        let admitted = if uses_existing_grant(&request) {
-            service.grant_use(phase).admits()
-        } else {
-            admission(phase, service.trust())
-        };
-        if let Err(failure) = admitted {
+        if let Err(failure) = request_admission(
+            &request,
+            phase,
+            || service.trust(),
+            || service.policy_source.look(),
+        ) {
             return ControlResult::failure(operation, failure, Some(false));
         }
     }
@@ -953,8 +976,8 @@ async fn issue(
             .pending
             .lock()
             .map_err(|_| Failure::RuntimeFailure)?;
-        if state.phase != Phase::Serving
-            || pending.len() >= 4
+        admission(state.phase, Ok(None))?;
+        if pending.len() >= 4
             || state.registry.iter().count() + pending.len() >= MAX_GRANTS
             || !pending.insert(scope.account.clone())
         {
@@ -971,14 +994,14 @@ async fn issue(
     drop(pending);
     approval?;
     let _setup = setup_admission(service)?;
-    if admission(state.phase, service.trust()).is_err()
-        || !caller.still_present()
-        || launch_owner
-            .as_ref()
-            .is_some_and(|owner| !owner.matches(caller))
-    {
-        return Err(Failure::AuthorityDenied);
-    }
+    post_approval_admission(
+        state.phase,
+        service.trust(),
+        caller.still_present()
+            && launch_owner
+                .as_ref()
+                .is_none_or(|owner| owner.matches(caller)),
+    )?;
     let now = now()?;
     let deadline = now
         .checked_add(limits.hard_timeout())
@@ -1172,14 +1195,14 @@ fn require_launch_state(
     caller: &Caller,
     phase: LaunchPhase,
 ) -> Result<(), Failure> {
-    if admission(state.phase, service.trust()).is_err()
-        || state
-            .registry
-            .get(id)
-            .ok_or(Failure::NoGrant)?
-            .lifetime
-            .state()
-            != LeaseState::Active
+    admission(state.phase, service.trust())?;
+    if state
+        .registry
+        .get(id)
+        .ok_or(Failure::NoGrant)?
+        .lifetime
+        .state()
+        != LeaseState::Active
         || !state
             .metadata
             .get(&id)
@@ -1505,9 +1528,7 @@ async fn delegate(
     let id = new_id()?;
     let mut state = service.state.lock().await;
     let now = now()?;
-    if state.phase != Phase::Serving {
-        return Err(Failure::NativeUnavailable);
-    }
+    admission(state.phase, Ok(None))?;
     if depth(&state, parent) >= 16 {
         return Err(Failure::Busy);
     }
@@ -1627,7 +1648,8 @@ async fn execute(
     ) = {
         let mut state = service.state.lock().await;
         let now = now()?;
-        if service.grant_use(state.phase) != GrantUse::Open || state.jobs.len() >= MAX_EXECUTIONS {
+        service.grant_use(state.phase).admits()?;
+        if state.jobs.len() >= MAX_EXECUTIONS {
             return Err(Failure::Busy);
         }
         let grant_id = select(&state, &caller.scope, selected)?;
@@ -3018,8 +3040,9 @@ fn admission(phase: Phase, trust: Look<Option<Input>>) -> Result<(), Failure> {
     match (phase, trust) {
         (Phase::Serving, Ok(None)) => Ok(()),
         (Phase::Serving, Err(_)) => Err(Failure::NativeUnavailable),
-        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_), _) => Err(Failure::AuthorityDenied),
-        (Phase::Stopping, _) => Err(Failure::Busy),
+        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_) | Phase::Stopping, _) => {
+            Err(Failure::Draining)
+        }
     }
 }
 
@@ -3043,6 +3066,43 @@ fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
             "dev-auth grant trust changed: the {input} is not the one bound at startup; admission is closed and {} running job(s) continue under their grants",
             state.jobs.len()
         );
+    }
+}
+
+/// Whether a grant that the user just approved may still start in `phase`.
+/// A drain that began while the approval was open refuses it as the refusal
+/// before the approval does, with `Failure::Draining`, and not as a denial.
+/// Only a caller or launch owner that changed is a denial (ADR 0144).
+fn post_approval_admission(
+    phase: Phase,
+    trust: Look<Option<Input>>,
+    unchanged: bool,
+) -> Result<(), Failure> {
+    admission(phase, trust)?;
+    if unchanged {
+        Ok(())
+    } else {
+        Err(Failure::AuthorityDenied)
+    }
+}
+
+/// Whether `request` may start in `phase`. New work under an active grant
+/// needs a look at the grant policy, and any other new work a look at every
+/// watched trust input. Observing and ending grants needs neither. A refusal
+/// during a drain is `Failure::Draining`, which tells the caller to rerun
+/// (ADR 0144).
+fn request_admission(
+    request: &ControlRequest,
+    phase: Phase,
+    trust: impl FnOnce() -> Look<Option<Input>>,
+    policy: impl FnOnce() -> Look<bool>,
+) -> Result<(), Failure> {
+    if !admits_new_work(request) {
+        Ok(())
+    } else if uses_existing_grant(request) {
+        grant_use(phase, policy()).admits()
+    } else {
+        admission(phase, trust())
     }
 }
 
@@ -3117,7 +3177,7 @@ impl GrantUse {
     fn admits(self) -> Result<(), Failure> {
         match self {
             Self::Open => Ok(()),
-            Self::Draining => Err(Failure::AuthorityDenied),
+            Self::Draining => Err(Failure::Draining),
             Self::Unobserved => Err(Failure::NativeUnavailable),
         }
     }
@@ -3311,30 +3371,18 @@ enum UnitFault {
 /// A failed call means the service manager has not answered yet only when
 /// the bus could not deliver it. Any other reply is the manager's answer.
 fn bus_fault(error: &zbus::Error) -> UnitFault {
-    match error {
-        zbus::Error::InputOutput(_) | zbus::Error::Connection(..) | zbus::Error::Handshake(_) => {
-            UnitFault::Unreachable
-        }
-        zbus::Error::MethodError(name, _, _) => reply_fault(name.as_str()),
-        zbus::Error::FDO(error) => fdo_fault(error),
-        _ => UnitFault::Mismatch,
-    }
+    unit_fault(super::bus::unanswered(error))
 }
 
 fn fdo_fault(error: &zbus::fdo::Error) -> UnitFault {
-    match error {
-        zbus::fdo::Error::ZBus(error) => bus_fault(error),
-        error => reply_fault(zbus::DBusError::name(error).as_str()),
-    }
+    unit_fault(super::bus::unanswered_fdo(error))
 }
 
-fn reply_fault(name: &str) -> UnitFault {
-    match name.strip_prefix("org.freedesktop.DBus.Error.") {
-        Some(
-            "ServiceUnknown" | "NameHasNoOwner" | "NoReply" | "Timeout" | "TimedOut"
-            | "Disconnected" | "NoServer" | "IOError",
-        ) => UnitFault::Unreachable,
-        _ => UnitFault::Mismatch,
+fn unit_fault(unanswered: bool) -> UnitFault {
+    if unanswered {
+        UnitFault::Unreachable
+    } else {
+        UnitFault::Mismatch
     }
 }
 
@@ -3444,20 +3492,23 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
         .get(service_interface, "TimeoutStopUSec")
         .await
         .map_err(|error| fdo_fault(&error))?;
-    unit_contract(
-        &UnitProperties {
-            main_pid: u32::try_from(main_pid).map_err(|_| Mismatch)?,
-            kill_mode: String::try_from(kill_mode).map_err(|_| Mismatch)?,
-            send_kill: bool::try_from(send_kill).map_err(|_| Mismatch)?,
-            control_group: String::try_from(group).map_err(|_| Mismatch)?,
-            exit_type: String::try_from(exit_type).map_err(|_| Mismatch)?,
-            remain: bool::try_from(remain).map_err(|_| Mismatch)?,
-            delegated: bool::try_from(delegated).map_err(|_| Mismatch)?,
-            stop_timeout: Duration::from_micros(u64::try_from(stop_timeout).map_err(|_| Mismatch)?),
-        },
-        std::process::id(),
-        cgroup,
-    )
+    let unit = UnitProperties {
+        main_pid: u32::try_from(main_pid).map_err(|_| Mismatch)?,
+        kill_mode: String::try_from(kill_mode).map_err(|_| Mismatch)?,
+        send_kill: bool::try_from(send_kill).map_err(|_| Mismatch)?,
+        control_group: String::try_from(group).map_err(|_| Mismatch)?,
+        exit_type: String::try_from(exit_type).map_err(|_| Mismatch)?,
+        remain: bool::try_from(remain).map_err(|_| Mismatch)?,
+        delegated: bool::try_from(delegated).map_err(|_| Mismatch)?,
+        stop_timeout: Duration::from_micros(u64::try_from(stop_timeout).map_err(|_| Mismatch)?),
+    };
+    unit_contract(&unit, std::process::id(), cgroup)?;
+    if !unit.drains() {
+        eprintln!(
+            "dev-auth grant service unit predates this release: a stop sends SIGTERM to every job at once and cannot drain, one OOM kill of any process stops the unit, and it still requires polkit.service and restarts only after a failure; rerun product setup to publish the current unit"
+        );
+    }
+    Ok(())
 }
 
 /// The unit properties that startup confirms through the service manager.
@@ -3473,19 +3524,38 @@ struct UnitProperties {
     stop_timeout: Duration,
 }
 
+impl UnitProperties {
+    /// Whether a stop of the unit lets the coordinator drain, which needs
+    /// the published unit's kill mode and stop timeout.
+    fn drains(&self) -> bool {
+        self.kill_mode == "mixed" && self.stop_timeout >= STOP_BUDGET
+    }
+
+    /// Whether the unit is the previous one: `KillMode=control-group` sends
+    /// SIGTERM to every process at a stop, so a stop cannot drain, and the
+    /// stop timeout bounds how long a job that ignores SIGTERM outlives the
+    /// coordinator before SIGKILL, so it may not exceed the previous unit's.
+    fn is_previous(&self) -> bool {
+        let (_, _, seconds) = super::assets::TEARDOWNS[1];
+        self.kill_mode == "control-group" && self.stop_timeout <= Duration::from_secs(seconds)
+    }
+}
+
 /// Whether the unit that runs the coordinator, as process `pid` in `cgroup`,
-/// keeps its crash cleanup and stop contract (ADR 0137, ADR 0141).
-/// `KillMode=mixed` sends SIGTERM to the coordinator alone and SIGKILL to
-/// every process left once it exits, so the coordinator can drain, and its
-/// exit stops every managed job.
+/// keeps its crash cleanup contract (ADR 0137), and a stop contract that
+/// either drains (ADR 0141) or is the previous unit's (ADR 0144). Under
+/// either, the service manager sends SIGKILL to every process left once the
+/// coordinator exits, at most the stop timeout after it asked them to stop.
+/// A coordinator that refused the previous unit would stay down until setup
+/// rewrote it, for example after an executable replaced without it or a
+/// rollback.
 fn unit_contract(unit: &UnitProperties, pid: u32, cgroup: &Path) -> Result<(), UnitFault> {
     if unit.main_pid != pid
-        || unit.kill_mode != "mixed"
         || !unit.send_kill
+        || !(unit.drains() || unit.is_previous())
         || unit.exit_type != "main"
         || unit.remain
         || unit.delegated
-        || unit.stop_timeout < STOP_BUDGET
         || Path::new("/sys/fs/cgroup").join(unit.control_group.trim_start_matches('/')) != cgroup
     {
         return Err(UnitFault::Mismatch);
@@ -4348,14 +4418,12 @@ mod tests {
         for error in &answered {
             assert_eq!(bus_fault(error), UnitFault::Mismatch, "{error}");
         }
-        assert_eq!(
-            reply_fault("org.freedesktop.systemd1.NoUnitForPID"),
-            UnitFault::Mismatch
-        );
-        assert_eq!(
-            reply_fault("org.freedesktop.DBus.Error.NameHasNoOwner"),
-            UnitFault::Unreachable
-        );
+        assert!(!super::super::bus::unanswered_reply(
+            "org.freedesktop.systemd1.NoUnitForPID"
+        ));
+        assert!(super::super::bus::unanswered_reply(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ));
     }
 
     #[tokio::test]
@@ -4879,16 +4947,23 @@ mod tests {
     const UNIT_CGROUP: &str = "/sys/fs/cgroup/system.slice/dev-auth-grants.service";
 
     #[test]
-    fn startup_requires_a_unit_that_lets_the_coordinator_drain_before_anything_is_killed() {
+    fn startup_refuses_a_unit_whose_coordinator_exit_could_leave_managed_work_running() {
         let cgroup = Path::new(UNIT_CGROUP);
         assert_eq!(unit_contract(&drainable_unit(), 7, cgroup), Ok(()));
         for (unit, why) in [
             (
                 UnitProperties {
-                    kill_mode: "control-group".into(),
+                    kill_mode: "process".into(),
                     ..drainable_unit()
                 },
-                "the service manager would send SIGTERM to every job at a stop",
+                "the service manager would stop only the coordinator",
+            ),
+            (
+                UnitProperties {
+                    kill_mode: "none".into(),
+                    ..drainable_unit()
+                },
+                "the service manager would stop nothing",
             ),
             (
                 UnitProperties {
@@ -4906,6 +4981,14 @@ mod tests {
             ),
             (
                 UnitProperties {
+                    kill_mode: "control-group".into(),
+                    send_kill: false,
+                    ..drainable_unit()
+                },
+                "jobs would outlive the coordinator under the previous unit as well",
+            ),
+            (
+                UnitProperties {
                     delegated: true,
                     ..drainable_unit()
                 },
@@ -4917,6 +5000,126 @@ mod tests {
                 Err(UnitFault::Mismatch),
                 "{why}"
             );
+        }
+    }
+
+    #[test]
+    fn a_panic_in_a_coordinator_task_ends_the_process_with_a_failure_status() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async { panic!("a connection task failed") });
+            let joined = tasks.join_next().await.unwrap();
+            let exit = task_ended(&joined).expect("a panicked task ends serving");
+            assert_eq!(exit.result(), Err(Failure::RuntimeFailure));
+            assert_ne!(Failure::RuntimeFailure.exit_code(), 0);
+            tasks.spawn(async {});
+            assert_eq!(task_ended(&tasks.join_next().await.unwrap()), None);
+        });
+    }
+
+    #[test]
+    fn only_an_orderly_stop_ends_the_process_with_success() {
+        assert_eq!(Exit::Stopped.result(), Ok(()));
+        for input in [Input::Policy, Input::SudoProgram] {
+            assert!(Exit::Changed(input).result().is_err(), "{input}");
+        }
+        assert!(Exit::Faulted.result().is_err());
+    }
+
+    // Apply and recovery switch the executable before they write the unit,
+    // and restoration writes the unit before the executable, so either unit
+    // that setup observes can sit beside this executable. An executable that
+    // replaced the installed one without setup does too. A start then, after a
+    // crash or a boot, must not leave the coordinator refusing to run until
+    // setup finishes (#105).
+    #[test]
+    fn the_coordinator_starts_under_every_unit_that_setup_can_leave_beside_it() {
+        // Hand-worked from the two units: 0.5.5 shipped control-group with a
+        // 5 second stop timeout, and this release ships mixed with 90.
+        assert_eq!(
+            super::super::assets::TEARDOWNS,
+            [("mixed", "1min 30s", 90), ("control-group", "5s", 5)]
+        );
+        for (kill_mode, stop_timeout, seconds) in super::super::assets::TEARDOWNS {
+            let unit = UnitProperties {
+                kill_mode: kill_mode.into(),
+                stop_timeout: at(seconds),
+                ..drainable_unit()
+            };
+            assert_eq!(
+                unit_contract(&unit, 7, Path::new(UNIT_CGROUP)),
+                Ok(()),
+                "KillMode={kill_mode} TimeoutStopUSec={stop_timeout}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unit_whose_stop_leaves_jobs_running_longer_than_the_previous_one_does_is_refused() {
+        let infinity = Duration::from_micros(u64::MAX);
+        for (kill_mode, stop_timeout, why) in [
+            (
+                "control-group",
+                at(6),
+                "one second longer than the previous unit",
+            ),
+            (
+                "control-group",
+                at(90),
+                "the published timeout without the drain",
+            ),
+            (
+                "control-group",
+                infinity,
+                "a drop-in with TimeoutStopSec=infinity",
+            ),
+            ("mixed", at(5), "the stop timeout would cut the drain short"),
+            (
+                "mixed",
+                at(79),
+                "a timeout one second below the 80 second orderly stop",
+            ),
+        ] {
+            let unit = UnitProperties {
+                kill_mode: kill_mode.into(),
+                stop_timeout,
+                ..drainable_unit()
+            };
+            assert_eq!(
+                unit_contract(&unit, 7, Path::new(UNIT_CGROUP)),
+                Err(UnitFault::Mismatch),
+                "{kill_mode}: {why}"
+            );
+        }
+        // The previous unit's own bound, and anything below it, is accepted.
+        for seconds in [0, 1, 5] {
+            let unit = UnitProperties {
+                kill_mode: "control-group".into(),
+                stop_timeout: at(seconds),
+                ..drainable_unit()
+            };
+            assert_eq!(unit_contract(&unit, 7, Path::new(UNIT_CGROUP)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn only_the_published_unit_lets_a_stop_drain() {
+        assert!(drainable_unit().drains());
+        for unit in [
+            UnitProperties {
+                kill_mode: "control-group".into(),
+                stop_timeout: at(5),
+                ..drainable_unit()
+            },
+            UnitProperties {
+                stop_timeout: at(5),
+                ..drainable_unit()
+            },
+        ] {
+            assert!(!unit.drains());
         }
     }
 
@@ -5059,6 +5262,176 @@ mod tests {
                 request.operation()
             );
         }
+    }
+
+    #[test]
+    fn work_that_a_drain_refuses_is_told_to_rerun_once_the_coordinator_restarts() {
+        let grant = "0123456789abcdef0123456789abcdef".to_owned();
+        let execution = || super::super::Execution {
+            program: "/usr/bin/true".into(),
+            arguments: vec![],
+            working_directory: "/".into(),
+            environment: vec![],
+            terminal: false,
+        };
+        // The sudo plugin's own line for a drain, which the CLI prints after
+        // `dev-auth: `. The refusal of other work is that line for work
+        // instead of sudo, and names the unit that restarts.
+        let plugin_guidance = || {
+            let plugin = include_str!("../../../../dev-auth-sudo/src/native.rs");
+            let line = plugin
+                .lines()
+                .find(|line| line.contains("is draining and admits no new sudo"))
+                .expect("the sudo plugin's drain line");
+            let text = line
+                .split_once("c\"dev-auth: ")
+                .and_then(|(_, rest)| rest.split_once("\\n\""))
+                .expect("the line is a C string ending in a newline")
+                .0;
+            text.replace("no new sudo", "no new work")
+                .replace("once it restarts", "once dev-auth-grants.service restarts")
+        };
+        assert_eq!(
+            plugin_guidance(),
+            "the grant coordinator is draining and admits no new work; running commands continue; rerun this step once dev-auth-grants.service restarts"
+        );
+        let exec = ControlRequest::Exec {
+            grant: None,
+            execution: execution(),
+        };
+        let relay = ControlRequest::SudoRelay {
+            grant: grant.clone(),
+            execution: execution(),
+        };
+        let request = ControlRequest::Request {
+            request: GrantRequest::command(Authority::Administrator, 60),
+        };
+        let delegate = ControlRequest::Delegate {
+            grant,
+            request: GrantRequest::command(Authority::Administrator, 60),
+        };
+        // The sudo plugin tells the user to rerun the step once the unit
+        // restarts. The refusal of the other work carries the same guidance
+        // and names the same unit, and is retryable like an unavailable
+        // boundary (exit 3), not a policy denial (exit 4).
+        let refusal = |request: &ControlRequest,
+                       phase: Phase,
+                       trust: Look<Option<Input>>,
+                       policy: Look<bool>| {
+            request_admission(request, phase, || trust, || policy)
+                .err()
+                .map(|failure| {
+                    let printed = ControlResult::failure(request.operation(), failure, Some(false));
+                    assert_eq!(printed.exit_code(), 3, "{failure:?}");
+                    assert_eq!(failure.message(), plugin_guidance(), "{failure:?}");
+                    serde_json::to_value(printed).unwrap()["error_kind"].clone()
+                })
+        };
+        let draining = serde_json::json!("draining");
+        let policy_drain = Phase::Draining(Drain::Changed(Input::Policy));
+        let stop = Phase::Serving.stop_requested(at(100));
+        for (phase, trust, policy, why) in [
+            (
+                policy_drain,
+                Ok(Some(Input::Policy)),
+                Ok(false),
+                "a policy drain",
+            ),
+            (stop, Ok(None), Ok(true), "an orderly stop"),
+            (
+                Phase::Serving,
+                Ok(Some(Input::Policy)),
+                Ok(false),
+                "a policy change not yet reaped",
+            ),
+        ] {
+            for work in [&exec, &relay, &request, &delegate] {
+                assert_eq!(
+                    refusal(work, phase, trust, policy),
+                    Some(draining.clone()),
+                    "{why}: {}",
+                    work.operation()
+                );
+            }
+        }
+        let sudo_drain = Phase::Draining(Drain::Changed(Input::SudoProgram));
+        let replaced = Ok(Some(Input::SudoProgram));
+        assert_eq!(refusal(&exec, sudo_drain, replaced, Ok(true)), None);
+        assert_eq!(
+            refusal(&request, sudo_drain, replaced, Ok(true)),
+            Some(draining),
+            "a new grant waits for the coordinator that binds the new program"
+        );
+        assert_eq!(
+            request_admission(&exec, Phase::Serving, || Ok(None), || Ok(true)),
+            Ok(())
+        );
+        for observation in [
+            ControlRequest::Status { requirement: None },
+            ControlRequest::Leave,
+        ] {
+            assert_eq!(
+                request_admission(&observation, policy_drain, || Ok(None), || Ok(false)),
+                Ok(()),
+                "{} still answers during a drain",
+                observation.operation()
+            );
+        }
+    }
+
+    #[test]
+    fn a_drain_that_begins_while_an_approval_is_open_is_told_to_rerun_not_denied() {
+        let policy_drain = Phase::Draining(Drain::Changed(Input::Policy));
+        let sudo_drain = Phase::Draining(Drain::Changed(Input::SudoProgram));
+        let stop = Phase::Serving.stop_requested(at(100));
+        // The approval succeeded and the caller is unchanged, but the
+        // coordinator began to drain meanwhile. Each refusal is the rerun
+        // guidance of the refusal before the approval.
+        for (phase, trust, why) in [
+            (policy_drain, Ok(Some(Input::Policy)), "a policy drain"),
+            (
+                sudo_drain,
+                Ok(Some(Input::SudoProgram)),
+                "a sudo-program drain",
+            ),
+            (stop, Ok(None), "an orderly stop"),
+            (Phase::Stopping, Ok(None), "the final stop"),
+            (
+                Phase::Serving,
+                Ok(Some(Input::Policy)),
+                "a change not yet reaped",
+            ),
+        ] {
+            assert_eq!(
+                post_approval_admission(phase, trust, true),
+                Err(Failure::Draining),
+                "{why}"
+            );
+            assert_eq!(
+                admission(phase, trust),
+                Err(Failure::Draining),
+                "{why}: a new grant"
+            );
+        }
+        assert_eq!(
+            post_approval_admission(Phase::Serving, Ok(None), true),
+            Ok(())
+        );
+        assert_eq!(
+            post_approval_admission(Phase::Serving, Ok(None), false),
+            Err(Failure::AuthorityDenied),
+            "a caller that left is still a denial"
+        );
+        assert_eq!(
+            post_approval_admission(Phase::Serving, Err(UNREADABLE), true),
+            Err(Failure::NativeUnavailable),
+            "a look that could not be taken is retryable"
+        );
+        assert_eq!(
+            post_approval_admission(policy_drain, Ok(Some(Input::Policy)), false),
+            Err(Failure::Draining),
+            "the drain is reported first"
+        );
     }
 
     #[test]

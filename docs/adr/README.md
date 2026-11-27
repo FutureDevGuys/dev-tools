@@ -11,6 +11,7 @@ SyncConfigs also maintains product-local records, including [durable overlay pub
 
 | ADR | Decision | Status | Verification |
 | --- | --- | --- | --- |
+| [0144](0144-dev-auth-coordinator-lifecycle-edges.md) | Dev Auth keeps grants across a PolicyKit restart, restarts the coordinator after any unordered exit, starts it under the previous unit, exempts its cgroup from systemd-oomd and tells refused work to rerun during a drain | proposed | hermetic source tests passed; native acceptance pending |
 | [0143](0143-uv-completion-global-options.md) | UV completion passthrough after recognized global options | proposed | Linux completion acceptance passed; three unrelated environment-dependent tests blocked |
 | [0142](0142-calling-thread-foreground-terminal-custody.md) | Linux calling-thread foreground terminal custody shared by native command consumers | accepted | native mechanism and signed Linux consumer qualification passed |
 | [0141](0141-graceful-ends-and-drained-stops-for-managed-work.md) | Dev Auth ends managed work with SIGTERM and a fixed 10-second grace before SIGKILL, drains an orderly coordinator stop, refuses setup over running jobs, never idles a grant with attached work, contains OOM kills and job process groups, and keeps admitted grants working across a sudo-program change | proposed | hermetic source tests passed; native acceptance pending |

@@ -97,6 +97,10 @@ Because active grants keep their use, this drain ends only once no grant is acti
 
 A change to the grant policy is different. Every active grant was approved under the old policy, so after a policy change the coordinator refuses new work under every grant, and answers a routed sudo with `draining` as above. A policy change during a sudo-program drain turns it into a policy drain, which ends once no job or connection remains. An orderly stop refuses the same work.
 
+### Later changes
+
+[ADR 0144](0144-dev-auth-coordinator-lifecycle-edges.md) lets startup also accept the previous unit's `KillMode=control-group`, restarts the coordinator after any exit that no stop job ordered instead of only after a failure, and gives refused work during a drain a `draining` failure that tells the caller to rerun.
+
 ### Diagnostics
 
 The coordinator writes one journal line for each of these events:
