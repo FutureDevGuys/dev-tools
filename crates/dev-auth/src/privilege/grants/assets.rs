@@ -8,6 +8,12 @@ pub const POLKIT: &str =
 pub const SUDO_CONFIGURATION: &str = include_str!("../../../assets/grants/sudo.conf");
 pub const SUDOERS: &str = include_str!("../../../assets/grants/sudoers");
 
+/// The kill mode and stop timeout, as `systemctl show` prints them, of the
+/// unit that setup publishes and of the unit it replaces. Setup observes and
+/// stops a coordinator under either, and the coordinator starts under either
+/// (ADR 0144).
+pub const TEARDOWNS: [(&str, &str); 2] = [("mixed", "1min 30s"), ("control-group", "5s")];
+
 #[cfg(test)]
 mod tests {
     use super::*;

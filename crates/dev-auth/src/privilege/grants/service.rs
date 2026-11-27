@@ -3455,20 +3455,23 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
         .get(service_interface, "TimeoutStopUSec")
         .await
         .map_err(|error| fdo_fault(&error))?;
-    unit_contract(
-        &UnitProperties {
-            main_pid: u32::try_from(main_pid).map_err(|_| Mismatch)?,
-            kill_mode: String::try_from(kill_mode).map_err(|_| Mismatch)?,
-            send_kill: bool::try_from(send_kill).map_err(|_| Mismatch)?,
-            control_group: String::try_from(group).map_err(|_| Mismatch)?,
-            exit_type: String::try_from(exit_type).map_err(|_| Mismatch)?,
-            remain: bool::try_from(remain).map_err(|_| Mismatch)?,
-            delegated: bool::try_from(delegated).map_err(|_| Mismatch)?,
-            stop_timeout: Duration::from_micros(u64::try_from(stop_timeout).map_err(|_| Mismatch)?),
-        },
-        std::process::id(),
-        cgroup,
-    )
+    let unit = UnitProperties {
+        main_pid: u32::try_from(main_pid).map_err(|_| Mismatch)?,
+        kill_mode: String::try_from(kill_mode).map_err(|_| Mismatch)?,
+        send_kill: bool::try_from(send_kill).map_err(|_| Mismatch)?,
+        control_group: String::try_from(group).map_err(|_| Mismatch)?,
+        exit_type: String::try_from(exit_type).map_err(|_| Mismatch)?,
+        remain: bool::try_from(remain).map_err(|_| Mismatch)?,
+        delegated: bool::try_from(delegated).map_err(|_| Mismatch)?,
+        stop_timeout: Duration::from_micros(u64::try_from(stop_timeout).map_err(|_| Mismatch)?),
+    };
+    unit_contract(&unit, std::process::id(), cgroup)?;
+    if !unit.drains() {
+        eprintln!(
+            "dev-auth grant service unit predates orderly stops: a stop sends SIGTERM to every job at once; rerun product setup to publish the current unit"
+        );
+    }
+    Ok(())
 }
 
 /// The unit properties that startup confirms through the service manager.
@@ -3484,19 +3487,36 @@ struct UnitProperties {
     stop_timeout: Duration,
 }
 
+impl UnitProperties {
+    /// Whether a stop of the unit lets the coordinator drain, which needs
+    /// the published unit's kill mode and stop timeout.
+    fn drains(&self) -> bool {
+        self.kill_mode == "mixed" && self.stop_timeout >= STOP_BUDGET
+    }
+
+    /// Whether the unit stops every process in it once the coordinator exits
+    /// or the stop times out. `KillMode=mixed` sends SIGTERM to the
+    /// coordinator alone first. The previous unit's `KillMode=control-group`
+    /// sends it to every process, so a stop cannot drain, but a coordinator
+    /// exit still leaves nothing running.
+    fn stops_everything(&self) -> bool {
+        self.send_kill && matches!(self.kill_mode.as_str(), "mixed" | "control-group")
+    }
+}
+
 /// Whether the unit that runs the coordinator, as process `pid` in `cgroup`,
-/// keeps its crash cleanup and stop contract (ADR 0137, ADR 0141).
-/// `KillMode=mixed` sends SIGTERM to the coordinator alone and SIGKILL to
-/// every process left once it exits, so the coordinator can drain, and its
-/// exit stops every managed job.
+/// keeps its crash cleanup contract (ADR 0137), and a stop contract that
+/// either drains (ADR 0141) or is the previous unit's (ADR 0144). The
+/// coordinator's exit stops every managed job under either. A coordinator
+/// that refused the previous unit would stay down until setup rewrote it,
+/// for example after an executable replaced without it or a rollback.
 fn unit_contract(unit: &UnitProperties, pid: u32, cgroup: &Path) -> Result<(), UnitFault> {
     if unit.main_pid != pid
-        || unit.kill_mode != "mixed"
-        || !unit.send_kill
+        || !unit.stops_everything()
+        || (unit.kill_mode == "mixed" && !unit.drains())
         || unit.exit_type != "main"
         || unit.remain
         || unit.delegated
-        || unit.stop_timeout < STOP_BUDGET
         || Path::new("/sys/fs/cgroup").join(unit.control_group.trim_start_matches('/')) != cgroup
     {
         return Err(UnitFault::Mismatch);
@@ -4888,16 +4908,23 @@ mod tests {
     const UNIT_CGROUP: &str = "/sys/fs/cgroup/system.slice/dev-auth-grants.service";
 
     #[test]
-    fn startup_requires_a_unit_that_lets_the_coordinator_drain_before_anything_is_killed() {
+    fn startup_refuses_a_unit_whose_coordinator_exit_could_leave_managed_work_running() {
         let cgroup = Path::new(UNIT_CGROUP);
         assert_eq!(unit_contract(&drainable_unit(), 7, cgroup), Ok(()));
         for (unit, why) in [
             (
                 UnitProperties {
-                    kill_mode: "control-group".into(),
+                    kill_mode: "process".into(),
                     ..drainable_unit()
                 },
-                "the service manager would send SIGTERM to every job at a stop",
+                "the service manager would stop only the coordinator",
+            ),
+            (
+                UnitProperties {
+                    kill_mode: "none".into(),
+                    ..drainable_unit()
+                },
+                "the service manager would stop nothing",
             ),
             (
                 UnitProperties {
@@ -4912,6 +4939,14 @@ mod tests {
                     ..drainable_unit()
                 },
                 "jobs would outlive the coordinator",
+            ),
+            (
+                UnitProperties {
+                    kill_mode: "control-group".into(),
+                    send_kill: false,
+                    ..drainable_unit()
+                },
+                "jobs would outlive the coordinator under the previous unit as well",
             ),
             (
                 UnitProperties {
@@ -4953,6 +4988,53 @@ mod tests {
             assert!(Exit::Changed(input).result().is_err(), "{input}");
         }
         assert!(Exit::Faulted.result().is_err());
+    }
+
+    // Apply and recovery switch the executable before they write the unit,
+    // and restoration writes the unit before the executable, so either unit
+    // that setup observes can sit beside this executable. An executable that
+    // replaced the installed one without setup does too. A start then, after a
+    // crash or a boot, must not leave the coordinator refusing to run until
+    // setup finishes (#105).
+    #[test]
+    fn the_coordinator_starts_under_every_unit_that_setup_can_leave_beside_it() {
+        for (kill_mode, stop_timeout, seconds) in
+            [("mixed", "1min 30s", 90), ("control-group", "5s", 5)]
+        {
+            assert!(
+                super::super::assets::TEARDOWNS.contains(&(kill_mode, stop_timeout)),
+                "{kill_mode} {stop_timeout} is a unit setup observes"
+            );
+            let unit = UnitProperties {
+                kill_mode: kill_mode.into(),
+                stop_timeout: at(seconds),
+                ..drainable_unit()
+            };
+            assert_eq!(
+                unit_contract(&unit, 7, Path::new(UNIT_CGROUP)),
+                Ok(()),
+                "KillMode={kill_mode} TimeoutStopUSec={stop_timeout}"
+            );
+        }
+        assert_eq!(super::super::assets::TEARDOWNS.len(), 2);
+    }
+
+    #[test]
+    fn only_the_published_unit_lets_a_stop_drain() {
+        assert!(drainable_unit().drains());
+        for unit in [
+            UnitProperties {
+                kill_mode: "control-group".into(),
+                stop_timeout: at(5),
+                ..drainable_unit()
+            },
+            UnitProperties {
+                stop_timeout: at(5),
+                ..drainable_unit()
+            },
+        ] {
+            assert!(!unit.drains());
+        }
     }
 
     #[test]
