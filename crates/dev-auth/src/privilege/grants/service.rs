@@ -3488,7 +3488,7 @@ async fn verify_service_unit(cgroup: &Path) -> Result<(), UnitFault> {
     unit_contract(&unit, std::process::id(), cgroup)?;
     if !unit.drains() {
         eprintln!(
-            "dev-auth grant service unit predates orderly stops: a stop sends SIGTERM to every job at once; rerun product setup to publish the current unit"
+            "dev-auth grant service unit predates this release: a stop sends SIGTERM to every job at once and cannot drain, one OOM kill of any process stops the unit, and it still requires polkit.service and restarts only after a failure; rerun product setup to publish the current unit"
         );
     }
     Ok(())
@@ -3514,26 +3514,28 @@ impl UnitProperties {
         self.kill_mode == "mixed" && self.stop_timeout >= STOP_BUDGET
     }
 
-    /// Whether the unit stops every process in it once the coordinator exits
-    /// or the stop times out. `KillMode=mixed` sends SIGTERM to the
-    /// coordinator alone first. The previous unit's `KillMode=control-group`
-    /// sends it to every process, so a stop cannot drain, but a coordinator
-    /// exit still leaves nothing running.
-    fn stops_everything(&self) -> bool {
-        self.send_kill && matches!(self.kill_mode.as_str(), "mixed" | "control-group")
+    /// Whether the unit is the previous one: `KillMode=control-group` sends
+    /// SIGTERM to every process at a stop, so a stop cannot drain, and the
+    /// stop timeout bounds how long a job that ignores SIGTERM outlives the
+    /// coordinator before SIGKILL, so it may not exceed the previous unit's.
+    fn is_previous(&self) -> bool {
+        let (_, _, seconds) = super::assets::TEARDOWNS[1];
+        self.kill_mode == "control-group" && self.stop_timeout <= Duration::from_secs(seconds)
     }
 }
 
 /// Whether the unit that runs the coordinator, as process `pid` in `cgroup`,
 /// keeps its crash cleanup contract (ADR 0137), and a stop contract that
-/// either drains (ADR 0141) or is the previous unit's (ADR 0144). The
-/// coordinator's exit stops every managed job under either. A coordinator
-/// that refused the previous unit would stay down until setup rewrote it,
-/// for example after an executable replaced without it or a rollback.
+/// either drains (ADR 0141) or is the previous unit's (ADR 0144). Under
+/// either, the service manager sends SIGKILL to every process left once the
+/// coordinator exits, at most the stop timeout after it asked them to stop.
+/// A coordinator that refused the previous unit would stay down until setup
+/// rewrote it, for example after an executable replaced without it or a
+/// rollback.
 fn unit_contract(unit: &UnitProperties, pid: u32, cgroup: &Path) -> Result<(), UnitFault> {
     if unit.main_pid != pid
-        || !unit.stops_everything()
-        || (unit.kill_mode == "mixed" && !unit.drains())
+        || !unit.send_kill
+        || !(unit.drains() || unit.is_previous())
         || unit.exit_type != "main"
         || unit.remain
         || unit.delegated
@@ -5018,13 +5020,13 @@ mod tests {
     // setup finishes (#105).
     #[test]
     fn the_coordinator_starts_under_every_unit_that_setup_can_leave_beside_it() {
-        for (kill_mode, stop_timeout, seconds) in
+        // Hand-worked from the two units: 0.5.5 shipped control-group with a
+        // 5 second stop timeout, and this release ships mixed with 90.
+        assert_eq!(
+            super::super::assets::TEARDOWNS,
             [("mixed", "1min 30s", 90), ("control-group", "5s", 5)]
-        {
-            assert!(
-                super::super::assets::TEARDOWNS.contains(&(kill_mode, stop_timeout)),
-                "{kill_mode} {stop_timeout} is a unit setup observes"
-            );
+        );
+        for (kill_mode, stop_timeout, seconds) in super::super::assets::TEARDOWNS {
             let unit = UnitProperties {
                 kill_mode: kill_mode.into(),
                 stop_timeout: at(seconds),
@@ -5036,7 +5038,54 @@ mod tests {
                 "KillMode={kill_mode} TimeoutStopUSec={stop_timeout}"
             );
         }
-        assert_eq!(super::super::assets::TEARDOWNS.len(), 2);
+    }
+
+    #[test]
+    fn a_unit_whose_stop_leaves_jobs_running_longer_than_the_previous_one_does_is_refused() {
+        let infinity = Duration::from_micros(u64::MAX);
+        for (kill_mode, stop_timeout, why) in [
+            (
+                "control-group",
+                at(6),
+                "one second longer than the previous unit",
+            ),
+            (
+                "control-group",
+                at(90),
+                "the published timeout without the drain",
+            ),
+            (
+                "control-group",
+                infinity,
+                "a drop-in with TimeoutStopSec=infinity",
+            ),
+            ("mixed", at(5), "the stop timeout would cut the drain short"),
+            (
+                "mixed",
+                at(79),
+                "a timeout one second below the 80 second orderly stop",
+            ),
+        ] {
+            let unit = UnitProperties {
+                kill_mode: kill_mode.into(),
+                stop_timeout,
+                ..drainable_unit()
+            };
+            assert_eq!(
+                unit_contract(&unit, 7, Path::new(UNIT_CGROUP)),
+                Err(UnitFault::Mismatch),
+                "{kill_mode}: {why}"
+            );
+        }
+        // The previous unit's own bound, and anything below it, is accepted.
+        for seconds in [0, 1, 5] {
+            let unit = UnitProperties {
+                kill_mode: "control-group".into(),
+                stop_timeout: at(seconds),
+                ..drainable_unit()
+            };
+            assert_eq!(unit_contract(&unit, 7, Path::new(UNIT_CGROUP)), Ok(()));
+        }
     }
 
     #[test]

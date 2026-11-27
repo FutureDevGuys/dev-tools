@@ -99,7 +99,9 @@ fn parse(bytes: &[u8]) -> Result<State> {
     }
     if fields["LoadState"] != "loaded"
         || fields["FragmentPath"] != SERVICE
-        || !assets::TEARDOWNS.contains(&(fields["KillMode"], fields["TimeoutStopUSec"]))
+        || !assets::TEARDOWNS.iter().any(|(mode, shown, _)| {
+            (*mode, *shown) == (fields["KillMode"], fields["TimeoutStopUSec"])
+        })
         || fields["SendSIGKILL"] != "yes"
         || fields["Delegate"] != "no"
         || fields["ExitType"] != "main"
