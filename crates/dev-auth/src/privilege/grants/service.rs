@@ -771,12 +771,12 @@ async fn dispatch(
     }
     if admits_new_work(&request) {
         let phase = service.state.lock().await.phase;
-        let admitted = if uses_existing_grant(&request) {
-            service.grant_use(phase).admits()
-        } else {
-            admission(phase, service.trust())
-        };
-        if let Err(failure) = admitted {
+        if let Err(failure) = request_admission(
+            &request,
+            phase,
+            || service.trust(),
+            || service.policy_source.look(),
+        ) {
             return ControlResult::failure(operation, failure, Some(false));
         }
     }
@@ -3041,7 +3041,7 @@ fn admission(phase: Phase, trust: Look<Option<Input>>) -> Result<(), Failure> {
     match (phase, trust) {
         (Phase::Serving, Ok(None)) => Ok(()),
         (Phase::Serving, Err(_)) => Err(Failure::NativeUnavailable),
-        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_), _) => Err(Failure::AuthorityDenied),
+        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_), _) => Err(Failure::Draining),
         (Phase::Stopping, _) => Err(Failure::Busy),
     }
 }
@@ -3066,6 +3066,26 @@ fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
             "dev-auth grant trust changed: the {input} is not the one bound at startup; admission is closed and {} running job(s) continue under their grants",
             state.jobs.len()
         );
+    }
+}
+
+/// Whether `request` may start in `phase`. New work under an active grant
+/// needs a look at the grant policy, and any other new work a look at every
+/// watched trust input. Observing and ending grants needs neither. A refusal
+/// during a drain is `Failure::Draining`, which tells the caller to rerun
+/// (ADR 0144).
+fn request_admission(
+    request: &ControlRequest,
+    phase: Phase,
+    trust: impl FnOnce() -> Look<Option<Input>>,
+    policy: impl FnOnce() -> Look<bool>,
+) -> Result<(), Failure> {
+    if !admits_new_work(request) {
+        Ok(())
+    } else if uses_existing_grant(request) {
+        grant_use(phase, policy()).admits()
+    } else {
+        admission(phase, trust())
     }
 }
 
@@ -3140,7 +3160,7 @@ impl GrantUse {
     fn admits(self) -> Result<(), Failure> {
         match self {
             Self::Open => Ok(()),
-            Self::Draining => Err(Failure::AuthorityDenied),
+            Self::Draining => Err(Failure::Draining),
             Self::Unobserved => Err(Failure::NativeUnavailable),
         }
     }
@@ -5174,6 +5194,104 @@ mod tests {
                 !uses_existing_grant(&request),
                 "{}: a new grant waits for the coordinator that binds the new state",
                 request.operation()
+            );
+        }
+    }
+
+    #[test]
+    fn work_that_a_drain_refuses_is_told_to_rerun_once_the_coordinator_restarts() {
+        let grant = "0123456789abcdef0123456789abcdef".to_owned();
+        let execution = || super::super::Execution {
+            program: "/usr/bin/true".into(),
+            arguments: vec![],
+            working_directory: "/".into(),
+            environment: vec![],
+            terminal: false,
+        };
+        let exec = ControlRequest::Exec {
+            grant: None,
+            execution: execution(),
+        };
+        let relay = ControlRequest::SudoRelay {
+            grant: grant.clone(),
+            execution: execution(),
+        };
+        let request = ControlRequest::Request {
+            request: GrantRequest::command(Authority::Administrator, 60),
+        };
+        let delegate = ControlRequest::Delegate {
+            grant,
+            request: GrantRequest::command(Authority::Administrator, 60),
+        };
+        // The sudo plugin tells the user to rerun the step once the unit
+        // restarts. The refusal of the other work carries the same guidance
+        // and names the same unit, and is retryable like an unavailable
+        // boundary (exit 3), not a policy denial (exit 4).
+        let refusal = |request: &ControlRequest,
+                       phase: Phase,
+                       trust: Look<Option<Input>>,
+                       policy: Look<bool>| {
+            request_admission(request, phase, || trust, || policy)
+                .err()
+                .map(|failure| {
+                    let printed = ControlResult::failure(request.operation(), failure, Some(false));
+                    assert_eq!(printed.exit_code(), 3, "{failure:?}");
+                    assert!(failure.message().contains("rerun"), "{failure:?}");
+                    assert!(
+                        failure.message().contains("dev-auth-grants.service"),
+                        "{failure:?}"
+                    );
+                    serde_json::to_value(printed).unwrap()["error_kind"].clone()
+                })
+        };
+        let draining = serde_json::json!("draining");
+        let policy_drain = Phase::Draining(Drain::Changed(Input::Policy));
+        let stop = Phase::Serving.stop_requested(at(100));
+        for (phase, trust, policy, why) in [
+            (
+                policy_drain,
+                Ok(Some(Input::Policy)),
+                Ok(false),
+                "a policy drain",
+            ),
+            (stop, Ok(None), Ok(true), "an orderly stop"),
+            (
+                Phase::Serving,
+                Ok(Some(Input::Policy)),
+                Ok(false),
+                "a policy change not yet reaped",
+            ),
+        ] {
+            for work in [&exec, &relay, &request, &delegate] {
+                assert_eq!(
+                    refusal(work, phase, trust, policy),
+                    Some(draining.clone()),
+                    "{why}: {}",
+                    work.operation()
+                );
+            }
+        }
+        let sudo_drain = Phase::Draining(Drain::Changed(Input::SudoProgram));
+        let replaced = Ok(Some(Input::SudoProgram));
+        assert_eq!(refusal(&exec, sudo_drain, replaced, Ok(true)), None);
+        assert_eq!(
+            refusal(&request, sudo_drain, replaced, Ok(true)),
+            Some(draining),
+            "a new grant waits for the coordinator that binds the new program"
+        );
+        assert_eq!(
+            request_admission(&exec, Phase::Serving, || Ok(None), || Ok(true)),
+            Ok(())
+        );
+        for observation in [
+            ControlRequest::Status { requirement: None },
+            ControlRequest::Leave,
+        ] {
+            assert_eq!(
+                request_admission(&observation, policy_drain, || Ok(None), || Ok(false)),
+                Ok(()),
+                "{} still answers during a drain",
+                observation.operation()
             );
         }
     }

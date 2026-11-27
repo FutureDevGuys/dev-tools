@@ -416,6 +416,9 @@ pub enum Failure {
     /// The covering grant ends before a status requirement's remaining time.
     InsufficientRemaining,
     Interrupted,
+    /// The coordinator admits no new work while it drains, and the same step
+    /// can be rerun once the service manager restarts it (ADR 0144).
+    Draining,
 }
 
 impl Failure {
@@ -427,6 +430,7 @@ impl Failure {
             | Self::NoGrant
             | Self::NativeUnavailable
             | Self::Busy
+            | Self::Draining
             | Self::InsufficientRemaining => 3,
             Self::ApprovalDenied
             | Self::AuthorityDenied
@@ -462,6 +466,9 @@ impl Failure {
                 "the covering administrator grant ends before the required remaining time"
             }
             Self::Interrupted => "administrator operation was interrupted",
+            Self::Draining => {
+                "the grant coordinator is draining and admits no new work; running commands continue; rerun this step once dev-auth-grants.service restarts"
+            }
         }
     }
 }
