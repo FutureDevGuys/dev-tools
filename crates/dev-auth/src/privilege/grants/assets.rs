@@ -33,7 +33,6 @@ mod tests {
             "Delegate=no",
             "ExitType=main",
             "RemainAfterExit=no",
-            "Restart=on-failure",
         ] {
             assert!(SERVICE.lines().any(|line| line == required));
         }
@@ -65,5 +64,16 @@ mod tests {
                 "{key}= names polkit.service"
             );
         }
+    }
+
+    #[test]
+    fn the_service_manager_restarts_the_coordinator_after_any_exit_it_did_not_order() {
+        // A stop that the service manager orders never restarts a unit,
+        // whatever Restart= says. Restart=on-failure also skips an exit with
+        // status 0, such as the drain after a SIGTERM from `kill -TERM -1`
+        // (#105).
+        assert_eq!(setting("Restart").collect::<Vec<_>>(), ["always"]);
+        assert_eq!(setting("RestartSec").collect::<Vec<_>>(), ["2s"]);
+        assert_eq!(setting("RestartPreventExitStatus").next(), None);
     }
 }

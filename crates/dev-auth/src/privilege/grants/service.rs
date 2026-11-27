@@ -227,6 +227,27 @@ enum Drain {
 enum Exit {
     Stopped,
     Changed(Input),
+    /// A task of the coordinator panicked or was cancelled, which no orderly
+    /// path does. Every grant stops and the process exits with a failure
+    /// status, so the exit is visible as one (#105).
+    Faulted,
+}
+
+impl Exit {
+    /// How the coordinator process ends once every grant has ended.
+    fn result(self) -> Result<(), Failure> {
+        match self {
+            Self::Stopped => Ok(()),
+            Self::Changed(_) => Err(Failure::AuthorityDenied),
+            Self::Faulted => Err(Failure::RuntimeFailure),
+        }
+    }
+}
+
+/// Why the coordinator stops serving once one of its tasks ended with
+/// `joined`.
+fn task_ended(joined: &Result<(), tokio::task::JoinError>) -> Option<Exit> {
+    joined.is_err().then_some(Exit::Faulted)
 }
 
 impl Phase {
@@ -531,7 +552,7 @@ async fn run(
                     login_tick = 0;
                     if login_check.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
                         if let Some(finished) = login_check.take() {
-                            if finished.await.is_err() { break Exit::Stopped; }
+                            if let Some(exit) = task_ended(&finished.await) { break exit; }
                         }
                         let service = Arc::clone(&service);
                         login_check = Some(tokio::spawn(async move { check_logins(&service).await; }));
@@ -539,7 +560,7 @@ async fn run(
                 }
             }
             completed = connections.join_next(), if !connections.is_empty() => {
-                if completed.is_some_and(|result| result.is_err()) { break Exit::Stopped; }
+                if let Some(exit) = completed.as_ref().and_then(task_ended) { break exit; }
             }
             readiness = listener.readable(), if connections.len() < MAX_CONNECTIONS => {
                 let mut readiness = readiness.map_err(|_| Failure::NativeUnavailable)?;
@@ -571,6 +592,11 @@ async fn run(
             "dev-auth grant coordinator exiting: the {input} changed and no managed job remains; the service manager starts a coordinator that binds the new state"
         );
     }
+    if exit == Exit::Faulted {
+        eprintln!(
+            "dev-auth grant coordinator exiting: one of its tasks failed; every grant stops and the service manager restarts the coordinator"
+        );
+    }
     {
         let mut state = service.state.lock().await;
         if matches!(state.phase, Phase::Draining(Drain::Stop { .. })) {
@@ -593,10 +619,7 @@ async fn run(
     if !ended {
         return Err(Failure::CleanupFailed);
     }
-    match exit {
-        Exit::Changed(_) => Err(Failure::AuthorityDenied),
-        Exit::Stopped => Ok(()),
-    }
+    exit.result()
 }
 
 /// How long an orderly stop waits for running jobs to finish (ADR 0141).
@@ -4904,6 +4927,32 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    #[test]
+    fn a_panic_in_a_coordinator_task_ends_the_process_with_a_failure_status() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async { panic!("a connection task failed") });
+            let joined = tasks.join_next().await.unwrap();
+            let exit = task_ended(&joined).expect("a panicked task ends serving");
+            assert_eq!(exit.result(), Err(Failure::RuntimeFailure));
+            assert_ne!(Failure::RuntimeFailure.exit_code(), 0);
+            tasks.spawn(async {});
+            assert_eq!(task_ended(&tasks.join_next().await.unwrap()), None);
+        });
+    }
+
+    #[test]
+    fn only_an_orderly_stop_ends_the_process_with_success() {
+        assert_eq!(Exit::Stopped.result(), Ok(()));
+        for input in [Input::Policy, Input::SudoProgram] {
+            assert!(Exit::Changed(input).result().is_err(), "{input}");
+        }
+        assert!(Exit::Faulted.result().is_err());
     }
 
     #[test]
