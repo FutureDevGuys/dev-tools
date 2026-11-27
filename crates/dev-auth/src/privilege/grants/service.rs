@@ -3311,30 +3311,18 @@ enum UnitFault {
 /// A failed call means the service manager has not answered yet only when
 /// the bus could not deliver it. Any other reply is the manager's answer.
 fn bus_fault(error: &zbus::Error) -> UnitFault {
-    match error {
-        zbus::Error::InputOutput(_) | zbus::Error::Connection(..) | zbus::Error::Handshake(_) => {
-            UnitFault::Unreachable
-        }
-        zbus::Error::MethodError(name, _, _) => reply_fault(name.as_str()),
-        zbus::Error::FDO(error) => fdo_fault(error),
-        _ => UnitFault::Mismatch,
-    }
+    unit_fault(super::bus::unanswered(error))
 }
 
 fn fdo_fault(error: &zbus::fdo::Error) -> UnitFault {
-    match error {
-        zbus::fdo::Error::ZBus(error) => bus_fault(error),
-        error => reply_fault(zbus::DBusError::name(error).as_str()),
-    }
+    unit_fault(super::bus::unanswered_fdo(error))
 }
 
-fn reply_fault(name: &str) -> UnitFault {
-    match name.strip_prefix("org.freedesktop.DBus.Error.") {
-        Some(
-            "ServiceUnknown" | "NameHasNoOwner" | "NoReply" | "Timeout" | "TimedOut"
-            | "Disconnected" | "NoServer" | "IOError",
-        ) => UnitFault::Unreachable,
-        _ => UnitFault::Mismatch,
+fn unit_fault(unanswered: bool) -> UnitFault {
+    if unanswered {
+        UnitFault::Unreachable
+    } else {
+        UnitFault::Mismatch
     }
 }
 
@@ -4348,14 +4336,12 @@ mod tests {
         for error in &answered {
             assert_eq!(bus_fault(error), UnitFault::Mismatch, "{error}");
         }
-        assert_eq!(
-            reply_fault("org.freedesktop.systemd1.NoUnitForPID"),
-            UnitFault::Mismatch
-        );
-        assert_eq!(
-            reply_fault("org.freedesktop.DBus.Error.NameHasNoOwner"),
-            UnitFault::Unreachable
-        );
+        assert!(!super::super::bus::unanswered_reply(
+            "org.freedesktop.systemd1.NoUnitForPID"
+        ));
+        assert!(super::super::bus::unanswered_reply(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ));
     }
 
     #[tokio::test]

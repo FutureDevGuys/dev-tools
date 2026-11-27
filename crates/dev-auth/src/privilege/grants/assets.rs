@@ -11,6 +11,13 @@ pub const SUDOERS: &str = include_str!("../../../assets/grants/sudoers");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setting(key: &str) -> impl Iterator<Item = &'static str> + '_ {
+        SERVICE
+            .lines()
+            .filter_map(move |line| line.strip_prefix(key)?.strip_prefix('='))
+    }
+
     #[test]
     fn administrator_assets_require_fresh_approval_and_independent_crash_cleanup() {
         assert!(POLKIT.contains(super::super::approval::ACTION));
@@ -35,5 +42,28 @@ mod tests {
         assert!(SUDOERS.contains("%:dev-auth-active"));
         assert!(SUDO_CONFIGURATION.contains("dev_auth_sudo_audit"));
         assert!(SUDO_CONFIGURATION.contains("dev_auth_sudo_approval"));
+    }
+
+    #[test]
+    fn no_other_units_stop_or_restart_stops_the_coordinator() {
+        // Each of these stops this unit when the named unit stops or
+        // restarts, or, for Conflicts=, when it starts. A package upgrade
+        // that restarts PolicyKit would then end every grant (#105).
+        for key in [
+            "Requires",
+            "Requisite",
+            "BindsTo",
+            "PartOf",
+            "StopPropagatedFrom",
+            "Conflicts",
+        ] {
+            assert_eq!(setting(key).next(), None, "{key}= stops the coordinator");
+        }
+        for key in ["Wants", "After"] {
+            assert!(
+                setting(key).any(|units| units.split(' ').any(|unit| unit == "polkit.service")),
+                "{key}= names polkit.service"
+            );
+        }
     }
 }

@@ -23,6 +23,8 @@ mod approval;
 #[cfg(target_os = "linux")]
 pub mod assets;
 #[cfg(target_os = "linux")]
+mod bus;
+#[cfg(target_os = "linux")]
 mod execution_io;
 #[cfg(target_os = "linux")]
 mod graph;
