@@ -82,4 +82,16 @@ mod tests {
         assert_eq!(setting("RestartSec").collect::<Vec<_>>(), ["2s"]);
         assert_eq!(setting("RestartPreventExitStatus").next(), None);
     }
+
+    #[test]
+    fn systemd_oomd_never_selects_the_coordinators_own_cgroup() {
+        // systemd-oomd selects a cgroup and kills everything in it, and
+        // killing this unit's cgroup would end every grant (#105). The
+        // preference is not applied to the cgroups below the unit's (see
+        // systemd.resource-control), so those stay ordinary candidates.
+        assert_eq!(
+            setting("ManagedOOMPreference").collect::<Vec<_>>(),
+            ["omit"]
+        );
+    }
 }
