@@ -4,11 +4,13 @@
 
 - Update All generic lock diagnostics, PR #116: source and controlled Linux CLI validation pass. One socket fixture remains blocked by the cloud sandbox and fails identically on baseline. Release and desktop installation remain pending; no installed product changed.
 
-- **Dev Auth lifecycle gaps (#105)**, pull request #124 on branch `fix/dev-auth-lifecycle-105`, closes #105 and waits for review and a merge commit. Its six items and ADR 0144 are in the pull request. Native acceptance of the lifecycle edges is pending, and two tests fail identically on `main` on the development host: the managed Git clone credential test and the `grant_cli` template help test. Release 0.5.6 and installation wait on the owner.
-- **Dev Auth 0.5.6**, after #105 merges.
-  - Advance `crates/dev-auth` and `crates/dev-auth-sudo` to 0.5.6 with `Cargo.lock`.
-  - Then build twice, compare, verify and publish through the approved release-builder workload; that step waits on the owner's approval. The newest published release is 0.5.5.
+- **Dev Auth 0.5.6.** #105's lifecycle fixes merged in #124 (ADR 0144), after an independent review and a re-review, and the core and helper are advanced to 0.5.6. Remaining:
+  - Build twice, compare, verify and publish through the approved release-builder workload. That waits on the owner's approval. The newest published release is 0.5.5.
   - Releases through 0.5.5 judge a setup plan in the release that plans it (ADR 0140), so an upgrade from 0.5.5 or older must plan with the 0.5.6 executable itself.
+  - Native acceptance of the six lifecycle edges, which ADR 0144 records as `status: proposed`.
+  - Low review leftovers. The managed-sudo bridge's checks after the preflight answer (`sudo_bridge.rs`) still drop the connection during a drain instead of answering `draining`. Setup accepts only an exact 5 s `control-group` stop while startup accepts up to 5 s. Startup reads the previous-unit bound from the second `TEARDOWNS` entry; a test pins the list. The checks after approval in delegation, launch activation and the `exec` slot have no hermetic test.
+  - Two `dev-auth` tests fail identically on `main` on the development host: the managed Git clone credential test and the `grant_cli` template help test. They depend on that host's environment.
+- **Update All benign diagnostics** (#125) and the dashboard colors wait on the next signed Update All release: yay's keyring probe (`gpg: error reading key: No public key`) and uv's missing-extra warning no longer mark a clean run as completed with issues.
 - **Agent Plugins as a Dev Tools product**, after Dev Auth 0.5.6. The owner: "Do this task here: 'dev-tools: agent-plugins as an encapsulated, modular product'". Their wider direction: "it needs to be able to just work when given a config or just given arguments or flags. However, I think that there should be commands to generate default configurations too", "I think update all also does something similar, so that would need to change too", and "the finished tools themselves are encapsulated and hermetic". Not started. The work:
   - port the agent-tooling projector to Rust on shared crates;
   - add a command that writes the default configuration;
