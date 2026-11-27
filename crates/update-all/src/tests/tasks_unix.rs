@@ -5418,7 +5418,11 @@ fn truthful_item_observations_survive_a_failed_command_or_output_validation() {
     let mut spec = builtin_to_task_spec(task, false);
     let ctx = test_context(Arc::new(PrivilegeSession::default()));
     for (program, diagnostic, exit) in [
-        ("winget", "Error processing package dependencies. Exiting...", 0),
+        (
+            "winget",
+            "Error processing package dependencies. Exiting...",
+            0,
+        ),
         ("provider", "deterministic provider exit", 7),
     ] {
         let program = temp.path().join(program);
@@ -5444,7 +5448,10 @@ exit {exit}
         let result = run_command_task(&ctx, &spec, command).unwrap();
         assert_eq!(result.status, TaskStatus::Failed);
         assert_ne!(result.details[0], "component update completed");
-        assert!(!result.details[0].contains("UPDATE_ALL_RESULT"), "{result:?}");
+        assert!(
+            !result.details[0].contains("UPDATE_ALL_RESULT"),
+            "{result:?}"
+        );
         let row = &result
             .report_sections
             .iter()

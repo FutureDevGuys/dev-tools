@@ -851,6 +851,67 @@ fn stderr_log_level_is_content_based() {
 }
 
 #[test]
+fn benign_provider_notices_do_not_mark_a_completed_task_with_issues() {
+    let output = [
+        "gpg: error reading key: No public key",
+        "gpg: error reading key: No public key",
+        "warning: The package `typer==0.29.3` does not have an extra named `all`",
+        "==> WARNING: Skipping verification of source file PGP signatures.",
+    ]
+    .join("\n");
+    let mut result = TaskResult::completed("Diagnostics");
+
+    attach_command_output_diagnostics(&mut result, &output);
+
+    let advisory = result
+        .advisories
+        .iter()
+        .find(|advisory| advisory.code == "command-output-diagnostics")
+        .expect("the remaining makepkg warning is still reported");
+    assert_eq!(advisory.severity, AdvisorySeverity::Warning);
+    let section = result
+        .report_sections
+        .iter()
+        .find(|section| section.key == "command_diagnostics")
+        .expect("diagnostic report section");
+    assert_eq!(section.rows.len(), 1, "{section:#?}");
+}
+
+#[test]
+fn benign_provider_notices_alone_add_no_diagnostics() {
+    let output = [
+        "gpg: error reading key: No public key",
+        "warning: The package `typer==0.29.3` does not have an extra named `all`",
+    ]
+    .join("\n");
+    let mut result = TaskResult::completed("Diagnostics");
+
+    attach_command_output_diagnostics(&mut result, &output);
+
+    assert!(result.advisories.is_empty(), "{:#?}", result.advisories);
+    assert!(result.report_sections.is_empty());
+}
+
+#[test]
+fn real_signature_and_key_failures_remain_errors() {
+    for line in [
+        "==> ERROR: One or more PGP signatures could not be verified!",
+        "gpg: error reading key: General error",
+        "error: package hook failed",
+    ] {
+        let mut result = TaskResult::completed("Diagnostics");
+        attach_command_output_diagnostics(&mut result, line);
+        assert!(
+            result.advisories.iter().any(|advisory| {
+                advisory.code == "command-output-diagnostics"
+                    && advisory.severity == AdvisorySeverity::Error
+            }),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn command_output_diagnostics_dedupes_and_caps_warning_samples() {
     let output = [
         "warning: alpha package is deprecated",

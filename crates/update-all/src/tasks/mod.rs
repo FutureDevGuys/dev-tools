@@ -4815,6 +4815,9 @@ fn command_diagnostic_sample(line: &str) -> Option<(&'static str, NormalizedComm
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
+    if is_benign_provider_notice(&lower) {
+        return None;
+    }
     if lower.contains("no debugging symbols") {
         return Some((
             "warning",
@@ -4843,6 +4846,17 @@ fn command_diagnostic_sample(line: &str) -> Option<(&'static str, NormalizedComm
         ));
     }
     None
+}
+
+/// Provider output that looks like a diagnostic but reports nothing the user
+/// can or should act on. The complete task log keeps every line.
+fn is_benign_provider_notice(lower: &str) -> bool {
+    // makepkg and yay probe the keyring before importing a source's signing
+    // key; a real verification failure is reported separately by makepkg.
+    lower.starts_with("gpg: error reading key: no public key")
+        // A dependency requested an extra its own upstream no longer ships;
+        // the package still installs and the requester owns the fix.
+        || (lower.starts_with("warning: the package `") && lower.contains("` does not have an extra named `"))
 }
 
 fn command_diagnostic_kind(lower: &str) -> Option<&'static str> {
