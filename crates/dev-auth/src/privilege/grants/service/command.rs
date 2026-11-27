@@ -249,8 +249,8 @@ pub(super) async fn run(
             .pending
             .lock()
             .map_err(|_| Failure::RuntimeFailure)?;
-        if state.phase != Phase::Serving
-            || pending.len() >= 4
+        admission(state.phase, Ok(None))?;
+        if pending.len() >= 4
             || state.registry.iter().count() + pending.len() >= MAX_GRANTS
             || !pending.insert(caller.scope.account.clone())
         {
@@ -282,12 +282,11 @@ pub(super) async fn run(
     drop(pending);
     approval?;
     let setup_lease = setup_admission(service)?;
-    if admission(state.phase, service.trust()).is_err()
-        || !caller.still_present()
-        || !program.unchanged()
-    {
-        return Err(Failure::AuthorityDenied);
-    }
+    super::post_approval_admission(
+        state.phase,
+        service.trust(),
+        caller.still_present() && program.unchanged(),
+    )?;
     if state.jobs.len() >= MAX_EXECUTIONS {
         return Err(Failure::Busy);
     }

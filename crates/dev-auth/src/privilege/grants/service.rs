@@ -976,8 +976,8 @@ async fn issue(
             .pending
             .lock()
             .map_err(|_| Failure::RuntimeFailure)?;
-        if state.phase != Phase::Serving
-            || pending.len() >= 4
+        admission(state.phase, Ok(None))?;
+        if pending.len() >= 4
             || state.registry.iter().count() + pending.len() >= MAX_GRANTS
             || !pending.insert(scope.account.clone())
         {
@@ -994,14 +994,14 @@ async fn issue(
     drop(pending);
     approval?;
     let _setup = setup_admission(service)?;
-    if admission(state.phase, service.trust()).is_err()
-        || !caller.still_present()
-        || launch_owner
-            .as_ref()
-            .is_some_and(|owner| !owner.matches(caller))
-    {
-        return Err(Failure::AuthorityDenied);
-    }
+    post_approval_admission(
+        state.phase,
+        service.trust(),
+        caller.still_present()
+            && launch_owner
+                .as_ref()
+                .is_none_or(|owner| owner.matches(caller)),
+    )?;
     let now = now()?;
     let deadline = now
         .checked_add(limits.hard_timeout())
@@ -1195,14 +1195,14 @@ fn require_launch_state(
     caller: &Caller,
     phase: LaunchPhase,
 ) -> Result<(), Failure> {
-    if admission(state.phase, service.trust()).is_err()
-        || state
-            .registry
-            .get(id)
-            .ok_or(Failure::NoGrant)?
-            .lifetime
-            .state()
-            != LeaseState::Active
+    admission(state.phase, service.trust())?;
+    if state
+        .registry
+        .get(id)
+        .ok_or(Failure::NoGrant)?
+        .lifetime
+        .state()
+        != LeaseState::Active
         || !state
             .metadata
             .get(&id)
@@ -1528,9 +1528,7 @@ async fn delegate(
     let id = new_id()?;
     let mut state = service.state.lock().await;
     let now = now()?;
-    if state.phase != Phase::Serving {
-        return Err(Failure::NativeUnavailable);
-    }
+    admission(state.phase, Ok(None))?;
     if depth(&state, parent) >= 16 {
         return Err(Failure::Busy);
     }
@@ -1650,7 +1648,8 @@ async fn execute(
     ) = {
         let mut state = service.state.lock().await;
         let now = now()?;
-        if service.grant_use(state.phase) != GrantUse::Open || state.jobs.len() >= MAX_EXECUTIONS {
+        service.grant_use(state.phase).admits()?;
+        if state.jobs.len() >= MAX_EXECUTIONS {
             return Err(Failure::Busy);
         }
         let grant_id = select(&state, &caller.scope, selected)?;
@@ -3041,8 +3040,9 @@ fn admission(phase: Phase, trust: Look<Option<Input>>) -> Result<(), Failure> {
     match (phase, trust) {
         (Phase::Serving, Ok(None)) => Ok(()),
         (Phase::Serving, Err(_)) => Err(Failure::NativeUnavailable),
-        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_), _) => Err(Failure::Draining),
-        (Phase::Stopping, _) => Err(Failure::Busy),
+        (Phase::Serving, Ok(Some(_))) | (Phase::Draining(_) | Phase::Stopping, _) => {
+            Err(Failure::Draining)
+        }
     }
 }
 
@@ -3066,6 +3066,23 @@ fn watch_trust(state: &mut State, look: Look<Option<Input>>) {
             "dev-auth grant trust changed: the {input} is not the one bound at startup; admission is closed and {} running job(s) continue under their grants",
             state.jobs.len()
         );
+    }
+}
+
+/// Whether a grant that the user just approved may still start in `phase`.
+/// A drain that began while the approval was open refuses it as the refusal
+/// before the approval does, with `Failure::Draining`, and not as a denial.
+/// Only a caller or launch owner that changed is a denial (ADR 0144).
+fn post_approval_admission(
+    phase: Phase,
+    trust: Look<Option<Input>>,
+    unchanged: bool,
+) -> Result<(), Failure> {
+    admission(phase, trust)?;
+    if unchanged {
+        Ok(())
+    } else {
+        Err(Failure::AuthorityDenied)
     }
 }
 
@@ -5257,6 +5274,27 @@ mod tests {
             environment: vec![],
             terminal: false,
         };
+        // The sudo plugin's own line for a drain, which the CLI prints after
+        // `dev-auth: `. The refusal of other work is that line for work
+        // instead of sudo, and names the unit that restarts.
+        let plugin_guidance = || {
+            let plugin = include_str!("../../../../dev-auth-sudo/src/native.rs");
+            let line = plugin
+                .lines()
+                .find(|line| line.contains("is draining and admits no new sudo"))
+                .expect("the sudo plugin's drain line");
+            let text = line
+                .split_once("c\"dev-auth: ")
+                .and_then(|(_, rest)| rest.split_once("\\n\""))
+                .expect("the line is a C string ending in a newline")
+                .0;
+            text.replace("no new sudo", "no new work")
+                .replace("once it restarts", "once dev-auth-grants.service restarts")
+        };
+        assert_eq!(
+            plugin_guidance(),
+            "the grant coordinator is draining and admits no new work; running commands continue; rerun this step once dev-auth-grants.service restarts"
+        );
         let exec = ControlRequest::Exec {
             grant: None,
             execution: execution(),
@@ -5285,11 +5323,7 @@ mod tests {
                 .map(|failure| {
                     let printed = ControlResult::failure(request.operation(), failure, Some(false));
                     assert_eq!(printed.exit_code(), 3, "{failure:?}");
-                    assert!(failure.message().contains("rerun"), "{failure:?}");
-                    assert!(
-                        failure.message().contains("dev-auth-grants.service"),
-                        "{failure:?}"
-                    );
+                    assert_eq!(failure.message(), plugin_guidance(), "{failure:?}");
                     serde_json::to_value(printed).unwrap()["error_kind"].clone()
                 })
         };
@@ -5343,6 +5377,61 @@ mod tests {
                 observation.operation()
             );
         }
+    }
+
+    #[test]
+    fn a_drain_that_begins_while_an_approval_is_open_is_told_to_rerun_not_denied() {
+        let policy_drain = Phase::Draining(Drain::Changed(Input::Policy));
+        let sudo_drain = Phase::Draining(Drain::Changed(Input::SudoProgram));
+        let stop = Phase::Serving.stop_requested(at(100));
+        // The approval succeeded and the caller is unchanged, but the
+        // coordinator began to drain meanwhile. Each refusal is the rerun
+        // guidance of the refusal before the approval.
+        for (phase, trust, why) in [
+            (policy_drain, Ok(Some(Input::Policy)), "a policy drain"),
+            (
+                sudo_drain,
+                Ok(Some(Input::SudoProgram)),
+                "a sudo-program drain",
+            ),
+            (stop, Ok(None), "an orderly stop"),
+            (Phase::Stopping, Ok(None), "the final stop"),
+            (
+                Phase::Serving,
+                Ok(Some(Input::Policy)),
+                "a change not yet reaped",
+            ),
+        ] {
+            assert_eq!(
+                post_approval_admission(phase, trust, true),
+                Err(Failure::Draining),
+                "{why}"
+            );
+            assert_eq!(
+                admission(phase, trust),
+                Err(Failure::Draining),
+                "{why}: a new grant"
+            );
+        }
+        assert_eq!(
+            post_approval_admission(Phase::Serving, Ok(None), true),
+            Ok(())
+        );
+        assert_eq!(
+            post_approval_admission(Phase::Serving, Ok(None), false),
+            Err(Failure::AuthorityDenied),
+            "a caller that left is still a denial"
+        );
+        assert_eq!(
+            post_approval_admission(Phase::Serving, Err(UNREADABLE), true),
+            Err(Failure::NativeUnavailable),
+            "a look that could not be taken is retryable"
+        );
+        assert_eq!(
+            post_approval_admission(policy_drain, Ok(Some(Input::Policy)), false),
+            Err(Failure::Draining),
+            "the drain is reported first"
+        );
     }
 
     #[test]
