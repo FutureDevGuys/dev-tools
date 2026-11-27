@@ -886,3 +886,35 @@ fn logout_ends_user_and_command_grants_but_not_workload_grants() {
     assert!(GrantScope::Command.ends_at_logout());
     assert!(!GrantScope::Workload.ends_at_logout());
 }
+
+#[test]
+fn a_drain_refusal_is_the_documented_retryable_draining_result() {
+    // docs/dev-auth-privilege.md and ADR 0144: `error_kind` `draining`, exit
+    // 3, and the same schema as every other result, which an older client
+    // cannot decode and reports as a protocol violation.
+    let refused =
+        dev_auth::privilege::grants::ControlResult::failure("exec", Failure::Draining, Some(false));
+    assert_eq!(refused.exit_code(), 3);
+    let document = serde_json::to_value(&refused).unwrap();
+    assert_eq!(document["schema"], "dev-auth-administrator-grant-result-v1");
+    assert_eq!(document["operation"], "exec");
+    assert_eq!(document["changed"], false);
+    assert_eq!(document["error_kind"], "draining");
+    let decoded: dev_auth::privilege::grants::ControlResult =
+        serde_json::from_value(document).unwrap();
+    assert_eq!(decoded.error_kind, Some(Failure::Draining));
+    assert_eq!(
+        Failure::Draining.message(),
+        "the grant coordinator is draining and admits no new work; running commands continue; rerun this step once dev-auth-grants.service restarts"
+    );
+    // The retryable kinds that sit beside it keep their documented codes.
+    for (failure, kind, exit) in [
+        (Failure::NativeUnavailable, "native_unavailable", 3),
+        (Failure::Busy, "busy", 3),
+        (Failure::InsufficientRemaining, "insufficient_remaining", 3),
+        (Failure::AuthorityDenied, "authority_denied", 4),
+    ] {
+        assert_eq!(failure.exit_code(), exit, "{kind}");
+        assert_eq!(serde_json::to_value(failure).unwrap(), kind);
+    }
+}

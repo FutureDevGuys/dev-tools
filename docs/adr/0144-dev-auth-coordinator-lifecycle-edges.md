@@ -32,16 +32,20 @@ The unit has `Restart=always` with `RestartSec=2s`. A stop that the service mana
 
 A panicked or cancelled coordinator task also ends the process with a failure status, the runtime-failure status, instead of 0. Only an orderly stop exits with success. The service manager's start rate limit still ends a restart loop, as it did for `Restart=on-failure`.
 
+Two consequences are accepted. `systemctl kill` of the coordinator now restarts it, because no stop job ordered the exit. Setup observes the unit before it changes anything and treats `activating` with the `auto-restart` sub-state as a nonterminal transition, so a setup that starts during the two seconds before a restart fails closed and is rerun.
+
 ### Startup accepts the previous unit
 
-Startup still requires that the coordinator is the unit's main process in the unit's own cgroup, that the service manager kills every process left once the coordinator exits (`SendSIGKILL=yes`), `ExitType=main`, `RemainAfterExit=no` and `Delegate=no`. These keep ADR 0137's crash cleanup. For the stop contract it accepts either:
+Startup still requires that the coordinator is the unit's main process in the unit's own cgroup, that the service manager kills every process left once the coordinator exits (`SendSIGKILL=yes`), `ExitType=main`, `RemainAfterExit=no` and `Delegate=no`. For the stop contract it accepts either:
 
-- `KillMode=mixed` with a stop timeout of at least the orderly stop's bound, which is the unit this release publishes and the only one under which a stop drains (ADR 0141); or
-- `KillMode=control-group`, the unit that setup replaces. A stop sends SIGTERM to every process at once, so jobs end without a drain, but the coordinator's exit still stops every job.
+- `KillMode=mixed` with a stop timeout of at least the orderly stop's bound of 80 seconds, which is the unit this release publishes and the only one under which a stop drains (ADR 0141); or
+- `KillMode=control-group` with a stop timeout of at most 5 seconds, which is the unit that setup replaces. A stop sends SIGTERM to every process at once, so jobs end without a drain.
 
-It refuses `process`, `none` and `mixed` with a shorter stop timeout. Under `control-group` the coordinator writes one journal line that a stop cannot drain and that product setup publishes the current unit.
+It refuses `process`, `none`, `mixed` with a shorter stop timeout, and `control-group` with a longer one. The 5 second bound is the one the released 0.5.5 coordinator enforced. Under `control-group` the service manager sends only SIGTERM to the processes left when the coordinator exits, and SIGKILL once the stop timeout passes, so the timeout bounds how long a job that ignores SIGTERM outlives the coordinator. With the previous unit that is up to 5 seconds, and a longer or infinite timeout, for example from a drop-in, would let such a job outlive its grant without bound. A coordinator exit therefore stops every job at once only under the published unit, and this record claims no more than that bound for the previous one.
 
-This relaxes ADR 0141's rule that startup refuses any unit that does not let the coordinator drain. A coordinator that is down gives no managed sudo and no grants, which is worse than a coordinator that cannot drain a stop, and the previous unit is one that setup itself still observes and stops. Setup's observation and the coordinator's startup compile in one list of the kill modes and stop timeouts they accept (`TEARDOWNS`), and a test requires each listed unit to satisfy startup.
+Under `control-group` the coordinator writes one journal line that says the unit predates this release: a stop cannot drain, one OOM kill of any process stops the unit, it still requires `polkit.service` and it restarts only after a failure. It says to rerun product setup.
+
+This relaxes ADR 0141's rule that startup refuses any unit that does not let the coordinator drain. A coordinator that is down gives no managed sudo and no grants, which is worse than a coordinator that cannot drain a stop, and the previous unit is one that setup itself still observes and stops. The units that setup observes and that startup accepts are listed once (`TEARDOWNS`). Setup compares the exact pairs, startup uses the published pair as a lower bound and the previous pair as an upper bound, and tests require both to hold and refuse a longer `control-group` timeout and an infinite one.
 
 The binary and the unit move together in these paths, and the order matters only where a start could fall between them:
 
@@ -53,7 +57,7 @@ An older release's executable still refuses the unit that this release publishes
 
 ### oomd exempts the coordinator's cgroup
 
-The unit has `ManagedOOMPreference=omit`, so `systemd-oomd` does not select the coordinator's own cgroup, whose kill would end every grant. The service manager does not apply the preference to the cgroups below the unit's, so the job boundaries are ordinary candidates, and an out-of-memory kill of one job's cgroup leaves the coordinator and every other job running.
+The unit has `ManagedOOMPreference=omit`, so `systemd-oomd` does not select the coordinator's own cgroup, whose kill would end every grant. The service manager does not apply the preference to the cgroups below the unit's. Whether `systemd-oomd` can rank or select one job's cgroup is not established: the memory controller cannot be enabled below the unit (ADR 0141), so a job cgroup may have no memory accounting for it to read. This record therefore claims only the exemption of the unit's cgroup, and per-job oomd containment is unverified until native acceptance.
 
 ### The task limit stays shared
 
@@ -61,11 +65,11 @@ A task limit for one job needs `pids.max` in the job's cgroup, which needs the p
 
 ### Refused work during a drain is told to rerun
 
-A new failure kind, `draining`, replaces `authority_denied` for work that a drain refuses: `exec`, `run-plan`, a managed sudo relay, a new request, a delegation and a launch. That covers a policy change, a stop and a policy change not yet reaped. Its exit status is 3, like the other failures that a retry resolves, and its message says that the coordinator is draining and admits no new work, that running commands continue, and that the step should be rerun once `dev-auth-grants.service` restarts. The text mirrors the sudo plugin's line and names no grant, account or path.
+A new failure kind, `draining`, replaces `authority_denied`, `busy` and `native_unavailable` for work that a drain or a stop refuses: `exec`, `run-plan`, a managed sudo relay, a new request, `run`, a delegation and a launch. That covers a policy change, a sudo-program change for work that needs the new state, a stop, the final stop that follows it and a change not yet reaped. Its exit status is 3, like the other failures that a retry resolves, and its message says that the coordinator is draining and admits no new work, that running commands continue, and that the step should be rerun once `dev-auth-grants.service` restarts. The text is the sudo plugin's line with sudo replaced by work and the unit named, and a test compares the whole message with the plugin's line.
 
-A coordinator that is shutting down after the drain (the stopping phase) still answers `busy`. A look at the policy that fails still answers `native_unavailable`. A request that the registry refuses keeps `authority_denied`.
+Every admission check answers `draining`, not only the first. A request that needs approval is checked before the approval and again after it, and so are the launch activation and commit, the delegation and an `exec` that takes its job slot. A drain that begins while the PolicyKit dialog is open therefore refuses the approved grant with the same guidance, not with a denial. All of these checks use one admission function. Only a caller, launch owner or program that changed during the approval is still `authority_denied`, and the drain is reported before it. `busy` now means only that a request or job limit was reached. A look at the policy or a trust input that could not be taken answers `native_unavailable`, which is retryable. A request that the registry refuses keeps `authority_denied`.
 
-An older client cannot decode the new kind and reports a protocol failure instead of printing it, so a client and its coordinator should be upgraded together, which setup does.
+`draining` is an additive value of `error_kind` under the same `dev-auth-administrator-grant-result-v1` schema, as `insufficient_remaining` was in ADR 0139. A new schema name would make an older client reject every result, so the schema stays. An older client cannot decode the new kind and reports a protocol failure, with no `changed` value, instead of printing it, so a client and its coordinator should be upgraded together, which setup does. A conformance test pins the name, the exit status, the message and the schema.
 
 ## Verification
 
@@ -74,7 +78,11 @@ Hermetic tests need no root, systemd, D-Bus or PolicyKit. They cover these cases
 - the unit asset has no `Requires=`, `Requisite=`, `BindsTo=`, `PartOf=`, `StopPropagatedFrom=` or `Conflicts=`, wants and follows `polkit.service`, sets `Restart=always` without `RestartPreventExitStatus=`, and sets `ManagedOOMPreference=omit`;
 - an unanswered approval call is `native_unavailable` with exit 3 and an answered one is `approval_denied`;
 - a panicked task ends the process with a failure status, only an orderly stop exits with success, and a task that finished normally ends nothing;
-- startup accepts the published unit and the previous one, each listed unit that setup observes satisfies startup, and a unit that stops only the coordinator, stops nothing or keeps `SendSIGKILL=no` is refused;
-- each kind of work that a drain refuses fails with `draining`, exit 3 and the rerun message, work under an active grant continues through a sudo-program drain, and `status` and `leave` still answer.
+- startup accepts the published unit and the previous one, each listed unit that setup observes satisfies startup, and a unit that stops only the coordinator, stops nothing, keeps `SendSIGKILL=no`, has `control-group` with a timeout above 5 seconds or an infinite one, or has `mixed` below 80 seconds is refused;
+- each kind of work that a drain refuses fails with `draining`, exit 3 and the sudo plugin's guidance, work under an active grant continues through a sudo-program drain, and `status` and `leave` still answer;
+- the decision after an approval answers `draining` in every drain and stop, and `authority_denied` only for a caller that changed;
+- the result document for `draining` has the documented schema, kind and exit status.
+
+The post-approval checks of delegation, launch activation and an `exec` taking its job slot call the same admission function, but need a live coordinator, caller and approval to run, so only the function itself is covered hermetically.
 
 Native acceptance remains pending. It needs a PolicyKit restart while a grant is active and a request made while PolicyKit is stopped, a `kill -TERM -1` and a panic injected into the coordinator followed by the restart, an executable replaced beside the previous unit and a crash, `systemd-oomd` under memory pressure, and `exec` during a policy drain on an installed system.
