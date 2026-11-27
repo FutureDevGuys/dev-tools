@@ -159,6 +159,14 @@ mod tests {
 
     #[test]
     fn closed_peer_is_end_of_stream_not_a_malformed_frame() {
+        // A sibling test's forked child can inherit `sender`, and the peer is
+        // closed only once every copy is, so this runs in a process of its own.
+        if crate::test_isolation::run_isolated(concat!(
+            module_path!(),
+            "::closed_peer_is_end_of_stream_not_a_malformed_frame"
+        )) {
+            return;
+        }
         let (receiver, sender) = pair();
         drop(sender);
         assert_eq!(
